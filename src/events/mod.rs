@@ -27,7 +27,7 @@ pub use model_call_telemetry::{
 pub use payloads::*;
 pub(crate) use run_aggregate::{
     CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
-    RunTerminalDecision, TaskKernelAdmission, TaskKernelOperationClaim,
+    RunTerminalDecision, TaskKernelAdmission, TaskKernelOperationClaim, OWNER_APPROVAL_DECLINED,
 };
 #[cfg(test)]
 pub(crate) use store::GeneratedResponseRef;

@@ -60,6 +60,17 @@ async fn approvals_harness(
     answers: Vec<Option<crate::types::ApprovalResponse>>,
     timeout: Option<std::time::Duration>,
 ) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+    approvals_harness_with(script, answers, timeout, Vec::new()).await
+}
+
+/// [`approvals_harness`] with `extra` tools offered beside http_request and
+/// the terminal.
+async fn approvals_harness_with(
+    script: Vec<crate::traits::ProviderResponse>,
+    answers: Vec<Option<crate::types::ApprovalResponse>>,
+    timeout: Option<std::time::Duration>,
+    extra: Vec<Arc<dyn crate::traits::Tool>>,
+) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
     let pool_file = tempfile::NamedTempFile::new().unwrap();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
@@ -83,9 +94,11 @@ async fn approvals_harness(
     let http: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::HttpRequestTool::new(
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     ));
+    let mut tools = vec![http, terminal];
+    tools.extend(extra);
     let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_responses(script),
-        vec![http, terminal],
+        tools,
         None,
     )
     .await
@@ -103,9 +116,12 @@ async fn approvals_harness(
 }
 
 async fn run_owner_turn(harness: &crate::testing::TestHarness, channel_ctx: ChannelContext) {
+    run_owner_turn_on(&harness.agent, channel_ctx).await;
+}
+
+async fn run_owner_turn_on(agent: &crate::agent::Agent, channel_ctx: ChannelContext) {
     use crate::runtime_ports::AgentIngress;
-    harness
-        .agent
+    agent
         .handle_inbound_message(crate::runtime_ports::InboundMessageRequest {
             session_id: APPROVALS_SESSION.to_string(),
             user_text: "Post the synthetic report for Alice Rivera".to_string(),
@@ -888,4 +904,157 @@ async fn declined_terminal_call_reasks_undeterminable_retry() {
     assert!(!results[1].contains("synthetic-opaque-ran"), "{results:?}");
     assert!(root.join("a").exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every tool message the model received on any call (parent and child
+/// runs share the provider), in call order, without repeats.
+async fn all_tool_messages(harness_provider: &MockProvider) -> Vec<String> {
+    let calls = harness_provider.call_log.lock().await;
+    let mut seen = Vec::new();
+    for call in calls.iter() {
+        for message in call.messages.iter().filter(|m| m["role"] == "tool") {
+            let content = message["content"].as_str().unwrap_or_default().to_string();
+            if !seen.contains(&content) {
+                seen.push(content);
+            }
+        }
+    }
+    seen
+}
+
+/// A decline in the parent run binds the child it spawns: the child's POST
+/// to the declined host is refused by its own kernel before anyone is
+/// asked, so the owner sees one card in all.
+#[tokio::test]
+async fn child_inherits_parent_decline() {
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let (mut harness, approver) = approvals_harness_with(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::tool_call_response(
+                "spawn_agent",
+                &json!({
+                    "mission": "Deliver the synthetic report",
+                    "task": "POST the synthetic report to https://h.example.invalid/x.",
+                })
+                .to_string(),
+            ),
+            // The child's run.
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::text_response("Child: the owner declined; nothing was sent."),
+            // The parent's closing reply.
+            MockProvider::text_response("The owner declined; nothing was sent."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        // Without the inherited decline the child's card would wait here,
+        // then time out as a decline of its own.
+        Some(std::time::Duration::from_millis(300)),
+        vec![Arc::new(OfferedSpawnAgent(spawn_tool.clone()))],
+    )
+    .await;
+    harness.agent.set_test_orchestrator_mode();
+    let provider = harness.provider.clone();
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
+    run_owner_turn_on(&agent, ChannelContext::private("telegram")).await;
+
+    let created: Vec<_> = crate::agent::authority::CREATED_CHILD_INHERITANCE
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|inherited| {
+            inherited.origin_request.as_deref()
+                == Some("Post the synthetic report for Alice Rivera")
+                && inherited.mode_session.as_deref() == Some(APPROVALS_SESSION)
+        })
+        .cloned()
+        .collect();
+    assert!(
+        created.iter().any(|inherited| inherited
+            .declined
+            .iter()
+            .any(|key| key.target == "h.example.invalid:443")),
+        "{created:?}"
+    );
+    assert_eq!(approver.card_count(), 1, "the child's retry gets no card");
+    let messages = all_tool_messages(&provider).await;
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("[OWNER DECLINED]") && m.contains("declined by the owner")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("[OWNER DECLINED]")
+            && m.contains("h.example.invalid:443")
+            && !m.contains("declined by the owner")),
+        "the child's POST is refused for the parent's decline: {messages:?}"
+    );
+}
+
+/// One decline, then three retries of the same egress through
+/// http_request and the terminal: each is refused by the kernel, and the
+/// owner is asked once in all.
+#[tokio::test]
+async fn repeated_declined_retries_send_no_new_cards() {
+    let (harness, approver) = approvals_harness(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            http_call("POST", "https://h.example.invalid/x", Some("report again")),
+            curl_call("curl -X POST https://h.example.invalid/y -d report"),
+            http_call("PUT", "https://h.example.invalid/z", Some("report")),
+            MockProvider::text_response("The owner declined; nothing was sent."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        Some(std::time::Duration::from_millis(300)),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "the retries send no new cards");
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 4, "{results:?}");
+    for retry in &results[1..] {
+        assert!(retry.contains("[OWNER DECLINED]"), "{results:?}");
+        assert!(retry.contains("h.example.invalid:443"), "{results:?}");
+    }
+    let decisions = approval_conditions(&harness).await;
+    assert_eq!(
+        conditions(&decisions),
+        ["owner_approval_requested", "owner_approval_declined"],
+        "{decisions:?}"
+    );
+    // Four Denied receipts in the ledger: the declined call and the three
+    // retries, each typed as an owner decline.
+    let denials: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND event_type = 'tool_result' \
+         AND data LIKE '%\"reason_code\":\"owner_approval_declined\"%'",
+    )
+    .bind(APPROVALS_SESSION)
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(denials, 4);
+}
+
+/// A run whose requested action the owner declined does not end as a
+/// success, whatever the model's closing reply says.
+#[tokio::test]
+async fn declined_effect_reported_honestly() {
+    let (harness, approver) = approvals_harness(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::text_response("Done."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        None,
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1);
+    let outcome = latest_task_outcome(&harness, APPROVALS_SESSION).await;
+    assert_ne!(outcome, crate::events::TaskOutcome::Succeeded);
+    assert_eq!(outcome, crate::events::TaskOutcome::Partial);
 }

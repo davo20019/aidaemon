@@ -140,24 +140,71 @@ pub(super) fn canonicalize_call(
     call
 }
 
+/// How the kernel judged a dispatched call's filesystem scope.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum DispatchJudgment {
+    /// Not a call the kernel's terminal rules judge: scope-checked now.
+    CheckNow,
+    /// A terminal call the kernel judged: the scope check it was judged
+    /// with, reused as is, so the escalation granted is the one the owner
+    /// was shown even if the turn's known project directory moved since.
+    /// The remaining window is the filesystem itself: a path created or a
+    /// symlink swapped between the judgment and the run is not re-judged;
+    /// in Sandbox confinement the sandbox enforces the granted, resolved
+    /// paths when the command runs.
+    Judged(Option<crate::agent::tool_execution::ScopeCheck>),
+    /// A terminal call that reached the dispatcher without the kernel's
+    /// judgment. Its ladder was never run, so it is refused.
+    Unjudged,
+}
+
+/// The refusal for a terminal call that reached the dispatcher without the
+/// kernel's judgment.
+pub(super) fn unjudged_terminal_refusal() -> String {
+    "terminal call requires approval through the agent kernel; it reached the dispatcher \
+     without the kernel's judgment and was not run."
+        .to_string()
+}
+
+/// The kernel's judgment of a dispatched call, removed from `judged`:
+/// `None` when the tool is not the terminal (whose approval ladder the
+/// kernel runs and the tool then skips), `Some(None)` when the terminal
+/// call was never judged in `run`.
+pub(super) fn take_terminal_judgment(
+    judged: &crate::agent::approvals::JudgedCalls,
+    run: sdk::RunId,
+    tool: Option<&dyn crate::traits::Tool>,
+    call_id: &str,
+) -> Option<Option<crate::agent::approvals::JudgedTerminal>> {
+    let terminal = tool
+        .and_then(|tool| tool.as_any())
+        .is_some_and(|any| any.downcast_ref::<crate::tools::TerminalTool>().is_some());
+    terminal.then(|| judged.take(run, call_id))
+}
+
 /// Put a dispatched call in its canonical form: a terminal call the kernel
-/// judged runs exactly as judged; any other call is canonicalized now. The
-/// model's explicit directory refines the turn's known project directory.
-/// Returns the injected directory.
+/// judged runs exactly as judged, with the scope it was judged with; any
+/// other call is canonicalized now. The model's explicit directory refines
+/// the turn's known project directory. Returns the injected directory and
+/// the kernel's judgment.
 pub(super) fn canonicalize_dispatched_call(
     scope: &TurnScope<'_>,
     tool: Option<&dyn crate::traits::Tool>,
     request: &mut ToolRequest,
-) -> Option<String> {
-    let judged = if request.name == "terminal" {
-        scope
-            .judged_terminal_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&request.call_id)
-            .map(|judged| judged.call)
-    } else {
-        None
+) -> (Option<String>, DispatchJudgment) {
+    let taken = take_terminal_judgment(
+        &scope.judged_terminal_calls,
+        request.run_id,
+        tool,
+        &request.call_id,
+    );
+    let (judged, judgment) = match taken {
+        Some(Some(judged)) => {
+            let check = judged.scope.as_scope_check();
+            (Some(judged.call), DispatchJudgment::Judged(check))
+        }
+        Some(None) => (None, DispatchJudgment::Unjudged),
+        None => (None, DispatchJudgment::CheckNow),
     };
     let canonical = match judged {
         Some(canonical) => canonical,
@@ -196,7 +243,7 @@ pub(super) fn canonicalize_dispatched_call(
         );
     }
     request.arguments = canonical.arguments;
-    canonical.injected_dir
+    (canonical.injected_dir, judgment)
 }
 
 /// A replayed call's result, marked so the model does not read the earlier
@@ -365,10 +412,17 @@ impl Agent {
             .iter()
             .find(|tool| tool.name() == request.name)
             .cloned();
-        let injected_dir = canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
+        let (injected_dir, judgment) =
+            canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
         let mut output = self
-            .run_sdk_tool_call(scope, &request, &arguments, injected_dir.as_deref())
+            .run_sdk_tool_call(
+                scope,
+                &request,
+                &arguments,
+                injected_dir.as_deref(),
+                &judgment,
+            )
             .await;
         // Refusals, deferrals, replays and suppressed duplicates are the
         // daemon's own words: trusted.
@@ -477,6 +531,15 @@ impl Agent {
             ),
             origin_trusted: scope.origin_trusted,
             trusted_roots: scope.trust_roots.clone(),
+            // What the owner declined in this run so far (the run's
+            // declines already hold what this turn itself inherited).
+            declined: crate::agent::authority::union_declines(
+                self.inherited_authority
+                    .as_ref()
+                    .map(|parent| parent.declined.as_slice())
+                    .unwrap_or_default(),
+                &scope.run_declines.snapshot(),
+            ),
         }
     }
 
@@ -488,11 +551,19 @@ impl Agent {
         request: &ToolRequest,
         arguments: &str,
         injected_dir: Option<&str>,
+        judgment: &DispatchJudgment,
     ) -> sdk::ToolOutput {
         // The controller-side filesystem check: protected host data and undeclared writes outside the task
         // boundary are refused; an exact out-of-scope target a user may
-        // authorize goes to the tool's approval prompt.
-        let scope_check = self.sdk_scope_check(scope, &request.name, arguments);
+        // authorize goes to the tool's approval prompt. A terminal call the
+        // kernel judged keeps the scope it was judged (and the owner asked)
+        // with.
+        let scope_check = match judgment {
+            DispatchJudgment::Judged(check) => check.clone(),
+            DispatchJudgment::CheckNow | DispatchJudgment::Unjudged => {
+                self.sdk_scope_check(scope, &request.name, arguments)
+            }
+        };
         let scope_escalation = match &scope_check {
             Some(crate::agent::tool_execution::ScopeCheck::Escalatable { reason, escalation }) => {
                 info!(
@@ -559,7 +630,9 @@ impl Agent {
         // the tools that could act on it.
         let untrusted_block = scope.restrict_untrusted_reference_tools
             && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
-        let gate = if let Some(reason) = ceiling_denial {
+        let gate = if *judgment == DispatchJudgment::Unjudged {
+            Err((unjudged_terminal_refusal(), "kernel_judgment_missing"))
+        } else if let Some(reason) = ceiling_denial {
             Err((
                 format!(
                     "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \

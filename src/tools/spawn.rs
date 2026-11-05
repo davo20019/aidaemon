@@ -1103,6 +1103,11 @@ mod tests {
             origin_request: Some("Summarize the synthetic notes.".to_string()),
             origin_trusted: true,
             trusted_roots: Vec::new(),
+            declined: vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "h.example.invalid",
+                None,
+            )],
         };
         let json = serde_json::json!({
             "mission": "test",

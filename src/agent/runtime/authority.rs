@@ -182,6 +182,26 @@ pub(crate) struct InheritedAuthority {
     /// outside them. Required: a missing value is no trust, never "no
     /// constraint".
     pub trusted_roots: Vec<String>,
+    /// Effects the owner declined in the parent run so far (its
+    /// `RunState::declined`, which already holds what the parent itself
+    /// inherited): the child's run starts with them, so a decline binds the
+    /// child for the same effect and target. Required: a child never starts
+    /// with fewer declines than its parent had.
+    pub declined: Vec<aidaemon_core::EffectKey>,
+}
+
+/// The union of two decline lists, in order, without repeats.
+pub(crate) fn union_declines(
+    first: &[aidaemon_core::EffectKey],
+    second: &[aidaemon_core::EffectKey],
+) -> Vec<aidaemon_core::EffectKey> {
+    let mut all = first.to_vec();
+    for key in second {
+        if !all.contains(key) {
+            all.push(key.clone());
+        }
+    }
+    all
 }
 
 /// The most of the root request a child inherits (and the verifier is
@@ -614,6 +634,7 @@ mod tests {
             origin_request: Some("Summarize the synthetic notes.".to_string()),
             origin_trusted: true,
             trusted_roots: Vec::new(),
+            declined: Vec::new(),
         }
     }
 
@@ -720,6 +741,7 @@ mod tests {
             origin_request: Some("Post this for me.".to_string()),
             origin_trusted: false,
             trusted_roots: Vec::new(),
+            declined: Vec::new(),
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,

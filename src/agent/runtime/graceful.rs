@@ -1342,7 +1342,8 @@ fn task_end_decision_and_outcome(
         crate::events::RunTerminalDecision::Unspecified
             if effective_status == TaskStatus::Completed
                 && outcome == crate::events::TaskOutcome::Succeeded
-                && run_aggregate.terminal_policy_denial() =>
+                && run_aggregate.terminal_policy_denial()
+                && !run_aggregate.owner_declined() =>
         {
             crate::events::RunTerminalDecision::ClosedByPolicyDenial
         }
@@ -1384,6 +1385,15 @@ fn task_end_decision_and_outcome(
             crate::events::TaskOutcome::Failed
         }
         (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
+    };
+    // The owner declined part of what the run set out to do: whatever the
+    // closing reply says, that work did not happen.
+    let effective_outcome = if effective_outcome == crate::events::TaskOutcome::Succeeded
+        && run_aggregate.owner_declined()
+    {
+        crate::events::TaskOutcome::Partial
+    } else {
+        effective_outcome
     };
     (terminal_decision, effective_outcome)
 }

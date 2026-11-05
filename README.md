@@ -68,7 +68,7 @@ Trigger-based instructions that teach it new workflows. Load from files, URLs, o
 Cron-style scheduled tasks with natural language time parsing. Email triggers via IMAP IDLE. Long-running goal tracking with task breakdown and multi-schedule support.
 
 ### Security
-Terminal command allowlists, inline approval flow (Allow Once / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
+Terminal command allowlists, inline approval flow (Allow Once / Allow Session / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
 
 ## Running as a Service
 
@@ -203,6 +203,50 @@ Chat commands (owner only) change one chat for four hours:
 - `/mode full | unrestricted | readonly` switches the chat's mode; `/mode` on
   its own shows the current one. `/mode full` ends a read-only or unrestricted
   period early.
+
+### Approvals
+
+Some actions wait for your OK. aidaemon sends you a card in the chat that
+says what the agent wants to do, how risky it is, and anything worth
+knowing. You are asked when the agent wants to:
+
+- send an HTTP request that changes something (anything other than a plain
+  GET, HEAD or OPTIONS), including a live test of a new API connection;
+- run a terminal command that is not on your allowlist, or one that needs a
+  look whatever the list says: reading sensitive files such as `~/.ssh`,
+  starting something that keeps running in the background, reaching outside
+  the task's folders in a sandboxed terminal, or turning on trust-all mode;
+- run any terminal command in a chat started by an automated trigger, such as
+  an incoming email.
+
+Scheduled tasks you set up yourself run without cards. Before anything is
+asked, outgoing requests are checked for secrets such as API keys and tokens:
+a request carrying one is blocked, not asked about.
+
+How to answer:
+
+- **Allow Once** runs this one action.
+- **Allow Session** also allows the same action again without asking, until
+  the daemon restarts. For a web request this covers the same request from
+  this chat and the helper agents it starts; for a terminal command, commands
+  that start the same way.
+- **Allow Always** (terminal commands) saves the command's start to your
+  allowlist, so commands like it run without a card from now on.
+- **Deny** stops the action.
+
+A card offers either Allow Session or Allow Always, depending on how risky the
+action is and the terminal's permission mode. A card waits five minutes; no
+answer, or a card that could not be delivered, counts as Deny.
+
+A Deny holds for the rest of the task. The agent cannot get around it by
+trying another way: once you decline a POST to a site, a `curl` to that site
+from the terminal is refused too, and so is the same request from any helper
+agent the task starts. No new card is sent for these retries. If, after a
+Deny, the agent tries something whose effects cannot be worked out in advance
+(an unfamiliar script, for example), you are asked again; it is never let
+through quietly. A task in which you declined something is recorded as only
+partly done, never as a success. Your next message starts a new task, so you
+can change your mind and ask again.
 
 ### Customize your agent
 

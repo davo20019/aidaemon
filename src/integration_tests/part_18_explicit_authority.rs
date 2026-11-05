@@ -691,6 +691,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         origin_request: None,
         origin_trusted: true,
         trusted_roots: Vec::new(),
+        declined: Vec::new(),
     });
     assert_eq!(child.mode_session_for("sub_agent_synthetic_unit"), session);
     let ceiling = crate::agent::authority::SessionModeCeiling::new(
@@ -710,6 +711,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         origin_request: None,
         origin_trusted: true,
         trusted_roots: Vec::new(),
+        declined: Vec::new(),
     });
     let grandchild = child
         .authority_for_child(UserRole::Owner, &ctx, None)
@@ -1052,6 +1054,7 @@ async fn readonly_reaches_a_running_child_through_its_parent_chat() {
             origin_request: Some("Write the child note.".to_string()),
             origin_trusted: true,
             trusted_roots: Vec::new(),
+            declined: Vec::new(),
         });
     assert_eq!(harness.agent.mode_session_for(child_session), parent);
     let ceiling = crate::agent::authority::SessionModeCeiling::new(

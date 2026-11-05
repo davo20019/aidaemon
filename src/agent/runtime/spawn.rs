@@ -2130,6 +2130,11 @@ impl Agent {
             // Without a parent constraint the child's own facts decide.
             origin_trusted: inherited.is_none_or(|inherited| inherited.origin_trusted),
             trusted_roots,
+            // Inside a chain the declines the chain inherited carry on; a
+            // root dispatch has none (it runs outside any declining run).
+            declined: inherited
+                .map(|inherited| inherited.declined.clone())
+                .unwrap_or_default(),
         }
     }
 

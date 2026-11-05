@@ -437,8 +437,8 @@ pub(super) fn terminal_canonicalizer(
             Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) => {
                 super::approvals::TerminalScope::Escalate(escalation)
             }
-            Some(crate::agent::tool_execution::ScopeCheck::Rejected(_)) => {
-                super::approvals::TerminalScope::Refused
+            Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason)) => {
+                super::approvals::TerminalScope::Refused(reason)
             }
             None => super::approvals::TerminalScope::InScope,
         };
@@ -448,6 +448,8 @@ pub(super) fn terminal_canonicalizer(
 
 /// One tool call handed from the SDK run to the daemon dispatcher.
 pub(super) struct ToolRequest {
+    /// The kernel run the call belongs to (call ids are unique per run).
+    run_id: sdk::RunId,
     name: String,
     arguments: Value,
     call_id: String,
@@ -568,8 +570,12 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// explicit directories (see `SdkTurnSetup::known_project_dir`).
     known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
     /// Terminal calls in the canonical form the kernel's approval rules
-    /// judged, by call id: the dispatcher executes exactly these.
+    /// judged, by run and call id: the dispatcher executes exactly these,
+    /// with the scope they were judged with.
     judged_terminal_calls: super::approvals::JudgedCalls,
+    /// The run's declines as the kernel last showed them to the approval
+    /// rules: a child spawned from this turn starts with them.
+    run_declines: super::approvals::RunDeclines,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
@@ -725,7 +731,7 @@ impl Agent {
                 } else if untrusted_denial {
                     "untrusted_egress_denied"
                 } else if owner_declined {
-                    "owner_approval_declined"
+                    crate::events::OWNER_APPROVAL_DECLINED
                 } else if egress_blocked {
                     "egress_secret_blocked"
                 } else {
@@ -990,6 +996,7 @@ impl Agent {
         // project directory as it is refined during the run).
         let known_project_dir = Arc::new(std::sync::Mutex::new(known_project_dir));
         let judged_terminal_calls = super::approvals::JudgedCalls::default();
+        let run_declines = super::approvals::RunDeclines::default();
         let workspace_grant = channel_ctx.active_workspace_grant(user_role).is_some();
         let terminal_approvals =
             super::approvals::TerminalApprovals::find(&self.tools).map(|terminal| {
@@ -1020,6 +1027,7 @@ impl Agent {
             user_role: Some(user_role),
             untrusted_trigger_session: super::is_trigger_session(session_id),
             terminal: terminal_approvals,
+            run_declines: run_declines.clone(),
         };
         let rules = Arc::new(rules);
         let approvals = self.owner_approvals.clone();
@@ -1126,6 +1134,12 @@ impl Agent {
         if starts_tainted {
             state = state.with_untrusted_context();
         }
+        // A child starts bound by what the owner declined in its parent's
+        // run (set after the user message: a new run's declines start empty).
+        if let Some(parent) = self.inherited_authority.as_ref() {
+            state.declined =
+                crate::agent::authority::union_declines(&state.declined, &parent.declined);
+        }
         let prefix_len = state.messages.len();
 
         // Drive the run and the tool dispatcher together on this task.
@@ -1181,6 +1195,7 @@ impl Agent {
             continue_inline_after_background,
             known_project_dir: known_project_dir.clone(),
             judged_terminal_calls,
+            run_declines,
             project_scope,
             authority: &authority,
             ceiling: ceiling.clone(),

@@ -304,6 +304,7 @@ impl sdk::Tool for BridgedTool {
         let (reply, answer) = oneshot::channel();
         self.calls
             .send(DaemonCall::Tool(ToolRequest {
+                run_id: ctx.run_id,
                 name: self.spec.name.clone(),
                 arguments,
                 call_id: ctx.call_id.clone(),

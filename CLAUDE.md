@@ -332,6 +332,28 @@ calls instead of checking them.
 - Never key trust, egress or taint on tool names or on request/content
   wording.
 
+## Owner Approval Rule
+
+Every safeguard that can refuse, approve or scan a tool call is a kernel hook judging typed effects. Tools never prompt the owner or refuse on policy inside `call()`; a decline binds the run for that effect and target across tools.
+
+- Tools declare a call's effects (`EffectKey`: egress `host:port`, absolute
+  paths for delete/write/configuration, named credential/process). The
+  kernel refuses any call overlapping `RunState::declined` with
+  `[OWNER DECLINED]` before any hook runs, and sends no new card.
+- `aidaemon_policies::ApprovalPolicy` asks; the app supplies only its rules
+  (`AppApprovalRules` in `src/agent/runtime/approvals.rs`: the http_request
+  and terminal ladders, with turn facts, never `_` arguments), its grant
+  stores, and the resolver that sends the card. Timeout, send failure and
+  Deny all decline. `EgressGuard` refuses secrets in outbound calls with
+  `[EGRESS BLOCKED]` before anyone is asked.
+- A child agent starts with its parent run's declines
+  (`InheritedAuthority::declined`, seeded into the child's `RunState` after
+  its user message is set). Session grants are shared with children.
+- The dispatcher runs a terminal call exactly as the kernel judged it,
+  keyed by run and call id, with the judged scope; a terminal call with no
+  judgment is refused ("requires approval through the agent kernel").
+- A run in which the owner declined something never ends `Succeeded`.
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the

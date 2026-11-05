@@ -87,6 +87,9 @@ pub(crate) struct RunObligation {
     pub prerequisite: bool,
 }
 
+/// The typed reason code of a refusal the owner declined.
+pub(crate) const OWNER_APPROVAL_DECLINED: &str = "owner_approval_declined";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RunOperation {
     pub operation_id: String,
@@ -110,6 +113,11 @@ pub(crate) struct RunOperation {
     /// Retrying the same operation cannot cross that boundary.
     #[serde(default)]
     pub policy_denied: bool,
+    /// The owner declined the operation (its refusal is typed
+    /// `owner_approval_declined`): the owner's answer, not an authority
+    /// boundary the run closed at.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_declined: bool,
     /// The proposed operation carried mutating semantics.
     #[serde(default)]
     pub mutating: bool,
@@ -960,6 +968,7 @@ impl RunAggregate {
                 outcome: None,
                 dispatched: false,
                 policy_denied: false,
+                owner_declined: false,
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
@@ -1101,6 +1110,7 @@ impl RunAggregate {
                 outcome: None,
                 dispatched: false,
                 policy_denied: false,
+                owner_declined: false,
                 mutating: false,
                 evidence_capabilities: Vec::new(),
                 targets: Vec::new(),
@@ -1116,6 +1126,11 @@ impl RunAggregate {
         operation.dispatched = operation.dispatched || receipt.invocation_stage.reached_dispatch();
         operation.policy_denied =
             operation.policy_denied || (!operation.dispatched && receipt.access_denial.is_some());
+        operation.owner_declined = operation.owner_declined
+            || receipt
+                .access_denial
+                .as_ref()
+                .is_some_and(|denial| denial.reason_code == OWNER_APPROVAL_DECLINED);
         operation.mutating = operation.mutating || receipt.semantics.mutates_state();
         if operation.evidence_capabilities.is_empty() {
             operation.evidence_capabilities = receipt.semantics.evidence.clone();
@@ -1674,6 +1689,14 @@ impl RunAggregate {
             };
         }
         CloseoutDecision::Unreachable { blocked }
+    }
+
+    /// The owner declined at least one operation of the run: what it was
+    /// asked to do did not all happen, so it never closes as a success.
+    pub(crate) fn owner_declined(&self) -> bool {
+        self.operations
+            .values()
+            .any(|operation| operation.owner_declined)
     }
 
     /// Operations refused before dispatch by a typed policy boundary.

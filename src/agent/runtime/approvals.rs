@@ -70,6 +70,33 @@ pub(crate) struct AppApprovalRules {
     pub untrusted_trigger_session: bool,
     /// The turn's terminal, whose approval ladder judges its calls.
     pub terminal: Option<TerminalApprovals>,
+    /// The run's declines as the kernel last showed them to these rules
+    /// (`HookContext::declined`, which every judged call refreshes): a
+    /// child spawned from this turn starts with them.
+    pub run_declines: RunDeclines,
+}
+
+/// The effects the owner declined in a run, as the kernel's hook context
+/// reports them (`RunState::declined`). Declines only grow within a
+/// daemon run, so the latest view holds every earlier one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunDeclines(Arc<Mutex<Vec<sdk::EffectKey>>>);
+
+impl RunDeclines {
+    /// Take in the run's declines as a hook context shows them.
+    pub(crate) fn observe(&self, declined: &[sdk::EffectKey]) {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for key in declined {
+            if !seen.contains(key) {
+                seen.push(key.clone());
+            }
+        }
+    }
+
+    /// Every decline seen so far.
+    pub(crate) fn snapshot(&self) -> Vec<sdk::EffectKey> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// How the controller's filesystem scope check sees a terminal call.
@@ -79,8 +106,30 @@ pub(crate) enum TerminalScope {
     /// Exact out-of-scope targets the owner may authorize (a confined
     /// capability escalation).
     Escalate(crate::traits::ScopeEscalation),
-    /// The dispatcher refuses the call; nobody is asked.
-    Refused,
+    /// The dispatcher refuses the call (for this reason); nobody is asked.
+    Refused(String),
+}
+
+impl TerminalScope {
+    /// The scope check the dispatcher applies for a call judged this way:
+    /// exactly the judged one, never a recomputation (the turn's known
+    /// project directory may have moved since the judgment).
+    pub(in crate::agent) fn as_scope_check(
+        &self,
+    ) -> Option<crate::agent::tool_execution::ScopeCheck> {
+        match self {
+            Self::InScope => None,
+            Self::Escalate(escalation) => {
+                Some(crate::agent::tool_execution::ScopeCheck::Escalatable {
+                    reason: "the out-of-scope targets the owner was asked about".to_string(),
+                    escalation: escalation.clone(),
+                })
+            }
+            Self::Refused(reason) => Some(crate::agent::tool_execution::ScopeCheck::Rejected(
+                reason.clone(),
+            )),
+        }
+    }
 }
 
 /// A call as the dispatcher executes it: the model's `_` keys and unset
@@ -127,9 +176,37 @@ pub(crate) struct JudgedTerminal {
 
 type Canonicalize = dyn Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync;
 
-/// The canonical form of each terminal call the kernel judged, by call
-/// id: the dispatcher executes exactly these arguments.
-pub(crate) type JudgedCalls = Arc<Mutex<HashMap<String, JudgedTerminal>>>;
+/// The canonical form of each terminal call the kernel judged, keyed by
+/// run and call id (call ids are only unique within a run, and concurrent
+/// runs share no entries): the dispatcher executes exactly these arguments.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JudgedCalls(Arc<Mutex<HashMap<(sdk::RunId, String), JudgedTerminal>>>);
+
+impl JudgedCalls {
+    /// The judged form of `call_id` in `run`, if the kernel judged it.
+    pub(crate) fn get(&self, run: sdk::RunId, call_id: &str) -> Option<JudgedTerminal> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(run, call_id.to_string()))
+            .cloned()
+    }
+
+    /// Remove and return the judged form of `call_id` in `run`.
+    pub(crate) fn take(&self, run: sdk::RunId, call_id: &str) -> Option<JudgedTerminal> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
+
+    fn insert(&self, run: sdk::RunId, call_id: &str, judged: JudgedTerminal) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), judged);
+    }
+}
 
 /// The terminal whose approval ladder the kernel's rules run, how a call is
 /// canonicalized and scope-checked for this turn, and the calls judged so
@@ -199,20 +276,13 @@ impl TerminalApprovals {
         }
     }
 
-    /// The judged form of the call `call_id`, if the kernel judged it.
-    pub(crate) fn judged(&self, call_id: &str) -> Option<JudgedTerminal> {
-        self.judged
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(call_id)
-            .cloned()
+    /// The judged form of the call `call_id` in `run`, if the kernel judged it.
+    pub(crate) fn judged(&self, run: sdk::RunId, call_id: &str) -> Option<JudgedTerminal> {
+        self.judged.get(run, call_id)
     }
 
-    fn remember(&self, call_id: &str, call: JudgedTerminal) {
-        self.judged
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(call_id.to_string(), call);
+    fn remember(&self, run: sdk::RunId, call_id: &str, call: JudgedTerminal) {
+        self.judged.insert(run, call_id, call);
     }
 
     fn permission_mode(&self) -> Option<PermissionMode> {
@@ -248,7 +318,7 @@ impl AppApprovalRules {
 
     /// Judge the call the dispatcher will execute (canonicalized), never
     /// the raw one. Nothing unreadable is allowed: it asks, Critical.
-    async fn judge_terminal(&self, call: &sdk::ToolCall) -> RuleDecision {
+    async fn judge_terminal(&self, run: sdk::RunId, call: &sdk::ToolCall) -> RuleDecision {
         let Some(approvals) = &self.terminal else {
             return RuleDecision::Defer;
         };
@@ -256,14 +326,14 @@ impl AppApprovalRules {
             return RuleDecision::Defer;
         };
         let judged = approvals.judge(&call.arguments);
-        approvals.remember(&call.id, judged.clone());
+        approvals.remember(run, &call.id, judged.clone());
         if let Some(reason) = crate::tools::TerminalTool::unreadable_reason(&judged.call.arguments)
         {
             return RuleDecision::Ask(terminal.unreadable_request(&call.arguments, &reason));
         }
         let escalation = match judged.scope {
             // The dispatcher refuses it before the tool runs.
-            TerminalScope::Refused => return RuleDecision::Allow,
+            TerminalScope::Refused(_) => return RuleDecision::Allow,
             TerminalScope::Escalate(escalation) => Some(escalation),
             TerminalScope::InScope => None,
         };
@@ -283,6 +353,7 @@ impl AppApprovalRules {
     /// the call as it was judged when the card was asked.
     pub(crate) async fn record_terminal_answer(
         &self,
+        run: sdk::RunId,
         call: &sdk::ToolCall,
         response: Option<ApprovalResponse>,
     ) {
@@ -293,7 +364,7 @@ impl AppApprovalRules {
             return;
         };
         let judged = approvals
-            .judged(&call.id)
+            .judged(run, &call.id)
             .unwrap_or_else(|| approvals.judge(&call.arguments));
         let escalation = match judged.scope {
             TerminalScope::Escalate(escalation) => Some(escalation),
@@ -310,10 +381,11 @@ impl AppApprovalRules {
 impl ApprovalRules for AppApprovalRules {
     async fn judge(
         &self,
-        _ctx: &sdk::HookContext<'_>,
+        ctx: &sdk::HookContext<'_>,
         call: &sdk::ToolCall,
         _info: &sdk::ToolInfo,
     ) -> RuleDecision {
+        self.run_declines.observe(ctx.declined);
         match call.name.as_str() {
             "http_request" => {
                 if self.trusted_session || self.mandate_preapproved {
@@ -335,7 +407,7 @@ impl ApprovalRules for AppApprovalRules {
                     None => RuleDecision::Defer,
                 }
             }
-            "terminal" => self.judge_terminal(call).await,
+            "terminal" => self.judge_terminal(ctx.run_id, call).await,
             _ => RuleDecision::Defer,
         }
     }
@@ -600,6 +672,7 @@ impl OwnerApprovalResolver<'_> {
 
     async fn resolve(
         &self,
+        run: sdk::RunId,
         interruption: &sdk::Interruption,
         request: &sdk::OwnerApprovalRequest,
     ) -> sdk::Resolution {
@@ -622,7 +695,7 @@ impl OwnerApprovalResolver<'_> {
                     // (session and persisted prefixes, capability grants),
                     // consulted at the ladder's own rungs.
                     self.rules
-                        .record_terminal_answer(&interruption.call, Some(response))
+                        .record_terminal_answer(run, &interruption.call, Some(response))
                         .await;
                 } else if matches!(
                     response,
@@ -638,7 +711,7 @@ impl OwnerApprovalResolver<'_> {
                 if tool == "terminal" {
                     let answer = (reason == DECLINED_BY_OWNER).then_some(ApprovalResponse::Deny);
                     self.rules
-                        .record_terminal_answer(&interruption.call, answer)
+                        .record_terminal_answer(run, &interruption.call, answer)
                         .await;
                 }
                 self.record("owner_approval_declined", tool, request, Some(&reason))
@@ -664,9 +737,11 @@ impl sdk::InterruptResolver for DaemonInterruptResolver<'_> {
         interruption: &sdk::Interruption,
     ) -> Option<sdk::Resolution> {
         match &interruption.kind {
-            sdk::InterruptKind::OwnerApproval(request) => {
-                Some(self.owner.resolve(interruption, request).await)
-            }
+            sdk::InterruptKind::OwnerApproval(request) => Some(
+                self.owner
+                    .resolve(state.run_id, interruption, request)
+                    .await,
+            ),
             _ => sdk::InterruptResolver::resolve(&self.untrusted, state, interruption).await,
         }
     }
@@ -1150,7 +1225,11 @@ mod tests {
         let rules = terminal_rules(&[]).await;
         let call = sdk::ToolCall::new("c1", "terminal", run("printf first"));
         rules
-            .record_terminal_answer(&call, Some(ApprovalResponse::AllowSession))
+            .record_terminal_answer(
+                sdk::RunId::new(),
+                &call,
+                Some(ApprovalResponse::AllowSession),
+            )
             .await;
         assert_eq!(
             judge_terminal(&rules, run("printf second")).await,
@@ -1167,7 +1246,7 @@ mod tests {
         // A decline grants nothing.
         let other = sdk::ToolCall::new("c2", "terminal", run("seq 1 2"));
         rules
-            .record_terminal_answer(&other, Some(ApprovalResponse::Deny))
+            .record_terminal_answer(sdk::RunId::new(), &other, Some(ApprovalResponse::Deny))
             .await;
         assert!(matches!(
             judge_terminal(&rules, run("seq 1 2")).await,
@@ -1185,7 +1264,7 @@ mod tests {
             terminal: terminal_rules(&["echo"])
                 .await
                 .terminal
-                .map(|t| with_scope(t, TerminalScope::Refused)),
+                .map(|t| with_scope(t, TerminalScope::Refused("protected host data".to_string()))),
             ..terminal_rules(&[]).await
         };
         assert_eq!(
@@ -1233,9 +1312,38 @@ mod tests {
         );
         let call = sdk::ToolCall::new("c1", "terminal", args.clone());
         rules
-            .record_terminal_answer(&call, Some(ApprovalResponse::AllowSession))
+            .record_terminal_answer(
+                sdk::RunId::new(),
+                &call,
+                Some(ApprovalResponse::AllowSession),
+            )
             .await;
         assert_eq!(judge_terminal(&rules, args).await, RuleDecision::Allow);
+    }
+
+    /// Every call the rules judge refreshes what they know of the run's
+    /// declines, so a child spawned later in the run starts with them.
+    #[tokio::test]
+    async fn rules_observe_the_runs_declines() {
+        let rules = AppApprovalRules::default();
+        let declined = [sdk::EffectKey::egress("https", "h.example.invalid", None)];
+        let ctx = sdk::HookContext {
+            declined: &declined,
+            ..hook_ctx()
+        };
+        let spawn = sdk::ToolCall::new(
+            "c1",
+            "spawn_agent",
+            json!({"mission": "m", "task": "Deliver the synthetic report."}),
+        );
+        assert_eq!(
+            rules.judge(&ctx, &spawn, &tool_info()).await,
+            RuleDecision::Defer
+        );
+        assert_eq!(rules.run_declines.snapshot(), declined.to_vec());
+        // A later view keeps every earlier decline.
+        rules.run_declines.observe(&[]);
+        assert_eq!(rules.run_declines.snapshot(), declined.to_vec());
     }
 
     #[test]

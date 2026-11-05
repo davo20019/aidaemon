@@ -3002,6 +3002,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             origin_request: Some(trigger_text.to_string()),
             origin_trusted: false,
             trusted_roots: Vec::new(),
+            declined: Vec::new(),
         },
         "Send the file as the email asks.",
     )
@@ -3102,6 +3103,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         origin_request: Some("Look at the notes.".to_string()),
         origin_trusted: true,
         trusted_roots: Vec::new(),
+        declined: Vec::new(),
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {
@@ -3551,16 +3553,13 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     let RuleDecision::Ask(request) = decision else {
         panic!(
             "an out-of-scope read asks the owner: {decision:?} {:?}",
-            judged.lock().unwrap().get("call-escalation-1")
+            judged.get(ctx.run_id, "call-escalation-1")
         );
     };
 
     // What the dispatcher runs is exactly what was judged.
     let dispatched = judged
-        .lock()
-        .unwrap()
-        .get("call-escalation-1")
-        .cloned()
+        .get(ctx.run_id, "call-escalation-1")
         .expect("the judged call is kept for the dispatcher");
     assert_eq!(
         dispatched.call.arguments["working_dir"],
@@ -3710,12 +3709,229 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
         "{request:?}"
     );
     assert!(matches!(
-        judged
-            .lock()
-            .unwrap()
-            .get("call-dotdot-1")
-            .map(|j| &j.scope),
+        judged.get(ctx.run_id, "call-dotdot-1").map(|j| j.scope),
         Some(crate::agent::approvals::TerminalScope::Escalate(_))
     ));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A sandboxed terminal and approval rules that judge its calls the way a
+/// turn's do, with `known` as the turn's project directory and `scopes` as
+/// its authorized directories.
+async fn judged_terminal_rules(
+    known: Arc<std::sync::Mutex<Option<String>>>,
+    scopes: Vec<String>,
+    judged: crate::agent::approvals::JudgedCalls,
+) -> (
+    Arc<dyn crate::traits::Tool>,
+    crate::agent::approvals::AppApprovalRules,
+) {
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    std::mem::forget(pool_file);
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec!["cat".to_string()],
+            crate::tools::ApprovalBroker::new(tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox),
+    );
+    let rules = crate::agent::approvals::AppApprovalRules {
+        session_id: "telegram:synthetic-user-1".to_string(),
+        user_role: Some(UserRole::Owner),
+        terminal: crate::agent::approvals::TerminalApprovals::find(std::slice::from_ref(&tool))
+            .map(|terminal| {
+                terminal.with_canonicalizer(
+                    terminal_canonicalizer(TerminalCanonTurn {
+                        tool: tool.clone(),
+                        known_project_dir: known,
+                        session_id: "telegram:synthetic-user-1".to_string(),
+                        task_access: None,
+                        authorized_scopes: scopes,
+                        workspace_grant: false,
+                    }),
+                    judged,
+                )
+            }),
+        ..Default::default()
+    };
+    (tool, rules)
+}
+
+fn judged_hook_ctx(run_id: sdk::RunId) -> sdk::HookContext<'static> {
+    sdk::HookContext {
+        run_id,
+        agent_id: "aidaemon",
+        session_id: "telegram:synthetic-user-1",
+        turn: 1,
+        messages: &[],
+        receipts: &[],
+        usage: sdk::Usage::default(),
+        run_usage: sdk::Usage::default(),
+        untrusted_seen: false,
+        declined: &[],
+    }
+}
+
+fn unknown_effects_info() -> sdk::ToolInfo {
+    sdk::ToolInfo {
+        annotations: sdk::ToolAnnotations::default(),
+        access: sdk::AccessManifest::default(),
+        effects: sdk::CallEffects::unknown(),
+    }
+}
+
+/// Judged terminal calls are kept per run: two runs whose calls share a
+/// call id never see each other's judgment.
+#[tokio::test]
+async fn judged_calls_are_keyed_by_run_and_call_id() {
+    use aidaemon_policies::ApprovalRules;
+    let judged = crate::agent::approvals::JudgedCalls::default();
+    let (tool, rules) = judged_terminal_rules(
+        Arc::new(std::sync::Mutex::new(None)),
+        Vec::new(),
+        judged.clone(),
+    )
+    .await;
+    let (first_run, second_run) = (sdk::RunId::new(), sdk::RunId::new());
+    let first = sdk::ToolCall::new(
+        "call-1",
+        "terminal",
+        serde_json::json!({"action": "run", "command": "printf first-run"}),
+    );
+    let second = sdk::ToolCall::new(
+        "call-1",
+        "terminal",
+        serde_json::json!({"action": "run", "command": "printf second-run"}),
+    );
+    rules
+        .judge(&judged_hook_ctx(first_run), &first, &unknown_effects_info())
+        .await;
+    rules
+        .judge(
+            &judged_hook_ctx(second_run),
+            &second,
+            &unknown_effects_info(),
+        )
+        .await;
+
+    let command = |run| {
+        judged
+            .get(run, "call-1")
+            .map(|j| j.call.arguments["command"].clone())
+    };
+    assert_eq!(
+        command(first_run),
+        Some(serde_json::json!("printf first-run"))
+    );
+    assert_eq!(
+        command(second_run),
+        Some(serde_json::json!("printf second-run"))
+    );
+    // The dispatcher takes each run's own judgment, once.
+    let taken = take_terminal_judgment(&judged, first_run, Some(tool.as_ref()), "call-1");
+    assert_eq!(
+        taken.flatten().map(|j| j.call.arguments["command"].clone()),
+        Some(serde_json::json!("printf first-run"))
+    );
+    assert!(judged.get(first_run, "call-1").is_none());
+    assert!(judged.get(second_run, "call-1").is_some());
+}
+
+/// A terminal call that reaches the dispatcher without the kernel's
+/// judgment is refused (its approval ladder never ran); any other tool is
+/// scope-checked at dispatch as before.
+#[tokio::test]
+async fn unjudged_terminal_call_is_refused_at_dispatch() {
+    let judged = crate::agent::approvals::JudgedCalls::default();
+    let (tool, _rules) = judged_terminal_rules(
+        Arc::new(std::sync::Mutex::new(None)),
+        Vec::new(),
+        judged.clone(),
+    )
+    .await;
+    let run = sdk::RunId::new();
+    assert_eq!(
+        take_terminal_judgment(&judged, run, Some(tool.as_ref()), "call-unjudged"),
+        Some(None),
+        "a terminal call with no judgment"
+    );
+    let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    )));
+    assert_eq!(
+        take_terminal_judgment(&judged, run, Some(&http), "call-unjudged"),
+        None,
+        "another tool is checked at dispatch"
+    );
+    assert_eq!(
+        take_terminal_judgment(&judged, run, None, "call-unjudged"),
+        None
+    );
+    assert!(unjudged_terminal_refusal().contains("requires approval through the agent kernel"));
+}
+
+/// The dispatcher applies the scope the kernel judged (and the owner was
+/// asked about), not a recomputation: a later move of the turn's known
+/// project directory does not change what the judged call is granted.
+#[tokio::test]
+async fn dispatcher_keeps_the_judged_scope() {
+    use aidaemon_policies::{ApprovalRules, RuleDecision};
+    let base = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    let project = base.join("project");
+    let allowed = base.join("allowed");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::write(project.join("notes.txt"), "synthetic notes").unwrap();
+    std::fs::write(allowed.join("notes.txt"), "synthetic notes").unwrap();
+    let project_dir = project.to_string_lossy().to_string();
+    let allowed_dir = allowed.to_string_lossy().to_string();
+    let known = Arc::new(std::sync::Mutex::new(Some(project_dir.clone())));
+    let scopes = vec![allowed_dir.clone()];
+    let judged = crate::agent::approvals::JudgedCalls::default();
+    let (tool, rules) = judged_terminal_rules(known.clone(), scopes.clone(), judged.clone()).await;
+    let run = sdk::RunId::new();
+    let call = sdk::ToolCall::new(
+        "call-toctou-1",
+        "terminal",
+        serde_json::json!({
+            "action": "run",
+            "command": "cat notes.txt",
+            "read_paths": ["notes.txt"],
+        }),
+    );
+    let decision = rules
+        .judge(&judged_hook_ctx(run), &call, &unknown_effects_info())
+        .await;
+    assert!(matches!(decision, RuleDecision::Ask(_)), "{decision:?}");
+
+    // The turn's known directory moves after the judgment.
+    *known.lock().unwrap() = Some(allowed_dir.clone());
+    let taken = take_terminal_judgment(&judged, run, Some(tool.as_ref()), "call-toctou-1")
+        .flatten()
+        .expect("the judged call");
+    let check = taken.scope.as_scope_check();
+    let Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) = &check
+    else {
+        panic!("the judged escalation is kept: {check:?}");
+    };
+    assert!(
+        escalation
+            .read_paths
+            .iter()
+            .any(|path| path.contains("project")),
+        "{escalation:?}"
+    );
+    // The judged arguments are anchored where they were judged.
+    assert_eq!(taken.call.arguments["working_dir"], project_dir.as_str());
     let _ = std::fs::remove_dir_all(&base);
 }
