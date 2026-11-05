@@ -417,13 +417,10 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
             Some("attempt-real"),
             "{tool}"
         );
-        if tool == "manage_goal_tasks" {
-            assert_eq!(facts.mandate_id.as_deref(), Some("mandate-real"));
-            assert_eq!(facts.mandate_version, Some(7));
-        } else {
-            assert_eq!(facts.mandate_id, None);
-            assert_eq!(facts.mandate_version, None);
-        }
+        // `manage_mandates` matches a committed decision to the fence's
+        // mandate before finishing the review on it.
+        assert_eq!(facts.mandate_id.as_deref(), Some("mandate-real"), "{tool}");
+        assert_eq!(facts.mandate_version, Some(7), "{tool}");
     }
 }
 
