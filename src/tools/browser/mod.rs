@@ -436,7 +436,8 @@ pub struct BrowserTool {
     media_tx: mpsc::Sender<MediaMessage>,
     /// Shared inbox for persisting screenshots for agent vision context.
     inbox_dir: PathBuf,
-    /// Per-session page state, keyed by trusted internal `_session_id`.
+    /// Per-session page state, keyed by the call's typed
+    /// `ToolCallContext::session_id`.
     sessions: BrowserSessionRegistry,
     /// Transport used to prompt the user Allow/Deny at action time.
     ///

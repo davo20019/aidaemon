@@ -107,6 +107,48 @@ Rules every channel follows:
   memory system, implement `aidaemon_policies::Recall` and use it with
   `MemoryInjection`.
 
+## The tool contract
+
+A tool is described in two layers.
+
+- **The kernel `Tool`** (`aidaemon-core`) is what every agent runs: `spec`,
+  `call`, `annotations`, `access`, `effects`, `source_trust` and
+  `timeout`. Its `ToolContext` carries `Extensions`, typed application
+  values keyed by type that the application sets once with
+  `AgentBuilder::tool_extensions`.
+- **`aidaemon_tools::ToolSemantics`** is the richer description the
+  daemon's dispatcher reads before it runs a call: capabilities, typed call
+  semantics, access manifests, receipt kinds, durable replay, output trust,
+  `dispatch_facts` (how the dispatcher treats the tool: always offered,
+  same-tool allowance, file delivery, child spawning and so on, never keyed
+  on its name) and `owner_approval_request`. Every method has a
+  conservative default. The daemon's own tool trait adds only execution on
+  top (`Tool: ToolSemantics`); a bridged tool reaches the kernel as a
+  kernel `Tool`.
+
+Facts about a call (who is calling, the session, the channel's
+visibility, the task, the mandate fence, approval scope) reach a daemon
+tool as a typed `ToolCallContext`, filled by the dispatcher. A tool never
+reads them from its arguments: the dispatcher strips any `_`-prefixed key
+a model sends, and the context is never serialized.
+
+`owner_approval_request(call, facts)` is how a tool states the owner
+approval a call needs: `Ask(request)`, `NotNeeded`, or `Unjudged` (the
+policy's mode decides). The daemon's approval rules hold only the turn's
+facts and ask the tool; they never match a tool by name or type.
+
+A tool ends a run with a typed finish: `ToolOutput::finish(Finish)`,
+with a `FinishOutcome` of `Succeeded`, `Partial` or `Blocked` and an
+optional final reply. The run ends `RunStatus::Finished`; a `Succeeded`
+finish in a run where the owner declined something is reported as
+`Partial`. Nothing in a tool's output text ends a run.
+
+Tools get their dependencies through constructors: store traits from
+`aidaemon_tools::services` (facts, episodes, people, settings, OAuth) and
+an `ExecutionBackend`, the workspace a tool's commands and files live in
+(local, Docker, SSH). A `Sandbox` is narrower: the runner that confines
+one command inside that workspace.
+
 ## Effects, safeguards and owner approvals
 
 A tool's `effects(arguments)` returns `CallEffects`: the `EffectKey`s the

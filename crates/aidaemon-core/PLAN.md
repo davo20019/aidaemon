@@ -222,15 +222,19 @@ Order:
         pay, or a rejected key, and fails later calls without sending them.
         A chain moves past the account's other models at once; backends
         classify plan caps, daily quotas and out-of-credit errors.
-- [ ] 8.2 Tool contract. Decide where each fact of the daemon's tool
-      trait (27 methods: call semantics, receipt kinds, durable replay,
-      owner control plane, output trust, ...) lives: the kernel `Tool`, an
-      SDK extension trait in `aidaemon-tools`, or SDK hooks. Tools get a
-      typed context with handles to config and state services, instead of
-      reading daemon config (22 tool files) and state (21) directly. Add a
-      typed way for a tool result to end a run (`ToolOutput::finish`),
-      replacing the `TERMINAL_REPLY_STOP` / `end_with` workaround, so the
-      memory writer no longer skips those runs.
+- [x] 8.2 Tool contract. The kernel `Tool` gained typed `Extensions`
+      and `ToolOutput::finish` (`RunStatus::Finished`, downgraded to
+      `Partial` after a decline). `aidaemon_tools::ToolSemantics` holds
+      what describes a call (including `dispatch_facts` and
+      `owner_approval_request`), `ToolCallContext` carries the
+      dispatcher's typed per-call facts (no `_` argument injection), the
+      store traits live in `aidaemon_tools::services`, and tools receive
+      their `ExecutionBackend` through constructors. The daemon `Tool` is
+      `Tool: ToolSemantics` plus execution. Run-ending goes only through
+      a tool's typed finish; MCP tools are bridged through the kernel,
+      execute the instance judged at turn start, and their annotation
+      hints never loosen a safeguard. The approval rules and the
+      dispatcher no longer match tools by name or downcast.
 - [ ] 8.3 The dispatcher bridge becomes SDK hooks. Today every call goes
       back over a channel to `src/agent/runtime/sdk_engine/tool_calls.rs`,
       which does about ten steps per call: idempotency and replay, ledger
@@ -240,6 +244,21 @@ Order:
       kernel `Rewrite` hook that runs before call effects are computed
       (today a terminal call's relative paths are declared incomplete
       because the directory is injected after the kernel judged it).
+      The daemon `Tool` trait and `BridgedTool` are deleted here. Parked
+      from 8.2:
+      - the global `active_execution_backend()` readers outside
+        `src/tools` (runtime, slack, checkpoints, workspaces, and
+        `tool_exec`'s guest-scoped file tools);
+      - `cli_agent` and `send_file` detecting a background handoff from
+        their output text;
+      - `stop.rs` closeout lookups that see daemon tools only;
+      - a background handoff that bypasses a typed `FailedPermanent`;
+      - name checks left in `tool_exec.rs` (checkpoints for
+        `write_file`/`edit_file`, `cli_agent`'s watchdog bypass) and the
+        `manage_memories`/`manage_people` status summary in
+        `tool_calls.rs`;
+      - the goals/mandates store slice and the concrete `EventStore`
+        (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`.
 - [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining

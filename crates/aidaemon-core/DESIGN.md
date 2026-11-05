@@ -211,6 +211,32 @@ in it may run twice (see "Idempotent replay" below).
   `http://127.0.0.1:8765` passes. Register it before `UntrustedHook` and
   `ApprovalPolicy`, so the owner is never asked about a call it refuses.
 
+## The tool contract
+
+- **Kernel `Tool`.** `spec`, `call`, `annotations`, `access`, `effects`,
+  `source_trust`, `timeout`. `ToolContext::extensions` carries
+  `Extensions`: application values keyed by type, set once with
+  `AgentBuilder::tool_extensions`, read with a typed getter. They hold
+  what the kernel cannot type itself (the daemon's configuration).
+- **Typed finish.** `ToolOutput::finish(Finish { outcome, reply })` ends
+  the run after the batch with `RunStatus::Finished { outcome, tool }`.
+  `FinishOutcome` is `Succeeded`, `Partial` or `Blocked`. A `Succeeded`
+  finish in a run with declined effects is reported as `Partial`. This
+  is the only way a tool ends a run; output text never does.
+- **`aidaemon_tools::ToolSemantics`.** The SDK extension trait for what
+  describes a call without running it: capabilities, call semantics,
+  access manifests, receipt kinds, durable replay, output trust, typed
+  `dispatch_facts`, and `owner_approval_request`, which returns `Ask`,
+  `NotNeeded` or `Unjudged` from the call and its `ToolCallContext`. The
+  daemon's tool trait is `Tool: ToolSemantics` plus execution.
+- **`ToolCallContext`.** The dispatcher's typed facts about one call
+  (role, session, channel visibility, task, mandate fence, approval
+  scope, trust roots). Never serialized; tools never read `_` arguments.
+- **Services and workspaces.** Tools receive store traits
+  (`aidaemon_tools::services`) and an `ExecutionBackend` (the workspace:
+  local, Docker, SSH) through their constructors. `Sandbox` is the
+  per-command runner that confines a command within it.
+
 ## Images
 
 `Image` (base64 bytes or a URL) rides on `Message::images` for user

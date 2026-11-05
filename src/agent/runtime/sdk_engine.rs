@@ -358,7 +358,8 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// The turn's explicit workspace binding (`TurnContext::explicit_workspace`),
     /// a trusted root. An inferred binding is never passed here.
     pub(in crate::agent) explicit_workspace: Option<String>,
-    /// The single-project scope lock, passed to tools as `_project_scope`.
+    /// The single-project scope lock, passed to tools as
+    /// `ToolCallContext::project_scope`.
     pub(in crate::agent) project_scope: Option<String>,
     /// What this turn may do, resolved from explicit facts: the kernel's
     /// `AuthorityHook` enforces its level and tool set, and the
