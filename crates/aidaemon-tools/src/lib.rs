@@ -46,6 +46,7 @@ mod checklist;
 mod exec;
 mod fs;
 mod search;
+pub mod semantics;
 mod shell;
 mod util;
 mod web;

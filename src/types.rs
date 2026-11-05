@@ -342,33 +342,7 @@ impl ChannelContext {
     }
 }
 
-/// Role assigned to a user based on config (owner_ids).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserRole {
-    /// Full access — listed in `users.owner_ids`.
-    Owner,
-    /// Allowed by channel allowlist but not an owner.
-    Guest,
-    /// Non-whitelisted user — conversational access only, no tools.
-    Public,
-}
-
-impl std::fmt::Display for UserRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UserRole::Owner => write!(f, "owner"),
-            UserRole::Guest => write!(f, "guest"),
-            UserRole::Public => write!(f, "public"),
-        }
-    }
-}
-
-impl UserRole {
-    /// Only explicit owner traffic is allowed to update durable owner memory.
-    pub fn can_persist_owner_memory(self) -> bool {
-        matches!(self, Self::Owner)
-    }
-}
+pub use aidaemon_tools::semantics::UserRole;
 
 /// Distinguishes different kinds of approval requests so channels can render
 /// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel

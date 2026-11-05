@@ -76,6 +76,7 @@ dependencies = [
  "aidaemon-node-protocol",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-tools",
  "anyhow",
  "assert_cmd",
  "async-imap",
@@ -368,6 +369,7 @@ name = "aidaemon-tools"
 version = "0.0.1"
 dependencies = [
  "aidaemon-core",
+ "anyhow",
  "async-trait",
  "globset",
  "htmd",
@@ -377,6 +379,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "shellexpand",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

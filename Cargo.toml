@@ -107,6 +107,8 @@ portable-pty = { version = "0.8", optional = true }
 # The agent kernel (workspace crate).
 aidaemon-core = { path = "crates/aidaemon-core" }
 aidaemon-policies = { path = "crates/aidaemon-policies" }
+# Tool semantics (call descriptions, receipts metadata) live in the SDK.
+aidaemon-tools = { path = "crates/aidaemon-tools" }
 aidaemon-providers = { path = "crates/aidaemon-providers" }
 # Optional SDK memory backend (`[memory] backend = "sdk"`).
 aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
