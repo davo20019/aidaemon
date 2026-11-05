@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use aidaemon_core::{
     ApprovalRisk, EffectClass, Hook, HookContext, InterruptKind, OwnerApprovalRequest, Safeguard,
-    ToolCall, ToolDecision, ToolInfo,
+    ToolCall, ToolDecision, ToolInfo, OWNER_DECLINED,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -251,9 +251,18 @@ impl ApprovalPolicy {
         }
     }
 
-    /// An ask, unless a grant covers it.
-    async fn ask(&self, request: OwnerApprovalRequest, info: &ToolInfo) -> ToolDecision {
+    /// An ask, unless the owner already declined this exact request or a
+    /// grant covers it.
+    async fn ask(
+        &self,
+        ctx: &HookContext<'_>,
+        request: OwnerApprovalRequest,
+        info: &ToolInfo,
+    ) -> ToolDecision {
         let request = with_effects(request, info);
+        if let Some(refusal) = declined_subject(ctx, &request) {
+            return refusal;
+        }
         if let Some(grants) = &self.grants {
             if grants.covers(&request).await {
                 return ToolDecision::Allow;
@@ -303,6 +312,23 @@ fn interrupt(request: OwnerApprovalRequest, info: &ToolInfo) -> ToolDecision {
     }
 }
 
+/// The refusal for a request whose subject the owner declined in this run
+/// (recorded by the kernel as an [`EffectClass::Call`] key when the declined
+/// request declared no effects), so the identical request gets no new card.
+fn declined_subject(ctx: &HookContext<'_>, request: &OwnerApprovalRequest) -> Option<ToolDecision> {
+    let declined = ctx
+        .declined
+        .iter()
+        .find(|key| key.class == EffectClass::Call && key.target == request.subject)?;
+    Some(ToolDecision::Deny {
+        reason: format!(
+            "{OWNER_DECLINED} The owner declined {} {} earlier in this run. Do not attempt it \
+             another way; tell the owner it was not done.",
+            declined.class, declined.target
+        ),
+    })
+}
+
 /// After a decline in this run, an egress or destructive call whose effects
 /// are not fully declared might be the declined action by another route.
 fn needs_reask(ctx: &HookContext<'_>, info: &ToolInfo) -> bool {
@@ -344,7 +370,7 @@ impl Hook for ApprovalPolicy {
         };
         let decision = match step {
             Step::Decided(decision) => decision,
-            Step::Ask(request) => self.ask(request, info).await,
+            Step::Ask(request) => self.ask(ctx, request, info).await,
         };
         if decision == ToolDecision::Allow && needs_reask(ctx, info) {
             // Never silently allow an undeterminable call after a decline;
@@ -352,7 +378,11 @@ impl Hook for ApprovalPolicy {
             let why = "the owner declined an action earlier in this run, and what this call \
                        does cannot be fully determined"
                 .to_string();
-            return interrupt(call_request(&call.name, &call.arguments, info, why), info);
+            let request = with_effects(call_request(&call.name, &call.arguments, info, why), info);
+            if let Some(refusal) = declined_subject(ctx, &request) {
+                return refusal;
+            }
+            return interrupt(request, info);
         }
         decision
     }
@@ -836,8 +866,7 @@ mod rules_tests {
     }
 
     #[test]
-    fn effect_class_names_reach_the_owner() {
-        // Mode asks summarize the call for the owner.
+    fn mode_ask_summary_names_the_tool() {
         let policy = ApprovalPolicy::new(ApprovalMode::Always);
         let info = send_info(complete(vec![EffectKey::named(
             EffectClass::Process,
@@ -845,5 +874,97 @@ mod rules_tests {
         )]));
         let decision = policy.decide("shell", &info);
         assert!(owner_request(&decision).summary.contains("shell"));
+    }
+
+    /// An opaque destructive tool (no declared effects), asked about by the
+    /// mode.
+    fn opaque_agent(replies: Vec<aidaemon_core::ModelResponse>) -> (Agent, Arc<AtomicUsize>) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let agent = Agent::builder("a")
+            .allow_unguarded()
+            .model("m")
+            .provider(ScriptedProvider::new(replies))
+            .tool(
+                FnTool::new(
+                    spec("terminal", "runs a command", &[]),
+                    ToolAnnotations::DESTRUCTIVE,
+                    move |_: Value| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(ToolOutput::text("ran")))
+                    },
+                )
+                .with_trust(SourceTrust::Trusted),
+            )
+            .hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))
+            .build()
+            .unwrap();
+        (agent, ran)
+    }
+
+    /// Denies every interruption and counts the cards.
+    #[derive(Default)]
+    struct CountingDeny(AtomicUsize);
+
+    #[async_trait]
+    impl aidaemon_core::InterruptResolver for CountingDeny {
+        async fn resolve(
+            &self,
+            _: &aidaemon_core::RunState,
+            _: &aidaemon_core::Interruption,
+        ) -> Option<Resolution> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Resolution::Deny {
+                reason: "Jordan Lee said no".to_string(),
+            })
+        }
+    }
+
+    fn run_script(script: &str) -> Value {
+        json!({"command": format!("python3 /tmp/aidaemon-test/{script}")})
+    }
+
+    async fn run_denying(agent: &Agent) -> (aidaemon_core::RunOutcome, usize) {
+        let resolver = CountingDeny::default();
+        let out = agent
+            .run_resolving(
+                aidaemon_core::RunState::new("a", "s", "go"),
+                aidaemon_core::CancellationToken::new(),
+                &resolver,
+            )
+            .await
+            .unwrap();
+        (out, resolver.0.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn declined_request_without_effects_blocks_identical_retry() {
+        let (agent, ran) = opaque_agent(vec![
+            tool_calls([call("c1", "terminal", run_script("run.py"))]),
+            tool_calls([call("c2", "terminal", run_script("run.py"))]),
+            text("done"),
+        ]);
+        let (out, cards) = run_denying(&agent).await;
+        assert!(out.is_completed(), "{:?}", out.status);
+        assert_eq!(cards, 1, "no second card");
+        let retry = out.receipts()[1].reason.clone().unwrap();
+        assert!(
+            retry.starts_with("[OWNER DECLINED] The owner declined call "),
+            "{retry}"
+        );
+        assert!(retry.contains("tell the owner it was not done"), "{retry}");
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn declined_request_without_effects_still_asks_other_subject() {
+        let (agent, ran) = opaque_agent(vec![
+            tool_calls([call("c1", "terminal", run_script("run.py"))]),
+            tool_calls([call("c2", "terminal", run_script("other.py"))]),
+            text("done"),
+        ]);
+        let (_, cards) = run_denying(&agent).await;
+        assert_eq!(cards, 2);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 }
