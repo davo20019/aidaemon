@@ -174,9 +174,10 @@ impl Tool for ManagePeopleTool {
         match action.as_deref() {
             Some(
                 "status" | "add" | "list" | "view" | "brief" | "upcoming" | "reconnect" | "update"
-                | "remove" | "add_fact" | "remove_fact" | "link" | "export" | "purge" | "audit"
-                | "confirm",
+                | "remove" | "add_fact" | "remove_fact" | "export" | "purge" | "audit" | "confirm",
             ) => aidaemon_core::CallEffects::none(),
+            // `link` binds a sender to a person, so that person's facts reach
+            // the sender's later turns: it widens who sees the owner's notes.
             _ => aidaemon_core::CallEffects::unknown(),
         }
     }
@@ -879,8 +880,8 @@ mod tests {
         );
     }
 
-    /// The people store is the agent's own; only the enable/disable setting
-    /// stays undeclared.
+    /// The people store is the agent's own; the enable/disable setting and
+    /// `link` (which widens who sees a person's facts) stay undeclared.
     #[tokio::test]
     async fn people_store_actions_declare_no_effects() {
         let tool = setup_tool().await;
@@ -894,7 +895,7 @@ mod tests {
                 "{action}"
             );
         }
-        for action in ["enable", "disable", "unknown"] {
+        for action in ["enable", "disable", "link", "unknown"] {
             assert!(!effects(action).complete, "{action}");
         }
     }

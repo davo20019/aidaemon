@@ -91,8 +91,9 @@ Rules every channel follows:
   the `Retry` wrapper, not in your provider.
 - **Tool**: `spec` (JSON schema with `additionalProperties: false`) and
   `call`. Declare honest `annotations` (read-only tools run in parallel;
-  unannotated tools are treated as destructive; set `egress` on anything
-  that sends data off the machine, reads included), an `access` manifest
+  unannotated tools are treated as destructive; set `egress` on a call
+  that sends owner data off the machine, and declare the host it contacts
+  as an `Egress` effect, which is how a network read is covered), an `access` manifest
   so scope policies and sandboxes can reason about the call, and
   `effects` (see below). Never prompt the owner or refuse on policy
   inside `call`; that is a hook's job. Return failures as
@@ -127,7 +128,11 @@ egress, and unknown otherwise.
   into an `InterruptKind::OwnerApproval` interruption carrying the call's
   effects, unless your `ApprovalGrants` (or `SessionGrants`) cover it.
   After a decline in the run, a call with incomplete effects is asked
-  again even where a rule or grant would allow it.
+  again even where a rule or grant would allow it: an egress or
+  destructive call after any decline, and any call that is not
+  read-only after a declined delete, write, configuration or call. A
+  tool whose only effect is the agent's own state declares
+  `CallEffects::none()` and is never asked again.
 - `EgressGuard` (`Egress`) refuses a call annotated `egress` or declaring
   an `Egress` effect whose arguments carry a secret, with
   `[EGRESS BLOCKED]` (`aidaemon_core::EGRESS_BLOCKED`).

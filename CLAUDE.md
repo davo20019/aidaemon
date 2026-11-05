@@ -342,6 +342,12 @@ across tools. Do not add a new in-tool prompt or policy refusal.
 Not yet everywhere: `cli_agent`, `browser`, `computer_use` and the `manage_*`
 tools still prompt inside `call()` until Phase 3c moves them onto the kernel.
 
+A call whose only effect is the agent's own internal state (its memory,
+people store, checklist or goal bookkeeping) declares `CallEffects::none()`,
+so a decline never makes it ask. Anything that sends, schedules, spawns work,
+changes config or credentials, or widens who can see data keeps declaring its
+effects (or `unknown()`).
+
 - Tools declare a call's effects (`EffectKey`: egress `host:port`, absolute
   paths for delete/write/configuration, named credential/process). The
   kernel refuses any call overlapping `RunState::declined` with
