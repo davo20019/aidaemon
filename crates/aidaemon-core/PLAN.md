@@ -185,9 +185,10 @@ in `aidaemon-policies`, extending what is there (`ApprovalPolicy`,
 only facts specific to it (its tools' effects, the owner's rules, the
 channel that asks the owner) and deletes the logic it duplicates.
 
-Where duplication comes from: the daemon uses `aidaemon-core`, and uses
-`aidaemon-policies` and `aidaemon-memory` only a little. It does not use
-`aidaemon-tools`, the channel crates, `aidaemon-providers`, `aidaemon-mcp`,
+Where duplication comes from: the daemon uses `aidaemon-core` and
+`aidaemon-providers` (every model call, since 8.8's providers step), and
+uses `aidaemon-policies` and `aidaemon-memory` only in part. It does not use
+`aidaemon-tools`, the channel crates, `aidaemon-mcp`,
 `aidaemon-store-sqlite` or `aidaemon-agents`, because it has larger copies
 of each in `src/`.
 
@@ -201,19 +202,20 @@ Order:
       `Redactor`'s patterns. Plan:
       `docs/superpowers/plans/2026-11-04-authority-phase-3a-effects-and-approvals.md`
       (local; `docs/` is gitignored).
-- [x] 8.1b Provider failover in the kernel (done by a parallel session:
-      `c8dc38c`, `c13ab02`, daemon recovery on `Failover` in `c65cbc6`). Today the daemon's
-      `sdk_engine/model_call.rs` runs the router and its fallbacks, and the
-      whole call sits under one 90 s cap (`FOREGROUND_MAX_MODEL_CALL`), so
-      a fallback inherits whatever time the failing provider left and can
-      be cut off. Add a kernel `Failover` provider next to `Retry`:
-      - each attempt gets its own deadline;
-      - each switch is a typed event the run can see and tests can assert;
-      - a test where the primary hangs and the fallback answers within its
-        own budget.
-
-      The daemon's router keeps choosing which models form the chain (app
-      policy).
+- [x] 8.1b Provider failover in the kernel (done by a parallel session).
+      - `c8dc38c`: a kernel `Failover` provider next to `Retry`. Each
+        attempt gets its own deadline (time to the first stream event), a
+        `FailoverPolicy` decides retry, next step or stop, and each switch
+        is a `StreamEvent::Switched` reported as `Event::ProviderSwitched`.
+      - `c13ab02`: a policy can rewrite the request for a retry
+        (`RetryWith`) and skip an attempt without sending it
+        (`before_attempt`).
+      - `c65cbc6`: the daemon's model-call recovery runs as a `Failover`
+        policy (`DaemonRecovery`). The chain is the requested model, the
+        router's other models, then the failover providers' models (app
+        policy). The first attempt's deadline sits under the call's idle
+        watchdog, so a hung primary hands over to the fallbacks instead of
+        the watchdog cancelling the call.
 - [ ] 8.2 Tool contract. Decide where each fact of the daemon's tool
       trait (27 methods: call semantics, receipt kinds, durable replay,
       owner control plane, output trust, ...) lives: the kernel `Tool`, an
@@ -237,7 +239,11 @@ Order:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
-      `AgentBuilder`.
+      `AgentBuilder`. Includes child→parent decline propagation (a child's
+      Deny does not reach its parent today) and kernel-level decline
+      inheritance (the kernel passes a run's declines to its children
+      directly, including children already running when the parent
+      declines; today the daemon seeds them only at spawn).
 - [ ] 8.7 Authority Phase 4 (end check, typed final outcome, budgets) and
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
@@ -257,10 +263,12 @@ Order:
 
 Independent of the SDK; each is a small PR against `master`.
 
-- [ ] `src/tools/cli_agent.rs:662-711` launches external agents with their
+- [x] `src/tools/cli_agent.rs` launched external agents with their
       safety off (`--dangerously-skip-permissions`,
-      `--dangerously-bypass-approvals-and-sandbox`, `--yolo`). Default to
-      sandboxed / permission modes, make full bypass opt-in.
+      `--dangerously-bypass-approvals-and-sandbox`, `--yolo`). Phase 3a
+      Task 0 (`772a293`, `4b9b2ed`): every launch path strips the bypass
+      flags (`strip_permission_bypass_flags`). The defaults still list
+      them; an allowlist argument policy is 3c.
 - [ ] No default sandbox on Linux (Docker backend is behind an empty,
       off-by-default `execution-docker` feature).
 - [ ] `PlanRecovery::recover_interrupted_plans` (`src/plans/recovery.rs:39`)

@@ -1,10 +1,12 @@
 # aidaemon-core: design sketch
 
 Status: **experimental**, not published. The kernel is the daemon's only
-agent loop (`PLAN.md`, Phase 7). Most other SDK crates (tools, channels,
-providers, MCP, store, agents) are not yet used by the daemon, which still
-has its own larger copies; making the daemon a thin composition of the SDK
-crates is `PLAN.md`, Phase 8.
+agent loop (`PLAN.md`, Phase 7). The daemon also runs every model call on
+`aidaemon-providers` and its owner approvals and outbound secret scan on
+`aidaemon-policies`. Most other SDK crates (tools, channels, MCP, store,
+agents) are not yet used by the daemon, which still has its own larger
+copies; making the daemon a thin composition of the SDK crates is
+`PLAN.md`, Phase 8.
 
 The reasoning behind each choice comes from the Harness Field Guide, a survey
 of 14 harness concepts across Claude Code, Codex, OpenHands, SWE-agent, Aider,
@@ -36,7 +38,7 @@ hooks or the tool batch.
 |---|---|---|
 | `Agent` / `AgentBuilder` | `agent.rs` | Configuration as data with a stable id. No per-run state, cheap to clone. |
 | `Provider` | `provider.rs` | `complete(&ModelRequest) -> ModelResponse`. Retries are a wrapper (`Retry`), not loop logic. |
-| `Tool` | `tool.rs` | `spec` + `call` required. `annotations` default to destructive; `validate` defaults to a `required`-keys check. |
+| `Tool` | `tool.rs` | `spec` + `call` required. `annotations` default to destructive; `validate` defaults to a `required`-keys check; `effects` declares what a call does (`CallEffects`). |
 | `ToolContext` | `tool.rs` | Trusted run/session/call ids and a cancel token, passed *beside* the model's arguments. |
 | `Hook` | `hook.rs` | `before_model`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`. All default to no-ops. |
 | `Receipt` | `receipt.rs` | One per tool call, refusals included: status, stage, duration, reason, structured details. |
@@ -161,6 +163,54 @@ in it may run twice (see "Idempotent replay" below).
   exact call it was shown or denying it with a reason. `MarkOnly` runs the
   call and leaves `after_untrusted` on its receipt.
 
+## Effects, declines and owner approvals
+
+- **Typed call effects.** `Tool::effects(arguments)` returns `CallEffects`:
+  a list of `EffectKey`s (class plus normalized target) and whether the
+  list is `complete`. Classes are `Egress` (`host:port`), `Delete`, `Write`
+  and `Configuration` (absolute, lexically normalized paths), `Credential`
+  and `Process` (names), and `Call` (the kernel's key for a declined
+  request that declared no effects). Build keys with `EffectKey::path`,
+  `EffectKey::egress` and `EffectKey::named`; path keys overlap when one
+  is the other or below it. The default is `CallEffects::none()` for a
+  read-only call that is not egress and `CallEffects::unknown()`
+  otherwise, so a tool annotated `egress` should declare its egress
+  target. Hooks see the effects in `ToolInfo::effects`; they are
+  recomputed after a rewrite.
+- **Required safeguards.** `AgentBuilder::build` refuses an agent with
+  tools unless every `Safeguard::REQUIRED` is covered by a hook's
+  `safeguards()` or by `AgentBuilder::attest`: `Authority`, `Scope`,
+  `UntrustedOutput`, `Approval` (calls needing the owner's approval are
+  put to them as an `InterruptKind::OwnerApproval` interruption) and
+  `Egress` (outbound calls never carry secrets).
+- **The decline invariant.** When an owner-approval interruption is
+  resolved `Deny` (whatever the resolver: a tap, a timeout, a send
+  failure), the kernel adds the request's effects to
+  `RunState::declined`, or its subject as a `Call` key when it declared
+  none (a blank subject binds nothing). From then on `decide()` refuses any call whose effects overlap a
+  declined key, with `[OWNER DECLINED]` (`OWNER_DECLINED`), before any
+  hook runs and again after every rewrite, in the same batch and in later
+  turns. No hook can opt out. A new user message
+  (`RunState::with_user_message`) clears the declines.
+- **`aidaemon_policies::ApprovalPolicy`** (declares `Approval`): hard
+  blocks for catastrophic commands, deny rules, the application's
+  `ApprovalRules` (`Allow`, `Deny`, `Ask(request)` or `Defer`), allow
+  rules, then the `ApprovalMode`. An ask that the `ApprovalGrants` cover
+  (for example `SessionGrants`, keyed by each effect plus the subject) is
+  allowed; otherwise it becomes a typed owner-approval interruption
+  carrying the call's effects. After a decline in the run, a call whose
+  effects are incomplete is asked again even where a rule or grant would
+  allow it: an egress or destructive call after any decline, and any call
+  that is not read-only after a declined delete, write, configuration or
+  call.
+- **`aidaemon_policies::EgressGuard`** (declares `Egress`): for a call
+  annotated `egress` or declaring an `Egress` effect, scans every string
+  and object key in the arguments for the `Redactor`'s secret shapes and
+  configured literals, and refuses with `[EGRESS BLOCKED]`
+  (`EGRESS_BLOCKED`). No shape matches a host and port, so
+  `http://127.0.0.1:8765` passes. Register it before `UntrustedHook` and
+  `ApprovalPolicy`, so the owner is never asked about a call it refuses.
+
 ## Images
 
 `Image` (base64 bytes or a URL) rides on `Message::images` for user
@@ -190,7 +240,7 @@ see images is the caller's decision; the kernel does not gate it. `Debug` on
 
 | Daemon feature today | As a hook |
 |---|---|
-| Approval broker, risk levels, permission modes | `before_tool` → `Interrupt` / `Deny` |
+| Approval broker, risk levels, permission modes | `before_tool` → `Interrupt` / `Deny` (done: `ApprovalPolicy` with the daemon's `AppApprovalRules`) |
 | Mandate authority gate, correction sandbox | `before_tool` → `Deny` |
 | Project-instruction just-in-time discovery | `before_tool` → `Deny` with "new instructions loaded, retry" + `before_model` injection |
 | Memory / facts / episodes injection | `before_model` |

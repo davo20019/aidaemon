@@ -76,10 +76,12 @@ pub trait ApprovalGrants: Send + Sync {
 /// An ask that the [`ApprovalPolicy::with_grants`] grants cover is allowed;
 /// otherwise it becomes an [`InterruptKind::OwnerApproval`] interruption
 /// whose request carries the call's declared effects, so a denial binds the
-/// rest of the run. After the owner declined something in the run, an
-/// egress or destructive call whose effects the tool could not fully
-/// declare is asked about even where it would be allowed: it might be the
-/// declined action by another route.
+/// rest of the run. After the owner declined something in the run, a call
+/// whose effects the tool could not fully declare is asked about even where
+/// a rule or grant would allow it, since it might be the declined action by
+/// another route: an egress or destructive call after any decline, and any
+/// call that is not read-only after a declined delete, write, configuration
+/// or call.
 ///
 /// Command prefixes are matched by tokens, not characters: `git push`
 /// matches `git push origin` but not `git pushy`, and a prefix never

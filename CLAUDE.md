@@ -334,7 +334,13 @@ calls instead of checking them.
 
 ## Owner Approval Rule
 
-Every safeguard that can refuse, approve or scan a tool call is a kernel hook judging typed effects. Tools never prompt the owner or refuse on policy inside `call()`; a decline binds the run for that effect and target across tools.
+The rule: every safeguard that can refuse, approve or scan a tool call is a
+kernel hook judging typed effects. A tool must not prompt the owner or refuse
+on policy inside `call()`; a decline binds the run for that effect and target
+across tools. Do not add a new in-tool prompt or policy refusal.
+
+Not yet everywhere: `cli_agent`, `browser`, `computer_use` and the `manage_*`
+tools still prompt inside `call()` until Phase 3c moves them onto the kernel.
 
 - Tools declare a call's effects (`EffectKey`: egress `host:port`, absolute
   paths for delete/write/configuration, named credential/process). The
@@ -346,6 +352,10 @@ Every safeguard that can refuse, approve or scan a tool call is a kernel hook ju
   stores, and the resolver that sends the card. Timeout, send failure and
   Deny all decline. `EgressGuard` refuses secrets in outbound calls with
   `[EGRESS BLOCKED]` before anyone is asked.
+- After a decline, a call whose effects are incomplete is asked again even
+  when a rule or grant would allow it: an egress or destructive one after any
+  decline, any non-read-only one after a declined delete, write,
+  configuration or call.
 - A child agent starts with its parent run's declines
   (`InheritedAuthority::declined`, seeded into the child's `RunState` after
   its user message is set). Session grants are shared with children.

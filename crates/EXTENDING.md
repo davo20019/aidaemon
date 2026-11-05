@@ -91,9 +91,12 @@ Rules every channel follows:
   the `Retry` wrapper, not in your provider.
 - **Tool**: `spec` (JSON schema with `additionalProperties: false`) and
   `call`. Declare honest `annotations` (read-only tools run in parallel;
-  unannotated tools are treated as destructive) and an `access` manifest
-  so scope policies and sandboxes can reason about the call. Return
-  failures as `ToolOutput::error`, not panics.
+  unannotated tools are treated as destructive; set `egress` on anything
+  that sends data off the machine, reads included), an `access` manifest
+  so scope policies and sandboxes can reason about the call, and
+  `effects` (see below). Never prompt the owner or refuse on policy
+  inside `call`; that is a hook's job. Return failures as
+  `ToolOutput::error`, not panics.
 - **Hook**: implement only the methods you need (`before_model`,
   `before_tool`, `after_tool`, `on_stop`, `on_stuck`). Base decisions on
   typed state in `HookContext`, `ToolInfo` and receipts.
@@ -102,6 +105,38 @@ Rules every channel follows:
   embedding API, or `Scorer` for different ranking. To replace the whole
   memory system, implement `aidaemon_policies::Recall` and use it with
   `MemoryInjection`.
+
+## Effects, safeguards and owner approvals
+
+A tool's `effects(arguments)` returns `CallEffects`: the `EffectKey`s the
+call touches and whether that list is `complete`. Build keys with
+`EffectKey::egress(scheme, host, port)` for a host it contacts,
+`EffectKey::path(EffectClass::Delete | Write | Configuration, abs_path)`
+for a path, and `EffectKey::named(EffectClass::Credential | Process, name)`.
+Set `complete: false` when the call may do more than it lists (an opaque
+script). The default is no effects for a read-only call that is not
+egress, and unknown otherwise.
+
+`AgentBuilder::build` refuses an agent with tools unless hooks (or
+`AgentBuilder::attest`) cover every `Safeguard::REQUIRED`: `Authority`,
+`Scope`, `UntrustedOutput`, `Approval` and `Egress`. From
+`aidaemon-policies`:
+
+- `ApprovalPolicy` (`Approval`) applies hard blocks, deny rules, your
+  `ApprovalRules`, allow rules and an `ApprovalMode`, and turns an ask
+  into an `InterruptKind::OwnerApproval` interruption carrying the call's
+  effects, unless your `ApprovalGrants` (or `SessionGrants`) cover it.
+  After a decline in the run, a call with incomplete effects is asked
+  again even where a rule or grant would allow it.
+- `EgressGuard` (`Egress`) refuses a call annotated `egress` or declaring
+  an `Egress` effect whose arguments carry a secret, with
+  `[EGRESS BLOCKED]` (`aidaemon_core::EGRESS_BLOCKED`).
+
+The kernel enforces the decline invariant itself: when an owner approval
+is resolved `Deny`, its effects (or its subject, if it declared none) are
+remembered for the run, and any later call overlapping them is refused
+with `[OWNER DECLINED]` before any hook runs, whichever tool makes it.
+Declare effects honestly: a key you leave out cannot be bound.
 
 ## Proving compatibility: conformance kits
 
