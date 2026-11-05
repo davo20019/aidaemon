@@ -589,6 +589,8 @@ pub struct SeenCard {
     pub session_id: String,
     pub risk_level: RiskLevel,
     pub warnings: Vec<String>,
+    /// The mode the card was sent with: it picks the buttons offered.
+    pub permission_mode: crate::tools::command_risk::PermissionMode,
 }
 
 /// Answers owner-approval cards from a script, in order: `Some(answer)`
@@ -614,6 +616,7 @@ impl ScriptedApprover {
                     session_id: request.session_id.clone(),
                     risk_level: request.risk_level,
                     warnings: request.warnings.clone(),
+                    permission_mode: request.permission_mode,
                 });
                 match script.next().flatten() {
                     Some(answer) => {

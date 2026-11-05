@@ -3465,3 +3465,157 @@ fn hook_order_is_pinned() {
         .build()
         .expect("every required safeguard is covered");
 }
+
+/// In sandbox confinement, the escalation on the owner's card is the one
+/// the dispatcher grants: the kernel judges the canonical call (model `_`
+/// keys dropped, the turn's project directory injected), and the
+/// dispatcher runs that same judged call. A relative read path resolves
+/// against the injected directory in both.
+#[tokio::test]
+async fn judged_terminal_escalation_is_the_dispatched_one() {
+    use aidaemon_policies::{ApprovalRules, RuleDecision};
+    let base = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    // The task may touch `allowed`; the turn runs in `project` (its known
+    // project directory), so a relative read there is out of scope.
+    let project = base.join("project");
+    let allowed = base.join("allowed");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::write(project.join("notes.txt"), "synthetic notes").unwrap();
+    let project_dir = project.to_string_lossy().to_string();
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec!["cat".to_string()],
+            crate::tools::ApprovalBroker::new(tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox),
+    );
+    let known = Arc::new(std::sync::Mutex::new(Some(project_dir.clone())));
+    let scopes = vec![allowed.to_string_lossy().to_string()];
+    let judged = crate::agent::approvals::JudgedCalls::default();
+    let rules = crate::agent::approvals::AppApprovalRules {
+        session_id: "telegram:synthetic-user-1".to_string(),
+        user_role: Some(UserRole::Owner),
+        terminal: crate::agent::approvals::TerminalApprovals::find(std::slice::from_ref(&tool))
+            .map(|terminal| {
+                terminal.with_canonicalizer(
+                    terminal_canonicalizer(TerminalCanonTurn {
+                        tool: tool.clone(),
+                        known_project_dir: known.clone(),
+                        session_id: "telegram:synthetic-user-1".to_string(),
+                        task_access: None,
+                        authorized_scopes: scopes.clone(),
+                        workspace_grant: false,
+                    }),
+                    judged.clone(),
+                )
+            }),
+        ..Default::default()
+    };
+    let raw = serde_json::json!({
+        "action": "run",
+        "command": "cat notes.txt",
+        "read_paths": ["notes.txt"],
+        "_session_id": 7,
+    });
+    let call = sdk::ToolCall::new("call-escalation-1", "terminal", raw.clone());
+    let ctx = sdk::HookContext {
+        run_id: sdk::RunId::new(),
+        agent_id: "aidaemon",
+        session_id: "telegram:synthetic-user-1",
+        turn: 1,
+        messages: &[],
+        receipts: &[],
+        usage: sdk::Usage::default(),
+        run_usage: sdk::Usage::default(),
+        untrusted_seen: false,
+        declined: &[],
+    };
+    let info = sdk::ToolInfo {
+        annotations: sdk::ToolAnnotations::default(),
+        access: sdk::AccessManifest::default(),
+        effects: sdk::CallEffects::unknown(),
+    };
+    let decision = rules.judge(&ctx, &call, &info).await;
+    let RuleDecision::Ask(request) = decision else {
+        panic!(
+            "an out-of-scope read asks the owner: {decision:?} {:?}",
+            judged.lock().unwrap().get("call-escalation-1")
+        );
+    };
+
+    // What the dispatcher runs is exactly what was judged.
+    let dispatched = judged
+        .lock()
+        .unwrap()
+        .get("call-escalation-1")
+        .cloned()
+        .expect("the judged call is kept for the dispatcher");
+    assert_eq!(
+        dispatched.call.arguments["working_dir"],
+        project_dir.as_str()
+    );
+    assert!(dispatched.call.arguments.get("_session_id").is_none());
+    let granted = match call_scope_check(
+        tool.as_ref(),
+        &dispatched.call.arguments.to_string(),
+        &CallScopeFacts {
+            session_id: "telegram:synthetic-user-1",
+            task_access: None,
+            authorized_scopes: &scopes,
+            known_project_dir: Some(&project_dir),
+        },
+    ) {
+        Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) => {
+            escalation
+        }
+        other => panic!("the dispatcher escalates: {other:?}"),
+    };
+    assert_eq!(
+        dispatched.scope,
+        crate::agent::approvals::TerminalScope::Escalate(granted.clone())
+    );
+    // The card names every escalated path the dispatcher grants.
+    for path in &granted.read_paths {
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("read outside task scope: {path}"))),
+            "{path} not on the card: {request:?}"
+        );
+    }
+    assert!(!granted.read_paths.is_empty());
+    // Judged on the raw call instead, the card would have named another
+    // escalation than the one granted (the hazard this closes).
+    let raw_scope = call_scope_check(
+        tool.as_ref(),
+        &raw.to_string(),
+        &CallScopeFacts {
+            session_id: "telegram:synthetic-user-1",
+            task_access: None,
+            authorized_scopes: &scopes,
+            known_project_dir: Some(&project_dir),
+        },
+    );
+    assert!(
+        !matches!(
+            &raw_scope,
+            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. })
+                if *escalation == granted
+        ),
+        "{raw_scope:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

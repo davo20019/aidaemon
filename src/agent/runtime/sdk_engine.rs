@@ -387,6 +387,65 @@ pub(super) struct StopCheck {
     reply: oneshot::Sender<sdk::StopDecision>,
 }
 
+/// What a turn's terminal canonicalizer reads (see [`terminal_canonicalizer`]).
+pub(super) struct TerminalCanonTurn {
+    pub tool: Arc<dyn crate::traits::Tool>,
+    pub known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
+    pub session_id: String,
+    pub task_access: Option<crate::traits::ToolCallAccessManifest>,
+    pub authorized_scopes: Vec<String>,
+    pub workspace_grant: bool,
+}
+
+/// How the kernel's terminal rules see a call: in the canonical form the
+/// dispatcher executes ([`tool_calls::canonicalize_call`]), scope-checked
+/// exactly as the dispatcher will check it.
+pub(super) fn terminal_canonicalizer(
+    turn: TerminalCanonTurn,
+) -> impl Fn(&Value) -> super::approvals::JudgedTerminal + Send + Sync + 'static {
+    move |raw| {
+        let known = turn
+            .known_project_dir
+            .lock()
+            .ok()
+            .and_then(|known| known.clone());
+        let call = tool_calls::canonicalize_call(
+            Some(turn.tool.as_ref()),
+            "terminal",
+            raw,
+            &tool_calls::CanonFacts {
+                workspace_grant: turn.workspace_grant,
+                known_project_dir: known.as_deref(),
+                task_access: turn.task_access.as_ref(),
+                authorized_scopes: &turn.authorized_scopes,
+            },
+        );
+        // `known` as the dispatcher's scope check reads it, after this
+        // call's explicit directory refined it.
+        let known = call.explicit_dir.clone().or(known);
+        let facts = tool_calls::CallScopeFacts {
+            session_id: &turn.session_id,
+            task_access: turn.task_access.as_ref(),
+            authorized_scopes: &turn.authorized_scopes,
+            known_project_dir: known.as_deref(),
+        };
+        let scope = match tool_calls::call_scope_check(
+            turn.tool.as_ref(),
+            &call.arguments.to_string(),
+            &facts,
+        ) {
+            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) => {
+                super::approvals::TerminalScope::Escalate(escalation)
+            }
+            Some(crate::agent::tool_execution::ScopeCheck::Rejected(_)) => {
+                super::approvals::TerminalScope::Refused
+            }
+            None => super::approvals::TerminalScope::InScope,
+        };
+        super::approvals::JudgedTerminal { call, scope }
+    }
+}
+
 /// One tool call handed from the SDK run to the daemon dispatcher.
 pub(super) struct ToolRequest {
     name: String,
@@ -508,6 +567,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// Where calls without a directory run; refined by the model's own
     /// explicit directories (see `SdkTurnSetup::known_project_dir`).
     known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
+    /// Terminal calls in the canonical form the kernel's approval rules
+    /// judged, by call id: the dispatcher executes exactly these.
+    judged_terminal_calls: super::approvals::JudgedCalls,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
@@ -927,6 +989,8 @@ impl Agent {
         // the dispatcher's scope check will (same facts, same known
         // project directory as it is refined during the run).
         let known_project_dir = Arc::new(std::sync::Mutex::new(known_project_dir));
+        let judged_terminal_calls = super::approvals::JudgedCalls::default();
+        let workspace_grant = channel_ctx.active_workspace_grant(user_role).is_some();
         let terminal_approvals =
             super::approvals::TerminalApprovals::find(&self.tools).map(|terminal| {
                 let tool = terminal.tool();
@@ -934,29 +998,17 @@ impl Agent {
                 let session = session_id.to_string();
                 let task_access = authority.task_access.clone();
                 let scopes = authorized_scopes.clone();
-                terminal.with_scope(move |arguments| {
-                    let known = known.lock().ok().and_then(|known| known.clone());
-                    let facts = tool_calls::CallScopeFacts {
-                        session_id: &session,
-                        task_access: task_access.as_ref(),
-                        authorized_scopes: &scopes,
-                        known_project_dir: known.as_deref(),
-                    };
-                    match tool_calls::call_scope_check(
-                        tool.as_ref(),
-                        &arguments.to_string(),
-                        &facts,
-                    ) {
-                        Some(crate::agent::tool_execution::ScopeCheck::Escalatable {
-                            escalation,
-                            ..
-                        }) => super::approvals::TerminalScope::Escalate(escalation),
-                        Some(crate::agent::tool_execution::ScopeCheck::Rejected(_)) => {
-                            super::approvals::TerminalScope::Refused
-                        }
-                        None => super::approvals::TerminalScope::InScope,
-                    }
-                })
+                terminal.with_canonicalizer(
+                    terminal_canonicalizer(TerminalCanonTurn {
+                        tool,
+                        known_project_dir: known,
+                        session_id: session,
+                        task_access,
+                        authorized_scopes: scopes,
+                        workspace_grant,
+                    }),
+                    judged_terminal_calls.clone(),
+                )
             });
         let rules = super::approvals::AppApprovalRules {
             trusted_session: !mandate_run
@@ -1128,6 +1180,7 @@ impl Agent {
             raised_output_tokens: std::sync::atomic::AtomicU32::new(0),
             continue_inline_after_background,
             known_project_dir: known_project_dir.clone(),
+            judged_terminal_calls,
             project_scope,
             authority: &authority,
             ceiling: ceiling.clone(),

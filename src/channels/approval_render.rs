@@ -19,7 +19,7 @@ const MAX_CMD_DISPLAY: usize = 3600;
 /// - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
 /// - Cautious mode: All get [Once, Session, Deny]
 /// - YOLO mode: All get [Once, Always, Deny]
-pub(super) fn approval_use_session_button(
+pub(crate) fn approval_use_session_button(
     permission_mode: PermissionMode,
     risk_level: RiskLevel,
 ) -> bool {

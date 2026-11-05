@@ -83,20 +83,68 @@ pub(crate) enum TerminalScope {
     Refused,
 }
 
-type ScopeOf = dyn Fn(&serde_json::Value) -> TerminalScope + Send + Sync;
+/// A call as the dispatcher executes it: the model's `_` keys and unset
+/// optional arguments dropped, the turn's project directory injected and
+/// unauthorized read roots dropped (`sdk_engine::tool_calls::canonicalize_call`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalCall {
+    pub arguments: serde_json::Value,
+    /// The model's own explicit directory; it refines the turn's known
+    /// project directory when the call is dispatched.
+    pub explicit_dir: Option<String>,
+    /// The project directory injected into the call, if any.
+    pub injected_dir: Option<String>,
+    /// Declared read roots dropped as unauthorized.
+    pub stripped_read_roots: Vec<String>,
+}
 
-/// The terminal whose approval ladder the kernel's rules run, and the
-/// turn's scope check of a call (for a confined capability escalation).
+impl CanonicalCall {
+    /// Only the model's `_` keys and unset optional arguments dropped (no
+    /// turn to anchor against).
+    pub(crate) fn stripped(
+        tool: Option<&dyn crate::traits::Tool>,
+        raw: &serde_json::Value,
+    ) -> Self {
+        let mut arguments = raw.clone();
+        if let serde_json::Value::Object(map) = &mut arguments {
+            crate::agent::tool_exec::strip_model_arguments(map, tool);
+        }
+        Self {
+            arguments,
+            explicit_dir: None,
+            injected_dir: None,
+            stripped_read_roots: Vec::new(),
+        }
+    }
+}
+
+/// A terminal call as the kernel judged it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JudgedTerminal {
+    pub call: CanonicalCall,
+    pub scope: TerminalScope,
+}
+
+type Canonicalize = dyn Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync;
+
+/// The canonical form of each terminal call the kernel judged, by call
+/// id: the dispatcher executes exactly these arguments.
+pub(crate) type JudgedCalls = Arc<Mutex<HashMap<String, JudgedTerminal>>>;
+
+/// The terminal whose approval ladder the kernel's rules run, how a call is
+/// canonicalized and scope-checked for this turn, and the calls judged so
+/// far (which the dispatcher then runs as judged).
 #[derive(Clone)]
 pub(crate) struct TerminalApprovals {
     tool: Arc<dyn crate::traits::Tool>,
-    scope: Option<Arc<ScopeOf>>,
+    canonicalize: Option<Arc<Canonicalize>>,
+    judged: JudgedCalls,
 }
 
 impl std::fmt::Debug for TerminalApprovals {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalApprovals")
-            .field("scope", &self.scope.is_some())
+            .field("canonicalize", &self.canonicalize.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -108,7 +156,11 @@ impl TerminalApprovals {
             .iter()
             .find(|tool| Self::downcast(tool.as_ref()).is_some())?
             .clone();
-        Some(Self { tool, scope: None })
+        Some(Self {
+            tool,
+            canonicalize: None,
+            judged: JudgedCalls::default(),
+        })
     }
 
     /// The terminal tool itself.
@@ -116,12 +168,15 @@ impl TerminalApprovals {
         self.tool.clone()
     }
 
-    /// Judge capability escalations with the turn's scope check.
-    pub(crate) fn with_scope(
+    /// Canonicalize and scope-check calls as the turn's dispatcher does,
+    /// recording each judged call in `judged` for the dispatcher.
+    pub(crate) fn with_canonicalizer(
         mut self,
-        scope: impl Fn(&serde_json::Value) -> TerminalScope + Send + Sync + 'static,
+        canonicalize: impl Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync + 'static,
+        judged: JudgedCalls,
     ) -> Self {
-        self.scope = Some(Arc::new(scope));
+        self.canonicalize = Some(Arc::new(canonicalize));
+        self.judged = judged;
         self
     }
 
@@ -133,11 +188,35 @@ impl TerminalApprovals {
         Self::downcast(self.tool.as_ref())
     }
 
-    fn scope(&self, arguments: &serde_json::Value) -> TerminalScope {
-        match &self.scope {
-            Some(scope) => scope(arguments),
-            None => TerminalScope::InScope,
+    /// The call in the form the dispatcher will execute, with its scope.
+    pub(crate) fn judge(&self, raw: &serde_json::Value) -> JudgedTerminal {
+        match &self.canonicalize {
+            Some(canonicalize) => canonicalize(raw),
+            None => JudgedTerminal {
+                call: CanonicalCall::stripped(Some(self.tool.as_ref()), raw),
+                scope: TerminalScope::InScope,
+            },
         }
+    }
+
+    /// The judged form of the call `call_id`, if the kernel judged it.
+    pub(crate) fn judged(&self, call_id: &str) -> Option<JudgedTerminal> {
+        self.judged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(call_id)
+            .cloned()
+    }
+
+    fn remember(&self, call_id: &str, call: JudgedTerminal) {
+        self.judged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(call_id.to_string(), call);
+    }
+
+    fn permission_mode(&self) -> Option<PermissionMode> {
+        self.terminal().map(|terminal| terminal.permission_mode())
     }
 }
 
@@ -156,6 +235,19 @@ impl AppApprovalRules {
         }
     }
 
+    /// The mode a card for `tool` is sent with: the terminal's configured
+    /// mode for its cards (as its own prompt used), Cautious otherwise.
+    pub(crate) fn card_permission_mode(&self, tool: &str) -> PermissionMode {
+        match (tool, &self.terminal) {
+            ("terminal", Some(terminal)) => terminal
+                .permission_mode()
+                .unwrap_or(PermissionMode::Cautious),
+            _ => PermissionMode::Cautious,
+        }
+    }
+
+    /// Judge the call the dispatcher will execute (canonicalized), never
+    /// the raw one. Nothing unreadable is allowed: it asks, Critical.
     async fn judge_terminal(&self, call: &sdk::ToolCall) -> RuleDecision {
         let Some(approvals) = &self.terminal else {
             return RuleDecision::Defer;
@@ -163,7 +255,13 @@ impl AppApprovalRules {
         let Some(terminal) = approvals.terminal() else {
             return RuleDecision::Defer;
         };
-        let escalation = match approvals.scope(&call.arguments) {
+        let judged = approvals.judge(&call.arguments);
+        approvals.remember(&call.id, judged.clone());
+        if let Some(reason) = crate::tools::TerminalTool::unreadable_reason(&judged.call.arguments)
+        {
+            return RuleDecision::Ask(terminal.unreadable_request(&call.arguments, &reason));
+        }
+        let escalation = match judged.scope {
             // The dispatcher refuses it before the tool runs.
             TerminalScope::Refused => return RuleDecision::Allow,
             TerminalScope::Escalate(escalation) => Some(escalation),
@@ -171,16 +269,18 @@ impl AppApprovalRules {
         };
         let trust = self.terminal_trust(escalation);
         match terminal
-            .owner_approval_request(&call.arguments, &trust)
+            .owner_approval_request(&judged.call.arguments, &trust)
             .await
         {
-            Some(request) => RuleDecision::Ask(request),
-            None => RuleDecision::Allow,
+            Ok(Some(request)) => RuleDecision::Ask(request),
+            Ok(None) => RuleDecision::Allow,
+            Err(reason) => RuleDecision::Ask(terminal.unreadable_request(&call.arguments, &reason)),
         }
     }
 
     /// Apply the owner's answer to a terminal card to the terminal's grant
-    /// stores (`None`: the card timed out or never reached the owner).
+    /// stores (`None`: the card timed out or never reached the owner), for
+    /// the call as it was judged when the card was asked.
     pub(crate) async fn record_terminal_answer(
         &self,
         call: &sdk::ToolCall,
@@ -192,13 +292,16 @@ impl AppApprovalRules {
         let Some(terminal) = approvals.terminal() else {
             return;
         };
-        let escalation = match approvals.scope(&call.arguments) {
+        let judged = approvals
+            .judged(&call.id)
+            .unwrap_or_else(|| approvals.judge(&call.arguments));
+        let escalation = match judged.scope {
             TerminalScope::Escalate(escalation) => Some(escalation),
             _ => None,
         };
         let trust = self.terminal_trust(escalation);
         terminal
-            .record_owner_answer(&call.arguments, &trust, response)
+            .record_owner_answer(&judged.call.arguments, &trust, response)
             .await;
     }
 }
@@ -325,6 +428,7 @@ impl OwnerApprovals {
         &self,
         card_session: &str,
         request: &sdk::OwnerApprovalRequest,
+        permission_mode: PermissionMode,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Answer {
         let broker = self
@@ -348,7 +452,7 @@ impl OwnerApprovals {
                 session_id: card_session.to_string(),
                 risk_level: card_risk(request.risk),
                 warnings: request.warnings.clone(),
-                permission_mode: PermissionMode::Cautious,
+                permission_mode,
                 response_tx,
                 kind: Default::default(),
             })
@@ -504,7 +608,12 @@ impl OwnerApprovalResolver<'_> {
             .await;
         match self
             .approvals
-            .ask(self.card_session, request, &self.cancel)
+            .ask(
+                self.card_session,
+                request,
+                self.rules.card_permission_mode(tool),
+                &self.cancel,
+            )
             .await
         {
             Answer::Granted(response) => {
@@ -842,6 +951,17 @@ mod tests {
         }
     }
 
+    /// The terminal with every call judged to have `scope`.
+    fn with_scope(terminal: TerminalApprovals, scope: TerminalScope) -> TerminalApprovals {
+        terminal.with_canonicalizer(
+            move |raw| JudgedTerminal {
+                call: CanonicalCall::stripped(None, raw),
+                scope: scope.clone(),
+            },
+            JudgedCalls::default(),
+        )
+    }
+
     async fn judge_terminal(rules: &AppApprovalRules, args: serde_json::Value) -> RuleDecision {
         let call = sdk::ToolCall::new("c1", "terminal", args);
         rules.judge(&hook_ctx(), &call, &tool_info()).await
@@ -884,11 +1004,18 @@ mod tests {
             judge_terminal(&trusted, run("printf synthetic")).await,
             RuleDecision::Allow
         );
-        // The explicit allow precedes the approval floor (as before).
-        assert_eq!(
-            judge_terminal(&base, run("cat ~/.ssh/config")).await,
-            RuleDecision::Allow
-        );
+        // The approval floor precedes the explicit allow (owner ruling,
+        // closing the T10 hole): an allowlisted command touching a
+        // credential path asks; a plain allowlisted command does not.
+        for sensitive in ["cat ~/.ssh/config", "cat ~/.ssh/id_rsa"] {
+            let asked = judge_terminal(&base, run(sensitive)).await;
+            assert!(
+                matches!(asked, RuleDecision::Ask(_)),
+                "{sensitive}: {asked:?}"
+            );
+        }
+        let plain = terminal_rules(&["ls"]).await;
+        assert_eq!(judge_terminal(&plain, run("ls")).await, RuleDecision::Allow);
         // The floor asks for a credential path that no grant covers.
         let floor = judge_terminal(&base, run("head ~/.ssh/config")).await;
         assert!(matches!(floor, RuleDecision::Ask(_)), "{floor:?}");
@@ -968,10 +1095,51 @@ mod tests {
         };
         assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
         assert_eq!(request.subject, "ENABLE TRUST-ALL MODE");
+        // Always asked, even when it is already on, and whatever the
+        // model's `_` keys say.
         let on = terminal_rules(&["*"]).await;
+        assert!(matches!(
+            judge_terminal(&on, json!({"action": "trust_all", "_goal_id": 0})).await,
+            RuleDecision::Ask(_)
+        ));
+    }
+
+    /// A terminal call whose arguments cannot be read is never allowed: it
+    /// asks, Critical, with the raw arguments on the card.
+    #[tokio::test]
+    async fn unreadable_terminal_call_asks_critical_with_raw_arguments() {
+        let rules = terminal_rules(&["*"]).await;
+        let raw = json!({"action": "run", "command": 5, "detach": "yes"});
+        let RuleDecision::Ask(request) = judge_terminal(&rules, raw.clone()).await else {
+            panic!("an unreadable call must ask");
+        };
+        assert_eq!(request.risk, sdk::ApprovalRisk::Critical);
+        assert!(request.summary.contains(&raw.to_string()), "{request:?}");
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be read")),
+            "{request:?}"
+        );
+        // The model's `_` keys of the wrong type are dropped first, as the
+        // dispatcher drops them: the call is judged on what runs.
+        let spoofed = json!({"action": "run", "command": "ls", "_session_id": 1});
+        assert_eq!(judge_terminal(&rules, spoofed).await, RuleDecision::Allow);
+    }
+
+    /// Terminal cards go out in the terminal's configured mode (which picks
+    /// the buttons); other tools' cards stay Cautious.
+    #[tokio::test]
+    async fn terminal_cards_use_the_terminal_permission_mode() {
+        let rules = terminal_rules(&[]).await;
         assert_eq!(
-            judge_terminal(&on, json!({"action": "trust_all"})).await,
-            RuleDecision::Allow
+            rules.card_permission_mode("terminal"),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            rules.card_permission_mode("http_request"),
+            PermissionMode::Cautious
         );
     }
 
@@ -1017,7 +1185,7 @@ mod tests {
             terminal: terminal_rules(&["echo"])
                 .await
                 .terminal
-                .map(|t| t.with_scope(|_| TerminalScope::Refused)),
+                .map(|t| with_scope(t, TerminalScope::Refused)),
             ..terminal_rules(&[]).await
         };
         assert_eq!(
@@ -1051,7 +1219,7 @@ mod tests {
         let scoped = escalation.clone();
         let rules = AppApprovalRules {
             terminal: TerminalApprovals::find(&[confined])
-                .map(|t| t.with_scope(move |_| TerminalScope::Escalate(scoped.clone()))),
+                .map(|t| with_scope(t, TerminalScope::Escalate(scoped.clone()))),
             ..terminal_rules(&[]).await
         };
         let args = run("cat /tmp/aidaemon-test/sibling/notes.txt");

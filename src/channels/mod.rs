@@ -1,4 +1,4 @@
-mod approval_render;
+pub(crate) mod approval_render;
 pub(crate) mod attachments;
 pub(crate) mod commands;
 pub(crate) mod connect;

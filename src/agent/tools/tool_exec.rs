@@ -708,12 +708,13 @@ impl Agent {
         };
         let enriched_args = match parsed_args {
             Ok(Value::Object(mut map)) => {
-                // Strip any underscore-prefixed fields the LLM might have injected
-                // to prevent spoofing of internal enrichment fields.
-                map.retain(|k, _| !k.starts_with('_'));
-                if let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) {
-                    drop_unset_optional_arguments(&mut map, &tool.schema());
-                }
+                strip_model_arguments(
+                    &mut map,
+                    self.tools
+                        .iter()
+                        .find(|tool| tool.name() == name)
+                        .map(|tool| tool.as_ref()),
+                );
                 map.insert("_session_id".to_string(), json!(session_id));
                 map.insert(
                     "_channel_visibility".to_string(),
@@ -1030,6 +1031,22 @@ impl std::error::Error for UnknownToolError {}
 /// `[]` for "not provided"; a tool would otherwise read them as values (an
 /// empty session filter that matches nothing, an empty `schedules` list that
 /// hides `schedule`). Required fields, numbers and booleans are untouched.
+/// The model's arguments as the dispatcher reads them: any `_`-prefixed key
+/// the model sent is dropped (only the dispatcher sets those, after this),
+/// and optional arguments the model left unset are dropped against the
+/// tool's schema. The kernel's terminal approval rules judge a call after
+/// this same step (`sdk_engine::tool_calls::canonicalize_call`), so the
+/// judged call is the executed one.
+pub(crate) fn strip_model_arguments(
+    map: &mut serde_json::Map<String, Value>,
+    tool: Option<&dyn crate::traits::Tool>,
+) {
+    map.retain(|k, _| !k.starts_with('_'));
+    if let Some(tool) = tool {
+        drop_unset_optional_arguments(map, &tool.schema());
+    }
+}
+
 fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schema: &Value) {
     let parameters = schema.get("parameters").unwrap_or(schema);
     let required: Vec<&str> = parameters

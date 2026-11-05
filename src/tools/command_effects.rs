@@ -752,7 +752,18 @@ fn scan(command: &str) -> Scan {
             '&' => segments.push(std::mem::take(&mut cur)),
             '<' => {
                 let target = redirect_target(&chars, i + 1);
-                if matches!(next, Some('<') | Some('(') | Some('>')) || target.is_empty() {
+                // `N<` opens a file on descriptor N, which the command may
+                // read however it likes: not a plain stdin redirect.
+                let word: String = cur
+                    .chars()
+                    .rev()
+                    .take_while(|c| !c.is_whitespace())
+                    .collect();
+                let numbered = !word.is_empty() && word.chars().all(|d| d.is_ascii_digit());
+                if numbered
+                    || matches!(next, Some('<') | Some('(') | Some('>'))
+                    || target.is_empty()
+                {
                     unsafe_syntax = true;
                 } else if target != "/dev/null" {
                     input_targets.push(target);

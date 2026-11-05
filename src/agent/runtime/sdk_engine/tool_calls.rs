@@ -67,66 +67,136 @@ pub(super) fn grant_own_spill_reads(
     }
 }
 
-/// Anchor a call without a directory to the turn's project directory: a
-/// scheduled goal's terminal command runs in its
-/// bound workspace, not the daemon's cwd. The model's own explicit directory
-/// refines the anchor; an injected one never does (it may be a parent
-/// directory picked because the target does not exist yet). Returns the
-/// injected directory.
-pub(super) fn anchor_call_to_project_dir(
-    scope: &TurnScope<'_>,
-    request: &mut ToolRequest,
-) -> Option<String> {
-    // A channel workspace grant scopes the file tools itself.
-    if scope
-        .channel_ctx
-        .active_workspace_grant(scope.user_role)
-        .is_some()
-    {
-        return None;
-    }
-    let arguments = serde_json::to_string(&request.arguments).ok()?;
-    let mut known = scope.known_project_dir.lock().ok()?;
-    if let Some(explicit) =
-        crate::agent::tool_execution::project_dir_from_tool_args(&request.name, &arguments)
-    {
-        *known = Some(explicit);
-    }
-    let (updated, injected) =
-        crate::agent::tool_execution::maybe_inject_project_dir_into_tool_args(
-            &request.name,
-            &arguments,
-            known.as_deref(),
-        )?;
-    request.arguments = serde_json::from_str(&updated).ok()?;
-    Some(injected)
+/// What canonicalizing a call reads from the turn.
+pub(super) struct CanonFacts<'a> {
+    /// A channel workspace grant scopes the file tools itself: no anchor.
+    pub workspace_grant: bool,
+    pub known_project_dir: Option<&'a str>,
+    pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
+    pub authorized_scopes: &'a [String],
 }
 
-/// Drop declared terminal read roots the task does not authorize before the
-/// scope check, so a superfluous root (`/tmp`) cannot veto an otherwise
-/// authorized call. Dropping a read root does not change what the call does.
-pub(super) fn attenuate_sdk_read_roots(scope: &TurnScope<'_>, request: &mut ToolRequest) {
-    if request.name != "terminal" {
-        return;
+/// THE canonical form of a call, used by both the kernel's terminal
+/// approval rules (which judge it) and the dispatcher (which executes it),
+/// so the judged call is the executed call:
+/// - terminal: the model's `_` keys and unset optional arguments dropped,
+///   exactly as the dispatcher drops them (`tool_exec::strip_model_arguments`);
+/// - a call without a directory is anchored to the turn's project
+///   directory: a scheduled goal's terminal command runs in its bound
+///   workspace, not the daemon's cwd. The model's own explicit directory
+///   refines the anchor; an injected one never does (it may be a parent
+///   directory picked because the target does not exist yet);
+/// - terminal: declared read roots the task does not authorize are
+///   dropped, so a superfluous root (`/tmp`) cannot veto an otherwise
+///   authorized call. Dropping a read root does not change what it does.
+pub(super) fn canonicalize_call(
+    tool: Option<&dyn crate::traits::Tool>,
+    name: &str,
+    raw: &Value,
+    facts: &CanonFacts<'_>,
+) -> crate::agent::approvals::CanonicalCall {
+    let terminal = name == "terminal";
+    let mut call = if terminal {
+        crate::agent::approvals::CanonicalCall::stripped(tool, raw)
+    } else {
+        crate::agent::approvals::CanonicalCall {
+            arguments: raw.clone(),
+            explicit_dir: None,
+            injected_dir: None,
+            stripped_read_roots: Vec::new(),
+        }
+    };
+    let mut known = facts.known_project_dir.map(str::to_string);
+    if !facts.workspace_grant {
+        if let Ok(text) = serde_json::to_string(&call.arguments) {
+            if let Some(explicit) =
+                crate::agent::tool_execution::project_dir_from_tool_args(name, &text)
+            {
+                known = Some(explicit.clone());
+                call.explicit_dir = Some(explicit);
+            }
+            if let Some((updated, injected)) =
+                crate::agent::tool_execution::maybe_inject_project_dir_into_tool_args(
+                    name,
+                    &text,
+                    known.as_deref(),
+                )
+            {
+                if let Ok(updated) = serde_json::from_str(&updated) {
+                    call.arguments = updated;
+                    call.injected_dir = Some(injected);
+                }
+            }
+        }
     }
-    let known = scope
-        .known_project_dir
-        .lock()
-        .ok()
-        .and_then(|known| known.clone());
-    let stripped = crate::agent::tool_execution::attenuate_unauthorized_read_roots(
-        &mut request.arguments,
-        scope.authority.task_access.as_ref(),
-        &scope.authorized_scopes,
-        known.as_deref(),
-    );
-    if !stripped.is_empty() {
+    if terminal {
+        call.stripped_read_roots = crate::agent::tool_execution::attenuate_unauthorized_read_roots(
+            &mut call.arguments,
+            facts.task_access,
+            facts.authorized_scopes,
+            known.as_deref(),
+        );
+    }
+    call
+}
+
+/// Put a dispatched call in its canonical form: a terminal call the kernel
+/// judged runs exactly as judged; any other call is canonicalized now. The
+/// model's explicit directory refines the turn's known project directory.
+/// Returns the injected directory.
+pub(super) fn canonicalize_dispatched_call(
+    scope: &TurnScope<'_>,
+    tool: Option<&dyn crate::traits::Tool>,
+    request: &mut ToolRequest,
+) -> Option<String> {
+    let judged = if request.name == "terminal" {
+        scope
+            .judged_terminal_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request.call_id)
+            .map(|judged| judged.call)
+    } else {
+        None
+    };
+    let canonical = match judged {
+        Some(canonical) => canonical,
+        None => {
+            let known = scope
+                .known_project_dir
+                .lock()
+                .ok()
+                .and_then(|known| known.clone());
+            canonicalize_call(
+                tool,
+                &request.name,
+                &request.arguments,
+                &CanonFacts {
+                    workspace_grant: scope
+                        .channel_ctx
+                        .active_workspace_grant(scope.user_role)
+                        .is_some(),
+                    known_project_dir: known.as_deref(),
+                    task_access: scope.authority.task_access.as_ref(),
+                    authorized_scopes: &scope.authorized_scopes,
+                },
+            )
+        }
+    };
+    if let Some(explicit) = &canonical.explicit_dir {
+        if let Ok(mut known) = scope.known_project_dir.lock() {
+            *known = Some(explicit.clone());
+        }
+    }
+    if !canonical.stripped_read_roots.is_empty() {
         info!(
             task_id = scope.task_id,
-            stripped_read_roots = ?stripped,
+            stripped_read_roots = ?canonical.stripped_read_roots,
             "SDK engine: attenuated unauthorized declared read roots"
         );
     }
+    request.arguments = canonical.arguments;
+    canonical.injected_dir
 }
 
 /// A replayed call's result, marked so the model does not read the earlier
@@ -290,8 +360,12 @@ impl Agent {
         scope: &TurnScope<'_>,
         mut request: ToolRequest,
     ) {
-        let injected_dir = anchor_call_to_project_dir(scope, &mut request);
-        attenuate_sdk_read_roots(scope, &mut request);
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == request.name)
+            .cloned();
+        let injected_dir = canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
         let mut output = self
             .run_sdk_tool_call(scope, &request, &arguments, injected_dir.as_deref())

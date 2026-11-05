@@ -898,6 +898,8 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Permission persistence mode: picks the buttons on the owner's cards.
+    permission_mode: PermissionMode,
     /// Host vs sandbox execution.
     confinement: crate::types::TerminalConfinement,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
@@ -3510,6 +3512,7 @@ impl TerminalTool {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
+            permission_mode,
             confinement: crate::types::TerminalConfinement::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
@@ -3822,8 +3825,9 @@ impl TerminalTool {
     ///   3. untrusted trigger      → external triggers always ask
     ///   4. detach && !allowed     → novel detached commands ask
     ///   5. trusted session        → scheduled tasks run without asking
-    ///   6. explicit allow         → a prior owner grant (session or persisted)
-    ///   7. approval floor         → protected credential path, never downgraded
+    ///   6. approval floor         → protected credential path, never
+    ///      downgraded; before the explicit allow, so no grant skips it
+    ///   7. explicit allow         → a prior owner grant (session or persisted)
     ///   8. semantic assessment    → ask only for dangerous effects; a failure
     ///      or a timeout fails closed to Critical
     ///   9. no assessor configured → Critical
@@ -3878,12 +3882,14 @@ impl TerminalTool {
         } else if trust.trusted_session {
             info!(command = %command, session = %trust.session_id, "Auto-approved: trusted scheduled task");
             false
+        } else if let Some(reason) = deterministic_approval_floor {
+            // Before the explicit allow (owner ruling): an allowlisted or
+            // session-granted command touching a credential path still asks.
+            approval_warnings.push(reason);
+            true
         } else if is_allowed {
             info!(command = %command, "Auto-approved: explicit command grant");
             false
-        } else if let Some(reason) = deterministic_approval_floor {
-            approval_warnings.push(reason);
-            true
         } else if let Some(runtime) = self.command_risk_runtime.get() {
             match assess_command(
                 runtime,
@@ -3993,6 +3999,50 @@ impl TerminalTool {
         }
     }
 
+    /// A terminal call's arguments, or why they cannot be read.
+    fn read_arguments(arguments: &Value) -> Result<TerminalArgs, String> {
+        serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())
+    }
+
+    /// Why a terminal call's arguments cannot be read, if they cannot.
+    pub(crate) fn unreadable_reason(arguments: &Value) -> Option<String> {
+        Self::read_arguments(arguments).err()
+    }
+
+    /// The card for a terminal call whose arguments cannot be read: nothing
+    /// about it can be judged, so the owner sees the raw arguments, Critical.
+    pub(crate) fn unreadable_request(
+        &self,
+        raw: &Value,
+        reason: &str,
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        let shown = raw.to_string();
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("terminal {shown}"),
+            subject: format!("terminal {shown}"),
+            risk: aidaemon_core::ApprovalRisk::Critical,
+            warnings: vec![
+                format!(
+                    "Execution target: {} ({}) workspace {}",
+                    self.backend.kind().as_str(),
+                    self.backend.id(),
+                    self.backend.workspace_root()
+                ),
+                format!(
+                    "The call's arguments could not be read ({reason}); nothing about what it \
+                     does could be judged."
+                ),
+            ],
+        }
+    }
+
+    /// The permission mode the owner's terminal cards are sent with (it
+    /// picks the buttons offered).
+    pub(crate) fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
+    }
+
     /// The owner approval a terminal call needs, for the daemon's kernel
     /// approval rules: the T8 ladder for `run` (after the hard blocks, which
     /// the tool refuses on its own), the trust-all card, or `None`. The
@@ -4001,30 +4051,31 @@ impl TerminalTool {
         &self,
         arguments: &Value,
         trust: &TerminalTrust,
-    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
-        let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
+    ) -> Result<Option<aidaemon_core::OwnerApprovalRequest>, String> {
+        let args: TerminalArgs = Self::read_arguments(arguments)?;
         let (subject, ask) = match TerminalAction::parse(&args.action) {
-            TerminalAction::TrustAll => {
-                if self.allowed_prefixes.read().await.iter().any(|p| p == "*") {
-                    return None;
-                }
-                (
-                    Self::TRUST_ALL_SUBJECT.to_string(),
-                    LadderAsk {
-                        risk: RiskLevel::Critical,
-                        warnings: Self::trust_all_warnings(),
-                    },
-                )
-            }
+            // Always asked: the card is the only way trust-all turns on.
+            TerminalAction::TrustAll => (
+                Self::TRUST_ALL_SUBJECT.to_string(),
+                LadderAsk {
+                    risk: RiskLevel::Critical,
+                    warnings: Self::trust_all_warnings(),
+                },
+            ),
             TerminalAction::Run | TerminalAction::Unrecognized => {
-                let command = Self::run_command(&args)?;
+                // Neither or both of command and script: the tool refuses it.
+                let Some(command) = Self::run_command(&args) else {
+                    return Ok(None);
+                };
                 if self.pre_approval_block(&args, command, trust).is_some() {
-                    return None;
+                    return Ok(None);
                 }
-                let ask = self.approval_ladder(&args, command, trust).await?;
+                let Some(ask) = self.approval_ladder(&args, command, trust).await else {
+                    return Ok(None);
+                };
                 (command.to_string(), ask)
             }
-            _ => return None,
+            _ => return Ok(None),
         };
         let mut warnings = ask.warnings;
         warnings.insert(
@@ -4050,7 +4101,7 @@ impl TerminalTool {
                 )
                 .await;
         }
-        Some(aidaemon_core::OwnerApprovalRequest {
+        Ok(Some(aidaemon_core::OwnerApprovalRequest {
             effects: Vec::new(),
             summary: subject.clone(),
             subject,
@@ -4060,7 +4111,7 @@ impl TerminalTool {
                 _ => aidaemon_core::ApprovalRisk::Medium,
             },
             warnings,
-        })
+        }))
     }
 
     /// Apply the owner's answer to a terminal card the kernel asked, as the
@@ -9639,6 +9690,7 @@ mod tests {
         let request = tool
             .owner_approval_request(&args, &owner_trust())
             .await
+            .unwrap()
             .expect("a dangerous command asks the owner");
         assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
         assert_eq!(request.subject, "git push synthetic-remote main");
@@ -9781,7 +9833,9 @@ mod tests {
             "cat << EOF\nx\nEOF",
             "cat <<< x",
             "cat <(ls)",
-            "cat 3< ~/x",
+            // Inside the roots: only the numbered-descriptor redirect makes
+            // it untrusted, so this fails if the parser ignores `N<`.
+            "cat 3< /tmp/aidaemon-test/project/x",
         ] {
             let args = serde_json::json!({
                 "action": "run",
@@ -9792,6 +9846,24 @@ mod tests {
             assert_eq!(
                 host.output_trust(&args, &roots),
                 SourceTrust::Untrusted,
+                "{command}"
+            );
+        }
+        // Controls: the same reads inside the roots without the odd
+        // redirect are trusted.
+        for command in [
+            "cat /tmp/aidaemon-test/project/x",
+            "cat < /tmp/aidaemon-test/project/x",
+        ] {
+            let args = serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Trusted,
                 "{command}"
             );
         }
@@ -13274,6 +13346,7 @@ mod tests {
         let request = tool
             .owner_approval_request(&args, &trust)
             .await
+            .unwrap()
             .expect("untrusted-source command must ask even when allowlisted");
         assert!(
             request
@@ -13286,6 +13359,7 @@ mod tests {
         assert!(tool
             .owner_approval_request(&args, &owner_trust())
             .await
+            .unwrap()
             .is_none());
     }
 
