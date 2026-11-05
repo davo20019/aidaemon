@@ -93,7 +93,7 @@ pub(crate) fn map_status(status: StatusCode, headers: &HeaderMap, body: &str) ->
         "provider HTTP error"
     );
     match status.as_u16() {
-        429 => ProviderError::RateLimited {
+        429 if !crate::errors::out_of_credit(body) => ProviderError::RateLimited {
             retry_after: retry_after(headers),
         },
         status => crate::errors::error_for_status(status, body, detail),
@@ -303,6 +303,14 @@ mod tests {
                 retry_after: Some(Duration::from_secs(7))
             }
         );
+        assert!(matches!(
+            map_status(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota"}}"#
+            ),
+            ProviderError::Billing { .. }
+        ));
         assert!(matches!(
             map_status(StatusCode::UNAUTHORIZED, &HeaderMap::new(), "x"),
             ProviderError::Auth(_)
