@@ -275,6 +275,67 @@ pub(crate) mod tests {
         assert!(recorded.learned[0].completed_naturally);
     }
 
+    /// A run a tool finished with work done is a completed run for both
+    /// memory writers: the daemon's summarizes and learns, the memory
+    /// plugin's extracts facts.
+    #[tokio::test]
+    async fn finished_run_is_written_by_both_memory_writers() {
+        use aidaemon_core::testing::{call, spec, tool_calls};
+        use aidaemon_memory::{FactExtractor, HashEmbedder, InMemoryMemoryStore, Memory};
+        for finish in [
+            sdk::Finish::succeeded("Connected the synthetic service."),
+            sdk::Finish::partial("Started; the rest runs in the background."),
+        ] {
+            let writes = Arc::new(RecordingWrites::default());
+            let extraction = ScriptedProvider::new([text(r#"{"facts": []}"#)]);
+            let memory = Memory::builder(
+                Arc::new(InMemoryMemoryStore::new()),
+                Arc::new(HashEmbedder::default()),
+            )
+            .extractor(FactExtractor::new(extraction, "small"))
+            .build();
+            let plugin_writer = Arc::new(aidaemon_memory::MemoryWriter::new(memory));
+            let finisher = sdk::FnTool::new(
+                spec("finisher", "finishes", &[]),
+                sdk::ToolAnnotations::READ_ONLY,
+                move |_: serde_json::Value| {
+                    std::future::ready(Ok(sdk::ToolOutput::text("done").finish(finish.clone())))
+                },
+            );
+            let agent = sdk::Agent::builder("test")
+                .allow_unguarded()
+                .model("scripted")
+                .provider(ScriptedProvider::new([tool_calls([call(
+                    "c1",
+                    "finisher",
+                    serde_json::json!({}),
+                )])]))
+                .tool(finisher)
+                .hook(DaemonMemoryWriter::new(
+                    turn(0, "telegram:synthetic-user-1").await,
+                    SETTINGS,
+                    writes.clone(),
+                ))
+                .hook_arc(plugin_writer.clone())
+                .build()
+                .unwrap();
+            let outcome = agent.run("s", "go").await.unwrap();
+            assert!(matches!(outcome.status, sdk::RunStatus::Finished { .. }));
+
+            {
+                let recorded = writes.0.lock().unwrap();
+                assert_eq!(recorded.summarized, 1, "the daemon writer summarizes");
+                assert_eq!(recorded.learned.len(), 1);
+                assert!(recorded.learned[0].completed_naturally);
+            }
+            assert_eq!(
+                plugin_writer.drain().await.len(),
+                1,
+                "the memory plugin's writer ingests the turn"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn writer_skips_failed_and_cancelled_runs() {
         let failed = run(

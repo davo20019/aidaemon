@@ -47,9 +47,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{
-    Agent, AgentBuilder, BuildError, Hook, HookContext, Limits, Message, ModelRequest, Role,
-    RunOutcome, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput, ToolResult,
-    ToolSpec,
+    Agent, AgentBuilder, BuildError, FinishOutcome, Hook, HookContext, Limits, Message,
+    ModelRequest, Role, RunOutcome, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError,
+    ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -404,6 +404,27 @@ impl Tool for AgentTool {
                 let text = outcome.final_text.as_deref().unwrap_or_default();
                 ToolOutput::text(condense(text, self.max_result_chars))
             }
+            // A tool in the sub-agent ended its run: the finish reply is the
+            // answer. Partial work says so; a blocked one is a failure the
+            // caller should react to.
+            RunStatus::Finished {
+                outcome: finish, ..
+            } => {
+                let text = condense(
+                    outcome.final_text.as_deref().unwrap_or_default(),
+                    self.max_result_chars,
+                );
+                match finish {
+                    FinishOutcome::Succeeded => ToolOutput::text(text),
+                    FinishOutcome::Partial => ToolOutput::text(format!(
+                        "sub-agent `{}` finished part of the task:\n{text}",
+                        self.name
+                    )),
+                    _ => {
+                        ToolOutput::error(format!("sub-agent `{}` is blocked:\n{text}", self.name))
+                    }
+                }
+            }
             RunStatus::Interrupted { interruption } => ToolOutput::error(format!(
                 "sub-agent `{}` paused waiting for approval of `{}` ({}). Sub-agents that need \
                  approval are not supported in synchronous agent-as-tool mode, so the call did \
@@ -445,6 +466,15 @@ pub fn status_label(status: &RunStatus) -> String {
         RunStatus::Stuck { signal } => format!("stuck ({signal:?})"),
         RunStatus::Cancelled => "cancelled".into(),
         RunStatus::ProviderFailed { error } => format!("provider failed ({error})"),
+        RunStatus::Finished { outcome, tool } => {
+            let how = match outcome {
+                FinishOutcome::Succeeded => "succeeded",
+                FinishOutcome::Partial => "partial",
+                FinishOutcome::Blocked => "blocked",
+                _ => "ended",
+            };
+            format!("finished by `{tool}` ({how})")
+        }
         other => format!("{other:?}"),
     }
 }

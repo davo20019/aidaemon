@@ -748,10 +748,16 @@ impl Inner {
         self.remember(session, generation, &outcome).await;
 
         match &outcome.status {
-            RunStatus::Completed => {
+            // The model's final answer, or the reply a tool finished the
+            // run with.
+            RunStatus::Completed | RunStatus::Finished { .. } => {
                 let text = outcome.final_text.as_deref().unwrap_or("").trim();
-                self.reply(&origin, if text.is_empty() { "Done." } else { text })
-                    .await;
+                if text.is_empty() {
+                    self.reply(&origin, &render::ending_text(&outcome.status))
+                        .await;
+                } else {
+                    self.reply(&origin, text).await;
+                }
                 None
             }
             RunStatus::Interrupted { interruption } => {

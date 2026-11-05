@@ -576,3 +576,17 @@ async fn shipped_scenarios_all_pass() {
         assert!(statuses.iter().any(|x| x == s), "{statuses:?}");
     }
 }
+
+/// A run a tool finished has its own status, never "unknown", and a
+/// scenario can expect it.
+#[test]
+fn finished_runs_have_their_own_status() {
+    let status = aidaemon_core::RunStatus::Finished {
+        outcome: aidaemon_core::FinishOutcome::Partial,
+        tool: "file_report".into(),
+    };
+    assert_eq!(aidaemon_eval::status_name(&status), "finished");
+    let expected: ExpectedStatus = serde_yaml::from_str("finished").unwrap();
+    assert_eq!(expected, ExpectedStatus::Finished);
+    assert_eq!(expected.as_str(), aidaemon_eval::status_name(&status));
+}

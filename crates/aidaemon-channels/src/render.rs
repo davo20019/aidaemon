@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use aidaemon_core::{Event, Interruption, LimitKind, ReceiptStatus, RunStatus};
+use aidaemon_core::{Event, FinishOutcome, Interruption, LimitKind, ReceiptStatus, RunStatus};
 
 const MAX_TOOL_LINES: usize = 8;
 
@@ -173,6 +173,13 @@ pub(crate) fn ending_text(status: &RunStatus) -> String {
             "I stopped because I was repeating myself without making progress.".to_string()
         }
         RunStatus::Cancelled => "Stopped.".to_string(),
+        // A tool ended the run; its reply, when it has one, is the answer.
+        RunStatus::Finished { outcome, .. } => match outcome {
+            FinishOutcome::Succeeded => "Done.".to_string(),
+            FinishOutcome::Partial => "I did part of it; the rest is still underway.".to_string(),
+            FinishOutcome::Blocked => "I can't go on without help.".to_string(),
+            _ => "I stopped here.".to_string(),
+        },
         RunStatus::ProviderFailed { error } => format!(
             "I could not get a reply from the model provider ({}). Please try again.",
             truncate_chars(error, 200)
@@ -188,6 +195,12 @@ pub(crate) fn status_word(status: &RunStatus) -> &'static str {
         RunStatus::Completed => "Done",
         RunStatus::Interrupted { .. } => "Waiting for approval",
         RunStatus::Cancelled => "Stopped",
+        RunStatus::Finished { outcome, .. } => match outcome {
+            FinishOutcome::Succeeded => "Done",
+            FinishOutcome::Partial => "Partly done",
+            FinishOutcome::Blocked => "Blocked",
+            _ => "Ended",
+        },
         _ => "Ended",
     }
 }
@@ -233,5 +246,25 @@ mod tests {
         });
         assert!(p.render(200).contains("Running `search`"));
         assert!(p.render(10).chars().count() <= 10);
+    }
+
+    /// A run a tool finished reads by its outcome, never as an unexpected
+    /// ending.
+    #[test]
+    fn finished_runs_read_by_their_outcome() {
+        let finished = |outcome| RunStatus::Finished {
+            outcome,
+            tool: "file_report".into(),
+        };
+        assert_eq!(ending_text(&finished(FinishOutcome::Succeeded)), "Done.");
+        assert_eq!(status_word(&finished(FinishOutcome::Succeeded)), "Done");
+        assert_eq!(
+            status_word(&finished(FinishOutcome::Partial)),
+            "Partly done"
+        );
+        assert_eq!(status_word(&finished(FinishOutcome::Blocked)), "Blocked");
+        for outcome in [FinishOutcome::Partial, FinishOutcome::Blocked] {
+            assert!(!ending_text(&finished(outcome)).contains("unexpectedly"));
+        }
     }
 }

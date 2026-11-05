@@ -598,3 +598,51 @@ async fn memory_recall_injects_into_requests_never_into_state() {
         .all(|m| !m.content.contains("Recalled memory")));
     assert_eq!(outcome.state.messages.len(), 2);
 }
+
+/// A run a tool finished with the work done or partly done is a completed
+/// run: its turn is extracted. A blocked finish is not.
+#[tokio::test]
+async fn finished_run_is_extracted_unless_blocked() {
+    use aidaemon_core::testing::{call, spec, tool_calls};
+    use aidaemon_core::{Finish, FnTool, ToolAnnotations, ToolOutput};
+    for (finish, extracted) in [
+        (Finish::succeeded("Booked a window seat."), 1),
+        (
+            Finish::partial("Booking the window seat in the background."),
+            1,
+        ),
+        (
+            Finish::blocked("The airline needs the owner's passport."),
+            0,
+        ),
+    ] {
+        let extraction = Arc::new(ScriptedProvider::new([facts_reply(json!([]))]));
+        let memory = memory_with(Some(FactExtractor::new(extraction.clone(), "small")), None);
+        let writer = Arc::new(MemoryWriter::new(memory));
+        let book = FnTool::new(
+            spec("book", "Books a seat", &[]),
+            ToolAnnotations::READ_ONLY,
+            move |_: serde_json::Value| {
+                std::future::ready(Ok(ToolOutput::text("booking").finish(finish.clone())))
+            },
+        );
+        let agent = Agent::builder("assistant")
+            .allow_unguarded()
+            .model("m")
+            .provider(ScriptedProvider::new([tool_calls([call(
+                "c1",
+                "book",
+                json!({}),
+            )])]))
+            .tool(book)
+            .hook_arc(writer.clone())
+            .build()
+            .unwrap();
+        agent
+            .run(SESSION, "I always prefer a window seat when I fly")
+            .await
+            .unwrap();
+        assert_eq!(writer.drain().await.len(), extracted);
+        assert_eq!(extraction.requests().len(), extracted);
+    }
+}

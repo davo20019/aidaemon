@@ -126,6 +126,8 @@ pub enum ExpectedStatus {
     Stuck,
     Cancelled,
     ProviderFailed,
+    /// A tool ended the run with its own finish.
+    Finished,
 }
 
 impl ExpectedStatus {
@@ -138,6 +140,7 @@ impl ExpectedStatus {
             Self::Stuck => "stuck",
             Self::Cancelled => "cancelled",
             Self::ProviderFailed => "provider_failed",
+            Self::Finished => "finished",
         }
     }
 }
@@ -152,6 +155,7 @@ pub fn status_name(status: &RunStatus) -> &'static str {
         RunStatus::Stuck { .. } => "stuck",
         RunStatus::Cancelled => "cancelled",
         RunStatus::ProviderFailed { .. } => "provider_failed",
+        RunStatus::Finished { .. } => "finished",
         _ => "unknown",
     }
 }

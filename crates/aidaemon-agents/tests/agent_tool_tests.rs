@@ -465,3 +465,64 @@ async fn invalid_arguments_are_rejected_before_the_child_runs() {
     assert_eq!(out.receipts()[0].status, ReceiptStatus::InvalidArguments);
     assert!(child_provider.requests().is_empty());
 }
+
+/// A child a tool finished: the finish reply is the answer, partial work
+/// says so, and a blocked child is an error the parent reacts to.
+#[tokio::test]
+async fn finished_child_returns_its_finish_reply() {
+    use aidaemon_core::Finish;
+    for (finish, error, expected) in [
+        (
+            Finish::succeeded("Filed the synthetic report."),
+            false,
+            "Filed the synthetic report.",
+        ),
+        (
+            Finish::partial("Filed half; the rest runs later."),
+            false,
+            "finished part of the task:\nFiled half; the rest runs later.",
+        ),
+        (
+            Finish::blocked("Needs the owner's sign-off."),
+            true,
+            "is blocked:\nNeeds the owner's sign-off.",
+        ),
+    ] {
+        let finisher = FnTool::new(
+            spec("file_report", "Files the report", &[]),
+            ToolAnnotations::READ_ONLY,
+            move |_: Value| {
+                let finish = finish.clone();
+                async move { Ok(ToolOutput::text("filed").finish(finish)) }
+            },
+        );
+        let child_provider = Arc::new(ScriptedProvider::new([tool_calls([call(
+            "f1",
+            "file_report",
+            json!({}),
+        )])]));
+        let tool = AgentTool::from_builder(
+            child_builder(child_provider).tool(finisher),
+            ChildBudget::default(),
+        )
+        .unwrap();
+        let parent_provider = Arc::new(ScriptedProvider::new([
+            tool_calls([delegate("c1", "file it")]),
+            text("handled"),
+        ]));
+        let out = parent(parent_provider.clone(), tool.name("research"))
+            .run("s", "go")
+            .await
+            .unwrap();
+        assert!(out.is_completed());
+        let seen = tool_message(&parent_provider, "c1");
+        assert!(seen.contains(expected), "{seen}");
+        let receipt = &out.receipts()[0];
+        assert_eq!(
+            receipt.status == ReceiptStatus::Failed,
+            error,
+            "{:?}",
+            receipt.status
+        );
+    }
+}

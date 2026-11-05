@@ -79,10 +79,24 @@ impl MemoryWriter {
     }
 }
 
+/// The run ended with an answer: the model's final reply, or a tool's
+/// finish with the work done or partly done.
+fn completed_with_work(outcome: &RunOutcome) -> bool {
+    matches!(
+        outcome.status,
+        aidaemon_core::RunStatus::Completed
+            | aidaemon_core::RunStatus::Finished {
+                outcome: aidaemon_core::FinishOutcome::Succeeded
+                    | aidaemon_core::FinishOutcome::Partial,
+                ..
+            }
+    )
+}
+
 #[async_trait]
 impl Hook for MemoryWriter {
     async fn on_run_end(&self, ctx: &HookContext<'_>, outcome: &RunOutcome) {
-        if !outcome.is_completed() || self.memory.extractor().is_none() {
+        if !completed_with_work(outcome) || self.memory.extractor().is_none() {
             return;
         }
         let Some(index) = aidaemon_policies::last_user_message_index(ctx.messages) else {
