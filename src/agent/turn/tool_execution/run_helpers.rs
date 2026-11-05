@@ -154,6 +154,42 @@ pub(super) fn access_manifest_scope_violation(
         .map(|check| check.reason().to_string())
 }
 
+/// A path as the filesystem resolves it, for scope containment: the
+/// longest prefix that exists is canonicalized (symlinks and `..` resolved
+/// physically), and the rest is resolved lexically (`.` dropped, `..` pops).
+/// A relative path is only resolved lexically; callers anchor relative
+/// targets to the execution cwd first.
+pub(in crate::agent) fn normalize_scope_path(raw: &str) -> std::path::PathBuf {
+    use std::path::{Component, Path, PathBuf};
+    let path = Path::new(raw);
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut start = 0;
+    let mut resolved = PathBuf::new();
+    if path.is_absolute() {
+        // The longest existing prefix, resolved physically.
+        for end in (1..=components.len()).rev() {
+            let prefix: PathBuf = components[..end].iter().collect();
+            if let Ok(real) = std::fs::canonicalize(&prefix) {
+                resolved = real;
+                start = end;
+                break;
+            }
+        }
+    }
+    for component in &components[start..] {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() && !path.is_absolute() {
+                    resolved.push("..");
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
+}
+
 pub(in crate::agent) fn access_manifest_scope_check(
     tool_name: &str,
     call: &crate::traits::ToolCallAccessManifest,
@@ -204,14 +240,20 @@ pub(in crate::agent) fn access_manifest_scope_check(
             (ToolTargetHintKind::Url, ToolTargetHintKind::Url) => {
                 grant.value.eq_ignore_ascii_case(&candidate.value)
             }
-            (ToolTargetHintKind::Path, ToolTargetHintKind::Path) => grant.value == candidate.value,
+            (ToolTargetHintKind::Path, ToolTargetHintKind::Path) => {
+                grant.value == candidate.value
+                    || normalize_scope_path(&grant.value) == normalize_scope_path(&candidate.value)
+            }
             (
                 ToolTargetHintKind::ProjectScope,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
             ) => {
-                let grant = std::path::Path::new(&grant.value);
-                let candidate = std::path::Path::new(&candidate.value);
-                candidate == grant || candidate.starts_with(grant)
+                // Both sides normalized first: `..` and symlinks are
+                // resolved, so `<root>/../x` and a link out of the root are
+                // not "inside" it.
+                let grant = normalize_scope_path(&grant.value);
+                let candidate = normalize_scope_path(&candidate.value);
+                candidate == grant || candidate.starts_with(&grant)
             }
             _ => false,
         };
@@ -227,9 +269,11 @@ pub(in crate::agent) fn access_manifest_scope_check(
             matches!(
                 target.kind,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
-            ) && crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+            ) && (crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            )) && !covered_by(target, &call.adapter_read_targets)
+            )) || crate::tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
+                &target.value,
+            ))) && !covered_by(target, &call.adapter_read_targets)
         })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
@@ -240,9 +284,11 @@ pub(in crate::agent) fn access_manifest_scope_check(
             matches!(
                 target.kind,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
-            ) && crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+            ) && (crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            ))
+            )) || crate::tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
+                &target.value,
+            )))
         })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
@@ -2372,6 +2418,71 @@ mod scope_escalation_tests {
             access_manifest_scope_violation("terminal", &call, Some(&task), &[], Some(root))
                 .is_some()
         );
+    }
+
+    /// A fresh project under `/tmp/aidaemon-test/<uuid>`, with a sibling.
+    fn temp_project() -> (std::path::PathBuf, String) {
+        let base =
+            std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join("a")).unwrap();
+        std::fs::create_dir_all(base.join("sibling")).unwrap();
+        std::fs::write(base.join("sibling").join("x"), "synthetic").unwrap();
+        let root = project.to_string_lossy().to_string();
+        (base, root)
+    }
+
+    /// `..` is resolved before the containment test: a path that walks out
+    /// of the project is out of scope however it is spelled.
+    #[test]
+    fn dotdot_escape_from_the_project_is_out_of_scope() {
+        let (base, root) = temp_project();
+        let task = task_scope(&root);
+        for escape in [format!("{root}/../sibling/x"), "../sibling/x".to_string()] {
+            let call = call_reading(&root, &escape);
+            assert!(
+                matches!(
+                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+                    Some(ScopeCheck::Escalatable { .. })
+                ),
+                "{escape} must be out of scope"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inner_dotdot_stays_in_scope() {
+        let (base, root) = temp_project();
+        let task = task_scope(&root);
+        let call = call_reading(&root, &format!("{root}/a/../b"));
+        assert_eq!(
+            access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A symlink inside the project that points outside it is judged by its
+    /// target, not by where it sits.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_out_of_the_project_is_out_of_scope() {
+        let (base, root) = temp_project();
+        let task = task_scope(&root);
+        let link = std::path::Path::new(&root).join("link");
+        std::os::unix::fs::symlink(base.join("sibling"), &link).unwrap();
+        for read in [format!("{root}/link/x"), format!("{root}/link/../x")] {
+            let call = call_reading(&root, &read);
+            assert!(
+                matches!(
+                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+                    Some(ScopeCheck::Escalatable { .. })
+                ),
+                "{read} must be out of scope"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

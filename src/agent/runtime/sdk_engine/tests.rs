@@ -3619,3 +3619,103 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// In sandbox confinement, a terminal read that walks out of the project
+/// with `..` is an escalation the owner is asked about, not an in-scope
+/// read.
+#[tokio::test]
+async fn sandbox_dotdot_read_out_of_the_project_asks() {
+    use aidaemon_policies::{ApprovalRules, RuleDecision};
+    let base = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    let project = base.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(base.join("sibling")).unwrap();
+    std::fs::write(base.join("sibling").join("x"), "synthetic").unwrap();
+    let project_dir = project.to_string_lossy().to_string();
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            vec!["cat".to_string()],
+            crate::tools::ApprovalBroker::new(tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox),
+    );
+    let judged = crate::agent::approvals::JudgedCalls::default();
+    let rules = crate::agent::approvals::AppApprovalRules {
+        session_id: "telegram:synthetic-user-1".to_string(),
+        user_role: Some(UserRole::Owner),
+        terminal: crate::agent::approvals::TerminalApprovals::find(std::slice::from_ref(&tool))
+            .map(|terminal| {
+                terminal.with_canonicalizer(
+                    terminal_canonicalizer(TerminalCanonTurn {
+                        tool: tool.clone(),
+                        known_project_dir: Arc::new(std::sync::Mutex::new(Some(
+                            project_dir.clone(),
+                        ))),
+                        session_id: "telegram:synthetic-user-1".to_string(),
+                        task_access: None,
+                        authorized_scopes: vec![project_dir.clone()],
+                        workspace_grant: false,
+                    }),
+                    judged.clone(),
+                )
+            }),
+        ..Default::default()
+    };
+    let call = sdk::ToolCall::new(
+        "call-dotdot-1",
+        "terminal",
+        serde_json::json!({
+            "action": "run",
+            "command": "cat ../sibling/x",
+            "read_paths": ["../sibling/x"],
+        }),
+    );
+    let ctx = sdk::HookContext {
+        run_id: sdk::RunId::new(),
+        agent_id: "aidaemon",
+        session_id: "telegram:synthetic-user-1",
+        turn: 1,
+        messages: &[],
+        receipts: &[],
+        usage: sdk::Usage::default(),
+        run_usage: sdk::Usage::default(),
+        untrusted_seen: false,
+        declined: &[],
+    };
+    let info = sdk::ToolInfo {
+        annotations: sdk::ToolAnnotations::default(),
+        access: sdk::AccessManifest::default(),
+        effects: sdk::CallEffects::unknown(),
+    };
+    let decision = rules.judge(&ctx, &call, &info).await;
+    let RuleDecision::Ask(request) = &decision else {
+        panic!("a `..` escape asks the owner: {decision:?}");
+    };
+    assert!(
+        request
+            .warnings
+            .iter()
+            .any(|w| w.contains("read outside task scope") && w.contains("sibling/x")),
+        "{request:?}"
+    );
+    assert!(matches!(
+        judged
+            .lock()
+            .unwrap()
+            .get("call-dotdot-1")
+            .map(|j| &j.scope),
+        Some(crate::agent::approvals::TerminalScope::Escalate(_))
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+}
