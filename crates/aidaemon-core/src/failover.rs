@@ -109,8 +109,12 @@ pub enum FailoverAction {
 }
 
 /// Decides what follows a failed attempt. The default ([`DefaultFailover`])
-/// retries rate limits and transient errors on the same step, moves on
-/// from authentication and other errors, and stops on an invalid request.
+/// retries what [`ProviderError::is_retryable`] allows on the same step,
+/// then moves on; it moves on at once from authentication, billing,
+/// not-found and other errors, and stops on an invalid request, a context
+/// overflow (the caller must shrink it) and a wrongly shaped reply.
+/// A request with [`crate::RequestOptions::single_attempt`] stops at its
+/// first error whatever the policy says.
 pub trait FailoverPolicy: Send + Sync {
     /// `attempt` counts from 1; `attempts` is the step's limit.
     fn after_error(&self, error: &ProviderError, attempt: u32, attempts: u32) -> FailoverAction;
@@ -133,9 +137,7 @@ impl Default for DefaultFailover {
 impl FailoverPolicy for DefaultFailover {
     fn after_error(&self, error: &ProviderError, attempt: u32, attempts: u32) -> FailoverAction {
         match error {
-            ProviderError::RateLimited { .. } | ProviderError::Transient(_)
-                if attempt < attempts =>
-            {
+            error if error.is_retryable() && attempt < attempts => {
                 let delay = match error {
                     ProviderError::RateLimited {
                         retry_after: Some(after),
@@ -144,7 +146,9 @@ impl FailoverPolicy for DefaultFailover {
                 };
                 FailoverAction::Retry(delay.min(MAX_BACKOFF))
             }
-            ProviderError::InvalidRequest(_) => FailoverAction::Stop,
+            ProviderError::InvalidRequest(_)
+            | ProviderError::ContextOverflow { .. }
+            | ProviderError::Malformed { parse: false, .. } => FailoverAction::Stop,
             _ => FailoverAction::Next,
         }
     }
@@ -196,10 +200,14 @@ impl Failover {
     /// `None` to move on, or the error to give up with.
     fn next_move(
         &self,
+        request: &ModelRequest,
         step: &FailoverStep,
         attempt: u32,
         error: ProviderError,
     ) -> Result<Option<Duration>, ProviderError> {
+        if request.options.single_attempt {
+            return Err(error);
+        }
         match self.policy.after_error(&error, attempt, step.attempts) {
             FailoverAction::Retry(delay) => Ok(Some(delay)),
             FailoverAction::Next => Ok(None),
@@ -251,7 +259,7 @@ impl Provider for Failover {
                     Ok(Err(error)) => error,
                     Err(_) => timed_out(step.deadline),
                 };
-                match self.next_move(step, attempt, error.clone())? {
+                match self.next_move(request, step, attempt, error.clone())? {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => break error,
                 }
@@ -296,7 +304,7 @@ impl Provider for Failover {
                         Err(_) => timed_out(step.deadline),
                     };
                     drop(events);
-                    match self.next_move(step, attempt, error.clone()) {
+                    match self.next_move(request, step, attempt, error.clone()) {
                         Ok(Some(delay)) => tokio::time::sleep(delay).await,
                         Ok(None) => break error,
                         Err(error) => {
@@ -357,6 +365,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: Default::default(),
             max_output_tokens: None,
+            ..Default::default()
         }
     }
 

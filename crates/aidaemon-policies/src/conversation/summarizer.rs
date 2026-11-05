@@ -159,6 +159,7 @@ impl Summarizer for ProviderSummarizer {
             tools: Vec::new(),
             tool_choice: Default::default(),
             max_output_tokens: None,
+            ..Default::default()
         };
         let _permit = self
             .permits

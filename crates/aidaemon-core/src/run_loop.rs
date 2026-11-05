@@ -845,6 +845,7 @@ impl<'a> Driver<'a> {
             tools: self.agent.specs.clone(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: self.agent.max_output_tokens,
+            ..Default::default()
         }
     }
 

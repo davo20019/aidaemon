@@ -87,11 +87,7 @@ pub(crate) fn map_status(status: StatusCode, headers: &HeaderMap, body: &str) ->
         429 => ProviderError::RateLimited {
             retry_after: retry_after(headers),
         },
-        401 | 403 => ProviderError::Auth(detail),
-        408 => ProviderError::Transient(detail),
-        400..=499 => ProviderError::InvalidRequest(detail),
-        500..=599 => ProviderError::Transient(detail),
-        _ => ProviderError::Other(detail),
+        status => crate::errors::error_for_status(status, body, detail),
     }
 }
 

@@ -438,6 +438,7 @@ mod tests {
             tools: Vec::new(),
             tool_choice: Default::default(),
             max_output_tokens: None,
+            ..Default::default()
         }
     }
 

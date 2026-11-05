@@ -33,6 +33,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         tools: vec![],
         tool_choice: ToolChoice::Auto,
         max_output_tokens: None,
+        ..Default::default()
     }
 }
 
@@ -338,7 +339,7 @@ async fn http_error_mapping() {
     ));
     assert!(matches!(
         error_for(MockResponse::status(404, r#"{"type":"error","error":{"type":"not_found_error","message":"model: nope"}}"#)).await,
-        ProviderError::InvalidRequest(m) if m.contains("model: nope")
+        ProviderError::NotFound(m) if m.contains("model: nope")
     ));
 }
 

@@ -17,9 +17,11 @@
 //! HTTP failures map to [`ProviderError`](aidaemon_core::ProviderError):
 //! 429 becomes `RateLimited` (with `retry-after`), 5xx, 408, timeouts,
 //! connection failures and mid-stream error events become `Transient`,
-//! 401/403 become `Auth`, and other 4xx become `InvalidRequest` with a
-//! short excerpt of the response body. Wrap a provider in
-//! [`aidaemon_core::Retry`] to retry the retryable ones.
+//! 401/403 `Auth`, 402 `Billing` (with the affordable tokens when stated),
+//! 404 `NotFound`, a context-length error `ContextOverflow` (with the
+//! window when stated), and other 4xx `InvalidRequest`, each with a short
+//! excerpt of the response body. Wrap a provider in
+//! [`aidaemon_core::Retry`] or [`aidaemon_core::Failover`] to recover.
 //!
 //! ```no_run
 //! use aidaemon_core::{Agent, Retry};
@@ -48,6 +50,7 @@
 //! ```
 
 mod anthropic;
+mod errors;
 mod openai;
 mod sse;
 mod transport;
@@ -56,5 +59,6 @@ pub use anthropic::{
     Anthropic, AnthropicBuilder, ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MAX_TOKENS,
     ANTHROPIC_VERSION,
 };
+pub use errors::{affordable_tokens, context_overflow, error_for_status};
 pub use openai::{OpenAiCompatible, OpenAiCompatibleBuilder, OPENAI_DEFAULT_BASE_URL};
 pub use transport::ConfigError;

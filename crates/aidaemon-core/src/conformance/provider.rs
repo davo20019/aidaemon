@@ -58,6 +58,7 @@ pub fn probe_requests() -> Vec<(&'static str, ModelRequest)> {
         tools,
         tool_choice: ToolChoice::Auto,
         max_output_tokens: Some(256),
+        ..Default::default()
     };
     vec![
         ("plain", base(Vec::new(), "Reply with a short greeting.")),
@@ -374,6 +375,7 @@ mod tests {
                     cached_input_tokens: 5,
                     cache_creation_tokens: 0,
                 },
+                ..Default::default()
             })
         }
         fn stream<'a>(

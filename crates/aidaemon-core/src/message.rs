@@ -36,6 +36,11 @@ pub struct ToolCall {
     pub name: String,
     /// Arguments as JSON. Providers that send a string should parse it first.
     pub arguments: Value,
+    /// Opaque data the same provider needs back when this call is replayed
+    /// in a later request (a reasoning signature, thinking blocks). Other
+    /// providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<Value>,
 }
 
 impl ToolCall {
@@ -44,7 +49,13 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments,
+            provider_data: None,
         }
+    }
+
+    pub fn with_provider_data(mut self, data: Value) -> Self {
+        self.provider_data = Some(data);
+        self
     }
 }
 

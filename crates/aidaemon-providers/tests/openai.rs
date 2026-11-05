@@ -34,6 +34,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         tools: vec![],
         tool_choice: ToolChoice::Auto,
         max_output_tokens: None,
+        ..Default::default()
     }
 }
 

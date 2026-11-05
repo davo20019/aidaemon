@@ -175,6 +175,7 @@ impl FactExtractor {
             tools: vec![Self::tool_spec()],
             tool_choice: ToolChoice::Specific(FACTS_TOOL.into()),
             max_output_tokens: Some(1_024),
+            ..Default::default()
         };
         let response = self.provider.complete(&request).await?;
         let mut extraction = parse_facts(&response);
@@ -400,6 +401,7 @@ impl EpisodeSummarizer {
             tools: vec![Self::tool_spec()],
             tool_choice: ToolChoice::Specific(EPISODE_TOOL.into()),
             max_output_tokens: Some(768),
+            ..Default::default()
         };
         let response = self.provider.complete(&request).await?;
         let payload = payload(&response, EPISODE_TOOL)

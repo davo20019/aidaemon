@@ -159,7 +159,17 @@ pub aidaemon_core::MessageOrigin::StopHook
 pub aidaemon_core::MessageOrigin::User
 pub enum aidaemon_core::ProviderError
 pub aidaemon_core::ProviderError::Auth(alloc::string::String)
+pub aidaemon_core::ProviderError::Billing
+pub aidaemon_core::ProviderError::Billing::affordable_tokens: core::option::Option<u64>
+pub aidaemon_core::ProviderError::Billing::message: alloc::string::String
+pub aidaemon_core::ProviderError::ContextOverflow
+pub aidaemon_core::ProviderError::ContextOverflow::limit: core::option::Option<u64>
+pub aidaemon_core::ProviderError::ContextOverflow::message: alloc::string::String
 pub aidaemon_core::ProviderError::InvalidRequest(alloc::string::String)
+pub aidaemon_core::ProviderError::Malformed
+pub aidaemon_core::ProviderError::Malformed::message: alloc::string::String
+pub aidaemon_core::ProviderError::Malformed::parse: bool
+pub aidaemon_core::ProviderError::NotFound(alloc::string::String)
 pub aidaemon_core::ProviderError::Other(alloc::string::String)
 pub aidaemon_core::ProviderError::RateLimited
 pub aidaemon_core::ProviderError::RateLimited::retry_after: core::option::Option<core::time::Duration>
@@ -180,6 +190,13 @@ pub enum aidaemon_core::Resolution
 pub aidaemon_core::Resolution::Approve
 pub aidaemon_core::Resolution::Deny
 pub aidaemon_core::Resolution::Deny::reason: alloc::string::String
+pub enum aidaemon_core::ResponseFormat
+pub aidaemon_core::ResponseFormat::JsonObject
+pub aidaemon_core::ResponseFormat::JsonSchema
+pub aidaemon_core::ResponseFormat::JsonSchema::name: alloc::string::String
+pub aidaemon_core::ResponseFormat::JsonSchema::schema: serde_json::value::Value
+pub aidaemon_core::ResponseFormat::JsonSchema::strict: bool
+pub aidaemon_core::ResponseFormat::Text
 pub enum aidaemon_core::Role
 pub aidaemon_core::Role::Assistant
 pub aidaemon_core::Role::System
@@ -417,9 +434,12 @@ pub struct aidaemon_core::ModelRequest
 pub aidaemon_core::ModelRequest::max_output_tokens: core::option::Option<u32>
 pub aidaemon_core::ModelRequest::messages: alloc::vec::Vec<aidaemon_core::Message>
 pub aidaemon_core::ModelRequest::model: alloc::string::String
+pub aidaemon_core::ModelRequest::options: aidaemon_core::RequestOptions
 pub aidaemon_core::ModelRequest::tool_choice: aidaemon_core::ToolChoice
 pub aidaemon_core::ModelRequest::tools: alloc::vec::Vec<aidaemon_core::ToolSpec>
 pub struct aidaemon_core::ModelResponse
+pub aidaemon_core::ModelResponse::note: core::option::Option<alloc::string::String>
+pub aidaemon_core::ModelResponse::reasoning: core::option::Option<alloc::string::String>
 pub aidaemon_core::ModelResponse::text: alloc::string::String
 pub aidaemon_core::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::ModelResponse::usage: aidaemon_core::Usage
@@ -448,6 +468,10 @@ pub aidaemon_core::Receipt::tool: alloc::string::String
 pub aidaemon_core::Receipt::turn: u32
 impl aidaemon_core::Receipt
 pub fn aidaemon_core::Receipt::succeeded(&self) -> bool
+pub struct aidaemon_core::RequestOptions
+pub aidaemon_core::RequestOptions::reasoning_effort: core::option::Option<alloc::string::String>
+pub aidaemon_core::RequestOptions::response_format: aidaemon_core::ResponseFormat
+pub aidaemon_core::RequestOptions::single_attempt: bool
 pub struct aidaemon_core::Retry<P>
 impl<P: aidaemon_core::Provider> aidaemon_core::Retry<P>
 pub fn aidaemon_core::Retry<P>::base_delay(self, core::time::Duration) -> Self
@@ -523,8 +547,10 @@ pub struct aidaemon_core::ToolCall
 pub aidaemon_core::ToolCall::arguments: serde_json::value::Value
 pub aidaemon_core::ToolCall::id: alloc::string::String
 pub aidaemon_core::ToolCall::name: alloc::string::String
+pub aidaemon_core::ToolCall::provider_data: core::option::Option<serde_json::value::Value>
 impl aidaemon_core::ToolCall
 pub fn aidaemon_core::ToolCall::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
+pub fn aidaemon_core::ToolCall::with_provider_data(self, serde_json::value::Value) -> Self
 #[non_exhaustive] pub struct aidaemon_core::ToolContext
 pub aidaemon_core::ToolContext::call_id: alloc::string::String
 pub aidaemon_core::ToolContext::cancel: tokio_util::sync::cancellation_token::CancellationToken

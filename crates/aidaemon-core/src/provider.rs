@@ -26,8 +26,38 @@ pub enum ToolChoice {
     Specific(String),
 }
 
+/// The shape a reply must take.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    /// Any JSON object.
+    JsonObject,
+    /// JSON matching `schema`.
+    JsonSchema {
+        name: String,
+        schema: Value,
+        strict: bool,
+    },
+}
+
+/// How a provider should answer, beyond the messages and tools. Providers
+/// map what their API supports and ignore the rest.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RequestOptions {
+    pub response_format: ResponseFormat,
+    /// Provider-neutral reasoning effort: `"low"`, `"medium"` or `"high"`;
+    /// `"off"` turns reasoning off. `None` keeps the provider's default.
+    pub reasoning_effort: Option<String>,
+    /// Exactly one attempt: providers skip their own internal retries, and
+    /// [`Retry`] and [`crate::Failover`] give up at the first error. For a
+    /// call that must not run twice.
+    pub single_attempt: bool,
+}
+
 /// One provider call. Hooks may edit it in [`crate::Hook::before_model`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequest {
     pub model: String,
     /// Instructions first (stable, cacheable), then the transcript.
@@ -35,6 +65,7 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     pub tool_choice: ToolChoice,
     pub max_output_tokens: Option<u32>,
+    pub options: RequestOptions,
 }
 
 /// Token accounting for one call or a whole run.
@@ -67,6 +98,12 @@ pub struct ModelResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// The model's visible reasoning, when the provider returns it apart
+    /// from the answer.
+    pub reasoning: Option<String>,
+    /// Why the reply may be incomplete (cut off at the token limit, held
+    /// back by a safety filter), in the provider's words.
+    pub note: Option<String>,
 }
 
 /// One item of a streamed reply. A well-formed stream yields any number of
@@ -92,13 +129,36 @@ pub enum ProviderError {
     InvalidRequest(String),
     #[error("authentication failed: {0}")]
     Auth(String),
+    /// The account cannot pay for the request. `affordable_tokens` is the
+    /// output the provider says it could still pay for, when it says.
+    #[error("billing: {message}")]
+    Billing {
+        message: String,
+        affordable_tokens: Option<u64>,
+    },
+    /// The model or endpoint does not exist here.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// The request does not fit the model's context window. `limit` is
+    /// the window in tokens, when the provider states it.
+    #[error("context window exceeded: {message}")]
+    ContextOverflow { message: String, limit: Option<u64> },
+    /// The reply could not be read. `parse` is true when it was not valid
+    /// at all (often a cut-off stream, worth another attempt), false when it
+    /// parsed but had the wrong shape.
+    #[error("malformed reply: {message}")]
+    Malformed { message: String, parse: bool },
     #[error("provider error: {0}")]
     Other(String),
 }
 
 impl ProviderError {
+    /// Worth another attempt at the same provider.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::Transient(_))
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Transient(_) | Self::Malformed { parse: true, .. }
+        )
     }
 }
 
@@ -205,7 +265,11 @@ impl<P: Provider> Provider for Retry<P> {
             attempt += 1;
             match self.inner.complete(request).await {
                 Ok(response) => return Ok(response),
-                Err(err) if err.is_retryable() && attempt < self.max_attempts => {
+                Err(err)
+                    if err.is_retryable()
+                        && attempt < self.max_attempts
+                        && !request.options.single_attempt =>
+                {
                     tokio::time::sleep(self.delay_for(&err, attempt)).await;
                 }
                 Err(err) => return Err(err),
@@ -225,7 +289,11 @@ impl<P: Provider> Provider for Retry<P> {
                 attempt += 1;
                 let mut events = self.inner.stream(request);
                 match events.next().await {
-                    Some(Err(err)) if err.is_retryable() && attempt < self.max_attempts => {
+                    Some(Err(err))
+                        if err.is_retryable()
+                            && attempt < self.max_attempts
+                            && !request.options.single_attempt =>
+                    {
                         tokio::time::sleep(self.delay_for(&err, attempt)).await;
                     }
                     first => return (first, events),

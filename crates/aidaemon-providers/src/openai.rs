@@ -389,6 +389,7 @@ impl SseDecoder for ChatDecoder {
             text: std::mem::take(&mut self.text),
             tool_calls,
             usage: self.usage,
+            ..Default::default()
         })
     }
 }

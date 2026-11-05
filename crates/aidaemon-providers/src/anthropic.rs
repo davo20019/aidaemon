@@ -525,6 +525,7 @@ impl SseDecoder for MessagesDecoder {
                 cached_input_tokens: self.cache_read,
                 cache_creation_tokens: self.cache_creation,
             },
+            ..Default::default()
         })
     }
 }

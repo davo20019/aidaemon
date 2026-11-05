@@ -321,6 +321,7 @@ impl ScriptedReply {
             text: self.text.clone().unwrap_or_default(),
             tool_calls,
             usage,
+            ..Default::default()
         }
     }
 }

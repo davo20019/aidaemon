@@ -1084,11 +1084,11 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
         run_usage: Default::default(),
         untrusted_seen: false,
     };
-    let call = sdk::ToolCall {
-        id: "c8".to_string(),
-        name: "write_file".to_string(),
-        arguments: serde_json::json!({"path": "/tmp/aidaemon-test/a.txt"}),
-    };
+    let call = sdk::ToolCall::new(
+        "c8",
+        "write_file",
+        serde_json::json!({"path": "/tmp/aidaemon-test/a.txt"}),
+    );
     let info = sdk::ToolInfo {
         annotations: sdk::ToolAnnotations::WRITE,
         access: Default::default(),
