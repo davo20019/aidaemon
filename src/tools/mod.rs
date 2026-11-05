@@ -122,4 +122,6 @@ mod service_status;
 pub use service_status::ServiceStatusTool;
 
 #[cfg(test)]
+mod execution_backend_injection_tests;
+#[cfg(test)]
 mod schema_lint_tests;
