@@ -1,5 +1,4 @@
 use super::*;
-use crate::providers::ChatJson;
 
 /// Telemetry captured during an LLM call with recovery, surfaced to the agent
 /// loop so it can be persisted as an `LlmCall` event. Populated via an out-param
@@ -24,17 +23,243 @@ fn malformed_reason_label(
     }
 }
 
-// impl-Agent justification: LLM call recovery and fallback cascade over llm_runtime/model/billing_failed_models.
-impl Agent {
-    /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
-    /// Tries stored fallback first, then cycles through router ordered models
-    /// (`default` + `fallback[]`).
-    pub(super) async fn pick_fallback_excluding(
+/// The daemon's recovery rules as a kernel [`aidaemon_core::FailoverPolicy`]:
+/// each provider error's recovery route decides whether to retry the same
+/// step (with backoff, or with a rewritten request) or move to the next model.
+/// One instance serves one call and records what it saw for telemetry.
+struct DaemonRecovery {
+    billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
+    uncommitted_work: bool,
+    provider_label: &'static str,
+    /// Models attempted, in order, and whether the run left the first one.
+    attempted: std::sync::Mutex<Vec<String>>,
+}
+
+/// How long a billing failure is cached before the model is tried again
+/// (credits may have been added).
+const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// The smallest output cap worth retrying with after a 402.
+const MIN_USEFUL_TOKENS: u64 = 512;
+
+fn has_media(request: &aidaemon_core::ModelRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|m| !m.images.is_empty() || !m.audio.is_empty())
+}
+
+fn without_media(request: &aidaemon_core::ModelRequest) -> aidaemon_core::ModelRequest {
+    let mut request = request.clone();
+    for message in &mut request.messages {
+        message.images.clear();
+        message.audio.clear();
+    }
+    request
+}
+
+/// The request with the provider's defaults instead of advanced options
+/// (response format, forced tool choice, reasoning effort, output cap).
+fn with_default_options(
+    request: &aidaemon_core::ModelRequest,
+) -> Option<aidaemon_core::ModelRequest> {
+    let defaults = aidaemon_core::ModelRequest {
+        model: request.model.clone(),
+        messages: request.messages.clone(),
+        tools: request.tools.clone(),
+        ..Default::default()
+    };
+    (defaults != *request).then_some(defaults)
+}
+
+impl aidaemon_core::FailoverPolicy for DaemonRecovery {
+    fn before_attempt(
         &self,
-        failed_model: &str,
-        exclude: &[&str],
-        router: Option<&Router>,
-    ) -> Option<String> {
+        request: &aidaemon_core::ModelRequest,
+    ) -> Result<(), aidaemon_core::ProviderError> {
+        if let Ok(mut attempted) = self.attempted.lock() {
+            attempted.push(request.model.clone());
+        }
+        let cached = self
+            .billing_failed_models
+            .try_read()
+            .ok()
+            .and_then(|cache| cache.get(&request.model).copied())
+            .is_some_and(|failed_at| failed_at.elapsed() < BILLING_FAIL_CACHE_TTL);
+        if cached {
+            info!(
+                model = %request.model,
+                "Skipping model — cached billing failure"
+            );
+            return Err(aidaemon_core::ProviderError::Billing {
+                message: format!("Cached billing failure for {}", request.model),
+                affordable_tokens: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn after_error(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+        error: &aidaemon_core::ProviderError,
+        attempt: u32,
+        _attempts: u32,
+    ) -> aidaemon_core::FailoverAction {
+        use aidaemon_core::FailoverAction::{Next, Retry, RetryWith, Stop};
+        let model = request.model.as_str();
+        let daemon_error = crate::providers::sdk_backed::to_daemon_error(error.clone());
+        warn!(
+            model,
+            attempt,
+            kind = ?daemon_error.kind,
+            status = ?daemon_error.status,
+            "LLM call failed: {}",
+            daemon_error
+        );
+        // Too long for this model's window: retrying cannot help. Record
+        // the window so the caller shrinks the request.
+        if let aidaemon_core::ProviderError::ContextOverflow { limit, .. } = error {
+            let attempted = crate::memory::context_window::estimate_multimodal_message_tokens(
+                &crate::providers::sdk_backed::to_chat_messages(&request.messages),
+            );
+            crate::config::record_context_overflow(model, limit.map(|l| l as usize), attempted);
+            return Stop;
+        }
+        let backoff = |base: Duration, max: Duration| {
+            crate::backoff::exponential_backoff(base, attempt.saturating_sub(1), max)
+        };
+        match daemon_error.recovery_route(false) {
+            ProviderRecoveryRoute::Fail => Stop,
+            // A 402 that says what it can afford: retry once with that cap,
+            // then remember the failure and move on.
+            ProviderRecoveryRoute::RetryReducedBudgetThenFallback => {
+                if let aidaemon_core::ProviderError::Billing {
+                    affordable_tokens: Some(affordable),
+                    ..
+                } = error
+                {
+                    if *affordable >= MIN_USEFUL_TOKENS && request.max_output_tokens.is_none() {
+                        let mut capped = request.clone();
+                        capped.max_output_tokens =
+                            Some(affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS) as u32);
+                        return RetryWith {
+                            delay: Duration::ZERO,
+                            request: Box::new(capped),
+                        };
+                    }
+                }
+                if let Ok(mut cache) = self.billing_failed_models.try_write() {
+                    cache.insert(model.to_string(), Instant::now());
+                    cache.retain(|_, at| at.elapsed() < BILLING_FAIL_CACHE_TTL);
+                }
+                Next
+            }
+            // A rejected request: drop media once, then advanced options once.
+            ProviderRecoveryRoute::AdaptRequestOnce => {
+                if has_media(request) {
+                    warn!(
+                        model,
+                        "Provider rejected multimodal payload; retrying text-only"
+                    );
+                    return RetryWith {
+                        delay: Duration::ZERO,
+                        request: Box::new(without_media(request)),
+                    };
+                }
+                match with_default_options(request) {
+                    Some(defaults) => {
+                        warn!(
+                            model,
+                            "Provider rejected advanced options; retrying with defaults"
+                        );
+                        RetryWith {
+                            delay: Duration::ZERO,
+                            request: Box::new(defaults),
+                        }
+                    }
+                    None => Stop,
+                }
+            }
+            ProviderRecoveryRoute::RetryRateLimitThenFallback => {
+                if attempt > Agent::MAX_LLM_RETRIES {
+                    return Next;
+                }
+                let base = Duration::from_secs(daemon_error.retry_after_secs.unwrap_or(5));
+                Retry(backoff(base, Duration::from_secs(120)))
+            }
+            ProviderRecoveryRoute::RetryTransientThenFallback => {
+                // A server error on a multimodal payload: try once without
+                // the media before backing off.
+                if daemon_error.kind == ProviderErrorKind::ServerError && has_media(request) {
+                    warn!(
+                        model,
+                        "Server error on a multimodal payload; retrying text-only"
+                    );
+                    return RetryWith {
+                        delay: Duration::ZERO,
+                        request: Box::new(without_media(request)),
+                    };
+                }
+                // Before any tool work has committed, an outage is cheap to
+                // wait out; after, keep the short ladder so a half-done task
+                // closes from its receipts.
+                let max = if self.uncommitted_work {
+                    Agent::MAX_LLM_RETRIES_UNCOMMITTED
+                } else {
+                    Agent::MAX_LLM_RETRIES
+                };
+                if attempt > max {
+                    return Next;
+                }
+                Retry(crate::backoff::jittered_delay(
+                    backoff(
+                        Duration::from_secs(Agent::RETRY_BASE_DELAY_SECS),
+                        Duration::from_secs(Agent::TRANSIENT_RETRY_MAX_DELAY_SECS),
+                    ),
+                    0.2,
+                ))
+            }
+            ProviderRecoveryRoute::RetryMalformedThenFallback => {
+                record_llm_payload_invalid_metric(self.provider_label, model, "parse");
+                if attempt > Agent::MAX_LLM_RETRIES {
+                    return Next;
+                }
+                Retry(backoff(
+                    Duration::from_secs(Agent::RETRY_BASE_DELAY_SECS),
+                    Duration::MAX,
+                ))
+            }
+            // A wrongly shaped reply is likely deterministic: one quick
+            // retry, then give up without other models.
+            ProviderRecoveryRoute::RetryMalformedThenFail => {
+                record_llm_payload_invalid_metric(
+                    self.provider_label,
+                    model,
+                    malformed_reason_label(daemon_error.malformed_reason),
+                );
+                if attempt > Agent::MAX_MALFORMED_PAYLOAD_RETRIES {
+                    return Stop;
+                }
+                Retry(Duration::from_secs(
+                    Agent::MALFORMED_PAYLOAD_RETRY_DELAY_SECS,
+                ))
+            }
+            ProviderRecoveryRoute::Fallback => Next,
+        }
+    }
+}
+
+/// Per-attempt deadline for each fallback model. Prevents a single hung
+/// provider from blocking the rest of the chain.
+const CASCADE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Attempts a step may make; the policy's per-route limits decide sooner.
+const MAX_STEP_ATTEMPTS: u32 = 16;
+
+// impl-Agent justification: LLM call recovery over llm_runtime/model/billing_failed_models.
+impl Agent {
+    /// The models to fall back to after `model`, in order: the stored
+    /// fallback model, then the router's models, each once.
+    async fn fallback_models(&self, model: &str, router: Option<&Router>) -> Vec<String> {
         let stored =
             match tokio::time::timeout(Duration::from_secs(2), self.fallback_model.read()).await {
                 Ok(guard) => guard.clone(),
@@ -43,269 +268,36 @@ impl Agent {
                     self.llm_runtime.snapshot().primary_model()
                 }
             };
-        if stored != failed_model && !exclude.contains(&stored.as_str()) {
-            return Some(stored);
-        }
-        // Stored fallback is the same or excluded — try router candidates.
-        if let Some(router) = router {
-            for candidate in router.all_models_ordered() {
-                if candidate != failed_model && !exclude.contains(&candidate.as_str()) {
-                    return Some(candidate);
-                }
+        let mut out: Vec<String> = Vec::new();
+        for candidate in std::iter::once(stored).chain(
+            router
+                .map(|router| router.all_models_ordered())
+                .unwrap_or_default(),
+        ) {
+            if candidate != model && !out.contains(&candidate) {
+                out.push(candidate);
             }
         }
-        None
+        out
     }
 
-    /// Per-attempt timeout for each individual provider call inside
-    /// cascade_fallback / billing retry.  Prevents a single hung provider
-    /// from blocking the entire recovery chain.
-    const CASCADE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
-
-    /// Try provider-local model fallbacks first, then configured alternate
-    /// providers and their model chains. On success, returns the response for
-    /// this call only (no persistent provider/model downgrade).
-    #[allow(clippy::too_many_arguments)]
-    async fn cascade_fallback(
-        &self,
-        provider: &crate::llm_runtime::ModelBackend,
-        router: Option<&Router>,
-        failed_model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-        last_err: &ProviderError,
-        telemetry: &mut LlmCallTelemetry,
-        pin_model: Option<&str>,
-    ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        if pin_model.is_some() {
-            return Err(anyhow::anyhow!(
-                "{} (model pinned for active computer_use task — fallback disabled)",
-                last_err.recovery_failed_message()
-            ));
-        }
-        // Entering the cascade means the original call already failed.
-        telemetry.fell_back = true;
-        let mut tried: Vec<String> = vec![failed_model.to_string()];
-        let mut final_err = last_err.clone();
-        let mut attempt = 1;
-        let runtime_snapshot = self.llm_runtime.snapshot();
-        let primary_provider_kind = runtime_snapshot.provider_kind();
-        let failover_targets = runtime_snapshot.failover_targets();
-
-        loop {
-            let exclude_refs: Vec<&str> = tried.iter().map(|s| s.as_str()).collect();
-            let fallback = match self
-                .pick_fallback_excluding(failed_model, &exclude_refs, router)
-                .await
-            {
-                Some(fallback_model) => fallback_model,
-                None => break,
-            };
-
-            warn!(
-                provider_kind = ?primary_provider_kind,
-                model = %fallback,
-                attempt,
-                "Primary-provider fallback attempt"
-            );
-
-            telemetry.attempts += 1;
-            match tokio::time::timeout(
-                Self::CASCADE_ATTEMPT_TIMEOUT,
-                provider.chat_with_options(&fallback, messages, tool_defs, options),
-            )
-            .await
-            {
-                Ok(Ok(resp)) => {
-                    self.stamp_lastgood().await;
-                    telemetry.final_model = fallback;
-                    return Ok(resp);
-                }
-                Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
-                    Ok(provider_err) => {
-                        final_err = provider_err;
-                        tried.push(fallback);
-                        attempt += 1;
-                    }
-                    Err(other) => return Err(other),
-                },
-                Err(_elapsed) => {
-                    warn!(
-                        model = %fallback,
-                        attempt,
-                        timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                        "Cascade fallback attempt timed out, trying next"
-                    );
-                    tried.push(fallback);
-                    attempt += 1;
-                }
-            }
-        }
-
-        for target in failover_targets {
-            for model in target.all_models_ordered() {
-                warn!(
-                    provider_kind = ?target.provider_kind(),
-                    model = %model,
-                    attempt,
-                    "Provider failover attempt"
-                );
-
-                telemetry.attempts += 1;
-                match tokio::time::timeout(
-                    Self::CASCADE_ATTEMPT_TIMEOUT,
-                    target
-                        .provider()
-                        .chat_with_options(&model, messages, tool_defs, options),
-                )
-                .await
-                {
-                    Ok(Ok(resp)) => {
-                        self.stamp_lastgood().await;
-                        telemetry.final_model = model;
-                        return Ok(resp);
-                    }
-                    Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
-                        Ok(provider_err) => {
-                            final_err = provider_err;
-                            attempt += 1;
-                        }
-                        Err(other) => return Err(other),
-                    },
-                    Err(_elapsed) => {
-                        warn!(
-                            model = %model,
-                            attempt,
-                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                            "Provider failover attempt timed out, trying next"
-                        );
-                        attempt += 1;
-                    }
-                }
-            }
-        }
-
-        // Keep the typed provider error as the cause so callers (deferred
-        // retry, telemetry) can still classify it; the recovery message is the
-        // user-facing context.
-        let message = final_err.recovery_failed_message();
-        Err(anyhow::Error::new(final_err).context(message))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn retry_malformed_response<F>(
-        &self,
-        provider: &crate::llm_runtime::ModelBackend,
-        model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-        provider_label: &str,
-        max_retries: u32,
-        wait_for_attempt: F,
-        retry_strategy: &str,
-    ) -> anyhow::Result<Option<crate::traits::ProviderResponse>>
-    where
-        F: Fn(u32) -> u64,
-    {
-        for attempt in 0..max_retries {
-            let wait = wait_for_attempt(attempt);
-            info!(
-                wait_secs = wait,
-                attempt = attempt + 1,
-                max = max_retries,
-                strategy = retry_strategy,
-                "Retrying after malformed provider response"
-            );
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            match provider
-                .chat_with_options(model, messages, tool_defs, options)
-                .await
-            {
-                Ok(resp) => {
-                    self.stamp_lastgood().await;
-                    return Ok(Some(resp));
-                }
-                Err(retry_err) => {
-                    let retry_provider_err = match retry_err.downcast::<ProviderError>() {
-                        Ok(pe) => pe,
-                        Err(other) => return Err(other),
-                    };
-                    if retry_provider_err.kind == ProviderErrorKind::MalformedResponse {
-                        let retry_reason =
-                            malformed_reason_label(retry_provider_err.malformed_reason);
-                        record_llm_payload_invalid_metric(provider_label, model, retry_reason);
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "{}",
-                        retry_provider_err.recovery_failed_message()
-                    ));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// When the provider rejects a multimodal payload, strip image/audio blocks and retry once.
+    /// One model call with the daemon's recovery, run as a kernel failover
+    /// chain: `model` on `provider` first (within `first_attempt_deadline`),
+    /// then the other models of its router, then each configured failover
+    /// provider's models (each within its own deadline). The chain is the
+    /// app's policy; [`DaemonRecovery`] decides retries per error:
     ///
-    /// TODO(v2): tiered multimodal fallback — strip `input_audio` first and retry;
-    /// only strip `image_url` on a second failure so mixed photo+voice turns keep images.
-    async fn try_text_only_vision_fallback(
-        &self,
-        provider: &crate::llm_runtime::ModelBackend,
-        model: &str,
-        messages: &[Value],
-        tool_defs: &[Value],
-        options: &ChatOptions,
-    ) -> Option<crate::traits::ProviderResponse> {
-        if !crate::providers::multimodal::messages_contain_multimodal_blocks(messages) {
-            return None;
-        }
-        warn!(
-            model,
-            "Provider rejected multimodal payload; retrying once with text-only content"
-        );
-        let mut text_only = messages.to_vec();
-        crate::providers::multimodal::strip_multimodal_blocks_from_messages(&mut text_only);
-        match provider
-            .chat_with_options(model, &text_only, tool_defs, options)
-            .await
-        {
-            Ok(resp) => {
-                self.stamp_lastgood().await;
-                Some(resp)
-            }
-            Err(retry_err) => {
-                warn!(
-                    model,
-                    error = %retry_err,
-                    "Text-only vision fallback retry also failed"
-                );
-                None
-            }
-        }
-    }
-
-    /// How long a billing failure is cached before we re-try that model.
-    /// After this window the model is attempted again (credits may have been added).
-    const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
-
-    /// Attempt an LLM call with error-classified recovery:
-    /// - RateLimit → exponential backoff retries, then cascade fallback
-    /// - BadRequest/ServerError with vision blocks → text-only strip retry once
-    /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
-    /// - MalformedResponse(Parse) → exponential backoff retries, then cascade fallback
-    /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
-    /// - NotFound → cascade fallback immediately
-    /// - Billing → cached skip + cascade fallback (avoids repeated 402s)
-    /// - Auth → return user-facing error immediately
+    /// - RateLimit, Timeout/Network/Server, malformed parse: backoff retries,
+    ///   then the next model (a server error on media first retries without
+    ///   it);
+    /// - BadRequest: retry once without media, then once with default
+    ///   options, then fail;
+    /// - Billing: retry once with the affordable cap, then cache the failure
+    ///   and move on (cached models are skipped for ten minutes);
+    /// - NotFound: next model; malformed shape: one retry, then fail;
+    /// - Auth or a context overflow (recorded for the caller): fail.
     ///
-    /// Cascade fallback now means:
-    /// 1. Other models on the current provider
-    /// 2. Configured failover providers and their model chains
+    /// `pin_model` (an active computer-use task) keeps the call on `model`.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_llm_with_recovery(
         &self,
@@ -317,431 +309,108 @@ impl Agent {
         options: &ChatOptions,
         telemetry: &mut LlmCallTelemetry,
         pin_model: Option<&str>,
+        first_attempt_deadline: Duration,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        // Default telemetry: first attempt, no fallback, on the requested model.
-        // Recovery paths below mutate this as they retry/cascade.
-        telemetry.final_model = model.to_string();
-        telemetry.fell_back = false;
-        telemetry.attempts = 1;
+        use aidaemon_core::{Failover, FailoverStep};
 
-        // --- Billing failure cache: skip models that recently 402'd ---
-        {
-            let cache = self.billing_failed_models.read().await;
-            if let Some(failed_at) = cache.get(model) {
-                if failed_at.elapsed() < Self::BILLING_FAIL_CACHE_TTL {
-                    info!(
-                        model,
-                        elapsed_secs = failed_at.elapsed().as_secs(),
-                        ttl_secs = Self::BILLING_FAIL_CACHE_TTL.as_secs(),
-                        "Skipping model — cached billing failure, cascading to fallback"
-                    );
-                    let billing_err = ProviderError {
-                        kind: ProviderErrorKind::Billing,
-                        status: Some(402),
-                        message: format!("Cached billing failure for {model}"),
-                        retry_after_secs: None,
-                        affordable_tokens: None,
-                        malformed_reason: None,
-                    };
-                    if options.single_attempt_fail_closed {
-                        let message = billing_err.user_message();
-                        return Err(anyhow::Error::new(billing_err).context(message));
-                    }
-                    return self
-                        .cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &billing_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        match provider
-            .chat_with_options(model, messages, tool_defs, options)
-            .await
-        {
-            Ok(resp) => {
-                // Config works — stamp as last known good (best-effort, non-blocking)
-                self.stamp_lastgood().await;
-                Ok(resp)
-            }
-            Err(e) => {
-                // Try to downcast to our classified ProviderError
-                let provider_err = match e.downcast::<ProviderError>() {
-                    Ok(pe) => pe,
-                    Err(other) => return Err(other), // not a provider error, propagate
-                };
-
-                warn!(
-                    kind = ?provider_err.kind,
-                    status = ?provider_err.status,
-                    "LLM call failed: {}",
-                    provider_err
+        let mut steps = vec![FailoverStep::from_arc(provider.clone())
+            .model(model)
+            .deadline(first_attempt_deadline)
+            .attempts(MAX_STEP_ATTEMPTS)];
+        if pin_model.is_none() {
+            for fallback in self.fallback_models(model, router.as_ref()).await {
+                steps.push(
+                    FailoverStep::from_arc(provider.clone())
+                        .model(fallback)
+                        .deadline(CASCADE_ATTEMPT_TIMEOUT)
+                        .attempts(MAX_STEP_ATTEMPTS),
                 );
-                // Too long for this model's window: retrying the same input
-                // cannot succeed. Record the window and hand the error back so
-                // the caller can shrink the request.
-                if let Some(stated) = crate::providers::context_overflow(&provider_err.to_string())
-                {
-                    let attempted =
-                        crate::memory::context_window::estimate_multimodal_message_tokens(messages);
-                    crate::config::record_context_overflow(model, stated, attempted);
-                    return Err(provider_err.into());
-                }
-                let recovery_route =
-                    provider_err.recovery_route(options.single_attempt_fail_closed);
-                if recovery_route == ProviderRecoveryRoute::Fail {
-                    warn!(
-                        model,
-                        single_attempt_fail_closed = options.single_attempt_fail_closed,
-                        kind = ?provider_err.kind,
-                        "Provider recovery graph reached a terminal state"
+            }
+            for target in self.llm_runtime.snapshot().failover_targets() {
+                for fallback in target.all_models_ordered() {
+                    steps.push(
+                        FailoverStep::from_arc(target.provider())
+                            .model(fallback)
+                            .deadline(CASCADE_ATTEMPT_TIMEOUT)
+                            .attempts(MAX_STEP_ATTEMPTS),
                     );
-                    return Err(provider_err.into());
-                }
-                let provider_label =
-                    provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
-
-                match recovery_route {
-                    // --- Billing (402): try reduced max_tokens first, then cascade ---
-                    // If the 402 tells us how many tokens we can afford, retry the
-                    // same model with a reduced cap. This avoids falling back to a
-                    // weaker free model when the primary still has partial budget.
-                    ProviderRecoveryRoute::RetryReducedBudgetThenFallback => {
-                        const MIN_USEFUL_TOKENS: u32 = 512;
-                        if let Some(affordable) = provider_err.affordable_tokens {
-                            if affordable >= MIN_USEFUL_TOKENS
-                                && options.max_tokens_override.is_none()
-                            {
-                                // Leave a small margin so the request fits comfortably.
-                                let reduced = affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS);
-                                info!(
-                                    model,
-                                    affordable,
-                                    reduced,
-                                    "Billing 402 with affordable tokens — retrying with reduced max_tokens"
-                                );
-                                let mut reduced_options = options.clone();
-                                reduced_options.max_tokens_override = Some(reduced);
-                                telemetry.attempts += 1;
-                                match tokio::time::timeout(
-                                    Self::CASCADE_ATTEMPT_TIMEOUT,
-                                    provider.chat_with_options(
-                                        model,
-                                        messages,
-                                        tool_defs,
-                                        &reduced_options,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(resp)) => {
-                                        self.stamp_lastgood().await;
-                                        return Ok(resp);
-                                    }
-                                    Ok(Err(retry_err)) => {
-                                        warn!(
-                                            model,
-                                            reduced,
-                                            error = %retry_err,
-                                            "Reduced max_tokens retry also failed; cascading to fallback"
-                                        );
-                                    }
-                                    Err(_elapsed) => {
-                                        warn!(
-                                            model,
-                                            reduced,
-                                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
-                                            "Reduced max_tokens retry timed out; cascading to fallback"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Cache the billing failure so subsequent iterations skip this model.
-                        {
-                            let mut cache = self.billing_failed_models.write().await;
-                            cache.insert(model.to_string(), Instant::now());
-                            // Prune expired entries while we hold the lock.
-                            cache.retain(|_, t| t.elapsed() < Self::BILLING_FAIL_CACHE_TTL);
-                        }
-
-                        warn!("Billing error on primary model, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-                    ProviderRecoveryRoute::AdaptRequestOnce => {
-                        if crate::providers::multimodal::messages_contain_multimodal_blocks(
-                            messages,
-                        ) {
-                            telemetry.attempts += 1;
-                        }
-                        if let Some(resp) = self
-                            .try_text_only_vision_fallback(
-                                &provider, model, messages, tool_defs, options,
-                            )
-                            .await
-                        {
-                            return Ok(resp);
-                        }
-                        if *options != ChatOptions::default() {
-                            warn!(
-                                model,
-                                response_mode = ?options.response_mode,
-                                tool_choice = ?options.tool_choice,
-                                "Provider rejected advanced chat options; retrying once with default options"
-                            );
-                            telemetry.attempts += 1;
-                            match provider.chat(model, messages, tool_defs).await {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(retry_err) => {
-                                    warn!(
-                                        model,
-                                        error = %retry_err,
-                                        "Fallback retry without advanced options also failed"
-                                    );
-                                }
-                            }
-                        }
-                        {
-                            let message = provider_err.user_message();
-                            Err(anyhow::Error::new(provider_err).context(message))
-                        }
-                    }
-
-                    // --- Rate limit: exponential backoff, then cascade fallback ---
-                    ProviderRecoveryRoute::RetryRateLimitThenFallback => {
-                        let base_wait = provider_err.retry_after_secs.unwrap_or(5);
-                        for attempt in 0..Self::MAX_LLM_RETRIES {
-                            let wait = crate::backoff::exponential_backoff(
-                                Duration::from_secs(base_wait),
-                                attempt,
-                                Duration::from_secs(120),
-                            )
-                            .as_secs();
-                            info!(
-                                wait_secs = wait,
-                                attempt = attempt + 1,
-                                max = Self::MAX_LLM_RETRIES,
-                                "Rate limited, waiting before retry"
-                            );
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
-                            telemetry.attempts += 1;
-                            match provider
-                                .chat_with_options(model, messages, tool_defs, options)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                        // All retries exhausted — cascade through fallback models
-                        warn!("Rate limit retries exhausted, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    // --- Timeout / Network / Server: exponential backoff, then cascade ---
-                    ProviderRecoveryRoute::RetryTransientThenFallback => {
-                        if provider_err.kind == ProviderErrorKind::ServerError {
-                            if let Some(resp) = self
-                                .try_text_only_vision_fallback(
-                                    &provider, model, messages, tool_defs, options,
-                                )
-                                .await
-                            {
-                                return Ok(resp);
-                            }
-                        }
-                        // Before any tool work has committed, a transient
-                        // outage is cheap to wait out: use the longer bounded
-                        // ladder (2+4+8+16+30s ≈ 60s, jittered). Once work has
-                        // committed, keep the short ladder so a half-done task
-                        // closes from its receipts instead of idling.
-                        let max_retries = if options.uncommitted_work {
-                            Self::MAX_LLM_RETRIES_UNCOMMITTED
-                        } else {
-                            Self::MAX_LLM_RETRIES
-                        };
-                        for attempt in 0..max_retries {
-                            let wait = crate::backoff::jittered_delay(
-                                crate::backoff::exponential_backoff(
-                                    Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
-                                    attempt,
-                                    Duration::from_secs(Self::TRANSIENT_RETRY_MAX_DELAY_SECS),
-                                ),
-                                0.2,
-                            );
-                            info!(
-                                wait_secs = wait.as_secs(),
-                                attempt = attempt + 1,
-                                max = max_retries,
-                                uncommitted_work = options.uncommitted_work,
-                                "Retrying after transient error"
-                            );
-                            tokio::time::sleep(wait).await;
-                            telemetry.attempts += 1;
-                            match provider
-                                .chat_with_options(model, messages, tool_defs, options)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                        // All retries exhausted — cascade through fallback models
-                        warn!("Transient error retries exhausted, trying cascade fallback");
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    // --- Malformed payload: reason-aware recovery ---
-                    ProviderRecoveryRoute::RetryMalformedThenFallback
-                    | ProviderRecoveryRoute::RetryMalformedThenFail => {
-                        let reason = malformed_reason_label(provider_err.malformed_reason);
-                        record_llm_payload_invalid_metric(provider_label, model, reason);
-
-                        if recovery_route == ProviderRecoveryRoute::RetryMalformedThenFallback {
-                            // Parse failures can be transient (gateway/proxy/body corruption).
-                            // Use the same resilient policy as other transient provider failures.
-                            let retry_result = self
-                                .retry_malformed_response(
-                                    &provider,
-                                    model,
-                                    messages,
-                                    tool_defs,
-                                    options,
-                                    provider_label,
-                                    Self::MAX_LLM_RETRIES,
-                                    |attempt| {
-                                        crate::backoff::exponential_backoff(
-                                            Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
-                                            attempt,
-                                            Duration::MAX,
-                                        )
-                                        .as_secs()
-                                    },
-                                    "parse_exponential_backoff",
-                                )
-                                .await?;
-                            if let Some(resp) = retry_result {
-                                return Ok(resp);
-                            }
-                            warn!("Malformed parse retries exhausted, trying cascade fallback");
-                            return self
-                                .cascade_fallback(
-                                    &provider,
-                                    router.as_ref(),
-                                    model,
-                                    messages,
-                                    tool_defs,
-                                    options,
-                                    &provider_err,
-                                    telemetry,
-                                    pin_model,
-                                )
-                                .await;
-                        }
-
-                        // Shape/unknown malformed responses are likely deterministic schema issues.
-                        // Retry once quickly, then fail fast without model cascade.
-                        let retry_result = self
-                            .retry_malformed_response(
-                                &provider,
-                                model,
-                                messages,
-                                tool_defs,
-                                options,
-                                provider_label,
-                                Self::MAX_MALFORMED_PAYLOAD_RETRIES,
-                                |_| Self::MALFORMED_PAYLOAD_RETRY_DELAY_SECS,
-                                "shape_or_unknown_single_retry",
-                            )
-                            .await?;
-                        if let Some(resp) = retry_result {
-                            return Ok(resp);
-                        }
-
-                        {
-                            let message = provider_err.user_message();
-                            Err(anyhow::Error::new(provider_err).context(message))
-                        }
-                    }
-
-                    // --- NotFound (bad model name): cascade fallback immediately ---
-                    ProviderRecoveryRoute::Fallback => {
-                        warn!(
-                            bad_model = model,
-                            "Model not found, trying cascade fallback"
-                        );
-                        self.cascade_fallback(
-                            &provider,
-                            router.as_ref(),
-                            model,
-                            messages,
-                            tool_defs,
-                            options,
-                            &provider_err,
-                            telemetry,
-                            pin_model,
-                        )
-                        .await
-                    }
-
-                    ProviderRecoveryRoute::Fail => {
-                        unreachable!("terminal provider recovery routes return before dispatch")
-                    }
                 }
             }
         }
+        let recovery = Arc::new(DaemonRecovery {
+            billing_failed_models: self.billing_failed_models.clone(),
+            uncommitted_work: options.uncommitted_work,
+            provider_label: provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind()),
+            attempted: std::sync::Mutex::new(Vec::new()),
+        });
+        let chain = Failover::new(steps).policy(RecoveryHandle(recovery.clone()));
+
+        let request =
+            crate::providers::sdk_backed::to_sdk_request(model, messages, tool_defs, options);
+        let result = crate::providers::sdk_backed::send(&chain, &request).await;
+
+        let attempted = recovery
+            .attempted
+            .lock()
+            .map(|models| models.clone())
+            .unwrap_or_default();
+        telemetry.attempts = attempted.len().max(1) as u32;
+        telemetry.final_model = attempted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| model.to_string());
+        telemetry.fell_back = attempted.iter().any(|attempt| attempt != model);
+
+        match result {
+            Ok(response) => {
+                // The config works: stamp it as last known good.
+                self.stamp_lastgood().await;
+                Ok(crate::providers::sdk_backed::to_provider_response(
+                    response,
+                    &telemetry.final_model,
+                ))
+            }
+            Err(error) => match error.downcast::<ProviderError>() {
+                Ok(provider_err) => {
+                    let terminal = provider_err.kind == ProviderErrorKind::Auth
+                        || options.single_attempt_fail_closed
+                        || crate::providers::context_overflow(&provider_err.to_string()).is_some();
+                    if terminal && !telemetry.fell_back {
+                        return Err(provider_err.into());
+                    }
+                    let message = if telemetry.fell_back {
+                        provider_err.recovery_failed_message()
+                    } else {
+                        provider_err.user_message()
+                    };
+                    Err(anyhow::Error::new(provider_err).context(message))
+                }
+                Err(other) => Err(other),
+            },
+        }
+    }
+}
+
+/// Shares one [`DaemonRecovery`] between the chain and the caller, which
+/// reads what it recorded.
+struct RecoveryHandle(Arc<DaemonRecovery>);
+
+impl aidaemon_core::FailoverPolicy for RecoveryHandle {
+    fn before_attempt(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+    ) -> Result<(), aidaemon_core::ProviderError> {
+        self.0.before_attempt(request)
+    }
+
+    fn after_error(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+        error: &aidaemon_core::ProviderError,
+        attempt: u32,
+        attempts: u32,
+    ) -> aidaemon_core::FailoverAction {
+        self.0.after_error(request, error, attempt, attempts)
     }
 }
 
@@ -838,6 +507,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hanging_primary_falls_back_within_its_own_deadline() {
+        /// Never answers.
+        struct Hanging;
+
+        #[async_trait::async_trait]
+        impl aidaemon_core::Provider for Hanging {
+            fn name(&self) -> &str {
+                "hanging"
+            }
+
+            async fn complete(
+                &self,
+                _: &aidaemon_core::ModelRequest,
+            ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+                std::future::pending().await
+            }
+        }
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("Answered by the failover provider"),
+        )]));
+        let hanging: crate::llm_runtime::ModelBackend = Arc::new(Hanging);
+        harness.agent.llm_runtime.swap(
+            hanging.clone(),
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+
+        // No other model on the hanging provider: the chain is the primary,
+        // then the failover provider.
+        *harness.agent.fallback_model.write().await = "primary-model".to_string();
+
+        let mut telemetry = super::LlmCallTelemetry::default();
+        let started = std::time::Instant::now();
+        let response = harness
+            .agent
+            .call_llm_with_recovery(
+                hanging,
+                None,
+                "primary-model",
+                &[],
+                &[],
+                &ChatOptions::default(),
+                &mut telemetry,
+                None,
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("the failover provider answers");
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Answered by the failover provider")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the primary must give up at its own deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(telemetry.fell_back);
+        assert_eq!(telemetry.final_model, "secondary-model");
+        assert_eq!(alternate.models_called().await, vec!["secondary-model"]);
+    }
+
+    #[tokio::test]
     async fn recovery_can_failover_to_another_provider() {
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -879,6 +623,7 @@ mod tests {
                 &ChatOptions::default(),
                 &mut telemetry,
                 None,
+                std::time::Duration::from_secs(60),
             )
             .await
             .expect("recover via alternate provider");
@@ -1014,6 +759,7 @@ mod tests {
                 &options,
                 &mut telemetry,
                 None,
+                std::time::Duration::from_secs(60),
             )
             .await;
 
@@ -1077,6 +823,7 @@ mod tests {
                 &options,
                 &mut telemetry,
                 None,
+                std::time::Duration::from_secs(60),
             )
             .await;
 

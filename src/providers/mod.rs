@@ -1,6 +1,5 @@
 mod error;
 pub(crate) mod factory;
-pub(crate) mod multimodal;
 pub(crate) mod sdk_backed;
 pub(crate) mod streaming;
 

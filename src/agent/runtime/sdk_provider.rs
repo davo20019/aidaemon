@@ -15,7 +15,6 @@ use super::sdk_engine::DaemonCall;
 use crate::memory::context_window::{
     estimate_multimodal_message_tokens, fit_messages_with_source_quotas,
 };
-use crate::providers::ChatJson;
 use crate::traits::{ChatOptions, ProviderResponse};
 
 /// One model request handed from the SDK run to the daemon dispatcher.
@@ -84,39 +83,80 @@ const RUNTIME_ATTEMPTS_PER_MODEL: u32 = 3;
 /// Longest wait between attempts, whatever a rate limit asks for.
 #[cfg_attr(not(feature = "sdk-memory"), allow(dead_code))]
 const RUNTIME_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long one background attempt may take to start answering.
+const RUNTIME_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
-/// What to do after a failed attempt.
-#[derive(Debug, PartialEq, Eq)]
-enum AttemptFailure {
-    Retry(std::time::Duration),
-    NextModel,
-    Fail,
+/// Recovery for background calls: rate limits, transient errors and parse
+/// failures retry with backoff, billing and not-found move to the next
+/// model, anything else fails. Records the models it attempted.
+#[derive(Default)]
+struct BackgroundRecovery {
+    attempted: std::sync::Mutex<Vec<String>>,
 }
 
-#[cfg_attr(not(feature = "sdk-memory"), allow(dead_code))]
-fn classify_attempt_failure(error: &anyhow::Error, attempt: u32) -> AttemptFailure {
-    use crate::providers::ProviderRecoveryRoute as Route;
+impl sdk::FailoverPolicy for BackgroundRecovery {
+    fn before_attempt(&self, request: &sdk::ModelRequest) -> Result<(), sdk::ProviderError> {
+        if let Ok(mut attempted) = self.attempted.lock() {
+            attempted.push(request.model.clone());
+        }
+        Ok(())
+    }
 
-    let Some(error) = error.downcast_ref::<crate::providers::ProviderError>() else {
-        return AttemptFailure::Fail;
-    };
-    match error.recovery_route(false) {
-        Route::Fail | Route::AdaptRequestOnce | Route::RetryMalformedThenFail => {
-            AttemptFailure::Fail
-        }
-        Route::Fallback | Route::RetryReducedBudgetThenFallback => AttemptFailure::NextModel,
-        Route::RetryRateLimitThenFallback
-        | Route::RetryTransientThenFallback
-        | Route::RetryMalformedThenFallback => {
-            if attempt + 1 >= RUNTIME_ATTEMPTS_PER_MODEL {
-                return AttemptFailure::NextModel;
+    fn after_error(
+        &self,
+        request: &sdk::ModelRequest,
+        error: &sdk::ProviderError,
+        attempt: u32,
+        attempts: u32,
+    ) -> sdk::FailoverAction {
+        use crate::providers::ProviderRecoveryRoute as Route;
+        let daemon_error = crate::providers::sdk_backed::to_daemon_error(error.clone());
+        let action = match daemon_error.recovery_route(false) {
+            Route::Fail | Route::AdaptRequestOnce | Route::RetryMalformedThenFail => {
+                sdk::FailoverAction::Stop
             }
-            let backoff = error
-                .retry_after_secs
-                .map(std::time::Duration::from_secs)
-                .unwrap_or_else(|| std::time::Duration::from_secs(1 << attempt));
-            AttemptFailure::Retry(backoff.min(RUNTIME_MAX_BACKOFF))
-        }
+            Route::Fallback | Route::RetryReducedBudgetThenFallback => sdk::FailoverAction::Next,
+            Route::RetryRateLimitThenFallback
+            | Route::RetryTransientThenFallback
+            | Route::RetryMalformedThenFallback => {
+                if attempt >= attempts {
+                    sdk::FailoverAction::Next
+                } else {
+                    let backoff = daemon_error
+                        .retry_after_secs
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| std::time::Duration::from_secs(1 << (attempt - 1)));
+                    sdk::FailoverAction::Retry(backoff.min(RUNTIME_MAX_BACKOFF))
+                }
+            }
+        };
+        tracing::warn!(
+            model = %request.model,
+            attempt,
+            %error,
+            next = ?action,
+            "background model call failed"
+        );
+        action
+    }
+}
+
+/// Shares one [`BackgroundRecovery`] with the caller.
+struct SharedRecovery(std::sync::Arc<BackgroundRecovery>);
+
+impl sdk::FailoverPolicy for SharedRecovery {
+    fn before_attempt(&self, request: &sdk::ModelRequest) -> Result<(), sdk::ProviderError> {
+        self.0.before_attempt(request)
+    }
+
+    fn after_error(
+        &self,
+        request: &sdk::ModelRequest,
+        error: &sdk::ProviderError,
+        attempt: u32,
+        attempts: u32,
+    ) -> sdk::FailoverAction {
+        self.0.after_error(request, error, attempt, attempts)
     }
 }
 
@@ -126,67 +166,48 @@ impl sdk::Provider for RuntimeProvider {
         "daemon-runtime"
     }
 
+    /// The requested model, then the primary model, on the runtime's
+    /// provider, each with retries; every success is accounted.
     async fn complete(
         &self,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let snapshot = self.runtime.snapshot();
         let provider = snapshot.provider();
-        let options = to_chat_options(request);
-        let messages = to_daemon_messages_from(&request.messages);
-        let tools = to_daemon_tools(&request.tools);
         let primary = snapshot.primary_model();
-        let mut candidates = vec![request.model.as_str()];
+        let step = |model: &str| {
+            sdk::FailoverStep::from_arc(provider.clone())
+                .model(model)
+                .deadline(RUNTIME_ATTEMPT_DEADLINE)
+                .attempts(RUNTIME_ATTEMPTS_PER_MODEL)
+        };
+        let mut steps = vec![step(&request.model)];
         if primary != request.model {
-            candidates.push(primary.as_str());
+            steps.push(step(&primary));
         }
-
-        let mut last_error = None;
-        'models: for model in candidates {
-            for attempt in 0..RUNTIME_ATTEMPTS_PER_MODEL {
-                let started = std::time::Instant::now();
-                match provider
-                    .chat_with_options(model, &messages, &tools, &options)
-                    .await
-                {
-                    Ok(response) => {
-                        if let Some(accounting) = &self.accounting {
-                            crate::events::record_background_model_call_telemetry(
-                                accounting.event_store.clone(),
-                                accounting.state.as_ref(),
-                                &format!("background:{}", accounting.purpose),
-                                accounting.purpose,
-                                model,
-                                &response,
-                                started.elapsed(),
-                            )
-                            .await;
-                        }
-                        return Ok(from_provider_response(response));
-                    }
-                    Err(error) => {
-                        let failure = classify_attempt_failure(&error, attempt);
-                        tracing::warn!(
-                            model,
-                            attempt = attempt + 1,
-                            %error,
-                            next = ?failure,
-                            "background model call failed"
-                        );
-                        last_error = Some(error);
-                        match failure {
-                            AttemptFailure::Retry(backoff) => tokio::time::sleep(backoff).await,
-                            AttemptFailure::NextModel => continue 'models,
-                            AttemptFailure::Fail => break 'models,
-                        }
-                    }
-                }
-            }
+        let recovery = std::sync::Arc::new(BackgroundRecovery::default());
+        let chain = sdk::Failover::new(steps).policy(SharedRecovery(recovery.clone()));
+        let started = std::time::Instant::now();
+        let response = chain.complete(request).await?;
+        if let Some(accounting) = &self.accounting {
+            let model = recovery
+                .attempted
+                .lock()
+                .ok()
+                .and_then(|models| models.last().cloned())
+                .unwrap_or_else(|| request.model.clone());
+            crate::events::record_background_model_call_telemetry(
+                accounting.event_store.clone(),
+                accounting.state.as_ref(),
+                &format!("background:{}", accounting.purpose),
+                accounting.purpose,
+                &model,
+                &crate::providers::sdk_backed::to_provider_response(response.clone(), &model),
+                started.elapsed(),
+            )
+            .await;
         }
-        Err(sdk::ProviderError::Other(last_error.map_or_else(
-            || "no model to call".to_string(),
-            |e| e.to_string(),
-        )))
+        Ok(response)
     }
 }
 
@@ -451,45 +472,44 @@ mod tests {
 
     #[test]
     fn runtime_provider_recovery_follows_the_typed_route() {
-        use crate::providers::{ProviderError, ProviderErrorKind};
+        use sdk::{FailoverAction, FailoverPolicy, ProviderError};
         use std::time::Duration;
 
-        let error = |kind, retry_after_secs| {
-            anyhow::Error::new(ProviderError {
-                kind,
-                status: None,
-                message: "synthetic".to_string(),
-                malformed_reason: None,
-                retry_after_secs,
-                affordable_tokens: None,
-            })
+        let policy = BackgroundRecovery::default();
+        let request = sdk::ModelRequest {
+            model: "fast-model".into(),
+            ..Default::default()
+        };
+        let after = |error: ProviderError, attempt| {
+            policy.after_error(&request, &error, attempt, RUNTIME_ATTEMPTS_PER_MODEL)
         };
         assert_eq!(
-            classify_attempt_failure(&error(ProviderErrorKind::Timeout, None), 1),
-            AttemptFailure::Retry(Duration::from_secs(2))
+            after(ProviderError::Transient("request timed out: x".into()), 2),
+            FailoverAction::Retry(Duration::from_secs(2))
         );
         assert_eq!(
-            classify_attempt_failure(&error(ProviderErrorKind::RateLimit, Some(600)), 0),
-            AttemptFailure::Retry(Duration::from_secs(30))
-        );
-        assert_eq!(
-            classify_attempt_failure(
-                &error(ProviderErrorKind::ServerError, None),
-                RUNTIME_ATTEMPTS_PER_MODEL - 1
+            after(
+                ProviderError::RateLimited {
+                    retry_after: Some(Duration::from_secs(600))
+                },
+                1
             ),
-            AttemptFailure::NextModel
+            FailoverAction::Retry(Duration::from_secs(30))
         );
         assert_eq!(
-            classify_attempt_failure(&error(ProviderErrorKind::NotFound, None), 0),
-            AttemptFailure::NextModel
+            after(
+                ProviderError::Transient("HTTP 503: down".into()),
+                RUNTIME_ATTEMPTS_PER_MODEL
+            ),
+            FailoverAction::Next
         );
         assert_eq!(
-            classify_attempt_failure(&error(ProviderErrorKind::Auth, None), 0),
-            AttemptFailure::Fail
+            after(ProviderError::NotFound("HTTP 404".into()), 1),
+            FailoverAction::Next
         );
         assert_eq!(
-            classify_attempt_failure(&anyhow::anyhow!("not a provider error"), 0),
-            AttemptFailure::Fail
+            after(ProviderError::Auth("HTTP 401".into()), 1),
+            FailoverAction::Stop
         );
     }
 
@@ -660,7 +680,10 @@ mod tests {
         assert_eq!(response.text, "hi");
         // Kept verbatim in the SDK's `_raw` form: the tool reports the bad
         // arguments, and the call replays byte for byte.
-        assert_eq!(response.tool_calls[0].arguments, json!({"_raw": "not json"}));
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            json!({"_raw": "not json"})
+        );
         assert_eq!(response.tool_calls[0].name, "terminal");
         assert_eq!(response.usage.input_tokens, 100);
         assert_eq!(response.usage.output_tokens, 7);

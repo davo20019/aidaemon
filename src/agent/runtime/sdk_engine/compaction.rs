@@ -189,6 +189,7 @@ impl Agent {
                 &options,
                 &mut telemetry,
                 None,
+                super::model_call::first_attempt_deadline(idle),
             ),
         )
         .await;
