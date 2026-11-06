@@ -332,6 +332,16 @@ pub async fn erase_session_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     session_id: &str,
 ) -> Result<(), Error> {
+    // A pool the run store was never opened on has no journal to erase, and
+    // `/wipe` must still succeed there.
+    let journaled: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_states'",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if journaled.is_none() {
+        return Ok(());
+    }
     sqlx::query("DROP TRIGGER IF EXISTS run_events_no_delete")
         .execute(&mut **tx)
         .await?;

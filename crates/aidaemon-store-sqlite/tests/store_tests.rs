@@ -419,3 +419,17 @@ async fn erase_session_removes_only_that_sessions_runs_and_keeps_the_guard() {
         .to_string();
     assert!(message.contains("append-only"), "wrong failure: {message}");
 }
+
+/// `/wipe` on a pool the run store was never opened on has nothing to erase
+/// and must not fail.
+#[tokio::test]
+async fn erase_session_without_a_journal_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}?mode=rwc", db_path(&dir).display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    aidaemon_store_sqlite::erase_session_in_tx(&mut tx, "s-never-journaled")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
