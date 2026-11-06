@@ -4260,3 +4260,25 @@ fn no_name_keyed_dispatch_remains() {
     }
     assert!(found.is_empty(), "name-keyed dispatch remains: {found:#?}");
 }
+
+#[test]
+fn a_decline_prevents_success_even_with_an_external_ack() {
+    let mut outcome = sdk::RunOutcome {
+        status: sdk::RunStatus::LimitReached {
+            limit: sdk::LimitKind::Turns,
+        },
+        final_text: None,
+        state: sdk::RunState::new("aidaemon", "synthetic-session", "do both steps"),
+    };
+    let verdict = TurnVerdict::default();
+    *verdict.external_action_ack.lock().unwrap() = Some("First step completed.".into());
+    assert_eq!(verdict.resolve(&outcome).2, TaskOutcome::Succeeded);
+    outcome
+        .state
+        .declined
+        .push(sdk::EffectKey::named(sdk::EffectClass::Process, "node"));
+    assert_eq!(verdict.resolve(&outcome).2, TaskOutcome::Partial);
+    outcome.status = sdk::RunStatus::Completed;
+    outcome.final_text = Some("Done.".into());
+    assert_eq!(verdict.resolve(&outcome).2, TaskOutcome::Partial);
+}

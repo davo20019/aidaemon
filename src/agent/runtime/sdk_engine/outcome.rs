@@ -284,15 +284,13 @@ impl TurnVerdict {
             ),
             _ => (reply, status, task_outcome),
         };
-        // The owner declined part of what the run set out to do: a tool's
-        // finish cannot call it succeeded.
-        let task_outcome = match (&outcome.status, task_outcome) {
-            (sdk::RunStatus::Finished { .. }, TaskOutcome::Succeeded)
-                if !outcome.state.declined.is_empty() =>
-            {
-                TaskOutcome::Partial
-            }
-            (_, task_outcome) => task_outcome,
+        // The owner declined part of what the run set out to do. However the
+        // run ended, and whatever acknowledged it (a tool's finish, or an
+        // external action's ack on a limit or provider stop), it never
+        // succeeds over that decline.
+        let task_outcome = match task_outcome {
+            TaskOutcome::Succeeded if !outcome.state.declined.is_empty() => TaskOutcome::Partial,
+            task_outcome => task_outcome,
         };
         if self.run_failure().is_some() {
             (reply, TaskStatus::Failed, TaskOutcome::Failed)
