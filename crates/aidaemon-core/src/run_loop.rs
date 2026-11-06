@@ -439,7 +439,7 @@ impl<'a> Driver<'a> {
             } else {
                 None
             };
-            let verdict = match settled {
+            let mut verdict = match settled {
                 // An approval settles only the hook that interrupted: the
                 // hooks after it still judge the call.
                 Some(Resolution::Approve) => {
@@ -449,6 +449,17 @@ impl<'a> Driver<'a> {
                 Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
                 None => self.decide(&mut call, &mut info, 0).await,
             };
+            // A rewrite may introduce egress after reads were queued. Let
+            // those reads taint the run before judging the rewritten call.
+            if info.annotations.egress && !group.is_empty() {
+                if let Some(end) = self
+                    .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                    .await?
+                {
+                    return Ok(end);
+                }
+                verdict = self.decide(&mut call, &mut info, 0).await;
+            }
             // A hook may have rewritten the call; judge and record what runs.
             let annotations = info.annotations;
 
@@ -551,8 +562,8 @@ impl<'a> Driver<'a> {
         Ok(Some(BatchEnd::Stuck(signal)))
     }
 
-    /// Ask `before_tool` hooks in order. Rewrites are applied (and the new
-    /// arguments re-validated) before the next hook sees the call.
+    /// Ask `before_tool` hooks in order. Changed arguments restart all
+    /// judgments; identical rewrites are no-ops. Non-converging chains fail closed.
     ///
     /// A call with an effect the owner declined earlier in the run is
     /// refused before any hook sees it, and again after any rewrite: no
@@ -563,14 +574,22 @@ impl<'a> Driver<'a> {
             return Verdict::Deny(reason);
         }
         let ctx = self.ctx();
-        for (hook_index, hook) in self.agent.hooks.iter().enumerate().skip(from) {
+        let mut hook_index = from;
+        let mut rewrites = 0;
+        while let Some(hook) = self.agent.hooks.get(hook_index) {
             match hook.before_tool(&ctx, call, info).await {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
                 ToolDecision::Interrupt { reason, kind } => {
                     return Verdict::Interrupt(reason, kind, hook_index)
                 }
-                ToolDecision::Rewrite { arguments } => {
+                ToolDecision::Rewrite { arguments } if arguments != call.arguments => {
+                    rewrites += 1;
+                    if rewrites > 16 {
+                        return Verdict::Deny(
+                            "tool hooks did not converge after 16 rewrites".into(),
+                        );
+                    }
                     call.arguments = arguments;
                     if let Some(tool) = self.agent.tools.get(&call.name) {
                         if let Err(reason) = tool.validate(&call.arguments) {
@@ -587,8 +606,14 @@ impl<'a> Driver<'a> {
                     if let Some(reason) = declined_reason(&self.state.declined, info) {
                         return Verdict::Deny(reason);
                     }
+                    // Every judgment applies to exact arguments. A rewrite
+                    // invalidates earlier authority, scans and approvals.
+                    hook_index = 0;
+                    continue;
                 }
+                ToolDecision::Rewrite { .. } => {}
             }
+            hook_index += 1;
         }
         Verdict::Allow
     }

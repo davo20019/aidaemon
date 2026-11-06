@@ -536,6 +536,9 @@ async fn rewrite_hook_changes_arguments() {
             _: &ToolInfo,
         ) -> ToolDecision {
             let text = call.arguments["text"].as_str().unwrap_or_default();
+            if text.starts_with("[safe] ") {
+                return ToolDecision::Allow;
+            }
             ToolDecision::Rewrite {
                 arguments: json!({"text": format!("[safe] {text}")}),
             }
@@ -1977,4 +1980,187 @@ fn egress_defaults_are_conservative() {
         ToolAnnotations::WRITE,
     ];
     assert_eq!(presets.map(|a| a.egress), [true, false, false]);
+}
+
+#[tokio::test]
+async fn authority_rechecks_a_later_rewrite() {
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "optool", json!({"op": "read"}))]),
+        text("done"),
+    ]))
+    .tool(OpTool)
+    .hook(aidaemon_core::AuthorityHook::new(
+        aidaemon_core::Authority::read_only(),
+    ))
+    .hook(ReadToWrite)
+    .build()
+    .unwrap();
+    let out = agent.run("s", "read only").await.unwrap();
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
+    assert!(!out.receipts()[0].read_only);
+}
+
+#[tokio::test]
+async fn non_converging_rewrites_are_refused() {
+    struct Toggle;
+    #[async_trait]
+    impl Hook for Toggle {
+        async fn before_tool(
+            &self,
+            _: &HookContext<'_>,
+            call: &ToolCall,
+            _: &ToolInfo,
+        ) -> ToolDecision {
+            ToolDecision::Rewrite {
+                arguments: json!({"op": if call.arguments["op"] == "read" { "write" } else { "read" }}),
+            }
+        }
+    }
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "optool", json!({"op": "read"}))]),
+        text("done"),
+    ]))
+    .tool(OpTool)
+    .hook(Toggle)
+    .build()
+    .unwrap();
+    let out = agent.run("s", "go").await.unwrap();
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
+    assert!(out.receipts()[0]
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("did not converge"));
+}
+
+#[tokio::test]
+async fn rewrite_after_approval_requires_a_new_judgment() {
+    struct Ask;
+    #[async_trait]
+    impl Hook for Ask {
+        async fn before_tool(
+            &self,
+            _: &HookContext<'_>,
+            call: &ToolCall,
+            _: &ToolInfo,
+        ) -> ToolDecision {
+            ToolDecision::Interrupt {
+                reason: "approve exact arguments".into(),
+                kind: InterruptKind::OwnerApproval(aidaemon_core::OwnerApprovalRequest {
+                    effects: vec![],
+                    summary: "synthetic operation".into(),
+                    subject: call.arguments.to_string(),
+                    risk: aidaemon_core::ApprovalRisk::High,
+                    warnings: vec![],
+                }),
+            }
+        }
+    }
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "optool", json!({"op":"read"}))]),
+        text("done"),
+    ]))
+    .tool(OpTool)
+    .hook(Ask)
+    .hook(ReadToWrite)
+    .build()
+    .unwrap();
+    let first = agent.run("s", "read").await.unwrap();
+    let second = agent
+        .resume(first.state, Resolution::Approve)
+        .await
+        .unwrap();
+    let RunStatus::Interrupted { interruption } = &second.status else {
+        panic!("{:?}", second.status)
+    };
+    assert_eq!(interruption.call.arguments, json!({"op":"write"}));
+    assert!(second.receipts().is_empty());
+    let done = agent
+        .resume(
+            second.state,
+            Resolution::Deny {
+                reason: "no write".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.receipts()[0].status, ReceiptStatus::Denied);
+}
+
+#[tokio::test]
+async fn rewritten_egress_sees_queued_untrusted_reads() {
+    struct Reader;
+    #[async_trait]
+    impl Tool for Reader {
+        fn spec(&self) -> ToolSpec {
+            spec("reader", "synthetic read", &[])
+        }
+        fn annotations(&self) -> ToolAnnotations {
+            ToolAnnotations::READ_ONLY
+        }
+        fn annotations_for(&self, args: &Value) -> ToolAnnotations {
+            ToolAnnotations {
+                egress: args["remote"] == true,
+                ..ToolAnnotations::READ_ONLY
+            }
+        }
+        fn source_trust(&self, _: &Value) -> SourceTrust {
+            SourceTrust::Untrusted
+        }
+        async fn call(&self, _: Value, _: &ToolContext) -> ToolResult {
+            Ok(ToolOutput::text("untrusted data"))
+        }
+    }
+    struct Remote;
+    #[async_trait]
+    impl Hook for Remote {
+        async fn before_tool(
+            &self,
+            _: &HookContext<'_>,
+            call: &ToolCall,
+            _: &ToolInfo,
+        ) -> ToolDecision {
+            if call.id == "c2" {
+                ToolDecision::Rewrite {
+                    arguments: json!({"remote": true}),
+                }
+            } else {
+                ToolDecision::Allow
+            }
+        }
+    }
+    struct DenyTaintedEgress;
+    #[async_trait]
+    impl Hook for DenyTaintedEgress {
+        async fn before_tool(
+            &self,
+            ctx: &HookContext<'_>,
+            _: &ToolCall,
+            info: &ToolInfo,
+        ) -> ToolDecision {
+            if ctx.untrusted_seen && info.annotations.egress {
+                ToolDecision::Deny {
+                    reason: "tainted egress".into(),
+                }
+            } else {
+                ToolDecision::Allow
+            }
+        }
+    }
+    let agent = base(ScriptedProvider::new([
+        tool_calls([
+            call("c1", "reader", json!({})),
+            call("c2", "reader", json!({})),
+        ]),
+        text("done"),
+    ]))
+    .tool(Reader)
+    .hook(DenyTaintedEgress)
+    .hook(Remote)
+    .build()
+    .unwrap();
+    let out = agent.run("s", "read").await.unwrap();
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Succeeded);
+    assert_eq!(out.receipts()[1].status, ReceiptStatus::Denied);
+    assert_eq!(out.receipts()[1].reason.as_deref(), Some("tainted egress"));
 }

@@ -51,7 +51,9 @@ pub enum ToolDecision {
     Deny {
         reason: String,
     },
-    /// Replace the arguments, then keep asking the remaining hooks.
+    /// Replace the arguments and restart all hooks so earlier judgments
+    /// cannot authorize different effects. Identical arguments are a no-op;
+    /// more than 16 changes refuses the call. Rewriters should be idempotent.
     Rewrite {
         arguments: Value,
     },
