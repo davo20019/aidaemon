@@ -12,7 +12,6 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::providers::ChatJson;
 use crate::skills::{self, Skill};
 use crate::traits::{Procedure, SkillDraft, StateStore};
 
@@ -323,8 +322,7 @@ impl SkillPromoter {
         let model = runtime_snapshot.primary_model();
         let call_start = std::time::Instant::now();
         let response = runtime_snapshot
-            .provider()
-            .chat(&model, &messages, &[])
+            .background_chat(&model, &messages, &[])
             .await?;
 
         crate::events::record_background_model_call_telemetry(

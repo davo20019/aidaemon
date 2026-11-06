@@ -12,7 +12,6 @@ use crate::events::{
     TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
 };
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::providers::ChatJson;
 use crate::tools::sanitize::redact_secrets;
 use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCallContext, ToolCapabilities};
 use crate::utils::truncate_str;
@@ -846,8 +845,7 @@ Rules: no invented event IDs; confidence 0..1.",
         let model = runtime_snapshot.primary_model();
         let call_start = std::time::Instant::now();
         let resp: ProviderResponse = match runtime_snapshot
-            .provider()
-            .chat(&model, &messages, &[])
+            .background_chat(&model, &messages, &[])
             .await
         {
             Ok(r) => r,

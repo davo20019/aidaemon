@@ -8,7 +8,6 @@ use crate::memory::embedding_index::{
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::scoring::calculate_episode_importance;
-use crate::providers::ChatJson;
 use crate::traits::{BehaviorPattern, Message, MessageAnnotation, Person, StateStore, UserProfile};
 use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 use chrono::{DateTime, Utc};
@@ -813,8 +812,7 @@ impl MemoryManager {
             let model = runtime_snapshot.primary_model();
             let call_start = std::time::Instant::now();
             match runtime_snapshot
-                .provider()
-                .chat(&model, &llm_messages, &[])
+                .background_chat(&model, &llm_messages, &[])
                 .await
             {
                 Ok(response) => {
@@ -1462,8 +1460,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .unwrap_or_else(|| runtime_snapshot.primary_model());
         let call_start = std::time::Instant::now();
         let response = runtime_snapshot
-            .provider()
-            .chat(&model, &llm_messages, &[])
+            .background_chat(&model, &llm_messages, &[])
             .await?;
 
         if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
