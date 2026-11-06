@@ -171,10 +171,12 @@ pub(in crate::agent) fn owner_request_for_verifier(
         .as_ref()
         .filter(|turn| turn.text.trim().eq_ignore_ascii_case(current))
         .map(|turn| turn.message_id.as_str());
-    // The owner's root of unfinished work: the earliest owed request in the
-    // lineage, so a chain of short continuations keeps pointing at the request
-    // that was never answered rather than at the latest "try again".
-    let root = state
+    // Every owed request in the lineage, oldest first. A single root chosen
+    // by timestamp is wrong: continuations are themselves owed requests, so
+    // the oldest-by-clock entry can be a bare "try again" that names nothing.
+    // Passing the whole owed set keeps the original, content-bearing request
+    // visible however the entries were stamped.
+    let mut owed: Vec<&OpenRequest> = state
         .open_request
         .iter()
         .chain(state.unfinished_requests.iter())
@@ -184,16 +186,32 @@ pub(in crate::agent) fn owner_request_for_verifier(
                 && !request.text.trim().is_empty()
                 && !open_request_anchor_expired(request, now)
         })
-        .min_by_key(|request| request.opened_at)?;
-    let earlier = root.text.trim();
+        .collect();
+    owed.sort_by_key(|request| request.opened_at);
+    let mut earlier: Vec<&str> = Vec::new();
+    for request in &owed {
+        let text = request.text.trim();
+        if !earlier.contains(&text) {
+            earlier.push(text);
+        }
+    }
+    if earlier.is_empty() {
+        return None;
+    }
+    let listed = earlier
+        .iter()
+        .map(|text| format!("- {}", serde_json::Value::from(*text)))
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(match resolved_followup_mode(state, current_user_text) {
         Some(super::followup::FollowupMode::Followup)
-        | Some(super::followup::FollowupMode::ClarificationAnswer) => {
-            format!("{earlier}\n\nThe owner's follow-up in the same conversation: {current}")
-        }
+        | Some(super::followup::FollowupMode::ClarificationAnswer) => format!(
+            "The owner's unfinished requests in this conversation, oldest first:\n{listed}\n\n\
+             The owner's follow-up in the same conversation: {current}"
+        ),
         Some(super::followup::FollowupMode::NewTask) | None => format!(
-            "{current}\n\nThe owner's earlier request in this conversation is still unfinished, \
-             so this message may continue it: {earlier}"
+            "{current}\n\nThe owner's earlier requests in this conversation are still \
+             unfinished, oldest first, so this message may continue one of them:\n{listed}"
         ),
     })
 }
@@ -2015,6 +2033,30 @@ mod owner_lineage_tests {
         state.unfinished_requests = vec![original];
         state.last_user_turn = Some(UserTurnSummary {
             message_id: "msg-3".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Try again".to_string(),
+        });
+        let origin = owner_request_for_verifier(&state, "Try again", now)
+            .expect("owed work is the verifier's origin");
+        assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn original_request_stays_visible_when_a_bare_continuation_is_older() {
+        // A repaired or late-recorded original request can carry a newer
+        // timestamp than an older bare "try again" entry. Both must reach the
+        // verifier, so the original's words are never hidden by ordering.
+        let now = Utc::now();
+        let mut bare = request(OpenRequestStatus::PartiallyAnswered, "Try again");
+        bare.user_message_id = "request-2".to_string();
+        bare.opened_at = now - chrono::Duration::minutes(30);
+        let mut original = request(OpenRequestStatus::PartiallyAnswered, EARLIER);
+        original.user_message_id = "request-1".to_string();
+        original.opened_at = now - chrono::Duration::minutes(1);
+        let mut state = DialogueState::new("session-1");
+        state.unfinished_requests = vec![bare, original];
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "msg-9".to_string(),
             kind: UserTurnKind::NewRequest,
             text: "Try again".to_string(),
         });
