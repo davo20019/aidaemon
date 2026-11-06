@@ -809,7 +809,8 @@ impl MemoryManager {
 
             // Background LLM call, no tools
             let runtime_snapshot = self.llm_runtime.snapshot();
-            let model = runtime_snapshot.primary_model();
+            // Background work does not need the strongest model.
+            let model = runtime_snapshot.cheap_model();
             let call_start = std::time::Instant::now();
             match runtime_snapshot
                 .background_chat(&model, &llm_messages, &[])

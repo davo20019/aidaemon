@@ -1019,7 +1019,6 @@ pub(in crate::agent) async fn run_bootstrap(
     // runtime primary model's trust tier to decide whether policy filtering is
     // merely observed or may narrow the roster.
     let llm_runtime_snapshot = agent.llm_runtime.snapshot();
-    let llm_provider = llm_runtime_snapshot.provider();
     let llm_router = llm_runtime_snapshot.router();
     let autonomous_bootstrap = agent.trust_tier_for_model(&llm_runtime_snapshot.primary_model())
         == crate::agent::trust_tier::ModelTrustTier::Autonomous;
@@ -1277,13 +1276,26 @@ pub(in crate::agent) async fn run_bootstrap(
             .await
             .map(|guard| *guard)
             .unwrap_or(false);
-    let planner_models = assessment_model_order(
-        llm_router
-            .as_ref()
-            .map(|router| router.all_models_ordered()),
+    // Assessment classifies the request; it does not need the strongest
+    // model. The primary's fast tier leads (an owner model pin still leads),
+    // and the failover providers' models follow, so a used-up primary quota
+    // does not cost the turn its assessment.
+    let mut cheap_first_models = vec![llm_runtime_snapshot.cheap_model()];
+    for candidate in llm_router
+        .as_ref()
+        .map(|router| router.all_models_ordered())
+        .unwrap_or_else(|| vec![model.clone()])
+    {
+        if !cheap_first_models.contains(&candidate) {
+            cheap_first_models.push(candidate);
+        }
+    }
+    let planner_models = llm_runtime_snapshot.with_failover_models(assessment_model_order(
+        Some(cheap_first_models),
         &model,
         model_override_active,
-    );
+    ));
+    let planner_backend = llm_runtime_snapshot.model_routed_backend();
     let planner_model = planner_models
         .first()
         .map_or(model.as_str(), String::as_str);
@@ -1367,7 +1379,7 @@ pub(in crate::agent) async fn run_bootstrap(
                     return None;
                 }
                 super::task_planning::generate_task_plan(
-                    llm_provider.clone(),
+                    planner_backend.clone(),
                     &planner_models,
                     user_text,
                     assessment_mode,
@@ -1392,7 +1404,7 @@ pub(in crate::agent) async fn run_bootstrap(
                 match planner_context.as_deref() {
                     Some(context) => {
                         super::task_planning::generate_task_relationship_candidates(
-                            llm_provider.clone(),
+                            planner_backend.clone(),
                             &planner_models,
                             user_text,
                             context,

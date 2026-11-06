@@ -65,6 +65,24 @@ impl ProviderRuntimeTarget {
             .filter(|models| !models.is_empty())
             .unwrap_or_else(|| vec![self.primary_model.clone()])
     }
+
+    /// The same models with this provider's fast tier first, for calls that
+    /// do not need its strongest model.
+    pub(crate) fn models_cheap_first(&self) -> Vec<String> {
+        cheap_first(self.router.as_ref(), self.all_models_ordered())
+    }
+}
+
+/// `models` reordered so the router's fast tier, when it is one of them,
+/// comes first.
+fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> {
+    if let Some(fast) = router.map(|router| router.select(crate::router::Tier::Fast).to_string()) {
+        if let Some(index) = models.iter().position(|model| *model == fast) {
+            let fast = models.remove(index);
+            models.insert(0, fast);
+        }
+    }
+    models
 }
 
 #[derive(Clone)]
@@ -127,11 +145,63 @@ impl LlmRuntimeSnapshot {
             .map(|model| FailoverStep::from_arc(self.provider.clone()).model(model))
             .collect();
         for target in &self.failover_targets {
-            for model in target.all_models_ordered() {
+            for model in target.models_cheap_first() {
                 steps.push(FailoverStep::from_arc(target.provider()).model(model));
             }
         }
         aidaemon_core::Failover::new(steps)
+    }
+
+    /// The primary provider's fast-tier model, for background and auxiliary
+    /// calls (memory consolidation, summaries, assessment) that do not need
+    /// the strongest model.
+    pub(crate) fn cheap_model(&self) -> String {
+        self.router
+            .as_ref()
+            .map(|router| router.select(crate::router::Tier::Fast).to_string())
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| self.primary_model.clone())
+    }
+
+    /// `primary_models` followed by every failover provider's models (fast
+    /// tier first), for callers that try candidates one by one themselves.
+    /// Run them on [`Self::model_routed_backend`].
+    pub(crate) fn with_failover_models(&self, mut primary_models: Vec<String>) -> Vec<String> {
+        for target in &self.failover_targets {
+            for model in target.models_cheap_first() {
+                if !primary_models.contains(&model) {
+                    primary_models.push(model);
+                }
+            }
+        }
+        primary_models
+    }
+
+    /// One backend that sends each request to the provider that owns its
+    /// model: the primary provider, else the first failover provider listing
+    /// it. Unknown models go to the primary.
+    pub(crate) fn model_routed_backend(&self) -> ModelBackend {
+        let routes = self
+            .failover_targets
+            .iter()
+            .flat_map(|target| {
+                let provider = target.provider();
+                target
+                    .all_models_ordered()
+                    .into_iter()
+                    .map(move |model| (model, provider.clone()))
+            })
+            .collect();
+        let primary_models = self
+            .router
+            .as_ref()
+            .map(Router::all_models_ordered)
+            .unwrap_or_else(|| vec![self.primary_model.clone()]);
+        Arc::new(ModelRoutedBackend {
+            primary: self.provider.clone(),
+            primary_models,
+            routes,
+        })
     }
 
     /// One background call on [`Self::background_chain`], starting at `model`.
@@ -252,6 +322,50 @@ pub fn router_from_models(models: ModelsConfig) -> Option<Router> {
     }
 }
 
+/// See [`LlmRuntimeSnapshot::model_routed_backend`].
+struct ModelRoutedBackend {
+    primary: ModelBackend,
+    primary_models: Vec<String>,
+    routes: Vec<(String, ModelBackend)>,
+}
+
+impl ModelRoutedBackend {
+    fn backend_for(&self, model: &str) -> &ModelBackend {
+        if self.primary_models.iter().any(|known| known == model) {
+            return &self.primary;
+        }
+        self.routes
+            .iter()
+            .find(|(known, _)| known == model)
+            .map(|(_, provider)| provider)
+            .unwrap_or(&self.primary)
+    }
+}
+
+#[async_trait::async_trait]
+impl aidaemon_core::Provider for ModelRoutedBackend {
+    fn name(&self) -> &str {
+        "model-routed"
+    }
+
+    async fn complete(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+    ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+        self.backend_for(&request.model).complete(request).await
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a aidaemon_core::ModelRequest,
+    ) -> futures::stream::BoxStream<
+        'a,
+        Result<aidaemon_core::StreamEvent, aidaemon_core::ProviderError>,
+    > {
+        self.backend_for(&request.model).stream(request)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +411,80 @@ mod tests {
         let served = failover.requests();
         assert_eq!(served.len(), 1);
         assert_eq!(served[0].model, "failover-model");
+    }
+
+    fn router(default: &str, fallback: &[&str], fast: &str) -> Router {
+        Router::new(ModelsConfig {
+            default_model: default.to_string(),
+            fallback_models: fallback.iter().map(|m| m.to_string()).collect(),
+            primary: default.to_string(),
+            fast: fast.to_string(),
+            smart: String::new(),
+        })
+    }
+
+    fn two_provider_runtime(
+        primary: Arc<ScriptedProvider>,
+        failover: Arc<ScriptedProvider>,
+    ) -> SharedLlmRuntime {
+        SharedLlmRuntime::new_with_failovers(
+            primary,
+            Some(router("strong", &["cheap"], "cheap")),
+            ProviderKind::OpenaiChatgpt,
+            "strong".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                failover,
+                Some(router("big-claude", &["small-claude"], "small-claude")),
+                ProviderKind::Anthropic,
+                "big-claude".to_string(),
+            )],
+        )
+    }
+
+    /// Auxiliary calls start on each provider's fast tier, and callers that
+    /// pick candidates themselves see the failover provider's models too.
+    #[test]
+    fn auxiliary_models_are_cheap_first_and_include_failover_providers() {
+        let runtime = two_provider_runtime(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ScriptedProvider::new([])),
+        );
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.cheap_model(), "cheap");
+        assert_eq!(
+            snapshot.with_failover_models(vec!["cheap".into(), "strong".into()]),
+            ["cheap", "strong", "small-claude", "big-claude"]
+        );
+    }
+
+    /// A model-picking caller (task assessment) reaches the failover provider
+    /// by naming one of its models, and the background chain tries the
+    /// failover provider's fast tier first.
+    #[tokio::test]
+    async fn requests_route_to_the_provider_that_owns_the_model() {
+        use crate::providers::sdk_backed::ChatJson;
+        let primary = Arc::new(ScriptedProvider::new([text("from primary")]));
+        let failover = Arc::new(ScriptedProvider::new([
+            text("from failover"),
+            text("background"),
+        ]));
+        let runtime = two_provider_runtime(primary.clone(), failover.clone());
+        let snapshot = runtime.snapshot();
+        let backend = snapshot.model_routed_backend();
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+
+        let answer = backend.chat("small-claude", &messages, &[]).await.unwrap();
+        assert_eq!(answer.content.as_deref(), Some("from failover"));
+        let answer = backend.chat("strong", &messages, &[]).await.unwrap();
+        assert_eq!(answer.content.as_deref(), Some("from primary"));
+
+        // Primary exhausted (its script is empty): the chain moves to the
+        // failover provider, starting at its fast tier.
+        let answer = snapshot
+            .background_chat("cheap", &messages, &[])
+            .await
+            .unwrap();
+        assert_eq!(answer.content.as_deref(), Some("background"));
+        assert_eq!(failover.requests().last().unwrap().model, "small-claude");
     }
 }
