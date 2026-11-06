@@ -568,6 +568,12 @@ pub struct DialogueState {
     /// antecedent until task assessment commits the relationship.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub antecedent_request: Option<OpenRequest>,
+    /// Owner requests that were still owed work when a later request began.
+    /// They are not answered by moving on: the owner's earlier request stays
+    /// the authority for a continuation (for example "try again") even after
+    /// a message is classified as a new request. Bounded and expiring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfinished_requests: Vec<OpenRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_question: Option<OpenQuestion>,
     /// The most recent open question that a user reply closed. Kept so the
@@ -598,6 +604,7 @@ impl DialogueState {
             revision: 1,
             open_request: None,
             antecedent_request: None,
+            unfinished_requests: Vec::new(),
             open_question: None,
             last_closed_question: None,
             last_assistant_turn: None,
