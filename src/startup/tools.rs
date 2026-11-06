@@ -998,7 +998,7 @@ async fn register_runtime_tool_by_id(
 ) -> anyhow::Result<()> {
     match tool_id {
         RuntimeToolId::ManageMcp => {
-            let manage_mcp = ManageMcpTool::new(mcp_registry, approval_tx);
+            let manage_mcp = ManageMcpTool::new(mcp_registry);
             tools.push(Arc::new(manage_mcp));
         }
         RuntimeToolId::ManagePeople => {

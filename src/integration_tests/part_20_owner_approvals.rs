@@ -1482,3 +1482,74 @@ async fn mcp_tool_call_passes_kernel_hooks() {
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
 }
+
+/// `manage_mcp` as is, except that it is offered on a Balanced turn
+/// (`high_impact_write` only filters the offer; the judgment and effects are
+/// the real tool's).
+struct OfferedManageMcpTool(crate::tools::ManageMcpTool);
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for OfferedManageMcpTool {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn schema(&self) -> serde_json::Value {
+        self.0.schema()
+    }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.0.call(arguments).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for OfferedManageMcpTool {
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &crate::traits::ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        self.0.owner_approval_request(call, facts).await
+    }
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        self.0.call_semantics(arguments)
+    }
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        self.0.call_effects(arguments)
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            high_impact_write: false,
+            ..self.0.capabilities()
+        }
+    }
+}
+
+/// A real MCP tool, with no private approval broker: denial is recorded by
+/// the kernel before any server can start, including repeat additions.
+#[tokio::test]
+async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
+    let backing = setup_test_agent(MockProvider::with_responses(vec![])).await.unwrap();
+    let registry = crate::mcp::McpRegistry::new(backing.state.clone());
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(OfferedManageMcpTool(
+        crate::tools::ManageMcpTool::new(registry.clone()),
+    ));
+    let args = r#"{"action":"add","name":"synthetic","command":"node","args":["synthetic-server.js"]}"#;
+    let (harness, approver) = approvals_harness_with(
+        vec![
+            MockProvider::tool_call_response("manage_mcp", args),
+            MockProvider::tool_call_response("manage_mcp", args),
+            MockProvider::text_response("The server was not added."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        Some(std::time::Duration::from_millis(300)),
+        vec![tool],
+    ).await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+    assert_eq!(approver.card_count(), 1);
+    assert!(registry.list_servers_with_status().await.unwrap().is_empty());
+    assert_eq!(ledger_refusals(&harness, APPROVALS_SESSION, "owner_approval_declined").await, 2);
+    assert_eq!(latest_task_outcome(&harness, APPROVALS_SESSION).await, crate::events::TaskOutcome::Partial);
+}

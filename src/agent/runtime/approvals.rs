@@ -900,14 +900,49 @@ mod tests {
         }
     }
 
-    /// Rules over the turn's approval-judging tools: a real `http_request`
-    /// and `manage_api`'s judgment.
+    /// `manage_mcp`'s approval judgment without its registry (which needs a
+    /// database): the same `ManageMcpTool::owner_approval` the tool runs.
+    struct ManageMcpApprovals;
+
+    #[async_trait]
+    impl crate::traits::ToolSemantics for ManageMcpApprovals {
+        async fn owner_approval_request(
+            &self,
+            call: &crate::traits::ApprovalCall<'_>,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> crate::traits::OwnerApprovalNeed {
+            crate::tools::ManageMcpTool::owner_approval(call.arguments)
+        }
+    }
+
+    #[async_trait]
+    impl crate::traits::Tool for ManageMcpApprovals {
+        fn name(&self) -> &str {
+            "manage_mcp"
+        }
+        fn description(&self) -> &str {
+            "manage_mcp approvals"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"name": "manage_mcp", "description": "", "parameters": {"type": "object"}})
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            anyhow::bail!("not run in these tests")
+        }
+    }
+
+    /// Rules over the turn's approval-judging tools: a real `http_request`,
+    /// `manage_api`'s judgment and `manage_mcp`'s judgment.
     fn rules() -> AppApprovalRules {
         let http: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::HttpRequestTool::new(
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         ));
         AppApprovalRules {
-            tools: ApprovalTools::new([http, Arc::new(ManageApiApprovals) as Arc<_>]),
+            tools: ApprovalTools::new([
+                http,
+                Arc::new(ManageApiApprovals) as Arc<_>,
+                Arc::new(ManageMcpApprovals) as Arc<_>,
+            ]),
             ..AppApprovalRules::default()
         }
     }
@@ -915,6 +950,116 @@ mod tests {
     async fn judge(rules: &AppApprovalRules, args: serde_json::Value) -> RuleDecision {
         let call = sdk::ToolCall::new("c1", "http_request", args);
         rules.judge(&hook_ctx(), &call, &tool_info()).await
+    }
+
+    /// An MCP start asks the owner in every session, and a call the add path
+    /// refuses needs no card (it never runs).
+    #[tokio::test]
+    async fn mcp_add_always_asks_before_dispatch() {
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                trusted_session: trusted,
+                mandate_preapproved: trusted,
+                ..rules()
+            };
+            let add = sdk::ToolCall::new(
+                "c1",
+                "manage_mcp",
+                json!({"action":"add","name":"synthetic","command":"node","args":["server.js"]}),
+            );
+            assert!(
+                matches!(
+                    rules.judge(&hook_ctx(), &add, &tool_info()).await,
+                    RuleDecision::Ask(_)
+                ),
+                "trusted={trusted}"
+            );
+            let refused = sdk::ToolCall::new(
+                "c2",
+                "manage_mcp",
+                json!({"action":"add","name":"synthetic","command":"sh"}),
+            );
+            assert_eq!(
+                rules.judge(&hook_ctx(), &refused, &tool_info()).await,
+                RuleDecision::Allow
+            );
+            let list = sdk::ToolCall::new("c3", "manage_mcp", json!({"action":"list"}));
+            assert_eq!(
+                rules.judge(&hook_ctx(), &list, &tool_info()).await,
+                RuleDecision::Allow
+            );
+        }
+    }
+
+    /// Exercise the real app rules and SDK policy with a process-effect
+    /// probe. The alternate name proves declines follow effects, not names.
+    #[tokio::test]
+    async fn mcp_approval_binds_process_effects_across_tools() {
+        use sdk::testing::{call, spec, text, tool_calls, ScriptedProvider};
+        struct ProcessProbe(&'static str, Arc<AtomicU64>);
+        #[async_trait]
+        impl sdk::Tool for ProcessProbe {
+            fn spec(&self) -> sdk::ToolSpec {
+                spec(self.0, "synthetic process probe", &[])
+            }
+            fn annotations(&self) -> sdk::ToolAnnotations {
+                sdk::ToolAnnotations::WRITE
+            }
+            fn effects(&self, args: &serde_json::Value) -> sdk::CallEffects {
+                crate::tools::ManageMcpTool::effects_for(&args.to_string())
+            }
+            async fn call(&self, _: serde_json::Value, _: &sdk::ToolContext) -> sdk::ToolResult {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Ok(sdk::ToolOutput::text("started"))
+            }
+        }
+        for approve in [false, true] {
+            let executed = Arc::new(AtomicU64::new(0));
+            let args =
+                json!({"action":"add","name":"synthetic","command":"node","args":["server.js"]});
+            let policy =
+                aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
+                    .with_rules(Arc::new(rules()));
+            let agent = sdk::Agent::builder("synthetic")
+                .allow_unguarded()
+                .model("mock")
+                .provider(ScriptedProvider::new([
+                    tool_calls([call("c1", "manage_mcp", args.clone())]),
+                    tool_calls([call("c2", "alternate_process", args)]),
+                    text("Finished considering the request."),
+                ]))
+                .tool(ProcessProbe("manage_mcp", executed.clone()))
+                .tool(ProcessProbe("alternate_process", executed.clone()))
+                .hook(policy)
+                .build()
+                .unwrap();
+            let pending = agent
+                .run("synthetic-session", "Add the server")
+                .await
+                .unwrap();
+            assert!(matches!(pending.status, sdk::RunStatus::Interrupted { .. }));
+            assert_eq!(executed.load(Ordering::SeqCst), 0);
+            let resolution = if approve {
+                sdk::Resolution::Approve
+            } else {
+                sdk::Resolution::Deny {
+                    reason: "No".into(),
+                }
+            };
+            let finished = agent.resume(pending.state, resolution).await.unwrap();
+            assert!(matches!(finished.status, sdk::RunStatus::Completed));
+            assert_eq!(executed.load(Ordering::SeqCst), if approve { 2 } else { 0 });
+            if !approve {
+                assert_eq!(
+                    finished.state.declined,
+                    vec![sdk::EffectKey::named(sdk::EffectClass::Process, "node")]
+                );
+                assert!(finished
+                    .receipts()
+                    .iter()
+                    .all(|r| r.status == sdk::ReceiptStatus::Denied));
+            }
+        }
     }
 
     #[tokio::test]
