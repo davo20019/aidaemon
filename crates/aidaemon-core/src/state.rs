@@ -137,6 +137,12 @@ pub struct RunState {
     /// run ([`RunState::with_user_message`]) starts with none.
     #[serde(default)]
     pub declined: Vec<EffectKey>,
+    /// Requirements stop hooks reported as unmet when the run stopped
+    /// ([`crate::StopDecision::AcceptUnmet`]), deduplicated, in hook order.
+    /// Set only when the run ends `Completed`; a new run
+    /// ([`RunState::with_user_message`]) starts with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet: Vec<String>,
     /// The first finish a call returned in the unfinished batch; the run
     /// ends with it once the batch ends (see [`crate::ToolOutput::finish`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +172,7 @@ impl RunState {
             untrusted_seen: false,
             stuck: StuckState::default(),
             declined: Vec::new(),
+            unmet: Vec::new(),
             finishing: None,
         }
     }
@@ -181,7 +188,8 @@ impl RunState {
     /// session, new run). Session receipts and `usage` keep accumulating;
     /// per-run counters and budgets (`turn`, `tool_calls`, `run_usage`,
     /// elapsed time) start again from zero, and the run's
-    /// [`RunState::declined`] effects are forgotten.
+    /// [`RunState::declined`] effects and [`RunState::unmet`] requirements
+    /// are forgotten.
     pub fn with_user_message(mut self, input: impl Into<Message>) -> Self {
         self.messages.push(input.into());
         self.run_id = RunId::new();
@@ -193,6 +201,7 @@ impl RunState {
         self.in_flight = None;
         self.stuck.reset();
         self.declined.clear();
+        self.unmet.clear();
         self.finishing = None;
         self
     }

@@ -99,6 +99,20 @@ receipt-based check rejecting a fabricated "done". aidaemon's assessor,
 of this hook, not kernel code; `track_requirements` would be a tool plus an
 `on_stop` hook.
 
+**Stopping and succeeding are separate decisions.** `RunStatus::Completed`
+means the model answered and every stop hook let the run stop; it does not
+mean the work was done. A hook that should let a run stop without vouching
+for it (its asking budget is spent, or the remaining work is deferred or
+blocked) returns `AcceptUnmet { unmet }`. The first `Continue` still wins;
+otherwise the run ends `Completed` with every reported line in
+`RunState::unmet`, and `RunOutcome::is_succeeded()` is false (as it is for
+any run with an owner decline). `ReceiptCompletionCheck` reports unresolved
+failures this way once its rejections are spent, and the SDK checklist
+reports deferred items this way. Applications should read
+`is_succeeded()`, not `is_completed()`, when they mean "the objective was
+met"; `aidaemon-agents`, `aidaemon-channels` and `aidaemon-eval`
+(`expect.succeeded`) do.
+
 **Interrupt and resume across processes.** `before_tool` can return
 `Interrupt`; the run ends with `RunStatus::Interrupted` and a serializable
 `RunState`. `Agent::resume(state, Approve | Deny)` continues, even in another

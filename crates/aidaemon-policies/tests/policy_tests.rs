@@ -315,7 +315,12 @@ async fn completion_check_is_bounded_and_scoped_to_the_user_turn() {
         .unwrap();
     let out = agent.run("s", "go").await.unwrap();
     assert!(out.is_completed());
-    assert_eq!(out.turns(), 3, "one rejection, then accepted");
+    assert_eq!(out.turns(), 3, "one rejection, then allowed to stop");
+    // Spending the rejection budget lets the run stop; it does not turn the
+    // unresolved failure into success.
+    assert!(!out.is_succeeded());
+    assert_eq!(out.unmet().len(), 1);
+    assert!(out.unmet()[0].contains("`shell`"), "{:?}", out.unmet());
 
     // A new user message starts a new scope: the old failure is not re-raised.
     let next = agent
@@ -323,6 +328,7 @@ async fn completion_check_is_bounded_and_scoped_to_the_user_turn() {
         .await
         .unwrap();
     assert!(next.is_completed());
+    assert!(next.is_succeeded());
     assert_eq!(next.turns(), 1);
 }
 
@@ -746,6 +752,9 @@ async fn policies_compose_in_one_agent_run() {
         out.final_text.as_deref(),
         Some("I could not finish: the cleanup command failed with exit status 1.")
     );
+    // The run stopped honestly, but the failed cleanup keeps it from
+    // counting as a success.
+    assert!(!out.is_succeeded());
     for request in provider.requests() {
         assert!(request.messages[1]
             .content

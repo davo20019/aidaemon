@@ -65,8 +65,28 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
+    /// The run stopped because the model answered and every stop hook let
+    /// it stop. That is not the same as the work being done: see
+    /// [`RunOutcome::is_succeeded`].
     pub fn is_completed(&self) -> bool {
         matches!(self.status, RunStatus::Completed)
+    }
+
+    /// The run's objective was met, as far as the kernel and its hooks can
+    /// tell: it completed with no unmet requirement and nothing the owner
+    /// declined, or a tool finished it as `Succeeded` (the kernel already
+    /// reports a finish in a run with declines as `Partial`).
+    pub fn is_succeeded(&self) -> bool {
+        match &self.status {
+            RunStatus::Completed => self.state.unmet.is_empty() && self.state.declined.is_empty(),
+            RunStatus::Finished { outcome, .. } => *outcome == FinishOutcome::Succeeded,
+            _ => false,
+        }
+    }
+
+    /// Requirements a stop hook reported as unmet when the run stopped.
+    pub fn unmet(&self) -> &[String] {
+        &self.state.unmet
     }
 
     /// Usage of the whole session.

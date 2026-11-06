@@ -43,10 +43,18 @@ pub(super) fn reply_for(outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskO
         .filter(|text| !text.is_empty())
         .map(str::to_string);
     match &outcome.status {
+        // Completed means the model stopped and every stop hook let it;
+        // it is a success only when no hook reported the objective unmet
+        // and the owner declined nothing (`RunOutcome::is_succeeded`).
+        // The ledger reconciles further at task end.
         sdk::RunStatus::Completed => (
             text.unwrap_or_default(),
             TaskStatus::Completed,
-            TaskOutcome::Succeeded,
+            if outcome.is_succeeded() {
+                TaskOutcome::Succeeded
+            } else {
+                TaskOutcome::Partial
+            },
         ),
         sdk::RunStatus::LimitReached { limit } => (
             text.unwrap_or_else(|| {

@@ -753,7 +753,7 @@ impl Inner {
             RunStatus::Completed | RunStatus::Finished { .. } => {
                 let text = outcome.final_text.as_deref().unwrap_or("").trim();
                 if text.is_empty() {
-                    self.reply(&origin, &render::ending_text(&outcome.status))
+                    self.reply(&origin, &render::outcome_ending_text(&outcome))
                         .await;
                 } else {
                     self.reply(&origin, text).await;
@@ -887,7 +887,7 @@ impl Inner {
         }
         if let Some(r) = &status_ref {
             let word = match &result {
-                Ok(outcome) => render::status_word(&outcome.status),
+                Ok(outcome) => render::outcome_word(outcome),
                 Err(_) => "Failed",
             };
             if let Err(err) = channel.edit(r, &progress.render_final(word, max)).await {

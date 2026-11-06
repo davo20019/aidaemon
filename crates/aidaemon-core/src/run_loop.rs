@@ -241,18 +241,31 @@ impl<'a> Driver<'a> {
 
             // 4a. No tool calls: the model thinks it is done. Ask stop hooks.
             if calls.is_empty() {
-                let rejection = {
+                // The first hook that asks to continue wins. Otherwise the
+                // run stops, carrying every requirement a hook reported as
+                // unmet: stopping is permitted, success is not implied.
+                let (rejection, unmet) = {
                     let ctx = self.ctx();
                     let mut rejection = None;
+                    let mut unmet: Vec<String> = Vec::new();
                     for hook in &self.agent.hooks {
-                        if let StopDecision::Continue { message } =
-                            hook.on_stop(&ctx, &response.text).await
-                        {
-                            rejection = Some(message);
-                            break;
+                        match hook.on_stop(&ctx, &response.text).await {
+                            StopDecision::Accept => {}
+                            StopDecision::Continue { message } => {
+                                rejection = Some(message);
+                                break;
+                            }
+                            StopDecision::AcceptUnmet { unmet: lines } => {
+                                for line in lines {
+                                    let line = line.trim().to_string();
+                                    if !line.is_empty() && !unmet.contains(&line) {
+                                        unmet.push(line);
+                                    }
+                                }
+                            }
                         }
                     }
-                    rejection
+                    (rejection, unmet)
                 };
                 match rejection {
                     Some(message) => {
@@ -267,6 +280,7 @@ impl<'a> Driver<'a> {
                         continue;
                     }
                     None => {
+                        self.state.unmet = unmet;
                         return self.finish(RunStatus::Completed, Some(response.text)).await;
                     }
                 }

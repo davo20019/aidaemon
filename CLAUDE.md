@@ -307,6 +307,14 @@ checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
 model's own typed statement of what it will do, so open reachable checklist
 items are demanded even after other work completed and a run that ends with
 one open is `partial`, not evidence-closed. Only receipts close either kind.
+An item the model marks `deferred`/`skipped` or drops from its list becomes
+`RunObligationState::Deferred`: the closeout never demands it (stopping is
+permitted, `UnreachableReason::ExecutorDeferred`), but it never counts toward
+`is_fulfilled`, `work_is_fulfilled` or `evidence_closed`, so the run ends
+`partial`. Editing a checklist never turns unperformed work into
+accomplished work. In the SDK kernel the same split is
+`StopDecision::AcceptUnmet` and `RunOutcome::is_succeeded()`: `Completed`
+means the run stopped, not that its objective was met.
 `task_assessment` defaults to `"shadow"` (assess and log what the assessor
 would have refused); `on` behaves the same without recording, and `off` skips
 the assessment call.

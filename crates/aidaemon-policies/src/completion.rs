@@ -22,8 +22,10 @@ pub enum Requirement {
 const REJECTION_PREFIX: &str = "[harness] completion check:";
 
 /// Rejects a final answer when the receipts do not support it, at most
-/// `max_rejections` times per user turn (default 2), then accepts so a run
-/// can never loop on this hook alone.
+/// `max_rejections` times per user turn (default 2). After that it lets the
+/// run stop so it can never loop on this hook alone, but reports what is
+/// still unsupported as [`StopDecision::AcceptUnmet`]: the run ends
+/// `Completed` and [`aidaemon_core::RunOutcome::is_succeeded`] is false.
 ///
 /// The rejection count is derived from the transcript (its own rejection
 /// messages since the last user message), so it survives resume in another
@@ -149,9 +151,6 @@ impl Hook for ReceiptCompletionCheck {
                 m.origin == Some(MessageOrigin::StopHook) && m.content.starts_with(REJECTION_PREFIX)
             })
             .count();
-        if rejections >= self.max_rejections {
-            return StopDecision::Accept;
-        }
         // The kernel appends exactly one tool message and one receipt per
         // call, together, so the last N receipts belong to the N tool
         // messages of this user turn (call ids alone may repeat across turns).
@@ -165,6 +164,12 @@ impl Hook for ReceiptCompletionCheck {
         let problems = self.problems(&receipts);
         if problems.is_empty() {
             return StopDecision::Accept;
+        }
+        // The asking budget is spent: let the run stop, but say what the
+        // receipts still do not support. Running out of rejections is not
+        // evidence that the work was done.
+        if rejections >= self.max_rejections {
+            return StopDecision::AcceptUnmet { unmet: problems };
         }
         let mut message = format!(
             "{REJECTION_PREFIX} the run is not finished yet (check {} of {}).",

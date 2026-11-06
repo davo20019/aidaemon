@@ -90,6 +90,7 @@ async fn completed_child_result_is_condensed_with_details() {
     assert_eq!(receipt.status, ReceiptStatus::Succeeded);
     assert_eq!(receipt.details["status"]["status"], "completed");
     assert_eq!(receipt.details["turns"], 1);
+    assert_eq!(receipt.details["succeeded"], true);
     assert_eq!(
         receipt.details["child_session_id"],
         "telegram:synthetic-user-1/sub/c1"
@@ -104,6 +105,42 @@ async fn completed_child_result_is_condensed_with_details() {
         .find(|m| m.role == Role::User)
         .unwrap();
     assert_eq!(user.content, "Find the release date");
+}
+
+#[tokio::test]
+async fn child_that_stops_with_unmet_requirements_reports_them() {
+    struct Unmet;
+    #[async_trait]
+    impl Hook for Unmet {
+        async fn on_stop(&self, _: &HookContext<'_>, _: &str) -> aidaemon_core::StopDecision {
+            aidaemon_core::StopDecision::AcceptUnmet {
+                unmet: vec!["checklist: [-] cite a primary source (deferred: paywalled)".into()],
+            }
+        }
+    }
+    let child_provider = Arc::new(ScriptedProvider::new([text("It shipped in May.")]));
+    let tool = AgentTool::from_builder(
+        child_builder(child_provider).hook(Unmet),
+        ChildBudget::default(),
+    )
+    .unwrap()
+    .name("research");
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "Find the release date with a source")]),
+        text("done"),
+    ]));
+    let out = parent(parent_provider.clone(), tool)
+        .run("telegram:synthetic-user-1", "go")
+        .await
+        .unwrap();
+
+    let seen = tool_message(&parent_provider, "c1");
+    assert!(seen.contains("stopped without finishing"), "{seen}");
+    assert!(seen.contains("cite a primary source"));
+    assert!(seen.contains("It shipped in May."));
+    let receipt = &out.receipts()[0];
+    assert_eq!(receipt.details["succeeded"], false);
+    assert_eq!(receipt.details["unmet"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

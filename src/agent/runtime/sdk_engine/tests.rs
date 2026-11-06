@@ -1563,6 +1563,15 @@ fn interrupted_and_failed_runs_map_to_non_success_outcomes() {
     assert_eq!(status, TaskStatus::Completed);
     assert_eq!(task_outcome, TaskOutcome::Succeeded);
 
+    // Stopping is not succeeding: a completed run whose stop hooks reported
+    // unmet requirements is partial.
+    outcome.state.unmet = vec!["checklist: [-] email the report".into()];
+    let (reply, status, task_outcome) = reply_for(&outcome);
+    assert_eq!(reply, "All set.");
+    assert_eq!(status, TaskStatus::Completed);
+    assert_eq!(task_outcome, TaskOutcome::Partial);
+    outcome.state.unmet.clear();
+
     outcome.status = sdk::RunStatus::Finished {
         outcome: sdk::FinishOutcome::Succeeded,
         tool: "synthetic_finisher".into(),

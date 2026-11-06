@@ -69,13 +69,30 @@ pub enum ToolDecision {
 }
 
 /// What an `on_stop` hook decides when the model replies without tool calls.
+///
+/// Stopping and succeeding are separate decisions. A hook can let the run
+/// stop (more turns would not help: the work is blocked, deferred or its
+/// budget for asking is spent) while recording that the objective was not
+/// met. Such a run ends [`crate::RunStatus::Completed`] with
+/// [`crate::RunState::unmet`] filled, and
+/// [`crate::RunOutcome::is_succeeded`] is false.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StopDecision {
+    /// Stop, and this hook has nothing against calling the run a success.
     Accept,
     /// Do not finish yet; append this message and run another turn.
-    Continue {
-        message: String,
-    },
+    Continue { message: String },
+    /// Stop, but the objective is not met. Each line names one unmet
+    /// requirement in words a person can read. The run ends `Completed`
+    /// (the model may not keep going) and never counts as succeeded.
+    AcceptUnmet { unmet: Vec<String> },
+}
+
+impl StopDecision {
+    /// Whether the run may stop (anything but [`StopDecision::Continue`]).
+    pub fn permits_stop(&self) -> bool {
+        !matches!(self, Self::Continue { .. })
+    }
 }
 
 /// What to do when the stuck detector fires.

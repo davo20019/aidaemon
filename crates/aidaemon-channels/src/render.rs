@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use aidaemon_core::{Event, FinishOutcome, Interruption, LimitKind, ReceiptStatus, RunStatus};
+use aidaemon_core::{
+    Event, FinishOutcome, Interruption, LimitKind, ReceiptStatus, RunOutcome, RunStatus,
+};
 
 const MAX_TOOL_LINES: usize = 8;
 
@@ -189,6 +191,29 @@ pub(crate) fn ending_text(status: &RunStatus) -> String {
     }
 }
 
+/// [`ending_text`] for a whole outcome: a run that stopped with unmet
+/// requirements says what was left undone instead of "Done.".
+pub(crate) fn outcome_ending_text(outcome: &RunOutcome) -> String {
+    if outcome.is_completed() && !outcome.unmet().is_empty() {
+        let mut text = "I stopped without finishing everything:".to_string();
+        for line in outcome.unmet() {
+            text.push_str("\n- ");
+            text.push_str(&truncate_chars(line, 300));
+        }
+        return text;
+    }
+    ending_text(&outcome.status)
+}
+
+/// [`status_word`] for a whole outcome: a completed run whose objective
+/// was not met reads "Partly done", like a partial finish.
+pub(crate) fn outcome_word(outcome: &RunOutcome) -> &'static str {
+    if outcome.is_completed() && !outcome.is_succeeded() {
+        return "Partly done";
+    }
+    status_word(&outcome.status)
+}
+
 /// One word for the final status-message edit.
 pub(crate) fn status_word(status: &RunStatus) -> &'static str {
     match status {
@@ -266,5 +291,22 @@ mod tests {
         for outcome in [FinishOutcome::Partial, FinishOutcome::Blocked] {
             assert!(!ending_text(&finished(outcome)).contains("unexpectedly"));
         }
+    }
+
+    /// Stopping is not succeeding: a completed run with unmet requirements
+    /// never reads as "Done".
+    #[test]
+    fn completed_runs_with_unmet_requirements_read_as_partly_done() {
+        let mut outcome = RunOutcome {
+            status: RunStatus::Completed,
+            final_text: None,
+            state: aidaemon_core::RunState::new("a", "s", "go"),
+        };
+        assert_eq!(outcome_word(&outcome), "Done");
+        assert_eq!(outcome_ending_text(&outcome), "Done.");
+        outcome.state.unmet = vec!["checklist: [-] email the report".into()];
+        assert_eq!(outcome_word(&outcome), "Partly done");
+        let text = outcome_ending_text(&outcome);
+        assert!(text.contains("without finishing") && text.contains("email the report"));
     }
 }

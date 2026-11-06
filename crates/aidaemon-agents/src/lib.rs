@@ -304,6 +304,8 @@ impl AgentTool {
             "child_run_id": outcome.state.run_id,
             "child_session_id": session,
             "status": outcome.status,
+            "succeeded": outcome.is_succeeded(),
+            "unmet": outcome.unmet(),
             "turns": outcome.turns(),
             "receipts": receipts,
             "usage": outcome.usage(),
@@ -400,6 +402,26 @@ impl Tool for AgentTool {
         let details = self.details(&outcome, &session);
         let usage = outcome.usage();
         let output = match &outcome.status {
+            // Completed means the child stopped, not that it did the work:
+            // unmet requirements are passed up so the caller cannot mistake
+            // a stop for a success.
+            RunStatus::Completed if !outcome.unmet().is_empty() => {
+                let text = condense(
+                    outcome.final_text.as_deref().unwrap_or_default(),
+                    self.max_result_chars,
+                );
+                let mut message = format!(
+                    "sub-agent `{}` stopped without finishing; still unmet:",
+                    self.name
+                );
+                for line in outcome.unmet() {
+                    message.push_str("\n- ");
+                    message.push_str(line);
+                }
+                message.push_str("\n\nIts reply:\n");
+                message.push_str(&text);
+                ToolOutput::text(message)
+            }
             RunStatus::Completed => {
                 let text = outcome.final_text.as_deref().unwrap_or_default();
                 ToolOutput::text(condense(text, self.max_result_chars))

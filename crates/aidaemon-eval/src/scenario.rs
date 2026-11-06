@@ -171,6 +171,12 @@ pub fn status_name(status: &RunStatus) -> &'static str {
 pub struct Expect {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ExpectedStatus>,
+    /// Whether the run's objective was met
+    /// ([`aidaemon_core::RunOutcome::is_succeeded`]). `completed` only says
+    /// the run stopped; a run that stops with unmet requirements is
+    /// `completed` but not `succeeded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succeeded: Option<bool>,
     /// Case-insensitive substrings the final text must contain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub final_text_contains: Vec<String>,

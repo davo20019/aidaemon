@@ -655,6 +655,81 @@ async fn stop_hook_can_reject_an_unsupported_done() {
         .any(|m| m.role == Role::User && m.content.contains("not run any tools")));
 }
 
+/// Lets the run stop but reports a fixed set of unmet requirements.
+struct Unmet(Vec<&'static str>);
+#[async_trait]
+impl Hook for Unmet {
+    async fn on_stop(&self, _: &HookContext<'_>, _: &str) -> StopDecision {
+        StopDecision::AcceptUnmet {
+            unmet: self.0.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// Asks for one more turn the first time, then accepts.
+struct ContinueOnce(AtomicUsize);
+#[async_trait]
+impl Hook for ContinueOnce {
+    async fn on_stop(&self, _: &HookContext<'_>, _: &str) -> StopDecision {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            StopDecision::Continue {
+                message: "one more turn".into(),
+            }
+        } else {
+            StopDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn stopping_with_unmet_requirements_completes_but_does_not_succeed() {
+    let agent = base(ScriptedProvider::new([text(
+        "I could not finish the export.",
+    )]))
+    .hook(Unmet(vec!["export the report", "export the report", "  "]))
+    .hook(Unmet(vec!["email it"]))
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "export and email the report").await.unwrap();
+
+    assert!(out.is_completed(), "the run may stop: {:?}", out.status);
+    assert!(!out.is_succeeded(), "but its objective is unmet");
+    assert_eq!(out.unmet(), ["export the report", "email it"]);
+    assert_eq!(out.turns(), 1, "an unmet stop never asks for more turns");
+}
+
+#[tokio::test]
+async fn a_continue_from_any_hook_wins_over_an_unmet_stop() {
+    let agent = base(ScriptedProvider::new([text("first"), text("second")]))
+        .hook(Unmet(vec!["still unmet"]))
+        .hook(ContinueOnce(AtomicUsize::new(0)))
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.turns(), 2);
+    assert_eq!(out.final_text.as_deref(), Some("second"));
+    assert_eq!(out.unmet(), ["still unmet"]);
+    assert!(!out.is_succeeded());
+}
+
+#[tokio::test]
+async fn unmet_requirements_do_not_carry_into_the_next_run() {
+    let agent = base(ScriptedProvider::new([text("blocked"), text("ok")]))
+        .build()
+        .unwrap();
+    let mut state = RunState::new("a", "s", "first");
+    state.unmet = vec!["left over".into()];
+    let next = state.with_user_message("second");
+    assert!(next.unmet.is_empty());
+
+    let out = agent.run("s", "plain question").await.unwrap();
+    assert!(out.is_completed() && out.is_succeeded());
+    assert!(out.unmet().is_empty());
+}
+
 // ---------- interrupt / resume ----------
 
 struct AskBeforeDestructive;

@@ -44,7 +44,14 @@ pub(crate) enum RunObligationState {
     Pending,
     Satisfied,
     Invalidated,
-    Abandoned,
+    /// The executor stopped working on a checklist item: it marked it
+    /// `deferred`/`skipped` or dropped it from its list. Deferral is not
+    /// evidence: the run may stop over a deferred item (the closeout never
+    /// demands it), but it never counts toward fulfillment, and a receipt
+    /// that proves it still closes it. Serialized projections written before
+    /// this distinction called it `abandoned`.
+    #[serde(alias = "abandoned")]
+    Deferred,
     Unverifiable,
 }
 
@@ -215,6 +222,9 @@ pub(crate) enum UnreachableReason {
     CardinalityExhausted,
     /// No visible tool admissible under the request's authority can satisfy it.
     NoAdmissibleTool,
+    /// The executor deferred or dropped its own checklist item. The loop may
+    /// not demand it (stopping is permitted), but it is not proven either.
+    ExecutorDeferred,
 }
 
 /// The ledger-first closeout verdict. See [`RunAggregate::closeout`].
@@ -624,8 +634,10 @@ impl RunAggregate {
     /// subject/facet receipt). Opaque identifiers are exact resource IDs; they
     /// never fall back to an untargeted observation.
     /// Untyped free-text items are not obligations. A later declaration
-    /// replaces the set: kept indices retain their proof, `deferred`/`skipped`
-    /// items are abandoned, removed indices are abandoned.
+    /// replaces the set: kept indices retain their proof; `deferred`/`skipped`
+    /// items and removed indices that are not already proven become
+    /// `Deferred`. Editing the checklist never turns unperformed work into
+    /// accomplished work: only receipts satisfy an obligation.
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
         self.executor_expectations_present = true;
         let exact_resource_targets = declared.schema_version >= 2;
@@ -637,7 +649,7 @@ impl RunAggregate {
         let mut declared_ids = BTreeSet::new();
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
-            let abandoned = matches!(item.status.as_str(), "deferred" | "skipped");
+            let deferred = matches!(item.status.as_str(), "deferred" | "skipped");
             let has_effect = !item.mutation_effects.is_empty();
             let declared_observation_targets = if item.observation_targets.is_empty() {
                 item.targets
@@ -686,12 +698,15 @@ impl RunAggregate {
             let existing_revision = existing
                 .filter(|_| same_contract)
                 .and_then(|o| o.satisfied_at_revision);
-            let state = if abandoned {
-                RunObligationState::Abandoned
-            } else if same_contract
+            // Proof wins over the label in both directions: a proven item
+            // stays satisfied even when re-posted as deferred, and a deferred
+            // label never stands in for proof.
+            let state = if same_contract
                 && existing.is_some_and(|o| o.state == RunObligationState::Satisfied)
             {
                 RunObligationState::Satisfied
+            } else if deferred {
+                RunObligationState::Deferred
             } else {
                 RunObligationState::Pending
             };
@@ -712,8 +727,11 @@ impl RunAggregate {
             });
         }
         for (id, obligation) in self.obligations.iter_mut() {
-            if id.contains("/obligation:checklist:") && !declared_ids.contains(id) {
-                obligation.state = RunObligationState::Abandoned;
+            if id.contains("/obligation:checklist:")
+                && !declared_ids.contains(id)
+                && obligation.state != RunObligationState::Satisfied
+            {
+                obligation.state = RunObligationState::Deferred;
             }
         }
         // The executor's natural flow is do-the-work-then-tick-the-item, so
@@ -768,7 +786,10 @@ impl RunAggregate {
         }
         for (id, obligation) in self.obligations.iter_mut() {
             if !id.contains("/obligation:checklist:")
-                || obligation.state != RunObligationState::Pending
+                || !matches!(
+                    obligation.state,
+                    RunObligationState::Pending | RunObligationState::Deferred
+                )
                 || obligation.receipt.is_some()
             {
                 continue;
@@ -889,18 +910,15 @@ impl RunAggregate {
         self.contract_present || self.executor_expectations_present
     }
 
-    /// Executor-declared obligations still open. These are the model's own
-    /// statement of unmet work; a run that ends with any open is incomplete,
-    /// not "closed by evidence".
+    /// Executor-declared obligations not yet proven, deferred ones included.
+    /// These are the model's own statement of unmet work; a run that ends
+    /// with any is incomplete, not "closed by evidence".
     pub(crate) fn open_executor_expectations(&self) -> usize {
         self.obligations
             .iter()
             .filter(|(id, obligation)| {
                 id.contains("/obligation:checklist:")
-                    && !matches!(
-                        obligation.state,
-                        RunObligationState::Satisfied | RunObligationState::Abandoned
-                    )
+                    && obligation.state != RunObligationState::Satisfied
             })
             .count()
     }
@@ -1439,11 +1457,10 @@ impl RunAggregate {
         }
     }
 
+    /// Every obligation counts as required: a deferred item is unmet work,
+    /// not a smaller denominator.
     pub(crate) fn required_count(&self) -> usize {
-        self.obligations
-            .values()
-            .filter(|obligation| obligation.state != RunObligationState::Abandoned)
-            .count()
+        self.obligations.len()
     }
 
     pub(crate) fn satisfied_count(&self) -> usize {
@@ -1458,12 +1475,10 @@ impl RunAggregate {
             && self.cardinality_violations == 0
             && self.invariant_violations.is_empty()
             && !self.obligations.is_empty()
-            && self.obligations.values().all(|obligation| {
-                matches!(
-                    obligation.state,
-                    RunObligationState::Satisfied | RunObligationState::Abandoned
-                )
-            })
+            && self
+                .obligations
+                .values()
+                .all(|obligation| obligation.state == RunObligationState::Satisfied)
     }
 
     /// Whether all execution/evidence work is proved and only presentation may
@@ -1488,12 +1503,7 @@ impl RunAggregate {
             // contract merely because an untracked tool happened to return.
             return self.operations.is_empty();
         }
-        work_obligations.all(|obligation| {
-            matches!(
-                obligation.state,
-                RunObligationState::Satisfied | RunObligationState::Abandoned
-            )
-        })
+        work_obligations.all(|obligation| obligation.state == RunObligationState::Satisfied)
     }
 
     /// Deterministic successful response projection. A semantic producer owns
@@ -1610,10 +1620,8 @@ impl RunAggregate {
         }
         let mut open = 0;
         for obligation in self.obligations.values() {
-            if matches!(
-                obligation.state,
-                RunObligationState::Satisfied | RunObligationState::Abandoned
-            ) || obligation.class == RunObligationClass::Deliver
+            if obligation.state == RunObligationState::Satisfied
+                || obligation.class == RunObligationClass::Deliver
             {
                 continue;
             }
@@ -1647,10 +1655,7 @@ impl RunAggregate {
         let mut reachable = Vec::new();
         let mut blocked = Vec::new();
         for obligation in self.obligations.values() {
-            if matches!(
-                obligation.state,
-                RunObligationState::Satisfied | RunObligationState::Abandoned
-            ) {
+            if obligation.state == RunObligationState::Satisfied {
                 continue;
             }
             // Delivery obligations are satisfied by the closeout itself (the
@@ -1658,7 +1663,9 @@ impl RunAggregate {
             if obligation.class == RunObligationClass::Deliver {
                 continue;
             }
-            let reason = if self.obligation_policy_denied(obligation) {
+            let reason = if obligation.state == RunObligationState::Deferred {
+                Some(UnreachableReason::ExecutorDeferred)
+            } else if self.obligation_policy_denied(obligation) {
                 Some(UnreachableReason::PolicyDenied)
             } else if self.obligation_exhausted(obligation) {
                 Some(UnreachableReason::CardinalityExhausted)
@@ -4617,7 +4624,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_redeclaration_keeps_proof_abandons_deferred_and_dropped_items() {
+    fn executor_redeclaration_keeps_proof_and_defers_without_fulfilling() {
         let mut events = vec![
             executor_expectations(vec![
                 checklist_item(
@@ -4662,14 +4669,184 @@ mod tests {
         );
         assert_eq!(
             aggregate.obligations["task:task-1/obligation:checklist:1"].state,
-            RunObligationState::Abandoned
+            RunObligationState::Deferred
         );
         assert_eq!(
             aggregate.obligations["task:task-1/obligation:checklist:2"].state,
-            RunObligationState::Abandoned
+            RunObligationState::Deferred
         );
-        assert_eq!(aggregate.open_executor_expectations(), 0);
+        // Deferral is not evidence: the items stay unmet work.
+        assert_eq!(aggregate.open_executor_expectations(), 2);
+        assert_eq!(aggregate.required_count(), 3);
+        assert_eq!(aggregate.satisfied_count(), 1);
+        assert!(!aggregate.is_fulfilled());
+        assert!(!aggregate.evidence_closed());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+        // Stopping is still permitted: the closeout never demands a deferred
+        // item, it reports it as blocked by the executor's own deferral.
+        assert_eq!(
+            aggregate.closeout(|_| true),
+            CloseoutDecision::Unreachable {
+                blocked: vec![
+                    (
+                        "task:task-1/obligation:checklist:1".to_string(),
+                        UnreachableReason::ExecutorDeferred
+                    ),
+                    (
+                        "task:task-1/obligation:checklist:2".to_string(),
+                        UnreachableReason::ExecutorDeferred
+                    ),
+                ],
+            }
+        );
+    }
+
+    /// The vacuous case: declare work, defer all of it, run nothing. Before
+    /// deferral counted as satisfaction this replayed as `Succeeded`.
+    #[test]
+    fn deferring_every_item_without_receipts_never_succeeds() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                "pending",
+            )]),
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &[],
+                "deferred",
+            )]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate.operations.is_empty());
+        assert!(!aggregate.is_fulfilled());
+        assert!(!aggregate.work_is_fulfilled());
+        assert!(aggregate.projected_success_response().is_none());
+        assert_eq!(aggregate.terminal_decision(), RunTerminalDecision::Pending);
+    }
+
+    /// Successful receipts for other work cannot evidence-close a run past
+    /// a deferred checklist item (the `SucceededByEvidence` path).
+    #[test]
+    fn deferred_items_block_evidence_closure() {
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/report"],
+                    "pending",
+                ),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::NONE,
+                    true,
+                    &["/tmp/sent"],
+                    "pending",
+                ),
+            ]),
+            call("w", "write_file"),
+            result(
+                "w",
+                "write_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/report"),
+            ),
+            executor_expectations(vec![
+                checklist_item(
+                    0,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &["/tmp/report"],
+                    "completed",
+                ),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::NONE,
+                    true,
+                    &["/tmp/sent"],
+                    "deferred",
+                ),
+            ]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert!(aggregate
+            .operations
+            .values()
+            .all(|op| op.outcome == Some(ToolOutcomeStatus::Succeeded)));
+        assert!(!aggregate.evidence_closed());
+        assert_ne!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::SucceededByEvidence
+        );
+        assert_ne!(
+            aggregate.terminal_decision(),
+            RunTerminalDecision::Succeeded
+        );
+    }
+
+    /// Receipts decide achievement in both directions: an item proven by a
+    /// receipt stays satisfied when re-posted as deferred or dropped, and a
+    /// deferred item a later receipt proves becomes satisfied.
+    #[test]
+    fn proof_outranks_the_deferred_label() {
+        let declare = |status: &str| {
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                &["/tmp/out"],
+                status,
+            )])
+        };
+        let write = || {
+            vec![
+                call("w", "write_file"),
+                result(
+                    "w",
+                    "write_file",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    workspace_write_semantics("/tmp/out"),
+                ),
+            ]
+        };
+
+        let mut proven_then_deferred = vec![declare("pending")];
+        proven_then_deferred.extend(write());
+        proven_then_deferred.push(declare("deferred"));
+        renumber(&mut proven_then_deferred);
+        let aggregate = RunAggregate::replay("task-1", &proven_then_deferred);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
         assert!(aggregate.is_fulfilled());
+
+        let mut deferred_then_proven = vec![declare("deferred")];
+        deferred_then_proven.extend(write());
+        renumber(&mut deferred_then_proven);
+        let aggregate = RunAggregate::replay("task-1", &deferred_then_proven);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        assert!(aggregate.is_fulfilled());
+    }
+
+    /// Serialized projections from before the rename still load.
+    #[test]
+    fn abandoned_projections_deserialize_as_deferred() {
+        let state: RunObligationState = serde_json::from_str("\"abandoned\"").unwrap();
+        assert_eq!(state, RunObligationState::Deferred);
     }
 
     #[test]

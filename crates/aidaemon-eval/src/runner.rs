@@ -208,6 +208,16 @@ pub fn check_expectations(expect: &Expect, outcome: &RunOutcome) -> Vec<String> 
         }
     }
 
+    if let Some(expected) = expect.succeeded {
+        if outcome.is_succeeded() != expected {
+            failures.push(format!(
+                "succeeded: expected `{expected}`, got `{}` (status {actual_status}, unmet: {:?})",
+                outcome.is_succeeded(),
+                outcome.unmet()
+            ));
+        }
+    }
+
     let text = outcome.final_text.as_deref().unwrap_or_default();
     let lower = text.to_lowercase();
     let shown = || {
