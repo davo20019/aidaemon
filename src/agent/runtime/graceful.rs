@@ -1354,6 +1354,22 @@ fn task_end_decision_and_outcome(
         (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
             crate::events::TaskOutcome::Partial
         }
+        // A refused operation is work the owner asked for that did not happen,
+        // whether or not the contract listed it. Obligations only cover what the
+        // contract expected, so a fulfilled contract beside a refused call would
+        // otherwise close the request as answered and drop the refused work.
+        // Stay partial so the request remains open for the owner's follow-up.
+        // `ClosedByPolicyDenial` (nothing else dispatched) keeps its boundary
+        // rule below.
+        (
+            _,
+            crate::events::RunTerminalDecision::Succeeded
+            | crate::events::RunTerminalDecision::SucceededByEvidence,
+        ) if outcome == crate::events::TaskOutcome::Succeeded
+            && run_aggregate.policy_denied_operations() > 0 =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
         (
             _,
             crate::events::RunTerminalDecision::Succeeded
@@ -1390,6 +1406,7 @@ fn task_end_decision_and_outcome(
         // the reply's success would close the owner's request as answered and
         // the refused work would be lost. Stay partial so the request remains
         // open for the owner's follow-up.
+        // Same refusal rule for runs whose contract expected nothing.
         (_, crate::events::RunTerminalDecision::Unspecified)
             if outcome == crate::events::TaskOutcome::Succeeded
                 && run_aggregate.policy_denied_operations() > 0 =>
@@ -1635,6 +1652,35 @@ mod tests {
             crate::events::RunTerminalDecision::ClosedByPolicyDenial
         );
         assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn refused_work_beside_a_fulfilled_contract_is_not_a_success() {
+        // The contract's only obligation was satisfied by a read; the refused
+        // call was never in the contract. The run's decision is therefore
+        // `Succeeded`, and the refusal must still keep the request open.
+        let mut aggregate = denial_only_aggregate();
+        aggregate.contract_present = true;
+        let obligation = serde_json::from_value(serde_json::json!({
+            "id": "obligation-read",
+            "class": "perform",
+            "state": "satisfied"
+        }))
+        .expect("obligation");
+        aggregate
+            .obligations
+            .insert("obligation-read".to_string(), obligation);
+        assert_eq!(
+            aggregate.terminal_decision(),
+            crate::events::RunTerminalDecision::Succeeded
+        );
+        let (_, outcome) = task_end_decision_and_outcome(
+            &aggregate,
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
     }
 
     #[test]
