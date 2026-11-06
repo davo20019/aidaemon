@@ -1384,6 +1384,18 @@ fn task_end_decision_and_outcome(
         {
             crate::events::TaskOutcome::Failed
         }
+        // A refused operation is owed work that did not happen. When the run
+        // also dispatched something else, the refusal is not "no proof of
+        // work" (`ClosedByPolicyDenial` handles that case); without this arm
+        // the reply's success would close the owner's request as answered and
+        // the refused work would be lost. Stay partial so the request remains
+        // open for the owner's follow-up.
+        (_, crate::events::RunTerminalDecision::Unspecified)
+            if outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.policy_denied_operations() > 0 =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
         (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
     };
     // The owner declined part of what the run set out to do: whatever the
@@ -1623,6 +1635,32 @@ mod tests {
             crate::events::RunTerminalDecision::ClosedByPolicyDenial
         );
         assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn refused_work_beside_dispatched_work_is_not_a_success() {
+        // The refused call is owed work; the dispatched read is not proof that
+        // it happened. The run must not close as an answered success.
+        let mut aggregate = denial_only_aggregate();
+        let read = serde_json::from_value(serde_json::json!({
+            "operation_id": "op-read",
+            "tool_name": "search_memories",
+            "dispatched": true
+        }))
+        .expect("operation");
+        aggregate.operations.insert("op-read".to_string(), read);
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &aggregate,
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(
+            decision,
+            crate::events::RunTerminalDecision::Unspecified,
+            "a mixed run is not closed by the denial-only boundary rule"
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
     }
 
     #[test]
