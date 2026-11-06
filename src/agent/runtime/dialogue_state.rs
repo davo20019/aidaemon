@@ -133,6 +133,59 @@ pub(in crate::agent) fn resolved_followup_mode(
     })
 }
 
+/// The owner's request text an untrusted-call verifier must judge a turn
+/// against, read from the persisted request lineage rather than from the
+/// current message alone.
+///
+/// A follow-up or clarification answer is judged against the open request it
+/// advances, with the follow-up quoted as the owner's refinement. A turn the
+/// classifier calls a new request still sees the owner's earlier request when
+/// that request is unfinished, so a short continuation such as "try again" is
+/// not judged as if the earlier work never existed. The earlier text is quoted
+/// context for the verifier, never a grant: the verifier still decides whether
+/// the exact proposed call is consistent with what the owner asked for.
+///
+/// Returns `None` when there is no unfinished owner request to add, in which
+/// case the current message is the whole request.
+pub(in crate::agent) fn owner_request_for_verifier(
+    state: &DialogueState,
+    current_user_text: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    let current = current_user_text.trim();
+    let current_message_id = state
+        .last_user_turn
+        .as_ref()
+        .filter(|turn| turn.text.trim().eq_ignore_ascii_case(current))
+        .map(|turn| turn.message_id.as_str());
+    let open = state.open_request.as_ref()?;
+    let unfinished = matches!(
+        open.status,
+        OpenRequestStatus::Open
+            | OpenRequestStatus::InProgress
+            | OpenRequestStatus::PartiallyAnswered
+            | OpenRequestStatus::Blocked
+    );
+    if !unfinished
+        || Some(open.user_message_id.as_str()) == current_message_id
+        || open.text.trim().is_empty()
+        || open_request_anchor_expired(open, now)
+    {
+        return None;
+    }
+    let earlier = open.text.trim();
+    Some(match resolved_followup_mode(state, current_user_text) {
+        Some(super::followup::FollowupMode::Followup)
+        | Some(super::followup::FollowupMode::ClarificationAnswer) => {
+            format!("{earlier}\n\nThe owner's follow-up in the same conversation: {current}")
+        }
+        Some(super::followup::FollowupMode::NewTask) | None => format!(
+            "{current}\n\nThe owner's earlier request in this conversation is still unfinished, \
+             so this message may continue it: {earlier}"
+        ),
+    })
+}
+
 /// Canonicalize a recent conversational user-message ID to the live request
 /// node it advances. The binding alone is never authority: its target must
 /// still be one of the request nodes currently eligible for adoption.
@@ -1814,6 +1867,101 @@ mod tests {
             separate_state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::NewRequest),
             "a concrete separate request must supersede rather than inherit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_lineage_tests {
+    use super::*;
+
+    fn request(status: OpenRequestStatus, text: &str) -> OpenRequest {
+        OpenRequest {
+            user_message_id: "request-1".to_string(),
+            text: text.to_string(),
+            status,
+            task_id: Some("task-1".to_string()),
+            project_scope: None,
+            semantic_scope: None,
+            completion_contract: None,
+            opened_at: Utc::now(),
+            resolved_at: None,
+        }
+    }
+
+    fn state_with(
+        open: OpenRequest,
+        current_id: &str,
+        current_text: &str,
+        kind: UserTurnKind,
+    ) -> DialogueState {
+        let mut state = DialogueState::new("session-1");
+        state.open_request = Some(open);
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: current_id.to_string(),
+            kind,
+            text: current_text.to_string(),
+        });
+        state
+    }
+
+    const EARLIER: &str = "Remove the three incorrect entries from the synthetic list.";
+
+    #[test]
+    fn followup_is_judged_against_the_open_request_it_advances() {
+        let state = state_with(
+            request(OpenRequestStatus::PartiallyAnswered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::Followup,
+        );
+        let origin = owner_request_for_verifier(&state, "Try again", Utc::now())
+            .expect("unfinished request is the verifier's origin");
+        assert!(origin.contains(EARLIER), "{origin}");
+        assert!(origin.contains("Try again"), "{origin}");
+    }
+
+    #[test]
+    fn new_task_still_sees_an_unfinished_earlier_request() {
+        // A classifier that calls a short continuation a new request must not
+        // strip the owner's unfinished request from the verifier's view.
+        let state = state_with(
+            request(OpenRequestStatus::PartiallyAnswered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::NewRequest,
+        );
+        let origin = owner_request_for_verifier(&state, "Try again", Utc::now())
+            .expect("unfinished request is still context");
+        assert!(origin.starts_with("Try again"), "{origin}");
+        assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn answered_request_adds_nothing() {
+        let state = state_with(
+            request(OpenRequestStatus::Answered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::NewRequest,
+        );
+        assert_eq!(
+            owner_request_for_verifier(&state, "Try again", Utc::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_current_message_is_never_its_own_antecedent() {
+        let state = state_with(
+            request(OpenRequestStatus::InProgress, EARLIER),
+            "request-1",
+            EARLIER,
+            UserTurnKind::NewRequest,
+        );
+        assert_eq!(
+            owner_request_for_verifier(&state, EARLIER, Utc::now()),
+            None
         );
     }
 }

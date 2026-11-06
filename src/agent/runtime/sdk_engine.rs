@@ -1215,9 +1215,25 @@ impl Agent {
         };
         // A child judges egress against its root's request, which is the
         // owner's only if every turn up to the root was.
+        // A root turn judges egress against the owner's request lineage:
+        // the open request a follow-up advances, or the unfinished earlier
+        // request a short continuation may refer to. Judging the bare current
+        // message is how "Try again" lost the request it was about.
         let inherited = self.inherited_authority.as_ref();
-        let origin_request = inherited
+        let lineage_request = if inherited.is_none() {
+            let dialogue =
+                super::dialogue_state::get_or_rebuild_dialogue_state(self, session_id).await;
+            super::dialogue_state::owner_request_for_verifier(
+                &dialogue,
+                user_text,
+                chrono::Utc::now(),
+            )
+        } else {
+            None
+        };
+        let origin_request: &str = inherited
             .and_then(|parent| parent.origin_request.as_deref())
+            .or(lineage_request.as_deref())
             .unwrap_or(user_text);
         let origin_trusted =
             crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
