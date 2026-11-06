@@ -69,6 +69,8 @@ const OPEN_QUESTION_IMPLICIT_BIND_TTL_MINUTES: i64 = 30;
 const RECENT_REQUEST_BINDING_LIMIT: usize = 32;
 /// Owed owner requests kept beside the open request. Oldest entries drop first.
 const UNFINISHED_REQUEST_LIMIT: usize = 4;
+/// Recent user messages kept so a request's referents can be resolved.
+const RECENT_USER_MESSAGE_LIMIT: usize = 6;
 
 /// A request whose owner work has not been answered yet.
 fn request_is_owed(request: &OpenRequest) -> bool {
@@ -198,6 +200,21 @@ pub(in crate::agent) fn owner_request_for_verifier(
     if earlier.is_empty() {
         return None;
     }
+    let neighbours: Vec<String> = state
+        .recent_user_messages
+        .iter()
+        .filter(|text| text.trim() != current)
+        .map(|text| format!("- {}", serde_json::Value::from(text.trim())))
+        .collect();
+    let context = if neighbours.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRecent messages from the owner in this conversation, oldest first \
+             (use them to resolve references such as \"it\" or \"them\"):\n{}",
+            neighbours.join("\n")
+        )
+    };
     let listed = earlier
         .iter()
         .map(|text| format!("- {}", serde_json::Value::from(*text)))
@@ -207,11 +224,11 @@ pub(in crate::agent) fn owner_request_for_verifier(
         Some(super::followup::FollowupMode::Followup)
         | Some(super::followup::FollowupMode::ClarificationAnswer) => format!(
             "The owner's unfinished requests in this conversation, oldest first:\n{listed}\n\n\
-             The owner's follow-up in the same conversation: {current}"
+             The owner's follow-up in the same conversation: {current}{context}"
         ),
         Some(super::followup::FollowupMode::NewTask) | None => format!(
             "{current}\n\nThe owner's earlier requests in this conversation are still \
-             unfinished, oldest first, so this message may continue one of them:\n{listed}"
+             unfinished, oldest first, so this message may continue one of them:\n{listed}{context}"
         ),
     })
 }
@@ -376,6 +393,12 @@ fn apply_user_message(
     state
         .unfinished_requests
         .retain(|request| !open_request_anchor_expired(request, observed_at));
+    state.recent_user_messages.push(trimmed.to_string());
+    let excess = state
+        .recent_user_messages
+        .len()
+        .saturating_sub(RECENT_USER_MESSAGE_LIMIT);
+    state.recent_user_messages.drain(..excess);
     let turn_kind = classify_user_turn(state, trimmed, alias_roots, observed_at);
     state.last_user_turn = Some(UserTurnSummary {
         message_id: message_id.to_string(),
@@ -2063,5 +2086,36 @@ mod owner_lineage_tests {
         let origin = owner_request_for_verifier(&state, "Try again", now)
             .expect("owed work is the verifier's origin");
         assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn owed_request_carries_the_owners_recent_referents() {
+        // "Remove it from memory" names nothing on its own. The owner's
+        // neighbouring messages are what "it" refers to, so the verifier must
+        // see them with the owed request.
+        let now = Utc::now();
+        let mut owed = request(
+            OpenRequestStatus::PartiallyAnswered,
+            "Remove it from memory",
+        );
+        owed.user_message_id = "request-1".to_string();
+        owed.opened_at = now;
+        let mut state = DialogueState::new("session-1");
+        state.unfinished_requests = vec![owed];
+        state.recent_user_messages = vec![
+            "Cloud pets?".to_string(),
+            "Isn't a project of mine".to_string(),
+            "Remove it from memory".to_string(),
+            "Try again".to_string(),
+        ];
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "msg-9".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Try again".to_string(),
+        });
+        let origin = owner_request_for_verifier(&state, "Try again", now)
+            .expect("owed work is the verifier's origin");
+        assert!(origin.contains("Cloud pets?"), "{origin}");
+        assert!(origin.contains("Isn't a project of mine"), "{origin}");
     }
 }

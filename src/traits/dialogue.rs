@@ -574,6 +574,11 @@ pub struct DialogueState {
     /// a message is classified as a new request. Bounded and expiring.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unfinished_requests: Vec<OpenRequest>,
+    /// The most recent user messages, oldest first. A referent such as "it"
+    /// in an owed request resolves only through these neighbours, so the
+    /// verifier is given them alongside the request. Bounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_user_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_question: Option<OpenQuestion>,
     /// The most recent open question that a user reply closed. Kept so the
@@ -605,6 +610,7 @@ impl DialogueState {
             open_request: None,
             antecedent_request: None,
             unfinished_requests: Vec::new(),
+            recent_user_messages: Vec::new(),
             open_question: None,
             last_closed_question: None,
             last_assistant_turn: None,
