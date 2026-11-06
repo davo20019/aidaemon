@@ -232,6 +232,40 @@ fn ephemeral() -> Value {
 pub const THINKING_BLOCKS_KEY: &str = "anthropic_thinking_blocks";
 
 /// The extended-thinking budget for a reasoning effort.
+/// Whether `model` predates adaptive thinking (Claude 4.6). Those models
+/// take a fixed `budget_tokens`; every later one (the whole Claude 5 family)
+/// rejects that with a 400 and takes `{"type": "adaptive"}` with
+/// `output_config.effort` instead. Matching the id is the API's own contract
+/// here: the request shape is fixed per model generation.
+fn takes_thinking_budget(model: &str) -> bool {
+    const BUDGET_GENERATIONS: &[&str] = &[
+        "claude-3",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-opus-4-5",
+        "claude-opus-4-2025",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-2025",
+        "claude-haiku-4-5",
+    ];
+    BUDGET_GENERATIONS
+        .iter()
+        .any(|generation| model.contains(generation))
+}
+
+/// The `output_config.effort` level for a provider-neutral effort label.
+fn adaptive_effort(effort: &str) -> &'static str {
+    match effort {
+        "low" => "low",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        // "medium" and unknown labels get the balanced default.
+        _ => "medium",
+    }
+}
+
 fn thinking_budget(effort: &str) -> u32 {
     match effort {
         "low" => 2_048,
@@ -274,13 +308,14 @@ fn build_body(
             request.tool_choice,
             ToolChoice::Required | ToolChoice::Specific(_)
         );
-    let budget = request
+    let effort = request
         .options
         .reasoning_effort
         .as_deref()
         .or(default_effort)
-        .filter(|effort| *effort != "off" && !forced)
-        .map(thinking_budget);
+        .filter(|effort| *effort != "off" && !forced);
+    let legacy_thinking = takes_thinking_budget(&request.model);
+    let budget = effort.filter(|_| legacy_thinking).map(thinking_budget);
     let mut max_tokens = request.max_output_tokens.unwrap_or(default_max_tokens);
     if let Some(budget) = budget {
         // The budget counts against max_tokens; keep room for the answer.
@@ -299,8 +334,15 @@ fn build_body(
         "messages": messages,
         "stream": true,
     });
-    if let Some(budget) = budget {
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    match (effort, budget) {
+        (_, Some(budget)) => {
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        }
+        (Some(effort), None) => {
+            body["thinking"] = json!({"type": "adaptive"});
+            body["output_config"] = json!({"effort": adaptive_effort(effort)});
+        }
+        (None, None) => {}
     }
     if !system.is_empty() {
         body["system"] = Value::Array(system);

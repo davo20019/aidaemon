@@ -401,7 +401,7 @@ fn later_system_messages_stay_in_place_as_reminders() {
 }
 
 #[test]
-fn reasoning_effort_sets_a_thinking_budget_unless_a_tool_is_forced() {
+fn reasoning_effort_sets_a_thinking_budget_on_pre_adaptive_models_unless_a_tool_is_forced() {
     let p = Anthropic::builder()
         .api_key("k")
         .max_tokens(1024)
@@ -409,6 +409,7 @@ fn reasoning_effort_sets_a_thinking_budget_unless_a_tool_is_forced() {
         .build()
         .unwrap();
     let mut req = request(vec![Message::user("Think.")]);
+    req.model = "claude-sonnet-4-5".into();
     let body = p.request_body(&req);
     assert_eq!(
         body["thinking"],
@@ -474,4 +475,30 @@ async fn thinking_blocks_are_kept_and_replayed() {
     ]));
     assert_eq!(replay["messages"][1]["content"][0], block);
     assert_eq!(replay["messages"][1]["content"][1]["type"], "tool_use");
+}
+
+/// Current models reject `budget_tokens` with a 400 (live: claude-haiku-5-5
+/// refused task assessment): effort becomes adaptive thinking with
+/// `output_config.effort`, and max_tokens is left alone.
+#[test]
+fn reasoning_effort_uses_adaptive_thinking_on_current_models() {
+    let p = Anthropic::builder()
+        .api_key("k")
+        .max_tokens(1024)
+        .build()
+        .unwrap();
+    for model in ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-4-6"] {
+        let mut req = request(vec![Message::user("Think.")]);
+        req.model = model.into();
+        req.options.reasoning_effort = Some("high".into());
+        let body = p.request_body(&req);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}), "{model}");
+        assert_eq!(body["output_config"], json!({"effort": "high"}), "{model}");
+        assert_eq!(body["max_tokens"], 1024, "{model}");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+
+        req.options.reasoning_effort = Some("off".into());
+        let body = p.request_body(&req);
+        assert!(body.get("thinking").is_none() && body.get("output_config").is_none());
+    }
 }
