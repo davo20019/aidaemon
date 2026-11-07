@@ -94,8 +94,9 @@ pub use extract::{
     parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
 };
 pub use learning::{
-    detect_domains, expertise_level, BehaviorPattern, ErrorSolution, Expertise, LearningStore,
-    Procedure, UserProfile,
+    detect_domains, error_pattern, expertise_level, extract_trigger_pattern, generalize_procedure,
+    new_error_solution, new_procedure, procedure_keyed_name, summarize_solution, BehaviorPattern,
+    ErrorSolution, Expertise, LearningStore, Procedure, UserProfile,
 };
 pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;

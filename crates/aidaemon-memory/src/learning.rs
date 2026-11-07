@@ -3,8 +3,11 @@
 //! per-domain expertise, behavior patterns and the user's communication
 //! profile, with [`LearningStore`] as the storage contract.
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -244,8 +247,161 @@ pub fn detect_domains(explicit_domains: &[String]) -> Vec<String> {
     domains
 }
 
+/// Replace specific paths and URLs in recorded actions with `<path>` and
+/// `<url>`, so a learned procedure applies beyond the task it came from.
+pub fn generalize_procedure(actions: &[String]) -> Vec<String> {
+    actions
+        .iter()
+        .map(|action| {
+            let generalized = PATH.replace_all(action, "<path>");
+            URL.replace_all(&generalized, "<url>").into_owned()
+        })
+        .collect()
+}
+
+/// The trigger a procedure is recalled by: the task's first sentence, cut
+/// to 100 bytes at a character boundary.
+pub fn extract_trigger_pattern(task_context: &str) -> String {
+    let first_sentence = task_context
+        .split('.')
+        .next()
+        .unwrap_or(task_context)
+        .trim();
+    truncate_bytes(first_sentence, 100).to_string()
+}
+
+/// A stable, collision-resistant procedure name: the readable `base_name`
+/// plus a short hash of the normalized steps, so different workflows under
+/// a generic name ("deploy") do not overwrite each other.
+pub fn procedure_keyed_name(base_name: &str, steps: &[String]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for step in steps {
+        hasher.update(step.to_lowercase().as_bytes());
+        hasher.update(b"\n");
+    }
+    let suffix: String = hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{base_name}-{suffix}")
+}
+
+/// A new procedure recording its first outcome. The store assigns the id.
+pub fn new_procedure(
+    name: String,
+    trigger_pattern: String,
+    steps: Vec<String>,
+    success: bool,
+) -> Procedure {
+    let now = Utc::now();
+    Procedure {
+        id: 0,
+        name,
+        trigger_pattern,
+        steps,
+        success_count: i32::from(success),
+        failure_count: i32::from(!success),
+        avg_duration_secs: None,
+        last_used_at: Some(now),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// An error message reduced to a pattern that matches recurrences: line and
+/// column numbers become `:<line>`, paths become `<path>`, cut to 200 bytes.
+pub fn error_pattern(error: &str) -> String {
+    let pattern = LINE_COLUMN.replace_all(error.trim(), ":<line>");
+    let pattern = PATH.replace_all(&pattern, "<path>");
+    truncate_bytes(&pattern, 200).to_string()
+}
+
+/// A one-line summary of the tools a solution used (`name(...)` actions).
+pub fn summarize_solution(actions: &[String]) -> String {
+    if actions.is_empty() {
+        return "No specific actions recorded".to_string();
+    }
+    let tools: Vec<&str> = actions
+        .iter()
+        .filter_map(|action| action.split('(').next())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    format!("Used {} tool(s): {}", tools.len(), tools.join(", "))
+}
+
+/// A new error solution, recorded as having worked once. The store assigns
+/// the id.
+pub fn new_error_solution(
+    error_pattern: String,
+    domain: Option<String>,
+    solution_summary: String,
+    solution_steps: Option<Vec<String>>,
+) -> ErrorSolution {
+    let now = Utc::now();
+    ErrorSolution {
+        id: 0,
+        error_pattern,
+        domain,
+        solution_summary,
+        solution_steps,
+        success_count: 1,
+        failure_count: 0,
+        last_used_at: Some(now),
+        created_at: now,
+    }
+}
+
+static PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/[\w/.-]+").unwrap());
+static URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://[^\s)]+").unwrap());
+static LINE_COLUMN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d+:\d+").unwrap());
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn truncate_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_patterns_drop_locations() {
+        let pattern = error_pattern(
+            "error[E0382]: borrow of moved value at /home/user/project/src/main.rs:42:10",
+        );
+        assert!(
+            pattern.contains("E0382") && pattern.contains("<path>") && pattern.contains("<line>")
+        );
+        assert!(error_pattern(&"é".repeat(300)).len() <= 200);
+    }
+
+    #[test]
+    fn procedures_generalize_and_get_stable_names() {
+        let actions = vec![
+            "terminal(cargo)".to_string(),
+            "web_fetch(/home/user/file.rs)".to_string(),
+        ];
+        assert!(generalize_procedure(&actions)[1].contains("<path>"));
+        let a = procedure_keyed_name("deploy", &actions);
+        assert_eq!(a, procedure_keyed_name("deploy", &actions));
+        assert!(a.starts_with("deploy-"));
+        let failed = new_procedure("n".into(), "t".into(), vec!["cargo test".into()], false);
+        assert_eq!((failed.success_count, failed.failure_count), (0, 1));
+        assert_eq!(
+            extract_trigger_pattern("Run the tests. Then deploy."),
+            "Run the tests"
+        );
+    }
+
     use super::*;
 
     #[test]
