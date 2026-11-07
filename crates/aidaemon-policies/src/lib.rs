@@ -58,7 +58,7 @@ pub use egress::EgressGuard;
 pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, ProjectInstructions};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
-pub use memory::{InMemoryRecall, MemoryInjection, Recall};
+pub use memory::{InMemoryRecall, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn, Recall};
 pub use redact::{secret_patterns, Redactor};
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{catastrophic_reason, command_segments};

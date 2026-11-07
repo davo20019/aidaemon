@@ -19,6 +19,7 @@
 //!
 //! | Piece | Plugs in as |
 //! |---|---|
+//! | [`ScopedMemory`] | `aidaemon_policies::MemorySystem`: the whole crate as one replaceable memory system |
 //! | [`MemoryRecall`] | `aidaemon_policies::Recall`, for `MemoryInjection` (`before_model`) |
 //! | [`MemoryWriter`] | `aidaemon_core::Hook` (`on_run_end`, background extraction) |
 //! | [`RememberTool`], [`RecallTool`] | `aidaemon_core::Tool` |
@@ -63,8 +64,10 @@
 //! - Any `aidaemon_core::Provider` for [`FactExtractor`] and
 //!   [`EpisodeSummarizer`].
 //!
-//! Or skip [`Memory`] entirely and implement `aidaemon_policies::Recall`
-//! yourself; the SDK only ever sees that trait.
+//! Or replace this crate entirely: implement `aidaemon_policies::MemorySystem`
+//! (the hooks and tools memory adds to a turn) or just
+//! `aidaemon_policies::Recall` (snippets for injection) in your own crate.
+//! The SDK only ever sees those traits.
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -75,6 +78,7 @@ mod memory;
 mod recall;
 mod scoring;
 mod store;
+mod system;
 mod tools;
 mod types;
 mod writer;
@@ -95,6 +99,7 @@ pub use scoring::{
 pub use store::{
     latest_version, InMemoryMemoryStore, MemoryStore, Migration, SqliteMemoryStore, MIGRATIONS,
 };
+pub use system::ScopedMemory;
 pub use tools::{RecallTool, RememberTool};
 pub use types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, same_value,

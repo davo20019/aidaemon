@@ -4,6 +4,11 @@
 //! active plugin returns the hooks (recall injection, run-end writing) and
 //! tools it wants, plus the daemon memory tools it owns. Swapping the plugin
 //! swaps the memory backend without touching the turn code.
+//!
+//! Any SDK `aidaemon_policies::MemorySystem` is a plugin through
+//! [`SystemMemory`]: the daemon decides the turn's scope and permissions,
+//! and the system decides how to remember. `aidaemon-memory` is the
+//! built-in system; [`DaemonMemory`] is the daemon's own store.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,12 +20,11 @@ use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
 
 mod recall;
-#[cfg(feature = "sdk-memory")]
-mod sdk_memory;
+mod system_memory;
 mod writer;
 pub(crate) use recall::DaemonRecall;
-#[cfg(feature = "sdk-memory")]
-pub(crate) use sdk_memory::SdkMemory;
+#[cfg_attr(not(feature = "sdk-memory"), allow(unused_imports))]
+pub(crate) use system_memory::SystemMemory;
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
@@ -227,7 +231,9 @@ pub(crate) async fn configured_plugin(
             )
             .extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
-            Some(Arc::new(SdkMemory::new(builder)))
+            Some(Arc::new(SystemMemory::new(Arc::new(
+                aidaemon_memory::ScopedMemory::new(builder),
+            ))))
         }
         #[cfg(not(feature = "sdk-memory"))]
         crate::config::MemoryBackend::Sdk => {

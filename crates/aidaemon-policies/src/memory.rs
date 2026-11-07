@@ -1,12 +1,70 @@
-//! Memory injection as a `before_model` hook over a pluggable [`Recall`].
+//! Memory as pluggable seams: a whole [`MemorySystem`] contributes hooks and
+//! tools to each turn, and [`MemoryInjection`] is a `before_model` hook over
+//! a [`Recall`] backend.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use aidaemon_core::{Hook, HookContext, Message, ModelRequest};
+use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Tool};
 use async_trait::async_trait;
 
 use crate::{insert_after_system, last_user_message_index};
+
+/// A whole long-term memory system, replaceable as one unit.
+///
+/// The host (an app built on the SDK) decides who may see what: it resolves
+/// the turn's [`MemoryTurn::scope`] and permissions from its own notion of
+/// users and channels. The memory system only decides how to remember and
+/// recall within that scope, by returning the hooks and tools it wants on
+/// the turn. `aidaemon-memory` is one implementation; any other backend
+/// (a vector database, a hosted memory service, an external memory server)
+/// implements this trait in its own crate.
+#[async_trait]
+pub trait MemorySystem: Send + Sync {
+    /// The hooks and tools this memory system adds to `turn`.
+    async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
+}
+
+/// What a [`MemorySystem`] may do on one turn, as the host decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryTurn {
+    /// The conversation the turn belongs to.
+    pub session_id: String,
+    /// The memory the turn reads and writes, shared by every session the
+    /// host maps to it (for example one scope for the owner's direct
+    /// messages, and one per group conversation).
+    pub scope: String,
+    /// The turn may read memory (recall, injection).
+    pub read: bool,
+    /// The turn may write memory.
+    pub write: bool,
+    /// Writes come only from explicit tool calls: no background learning
+    /// from the transcript (worker and child sessions).
+    pub explicit_writes_only: bool,
+}
+
+/// What a [`MemorySystem`] adds to one turn.
+#[derive(Default)]
+pub struct MemoryParts {
+    pub hooks: Vec<Arc<dyn Hook>>,
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl std::fmt::Debug for MemoryParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryParts")
+            .field("hooks", &self.hooks.len())
+            .field(
+                "tools",
+                &self
+                    .tools
+                    .iter()
+                    .map(|tool| tool.spec().name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
 
 /// A memory backend: return up to `limit` snippets relevant to `query`.
 #[async_trait]
