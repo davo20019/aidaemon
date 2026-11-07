@@ -118,8 +118,8 @@ aidaemon-mcp = { path = "crates/aidaemon-mcp" }
 aidaemon-channels = { path = "crates/aidaemon-channels" }
 aidaemon-channel-telegram = { path = "crates/aidaemon-channel-telegram" }
 aidaemon-channel-slack = { path = "crates/aidaemon-channel-slack", optional = true }
-# Optional SDK memory backend (`[memory] backend = "sdk"`).
-aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
+# Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.
+aidaemon-memory = { path = "crates/aidaemon-memory" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
@@ -155,7 +155,7 @@ encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
 # The aidaemon-memory crate as the memory plugin for agent turns.
-sdk-memory = ["dep:aidaemon-memory", "aidaemon-memory/fastembed"]
+sdk-memory = ["aidaemon-memory/fastembed"]
 
 [profile.release]
 lto = true

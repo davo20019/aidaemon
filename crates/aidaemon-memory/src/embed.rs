@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{MemoryError, Result};
 use crate::scoring::tokens;
 
 /// Turns text into vectors. Implement this to use an embedding API or
@@ -67,6 +67,28 @@ pub fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
     }
     let (chunks, _) = bytes.as_chunks::<4>();
     Some(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
+}
+
+/// Decode a stored vector that must have `dims` dimensions. Besides the
+/// binary format of [`encode_embedding`], this reads the legacy format a
+/// JSON array of numbers (older daemon databases stored vectors that way).
+/// Any other blob, including binary of the wrong length, is an error.
+pub fn decode_embedding_with_dim(bytes: &[u8], dims: usize) -> Result<Vec<f32>> {
+    let binary_len = dims
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| MemoryError::Invalid("embedding dimension overflow".into()))?;
+    if dims > 0 && bytes.len() == binary_len {
+        return Ok(decode_embedding(bytes).unwrap_or_default());
+    }
+    if bytes.first() == Some(&b'[') {
+        return serde_json::from_slice(bytes)
+            .map_err(|e| MemoryError::Invalid(format!("legacy JSON embedding: {e}")));
+    }
+    Err(MemoryError::Invalid(format!(
+        "unknown embedding format: length {}, expected {dims} dimensions, first byte {:?}",
+        bytes.len(),
+        bytes.first()
+    )))
 }
 
 /// Deterministic hashed bag-of-words embedder. No model, no network, same
@@ -236,6 +258,37 @@ mod fast {
 
 #[cfg(test)]
 mod tests {
+    use super::{decode_embedding_with_dim, encode_embedding};
+
+    #[test]
+    fn dimensioned_decode_reads_binary_and_legacy_json() {
+        let original: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
+        let binary = encode_embedding(&original);
+        assert_eq!(binary.len(), 1536);
+        assert_eq!(decode_embedding_with_dim(&binary, 384).unwrap(), original);
+        let json = serde_json::to_vec(&original).unwrap();
+        assert_eq!(decode_embedding_with_dim(&json, 384).unwrap(), original);
+    }
+
+    #[test]
+    fn dimensioned_decode_rejects_other_blobs() {
+        assert!(decode_embedding_with_dim(&[0u8; 100], 384).is_err());
+        assert!(decode_embedding_with_dim(&[], 384).is_err());
+        // Binary of another model's dimension is not silently accepted.
+        assert!(decode_embedding_with_dim(&encode_embedding(&[1.0; 8]), 384).is_err());
+    }
+
+    #[test]
+    fn special_float_values_round_trip() {
+        let mut vector: Vec<f32> = (0..384).map(|i| i as f32).collect();
+        vector[0] = f32::NEG_INFINITY;
+        vector[1] = f32::INFINITY;
+        vector[3] = -0.0;
+        let decoded = decode_embedding_with_dim(&encode_embedding(&vector), 384).unwrap();
+        assert!(decoded[0].is_infinite() && decoded[0].is_sign_negative());
+        assert!(decoded[1].is_infinite() && decoded[1].is_sign_positive());
+    }
+
     use super::*;
 
     #[tokio::test]

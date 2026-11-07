@@ -85,7 +85,9 @@ mod writer;
 
 #[cfg(feature = "fastembed")]
 pub use embed::FastEmbedder;
-pub use embed::{cosine, decode_embedding, encode_embedding, Embedder, HashEmbedder};
+pub use embed::{
+    cosine, decode_embedding, decode_embedding_with_dim, encode_embedding, Embedder, HashEmbedder,
+};
 pub use error::{MemoryError, Result};
 pub use extract::{
     parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
