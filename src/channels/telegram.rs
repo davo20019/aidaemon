@@ -92,6 +92,7 @@ pub struct TelegramChannel {
     channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
+    transports: crate::config::ChannelsConfig,
     /// URL for the Telegram Mini App terminal frontend.
     terminal_web_app_url: String,
     /// Terminal-lite session manager.
@@ -256,6 +257,7 @@ impl TelegramChannel {
             state: runtime.state,
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
+            transports: runtime.transports,
             terminal_web_app_url,
             terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
                 terminal_allowed_prefixes,
@@ -274,6 +276,7 @@ impl TelegramChannel {
             max_file_size_mb: self.max_file_size_mb,
             state: self.state.clone(),
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            transports: self.transports,
         }
     }
 

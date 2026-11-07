@@ -302,6 +302,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             max_file_size_mb: config.files.max_file_size_mb,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             watchdog_stale_threshold_secs,
+            transports: config.channels,
         },
     )
     .await;

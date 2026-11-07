@@ -366,6 +366,9 @@ pub struct AppConfig {
     #[cfg(feature = "slack")]
     #[serde(default)]
     pub slack_bots: Vec<SlackBotConfig>,
+    /// Which implementation carries each chat platform.
+    #[serde(default)]
+    pub channels: ChannelsConfig,
     #[serde(default)]
     pub state: StateConfig,
     #[serde(default)]
@@ -1544,6 +1547,30 @@ pub struct TelegramWebhookConfig {
     pub max_connections: Option<u8>,
     #[serde(default)]
     pub drop_pending_updates: bool,
+}
+
+/// Which implementation carries a chat platform's traffic.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTransport {
+    /// The SDK channel adapter (`aidaemon-channel-*`).
+    #[default]
+    Sdk,
+    /// The original implementation (serenity, teloxide, hand-written
+    /// Slack), kept until each bot has been checked live on the SDK one.
+    Legacy,
+}
+
+/// `[channels]`: the transport per platform, for configured and dynamic
+/// bots alike.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub telegram: ChannelTransport,
+    #[serde(default)]
+    pub discord: ChannelTransport,
+    #[serde(default)]
+    pub slack: ChannelTransport,
 }
 
 /// Telegram bot configuration for multi-bot support.
