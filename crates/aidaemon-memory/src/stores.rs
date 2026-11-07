@@ -379,3 +379,56 @@ pub trait PeopleStore: Send + Sync {
         Ok(vec![])
     }
 }
+
+/// An entity to create or merge in the memory graph.
+#[derive(Debug, Clone)]
+pub struct GraphEntityUpsert {
+    pub entity_type: String,
+    pub canonical_name: String,
+    pub display_name: String,
+    pub aliases: Vec<String>,
+    pub channel_id: Option<String>,
+    pub privacy: FactPrivacy,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphEdgeUpsert {
+    pub source_entity_id: i64,
+    pub target_entity_id: i64,
+    pub relation: String,
+    pub source_claim_id: i64,
+    pub confidence: f32,
+    pub channel_id: Option<String>,
+    pub privacy: FactPrivacy,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphSearchScope {
+    pub channel_id: Option<String>,
+    pub visibility: ChannelVisibility,
+    pub requester_is_owner: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphNeighbor {
+    pub entity_id: i64,
+    pub display_name: String,
+    pub relation: String,
+    pub depth: usize,
+}
+
+/// The memory graph: entities and the relations between them, each edge
+/// backed by the claim (fact) that asserts it, so retracting the claim
+/// invalidates the edge.
+#[async_trait]
+pub trait MemoryGraphStore: Send + Sync {
+    async fn upsert_entity(&self, entity: GraphEntityUpsert) -> anyhow::Result<i64>;
+    async fn upsert_edge(&self, edge: GraphEdgeUpsert) -> anyhow::Result<()>;
+    async fn invalidate_claim(&self, claim_id: i64, valid_to: &str) -> anyhow::Result<()>;
+    async fn neighbors(
+        &self,
+        start_entity_id: i64,
+        max_depth: usize,
+        scope: &GraphSearchScope,
+    ) -> anyhow::Result<Vec<GraphNeighbor>>;
+}
