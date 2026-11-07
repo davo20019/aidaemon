@@ -194,6 +194,7 @@ dependencies = [
  "aidaemon-channels",
  "async-trait",
  "axum",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",

@@ -937,3 +937,80 @@ async fn register_commands_sets_the_bot_menu() {
         json!({ "commands": [{ "command": "status", "description": "Show what the agent is doing" }] })
     );
 }
+
+/// A free local port (bound, then released).
+#[cfg(feature = "webhook")]
+async fn free_addr() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
+#[cfg(feature = "webhook")]
+#[tokio::test]
+async fn webhook_mode_registers_the_hook_and_accepts_only_signed_deliveries() {
+    let (mock, base) = start_mock().await;
+    let listen = free_addr().await;
+    let mut webhook = aidaemon_channel_telegram::WebhookConfig::new(
+        listen,
+        "https://bot.example.test/hooks/synthetic",
+    );
+    webhook.secret = Some("synthetic-secret_1".to_string());
+    webhook.drop_pending_updates = true;
+    let mut run = spawn(Arc::new(channel(&base).with_webhook(webhook)));
+
+    let registered = mock.wait_for_calls("setWebhook", 1).await;
+    assert_eq!(
+        registered[0].body["url"],
+        "https://bot.example.test/hooks/synthetic"
+    );
+    assert_eq!(registered[0].body["secret_token"], "synthetic-secret_1");
+    assert_eq!(registered[0].body["drop_pending_updates"], true);
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let update =
+        json!({ "update_id": 1, "message": message(1, dm_chat(), alice(), "hello by hook") });
+    let url = format!("http://{listen}/hooks/synthetic");
+    // Wait for the listener, then deliver without the secret: refused.
+    let mut unsigned = None;
+    for _ in 0..100 {
+        if let Ok(resp) = client.post(&url).json(&update).send().await {
+            unsigned = Some(resp.status());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(unsigned, Some(reqwest::StatusCode::UNAUTHORIZED));
+
+    let signed = client
+        .post(&url)
+        .header("X-Telegram-Bot-Api-Secret-Token", "synthetic-secret_1")
+        .json(&update)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed.status(), reqwest::StatusCode::OK);
+    let m = expect_message(run.next().await);
+    assert_eq!(m.text, "hello by hook");
+    assert!(
+        mock.calls("getUpdates").is_empty(),
+        "no polling in webhook mode"
+    );
+    run.stop().await.unwrap();
+}
+
+#[cfg(feature = "webhook")]
+#[tokio::test]
+async fn webhook_mode_falls_back_to_polling_when_the_listener_cannot_bind() {
+    let (mock, base) = start_mock().await;
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let webhook = aidaemon_channel_telegram::WebhookConfig::new(
+        taken.local_addr().unwrap(),
+        "https://bot.example.test/hooks/synthetic",
+    );
+    let run = spawn(Arc::new(channel(&base).with_webhook(webhook)));
+    mock.wait_for_calls("getUpdates", 1).await;
+    assert_eq!(mock.calls("deleteWebhook").len(), 1);
+    assert!(mock.calls("setWebhook").is_empty());
+    run.stop().await.unwrap();
+    drop(taken);
+}

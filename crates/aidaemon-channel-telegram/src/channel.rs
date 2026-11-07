@@ -54,6 +54,8 @@ pub struct TelegramChannel {
     backoff_initial: Duration,
     backoff_max: Duration,
     state: Arc<Shared>,
+    #[cfg(feature = "webhook")]
+    webhook: Option<crate::webhook::WebhookConfig>,
 }
 
 #[derive(Default)]
@@ -78,7 +80,18 @@ impl TelegramChannel {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Shared::default()),
+            #[cfg(feature = "webhook")]
+            webhook: None,
         }
+    }
+
+    /// Receive updates on a webhook instead of long polling. If the
+    /// listener cannot bind or Telegram refuses the webhook, `run` removes
+    /// the webhook and long-polls instead.
+    #[cfg(feature = "webhook")]
+    pub fn with_webhook(mut self, webhook: crate::webhook::WebhookConfig) -> Self {
+        self.webhook = Some(webhook);
+        self
     }
 
     /// Channel name, used as the session-id prefix (named `with_name` so it
@@ -223,6 +236,132 @@ impl TelegramChannel {
                 }
             }
         }
+    }
+
+    /// Long polling with `getUpdates`.
+    async fn run_polling(
+        &self,
+        events: mpsc::Sender<ChannelEvent>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ChannelError> {
+        let api = self.api();
+        let poll_timeout = Duration::from_secs(self.poll_timeout_secs);
+        let http_timeout = poll_timeout + Duration::from_secs(10);
+        let mut offset: Option<i64> = None;
+        let mut delay = self.backoff_initial;
+
+        loop {
+            let mut body = json!({
+                "timeout": self.poll_timeout_secs,
+                "allowed_updates": ["message", "callback_query"],
+            });
+            if let Some(offset) = offset {
+                body["offset"] = json!(offset);
+            }
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = events.closed() => return Ok(()),
+                r = api.call::<Vec<Update>>("getUpdates", &body, http_timeout) => r,
+            };
+            match result {
+                Ok(updates) => {
+                    delay = self.backoff_initial;
+                    for update in updates {
+                        offset = Some(offset.unwrap_or(i64::MIN).max(update.update_id + 1));
+                        if !self.handle_update(update, &events).await {
+                            return Ok(()); // receiver dropped
+                        }
+                        if shutdown.is_cancelled() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) if e.is_auth() => return Err(e.into()),
+                Err(e) => {
+                    let wait = retry_wait(&e, delay);
+                    warn!(channel = %self.name, error = %e, "getUpdates failed; retrying in {wait:?}");
+                    if !sleep_or_shutdown(wait, &shutdown).await {
+                        return Ok(());
+                    }
+                    if e.code() != Some(429) {
+                        delay = (delay * 2).min(self.backoff_max);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Webhook mode. `Ok(false)`: it could not start; poll instead.
+    #[cfg(feature = "webhook")]
+    async fn run_webhook(
+        &self,
+        webhook: &crate::webhook::WebhookConfig,
+        events: &mpsc::Sender<ChannelEvent>,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ChannelError> {
+        let listener = match crate::webhook::bind(webhook).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                warn!(
+                    channel = %self.name,
+                    listen = %webhook.listen,
+                    error = %e,
+                    "telegram webhook listener could not bind; long polling instead"
+                );
+                return Ok(false);
+            }
+        };
+        let secret = webhook
+            .secret
+            .clone()
+            .unwrap_or_else(crate::webhook::generate_secret);
+        let mut body = json!({
+            "url": webhook.url,
+            "secret_token": secret,
+            "allowed_updates": ["message", "callback_query"],
+            "drop_pending_updates": webhook.drop_pending_updates,
+        });
+        if let Some(max) = webhook
+            .max_connections
+            .filter(|max| (1..=100).contains(max))
+        {
+            body["max_connections"] = json!(max);
+        }
+        match self.call_with_retry::<Value>("setWebhook", &body).await {
+            Ok(_) => {}
+            Err(e) if e.is_auth() => return Err(e.into()),
+            Err(e) => {
+                warn!(channel = %self.name, error = %e, "setWebhook failed; long polling instead");
+                return Ok(false);
+            }
+        }
+        debug!(channel = %self.name, listen = %webhook.listen, "telegram webhook ready");
+        let (updates_tx, mut updates) = mpsc::channel(64);
+        let server_shutdown = shutdown.child_token();
+        let server = tokio::spawn(crate::webhook::serve(
+            listener,
+            webhook.path(),
+            secret,
+            updates_tx,
+            server_shutdown.clone(),
+        ));
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = events.closed() => break,
+                update = updates.recv() => match update {
+                    Some(update) => {
+                        if !self.handle_update(update, events).await {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+        server_shutdown.cancel();
+        let _ = server.await;
+        Ok(true)
     }
 
     async fn handle_update(&self, update: Update, events: &mpsc::Sender<ChannelEvent>) -> bool {
@@ -400,51 +539,23 @@ impl Channel for TelegramChannel {
         if !self.resolve_identity(&shutdown).await? {
             return Ok(());
         }
-        let api = self.api();
-        let poll_timeout = Duration::from_secs(self.poll_timeout_secs);
-        let http_timeout = poll_timeout + Duration::from_secs(10);
-        let mut offset: Option<i64> = None;
-        let mut delay = self.backoff_initial;
-
-        loop {
-            let mut body = json!({
-                "timeout": self.poll_timeout_secs,
-                "allowed_updates": ["message", "callback_query"],
-            });
-            if let Some(offset) = offset {
-                body["offset"] = json!(offset);
-            }
-            let result = tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
-                _ = events.closed() => return Ok(()),
-                r = api.call::<Vec<Update>>("getUpdates", &body, http_timeout) => r,
-            };
-            match result {
-                Ok(updates) => {
-                    delay = self.backoff_initial;
-                    for update in updates {
-                        offset = Some(offset.unwrap_or(i64::MIN).max(update.update_id + 1));
-                        if !self.handle_update(update, &events).await {
-                            return Ok(()); // receiver dropped
+        #[cfg(feature = "webhook")]
+        if let Some(webhook) = self.webhook.clone() {
+            match self.run_webhook(&webhook, &events, &shutdown).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    // A webhook left registered would make getUpdates fail.
+                    if let Err(e) = self.call::<Value>("deleteWebhook", &json!({})).await {
+                        if e.is_auth() {
+                            return Err(e.into());
                         }
-                        if shutdown.is_cancelled() {
-                            return Ok(());
-                        }
+                        warn!(channel = %self.name, error = %e, "deleteWebhook failed");
                     }
                 }
-                Err(e) if e.is_auth() => return Err(e.into()),
-                Err(e) => {
-                    let wait = retry_wait(&e, delay);
-                    warn!(channel = %self.name, error = %e, "getUpdates failed; retrying in {wait:?}");
-                    if !sleep_or_shutdown(wait, &shutdown).await {
-                        return Ok(());
-                    }
-                    if e.code() != Some(429) {
-                        delay = (delay * 2).min(self.backoff_max);
-                    }
-                }
+                Err(e) => return Err(e),
             }
         }
+        self.run_polling(events, shutdown).await
     }
 
     async fn send(
