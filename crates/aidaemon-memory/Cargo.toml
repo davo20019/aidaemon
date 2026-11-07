@@ -20,6 +20,7 @@ conformance = ["aidaemon-core/testing"]
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
 aidaemon-policies = { path = "../aidaemon-policies" }
+anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 fastembed = { version = "4", optional = true }

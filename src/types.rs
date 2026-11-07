@@ -269,8 +269,9 @@ impl ChannelContext {
     }
 }
 
+pub use aidaemon_core::ChannelVisibility;
+pub use aidaemon_memory::records::FactPrivacy;
 pub use aidaemon_tools::semantics::UserRole;
-pub use aidaemon_tools::services::{ChannelVisibility, FactPrivacy};
 
 /// Distinguishes different kinds of approval requests so channels can render
 /// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel

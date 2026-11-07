@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 
-pub use aidaemon_tools::services::{
-    EpisodeStore, FactStore, OAuthGatewayStore, OAuthStore, PeopleStore, PeopleToolStore,
-    SettingsStore,
-};
+pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
+pub use aidaemon_tools::services::{OAuthGatewayStore, OAuthStore, SettingsStore};
+
+/// Focused persistence contract used by people management.
+pub trait PeopleToolStore: PeopleStore + FactStore + SettingsStore {}
+
+impl<T> PeopleToolStore for T where T: PeopleStore + FactStore + SettingsStore {}
 
 /// Session message storage and context retrieval.
 #[async_trait]

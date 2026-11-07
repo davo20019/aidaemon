@@ -1,1 +1,1 @@
-pub use aidaemon_tools::services::{Person, PersonFact};
+pub use aidaemon_memory::records::{Person, PersonFact};
