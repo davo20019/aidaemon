@@ -95,8 +95,8 @@ pub use extract::{
 pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;
 pub use scoring::{
-    episode_importance, episode_recall_boost, term_overlap, tokens, HybridScorer, HybridWeights,
-    Scorer, ScoringConfig,
+    episode_importance, episode_recall_boost, term_overlap, tokens, word_overlap, HybridScorer,
+    HybridWeights, Scorer, ScoringConfig,
 };
 pub use store::{
     latest_version, InMemoryMemoryStore, MemoryStore, Migration, SqliteMemoryStore, MIGRATIONS,

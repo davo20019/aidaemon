@@ -285,9 +285,36 @@ pub fn term_overlap(query: &str, text: &str) -> f32 {
     query.intersection(&text).count() as f32 / query.len() as f32
 }
 
+/// Fraction of distinct query words that occur as words in `text`
+/// (0.0-1.0), counting every word, stopwords included. Unlike
+/// [`term_overlap`], a short query such as "who is she" keeps all its words:
+/// the signal for ranking when no embedder is available.
+pub fn word_overlap(query: &str, text: &str) -> f32 {
+    let words = |value: &str| {
+        value
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>()
+    };
+    let query = words(query);
+    if query.is_empty() {
+        return 0.0;
+    }
+    query.intersection(&words(text)).count() as f32 / query.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_overlap_counts_every_word() {
+        assert_eq!(word_overlap("who is she", "she is here"), 2.0 / 3.0);
+        assert_eq!(word_overlap("", "anything"), 0.0);
+        assert_eq!(word_overlap("Mia", "mia and zoe"), 1.0);
+    }
 
     #[test]
     fn corroborated_result_beats_single_weak_signal() {

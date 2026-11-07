@@ -5,7 +5,6 @@ pub mod embedding_index;
 pub mod embeddings;
 pub mod expertise;
 pub mod graph_store;
-pub mod hybrid;
 pub mod manager;
 pub mod math;
 pub mod neighborhood;

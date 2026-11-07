@@ -90,7 +90,7 @@ fn hybrid_fact_score(
     graph_match: bool,
     freshness: f32,
 ) -> f32 {
-    crate::memory::hybrid::fused_score(crate::memory::hybrid::HybridSignals {
+    aidaemon_memory::HybridWeights::default().fuse(&aidaemon_memory::Signals {
         semantic,
         lexical,
         graph: if graph_match { 1.0 } else { 0.0 },

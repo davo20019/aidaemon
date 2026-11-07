@@ -1,68 +1,31 @@
 use crate::traits::Message;
 
-/// Episodic search ranking should express semantic relevance, not make an old
-/// conversation effectively undiscoverable. Recall adds only a small bounded
-/// reinforcement and age is intentionally absent.
+/// Episodic search ranking: semantic relevance with a small bounded
+/// reinforcement for recalled episodes; age is intentionally absent, so an
+/// old conversation stays discoverable.
 pub fn episode_search_score(similarity: f32, recall_count: i32) -> f32 {
-    let recall_boost = 1.0 + ((recall_count.max(0) as f32 + 1.0).ln() * 0.04).min(0.16);
-    similarity * recall_boost
+    similarity * aidaemon_memory::episode_recall_boost(recall_count.max(0) as u32)
 }
 
-/// Deterministic degraded-mode relevance when the embedding service is
-/// unavailable. Short terms are retained and only exact word overlap scores.
-pub fn lexical_relevance(query: &str, text: &str) -> f32 {
-    let tokens = |value: &str| {
-        value
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned)
-            .collect::<std::collections::HashSet<_>>()
-    };
-    let query_tokens = tokens(query);
-    if query_tokens.is_empty() {
-        return 0.0;
-    }
-    let text_tokens = tokens(text);
-    query_tokens.intersection(&text_tokens).count() as f32 / query_tokens.len() as f32
-}
+/// Degraded-mode relevance when the embedding service is unavailable:
+/// exact word overlap, every word counting.
+pub use aidaemon_memory::word_overlap as lexical_relevance;
 
-/// Calculate episode importance based on various factors.
+/// Episode importance from typed session features.
 pub fn calculate_episode_importance(
     message_count: i32,
     has_errors: bool,
     has_decisions: bool,
     has_goals: bool,
-    emotional_intensity: f32, // 0.0-1.0 scale
+    emotional_intensity: f32,
 ) -> f32 {
-    let mut importance = 0.5; // Base importance
-
-    // More messages = more substantial session
-    if message_count > 20 {
-        importance += 0.2;
-    } else if message_count > 10 {
-        importance += 0.1;
-    }
-
-    // Error resolution is important to remember
-    if has_errors {
-        importance += 0.15;
-    }
-
-    // Decisions made during session
-    if has_decisions {
-        importance += 0.1;
-    }
-
-    // Goals mentioned or worked on
-    if has_goals {
-        importance += 0.1;
-    }
-
-    // Emotional sessions (frustration, excitement) are memorable
-    importance += emotional_intensity * 0.2;
-
-    importance.clamp(0.1, 1.0)
+    aidaemon_memory::episode_importance(
+        message_count.max(0) as usize,
+        has_errors,
+        has_decisions,
+        has_goals,
+        emotional_intensity,
+    )
 }
 
 /// Calculate importance score (0.0 - 1.0) based on heuristics.
