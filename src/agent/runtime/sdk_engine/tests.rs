@@ -3737,7 +3737,9 @@ fn hook_order_is_pinned() {
             allowances: Default::default(),
             limits: SAME_TOOL_LIMITS,
         },
-        ledger: LedgerStop { calls },
+        ledger: LedgerStop {
+            calls: calls.clone(),
+        },
         memory: vec![Arc::new(NoopMemoryHook)],
         egress: aidaemon_policies::EgressGuard::new(),
         untrusted: sdk::UntrustedHook::new(
@@ -3745,6 +3747,9 @@ fn hook_order_is_pinned() {
             aidaemon_policies::wrap_untrusted,
         ),
         approval: aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never),
+        dispatch: DispatchGate {
+            calls: calls.clone(),
+        },
     };
     let chain = hooks.chain();
     let slots: Vec<HookSlot> = chain.iter().map(|(slot, _)| *slot).collect();
@@ -3759,6 +3764,7 @@ fn hook_order_is_pinned() {
             HookSlot::Egress,
             HookSlot::Untrusted,
             HookSlot::Approval,
+            HookSlot::Dispatch,
         ]
     );
     // Approval and egress are real hooks now, not attestations: with only

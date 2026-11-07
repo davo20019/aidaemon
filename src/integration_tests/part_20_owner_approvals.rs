@@ -1338,6 +1338,14 @@ async fn dispatcher_executes_with_the_judged_scope() {
         ledger_refusals(&harness, &session, "controller_scope_contract_rejected").await,
         1
     );
+    // The dispatcher's gate refused it as a kernel hook: the model sees a
+    // kernel denial, and the ledger holds it once (above).
+    let seen = all_tool_messages(&harness.provider).await;
+    assert!(
+        seen.iter()
+            .any(|message| message.starts_with("Denied:") && message.contains("synthetic judged refusal")),
+        "{seen:?}"
+    );
 }
 
 // ==================== MCP registry tools on the SDK path ====================

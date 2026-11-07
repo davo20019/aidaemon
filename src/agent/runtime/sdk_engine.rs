@@ -318,6 +318,7 @@ enum KernelNotice {
 
 pub(super) enum DaemonCall {
     Tool(ToolRequest),
+    Gate(GateRequest),
     Model(ModelCall),
     Stop(StopCheck),
 }
@@ -471,14 +472,39 @@ pub(super) fn terminal_canonicalizer(
     }
 }
 
-/// One tool call handed from the SDK run to the daemon dispatcher.
-pub(super) struct ToolRequest {
+/// One kernel tool call as the daemon dispatcher sees it.
+pub(super) struct KernelCall {
     /// The kernel run the call belongs to (call ids are unique per run).
     run_id: sdk::RunId,
     name: String,
     arguments: Value,
     call_id: String,
+}
+
+/// One tool call handed from the SDK run to the daemon dispatcher.
+pub(super) struct ToolRequest {
+    call: KernelCall,
     reply: oneshot::Sender<sdk::ToolResult>,
+}
+
+impl std::ops::Deref for ToolRequest {
+    type Target = KernelCall;
+    fn deref(&self) -> &KernelCall {
+        &self.call
+    }
+}
+
+impl std::ops::DerefMut for ToolRequest {
+    fn deref_mut(&mut self) -> &mut KernelCall {
+        &mut self.call
+    }
+}
+
+/// A call the kernel's hooks allowed so far, put to the dispatcher's gates
+/// ([`hooks::DispatchGate`]) before it runs.
+pub(super) struct GateRequest {
+    call: KernelCall,
+    reply: oneshot::Sender<sdk::ToolDecision>,
 }
 
 /// Encode the image attachments `model` may see. Returns the images and
@@ -601,6 +627,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     judged_terminal_calls: super::approvals::JudgedCalls,
     /// How `CanonicalCallHook` canonicalized each call, by run and call id.
     canonical_calls: tool_calls::CanonicalCalls,
+    /// What the dispatcher's gates decided for each call, by run and call
+    /// id (`DispatchGate`); execution takes a cleared call's grant here.
+    gate_outcomes: tool_calls::GateOutcomes,
     /// The run's declines as the kernel last showed them to the approval
     /// rules: a child spawned from this turn starts with them.
     run_declines: super::approvals::RunDeclines,
@@ -701,6 +730,14 @@ impl Agent {
     /// an unknown tool or invalid arguments is a typed failed proposal; a
     /// hook denial is a policy denial.
     async fn record_kernel_refusal(&self, scope: &TurnScope<'_>, receipt: sdk::Receipt) {
+        // The dispatcher's gate recorded its own refusal, with its reason.
+        if receipt.status == sdk::ReceiptStatus::Denied
+            && scope
+                .gate_outcomes
+                .refused(receipt.run_id, &receipt.call_id)
+        {
+            return;
+        }
         // A refused call may be refused because it carries a secret: the
         // ledger never stores its arguments unredacted.
         let call = crate::traits::ToolCall {
@@ -1143,6 +1180,9 @@ impl Agent {
                 aidaemon_policies::wrap_untrusted,
             ),
             approval,
+            dispatch: DispatchGate {
+                calls: calls_tx.clone(),
+            },
         };
         for (_, hook) in hooks.chain() {
             builder = builder.hook_arc(hook);
@@ -1301,6 +1341,7 @@ impl Agent {
             known_project_dir: known_project_dir.clone(),
             judged_terminal_calls,
             canonical_calls,
+            gate_outcomes: Default::default(),
             run_declines,
             project_scope,
             authority: &authority,
@@ -1423,6 +1464,9 @@ impl Agent {
                 Some(call) = calls_rx.recv() => match call {
                     DaemonCall::Tool(request) => {
                         in_flight.push(self.dispatch_sdk_tool_call(&scope, request).boxed());
+                    }
+                    DaemonCall::Gate(request) => {
+                        in_flight.push(self.serve_sdk_gate(&scope, request).boxed());
                     }
                     DaemonCall::Model(call) => {
                         in_flight.push(self.serve_sdk_model_call(&scope, call).boxed());

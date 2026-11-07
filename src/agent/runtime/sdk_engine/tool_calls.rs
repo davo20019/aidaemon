@@ -162,7 +162,9 @@ pub(in crate::agent) struct CanonRecord {
 /// [`CanonicalCallHook`] before any other hook judges the call, read by the
 /// approval rules and the dispatcher, so nobody canonicalizes again.
 #[derive(Debug, Clone, Default)]
-pub(in crate::agent) struct CanonicalCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>);
+pub(in crate::agent) struct CanonicalCalls(
+    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>,
+);
 
 impl CanonicalCalls {
     pub(super) fn get(&self, run: sdk::RunId, call_id: &str) -> Option<CanonRecord> {
@@ -263,6 +265,76 @@ impl sdk::Hook for CanonicalCallHook {
                 arguments: canonical.arguments,
             }
         }
+    }
+}
+
+/// What the dispatcher's gates decided for one call.
+#[derive(Debug, Clone)]
+pub(in crate::agent) enum GateOutcome {
+    /// Refused, with the text the model sees (the ledger already has it).
+    Refuse(String),
+    /// Answered in the tool's place (the ledger already has it).
+    Answer(sdk::ToolOutput),
+    /// May run.
+    Clear(GateClearance),
+}
+
+impl GateOutcome {
+    fn decision(&self) -> sdk::ToolDecision {
+        match self {
+            Self::Refuse(reason) => sdk::ToolDecision::Deny {
+                reason: reason.clone(),
+            },
+            Self::Answer(output) => sdk::ToolDecision::Answer {
+                output: output.clone(),
+            },
+            Self::Clear(_) => sdk::ToolDecision::Allow,
+        }
+    }
+}
+
+/// What a cleared call runs with.
+#[derive(Debug, Clone)]
+pub(in crate::agent) struct GateClearance {
+    /// The filesystem scope check the call was cleared with.
+    pub scope_check: Option<crate::agent::tool_execution::ScopeCheck>,
+    /// The mandate run's grant for this exact call.
+    pub grant: Option<crate::traits::MandateAuthorityGrant>,
+}
+
+/// Gate outcomes by run and call id. A call is gated once: the kernel may
+/// put a call to its hooks again, and gets the same decision.
+#[derive(Debug, Clone, Default)]
+pub(in crate::agent) struct GateOutcomes(
+    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), GateOutcome>>>,
+);
+
+impl GateOutcomes {
+    fn get(&self, run: sdk::RunId, call_id: &str) -> Option<GateOutcome> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(run, call_id.to_string()))
+            .cloned()
+    }
+
+    fn take(&self, run: sdk::RunId, call_id: &str) -> Option<GateOutcome> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
+
+    fn insert(&self, run: sdk::RunId, call_id: &str, outcome: GateOutcome) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), outcome);
+    }
+
+    /// The gate refused this call and already recorded the refusal.
+    pub(super) fn refused(&self, run: sdk::RunId, call_id: &str) -> bool {
+        matches!(self.get(run, call_id), Some(GateOutcome::Refuse(_)))
     }
 }
 
@@ -700,30 +772,27 @@ impl Agent {
     pub(super) async fn run_sdk_tool_call(
         &self,
         scope: &TurnScope<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
         arguments: &str,
         injected_dir: Option<&str>,
         judgment: &DispatchJudgment,
     ) -> sdk::ToolOutput {
-        // The controller-side filesystem check: protected host data and undeclared writes outside the task
-        // boundary are refused; an exact out-of-scope target a user may
-        // authorize goes to the tool's approval prompt. A terminal call the
-        // kernel judged keeps the scope it was judged (and the owner asked)
-        // with.
-        let scope_check = match judgment {
-            DispatchJudgment::Judged(check) => check.clone(),
-            DispatchJudgment::CheckNow | DispatchJudgment::Unjudged => {
-                self.sdk_scope_check(scope, &request.name, arguments)
+        // The dispatcher's gates ran as the kernel's last hook
+        // (`DispatchGate`); a call that bypassed the hook chain is gated now.
+        let outcome = match scope.gate_outcomes.take(request.run_id, &request.call_id) {
+            Some(outcome) => outcome,
+            None => {
+                self.sdk_gate_call(scope, request, arguments, judgment)
+                    .await
             }
         };
-        let scope_escalation = match &scope_check {
-            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { reason, escalation }) => {
-                info!(
-                    tool = %request.name,
-                    reads = ?escalation.read_paths,
-                    writes = ?escalation.write_paths,
-                    "SDK engine: scope escalation routed to tool approval: {reason}"
-                );
+        let clearance = match outcome {
+            GateOutcome::Clear(clearance) => clearance,
+            GateOutcome::Refuse(refusal) => return sdk::ToolOutput::error(refusal),
+            GateOutcome::Answer(output) => return output,
+        };
+        let scope_escalation = match &clearance.scope_check {
+            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { escalation, .. }) => {
                 Some(escalation.clone())
             }
             _ => None,
@@ -736,174 +805,25 @@ impl Agent {
             .then(|| self.turn_authority_for_children(scope));
         // The session's mode as of now (`/readonly` can arrive mid-turn).
         let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
-        let mut ctx = ToolExecCtx {
-            // The MCP tool bridged and judged at turn start, if this is one.
-            mcp_tool: scope
-                .mcp_tools
-                .iter()
-                .find(|tool| tool.name() == request.name),
-            owner_approval_by_kernel: true,
-            session_id: scope.session_id,
-            task_id: Some(scope.task_id),
-            status_tx: scope.status_tx.clone(),
-            channel_visibility: scope.channel_ctx.visibility,
-            channel_id: scope.channel_ctx.channel_id.as_deref(),
-            project_scope: scope.project_scope.as_deref(),
-            trusted: scope.channel_ctx.trusted,
-            user_role: scope.user_role,
-            workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
-            mandate_authority: None,
-            tool_call_id: Some(&request.call_id),
-            mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly
-                || ceiling.is_some(),
-            scope_escalation: scope_escalation.as_ref(),
-            turn_authority: turn_authority.as_ref(),
-            trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
-            lone_root_call: self.depth == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
-        };
+        let mut ctx = self.sdk_exec_ctx(
+            scope,
+            request,
+            ceiling.is_some(),
+            scope_escalation.as_ref(),
+            turn_authority.as_ref(),
+        );
+        let grant = clearance.grant;
+        ctx.mandate_authority = grant.as_ref();
         let started = Instant::now();
         let call_semantics = self
             .semantics_for_exact_tool_call(&request.name, arguments)
             .await;
-        // The turn's resolved authority (level and tool set) was enforced
-        // by the kernel's `AuthorityHook` before this call reached the
-        // dispatcher. Here: the session's mode as of now, the
-        // untrusted-reference block, the filesystem scope check, then for
-        // mandate runs the per-call mandate authority gate, which issues the
-        // bounded grant or refuses the call.
-        // A call approved after an interruption resumes past the kernel's
-        // authority check, so the mode is judged again for every call.
-        let ceiling_denial = ceiling.as_ref().and_then(|ceiling| {
-            let annotations = self
-                .turn_tool(scope, &request.name)
-                .map(|tool| {
-                    tool.call_annotations_in(
-                        arguments,
-                        &crate::traits::TrustRoots::new(&scope.trust_roots),
-                    )
-                })
-                .unwrap_or_default();
-            ceiling.permits(&request.name, annotations).err()
-        });
-        // A matched skill that references untrusted external content blocks
-        // the tools that could act on it.
-        let untrusted_block = scope.restrict_untrusted_reference_tools
-            && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
-        let gate = if *judgment == DispatchJudgment::Unjudged {
-            Err((unjudged_terminal_refusal(), "kernel_judgment_missing"))
-        } else if let Some(reason) = ceiling_denial {
-            Err((
-                format!(
-                    "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
-                     Use a permitted tool or report the limitation.",
-                    request.name
-                ),
-                "session_mode_ceiling",
-            ))
-        } else if untrusted_block {
-            Err((
-                crate::agent::tool_execution::blocked_for_untrusted_external_reference_message(
-                    &request.name,
-                    &scope.untrusted_reference_skills,
-                ),
-                "untrusted_external_reference_blocked",
-            ))
-        } else if let Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason)) =
-            &scope_check
-        {
-            Err((
-                crate::agent::ToolResultNotice::ScopeLockBlockedResult {
-                    tool_name: request.name.clone(),
-                    reason: reason.clone(),
-                }
-                .render(),
-                "controller_scope_contract_rejected",
-            ))
-        } else {
-            self.sdk_mandate_gate(&ctx, request, arguments)
-                .await
-                .map_err(|refusal| (refusal, "mandate_authority"))
-        };
-        let grant = match gate {
-            Ok(grant) => grant,
-            Err((refusal, reason_code)) => {
-                info!(
-                    session_id = scope.session_id,
-                    task_id = scope.task_id,
-                    tool = %request.name,
-                    reason_code,
-                    "SDK engine: authority gate refused the call"
-                );
-                let call = crate::traits::ToolCall {
-                    id: request.call_id.clone(),
-                    name: request.name.clone(),
-                    arguments: arguments.to_string(),
-                    extra_content: None,
-                };
-                let semantics = self
-                    .semantics_for_exact_tool_call(&request.name, arguments)
-                    .await;
-                if let Err(error) = self
-                    .persist_pre_dispatch_policy_denial(
-                        scope.emitter,
-                        scope.session_id,
-                        self.ledger_task_id(scope),
-                        &call,
-                        arguments,
-                        refusal.clone(),
-                        reason_code,
-                        semantics,
-                        None,
-                    )
-                    .await
-                {
-                    warn!(task_id = scope.task_id, %error, "SDK engine: could not record a denial");
-                }
-                return sdk::ToolOutput::error(refusal);
-            }
-        };
-        ctx.mandate_authority = grant.as_ref();
-
-        // Before a call enters a deeper subtree, newly applicable nested
-        // project instructions are loaded and the call is deliberately not
-        // executed, so the model reviews them and retries (CLAUDE.md,
-        // "Project Instruction Loading").
-        if let Some(deferral) = self
-            .sdk_load_nested_instructions(scope, request, arguments, &call_semantics)
-            .await
-        {
-            return deferral;
-        }
-
         // The same file and caption go out once per task.
         let send_file_key = facts
             .delivers_files
             .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
             .flatten();
-        if let Some(key) = &send_file_key {
-            let already_sent = scope.sent_files.lock().is_ok_and(|sent| sent.contains(key));
-            if already_sent {
-                return self.sdk_suppress_duplicate_send(scope, request).await;
-            }
-        }
-        // Calls with side effects carry an idempotency key, bound to
-        // the task and the canonical arguments: a repeat reuses the durable
-        // receipt instead of performing the effect twice.
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
-        let preflight = crate::agent::tool_execution::durable_replay_preflight(
-            self,
-            scope.session_id,
-            &request.name,
-            arguments,
-            idempotency_key.as_deref(),
-        )
-        .await;
-        if let Some(output) = self
-            .sdk_replay_or_block(scope, request, arguments, &preflight)
-            .await
-        {
-            return output;
-        }
         // Shadow comparison, once per call that actually executes: after
         // deferral, duplicate suppression and durable replay, so a call that
         // is deferred, suppressed or replayed is not counted (the shadow
@@ -1364,6 +1284,275 @@ impl Agent {
         }
     }
 
+    /// The dispatcher's context for executing or gating `request`.
+    fn sdk_exec_ctx<'s>(
+        &'s self,
+        scope: &'s TurnScope<'_>,
+        request: &'s KernelCall,
+        ceiling_set: bool,
+        scope_escalation: Option<&'s crate::traits::ScopeEscalation>,
+        turn_authority: Option<&'s crate::agent::authority::InheritedAuthority>,
+    ) -> ToolExecCtx<'s> {
+        ToolExecCtx {
+            // The MCP tool bridged and judged at turn start, if this is one.
+            mcp_tool: scope
+                .mcp_tools
+                .iter()
+                .find(|tool| tool.name() == request.name),
+            owner_approval_by_kernel: true,
+            session_id: scope.session_id,
+            task_id: Some(scope.task_id),
+            status_tx: scope.status_tx.clone(),
+            channel_visibility: scope.channel_ctx.visibility,
+            channel_id: scope.channel_ctx.channel_id.as_deref(),
+            project_scope: scope.project_scope.as_deref(),
+            trusted: scope.channel_ctx.trusted,
+            user_role: scope.user_role,
+            workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),
+            mandate_authority: None,
+            tool_call_id: Some(&request.call_id),
+            mutation_forbidden: scope.authority.authority.level == sdk::AccessLevel::ReadOnly
+                || ceiling_set,
+            scope_escalation,
+            turn_authority,
+            trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
+            lone_root_call: self.depth == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
+        }
+    }
+
+    /// How the kernel judged a call's filesystem scope, without taking the
+    /// judgment (the dispatcher takes it when the call runs).
+    fn peek_judgment(&self, scope: &TurnScope<'_>, request: &KernelCall) -> DispatchJudgment {
+        let runs_as_judged = self
+            .turn_tool(scope, &request.name)
+            .is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
+        if !runs_as_judged {
+            return DispatchJudgment::CheckNow;
+        }
+        let judged = scope
+            .judged_terminal_calls
+            .get(request.run_id, &request.call_id);
+        #[cfg(test)]
+        let judged = match crate::agent::approvals::judgment_seam(scope.session_id) {
+            Some(crate::agent::approvals::JudgmentSeam::DropJudgment) => None,
+            _ => judged,
+        };
+        match judged {
+            Some(judged) => DispatchJudgment::Judged(judged.scope.as_scope_check()),
+            None => DispatchJudgment::Unjudged,
+        }
+    }
+
+    /// Serve [`hooks::DispatchGate`]: gate the call once and tell the
+    /// kernel what was decided.
+    pub(super) async fn serve_sdk_gate(&self, scope: &TurnScope<'_>, request: GateRequest) {
+        let call = &request.call;
+        let outcome = match scope.gate_outcomes.get(call.run_id, &call.call_id) {
+            Some(outcome) => outcome,
+            None => {
+                let arguments =
+                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                let judgment = self.peek_judgment(scope, call);
+                let outcome = self.sdk_gate_call(scope, call, &arguments, &judgment).await;
+                scope
+                    .gate_outcomes
+                    .insert(call.run_id, &call.call_id, outcome.clone());
+                outcome
+            }
+        };
+        let _ = request.reply.send(outcome.decision());
+    }
+
+    /// The dispatcher's gates for one call, in order: a terminal call the
+    /// kernel never judged, the session's live mode, the untrusted-reference
+    /// block, the filesystem scope check and the mandate authority refuse;
+    /// new nested project instructions defer the call; a duplicate
+    /// `send_file` and a durable replay answer in its place. Refusals and
+    /// answers are recorded in the run ledger here.
+    pub(super) async fn sdk_gate_call(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &KernelCall,
+        arguments: &str,
+        judgment: &DispatchJudgment,
+    ) -> GateOutcome {
+        // The controller-side filesystem check: protected host data and
+        // undeclared writes outside the task boundary are refused; an exact
+        // out-of-scope target a user may authorize goes to the tool's
+        // approval prompt. A terminal call the kernel judged keeps the scope
+        // it was judged (and the owner asked) with.
+        let scope_check = match judgment {
+            DispatchJudgment::Judged(check) => check.clone(),
+            DispatchJudgment::CheckNow | DispatchJudgment::Unjudged => {
+                self.sdk_scope_check(scope, &request.name, arguments)
+            }
+        };
+        let scope_escalation = match &scope_check {
+            Some(crate::agent::tool_execution::ScopeCheck::Escalatable { reason, escalation }) => {
+                info!(
+                    tool = %request.name,
+                    reads = ?escalation.read_paths,
+                    writes = ?escalation.write_paths,
+                    "SDK engine: scope escalation routed to tool approval: {reason}"
+                );
+                Some(escalation.clone())
+            }
+            _ => None,
+        };
+        // The session's mode as of now (`/readonly` can arrive mid-turn),
+        // judged again because a call approved after an interruption
+        // resumes past the kernel's authority check.
+        let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
+        let ceiling_denial = ceiling.as_ref().and_then(|ceiling| {
+            let annotations = self
+                .turn_tool(scope, &request.name)
+                .map(|tool| {
+                    tool.call_annotations_in(
+                        arguments,
+                        &crate::traits::TrustRoots::new(&scope.trust_roots),
+                    )
+                })
+                .unwrap_or_default();
+            ceiling.permits(&request.name, annotations).err()
+        });
+        // A matched skill that references untrusted external content blocks
+        // the tools that could act on it.
+        let untrusted_block = scope.restrict_untrusted_reference_tools
+            && crate::agent::is_untrusted_external_reference_blocked_tool(&request.name);
+        let gate = if *judgment == DispatchJudgment::Unjudged {
+            Err((unjudged_terminal_refusal(), "kernel_judgment_missing"))
+        } else if let Some(reason) = ceiling_denial {
+            Err((
+                format!(
+                    "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
+                     Use a permitted tool or report the limitation.",
+                    request.name
+                ),
+                "session_mode_ceiling",
+            ))
+        } else if untrusted_block {
+            Err((
+                crate::agent::tool_execution::blocked_for_untrusted_external_reference_message(
+                    &request.name,
+                    &scope.untrusted_reference_skills,
+                ),
+                "untrusted_external_reference_blocked",
+            ))
+        } else if let Some(crate::agent::tool_execution::ScopeCheck::Rejected(reason)) =
+            &scope_check
+        {
+            Err((
+                crate::agent::ToolResultNotice::ScopeLockBlockedResult {
+                    tool_name: request.name.clone(),
+                    reason: reason.clone(),
+                }
+                .render(),
+                "controller_scope_contract_rejected",
+            ))
+        } else {
+            let facts = self.turn_tool_facts(scope, &request.name);
+            let turn_authority = facts
+                .spawns_child_agents
+                .then(|| self.turn_authority_for_children(scope));
+            let ctx = self.sdk_exec_ctx(
+                scope,
+                request,
+                ceiling.is_some(),
+                scope_escalation.as_ref(),
+                turn_authority.as_ref(),
+            );
+            self.sdk_mandate_gate(&ctx, request, arguments)
+                .await
+                .map_err(|refusal| (refusal, "mandate_authority"))
+        };
+        let grant = match gate {
+            Ok(grant) => grant,
+            Err((refusal, reason_code)) => {
+                info!(
+                    session_id = scope.session_id,
+                    task_id = scope.task_id,
+                    tool = %request.name,
+                    reason_code,
+                    "SDK engine: authority gate refused the call"
+                );
+                let call = crate::traits::ToolCall {
+                    id: request.call_id.clone(),
+                    name: request.name.clone(),
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                };
+                let semantics = self
+                    .semantics_for_exact_tool_call(&request.name, arguments)
+                    .await;
+                if let Err(error) = self
+                    .persist_pre_dispatch_policy_denial(
+                        scope.emitter,
+                        scope.session_id,
+                        self.ledger_task_id(scope),
+                        &call,
+                        arguments,
+                        refusal.clone(),
+                        reason_code,
+                        semantics,
+                        None,
+                    )
+                    .await
+                {
+                    warn!(task_id = scope.task_id, %error, "SDK engine: could not record a denial");
+                }
+                return GateOutcome::Refuse(refusal);
+            }
+        };
+        // The daemon's own words: trusted.
+        let answer = |output: sdk::ToolOutput| {
+            GateOutcome::Answer(output.with_trust(sdk::SourceTrust::Trusted))
+        };
+        let call_semantics = self
+            .semantics_for_exact_tool_call(&request.name, arguments)
+            .await;
+        // Before a call enters a deeper subtree, newly applicable nested
+        // project instructions are loaded and the call is deliberately not
+        // executed, so the model reviews them and retries (CLAUDE.md,
+        // "Project Instruction Loading").
+        if let Some(deferral) = self
+            .sdk_load_nested_instructions(scope, request, arguments, &call_semantics)
+            .await
+        {
+            return answer(deferral);
+        }
+        // The same file and caption go out once per task.
+        let facts = self.turn_tool_facts(scope, &request.name);
+        let send_file_key = facts
+            .delivers_files
+            .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
+            .flatten();
+        if let Some(key) = &send_file_key {
+            let already_sent = scope.sent_files.lock().is_ok_and(|sent| sent.contains(key));
+            if already_sent {
+                return answer(self.sdk_suppress_duplicate_send(scope, request).await);
+            }
+        }
+        // Calls with side effects carry an idempotency key, bound to the task
+        // and the canonical arguments: a repeat reuses the durable receipt
+        // instead of performing the effect twice.
+        let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
+        let preflight = crate::agent::tool_execution::durable_replay_preflight(
+            self,
+            scope.session_id,
+            &request.name,
+            arguments,
+            idempotency_key.as_deref(),
+        )
+        .await;
+        if let Some(output) = self
+            .sdk_replay_or_block(scope, request, arguments, &preflight)
+            .await
+        {
+            return answer(output);
+        }
+        GateOutcome::Clear(GateClearance { scope_check, grant })
+    }
+
     /// Record an assistant message that calls tools before the calls run, so
     /// history and the run ledger see each call with the message that made it.
     pub(super) async fn persist_sdk_tool_call_message(
@@ -1401,7 +1590,7 @@ impl Agent {
     pub(super) fn sdk_idempotency_key(
         &self,
         scope: &TurnScope<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
         semantics: &crate::traits::ToolCallSemantics,
     ) -> Option<String> {
         let capabilities = self
@@ -1423,7 +1612,7 @@ impl Agent {
     pub(super) async fn sdk_suppress_duplicate_send(
         &self,
         scope: &TurnScope<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
     ) -> sdk::ToolOutput {
         info!(
             task_id = scope.task_id,
@@ -1471,7 +1660,7 @@ impl Agent {
     pub(super) async fn sdk_replay_or_block(
         &self,
         scope: &TurnScope<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
         arguments: &str,
         preflight: &crate::agent::tool_execution::DurableReplayPreflight,
     ) -> Option<sdk::ToolOutput> {
@@ -1599,7 +1788,7 @@ impl Agent {
     pub(super) async fn sdk_load_nested_instructions(
         &self,
         scope: &TurnScope<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
         arguments: &str,
         semantics: &crate::traits::ToolCallSemantics,
     ) -> Option<sdk::ToolOutput> {
@@ -1694,7 +1883,7 @@ impl Agent {
     pub(super) async fn sdk_mandate_gate(
         &self,
         ctx: &ToolExecCtx<'_>,
-        request: &ToolRequest,
+        request: &KernelCall,
         arguments: &str,
     ) -> Result<Option<crate::traits::MandateAuthorityGrant>, String> {
         let goal_id = match self.mandate_goal_id_for_tool_exec(ctx).await {

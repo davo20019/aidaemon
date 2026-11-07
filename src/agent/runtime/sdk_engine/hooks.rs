@@ -91,6 +91,7 @@ pub(super) enum HookSlot {
     Egress,
     Untrusted,
     Approval,
+    Dispatch,
 }
 
 /// The turn's hooks, registered in the pinned order: the canonical form of
@@ -110,6 +111,7 @@ pub(super) struct TurnHooks {
     pub(super) egress: aidaemon_policies::EgressGuard,
     pub(super) untrusted: sdk::UntrustedHook,
     pub(super) approval: aidaemon_policies::ApprovalPolicy,
+    pub(super) dispatch: DispatchGate,
 }
 
 impl TurnHooks {
@@ -124,7 +126,49 @@ impl TurnHooks {
         chain.push((HookSlot::Egress, Arc::new(self.egress)));
         chain.push((HookSlot::Untrusted, Arc::new(self.untrusted)));
         chain.push((HookSlot::Approval, Arc::new(self.approval)));
+        chain.push((HookSlot::Dispatch, Arc::new(self.dispatch)));
         chain
+    }
+}
+
+/// The dispatcher's own gates as the last `before_tool` hook, after the
+/// owner was asked (so a call approved after a wait is judged as of now):
+/// the session's live mode, the untrusted-reference block, the filesystem
+/// scope and the mandate authority refuse (`Deny`); deferral for new
+/// project instructions, a duplicate `send_file` and a durable replay
+/// answer in the tool's place (`Answer`). Served on the turn's task.
+pub(super) struct DispatchGate {
+    pub(super) calls: mpsc::Sender<DaemonCall>,
+}
+
+#[async_trait]
+impl sdk::Hook for DispatchGate {
+    async fn before_tool(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        call: &sdk::ToolCall,
+        _tool: &sdk::ToolInfo,
+    ) -> sdk::ToolDecision {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .calls
+            .send(DaemonCall::Gate(GateRequest {
+                call: KernelCall {
+                    run_id: ctx.run_id,
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    call_id: call.id.clone(),
+                },
+                reply,
+            }))
+            .await;
+        let stopped = || sdk::ToolDecision::Deny {
+            reason: "the tool dispatcher stopped before this call was checked".to_string(),
+        };
+        if sent.is_err() {
+            return stopped();
+        }
+        answer.await.unwrap_or_else(|_| stopped())
     }
 }
 
@@ -235,10 +279,12 @@ impl sdk::Tool for BridgedTool {
         let (reply, answer) = oneshot::channel();
         self.calls
             .send(DaemonCall::Tool(ToolRequest {
-                run_id: ctx.run_id,
-                name: self.spec.name.clone(),
-                arguments,
-                call_id: ctx.call_id.clone(),
+                call: KernelCall {
+                    run_id: ctx.run_id,
+                    name: self.spec.name.clone(),
+                    arguments,
+                    call_id: ctx.call_id.clone(),
+                },
                 reply,
             }))
             .await
