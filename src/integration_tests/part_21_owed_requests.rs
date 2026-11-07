@@ -55,7 +55,8 @@ async fn misclassified_continuation_still_shows_the_verifier_the_owed_request() 
         // the verifier checks, then a reply that cannot finish the work.
         MockProvider::tool_call_response("injected_page", r#"{"url":"https://example.invalid/x"}"#),
         MockProvider::tool_call_response("forget_probe", r#"{"key":"other_projects"}"#),
-        MockProvider::text_response(r#"{"consistent":true,"reason":"owner asked"}"#),
+        // The verifier refuses: the owed work did not happen.
+        MockProvider::text_response(r#"{"consistent":false,"reason":"request does not identify the entry"}"#),
         MockProvider::text_response("I could not finish that yet."),
         // Turn 3: "Try again", classified as a new request.
         MockProvider::tool_call_response("injected_page", r#"{"url":"https://example.invalid/x"}"#),

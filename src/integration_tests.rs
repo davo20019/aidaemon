@@ -25,3 +25,4 @@ include!("integration_tests/part_18_explicit_authority.rs");
 include!("integration_tests/part_19_untrusted_content.rs");
 include!("integration_tests/part_20_owner_approvals.rs");
 include!("integration_tests/part_21_owed_requests.rs");
+include!("integration_tests/part_22_deferred_items.rs");

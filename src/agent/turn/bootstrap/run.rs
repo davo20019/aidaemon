@@ -1306,6 +1306,23 @@ pub(in crate::agent) async fn run_bootstrap(
             .map(|summary| summary.summary.as_str()),
         &initial_turn_context.assessment_recent_messages,
     );
+    // Owed owner requests are continuation targets even when the transcript
+    // window no longer shows them; the assessor must be able to name them.
+    let owed_candidates = agent
+        .state
+        .get_dialogue_state(session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|state| {
+            crate::agent::dialogue_state::owed_request_candidate_rows(&state, chrono::Utc::now())
+        });
+    // Only an existing conversation gets the candidates: an absent context
+    // means no relationship producer runs, and that must stay true.
+    let planner_context = match (planner_context, owed_candidates) {
+        (Some(context), Some(owed)) => Some(format!("{context}\n\n{owed}")),
+        (context, _) => context,
+    };
     let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
         emitter: &emitter,
         state: agent.state.as_ref(),
