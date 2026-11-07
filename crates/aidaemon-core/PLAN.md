@@ -409,9 +409,32 @@ Order:
         session-id mapping, then Discord, then Slack, then Telegram.
         Done 2026-11-07: Telegram and Slack formatting (`df687af`, with
         `aidaemon_channels::latex`) and message splitting (`e6b154f`) come
-        from the crates.
-        Daemon Discord has no tests today. Live behavior needs a manual
-        smoke test per bot.
+        from the crates. The generic features are in the crates, each
+        tested against a mock of its platform:
+        - the contract (`edba5d0`): `delete`, `send_file`, `download`,
+          `register_commands`, `answer_command` and
+          `ChannelEvent::Command`; the runner answers a menu command and
+          handles it as typed. App buttons beyond approvals (goal
+          confirmations) go through `ask`, so there is no action event;
+        - Discord (`df2c102`): uploads, CDN downloads, deletes, the global
+          command menu (registered on READY), slash commands acked at once
+          with a deferred reply that `answer_command` fills in;
+        - Slack (`3d18e6a`): the external upload flow, `url_private`
+          downloads, `chat.delete`, slash commands answered through their
+          `response_url`; tokens and answers only go to Slack hosts;
+        - Telegram (`739b9db`, `2ddcce6`): `sendDocument`, `getFile`
+          downloads (20 MiB cap), `deleteMessage`, `setMyCommands`, and a
+          webhook mode (feature `webhook`) with a secret token that falls
+          back to long polling like the daemon's.
+        Not done: name lookups, a Slack typing substitute (needs the
+        inbound message's ts) and a configurable max message length.
+        Next: the daemon bridge. Each daemon channel's inbound handlers
+        (access, auto-claim, commands, files, dispatch) are written against
+        serenity, teloxide or raw Slack payloads and must be ported onto
+        `ChannelEvent`, with session-id mapping, behind a per-platform
+        opt-in so each bot can be live-tested before its old transport is
+        deleted. Daemon Discord has no tests today. Live behavior needs a
+        manual smoke test per bot.
 - [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
       scenario format and the trajectory assertions are duplicated.
       `src/harness_eval/report.rs` formats live telemetry and is not a
@@ -448,11 +471,8 @@ Independent of the SDK; each is a small PR against `master`.
 
 ## Known issues
 
-- **macOS CI job never runs.** `Test (macos-14)` is cancelled within a second
-  with no runner assigned (`runner_id: 0`) on every push since 2026-10-31.
-  Master passed on macOS on 2026-10-23. Likely Actions billing or a spending
-  limit for macOS minutes; check GitHub Settings → Billing and plans →
-  Actions. Not caused by code.
+- None open. (The macOS CI job ran again once it moved from the rejected
+  `macos-14` label to `macos-latest`, `43a5cd8`; it passed on `2d7d2e9`.)
 
 ## Working agreements
 
