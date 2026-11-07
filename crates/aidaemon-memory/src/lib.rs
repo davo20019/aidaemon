@@ -94,6 +94,7 @@ mod system;
 pub mod task_learning;
 mod text;
 mod tools;
+pub mod trajectory;
 mod types;
 mod writer;
 

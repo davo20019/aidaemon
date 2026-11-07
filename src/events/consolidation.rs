@@ -20,8 +20,7 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
-use crate::providers::ChatJson;
-use crate::traits::{Episode, ErrorSolution, Procedure};
+use crate::traits::{ErrorSolution, Procedure};
 
 /// Statistics from a consolidation run
 #[derive(Debug, Default)]
@@ -211,7 +210,9 @@ impl Consolidator {
         // 1. Extract and save procedures from successful task sequences
         let procedures = self.extract_procedures(&events).await;
         for proc in procedures {
-            if self.learning_evidence_gate_enforce && !self.procedure_meets_evidence_gate(&proc) {
+            if self.learning_evidence_gate_enforce
+                && !aidaemon_memory::trajectory::meets_evidence_gate(&proc)
+            {
                 info!(
                     trigger = %proc.trigger_pattern,
                     steps = proc.steps.len(),
@@ -249,39 +250,16 @@ impl Consolidator {
                     if self.is_duplicate_procedure(&plan.description).await {
                         continue;
                     }
-
-                    let proc = Procedure {
-                        id: 0,
-                        name: format!("plan_{}", &plan.id[..8.min(plan.id.len())]),
-                        trigger_pattern: plan.description.clone(),
-                        steps: steps.clone(),
-                        success_count: 1,
-                        failure_count: 0,
-                        avg_duration_secs: None,
-                        last_used_at: Some(Utc::now()),
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
+                    let Some(proc) = aidaemon_memory::trajectory::procedure_from_plan(
+                        &plan.id,
+                        &plan.description,
+                        steps,
+                    ) else {
+                        continue;
                     };
-
-                    // Try LLM enhancement for plan-based procedures too
-                    let tool_sequence_str = proc
-                        .steps
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("{}. {}", i + 1, s))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    let final_proc = match self
-                        .enhance_procedure_with_llm(&proc, &plan.description, &tool_sequence_str)
-                        .await
-                    {
-                        Some(enhanced) => enhanced,
-                        None => proc,
-                    };
-
+                    let final_proc = self.enhanced(proc, &plan.description).await;
                     if self.learning_evidence_gate_enforce
-                        && !self.procedure_meets_evidence_gate(&final_proc)
+                        && !aidaemon_memory::trajectory::meets_evidence_gate(&final_proc)
                     {
                         info!(
                             trigger = %final_proc.trigger_pattern,
@@ -421,204 +399,34 @@ impl Consolidator {
         }
     }
 
-    fn procedure_meets_evidence_gate(&self, procedure: &Procedure) -> bool {
-        if procedure.steps.len() < 2 {
-            return false;
-        }
-        if procedure.failure_count > 0 {
-            return false;
-        }
-        procedure.success_count >= 1
-    }
-
     // =========================================================================
     // Extraction Methods
     // =========================================================================
 
-    /// Extract procedures from successful task sequences
+    /// Procedures from successful task sequences (the SDK memory crate's
+    /// extraction over this session's trace), deduplicated against stored
+    /// triggers and enhanced by the model when available.
     pub async fn extract_procedures(&self, events: &[Event]) -> Vec<Procedure> {
+        let trace = trace_events(events);
         let mut procedures = Vec::new();
-
-        // Group events by task
-        let mut task_events: HashMap<String, Vec<&Event>> = HashMap::new();
-        for event in events {
-            if let Some(task_id) = &event.task_id {
-                task_events.entry(task_id.clone()).or_default().push(event);
-            }
-        }
-
-        // Find successful tasks with multiple tool calls
-        for (task_id, task_evts) in task_events {
-            // Check if task completed successfully
-            let task_end = task_evts
-                .iter()
-                .find(|e| e.event_type == EventType::TaskEnd);
-            let task_start = task_evts
-                .iter()
-                .find(|e| e.event_type == EventType::TaskStart);
-
-            let (task_end, task_start) = match (task_end, task_start) {
-                (Some(end), Some(start)) => (end, start),
-                _ => continue,
-            };
-
-            let end_data: TaskEndData = match task_end.parse_data() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            // Only extract from successful tasks
-            if end_data.effective_outcome() != crate::events::TaskOutcome::Succeeded {
+        for candidate in aidaemon_memory::trajectory::procedure_candidates(&trace) {
+            if self.is_duplicate_procedure(&candidate.description).await {
                 continue;
             }
-
-            // Need at least 2 tool calls to make a procedure
-            let tool_calls: Vec<&Event> = task_evts
-                .iter()
-                .filter(|e| e.event_type == EventType::ToolCall)
-                .copied()
-                .collect();
-
-            if tool_calls.len() < 2 {
-                continue;
-            }
-
-            // Extract task description as trigger pattern
-            let start_data: TaskStartData = match task_start.parse_data() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            // Build steps from tool calls
-            let mut steps = Vec::new();
-            for tc_event in &tool_calls {
-                if let Ok(tc_data) = tc_event.parse_data::<ToolCallData>() {
-                    let step = format!(
-                        "{}: {}",
-                        tc_data.name,
-                        tc_data.summary.unwrap_or_else(|| "...".to_string())
-                    );
-                    steps.push(step);
-                }
-            }
-
-            if steps.len() >= 2 {
-                // Deduplication: check if a semantically similar procedure already exists
-                if self.is_duplicate_procedure(&start_data.description).await {
-                    continue;
-                }
-
-                let proc = Procedure {
-                    id: 0,
-                    name: format!("auto_{}", &task_id[..8.min(task_id.len())]),
-                    trigger_pattern: start_data.description.clone(),
-                    steps: steps.clone(),
-                    success_count: 1,
-                    failure_count: 0,
-                    avg_duration_secs: Some(end_data.duration_secs as f32),
-                    last_used_at: Some(Utc::now()),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                };
-
-                // Try LLM enhancement
-                let tool_sequence_str = proc
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| format!("{}. {}", i + 1, s))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let final_proc = match self
-                    .enhance_procedure_with_llm(&proc, &start_data.description, &tool_sequence_str)
-                    .await
-                {
-                    Some(enhanced) => enhanced,
-                    None => proc,
-                };
-
-                procedures.push(final_proc);
-            }
+            let procedure = aidaemon_memory::trajectory::procedure_from_task(&candidate);
+            procedures.push(self.enhanced(procedure, &candidate.description).await);
         }
-
         procedures
     }
 
-    /// Extract error-solution pairs from recovered errors
+    /// Error-solution pairs from recovered errors.
     pub async fn extract_error_solutions(&self, events: &[Event]) -> Vec<ErrorSolution> {
-        let mut solutions = Vec::new();
-
-        // Find Error events followed by successful ToolResult
-        let mut i = 0;
-        while i < events.len() {
-            let event = &events[i];
-
-            if event.event_type == EventType::Error {
-                if let Ok(error_data) = event.parse_data::<ErrorData>() {
-                    // Look for recovery in subsequent events
-                    let mut recovery_tool: Option<String> = None;
-                    let mut recovery_summary: Option<String> = None;
-
-                    for next_event in events.iter().take(events.len().min(i + 10)).skip(i + 1) {
-                        if next_event.event_type == EventType::ToolResult {
-                            if let Ok(result_data) = next_event.parse_data::<ToolResultData>() {
-                                if result_data.succeeded() {
-                                    recovery_tool = Some(result_data.name);
-                                    recovery_summary = Some(truncate(&result_data.result, 200));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // If we found a recovery, create an error-solution pair
-                    if let (Some(tool), Some(summary)) = (recovery_tool, recovery_summary) {
-                        let solution = ErrorSolution {
-                            id: 0,
-                            error_pattern: crate::memory::procedures::extract_error_pattern(
-                                &error_data.message,
-                            ),
-                            domain: error_data.tool_name.clone(),
-                            solution_summary: format!("Used {} to resolve", tool),
-                            solution_steps: Some(vec![summary]),
-                            // A later successful tool call is a correlation,
-                            // not proof. Credit arrives only from verified
-                            // reuse (`update_error_solution_outcome`).
-                            success_count: 0,
-                            failure_count: 0,
-                            last_used_at: Some(Utc::now()),
-                            created_at: Utc::now(),
-                        };
-                        solutions.push(solution);
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        solutions
+        aidaemon_memory::trajectory::error_solutions(&trace_events(events))
     }
 
-    /// Extract expertise updates from task outcomes
+    /// Expertise observations from task outcomes.
     pub async fn extract_expertise_updates(&self, events: &[Event]) -> Vec<(String, bool)> {
-        let mut updates = Vec::new();
-
-        for event in events {
-            if event.event_type == EventType::TaskEnd {
-                if let Ok(data) = event.parse_data::<TaskEndData>() {
-                    // Infer domain from tool usage
-                    let domain = self.infer_domain_from_task(&data.task_id, events);
-                    if let Some(domain) = domain {
-                        let success =
-                            data.effective_outcome() == crate::events::TaskOutcome::Succeeded;
-                        updates.push((domain, success));
-                    }
-                }
-            }
-        }
-
-        updates
+        aidaemon_memory::trajectory::expertise_updates(&trace_events(events))
     }
 
     /// Mine operational warning/error decision points into durable failure patterns.
@@ -696,119 +504,6 @@ impl Consolidator {
         recorded
     }
 
-    /// Infer the domain from tools used in a task
-    fn infer_domain_from_task(&self, task_id: &str, events: &[Event]) -> Option<String> {
-        let tool_names: Vec<String> = events
-            .iter()
-            .filter(|e| e.task_id.as_ref() == Some(&task_id.to_string()))
-            .filter(|e| e.event_type == EventType::ToolCall)
-            .filter_map(|e| e.tool_name.clone())
-            .collect();
-
-        if tool_names.is_empty() {
-            return None;
-        }
-
-        // Simple domain inference based on tool usage
-        if tool_names.iter().any(|t| t == "terminal") {
-            if tool_names.iter().any(|t| t.contains("git")) {
-                return Some("git".to_string());
-            }
-            return Some("shell".to_string());
-        }
-        if tool_names
-            .iter()
-            .any(|t| t == "web_search" || t == "web_fetch")
-        {
-            return Some("research".to_string());
-        }
-        if tool_names.iter().any(|t| t == "browser") {
-            return Some("browser".to_string());
-        }
-
-        Some("general".to_string())
-    }
-
-    /// Create an episode summary for the session
-    async fn create_episode_summary(&self, session_id: &str, events: &[Event]) -> Option<Episode> {
-        if events.is_empty() {
-            return None;
-        }
-
-        // Get time range
-        let start_time = events.first()?.created_at;
-        let end_time = events.last()?.created_at;
-
-        // Count key events
-        let user_messages = events
-            .iter()
-            .filter(|e| e.event_type == EventType::UserMessage)
-            .count();
-        let task_count = events
-            .iter()
-            .filter(|e| e.event_type == EventType::TaskStart)
-            .count();
-        let error_count = events
-            .iter()
-            .filter(|e| e.event_type == EventType::Error)
-            .count();
-
-        // Determine outcome
-        let last_task_end = events
-            .iter()
-            .rev()
-            .find(|e| e.event_type == EventType::TaskEnd);
-
-        let outcome = if let Some(end_event) = last_task_end {
-            if let Ok(data) = end_event.parse_data::<TaskEndData>() {
-                match data.effective_outcome() {
-                    TaskOutcome::Succeeded => "successful",
-                    TaskOutcome::Partial => "partial",
-                    TaskOutcome::Failed => "failed",
-                }
-            } else {
-                "unknown"
-            }
-        } else {
-            "incomplete"
-        };
-
-        // Collect topics from task descriptions
-        let topics: Vec<String> = events
-            .iter()
-            .filter(|e| e.event_type == EventType::TaskStart)
-            .filter_map(|e| e.parse_data::<TaskStartData>().ok())
-            .map(|d| truncate(&d.description, 50))
-            .collect();
-
-        // Create summary
-        let summary = format!(
-            "Session with {} messages, {} tasks ({} errors). Outcome: {}",
-            user_messages, task_count, error_count, outcome
-        );
-
-        Some(Episode {
-            id: 0,
-            session_id: session_id.to_string(),
-            summary,
-            topics: if topics.is_empty() {
-                None
-            } else {
-                Some(topics)
-            },
-            emotional_tone: None,
-            outcome: Some(outcome.to_string()),
-            importance: calculate_importance(user_messages, task_count, error_count),
-            recall_count: 0,
-            last_recalled_at: None,
-            message_count: user_messages as i32,
-            start_time,
-            end_time,
-            created_at: Utc::now(),
-            channel_id: None,
-        })
-    }
-
     // =========================================================================
     // LLM Enhancement Methods
     // =========================================================================
@@ -833,164 +528,40 @@ impl Consolidator {
             Err(_) => return false,
         };
 
-        for row in &rows {
-            let blob: Option<Vec<u8>> = row.get("trigger_embedding");
-            if let Some(blob) = blob {
-                if let Ok(existing_emb) = crate::memory::binary::decode_embedding(&blob) {
-                    if crate::memory::math::cosine_similarity(&new_emb, &existing_emb) > 0.85 {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        let existing: Vec<Vec<f32>> = rows
+            .iter()
+            .filter_map(|row| row.get::<Option<Vec<u8>>, _>("trigger_embedding"))
+            .filter_map(|blob| crate::memory::binary::decode_embedding(&blob).ok())
+            .collect();
+        aidaemon_memory::trajectory::duplicates_existing_trigger(&new_emb, &existing)
     }
 
-    /// Use the FAST LLM model to generate a clean procedure definition.
-    /// Returns None if LLM fails, returns skip=true, or is unavailable.
-    async fn enhance_procedure_with_llm(
-        &self,
-        proc: &Procedure,
-        task_description: &str,
-        tool_sequence: &str,
-    ) -> Option<Procedure> {
-        let runtime = self.llm_runtime.as_ref()?;
-        let runtime_snapshot = runtime.snapshot();
-        let provider = runtime_snapshot.provider();
-        let model = runtime_snapshot.primary_model();
-
-        let step_count = proc.steps.len();
-        let duration_str = proc
-            .avg_duration_secs
-            .map(|d| format!("{:.0}", d))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let system_prompt = "You generate clean procedure definitions from successful task sequences.\nRespond with ONLY valid JSON.";
-
-        let user_prompt = format!(
-            "Given a task that completed successfully, generate a clean procedure definition.\n\n\
-             Task: {task_description}\n\
-             Tools used:\n{tool_sequence}\n\
-             Duration: {duration_str}s\n\n\
-             Respond with JSON:\n\
-             {{\n\
-               \"name\": \"descriptive-kebab-case-name\",\n\
-               \"trigger_pattern\": \"general description of when to use this\",\n\
-               \"steps\": [\"Step 1: ...\", \"Step 2: ...\"],\n\
-               \"skip\": false\n\
-             }}\n\n\
-             Rules:\n\
-             - name: 2-4 word kebab-case describing PURPOSE (not tools used)\n\
-             - trigger_pattern: General description, not the exact task\n\
-             - steps: Actionable instructions including tool names and key parameters\n\
-             - skip: true if too context-specific to be reusable\n\
-             - Step count must match original ({step_count} steps)"
-        );
-
-        let llm_messages = vec![
-            serde_json::json!({"role": "system", "content": system_prompt}),
-            serde_json::json!({"role": "user", "content": user_prompt}),
-        ];
-
-        let call_start = std::time::Instant::now();
-        let response = match provider.chat(&model, &llm_messages, &[]).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("LLM enhancement failed for procedure: {}", e);
-                return None;
-            }
+    /// `procedure` rewritten by the model into a reusable one (the SDK
+    /// memory crate's [`ProcedureEnhancer`]), or unchanged when there is no
+    /// model or it declines.
+    ///
+    /// [`ProcedureEnhancer`]: aidaemon_memory::trajectory::ProcedureEnhancer
+    async fn enhanced(&self, procedure: Procedure, task_description: &str) -> Procedure {
+        let Some(runtime) = self.llm_runtime.as_ref() else {
+            return procedure;
         };
-
-        if let Some(state) = &self.state {
-            crate::events::record_background_model_call_telemetry(
-                self.event_store.clone(),
-                state.as_ref(),
-                "background:consolidation",
-                "consolidation",
-                &model,
-                &response,
-                call_start.elapsed(),
-            )
-            .await;
-        }
-
-        let text = response.content?;
-        let trimmed = text.trim();
-        let json_str = if let Some(start) = trimmed.find('{') {
-            if let Some(end) = trimmed.rfind('}') {
-                &trimmed[start..=end]
-            } else {
-                trimmed
-            }
-        } else {
-            trimmed
+        let snapshot = runtime.snapshot();
+        let model = snapshot.primary_model();
+        let provider: Arc<dyn aidaemon_core::Provider> = match &self.state {
+            Some(state) => Arc::new(crate::agent::AccountedProvider {
+                inner: snapshot.provider(),
+                accounting: crate::agent::ModelCallAccounting {
+                    state: state.clone(),
+                    event_store: self.event_store.clone(),
+                    purpose: "consolidation",
+                },
+            }),
+            None => snapshot.provider(),
         };
-
-        let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Failed to parse LLM procedure enhancement: {}", e);
-                return None;
-            }
-        };
-
-        // Check if LLM says skip
-        if parsed
-            .get("skip")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            return None;
-        }
-
-        let name = parsed
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let trigger_pattern = parsed
-            .get("trigger_pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if name.is_empty() || trigger_pattern.is_empty() {
-            return None;
-        }
-
-        // Extract steps from LLM
-        let llm_steps: Vec<String> = parsed
-            .get("steps")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Step count validation: if LLM steps differ by more than 1, keep original steps
-        // but use LLM's name and trigger_pattern
-        let final_steps = if llm_steps.is_empty()
-            || (llm_steps.len() as isize - proc.steps.len() as isize).unsigned_abs() > 1
-        {
-            proc.steps.clone()
-        } else {
-            llm_steps
-        };
-
-        Some(Procedure {
-            id: proc.id,
-            name,
-            trigger_pattern,
-            steps: final_steps,
-            success_count: proc.success_count,
-            failure_count: proc.failure_count,
-            avg_duration_secs: proc.avg_duration_secs,
-            last_used_at: proc.last_used_at,
-            created_at: proc.created_at,
-            updated_at: proc.updated_at,
-        })
+        aidaemon_memory::trajectory::ProcedureEnhancer::new(provider, model)
+            .enhance(&procedure, task_description)
+            .await
+            .unwrap_or(procedure)
     }
 
     /// Generate and store a trigger embedding for a procedure.
@@ -1136,64 +707,6 @@ impl Consolidator {
 
         Ok(())
     }
-
-    async fn save_episode(&self, episode: &Episode) -> anyhow::Result<()> {
-        let topics_json = episode
-            .topics
-            .as_ref()
-            .map(|t| serde_json::to_string(t).unwrap_or_default());
-
-        let bounds = sqlx::query(
-            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
-             FROM events WHERE session_id = ?
-               AND event_type IN ('user_message','assistant_response')
-               AND created_at >= ? AND created_at <= ?",
-        )
-        .bind(&episode.session_id)
-        .bind(episode.start_time.to_rfc3339())
-        .bind(episode.end_time.to_rfc3339())
-        .fetch_optional(&self.pool)
-        .await?;
-        let start_event_id = bounds
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("start_event_id").ok())
-            .flatten();
-        let end_event_id = bounds
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
-            .flatten();
-        let channel_id = episode
-            .channel_id
-            .clone()
-            .or_else(|| crate::memory::derive_channel_id_from_session(&episode.session_id));
-
-        sqlx::query(
-            r#"
-            INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome,
-                                  importance, recall_count, message_count, start_time, end_time,
-                                  created_at, channel_id, start_event_id, end_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&episode.session_id)
-        .bind(&episode.summary)
-        .bind(&topics_json)
-        .bind(&episode.emotional_tone)
-        .bind(&episode.outcome)
-        .bind(episode.importance)
-        .bind(episode.recall_count)
-        .bind(episode.message_count)
-        .bind(episode.start_time.to_rfc3339())
-        .bind(episode.end_time.to_rfc3339())
-        .bind(episode.created_at.to_rfc3339())
-        .bind(channel_id)
-        .bind(start_event_id)
-        .bind(end_event_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
 }
 
 /// Consolidates old event sessions so the configured retention manager can
@@ -1273,16 +786,6 @@ fn truncate(s: &str, max_len: usize) -> String {
             .unwrap_or(0);
         format!("{}...", &s[..safe_end])
     }
-}
-
-fn calculate_importance(messages: usize, tasks: usize, errors: usize) -> f32 {
-    // Simple importance heuristic
-    let base = 0.3;
-    let message_factor = (messages as f32 * 0.05).min(0.3);
-    let task_factor = (tasks as f32 * 0.1).min(0.3);
-    let error_factor = (errors as f32 * 0.05).min(0.1);
-
-    (base + message_factor + task_factor + error_factor).min(1.0)
 }
 
 fn next_successful_tool_after(task_events: &[&Event], start_idx: usize) -> Option<String> {
@@ -1653,6 +1156,74 @@ fn failure_pattern_confidence(
     (base + outcome_bonus + recovery_bonus).clamp(0.1, 0.96)
 }
 
+/// This session's events as the SDK memory crate's task trace. Error
+/// messages lose the daemon's own scaffolding lines (untrusted-data
+/// envelopes, truncation notices), which would otherwise make unrelated
+/// errors share a pattern.
+fn trace_events(events: &[Event]) -> Vec<aidaemon_memory::trajectory::TraceEvent> {
+    use aidaemon_memory::trajectory::{TaskEnding, TraceEvent};
+    events
+        .iter()
+        .filter_map(|event| match event.event_type {
+            EventType::TaskStart => {
+                let data = event.parse_data::<TaskStartData>().ok()?;
+                Some(TraceEvent::TaskStarted {
+                    task_id: event.task_id.clone().unwrap_or(data.task_id),
+                    description: data.description,
+                })
+            }
+            EventType::ToolCall => {
+                let data = event.parse_data::<ToolCallData>().ok()?;
+                Some(TraceEvent::ToolCalled {
+                    task_id: event.task_id.clone(),
+                    name: data.name,
+                    summary: data.summary,
+                })
+            }
+            EventType::ToolResult => {
+                let data = event.parse_data::<ToolResultData>().ok()?;
+                Some(TraceEvent::ToolReturned {
+                    task_id: event.task_id.clone(),
+                    succeeded: data.succeeded(),
+                    name: data.name,
+                    result: data.result,
+                })
+            }
+            EventType::Error => {
+                let data = event.parse_data::<ErrorData>().ok()?;
+                let message = data
+                    .message
+                    .lines()
+                    .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(TraceEvent::Failed {
+                    task_id: event.task_id.clone(),
+                    message,
+                    tool: data.tool_name,
+                })
+            }
+            EventType::TaskEnd => {
+                let data = event.parse_data::<TaskEndData>().ok()?;
+                let task_id = event
+                    .task_id
+                    .clone()
+                    .or_else(|| (!data.task_id.is_empty()).then(|| data.task_id.clone()))?;
+                Some(TraceEvent::TaskEnded {
+                    task_id,
+                    outcome: match data.effective_outcome() {
+                        TaskOutcome::Succeeded => TaskEnding::Succeeded,
+                        TaskOutcome::Partial => TaskEnding::Partial,
+                        TaskOutcome::Failed => TaskEnding::Failed,
+                    },
+                    duration_secs: data.duration_secs as f64,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1684,21 +1255,6 @@ mod tests {
     }
 
     // ── calculate_importance tests ──
-
-    #[test]
-    fn test_calculate_importance_base() {
-        let result = calculate_importance(0, 0, 0);
-        assert!((result - 0.3).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_calculate_importance_capped() {
-        // Very high values: messages=100 (factor 5.0 capped to 0.3),
-        // tasks=100 (factor 10.0 capped to 0.3), errors=100 (factor 5.0 capped to 0.1)
-        // total = 0.3 + 0.3 + 0.3 + 0.1 = 1.0, capped at 1.0
-        let result = calculate_importance(100, 100, 100);
-        assert!((result - 1.0).abs() < f32::EPSILON);
-    }
 
     async fn setup_consolidator_test() -> (
         Arc<SqliteStateStore>,
