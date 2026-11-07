@@ -1382,6 +1382,11 @@ mod tests {
             )),
             MandateAuthorityDenial::ToolNotAllowed
         );
+        // Real MCP tools are named `{server}__{tool}`, with no `mcp__` prefix.
+        assert_eq!(
+            denial(decide(&mandate, &cycle, "x__post", args, &semantics)),
+            MandateAuthorityDenial::ToolNotAllowed
+        );
     }
 
     #[test]

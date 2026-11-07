@@ -119,6 +119,10 @@ pub struct ToolDispatchFacts {
     /// The tool is the executor's requirement checklist: the status line
     /// shows the checklist, and its items become ledger expectations.
     pub requirement_checklist: bool,
+    /// The call runs inside a process the daemon cannot see into (an MCP
+    /// server), so its downstream effects escape per-action scoping and
+    /// accounting. A mandate never delegates such a tool.
+    pub opaque_execution: bool,
 }
 
 /// The consecutive-call allowance of a tool (see

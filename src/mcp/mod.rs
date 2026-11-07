@@ -146,6 +146,14 @@ impl crate::traits::ToolSemantics for McpTool {
         self.capabilities
     }
 
+    /// The server is an opaque process: a mandate never delegates its tools.
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            opaque_execution: true,
+            ..Default::default()
+        }
+    }
+
     fn output_trust(
         &self,
         _arguments: &str,
@@ -275,6 +283,21 @@ mod annotation_tests {
             Arc::new(McpClient::idle_for_test()),
             mcp_tool_capabilities(),
         )
+    }
+
+    /// A mandate never delegates an MCP tool, whatever the server and tool
+    /// are called: the tool declares opaque execution.
+    #[test]
+    fn mcp_tools_are_never_delegated_to_a_mandate() {
+        let tool = McpTool::with_prefix(
+            "post".to_string(),
+            "x__post".to_string(),
+            serde_json::json!({"name": "x__post", "description": "", "parameters": {}}),
+            Arc::new(McpClient::idle_for_test()),
+            mcp_tool_capabilities(),
+        );
+        assert!(crate::mandates::is_non_delegable(&tool));
+        assert!(!crate::mandates::is_non_delegable_tool("x__post"));
     }
 
     fn hook_ctx(untrusted_seen: bool) -> aidaemon_core::HookContext<'static> {

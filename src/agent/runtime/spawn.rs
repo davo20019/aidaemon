@@ -606,11 +606,11 @@ impl Agent {
                 matches!(
                     tool.name(),
                     "manage_mandates" | "spawn_agent" | "report_blocker"
-                ) || (!crate::mandates::is_non_delegable_tool(tool.name())
+                ) || (!crate::mandates::is_non_delegable(tool.as_ref())
                     && mandate.authority.allows_tool(tool.name()))
             });
             for tool in full_tools {
-                if !crate::mandates::is_non_delegable_tool(tool.name())
+                if !crate::mandates::is_non_delegable(tool.as_ref())
                     && mandate.authority.allows_tool(tool.name())
                     && !tools
                         .iter()
@@ -775,7 +775,7 @@ impl Agent {
             full_tools
                 .iter()
                 .filter(|tool| {
-                    !crate::mandates::is_non_delegable_tool(tool.name())
+                    !crate::mandates::is_non_delegable(tool.as_ref())
                         && mandate.authority.allows_tool(tool.name())
                 })
                 .cloned()
@@ -1802,7 +1802,7 @@ impl Agent {
                         has_cli_agent && !is_scheduled_goal && mandate.is_none();
                     if let Some(mandate) = mandate.as_ref() {
                         tools.retain(|tool| {
-                            !crate::mandates::is_non_delegable_tool(tool.name())
+                            !crate::mandates::is_non_delegable(tool.as_ref())
                                 && mandate.authority.allows_tool(tool.name())
                         });
                     }

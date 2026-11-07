@@ -18,8 +18,17 @@ pub const MANDATE_PROTOCOL_TOOLS: &[&str] = &[
     "report_blocker",
 ];
 
+/// Whether the tool named `tool_name` is on the list a mandate never
+/// delegates. Where the tool itself is at hand, use [`is_non_delegable`],
+/// which also covers tools that declare opaque execution (MCP servers).
 pub(crate) fn is_non_delegable_tool(tool_name: &str) -> bool {
-    tool_name.starts_with("mcp__") || MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
+    MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
+}
+
+/// Whether a mandate may never delegate `tool`: a listed tool, or one whose
+/// calls run inside an opaque process (`ToolDispatchFacts::opaque_execution`).
+pub(crate) fn is_non_delegable(tool: &dyn crate::traits::Tool) -> bool {
+    tool.dispatch_facts().opaque_execution || is_non_delegable_tool(tool.name())
 }
 
 /// Extract only explicit owner guidance from a controller goal's otherwise

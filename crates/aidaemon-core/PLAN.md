@@ -339,9 +339,12 @@ Order:
            and port the hints-never-loosen test.
         4. `McpRegistry` holds crate servers.
         5. Delete the daemon client and the dead paths.
-        Separate fixes: `restart` and `enable` respawn a stored command with
-        no approval card; `is_non_delegable_tool` checks an `mcp__` prefix
-        no real name has.
+        Steps 1-2 were skipped: the daemon keeps its own tool wrapper and
+        rendering, and only the transport moved (done: `McpClient` wraps
+        `aidaemon_mcp::McpServer`; the dead retry path is deleted).
+        Separate fixes, done: `restart` and `enable` ask the owner before
+        respawning a stored command; `is_non_delegable_tool` no longer
+        relies on an `mcp__` prefix no real name has.
       - Channels map (2026-11-07). The daemon uses teloxide, serenity and
         hand-written Slack code, and does not depend on the channel crates.
         Use the crate adapters for transport only, not `ChannelRunner`: the
@@ -384,8 +387,10 @@ Independent of the SDK; each is a small PR against `master`.
       off-by-default `execution-docker` feature).
 - [ ] `PlanRecovery::recover_interrupted_plans` (`src/plans/recovery.rs:39`)
       is only called from tests.
-- [ ] `is_non_delegable_tool` (`src/mandates/mod.rs:11`) checks an `mcp__`
-      prefix, but MCP tools are named `{server}__{tool}`. Add a test.
+- [x] `is_non_delegable_tool` checked an `mcp__` prefix, but MCP tools are
+      named `{server}__{tool}`. Fixed with a typed
+      `ToolDispatchFacts::opaque_execution` that MCP tools declare;
+      `mandates::is_non_delegable(tool)` reads it.
 - [ ] State migrations have no version table.
 
 ## Known issues
