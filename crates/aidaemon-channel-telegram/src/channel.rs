@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use aidaemon_channels::{
-    ApprovalAnswer, ApprovalPrompt, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
-    Conversation, MessageRef, OutboundMessage,
+    ApprovalAnswer, ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError,
+    ChannelEvent, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
 };
 
 use crate::api::{ApiError, BotApi, InlineKeyboardButton, SentMessage, Update, User};
@@ -26,6 +26,12 @@ pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
 const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Uploads and downloads carry whole files.
+const FILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest caption Telegram accepts on a file.
+const CAPTION_MAX_LEN: usize = 1024;
+/// Largest file the hosted Bot API lets a bot download.
+pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Longest `retry_after` that `send` waits out by itself before surfacing
 /// [`ChannelError::RateLimited`].
 const MAX_SEND_RETRY_WAIT: Duration = Duration::from_secs(10);
@@ -379,9 +385,9 @@ impl Channel for TelegramChannel {
             buttons: true,
             typing_indicator: true,
             threads: true,
-            delete_messages: false,
-            files: false,
-            commands: false,
+            delete_messages: true,
+            files: true,
+            commands: true,
             max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
         }
     }
@@ -534,6 +540,110 @@ impl Channel for TelegramChannel {
             body["message_thread_id"] = json!(thread);
         }
         self.call::<Value>("sendChatAction", &body)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        let (chat_id, _) = parse_conversation_id(&message.conversation_id).ok_or_else(|| {
+            ChannelError::Other(format!(
+                "invalid telegram conversation id: {}",
+                message.conversation_id
+            ))
+        })?;
+        let message_id: i64 = message.message_id.parse().map_err(|_| {
+            ChannelError::Other(format!(
+                "invalid telegram message id: {}",
+                message.message_id
+            ))
+        })?;
+        self.call_with_retry::<Value>(
+            "deleteMessage",
+            &json!({ "chat_id": chat_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
+    }
+
+    /// Sent as a document, so the file arrives as it is (no recompression).
+    async fn send_file(
+        &self,
+        conversation: &Conversation,
+        file: &OutboundFile,
+    ) -> Result<MessageRef, ChannelError> {
+        let (chat_id, thread_id) = parse_conversation_id(&conversation.id).ok_or_else(|| {
+            ChannelError::Other(format!(
+                "invalid telegram conversation id: {}",
+                conversation.id
+            ))
+        })?;
+        let mut part =
+            reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.name.clone());
+        if let Some(mime) = file.mime_type.as_deref() {
+            part = part
+                .mime_str(mime)
+                .map_err(|e| ChannelError::Other(format!("invalid mime type {mime}: {e}")))?;
+        }
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", part);
+        if let Some(thread) = thread_id {
+            form = form.text("message_thread_id", thread.to_string());
+        }
+        if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+            // Plain text: an HTML caption cut at the limit could break a tag.
+            let plain = html_to_plain(&markdown_to_html(caption));
+            let caption: String = plain.chars().take(CAPTION_MAX_LEN).collect();
+            form = form.text("caption", caption);
+        }
+        let sent: SentMessage = self
+            .api()
+            .call_multipart("sendDocument", form, FILE_TIMEOUT)
+            .await?;
+        Ok(MessageRef {
+            conversation_id: conversation.id.clone(),
+            message_id: sent.message_id.to_string(),
+        })
+    }
+
+    /// `source` is a Telegram file id: resolved with `getFile`, then
+    /// fetched from the file endpoint.
+    async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+        if attachment
+            .size_bytes
+            .is_some_and(|size| size > MAX_DOWNLOAD_BYTES)
+        {
+            return Err(ChannelError::Other(format!(
+                "telegram bots cannot download files over {MAX_DOWNLOAD_BYTES} bytes"
+            )));
+        }
+        let file: Value = self
+            .call_with_retry("getFile", &json!({ "file_id": attachment.source }))
+            .await?;
+        let path = file
+            .get("file_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ChannelError::Other("telegram getFile: no file_path".into()))?;
+        self.api()
+            .download(path, FILE_TIMEOUT)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The bot's `/` menu (`setMyCommands`).
+    async fn register_commands(&self, commands: &[CommandSpec]) -> Result<(), ChannelError> {
+        let commands: Vec<Value> = commands
+            .iter()
+            .map(|command| {
+                json!({
+                    "command": command.name,
+                    "description": command.description.chars().take(256).collect::<String>(),
+                })
+            })
+            .collect();
+        self.call_with_retry::<Value>("setMyCommands", &json!({ "commands": commands }))
             .await
             .map(|_| ())
             .map_err(Into::into)

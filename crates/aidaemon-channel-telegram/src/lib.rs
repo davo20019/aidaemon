@@ -20,4 +20,4 @@ pub mod format;
 mod mapping;
 
 pub use callback::MAX_CALLBACK_DATA;
-pub use channel::{TelegramChannel, TELEGRAM_MAX_MESSAGE_LEN};
+pub use channel::{TelegramChannel, MAX_DOWNLOAD_BYTES, TELEGRAM_MAX_MESSAGE_LEN};

@@ -29,6 +29,8 @@ const GROUP_CHAT: i64 = -1000000000001;
 struct Call {
     method: String,
     body: Value,
+    /// The body as sent (multipart uploads are not JSON).
+    raw: String,
     at: Instant,
 }
 
@@ -79,8 +81,22 @@ impl Mock {
     }
 }
 
-async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl IntoResponse {
+async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> axum::response::Response {
     let path = uri.path();
+    // The file endpoint `getFile` paths are fetched from.
+    if let Some(file) = path.strip_prefix(&format!("/file/bot{TOKEN}/")) {
+        mock.calls.lock().unwrap().push(Call {
+            method: format!("file:{file}"),
+            body: Value::Null,
+            raw: String::new(),
+            at: Instant::now(),
+        });
+        return (StatusCode::OK, "synthetic file bytes").into_response();
+    }
+    json_handler(mock, path, body).await.into_response()
+}
+
+async fn json_handler(mock: Arc<Mock>, path: &str, body: Bytes) -> impl IntoResponse {
     let prefix = format!("/bot{TOKEN}/");
     let Some(method) = path.strip_prefix(&prefix) else {
         return (
@@ -88,10 +104,12 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl I
             Json(json!({ "ok": false, "error_code": 404, "description": "Not Found" })),
         );
     };
+    let raw = String::from_utf8_lossy(&body).into_owned();
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     mock.calls.lock().unwrap().push(Call {
         method: method.to_string(),
         body,
+        raw,
         at: Instant::now(),
     });
     let scripted = mock
@@ -112,9 +130,10 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl I
             tokio::time::sleep(Duration::from_millis(50)).await;
             json!([])
         }
-        "sendMessage" => {
+        "sendMessage" | "sendDocument" => {
             json!({ "message_id": 5000 + mock.next_message_id.fetch_add(1, Ordering::SeqCst) })
         }
+        "getFile" => json!({ "file_id": "synthetic-file", "file_path": "documents/notes.txt" }),
         _ => json!(true),
     };
     (
@@ -819,4 +838,102 @@ async fn typing_sends_chat_action() {
     assert_eq!(caps.max_message_len, 4096);
     assert_eq!(ch.name(), "telegram");
     assert_eq!(channel(&base).with_name("support").name(), "support");
+}
+
+#[tokio::test]
+async fn delete_removes_the_message() {
+    let (mock, base) = start_mock().await;
+    channel(&base)
+        .delete(&MessageRef {
+            conversation_id: DM_CHAT.to_string(),
+            message_id: "5001".to_string(),
+        })
+        .await
+        .unwrap();
+    let calls = mock.calls("deleteMessage");
+    assert_eq!(
+        calls[0].body,
+        json!({ "chat_id": DM_CHAT, "message_id": 5001 })
+    );
+}
+
+#[tokio::test]
+async fn send_file_uploads_a_document_with_a_plain_caption() {
+    let (mock, base) = start_mock().await;
+    let conversation = Conversation {
+        id: DM_CHAT.to_string(),
+        kind: ConversationKind::Direct,
+    };
+    let sent = channel(&base)
+        .send_file(
+            &conversation,
+            &aidaemon_channels::OutboundFile {
+                name: "report.txt".to_string(),
+                bytes: b"synthetic report for Acme Corp".to_vec(),
+                mime_type: Some("text/plain".to_string()),
+                caption: Some("The **weekly** report".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.conversation_id, DM_CHAT.to_string());
+    let calls = mock.calls("sendDocument");
+    assert_eq!(calls.len(), 1);
+    let raw = &calls[0].raw;
+    assert!(raw.contains("filename=\"report.txt\""), "{raw}");
+    assert!(raw.contains("synthetic report for Acme Corp"));
+    assert!(
+        raw.contains("The weekly report"),
+        "the caption is plain text: {raw}"
+    );
+    assert!(raw.contains(&DM_CHAT.to_string()));
+}
+
+#[tokio::test]
+async fn download_resolves_the_file_id_then_fetches_it() {
+    let (mock, base) = start_mock().await;
+    let bytes = channel(&base)
+        .download(&aidaemon_channels::Attachment {
+            name: "notes.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            size_bytes: Some(20),
+            source: "synthetic-file".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"synthetic file bytes");
+    assert_eq!(
+        mock.calls("getFile")[0].body,
+        json!({ "file_id": "synthetic-file" })
+    );
+    assert_eq!(mock.calls("file:documents/notes.txt").len(), 1);
+
+    // Over the Bot API's download limit: refused without a call.
+    let err = channel(&base)
+        .download(&aidaemon_channels::Attachment {
+            name: "big.bin".to_string(),
+            mime_type: None,
+            size_bytes: Some(aidaemon_channel_telegram::MAX_DOWNLOAD_BYTES + 1),
+            source: "synthetic-big".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)));
+    assert_eq!(mock.calls("getFile").len(), 1);
+}
+
+#[tokio::test]
+async fn register_commands_sets_the_bot_menu() {
+    let (mock, base) = start_mock().await;
+    channel(&base)
+        .register_commands(&[aidaemon_channels::CommandSpec {
+            name: "status".to_string(),
+            description: "Show what the agent is doing".to_string(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.calls("setMyCommands")[0].body,
+        json!({ "commands": [{ "command": "status", "description": "Show what the agent is doing" }] })
+    );
 }

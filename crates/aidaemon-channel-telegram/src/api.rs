@@ -103,13 +103,17 @@ struct ResponseParameters {
 pub(crate) struct BotApi {
     client: reqwest::Client,
     base: String,
+    /// Where `getFile` paths are downloaded from (holds the token).
+    file_base: String,
 }
 
 impl BotApi {
     pub(crate) fn new(client: reqwest::Client, api_base: &str, token: &str) -> Self {
+        let api_base = api_base.trim_end_matches('/');
         Self {
             client,
-            base: format!("{}/bot{}", api_base.trim_end_matches('/'), token),
+            base: format!("{api_base}/bot{token}"),
+            file_base: format!("{api_base}/file/bot{token}"),
         }
     }
 
@@ -120,11 +124,55 @@ impl BotApi {
         timeout: Duration,
     ) -> Result<T, ApiError> {
         let url = format!("{}/{}", self.base, method);
+        let request = self.client.post(&url).json(body).timeout(timeout);
+        self.finish(request).await
+    }
+
+    /// A call with a `multipart/form-data` body (file uploads).
+    pub(crate) async fn call_multipart<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        form: reqwest::multipart::Form,
+        timeout: Duration,
+    ) -> Result<T, ApiError> {
+        let url = format!("{}/{}", self.base, method);
+        let request = self.client.post(&url).multipart(form).timeout(timeout);
+        self.finish(request).await
+    }
+
+    /// Download a file by the `file_path` that `getFile` returned.
+    pub(crate) async fn download(
+        &self,
+        file_path: &str,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ApiError> {
+        let url = format!("{}/{}", self.file_base, file_path.trim_start_matches('/'));
         let resp = self
             .client
-            .post(&url)
-            .json(body)
+            .get(&url)
             .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| ApiError::Transport(redact(&e.without_url().to_string())))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ApiError::Api {
+                code: status.as_u16(),
+                description: "file download failed".to_string(),
+                retry_after: None,
+            });
+        }
+        resp.bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| ApiError::Transport(redact(&e.without_url().to_string())))
+    }
+
+    async fn finish<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, ApiError> {
+        let resp = request
             .send()
             .await
             .map_err(|e| ApiError::Transport(redact(&e.without_url().to_string())))?;
