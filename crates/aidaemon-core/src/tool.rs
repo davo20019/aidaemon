@@ -511,6 +511,21 @@ where
     }
 }
 
+/// The consecutive-call allowance of a tool: how long a run may call it in a
+/// row before the same-tool guard treats the streak as a loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SameToolStreak {
+    /// The default allowance.
+    #[default]
+    Standard,
+    /// A versatile or research tool whose calls naturally repeat (reading
+    /// files, searching, running commands): a longer allowance.
+    Versatile,
+    /// A step-wise tool driven one small action at a time (computer use):
+    /// the longest allowance, and no exemption for distinct arguments.
+    Stepwise,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

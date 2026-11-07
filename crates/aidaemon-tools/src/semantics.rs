@@ -122,19 +122,9 @@ pub struct ToolDispatchFacts {
 }
 
 /// The consecutive-call allowance of a tool (see
-/// [`ToolDispatchFacts::same_tool_streak`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SameToolStreak {
-    /// The default allowance.
-    #[default]
-    Standard,
-    /// A versatile or research tool whose calls naturally repeat (reading
-    /// files, searching, running commands): a longer allowance.
-    Versatile,
-    /// A step-wise tool driven one small action at a time (computer use):
-    /// the longest allowance, and no exemption for distinct arguments.
-    Stepwise,
-}
+/// [`ToolDispatchFacts::same_tool_streak`]). Defined in the kernel so the
+/// same-tool guard can take it without a dependency on the tools crate.
+pub use aidaemon_core::SameToolStreak;
 
 /// Safety and execution metadata for policy-driven tool selection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

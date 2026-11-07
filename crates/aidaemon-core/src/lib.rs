@@ -69,8 +69,8 @@ pub use state::{
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
-    AccessManifest, Extensions, Finish, FnTool, SourceTrust, Tool, ToolAnnotations, ToolContext,
-    ToolError, ToolInfo, ToolOutput, ToolResult,
+    AccessManifest, Extensions, Finish, FnTool, SameToolStreak, SourceTrust, Tool, ToolAnnotations,
+    ToolContext, ToolError, ToolInfo, ToolOutput, ToolResult,
 };
 
 pub use untrusted::{

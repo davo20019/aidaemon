@@ -257,6 +257,10 @@ impl aidaemon_core::Safeguard
 pub const aidaemon_core::Safeguard::REQUIRED: [aidaemon_core::Safeguard; 5]
 impl core::fmt::Display for aidaemon_core::Safeguard
 pub fn aidaemon_core::Safeguard::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum aidaemon_core::SameToolStreak
+pub aidaemon_core::SameToolStreak::Standard
+pub aidaemon_core::SameToolStreak::Stepwise
+pub aidaemon_core::SameToolStreak::Versatile
 pub enum aidaemon_core::SourceTrust
 pub aidaemon_core::SourceTrust::Trusted
 pub aidaemon_core::SourceTrust::Untrusted

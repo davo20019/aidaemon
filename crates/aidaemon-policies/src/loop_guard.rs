@@ -7,26 +7,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aidaemon_core::{Hook, HookContext, ToolCall, ToolDecision, ToolInfo};
+use aidaemon_core::{Hook, HookContext, SameToolStreak, ToolCall, ToolDecision, ToolInfo};
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
-/// How many consecutive calls a tool may make before the guard looks at
-/// whether the run is making progress.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StreakAllowance {
-    /// The default allowance: [`StreakLimits::base`].
-    #[default]
-    Default,
-    /// A tool whose consecutive calls usually vary: [`StreakLimits::versatile`].
-    Versatile,
-    /// A tool driven one step at a time: [`StreakLimits::stepwise`], and the
-    /// read-only exemption does not apply.
-    Stepwise,
-}
-
-/// The numbers behind each [`StreakAllowance`].
+/// The numbers behind each [`SameToolStreak`] allowance: `Standard` uses
+/// `base`, `Versatile` uses `versatile`, and `Stepwise` uses `stepwise` (with
+/// no read-only exemption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreakLimits {
     pub base: usize,
@@ -56,7 +44,7 @@ pub fn same_tool_loop(
     tool: &str,
     arguments: &Value,
     read_only: bool,
-    allowance: StreakAllowance,
+    allowance: SameToolStreak,
     limits: StreakLimits,
 ) -> bool {
     let mut streak: Vec<&Value> = previous
@@ -67,11 +55,11 @@ pub fn same_tool_loop(
         .collect();
     streak.push(arguments);
     let total = streak.len();
-    let stepwise = allowance == StreakAllowance::Stepwise;
+    let stepwise = allowance == SameToolStreak::Stepwise;
     let limit = match allowance {
-        StreakAllowance::Stepwise => limits.stepwise,
-        StreakAllowance::Versatile => limits.versatile,
-        StreakAllowance::Default => limits.base,
+        SameToolStreak::Stepwise => limits.stepwise,
+        SameToolStreak::Versatile => limits.versatile,
+        SameToolStreak::Standard => limits.base,
     };
     if total < limit {
         return false;
@@ -100,8 +88,8 @@ pub fn same_tool_loop(
 pub struct SameToolStreakGuard {
     /// Tools that are read-only for every call.
     pub read_only_tools: HashSet<String>,
-    /// Each tool's allowance. A tool not listed gets [`StreakAllowance::Default`].
-    pub allowances: HashMap<String, StreakAllowance>,
+    /// Each tool's allowance. A tool not listed gets [`SameToolStreak::Standard`].
+    pub allowances: HashMap<String, SameToolStreak>,
     pub limits: StreakLimits,
 }
 
@@ -162,7 +150,7 @@ mod tests {
             "t",
             &same,
             false,
-            StreakAllowance::Default,
+            SameToolStreak::Standard,
             limits
         ));
         assert!(!same_tool_loop(
@@ -170,7 +158,7 @@ mod tests {
             "t",
             &same,
             false,
-            StreakAllowance::Default,
+            SameToolStreak::Standard,
             limits
         ));
     }
@@ -185,7 +173,7 @@ mod tests {
             "read",
             &next,
             true,
-            StreakAllowance::Default,
+            SameToolStreak::Standard,
             limits
         ));
     }
@@ -200,7 +188,7 @@ mod tests {
             "step",
             &next,
             true,
-            StreakAllowance::Stepwise,
+            SameToolStreak::Stepwise,
             limits
         ));
     }
@@ -215,7 +203,7 @@ mod tests {
             "a",
             &json!({}),
             false,
-            StreakAllowance::Default,
+            SameToolStreak::Standard,
             limits
         ));
     }

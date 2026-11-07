@@ -1088,9 +1088,10 @@ impl Agent {
             });
         let hooks = TurnHooks {
             authority: authority_hook,
-            same_tool: SameToolLimit {
+            same_tool: aidaemon_policies::SameToolStreakGuard {
                 read_only_tools: read_only_tool_names(self.tools.iter()),
-                streaks: same_tool_streaks(self.tools.iter()),
+                allowances: same_tool_streaks(self.tools.iter()),
+                limits: SAME_TOOL_LIMITS,
             },
             ledger: LedgerStop {
                 calls: calls_tx.clone(),

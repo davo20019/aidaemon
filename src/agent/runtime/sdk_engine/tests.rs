@@ -1257,9 +1257,10 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
         access: Default::default(),
         effects: sdk::CallEffects::unknown(),
     };
-    let hook = SameToolLimit {
+    let hook = aidaemon_policies::SameToolStreakGuard {
         read_only_tools: Default::default(),
-        streaks: Default::default(),
+        allowances: Default::default(),
+        limits: SAME_TOOL_LIMITS,
     };
     match hook.before_tool(&ctx, &call, &info).await {
         sdk::ToolDecision::Deny { reason } => {
@@ -1276,6 +1277,24 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
         hook.before_tool(&ctx, &call, &info).await,
         sdk::ToolDecision::Allow
     );
+}
+
+/// The daemon's same-tool rule with its production limits.
+fn same_tool_loop(
+    previous: &[(String, serde_json::Value)],
+    tool: &str,
+    arguments: &serde_json::Value,
+    read_only: bool,
+    allowance: crate::traits::SameToolStreak,
+) -> bool {
+    aidaemon_policies::same_tool_loop(
+        previous,
+        tool,
+        arguments,
+        read_only,
+        allowance,
+        SAME_TOOL_LIMITS,
+    )
 }
 
 #[test]
@@ -3705,9 +3724,10 @@ fn hook_order_is_pinned() {
     let (calls, _rx) = mpsc::channel(1);
     let hooks = TurnHooks {
         authority: sdk::AuthorityHook::new(sdk::Authority::full()),
-        same_tool: SameToolLimit {
+        same_tool: aidaemon_policies::SameToolStreakGuard {
             read_only_tools: HashSet::new(),
-            streaks: Default::default(),
+            allowances: Default::default(),
+            limits: SAME_TOOL_LIMITS,
         },
         ledger: LedgerStop { calls },
         memory: vec![Arc::new(NoopMemoryHook)],

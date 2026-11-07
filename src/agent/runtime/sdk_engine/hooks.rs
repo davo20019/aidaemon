@@ -40,49 +40,16 @@ impl sdk::Hook for LedgerStop {
     }
 }
 
-/// Whether `tool` with `arguments`, after the run's earlier `previous` calls,
-/// continues a same-tool loop: 8 consecutive calls
-/// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for a tool whose `streak` is
-/// `Versatile` (versatile and research tools), 40 for a `Stepwise` one
-/// (computer use); diverse arguments get the higher limit as a bonus, not a
-/// bypass.
-/// `read_only` is the tool's typed annotation: a read-only streak in which
-/// every call has different arguments (paging through files, distinct
-/// lookups) observes something new each time, so it is progress, not a
-/// loop; budgets, the turn cap and the stuck detector bound it.
-pub(super) fn same_tool_loop(
-    previous: &[(String, Value)],
-    tool: &str,
-    arguments: &Value,
-    read_only: bool,
-    allowance: crate::traits::SameToolStreak,
-) -> bool {
-    use aidaemon_policies::{same_tool_loop as loop_rule, StreakAllowance, StreakLimits};
-    let allowance = match allowance {
-        crate::traits::SameToolStreak::Standard => StreakAllowance::Default,
-        crate::traits::SameToolStreak::Versatile => StreakAllowance::Versatile,
-        crate::traits::SameToolStreak::Stepwise => StreakAllowance::Stepwise,
-    };
-    let limits = StreakLimits {
+/// The same-tool guard's limits: 8 consecutive calls
+/// (`MAX_CONSECUTIVE_SAME_TOOL`), 16 for a `Versatile` tool, and 40 for a
+/// `Stepwise` one (computer use). The rule itself is
+/// `aidaemon_policies::SameToolStreakGuard`.
+pub(super) const SAME_TOOL_LIMITS: aidaemon_policies::StreakLimits =
+    aidaemon_policies::StreakLimits {
         base: crate::agent::MAX_CONSECUTIVE_SAME_TOOL,
         versatile: crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8,
         stepwise: 40,
     };
-    loop_rule(previous, tool, arguments, read_only, allowance, limits)
-}
-
-/// The consecutive-same-tool guard. A hook cannot end the
-/// run, so the looping call is refused with a redirect; if the model keeps
-/// at it, the kernel's stuck detector ends the run.
-///
-/// The distinct-arguments exemption is judged by the tool's worst case
-/// (`capabilities().read_only`), not the per-call annotation: a mixed tool
-/// such as `terminal` types most calls read-only, and must stay limited.
-pub(super) struct SameToolLimit {
-    pub(super) read_only_tools: std::collections::HashSet<String>,
-    /// Each tool's consecutive-call allowance, from its dispatch facts.
-    pub(super) streaks: std::collections::HashMap<String, crate::traits::SameToolStreak>,
-}
 
 /// Each tool's consecutive-call allowance (`dispatch_facts().same_tool_streak`).
 pub(super) fn same_tool_streaks<'a>(
@@ -99,7 +66,10 @@ pub(super) fn same_tool_streaks<'a>(
         .collect()
 }
 
-/// Names of the tools that are read-only for every call.
+/// Names of the tools that are read-only for every call. The same-tool
+/// guard's distinct-arguments exemption is judged by the tool's worst case
+/// (`capabilities().read_only`), not the per-call annotation: a mixed tool
+/// such as `terminal` types most calls read-only, and must stay limited.
 pub(super) fn read_only_tool_names<'a>(
     tools: impl IntoIterator<Item = &'a Arc<dyn crate::traits::Tool>>,
 ) -> std::collections::HashSet<String> {
@@ -108,39 +78,6 @@ pub(super) fn read_only_tool_names<'a>(
         .filter(|tool| tool.capabilities().read_only)
         .map(|tool| tool.name().to_string())
         .collect()
-}
-
-#[async_trait]
-impl sdk::Hook for SameToolLimit {
-    async fn before_tool(
-        &self,
-        ctx: &sdk::HookContext<'_>,
-        call: &sdk::ToolCall,
-        _tool: &sdk::ToolInfo,
-    ) -> sdk::ToolDecision {
-        let previous: Vec<(String, Value)> = ctx
-            .run_receipts()
-            .map(|receipt| (receipt.tool.clone(), receipt.arguments.clone()))
-            .collect();
-        if !same_tool_loop(
-            &previous,
-            &call.name,
-            &call.arguments,
-            self.read_only_tools.contains(&call.name),
-            self.streaks.get(&call.name).copied().unwrap_or_default(),
-        ) {
-            return sdk::ToolDecision::Allow;
-        }
-        warn!(tool = %call.name, "SDK engine: same tool called too many consecutive times");
-        sdk::ToolDecision::Deny {
-            reason: format!(
-                "[LOOP DETECTED] `{}` has been called too many times in a row without \
-                 finishing. Stop calling it: use a different approach, or answer with what \
-                 you have and the exact limitation.",
-                call.name
-            ),
-        }
-    }
 }
 
 /// Where a hook sits in the turn's `before_tool` chain.
@@ -164,7 +101,7 @@ pub(super) enum HookSlot {
 /// before all of them.
 pub(super) struct TurnHooks {
     pub(super) authority: sdk::AuthorityHook,
-    pub(super) same_tool: SameToolLimit,
+    pub(super) same_tool: aidaemon_policies::SameToolStreakGuard,
     pub(super) ledger: LedgerStop,
     pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
     pub(super) egress: aidaemon_policies::EgressGuard,
