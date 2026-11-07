@@ -37,6 +37,7 @@ mod conversation;
 mod egress;
 mod grants;
 mod instructions;
+mod loop_guard;
 mod memory;
 mod redact;
 mod scope;
@@ -56,6 +57,7 @@ pub use conversation::{
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, ProjectInstructions};
+pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakAllowance, StreakLimits};
 pub use memory::{InMemoryRecall, MemoryInjection, Recall};
 pub use redact::{secret_patterns, Redactor};
 pub use scope::{ScopeGuard, UndeclaredAccess};

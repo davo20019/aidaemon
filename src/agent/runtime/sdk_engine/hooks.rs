@@ -57,41 +57,18 @@ pub(super) fn same_tool_loop(
     read_only: bool,
     allowance: crate::traits::SameToolStreak,
 ) -> bool {
-    let mut streak: Vec<&Value> = previous
-        .iter()
-        .rev()
-        .take_while(|(name, _)| name == tool)
-        .map(|(_, args)| args)
-        .collect();
-    streak.push(arguments);
-    let total = streak.len();
-    let stepwise = allowance == crate::traits::SameToolStreak::Stepwise;
-    let limit = if stepwise {
-        40
-    } else if allowance == crate::traits::SameToolStreak::Versatile {
-        crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8
-    } else {
-        crate::agent::MAX_CONSECUTIVE_SAME_TOOL
+    use aidaemon_policies::{same_tool_loop as loop_rule, StreakAllowance, StreakLimits};
+    let allowance = match allowance {
+        crate::traits::SameToolStreak::Standard => StreakAllowance::Default,
+        crate::traits::SameToolStreak::Versatile => StreakAllowance::Versatile,
+        crate::traits::SameToolStreak::Stepwise => StreakAllowance::Stepwise,
     };
-    if total < limit {
-        return false;
-    }
-    let mut unique: Vec<&Value> = Vec::new();
-    for args in streak {
-        if !unique.contains(&args) {
-            unique.push(args);
-        }
-    }
-    if read_only && !stepwise && unique.len() == total {
-        return false;
-    }
-    let diverse = unique.len() * 2 > total;
-    let diverse_limit = if stepwise {
-        40
-    } else {
-        crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8
+    let limits = StreakLimits {
+        base: crate::agent::MAX_CONSECUTIVE_SAME_TOOL,
+        versatile: crate::agent::MAX_CONSECUTIVE_SAME_TOOL + 8,
+        stepwise: 40,
     };
-    !diverse || total >= diverse_limit
+    loop_rule(previous, tool, arguments, read_only, allowance, limits)
 }
 
 /// The consecutive-same-tool guard. A hook cannot end the
