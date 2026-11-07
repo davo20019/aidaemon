@@ -982,7 +982,12 @@ impl Agent {
                 // shape keeps independent inline work going.
                 let mut handed_off = false;
                 if outcome.metadata.background_started || outcome.metadata.background_handoff {
+                    // A call the tool itself typed as a permanent failure hands
+                    // nothing off, whatever it started: the run goes on.
+                    let typed_failure = outcome.metadata.outcome_status
+                        == Some(crate::traits::ToolOutcomeStatus::FailedPermanent);
                     let hands_off = finish.is_some()
+                        && !typed_failure
                         && !scope.continue_inline_after_background
                         && !outcome.metadata.detached;
                     handed_off = hands_off;

@@ -445,3 +445,35 @@ async fn handoff_whose_output_reads_like_a_failure_still_ends_the_run() {
     );
     assert_eq!(harness.provider.call_count().await, 1);
 }
+
+/// Text is not the judge, the tool's type is: a handoff the tool itself
+/// typed as a permanent failure hands nothing off, and the model goes on.
+#[tokio::test]
+async fn handoff_typed_as_a_permanent_failure_does_not_end_the_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_delegate", "{}"),
+        MockProvider::text_response("The helper could not start; here is what I found."),
+    ]);
+    let delegate = MockTool::new(
+        "synthetic_delegate",
+        "Hands a fix to a helper",
+        "The helper was refused before it started.",
+    )
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
+        background_handoff: true,
+        ..ToolCallMetadata::default()
+    })
+    .with_finish(handoff());
+    let harness = root(provider, vec![Arc::new(delegate)]).await;
+    let reply = ask(
+        &harness,
+        "finish-delegate-typed-failure",
+        "Fix the synthetic build",
+    )
+    .await;
+
+    // The run did not end on the tool's finish: the model was asked again.
+    assert_ne!(reply, "The helper was refused before it started.");
+    assert!(harness.provider.call_count().await >= 2);
+}
