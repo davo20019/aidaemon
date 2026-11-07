@@ -123,7 +123,7 @@ impl sdk_policies::ConversationSource for DaemonTurns {
 /// one its thresholds are calibrated against).
 fn to_sdk_turn(turn: &FetchedTurn) -> sdk_policies::ConversationTurn {
     let messages: Vec<sdk::Message> = turn.messages.iter().map(to_sdk_message).collect();
-    let tokens = crate::memory::context_window::estimate_multimodal_message_tokens(
+    let tokens = crate::context_budget::estimate_multimodal_message_tokens(
         &turn
             .messages
             .iter()
@@ -199,7 +199,7 @@ fn compactor(
 /// Thresholds in the daemon's calibrated tokens, as the SDK's raw estimate
 /// counts them.
 fn limits(fast_model: &str, threshold: usize, recent: usize) -> sdk_policies::CompactionLimits {
-    let correction = crate::memory::context_window::token_estimate_correction(fast_model);
+    let correction = crate::context_budget::token_estimate_correction(fast_model);
     sdk_policies::CompactionLimits {
         threshold: ((threshold as f64) / correction).ceil() as usize,
         keep_tokens: ((recent as f64) / correction).ceil() as usize,

@@ -663,7 +663,7 @@ impl Agent {
     ) -> (bool, usize, usize, usize, Option<i64>) {
         (
             self.context_window_config.enabled,
-            crate::memory::context_window::model_context_budget(model, &self.context_window_config),
+            crate::context_budget::model_context_budget(model, &self.context_window_config),
             self.context_window_config
                 .summarize_token_threshold_for(model),
             self.context_window_config.summary_recent_tokens_for(model),

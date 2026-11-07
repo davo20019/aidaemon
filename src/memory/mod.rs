@@ -1,5 +1,4 @@
 pub mod binary;
-pub mod context_window;
 pub mod core_profile;
 pub mod embedding_index;
 pub mod embeddings;
@@ -10,11 +9,11 @@ pub mod math;
 pub mod neighborhood;
 pub mod people_intelligence;
 pub mod procedures;
+pub mod progressive;
 pub mod retention;
 #[cfg(test)]
 pub mod retrieval_eval;
 pub mod scoring;
-pub mod skill_promotion;
 pub mod task_learning;
 
 pub use aidaemon_memory::task_learning::{FactLifetime, FACT_LIFETIME_INSTRUCTION};

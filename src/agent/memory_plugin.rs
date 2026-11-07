@@ -300,7 +300,7 @@ impl DaemonMemory {
 impl MemoryWrites for DaemonMemoryInner {
     fn extract_facts(&self, turn: &MemoryTurn, reply: &str) {
         let snapshot = self.llm_runtime.snapshot();
-        crate::memory::context_window::spawn_progressive_extraction(
+        crate::memory::progressive::spawn_progressive_extraction(
             self.llm_runtime.clone(),
             fast_model(&snapshot, &turn.model),
             self.state.clone(),

@@ -1924,7 +1924,7 @@ async fn run_assessment_lane(
             }
             physical_attempt = physical_attempt.saturating_add(1);
             let est_input_tokens = Some(
-                crate::memory::context_window::estimate_multimodal_message_tokens(&attempt_messages)
+                crate::context_budget::estimate_multimodal_message_tokens(&attempt_messages)
                     .min(u32::MAX as usize) as u32,
             );
             if hedge_fired && !in_flight.is_empty() {
@@ -2147,8 +2147,8 @@ pub(crate) async fn generate_task_relationship_candidates(
         json!({ "role": "user", "content": prompt }),
     ];
     let est_input_tokens = Some(
-        crate::memory::context_window::estimate_multimodal_message_tokens(&messages)
-            .min(u32::MAX as usize) as u32,
+        crate::context_budget::estimate_multimodal_message_tokens(&messages).min(u32::MAX as usize)
+            as u32,
     );
     let options = crate::traits::ChatOptions {
         response_mode: typed_object_response_mode("task_relationship"),

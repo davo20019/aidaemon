@@ -196,11 +196,7 @@ impl Agent {
                 preview
             }
             None if keep_inline => result_text,
-            None => crate::memory::context_window::compress_tool_result(
-                tool_name,
-                &result_text,
-                max_chars,
-            ),
+            None => crate::context_budget::compress_tool_result(tool_name, &result_text, max_chars),
         };
         if !keep_inline {
             if let Some(provenance) = result_metadata.result_provenance.as_mut() {

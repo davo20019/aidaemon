@@ -45,7 +45,7 @@ async fn test_long_conversation_no_crash() {
 /// Verify tool result compression: a very large tool result should be truncated.
 #[tokio::test]
 async fn test_tool_result_compressed() {
-    use crate::memory::context_window::compress_tool_result;
+    use crate::context_budget::compress_tool_result;
 
     // Result under the limit should pass through unchanged
     let short = "Hello world";

@@ -168,7 +168,7 @@ pub fn format_full_tree(snapshot: &AppSnapshot) -> String {
 
 /// Rough token cost of a rendered computer-use observation, for telemetry into
 /// where a computer-use prompt's bytes go: the AX-tree text (chars/4, matching
-/// `memory::context_window::estimate_tokens`) plus a fixed surrogate for an
+/// `context_budget::estimate_tokens`) plus a fixed surrogate for an
 /// attached screenshot. The AX tree is the variable, sometimes-huge part (a
 /// browser full tree can be ~1200 nodes); the screenshot is small and capped.
 pub fn observation_token_estimate(ax_text: &str, has_screenshot: bool) -> usize {

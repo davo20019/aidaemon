@@ -297,7 +297,7 @@ impl CommandContext {
                     })
                     .collect::<Vec<_>>();
                 let exact_tokens =
-                    crate::memory::context_window::estimate_multimodal_message_tokens(&raw_values);
+                    crate::context_budget::estimate_multimodal_message_tokens(&raw_values);
                 let compacted_messages = summary
                     .as_ref()
                     .map(|value| value.message_count)
@@ -314,7 +314,7 @@ impl CommandContext {
                                 .map(|seq| seq.to_string())
                                 .unwrap_or_else(|| "legacy".to_string()),
                             value.last_message_id,
-                            crate::memory::context_window::estimate_tokens(&value.summary)
+                            crate::context_budget::estimate_tokens(&value.summary)
                         )
                     },
                 );

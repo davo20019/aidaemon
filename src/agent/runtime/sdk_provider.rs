@@ -12,9 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use super::sdk_engine::DaemonCall;
-use crate::memory::context_window::{
-    estimate_multimodal_message_tokens, fit_messages_with_source_quotas,
-};
+use crate::context_budget::{estimate_multimodal_message_tokens, fit_messages_with_source_quotas};
 use crate::traits::{ChatOptions, ProviderResponse};
 
 /// One model request handed from the SDK run to the daemon dispatcher.

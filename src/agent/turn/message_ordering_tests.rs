@@ -187,7 +187,7 @@ fn test_post_fitting_fixup_removes_tool_result_whose_call_was_trimmed() {
     ];
 
     let (mut fitted, dropped) =
-        crate::memory::context_window::fit_messages_with_source_quotas(messages, 400);
+        crate::context_budget::fit_messages_with_source_quotas(messages, 400);
     assert!(dropped > 0);
     assert!(fitted.iter().any(|message| {
         message.get("tool_call_id").and_then(Value::as_str) == Some("call_trimmed")

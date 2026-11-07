@@ -128,7 +128,7 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
         // Too long for this model's window: retrying cannot help. Record
         // the window so the caller shrinks the request.
         if let aidaemon_core::ProviderError::ContextOverflow { limit, .. } = error {
-            let attempted = crate::memory::context_window::estimate_multimodal_message_tokens(
+            let attempted = crate::context_budget::estimate_multimodal_message_tokens(
                 &crate::providers::sdk_backed::to_chat_messages(&request.messages),
             );
             crate::config::record_context_overflow(model, limit.map(|l| l as usize), attempted);

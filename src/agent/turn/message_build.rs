@@ -486,19 +486,17 @@ pub(super) async fn build_turn_messages(
     let render_options = agent.render_options(model);
 
     let total_context_budget =
-        crate::memory::context_window::model_context_budget(model, &agent.context_window_config);
+        crate::context_budget::model_context_budget(model, &agent.context_window_config);
     // Pillar A: the system payload is now message zero (core) PLUS the task
     // context tail. Both occupy budget, so reserve for the sum.
-    let system_tokens = crate::memory::context_window::estimate_tokens(core_prompt)
-        + crate::memory::context_window::estimate_tokens(task_context_tail);
+    let system_tokens = crate::context_budget::estimate_tokens(core_prompt)
+        + crate::context_budget::estimate_tokens(task_context_tail);
     let original_tool_tokens =
-        crate::memory::context_window::estimate_tool_definition_tokens(original_tool_defs);
+        crate::context_budget::estimate_tool_definition_tokens(original_tool_defs);
     let tool_budget = total_context_budget
         .saturating_sub(system_tokens + RESPONSE_RESERVE_TOKENS + MIN_MESSAGE_BUDGET_TOKENS);
-    let mut effective_tool_defs = crate::memory::context_window::fit_tool_definitions_to_budget(
-        original_tool_defs,
-        tool_budget,
-    );
+    let mut effective_tool_defs =
+        crate::context_budget::fit_tool_definitions_to_budget(original_tool_defs, tool_budget);
 
     if effective_tool_defs != original_tool_defs {
         info!(
@@ -507,9 +505,8 @@ pub(super) async fn build_turn_messages(
             model,
             total_context_budget,
             original_tool_tokens,
-            effective_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
-                &effective_tool_defs
-            ),
+            effective_tool_tokens =
+                crate::context_budget::estimate_tool_definition_tokens(&effective_tool_defs),
             tool_count = effective_tool_defs.len(),
             "Compacted tool schema descriptions for model context compatibility"
         );
@@ -532,17 +529,16 @@ pub(super) async fn build_turn_messages(
     // legacy code used — no invented numbers. `core` is the cached core bytes
     // (already computed by Pillar A); `tools` is the name-sorted tool array this
     // build will send; `tail` is the `[Task Context]` tail string.
-    let core_tokens = crate::memory::context_window::estimate_tokens(core_prompt);
-    let tail_tokens = crate::memory::context_window::estimate_tokens(task_context_tail);
-    let tool_tokens_for_budget =
-        crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
+    let core_tokens = crate::context_budget::estimate_tokens(core_prompt);
+    let tail_tokens = crate::context_budget::estimate_tokens(task_context_tail);
+    let tool_tokens_for_budget = crate::context_budget::estimate_tool_definition_tokens(tool_defs);
     let archived_budget = super::turn_eviction::archived_budget(
         total_context_budget,
         core_tokens,
         tool_tokens_for_budget,
         tail_tokens,
         CURRENT_TURN_RESERVE_TOKENS,
-        crate::memory::context_window::CONTEXT_RESPONSE_RESERVE_TOKENS,
+        crate::context_budget::CONTEXT_RESPONSE_RESERVE_TOKENS,
         ARCHIVED_BUDGET_SAFETY_MARGIN,
     );
 
@@ -590,9 +586,7 @@ pub(super) async fn build_turn_messages(
                         &render_options,
                     );
                     let full_est =
-                        crate::memory::context_window::estimate_multimodal_message_tokens(
-                            &rendered,
-                        );
+                        crate::context_budget::estimate_multimodal_message_tokens(&rendered);
                     if init_anchor.is_none() {
                         // The newest turn is the (about-to-be) current turn. It is
                         // not part of the archived region, so its tokens are NOT
@@ -606,9 +600,7 @@ pub(super) async fn build_turn_messages(
                         if archived_turns_seen == 0 && full_est > low_water {
                             let compact = compact_immediate_parent_turn(&turn.messages);
                             let compact_est =
-                                crate::memory::context_window::estimate_multimodal_message_tokens(
-                                    &compact,
-                                );
+                                crate::context_budget::estimate_multimodal_message_tokens(&compact);
                             if !compact.is_empty() && compact_est <= low_water {
                                 (compact_est, true)
                             } else {
@@ -888,7 +880,7 @@ pub(super) async fn build_turn_messages(
                 cache_bytes.clone()
             };
             let full_est =
-                crate::memory::context_window::estimate_multimodal_message_tokens(&request_bytes);
+                crate::context_budget::estimate_multimodal_message_tokens(&request_bytes);
             let is_immediate_parent = turn_idx + 1 == turns.len();
             let bytes = if is_immediate_parent
                 && full_est > super::turn_eviction::low_water(archived_budget)
@@ -898,7 +890,7 @@ pub(super) async fn build_turn_messages(
                     request_bytes.clone()
                 } else {
                     let compact_est =
-                        crate::memory::context_window::estimate_multimodal_message_tokens(&compact);
+                        crate::context_budget::estimate_multimodal_message_tokens(&compact);
                     info!(
                         session_id,
                         turn_seq = turn.turn_seq,
@@ -928,7 +920,7 @@ pub(super) async fn build_turn_messages(
         .iter()
         .map(|r| super::turn_eviction::RenderedTurn {
             turn_seq: r.turn_seq,
-            est_tokens: crate::memory::context_window::estimate_multimodal_message_tokens(&r.bytes),
+            est_tokens: crate::context_budget::estimate_multimodal_message_tokens(&r.bytes),
         })
         .collect();
     let plan = super::turn_eviction::plan_eviction(&rendered_for_plan, archived_budget);
@@ -1307,9 +1299,9 @@ pub(super) async fn build_turn_messages(
     // user message onward) is handed to `fit_messages_with_source_quotas`.
     if agent.context_window_config.enabled {
         // Reserve for BOTH message zero (core) and the task context tail.
-        let system_tokens = crate::memory::context_window::estimate_tokens(core_prompt)
-            + crate::memory::context_window::estimate_tokens(task_context_tail);
-        let model_budget = crate::memory::context_window::compute_available_budget_precomputed(
+        let system_tokens = crate::context_budget::estimate_tokens(core_prompt)
+            + crate::context_budget::estimate_tokens(task_context_tail);
+        let model_budget = crate::context_budget::compute_available_budget_precomputed(
             model,
             system_tokens,
             tool_defs,
@@ -1339,13 +1331,10 @@ pub(super) async fn build_turn_messages(
         // The archived prefix already consumed `archived_budget`; the current
         // region is fit against the remaining budget.
         let archived_prefix_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&archived_prefix);
+            crate::context_budget::estimate_multimodal_message_tokens(&archived_prefix);
         let current_budget = effective_budget.saturating_sub(archived_prefix_tokens);
         let (fitted_current, dropped) =
-            crate::memory::context_window::fit_messages_with_source_quotas(
-                current_region,
-                current_budget,
-            );
+            crate::context_budget::fit_messages_with_source_quotas(current_region, current_budget);
         messages = archived_prefix;
         messages.extend(fitted_current);
         if dropped > 0 {
@@ -1570,12 +1559,11 @@ pub(super) async fn build_turn_messages(
     // Final enforcement must happen after every prompt component has been inserted.
     // Earlier trimming cannot account for execution checkpoints and one-shot directives.
     if agent.context_window_config.enabled {
-        let message_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
+        let message_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
         let final_tool_budget = total_context_budget.saturating_sub(
             message_tokens + RESPONSE_RESERVE_TOKENS + TOKEN_ESTIMATE_SAFETY_MARGIN,
         );
-        let final_tool_defs = crate::memory::context_window::fit_tool_definitions_to_budget(
+        let final_tool_defs = crate::context_budget::fit_tool_definitions_to_budget(
             original_tool_defs,
             final_tool_budget,
         );
@@ -1586,12 +1574,10 @@ pub(super) async fn build_turn_messages(
                 model,
                 message_tokens,
                 final_tool_budget,
-                before_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
-                    &effective_tool_defs
-                ),
-                after_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
-                    &final_tool_defs
-                ),
+                before_tool_tokens =
+                    crate::context_budget::estimate_tool_definition_tokens(&effective_tool_defs),
+                after_tool_tokens =
+                    crate::context_budget::estimate_tool_definition_tokens(&final_tool_defs),
                 tool_count = final_tool_defs.len(),
                 "Recompacted tool schemas after final prompt assembly"
             );
@@ -1635,10 +1621,8 @@ pub(super) async fn build_turn_messages(
             })
             .collect();
 
-        let est_msg_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
-        let est_tool_tokens =
-            crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
+        let est_msg_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
+        let est_tool_tokens = crate::context_budget::estimate_tool_definition_tokens(tool_defs);
         let est_total_tokens = est_msg_tokens + est_tool_tokens;
         let est_msg_tokens_u64 = est_msg_tokens as u64;
         let est_tool_tokens_u64 = est_tool_tokens as u64;
@@ -2677,8 +2661,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_context_model_compacts_tool_schemas_without_dropping_tools() {
+        use crate::context_budget::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::execution_policy::PolicyBundle;
-        use crate::memory::context_window::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
 
@@ -2798,8 +2782,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_context_model_rechecks_budget_after_final_prompt_assembly() {
+        use crate::context_budget::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::execution_policy::PolicyBundle;
-        use crate::memory::context_window::{estimate_tokens, estimate_tool_definition_tokens};
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
 

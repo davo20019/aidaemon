@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+pub mod promotion;
 pub mod resources;
 pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
 
@@ -1012,7 +1013,7 @@ fn compact_memory_value(value: &str, max_chars: usize) -> String {
 
 fn push_memory_line(prompt: &mut String, line: String) -> bool {
     let candidate = format!("{prompt}\n- {line}");
-    if crate::memory::context_window::estimate_tokens(&candidate) > QUERY_MEMORY_MAX_TOKENS {
+    if crate::context_budget::estimate_tokens(&candidate) > QUERY_MEMORY_MAX_TOKENS {
         return false;
     }
     *prompt = candidate;
@@ -1388,10 +1389,7 @@ mod tests {
         let report = render_query_ranked_memory(&memory, 20);
         assert_eq!(report.rendered_fact_ids.len(), QUERY_MEMORY_MAX_FACTS);
         assert!(report.prompt.contains("synthetic relevant value 1"));
-        assert!(
-            crate::memory::context_window::estimate_tokens(&report.prompt)
-                <= QUERY_MEMORY_MAX_TOKENS
-        );
+        assert!(crate::context_budget::estimate_tokens(&report.prompt) <= QUERY_MEMORY_MAX_TOKENS);
     }
 
     #[test]

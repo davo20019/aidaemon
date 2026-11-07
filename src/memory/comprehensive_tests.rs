@@ -2405,7 +2405,7 @@ async fn test_procedure_promotion_eligibility_criteria() {
 /// Verify context window token estimation.
 #[tokio::test]
 async fn test_context_window_token_estimation() {
-    use crate::memory::context_window::estimate_tokens;
+    use crate::context_budget::estimate_tokens;
 
     assert_eq!(estimate_tokens(""), 0);
     assert_eq!(estimate_tokens("hi"), 1); // ceil(2/4) = 1

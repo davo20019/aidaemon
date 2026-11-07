@@ -7,6 +7,7 @@ mod channels;
 mod checkpoints;
 mod cli_agent_flags;
 mod config;
+mod context_budget;
 mod conversation;
 mod core;
 mod cron_utils;

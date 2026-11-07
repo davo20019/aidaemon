@@ -42,7 +42,7 @@ pub(super) fn compaction_cut(run: &[Value], keep_tokens: usize) -> Option<usize>
     let mut tail_tokens = 0usize;
     let mut cut = run.len();
     for (index, message) in run.iter().enumerate().rev() {
-        tail_tokens += crate::memory::context_window::estimate_multimodal_message_tokens(
+        tail_tokens += crate::context_budget::estimate_multimodal_message_tokens(
             std::slice::from_ref(message),
         );
         if tail_tokens > keep_tokens {
@@ -112,10 +112,8 @@ pub(super) fn summary_request(previous: Option<&str>, messages: &[Value]) -> Vec
                 text.push_str(&format!("\n-> call {name}({arguments})"));
             }
         }
-        let text = crate::memory::context_window::compact_summary_input(
-            &text,
-            SUMMARY_INPUT_CHARS_PER_MESSAGE,
-        );
+        let text =
+            crate::context_budget::compact_summary_input(&text, SUMMARY_INPUT_CHARS_PER_MESSAGE);
         transcript.push_str(&format!("[{label}] {text}\n"));
     }
     vec![
@@ -148,7 +146,7 @@ impl Agent {
     ) -> Vec<Value> {
         let current = scope.compaction.lock().ok().and_then(|c| c.clone());
         let view = compacted_view(run, current.as_ref());
-        let view_tokens = crate::memory::context_window::estimate_multimodal_message_tokens(&view);
+        let view_tokens = crate::context_budget::estimate_multimodal_message_tokens(&view);
         // Mandate runs spend a durable shared balance through a lease; the
         // summarizer would bypass it, so they keep quota fitting.
         if self.mandate_execution.is_some()

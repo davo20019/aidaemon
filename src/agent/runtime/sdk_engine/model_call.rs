@@ -204,7 +204,7 @@ impl Agent {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime.snapshot();
         let tools = to_daemon_tools(&request.tools);
-        let budget = crate::memory::context_window::compute_available_budget_precomputed(
+        let budget = crate::context_budget::compute_available_budget_precomputed(
             &request.model,
             0,
             &tools,
@@ -240,8 +240,7 @@ impl Agent {
         };
         // An oversized run is compacted (older rounds summarized) before
         // quota fitting, which stays as the fallback.
-        let prefix_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&prefix);
+        let prefix_tokens = crate::context_budget::estimate_multimodal_message_tokens(&prefix);
         let run = self
             .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
@@ -274,8 +273,7 @@ impl Agent {
         if scope.text_only_next_call.swap(false, Ordering::Relaxed) {
             options.tool_choice = crate::traits::ToolChoiceMode::None;
         }
-        let est_input_tokens =
-            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
+        let est_input_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = crate::agent::llm::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it.
@@ -463,7 +461,7 @@ impl Agent {
                 .await;
         } else if usage.is_some() {
             // Calibrates the chars/4 estimate the summarization threshold uses.
-            crate::memory::context_window::record_token_estimate_calibration(
+            crate::context_budget::record_token_estimate_calibration(
                 &request.model,
                 est_input_tokens,
                 input_tokens as usize,
