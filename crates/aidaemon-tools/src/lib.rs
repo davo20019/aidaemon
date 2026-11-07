@@ -46,6 +46,7 @@ pub mod backend;
 mod checklist;
 mod exec;
 mod fs;
+pub mod path_class;
 mod search;
 pub mod semantics;
 pub mod services;
@@ -68,6 +69,7 @@ pub use exec::{
     LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox,
 };
 pub use fs::{EditFile, ReadFile, WriteFile, DEFAULT_READ_LIMIT};
+pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use shell::{Shell, DEFAULT_ENV_ALLOWLIST};
 pub use web::WebFetch;

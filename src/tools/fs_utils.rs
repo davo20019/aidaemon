@@ -31,70 +31,22 @@ pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".vs",
 ];
 
-/// Sensitive path patterns that should not be exposed through file tools.
-pub const SENSITIVE_PATTERNS: &[&str] = &[
-    ".git",
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".docker",
-    ".kube",
-    ".pulumi",
-    ".terraform",
-    ".env",
-    ".envrc",
-    ".dev.vars",
-    ".key",
-    ".pem",
-    ".aws/credentials",
-    ".netrc",
-    ".docker/config.json",
-    "credentials",
-    "id_rsa",
-    "id_ed25519",
-    ".npmrc",
-    ".pypirc",
-    ".htpasswd",
-    ".git-credentials",
-    "secrets",
-];
+/// Path classification lives in the SDK tools crate.
+use aidaemon_tools::path_class::same_file;
+use aidaemon_tools::PathClassifier;
 
-/// Entries that hold secrets; `read_file` refuses these. Narrower than
-/// `SENSITIVE_PATTERNS`, which also guards non-secret writes such as `.git`.
-pub const SECRET_READ_PATTERNS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".env",
-    ".envrc",
-    ".dev.vars",
-    ".key",
-    ".pem",
-    ".aws/credentials",
-    ".netrc",
-    ".docker/config.json",
-    "credentials",
-    "id_rsa",
-    "id_ed25519",
-    ".npmrc",
-    ".pypirc",
-    ".htpasswd",
-    ".git-credentials",
-    "secrets",
-];
-
-static DAEMON_PROTECTED_PATHS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+/// The daemon's classifier, holding its own config and env files as
+/// protected paths (set at startup).
+static DAEMON_PATHS: std::sync::RwLock<PathClassifier> =
+    std::sync::RwLock::new(PathClassifier::empty());
 
 /// Register the daemon's own config and env files (set at startup). These are
 /// changed only through `manage_config`, never by the file tools.
 pub fn set_daemon_protected_paths(paths: Vec<PathBuf>) {
-    let mut guard = DAEMON_PROTECTED_PATHS
+    let mut guard = DAEMON_PATHS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = paths;
+    *guard = PathClassifier::new(paths);
 }
 
 /// Test helper: protect `paths` as the daemon's own files until dropped.
@@ -115,9 +67,9 @@ impl DaemonPathsGuard {
         let lock = DAEMON_PATHS_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = DAEMON_PROTECTED_PATHS
+        let previous = DAEMON_PATHS
             .read()
-            .map(|g| g.clone())
+            .map(|g| g.protected_paths().to_vec())
             .unwrap_or_default();
         set_daemon_protected_paths(paths);
         Self(previous, lock)
@@ -128,28 +80,19 @@ impl DaemonPathsGuard {
 impl Drop for DaemonPathsGuard {
     fn drop(&mut self) {
         // Restore through the raw lock; `self.1` is still held.
-        if let Ok(mut guard) = DAEMON_PROTECTED_PATHS.write() {
-            *guard = std::mem::take(&mut self.0);
+        if let Ok(mut guard) = DAEMON_PATHS.write() {
+            *guard = PathClassifier::new(std::mem::take(&mut self.0));
         }
     }
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (a.canonicalize(), b.canonicalize()),
-            (Ok(x), Ok(y)) if x == y
-        )
-}
-
-fn is_daemon_protected(path: &Path) -> bool {
-    is_protected_in(&DAEMON_PROTECTED_PATHS, path)
-}
-
-/// A poisoned lock fails closed: the path counts as protected.
-fn is_protected_in(list: &std::sync::RwLock<Vec<PathBuf>>, path: &Path) -> bool {
-    list.read()
-        .map_or(true, |guard| guard.iter().any(|p| same_file(p, path)))
+/// Ask the daemon's classifier. A poisoned lock fails closed: the path
+/// counts as protected.
+fn classify(
+    lock: &std::sync::RwLock<PathClassifier>,
+    question: impl FnOnce(&PathClassifier) -> bool,
+) -> bool {
+    lock.read().map_or(true, |classifier| question(&classifier))
 }
 
 /// Env files named by the daemon's own environment variables
@@ -931,67 +874,22 @@ pub async fn backup_before_overwrite(
     let _ = backend.copy(path, &backup).await;
 }
 
-fn matches_patterns(path: &Path, patterns: &[&str]) -> bool {
-    let path_str = path.to_string_lossy();
-    let path_lower = path_str.to_ascii_lowercase();
-    patterns.iter().any(|pat| {
-        if pat.contains('/') {
-            // Multi-component patterns (e.g., ".aws/credentials"): substring match is fine
-            // because the slash provides enough specificity.
-            path_lower.contains(&pat.to_ascii_lowercase())
-        } else {
-            // Single-component patterns: match as an exact path component or filename.
-            path.components()
-                .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(pat))
-                || path
-                    .file_name()
-                    .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(pat))
-        }
-    })
-}
-
 /// True for files that hold secrets (keys, credentials, env files, the
 /// daemon's own config). Used by `read_file`.
 pub fn is_secret_path(path: &Path) -> bool {
-    is_secret_path_ignoring_name_shape(path) || has_secret_name_shape(path)
+    classify(&DAEMON_PATHS, |c| c.is_secret(path)) || is_configured_env_file(path)
 }
 
 /// Like `is_secret_path` but without the `.env.*` / `*.key` name-shape rules,
 /// so a template file is judged by where it lives alone.
 pub fn is_secret_path_ignoring_name_shape(path: &Path) -> bool {
-    matches_patterns(path, SECRET_READ_PATTERNS)
+    classify(&DAEMON_PATHS, |c| c.is_secret_ignoring_name_shape(path))
         || is_configured_env_file(path)
-        || is_daemon_protected(path)
 }
 
+/// True for paths the file tools must not write.
 pub fn is_sensitive_path(path: &Path) -> bool {
-    let pattern_match = matches_patterns(path, SENSITIVE_PATTERNS) || is_daemon_protected(path);
-    if pattern_match || is_configured_env_file(path) {
-        return true;
-    }
-
-    has_secret_name_shape(path)
-        || path.components().any(|component| {
-            let component = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-            component == "terraform.tfstate" || component.starts_with("terraform.tfstate.")
-        })
-}
-
-/// Secret-shaped names: env variants, key and keystore extensions.
-fn has_secret_name_shape(path: &Path) -> bool {
-    path.components().any(|component| {
-        let component = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-        component.starts_with(".env.")
-            || component.starts_with(".dev.vars.")
-            || component.ends_with(".key")
-            || component.ends_with(".pem")
-            || component.ends_with(".p12")
-            || component.ends_with(".pfx")
-            || component.ends_with(".jks")
-            || component.ends_with(".keystore")
-            || component == "terraform.tfstate"
-            || component.starts_with("terraform.tfstate.")
-    })
+    classify(&DAEMON_PATHS, |c| c.is_sensitive(path)) || is_configured_env_file(path)
 }
 
 /// Whether a path belongs to the host operating system's protected data
@@ -1232,19 +1130,17 @@ pub use aidaemon_tools::semantics::file_output_trust;
 mod tests {
     #[test]
     fn poisoned_protected_list_fails_closed() {
-        let list = std::sync::Arc::new(std::sync::RwLock::new(Vec::<PathBuf>::new()));
+        let list = std::sync::Arc::new(std::sync::RwLock::new(PathClassifier::default()));
         let l2 = list.clone();
         let _ = std::thread::spawn(move || {
             let _g = l2.write().unwrap();
             panic!("poison");
         })
         .join();
-        assert!(is_protected_in(&list, Path::new("/synthetic/anything.txt")));
-        let healthy = std::sync::RwLock::new(Vec::<PathBuf>::new());
-        assert!(!is_protected_in(
-            &healthy,
-            Path::new("/synthetic/anything.txt")
-        ));
+        let anything = Path::new("/synthetic/anything.txt");
+        assert!(classify(&list, |c| c.is_protected(anything)));
+        let healthy = std::sync::RwLock::new(PathClassifier::default());
+        assert!(!classify(&healthy, |c| c.is_protected(anything)));
     }
 
     use super::*;
