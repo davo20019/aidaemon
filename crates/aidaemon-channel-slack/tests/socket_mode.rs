@@ -311,3 +311,50 @@ async fn shutdown_stops_run_while_connected() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn slash_commands_become_command_events() {
+    let socket = MockSocket::start(vec![vec![
+        hello(),
+        json!({
+            "envelope_id": "env-cmd",
+            "type": "slash_commands",
+            "payload": {
+                "command": "/status",
+                "text": "  verbose ",
+                "channel_id": "D000SYNTH",
+                "user_id": "U000ALICE",
+                "user_name": "alice",
+                "response_url": "https://hooks.slack.com/commands/T000SYNTH/1/synthetic"
+            }
+        }),
+    ]])
+    .await;
+    let api = standard_api(socket.url.clone()).await;
+    let slack = channel(&api);
+    let (tx, mut rx) = mpsc::channel(4);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let run = tokio::spawn(async move { slack.run(tx, stop).await });
+
+    let ChannelEvent::Command(command) = next_event(&mut rx).await else {
+        panic!("expected a command")
+    };
+    assert_eq!(command.name, "status");
+    assert_eq!(command.args, "verbose");
+    assert_eq!(command.conversation.kind, ConversationKind::Direct);
+    assert_eq!(command.conversation.id, "D000SYNTH");
+    assert_eq!(command.sender.id, "U000ALICE");
+    assert_eq!(
+        command.handle,
+        "https://hooks.slack.com/commands/T000SYNTH/1/synthetic"
+    );
+    assert_eq!(socket.wait_for_acks(1).await, vec!["env-cmd".to_string()]);
+
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

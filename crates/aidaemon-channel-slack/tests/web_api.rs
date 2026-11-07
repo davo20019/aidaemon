@@ -236,3 +236,164 @@ async fn ask_renders_buttons_with_encoded_values() {
         assert_eq!(value, json!({ "p": "prompt-42", "c": choice }));
     }
 }
+
+#[tokio::test]
+async fn delete_calls_chat_delete() {
+    let api = ok_api().await;
+    channel(&api)
+        .delete(&MessageRef {
+            conversation_id: "C000SYNTH:1700000000.000100".into(),
+            message_id: "1700000001.000005".into(),
+        })
+        .await
+        .unwrap();
+    let calls = api.calls("chat.delete");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].json(),
+        json!({ "channel": "C000SYNTH", "ts": "1700000001.000005" })
+    );
+}
+
+#[tokio::test]
+async fn send_file_uses_the_external_upload_flow() {
+    let api = MockApi::start(|req, _| match req.method() {
+        "files.getUploadURLExternal" => {
+            let host = req.header("host").unwrap_or_default().to_string();
+            Response::json(json!({
+                "ok": true,
+                "upload_url": format!("http://{host}/upload/F000SYNTH"),
+                "file_id": "F000SYNTH",
+            }))
+        }
+        _ => Response::json(json!({ "ok": true })),
+    })
+    .await;
+    let sent = channel(&api)
+        .send_file(
+            &thread(),
+            &aidaemon_channels::OutboundFile {
+                name: "report.txt".into(),
+                bytes: b"synthetic report for Acme Corp".to_vec(),
+                mime_type: Some("text/plain".into()),
+                caption: Some("The **weekly** report".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.message_id, "F000SYNTH");
+
+    let ticket = api.calls("files.getUploadURLExternal");
+    assert_eq!(ticket.len(), 1);
+    assert!(
+        ticket[0].body.contains("filename=report.txt"),
+        "{}",
+        ticket[0].body
+    );
+    assert!(ticket[0].body.contains("length=30"), "{}", ticket[0].body);
+    let upload = api.calls("F000SYNTH");
+    assert_eq!(upload.len(), 1);
+    assert_eq!(upload[0].body, "synthetic report for Acme Corp");
+    let complete = api.calls("files.completeUploadExternal");
+    assert_eq!(complete.len(), 1);
+    let body = complete[0].json();
+    assert_eq!(body["files"][0]["id"], "F000SYNTH");
+    assert_eq!(body["channel_id"], "C000SYNTH");
+    assert_eq!(body["thread_ts"], "1700000000.000100");
+    assert_eq!(body["initial_comment"], "The *weekly* report");
+}
+
+#[tokio::test]
+async fn send_file_refuses_an_upload_url_off_slack() {
+    let api = MockApi::start(|req, _| match req.method() {
+        "files.getUploadURLExternal" => Response::json(json!({
+            "ok": true,
+            "upload_url": "https://uploads.example.test/F000SYNTH",
+            "file_id": "F000SYNTH",
+        })),
+        _ => Response::json(json!({ "ok": true })),
+    })
+    .await;
+    let err = channel(&api)
+        .send_file(
+            &group(),
+            &aidaemon_channels::OutboundFile {
+                name: "a.txt".into(),
+                bytes: b"x".to_vec(),
+                mime_type: None,
+                caption: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)));
+    assert!(api.calls("files.completeUploadExternal").is_empty());
+}
+
+#[tokio::test]
+async fn download_sends_the_bot_token_only_to_slack_hosts() {
+    let api = MockApi::start(|_, _| Response::json(json!("synthetic bytes"))).await;
+    let slack = channel(&api);
+    let host = api.base.trim_end_matches("/api").to_string();
+    let bytes = slack
+        .download(&aidaemon_channels::Attachment {
+            name: "notes.txt".into(),
+            mime_type: None,
+            size_bytes: None,
+            source: format!("{host}/files-pri/T000SYNTH-F000SYNTH/notes.txt"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"\"synthetic bytes\"");
+    assert_eq!(
+        api.requests()[0].header("authorization"),
+        Some("Bearer xoxb-synthetic")
+    );
+
+    let err = slack
+        .download(&aidaemon_channels::Attachment {
+            name: "notes.txt".into(),
+            mime_type: None,
+            size_bytes: None,
+            source: "https://files.example.test/notes.txt".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)));
+    assert_eq!(api.requests().len(), 1, "no request to another host");
+}
+
+#[tokio::test]
+async fn answer_command_posts_an_ephemeral_reply_to_the_response_url() {
+    let api = ok_api().await;
+    let slack = channel(&api);
+    let host = api.base.trim_end_matches("/api").to_string();
+    let command = aidaemon_channels::CommandInvocation {
+        conversation: group(),
+        sender: aidaemon_channels::Sender {
+            id: "U000ALICE".into(),
+            display_name: None,
+            is_bot: false,
+        },
+        name: "status".into(),
+        args: String::new(),
+        handle: format!("{host}/commands/T000SYNTH/1/synthetic"),
+    };
+    slack
+        .answer_command(&command, "All **quiet**")
+        .await
+        .unwrap();
+    let reqs = api.requests();
+    assert_eq!(reqs[0].path, "/commands/T000SYNTH/1/synthetic");
+    assert_eq!(
+        reqs[0].json(),
+        json!({ "response_type": "ephemeral", "text": "All *quiet*" })
+    );
+
+    let elsewhere = aidaemon_channels::CommandInvocation {
+        handle: "https://hooks.example.test/x".into(),
+        ..command
+    };
+    assert!(slack.answer_command(&elsewhere, "hi").await.is_err());
+    assert_eq!(api.requests().len(), 1);
+}

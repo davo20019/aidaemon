@@ -288,6 +288,45 @@ pub(crate) fn map_interactive(payload: &Value) -> Option<ChannelEvent> {
     }))
 }
 
+/// Map a `slash_commands` envelope payload. The handle is the command's
+/// `response_url`, which answers it.
+pub(crate) fn map_slash_command(payload: &Value) -> Option<ChannelEvent> {
+    let command = str_field(payload, "command")?;
+    let name = command.trim_start_matches('/').trim();
+    if name.is_empty() {
+        return None;
+    }
+    let channel = str_field(payload, "channel_id")?;
+    let user_id = str_field(payload, "user_id")?;
+    let handle = str_field(payload, "response_url")?;
+    let kind = if channel.starts_with('D') {
+        ConversationKind::Direct
+    } else {
+        ConversationKind::Group
+    };
+    Some(ChannelEvent::Command(
+        aidaemon_channels::CommandInvocation {
+            conversation: Conversation {
+                id: channel.to_string(),
+                kind,
+            },
+            sender: Sender {
+                id: user_id.to_string(),
+                display_name: str_field(payload, "user_name").map(str::to_string),
+                is_bot: false,
+            },
+            name: name.to_string(),
+            args: payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            handle: handle.to_string(),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

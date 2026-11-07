@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use aidaemon_channels::{
-    ApprovalPrompt, Channel, ChannelCapabilities, ChannelError, ChannelEvent, Conversation,
-    MessageRef, OutboundMessage,
+    ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
+    CommandInvocation, Conversation, MessageRef, OutboundFile, OutboundMessage,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -43,8 +43,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::events::{
-    map_events_api, map_interactive, split_conversation_id, ApprovalValue, MapContext,
-    SeenMessages, APPROVAL_ACTION_PREFIX,
+    map_events_api, map_interactive, map_slash_command, split_conversation_id, ApprovalValue,
+    MapContext, SeenMessages, APPROVAL_ACTION_PREFIX,
 };
 use crate::format::{markdown_to_mrkdwn, split_mrkdwn, truncate_chars};
 
@@ -164,13 +164,48 @@ impl SlackChannel {
         token: &str,
         body: Option<&Value>,
     ) -> Result<Value, ChannelError> {
+        self.call_with(method, token, |request| match body {
+            Some(body) => request.json(body),
+            None => request.header("Content-Type", "application/x-www-form-urlencoded"),
+        })
+        .await
+    }
+
+    /// A Web API call with form-encoded fields (methods that take no JSON).
+    async fn call_form(
+        &self,
+        method: &str,
+        fields: &[(&str, String)],
+    ) -> Result<Value, ChannelError> {
+        self.call_with(method, &self.bot_token, |request| request.form(fields))
+            .await
+    }
+
+    /// Whether `url` is Slack's own (or this channel's configured API
+    /// host): the bot token and command answers go nowhere else.
+    fn slack_url(&self, url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        let configured = reqwest::Url::parse(&self.api_base)
+            .ok()
+            .and_then(|base| base.host_str().map(str::to_string));
+        (parsed.scheme() == "https" && (host == "slack.com" || host.ends_with(".slack.com")))
+            || configured.as_deref() == Some(host)
+    }
+
+    async fn call_with(
+        &self,
+        method: &str,
+        token: &str,
+        body: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<Value, ChannelError> {
         let url = format!("{}/{}", self.api_base, method);
         for attempt in 0..2 {
-            let mut request = self.http.post(&url).bearer_auth(token);
-            request = match body {
-                Some(body) => request.json(body),
-                None => request.header("Content-Type", "application/x-www-form-urlencoded"),
-            };
+            let request = body(self.http.post(&url).bearer_auth(token));
             let response = request
                 .send()
                 .await
@@ -354,6 +389,7 @@ impl SlackChannel {
                     map_events_api(payload, &ctx, seen)
                 }
                 Some("interactive") => map_interactive(payload),
+                Some("slash_commands") => map_slash_command(payload),
                 other => {
                     debug!(envelope_type = ?other, "ignoring Slack envelope");
                     None
@@ -402,9 +438,9 @@ impl Channel for SlackChannel {
             buttons: true,
             typing_indicator: false,
             threads: true,
-            delete_messages: false,
-            files: false,
-            commands: false,
+            delete_messages: true,
+            files: true,
+            commands: true,
             max_message_len: MAX_MESSAGE_LEN,
         }
     }
@@ -553,5 +589,146 @@ impl Channel for SlackChannel {
             conversation_id: prompt.conversation.id.clone(),
             message_id: ts.to_string(),
         })
+    }
+
+    async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        let (channel, _) = split_conversation_id(&message.conversation_id);
+        let body = json!({ "channel": channel, "ts": message.message_id });
+        self.post_bot("chat.delete", &body).await.map(|_| ())
+    }
+
+    /// Slack's external upload: ask for an upload URL, send the bytes
+    /// there, then share the file in the conversation with its caption.
+    /// The returned ref's `message_id` is the Slack file id.
+    async fn send_file(
+        &self,
+        conversation: &Conversation,
+        file: &OutboundFile,
+    ) -> Result<MessageRef, ChannelError> {
+        let (channel, thread_ts) = split_conversation_id(&conversation.id);
+        let ticket = self
+            .call_form(
+                "files.getUploadURLExternal",
+                &[
+                    ("filename", file.name.clone()),
+                    ("length", file.bytes.len().to_string()),
+                ],
+            )
+            .await?;
+        let upload_url = ticket
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ChannelError::Other("files.getUploadURLExternal: no upload_url".into())
+            })?;
+        let file_id = ticket
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ChannelError::Other("files.getUploadURLExternal: no file_id".into()))?
+            .to_string();
+        if !self.slack_url(upload_url) {
+            return Err(ChannelError::Other(
+                "files.getUploadURLExternal: upload URL is not a Slack host".into(),
+            ));
+        }
+        let uploaded = self
+            .http
+            .post(upload_url)
+            .header("Content-Type", "application/octet-stream")
+            .body(file.bytes.clone())
+            .send()
+            .await
+            .map_err(|e| ChannelError::Transport(format!("file upload: {e}")))?;
+        if !uploaded.status().is_success() {
+            return Err(ChannelError::Transport(format!(
+                "file upload: HTTP {}",
+                uploaded.status()
+            )));
+        }
+        let mut complete = json!({
+            "files": [{ "id": file_id, "title": file.name }],
+            "channel_id": channel,
+        });
+        if let Some(ts) = thread_ts {
+            complete["thread_ts"] = json!(ts);
+        }
+        if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+            complete["initial_comment"] = json!(markdown_to_mrkdwn(caption));
+        }
+        self.post_bot("files.completeUploadExternal", &complete)
+            .await?;
+        Ok(MessageRef {
+            conversation_id: conversation.id.clone(),
+            message_id: file_id,
+        })
+    }
+
+    /// Slack file URLs need the bot token; it is only sent to Slack hosts.
+    async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+        if !self.slack_url(&attachment.source) {
+            return Err(ChannelError::Other(
+                "slack: attachment URL is not a Slack host".into(),
+            ));
+        }
+        let response = self
+            .http
+            .get(&attachment.source)
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .map_err(|e| ChannelError::Transport(format!("file download: {e}")))?;
+        if !response.status().is_success() {
+            return Err(ChannelError::Other(format!(
+                "file download: HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| ChannelError::Transport(format!("file download: {e}")))
+    }
+
+    /// Slack's slash commands are declared in the app manifest; there is
+    /// no API to change them.
+    async fn register_commands(
+        &self,
+        _commands: &[aidaemon_channels::CommandSpec],
+    ) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    /// Answer through the command's `response_url`, visible only to the
+    /// person who ran it.
+    async fn answer_command(
+        &self,
+        command: &CommandInvocation,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        if !self.slack_url(&command.handle) {
+            return Err(ChannelError::Other(
+                "slack: command response URL is not a Slack host".into(),
+            ));
+        }
+        let body = json!({
+            "response_type": "ephemeral",
+            "text": truncate_chars(&markdown_to_mrkdwn(text), MAX_MESSAGE_LEN),
+        });
+        let response = self
+            .http
+            .post(&command.handle)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ChannelError::Transport(format!("command response: {e}")))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ChannelError::Other(format!(
+                "command response: HTTP {}",
+                response.status()
+            )))
+        }
     }
 }
