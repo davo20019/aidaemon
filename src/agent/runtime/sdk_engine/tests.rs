@@ -298,7 +298,8 @@ async fn a_capped_plan_queues_the_request_until_the_reset() {
     assert!(
         reply
             .text
-            .contains("usage limit has been reached; it resets at")
+            // "resets at 14:00" or, past midnight, "resets on Nov 8 at 00:00".
+            .contains("usage limit has been reached; it resets ")
             && reply
                 .text
                 .contains("will run it automatically after the reset"),
@@ -1685,16 +1686,26 @@ async fn closeout_sees_only_offered_memory_tools() {
     let tools = &harness.agent.tools;
     let owned = closeout_visible_tools(
         tools,
+        &[],
         UserRole::Owner,
         crate::agent::memory_plugin::DAEMON_MEMORY_TOOLS,
     );
     assert!(owned.contains(&"remember_fact"));
-    let foreign = closeout_visible_tools(tools, UserRole::Owner, &[]);
+    let foreign = closeout_visible_tools(tools, &[], UserRole::Owner, &[]);
     assert!(!foreign.contains(&"remember_fact"));
     // Its goal actions stay offered under any plugin.
     assert!(foreign.contains(&"manage_memories"));
     assert!(!foreign.contains(&"manage_people"));
-    assert!(closeout_visible_tools(tools, UserRole::Public, &[]).is_empty());
+    // An MCP tool bridged for the turn is reachable too.
+    let bridged: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(crate::testing::MockTool::new(
+        "fake__lookup",
+        "A synthetic MCP tool",
+        "ok",
+    ))];
+    assert!(
+        closeout_visible_tools(tools, &bridged, UserRole::Owner, &[]).contains(&"fake__lookup")
+    );
+    assert!(closeout_visible_tools(tools, &bridged, UserRole::Public, &[]).is_empty());
 }
 
 #[test]

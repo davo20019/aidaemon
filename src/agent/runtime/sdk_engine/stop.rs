@@ -115,21 +115,29 @@ pub(super) fn closeout_demands_work(facts: &StopFacts) -> bool {
     facts.completed_results == 0 || executor_demands
 }
 
-/// The daemon tools the closeout may count as reachable: the registered
-/// tools, minus daemon memory tools the active memory plugin does not own.
+/// The tools the closeout may count as reachable: the registered daemon
+/// tools, minus daemon memory tools the active memory plugin does not own,
+/// and the MCP tools bridged for the turn.
 pub(super) fn closeout_visible_tools<'a>(
     tools: &'a [Arc<dyn crate::traits::Tool>],
+    mcp_tools: &'a [Arc<dyn crate::traits::Tool>],
     user_role: UserRole,
     owned_memory_tools: &[&str],
 ) -> Vec<&'a str> {
     if user_role == UserRole::Public {
         return Vec::new();
     }
-    tools
+    let mut visible: Vec<&str> = tools
         .iter()
         .map(|tool| tool.name())
         .filter(|name| daemon_tool_offer(name, owned_memory_tools) != DaemonToolOffer::Hidden)
-        .collect()
+        .collect();
+    for tool in mcp_tools {
+        if !visible.contains(&tool.name()) {
+            visible.push(tool.name());
+        }
+    }
+    visible
 }
 
 impl Agent {
@@ -278,8 +286,12 @@ impl Agent {
         let authority =
             crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);
-        let visible_tools =
-            closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
+        let visible_tools = closeout_visible_tools(
+            &self.tools,
+            &scope.mcp_tools,
+            scope.user_role,
+            scope.owned_memory_tools,
+        );
         let find = |name: &str| self.tools.iter().find(|tool| tool.name() == name);
         let verdict = crate::agent::closeout::stop_demand_verdict(
             demand,
@@ -385,8 +397,12 @@ impl Agent {
         let authority =
             crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);
-        let visible_tools =
-            closeout_visible_tools(&self.tools, scope.user_role, scope.owned_memory_tools);
+        let visible_tools = closeout_visible_tools(
+            &self.tools,
+            &scope.mcp_tools,
+            scope.user_role,
+            scope.owned_memory_tools,
+        );
         let read_only = |name: &str| {
             self.tools
                 .iter()
