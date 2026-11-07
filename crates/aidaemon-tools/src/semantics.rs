@@ -7,35 +7,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::services::ChannelVisibility;
+use aidaemon_core::ChannelVisibility;
 
-/// Role assigned to a user based on config (owner_ids).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserRole {
-    /// Full access — listed in `users.owner_ids`.
-    Owner,
-    /// Allowed by channel allowlist but not an owner.
-    Guest,
-    /// Non-whitelisted user — conversational access only, no tools.
-    Public,
-}
-
-impl std::fmt::Display for UserRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UserRole::Owner => write!(f, "owner"),
-            UserRole::Guest => write!(f, "guest"),
-            UserRole::Public => write!(f, "public"),
-        }
-    }
-}
-
-impl UserRole {
-    /// Only explicit owner traffic is allowed to update durable owner memory.
-    pub fn can_persist_owner_memory(self) -> bool {
-        matches!(self, Self::Owner)
-    }
-}
+/// The sender's role, shared across the SDK.
+pub use aidaemon_core::UserRole;
 
 /// Where an attachment originated — drives vision retention in archived turns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

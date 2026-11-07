@@ -11,20 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::semantics::UserRole;
 
-/// Visibility level of the channel the message originated from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelVisibility {
-    /// Direct message (1-on-1). Full memory, no restrictions.
-    Private,
-    /// Small private group (e.g., Telegram group, Slack MPIM). Cautious with sensitive info.
-    PrivateGroup,
-    /// Public channel visible to many users. No personal memory injected.
-    Public,
-    /// Untrusted public platform (Twitter, public APIs). Hardened security, minimal memory.
-    PublicExternal,
-    /// Internal/system-initiated (scheduler, triggers, sub-agents default). Full memory.
-    Internal,
-}
+/// The conversation's audience, shared across the SDK.
+pub use aidaemon_core::ChannelVisibility;
 
 /// Privacy level for facts stored in memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,32 +42,6 @@ impl FactPrivacy {
             "channel" => Self::Channel,
             "private" => Self::Private,
             _ => Self::Global,
-        }
-    }
-}
-
-impl std::fmt::Display for ChannelVisibility {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChannelVisibility::Private => write!(f, "private"),
-            ChannelVisibility::PrivateGroup => write!(f, "private_group"),
-            ChannelVisibility::Public => write!(f, "public"),
-            ChannelVisibility::PublicExternal => write!(f, "public_external"),
-            ChannelVisibility::Internal => write!(f, "internal"),
-        }
-    }
-}
-
-impl ChannelVisibility {
-    /// Parse from a string (e.g., from tool args). Falls back to `Internal`.
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s {
-            "private" => Self::Private,
-            "private_group" => Self::PrivateGroup,
-            "public" => Self::Public,
-            "public_external" => Self::PublicExternal,
-            "internal" => Self::Internal,
-            _ => Self::Internal,
         }
     }
 }

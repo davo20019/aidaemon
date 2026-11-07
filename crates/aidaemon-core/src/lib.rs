@@ -16,6 +16,7 @@
 
 mod agent;
 mod approval;
+mod audience;
 mod authority;
 mod error;
 mod event;
@@ -45,6 +46,7 @@ pub use approval::{
     ApprovalRisk, CallEffects, EffectClass, EffectKey, InterruptKind, OwnerApprovalRequest,
     EGRESS_BLOCKED, OWNER_DECLINED,
 };
+pub use audience::{ChannelVisibility, UserRole};
 pub use authority::{AccessLevel, Authority, AuthorityCeiling, AuthorityHook};
 pub use error::{BuildError, CoreError};
 pub use event::{Event, EventSink};

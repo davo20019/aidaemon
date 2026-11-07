@@ -87,6 +87,16 @@ pub aidaemon_core::BuildError::InvalidToolName(alloc::string::String)
 pub aidaemon_core::BuildError::MissingModel
 pub aidaemon_core::BuildError::MissingProvider
 pub aidaemon_core::BuildError::MissingSafeguard(aidaemon_core::Safeguard)
+pub enum aidaemon_core::ChannelVisibility
+pub aidaemon_core::ChannelVisibility::Internal
+pub aidaemon_core::ChannelVisibility::Private
+pub aidaemon_core::ChannelVisibility::PrivateGroup
+pub aidaemon_core::ChannelVisibility::Public
+pub aidaemon_core::ChannelVisibility::PublicExternal
+impl aidaemon_core::ChannelVisibility
+pub fn aidaemon_core::ChannelVisibility::from_str_lossy(&str) -> Self
+impl core::fmt::Display for aidaemon_core::ChannelVisibility
+pub fn aidaemon_core::ChannelVisibility::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum aidaemon_core::CoreError
 pub aidaemon_core::CoreError::AgentMismatch
 pub aidaemon_core::CoreError::AgentMismatch::expected: alloc::string::String
@@ -313,6 +323,14 @@ pub aidaemon_core::ToolDecision::Rewrite::arguments: serde_json::value::Value
 pub enum aidaemon_core::UntrustedMode
 pub aidaemon_core::UntrustedMode::Enforce
 pub aidaemon_core::UntrustedMode::MarkOnly
+pub enum aidaemon_core::UserRole
+pub aidaemon_core::UserRole::Guest
+pub aidaemon_core::UserRole::Owner
+pub aidaemon_core::UserRole::Public
+impl aidaemon_core::UserRole
+pub fn aidaemon_core::UserRole::can_persist_owner_memory(self) -> bool
+impl core::fmt::Display for aidaemon_core::UserRole
+pub fn aidaemon_core::UserRole::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::AccessManifest
 pub aidaemon_core::AccessManifest::commands: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::AccessManifest::hosts: alloc::vec::Vec<alloc::string::String>
