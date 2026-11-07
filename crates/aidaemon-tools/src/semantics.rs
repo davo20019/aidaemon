@@ -2274,6 +2274,25 @@ impl<'a> TrustRoots<'a> {
     }
 }
 
+/// Output trust of a file read: the owner's own files (inside the trusted
+/// roots) are `Trusted`; anything else, or a call whose first present path
+/// argument in `keys` is missing, is someone else's content.
+pub fn file_output_trust(
+    arguments: &str,
+    keys: &[&str],
+    roots: &TrustRoots<'_>,
+) -> aidaemon_core::SourceTrust {
+    let args = serde_json::from_str::<Value>(arguments).ok();
+    let path = args.as_ref().and_then(|args| {
+        keys.iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))
+    });
+    match path {
+        Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+        _ => aidaemon_core::SourceTrust::Untrusted,
+    }
+}
+
 /// Expand `~`, then resolve the path the way the filesystem will: every
 /// existing prefix through its symlinks (a link inside a root that points
 /// elsewhere leaves the root), the rest lexically. `None` for a relative
@@ -2341,4 +2360,35 @@ pub fn prepare_invocation<T: ToolSemantics + ?Sized>(
         receipt_kind: tool.receipt_kind(&canonical_arguments),
         canonical_arguments,
     })
+}
+
+#[cfg(test)]
+mod file_trust_tests {
+    use super::{file_output_trust, TrustRoots};
+    use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+
+    #[test]
+    fn files_inside_the_trusted_roots_are_trusted() {
+        let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+        let roots = TrustRoots::new(&roots);
+        let keys = ["path", "file_path"];
+        assert_eq!(
+            file_output_trust(r#"{"path":"/tmp/aidaemon-test/ws/a.txt"}"#, &keys, &roots),
+            Trusted
+        );
+        assert_eq!(
+            file_output_trust(
+                r#"{"file_path":"/tmp/aidaemon-test/ws/a.txt"}"#,
+                &keys,
+                &roots
+            ),
+            Trusted
+        );
+        assert_eq!(
+            file_output_trust(r#"{"path":"/etc/hosts"}"#, &keys, &roots),
+            Untrusted
+        );
+        assert_eq!(file_output_trust(r#"{}"#, &keys, &roots), Untrusted);
+        assert_eq!(file_output_trust("not json", &keys, &roots), Untrusted);
+    }
 }
