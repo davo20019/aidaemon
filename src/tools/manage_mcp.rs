@@ -4,65 +4,79 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::mcp::McpRegistry;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
+    semantics_for_exact_read_actions, Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects,
 };
-use crate::types::ApprovalResponse;
 
 /// Allowed commands for MCP server spawning.
 const ALLOWED_COMMANDS: &[&str] = &["npx", "uvx", "node", "python", "python3"];
 
 pub struct ManageMcpTool {
     registry: McpRegistry,
-    approval_tx: ApprovalBroker,
 }
 
 impl ManageMcpTool {
-    pub fn new(registry: McpRegistry, approval_tx: ApprovalBroker) -> Self {
-        Self {
-            registry,
-            approval_tx,
-        }
+    pub fn new(registry: McpRegistry) -> Self {
+        Self { registry }
     }
 
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec!["This will spawn an external MCP server process".to_string()],
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                tracing::warn!(description, "Approval response channel closed");
-                Err(anyhow::anyhow!("Approval response channel closed"))
-            }
-            Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s)");
-                Err(anyhow::anyhow!("Approval request timed out after 300s"))
-            }
+    /// The owner approval for one `add` call. Starting an external process
+    /// always asks, even in a trusted session. A call the add path would
+    /// refuse (unknown command, missing fields) needs no card: it never runs.
+    pub(crate) fn owner_approval(arguments: &Value) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        let Ok(args) = serde_json::from_value::<ManageMcpArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if args.action != "add" {
+            return OwnerApprovalNeed::NotNeeded;
         }
+        let (Some(name), Some(command)) = (
+            args.name.as_deref().filter(|s| !s.trim().is_empty()),
+            args.command.as_deref(),
+        ) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if !ALLOWED_COMMANDS.contains(&command) {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("Add MCP server '{name}' ({command} {})", args.args.join(" ")),
+            // The exact arguments the owner approves; a changed argument is a new card.
+            subject: json!({"action": "add", "name": name, "command": command, "args": args.args})
+                .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec!["This will download and execute an unverified package and register an external MCP server. Only approve if you trust the source.".to_string()],
+        })
     }
 
+    /// The typed effects of one call: starting a server runs its command as a
+    /// process. The process may also write files or contact hosts, so the
+    /// effects are declared incomplete.
+    pub(crate) fn effects_for(arguments: &str) -> aidaemon_core::CallEffects {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        let Ok(args) = serde_json::from_str::<ManageMcpArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        if args.action == "list" {
+            return CallEffects::none();
+        }
+        let mut effects = CallEffects::unknown();
+        if args.action == "add" {
+            if let Some(command) = args.command.filter(|command| !command.is_empty()) {
+                effects
+                    .keys
+                    .push(EffectKey::named(EffectClass::Process, &command));
+            }
+        }
+        effects
+    }
+
+    /// Starts a server. The owner was asked by the kernel before this runs.
     async fn handle_add(
         &self,
-        session_id: &str,
         name: &str,
         command: &str,
         args: Vec<String>,
@@ -74,24 +88,6 @@ impl ManageMcpTool {
                 command,
                 ALLOWED_COMMANDS.join(", ")
             ));
-        }
-
-        // Request user approval with unverified package warning
-        let args_display = args.join(" ");
-        let description = format!(
-            "Add MCP server '{}' ({} {})\n\
-             \u{26a0} WARNING: This will download and execute an unverified package. \
-             Only approve if you trust the source.",
-            name, command, args_display
-        );
-        let response = self.request_approval(session_id, &description).await?;
-        match response {
-            ApprovalResponse::Deny => {
-                return Ok("MCP server addition denied by user.".to_string());
-            }
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
         }
 
         let config = crate::config::McpServerConfig {
@@ -215,8 +211,6 @@ struct ManageMcpArgs {
     args: Vec<String>,
     key: Option<String>,
     value: Option<String>,
-    #[serde(default)]
-    _session_id: String,
 }
 
 fn manage_mcp_schema() -> Value {
@@ -259,21 +253,25 @@ impl Tool for ManageMcpTool {
         manage_mcp_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        _facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageMcpTool {
+    /// Run one call. Approval is judged by the kernel before this runs.
+    pub(crate) async fn run(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageMcpArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
 
@@ -287,7 +285,7 @@ impl Tool for ManageMcpTool {
                     .command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'command' is required for add action"))?;
-                self.handle_add(&args._session_id, name, command, args.args)
+                self.handle_add(name, command, args.args)
                     .await
             }
             "list" => self.handle_list().await,
@@ -342,9 +340,89 @@ impl Tool for ManageMcpTool {
     }
 }
 
+#[async_trait]
+impl crate::traits::ToolSemantics for ManageMcpTool {
+    /// Starting a server asks the owner, whatever the session. The dispatcher
+    /// runs the call only with that answer; a decline is recorded by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        Self::owner_approval(call.arguments)
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        Self::effects_for(arguments)
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addition_declares_process_but_does_not_claim_exhaustive_effects() {
+        let effects = ManageMcpTool::effects_for(
+            r#"{"action":"add","name":"synthetic","command":"node","args":["server.js"]}"#,
+        );
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::named(
+                aidaemon_core::EffectClass::Process,
+                "node"
+            )]
+        );
+        assert!(!effects.complete);
+        assert_eq!(
+            ManageMcpTool::effects_for(r#"{"action":"list"}"#),
+            aidaemon_core::CallEffects::none()
+        );
+    }
+
+    #[test]
+    fn approval_subject_binds_exact_arguments_and_ignores_injected_context() {
+        use crate::traits::OwnerApprovalNeed;
+        let args = json!({"action":"add","name":"synthetic","command":"node","args":["server.js"]});
+        let OwnerApprovalNeed::Ask(first) = ManageMcpTool::owner_approval(&args) else {
+            panic!("an add must ask");
+        };
+        let mut injected = args.clone();
+        injected["_session_id"] = json!("synthetic-session");
+        let OwnerApprovalNeed::Ask(same) = ManageMcpTool::owner_approval(&injected) else {
+            panic!("an add must ask");
+        };
+        assert_eq!(first, same);
+        let mut changed = args.clone();
+        changed["args"] = json!(["other.js"]);
+        let OwnerApprovalNeed::Ask(other) = ManageMcpTool::owner_approval(&changed) else {
+            panic!("an add must ask");
+        };
+        assert_ne!(first.subject, other.subject);
+        assert!(matches!(
+            ManageMcpTool::owner_approval(
+                &json!({"action":"add","name":"synthetic","command":"sh"})
+            ),
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
 
     #[test]
     fn schema_fits_payload_budget() {

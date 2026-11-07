@@ -12,7 +12,7 @@ use crate::testing::{
     setup_test_agent_with_models, setup_test_agent_with_models_and_policy,
     setup_test_agent_with_policy, MockProvider, MockTool,
 };
-use crate::tools::{EditFileTool, ReadFileTool};
+use crate::tools::EditFileTool;
 use crate::traits::store_prelude::*;
 use crate::traits::{Goal, Procedure, ProviderResponse, StateStore, UserProfile};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
@@ -442,13 +442,9 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     .unwrap()
     .unwrap();
 
-    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
     harness
         .agent
-        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            crate::tools::ApprovalBroker::new(http_approval_tx),
-        )));
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))));
     harness.agent.set_test_mandate_execution(
         &mandate.id,
         mandate.version,
@@ -567,79 +563,6 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
         .filter_map(|tool| tool["function"]["name"].as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"manage_mandates"));
-}
-
-#[tokio::test]
-async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical_reads() {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    use std::io::Write;
-    writeln!(file, "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta").unwrap();
-    let path = file.path().to_string_lossy().into_owned();
-    let first_args = json!({"path": path, "start_line": 1, "end_line": 3}).to_string();
-    let overlap_args = json!({"path": path, "start_line": 2, "end_line": 5}).to_string();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &first_args),
-        MockProvider::tool_call_response("read_file", &overlap_args),
-        MockProvider::text_response("The cached resume section contains beta and gamma."),
-    ]);
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(ReadFileTool)],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let response = harness
-        .agent
-        .handle_message(
-            "semantic_read_cache",
-            "Inspect the resume section and answer from the file.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response,
-        "The cached resume section contains beta and gamma."
-    );
-    let proposed_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_call' \
-         AND json_extract(data, '$.name') = 'read_file'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(proposed_reads, 3);
-    let physical_reads: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE session_id = ? AND event_type = 'tool_result' \
-         AND json_extract(data, '$.name') = 'read_file' \
-         AND json_extract(data, '$.receipt.invocation_stage') = 'dispatched'",
-    )
-    .bind("semantic_read_cache")
-    .fetch_one(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(physical_reads, 1);
-
-    let calls = harness.provider.call_log.lock().await;
-    let all_tool_content = calls
-        .iter()
-        .flat_map(|call| call.messages.iter())
-        .filter(|message| message.get("role").and_then(|value| value.as_str()) == Some("tool"))
-        .filter_map(|message| message.get("content").and_then(|value| value.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_tool_content.contains("complete task-local file artifact"));
-    assert!(all_tool_content.contains("Uncovered intervals: 4-5"));
 }
 
 #[tokio::test]
@@ -1218,7 +1141,19 @@ async fn test_slack_command_request_llm_payload() {
 async fn test_gemini_no_grounding_with_function_tools() {
     use serde_json::json;
 
-    let provider = crate::providers::GoogleGenAiProvider::new("fake-key");
+    let provider = aidaemon_providers::GoogleGenai::builder()
+        .api_key("fake-key")
+        .build()
+        .unwrap();
+    let body_for = |tools: &[serde_json::Value]| {
+        let messages = vec![json!({"role": "user", "content": "What time is it?"})];
+        provider.request_body(&crate::providers::sdk_backed::to_sdk_request(
+            "gemini-test",
+            &messages,
+            tools,
+            &crate::traits::ChatOptions::default(),
+        ))
+    };
 
     let tools = vec![json!({
         "type": "function",
@@ -1234,17 +1169,13 @@ async fn test_gemini_no_grounding_with_function_tools() {
         }
     })];
 
-    // When function tools are present, grounding must be disabled
-    let converted = provider.convert_tools_for_test(&tools, false);
-    assert!(converted.is_some(), "Should have tools");
-    let tools_array = converted.unwrap();
-
-    // Should have only 1 entry: function_declarations (NO google_search)
+    // When function tools are present, grounding must be disabled.
+    let body = body_for(&tools);
+    let tools_array = body["tools"].as_array().expect("should have tools");
     assert_eq!(
         tools_array.len(),
         1,
-        "Expected only function_declarations, got: {:?}",
-        tools_array
+        "Expected only function_declarations, got: {tools_array:?}"
     );
     assert!(
         tools_array[0].get("function_declarations").is_some(),
@@ -1255,10 +1186,9 @@ async fn test_gemini_no_grounding_with_function_tools() {
         "google_search should NOT be present alongside function tools"
     );
 
-    // When no function tools, grounding IS included
-    let converted_grounding = provider.convert_tools_for_test(&[], true);
-    assert!(converted_grounding.is_some());
-    let grounding_array = converted_grounding.unwrap();
+    // When no function tools, grounding IS included.
+    let body = body_for(&[]);
+    let grounding_array = body["tools"].as_array().expect("grounding tool");
     assert_eq!(grounding_array.len(), 1);
     assert!(
         grounding_array[0].get("google_search").is_some(),

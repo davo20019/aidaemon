@@ -32,6 +32,8 @@ impl Tool for SlowTool {
     }
 }
 
+impl crate::traits::ToolSemantics for SlowTool {}
+
 struct SlowCliAgentTool;
 
 #[async_trait::async_trait]
@@ -60,6 +62,8 @@ impl Tool for SlowCliAgentTool {
         Ok("ok".to_string())
     }
 }
+
+impl crate::traits::ToolSemantics for SlowCliAgentTool {}
 
 struct EchoSpawnAgentTool;
 
@@ -98,16 +102,6 @@ impl Tool for MandateMutationSpy {
         })
     }
 
-    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
-        crate::traits::ToolCallSemantics::mutation_with(
-            crate::traits::ToolMutationEffects::REMOTE_MUTATION,
-        )
-        .with_target_hint(
-            crate::traits::ToolTargetHintKind::Url,
-            "https://api.x.com/2/tweets",
-        )
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         self.calls.fetch_add(1, AtomicOrdering::SeqCst);
         Ok("mutated".to_string())
@@ -117,13 +111,25 @@ impl Tool for MandateMutationSpy {
         &self,
         arguments: &str,
         _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolExecutionContext,
+        exec_ctx: crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         self.saw_mandate_preapproval
             .store(exec_ctx.mandate_preapproved, AtomicOrdering::SeqCst);
         self.call(arguments)
             .await
             .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::traits::ToolSemantics for MandateMutationSpy {
+    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::REMOTE_MUTATION,
+        )
+        .with_target_hint(
+            crate::traits::ToolTargetHintKind::Url,
+            "https://api.x.com/2/tweets",
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -383,6 +389,8 @@ fn mandate_tool_ctx<'a>(
     grant: Option<&'a crate::traits::MandateAuthorityGrant>,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        mcp_tool: None,
+        owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
         status_tx: None,
@@ -392,12 +400,13 @@ fn mandate_tool_ctx<'a>(
         trusted: false,
         user_role: UserRole::Owner,
         workspace_grant: None,
-        correction_preapproved: false,
-        suppress_trusted_session: false,
         mandate_authority: grant,
         tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
         scope_escalation: None,
+        turn_authority: None,
+        trust_roots: None,
+        lone_root_call: false,
     }
 }
 
@@ -429,7 +438,27 @@ impl Tool for EchoSpawnAgentTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         Ok(arguments.to_string())
     }
+
+    /// Echoes the arguments and the dispatcher's typed facts.
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            json!({
+                "arguments": serde_json::from_str::<Value>(arguments)?,
+                "project_scope": facts.project_scope,
+                "session_id": facts.session_id,
+                "tool_call_id": facts.tool_call_id,
+            })
+            .to_string(),
+        ))
+    }
 }
+
+impl crate::traits::ToolSemantics for EchoSpawnAgentTool {}
 
 #[tokio::test]
 async fn execute_tool_watchdog_times_out_slow_tool() {
@@ -445,6 +474,8 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
             "slow_tool",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-1"),
                 status_tx: None,
@@ -454,12 +485,13 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -491,6 +523,8 @@ async fn execute_tool_watchdog_skips_cli_agent() {
             "cli_agent",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-3"),
                 status_tx: None,
@@ -500,12 +534,13 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -529,6 +564,8 @@ async fn execute_tool_watchdog_allows_fast_tool() {
             "system_info",
             "{}",
             &ToolExecCtx {
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-2"),
                 status_tx: None,
@@ -538,12 +575,13 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: None,
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -556,7 +594,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
 }
 
 #[tokio::test]
-async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
+async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
@@ -568,42 +606,51 @@ async fn execute_tool_watchdog_injects_project_scope_and_causal_tool_call_id() {
             "spawn_agent",
             r#"{"mission":"delegate log analysis","task":"inspect the logs","_project_scope":"/tmp/spoofed"}"#,
             &ToolExecCtx {
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "test-session",
                 task_id: Some("task-4"),
                 status_tx: None,
                 channel_visibility: ChannelVisibility::Private,
                 channel_id: None,
-                project_scope: Some("/Users/davidloor/Library/Logs/aidaemon"),
+                project_scope: Some("/tmp/aidaemon-test/logs"),
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: None,
                 tool_call_id: Some("call-parent-synthetic"),
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
         .expect("spawn_agent call should succeed");
 
-    let payload: Value = serde_json::from_str(&result).expect("spawn_agent args should be JSON");
+    let payload: Value = serde_json::from_str(&result).expect("spawn_agent echo should be JSON");
     assert_eq!(
-        payload.get("_project_scope").and_then(Value::as_str),
-        Some("/Users/davidloor/Library/Logs/aidaemon")
+        payload["project_scope"].as_str(),
+        Some("/tmp/aidaemon-test/logs"),
+        "the turn's scope, not the model's"
     );
     assert_eq!(
-        payload.get("mission").and_then(Value::as_str),
+        payload["arguments"]["mission"].as_str(),
         Some("delegate log analysis")
     );
+    assert_eq!(payload["session_id"].as_str(), Some("test-session"));
     assert_eq!(
-        payload.get("_session_id").and_then(Value::as_str),
-        Some("test-session")
-    );
-    assert_eq!(
-        payload.get("_tool_call_id").and_then(Value::as_str),
+        payload["tool_call_id"].as_str(),
         Some("call-parent-synthetic")
+    );
+    assert!(
+        payload["arguments"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('_')),
+        "{payload}"
     );
 }
 
@@ -624,6 +671,8 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         .call_semantics(arguments);
 
     let base_ctx = |grant| ToolExecCtx {
+        mcp_tool: None,
+        owner_approval_by_kernel: false,
         session_id: "owner-session",
         task_id: None,
         status_tx: None,
@@ -633,12 +682,13 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         trusted: false,
         user_role: UserRole::Owner,
         workspace_grant: None,
-        correction_preapproved: false,
-        suppress_trusted_session: false,
         mandate_authority: grant,
         tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
         mutation_forbidden: false,
         scope_escalation: None,
+        turn_authority: None,
+        trust_roots: None,
+        lone_root_call: false,
     };
 
     let executor_read = harness
@@ -906,6 +956,8 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
             "mandate_mutation_spy",
             arguments,
             &ToolExecCtx {
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
                 session_id: "owner-session",
                 task_id: None,
                 status_tx: None,
@@ -915,12 +967,13 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
                 trusted: false,
                 user_role: UserRole::Owner,
                 workspace_grant: None,
-                correction_preapproved: false,
-                suppress_trusted_session: false,
                 mandate_authority: Some(&grant),
                 tool_call_id: grant.tool_call_id.as_deref(),
                 mutation_forbidden: false,
                 scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
             },
         )
         .await
@@ -1052,4 +1105,108 @@ async fn mandate_dispatch_rejects_a_lost_root_task_attempt() {
         "unexpected root-attempt revocation error: {error}"
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+}
+
+/// The instance the kernel bridged and judged for a turn: it records that it
+/// ran, so a test can tell it from the registry's tool of the same name.
+struct JudgedMcpStandIn(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Tool for JudgedMcpStandIn {
+    fn name(&self) -> &str {
+        "fake__echo"
+    }
+
+    fn description(&self) -> &str {
+        "The judged instance of an MCP tool"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "fake__echo",
+            "description": "The judged instance of an MCP tool",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": true}
+        })
+    }
+
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok("ran the judged instance".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for JudgedMcpStandIn {}
+
+fn kernel_mcp_ctx<'a>(mcp_tool: Option<&'a Arc<dyn Tool>>) -> ToolExecCtx<'a> {
+    ToolExecCtx {
+        mcp_tool,
+        owner_approval_by_kernel: true,
+        ..mandate_tool_ctx(None)
+    }
+}
+
+/// A kernel call runs the MCP instance judged at turn start, even when the
+/// registry now holds a different tool under the same name (a server
+/// reloaded mid-turn): the registry's tool never runs.
+#[tokio::test]
+async fn kernel_call_runs_the_judged_mcp_instance_not_the_registrys() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let judged: Arc<dyn Tool> = Arc::new(JudgedMcpStandIn(ran.clone()));
+
+    let outcome = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(Some(&judged)),
+        )
+        .await
+        .expect("the judged instance runs");
+
+    assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
+    assert!(
+        outcome.output.contains("ran the judged instance"),
+        "{}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("synthetic registry echo"),
+        "the registry's tool ran: {}",
+        outcome.output
+    );
+}
+
+/// A kernel call for which the kernel judged no MCP tool runs nothing,
+/// even though the registry holds a tool under that name.
+#[tokio::test]
+async fn kernel_call_without_a_judged_mcp_tool_runs_nothing() {
+    let mut harness = setup_test_agent(MockProvider::new())
+        .await
+        .expect("setup test harness");
+    let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
+    assert!(registry.find_tool("fake__echo").await.is_some());
+    harness.agent.set_test_mcp_registry(registry);
+
+    let result = harness
+        .agent
+        .execute_tool_with_watchdog_outcome(
+            "fake__echo",
+            r#"{"text":"synthetic registry echo"}"#,
+            &kernel_mcp_ctx(None),
+        )
+        .await;
+
+    match result {
+        Err(error) => assert!(
+            error.downcast_ref::<UnknownToolError>().is_some(),
+            "{error}"
+        ),
+        Ok(outcome) => panic!("an unjudged MCP tool ran: {}", outcome.output),
+    }
 }

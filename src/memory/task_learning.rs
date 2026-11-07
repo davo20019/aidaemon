@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-use crate::traits::{ModelProvider, StateStore, Task};
+use crate::providers::ChatJson;
+use crate::traits::{StateStore, Task};
 use crate::types::FactPrivacy;
 
 /// Maximum size of activity log text sent to the extraction prompt.
@@ -23,7 +24,7 @@ const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     event_store: Arc<crate::events::EventStore>,
-    provider: Arc<dyn ModelProvider>,
+    provider: crate::llm_runtime::ModelBackend,
     model: String,
     task: Task,
 ) -> anyhow::Result<()> {

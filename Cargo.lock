@@ -71,7 +71,13 @@ name = "aidaemon"
 version = "0.12.9"
 dependencies = [
  "aes-gcm",
+ "aidaemon-core",
+ "aidaemon-memory",
  "aidaemon-node-protocol",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-store-sqlite",
+ "aidaemon-tools",
  "anyhow",
  "assert_cmd",
  "async-imap",
@@ -137,6 +143,140 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-agents"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-channel-discord"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-channels",
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-channel-slack"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-channels",
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-channel-telegram"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-channels",
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-channels"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-channels",
+ "aidaemon-core",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-core"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "aidaemon-eval"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-eval",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-mcp"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-mcp",
+ "async-trait",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-memory"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-memory",
+ "aidaemon-policies",
+ "async-trait",
+ "chrono",
+ "fastembed",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aidaemon-node-protocol"
 version = "0.1.0"
 dependencies = [
@@ -157,6 +297,95 @@ dependencies = [
  "reqwest",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "aidaemon-policies"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aidaemon-providers"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-sdk"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-agents",
+ "aidaemon-channel-discord",
+ "aidaemon-channel-slack",
+ "aidaemon-channel-telegram",
+ "aidaemon-channels",
+ "aidaemon-core",
+ "aidaemon-eval",
+ "aidaemon-mcp",
+ "aidaemon-memory",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-store-sqlite",
+ "aidaemon-tools",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-store-sqlite"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "aidaemon-tools"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "globset",
+ "htmd",
+ "ignore",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -6809,6 +7038,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

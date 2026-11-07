@@ -13,7 +13,6 @@
 use std::time::Instant;
 
 use crate::agent::llm_classifier::{classify_intent, LlmIntentClass};
-use crate::providers::OpenAiCompatibleProvider;
 
 struct CorpusCase {
     user_text: &'static str,
@@ -185,7 +184,10 @@ async fn intent_classifier_bench_run_corpus() {
     println!("base_url: {base_url}");
     println!("model:    {model}");
 
-    let provider = OpenAiCompatibleProvider::new(&base_url, &api_key)
+    let provider = aidaemon_providers::OpenAiCompatible::builder()
+        .base_url(&base_url)
+        .api_key(&api_key)
+        .build()
         .expect("failed to construct provider");
 
     let cases = corpus();

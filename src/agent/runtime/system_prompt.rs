@@ -1,4 +1,3 @@
-use super::recall_guardrails::{build_critical_facts_prompt_block, extract_critical_fact_summary};
 use super::*;
 
 /// Framing for the recent dialogue a new request keeps. The earlier turns are
@@ -180,9 +179,6 @@ impl Agent {
         channel_ctx: &ChannelContext,
         tools_count: usize,
         resume_checkpoint: Option<&ResumeCheckpoint>,
-        owner_dm_fact_cache: Option<&[crate::traits::Fact]>,
-        session_summary: Option<&crate::traits::ConversationSummary>,
-        memory_pipeline_allowed: bool,
         preserve_conversation_context: bool,
         project_instruction_scope: Option<&str>,
     ) -> anyhow::Result<(
@@ -311,9 +307,6 @@ impl Agent {
         // status on an internal channel must not implicitly import the owner's
         // private memory graph into an externally-acting agent.
         let mandate_context = self.mandate_execution.is_some();
-        let inject_personal = !mandate_context
-            && user_role == UserRole::Owner
-            && channel_ctx.should_inject_personal_memory();
         let non_owner_shared_context = user_role != UserRole::Owner
             && matches!(
                 channel_ctx.visibility,
@@ -321,195 +314,6 @@ impl Agent {
                     | ChannelVisibility::Public
                     | ChannelVisibility::PublicExternal
             );
-        // Memory retrieval remains current-request-scoped. Conversation
-        // continuity is assembled separately from typed task lineage below;
-        // mixing previous prose into this query would create an unremovable
-        // stale-context channel when semantic assessment refines a provisional
-        // follow-up into a new task.
-        let retrieval_query = user_text.to_string();
-
-        // Facts: always use channel-scoped semantic retrieval.
-        // Previously the owner_dm_fact_cache (all facts) was used here, but
-        // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
-        // to bleed into prompts for unrelated queries like "count lines in router.rs".
-        let facts = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else {
-            self.state
-                .get_relevant_facts_for_channel(
-                    &retrieval_query,
-                    self.limits.max_facts,
-                    channel_ctx.channel_id.as_deref(),
-                    channel_ctx.visibility,
-                    user_role == UserRole::Owner,
-                )
-                .await?
-        };
-
-        // Critical facts (identity/profile) use the pre-fetched identity-only
-        // cache from bootstrap, NOT get_facts(None) which returns ALL facts.
-        let mut critical_fact_summary = if mandate_context || !memory_pipeline_allowed {
-            Default::default()
-        } else if inject_personal && user_role == UserRole::Owner {
-            if let Some(identity_facts) = owner_dm_fact_cache {
-                extract_critical_fact_summary(identity_facts)
-            } else {
-                // No cache available (non-bootstrap path) — fetch identity
-                // categories directly instead of get_facts(None) which returns all.
-                let mut identity_facts = Vec::new();
-                for cat in &[
-                    "identity",
-                    "personal",
-                    "profile",
-                    "user",
-                    "assistant",
-                    "bot",
-                    "relationship",
-                    "preference",
-                    "family",
-                ] {
-                    if let Ok(mut facts) = self.state.get_facts(Some(cat)).await {
-                        identity_facts.append(&mut facts);
-                    }
-                }
-                extract_critical_fact_summary(&identity_facts)
-            }
-        } else {
-            Default::default()
-        };
-
-        // Episodes: channel-scoped for non-DM channels
-        let episodes = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_relevant_episodes(user_text, 3)
-                .await
-                .unwrap_or_default()
-        } else {
-            match channel_ctx.visibility {
-                ChannelVisibility::PublicExternal => vec![],
-                _ => self
-                    .state
-                    .get_relevant_episodes_for_channel(
-                        user_text,
-                        3,
-                        channel_ctx.channel_id.as_deref(),
-                    )
-                    .await
-                    .unwrap_or_default(),
-            }
-        };
-
-        // Personal goals/profile remain DM-only. Operational failure patterns are
-        // safe to use more broadly because they encode agent-side recovery guidance,
-        // not user-private preferences.
-        let goals = if mandate_context || !memory_pipeline_allowed {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_active_personal_goals(20)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
-        let patterns = if !memory_pipeline_allowed
-            || mandate_context
-            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
-        {
-            vec![]
-        } else if inject_personal {
-            self.state
-                .get_behavior_patterns(0.5)
-                .await
-                .unwrap_or_default()
-        } else {
-            self.state
-                .get_behavior_patterns(0.5)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|pattern| pattern.pattern_type == "failure")
-                .collect()
-        };
-        // Procedures and error solutions are operational — always load
-        // (except on PublicExternal where we restrict everything)
-        let (procedures, error_solutions) = if !memory_pipeline_allowed
-            || mandate_context
-            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
-        {
-            (vec![], vec![])
-        } else {
-            (
-                self.state
-                    .get_relevant_procedures(user_text, 5)
-                    .await
-                    .unwrap_or_default(),
-                self.state
-                    .get_relevant_error_solutions(user_text, 5)
-                    .await
-                    .unwrap_or_default(),
-            )
-        };
-        let profile = if memory_pipeline_allowed && !mandate_context && inject_personal {
-            self.state.get_user_profile().await.ok().flatten()
-        } else {
-            None
-        };
-
-        // People context: resolve current speaker and fetch people data (only when enabled)
-        let people_enabled = memory_pipeline_allowed
-            && !mandate_context
-            && self
-                .state
-                .get_setting("people_enabled")
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("true");
-
-        let (people, current_person, current_person_facts) =
-            if !memory_pipeline_allowed || mandate_context || !people_enabled {
-                (vec![], None, vec![])
-            } else if inject_personal {
-                // In owner DMs the people list only selects the privacy rules;
-                // the owner's own profile reaches the prompt via Core Profile.
-                let all_people = self.state.get_all_people().await.unwrap_or_default();
-                (all_people, None, vec![])
-            } else if let Some(ref sender_id) = channel_ctx.sender_id {
-                // Non-owner context: try to resolve who is speaking
-                match self.state.get_person_by_platform_id(sender_id).await {
-                    Ok(Some(person)) => {
-                        // Update interaction tracking (fire-and-forget)
-                        let _ = self.state.touch_person_interaction(person.id).await;
-                        let facts = self
-                            .state
-                            .get_person_facts(person.id, None)
-                            .await
-                            .unwrap_or_default();
-                        (vec![], Some(person), facts)
-                    }
-                    _ => (vec![], None, vec![]),
-                }
-            } else {
-                (vec![], None, vec![])
-            };
-
-        // Build extended system prompt with all memory components
-        let memory_context = MemoryContext {
-            facts: &facts,
-            episodes: &episodes,
-            goals: &goals,
-            patterns: &patterns,
-            procedures: &procedures,
-            error_solutions: &error_solutions,
-            profile: profile.as_ref(),
-            people: &people,
-            current_person: current_person.as_ref(),
-            current_person_facts: &current_person_facts,
-        };
 
         // Compile session context from recent events (for "what are you doing?" awareness)
         let session_context_str = if mandate_context || non_owner_shared_context {
@@ -566,62 +370,6 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
-        let (core_profile_str, core_profile_digest) = if memory_pipeline_allowed
-            && inject_personal
-            && user_role == UserRole::Owner
-            && self.depth == 0
-        {
-            let cached_ids = self
-                .session_core_profile_ids
-                .read()
-                .await
-                .get(session_id)
-                .cloned();
-            let (profile_str, new_ids, digest) = crate::memory::core_profile::build_core_profile(
-                &self.state,
-                cached_ids,
-                people_enabled,
-            )
-            .await
-            .unwrap_or_default();
-
-            if let Some(ids) = new_ids {
-                self.session_core_profile_ids
-                    .write()
-                    .await
-                    .insert(session_id.to_string(), ids);
-            }
-            (profile_str, digest)
-        } else {
-            (String::new(), Vec::new())
-        };
-
-        // Per-render core_profile selection digest (id + content hash per entity).
-        // Emitted as telemetry so a future core_profile churn self-explains: diffing
-        // consecutive digests shows exactly which entity's content changed or whether
-        // the selected set shifted — closing the "why did the core bust?" gap.
-        if self.record_decision_points && !core_profile_digest.is_empty() {
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                DecisionType::CoreProfileSelection,
-                format!(
-                    "Core profile selection: {} entities",
-                    core_profile_digest.len()
-                ),
-                json!({
-                    "code": "core_profile_digest",
-                    "count": core_profile_digest.len(),
-                    "entities": core_profile_digest
-                        .iter()
-                        .map(|(id, h)| json!({ "id": id, "h": h }))
-                        .collect::<Vec<_>>(),
-                }),
-            )
-            .await;
-        }
-
         let core_inputs = core_prompt::assemble_core_inputs(
             user_role,
             channel_ctx,
@@ -637,7 +385,6 @@ impl Agent {
                 .map(|(name, desc)| (name.to_string(), desc))
                 .collect(),
             channel_rules,
-            core_profile_str,
         );
         // Pillar A Task 7: per-session core cache. On a HIT (aggregate hash
         // unchanged since this session's last task) the rendered bytes are reused
@@ -661,77 +408,10 @@ impl Agent {
             }
             decision.bytes
         };
-        if let Some(configured_name) = infer_assistant_name_from_prompt(&self.system_prompt) {
-            critical_fact_summary.assistant_name = Some(configured_name);
-        }
-
         // ---- TAIL assembly (per-task volatile context) ----
-        // Critical facts (identity/profile) — exact stored values, volatile.
-        let critical_facts_block = build_critical_facts_prompt_block(&critical_fact_summary);
-
-        // Query-ranked memory recall + people/current-speaker context + matched
-        // skill CONTENT. These flow through `build_system_prompt_with_memory`
-        // (which no longer emits the availability catalog — that is CORE now).
-        let memory_render = skills::build_system_prompt_with_memory_report(
-            "",
-            &skills_snapshot,
-            &active_skills,
-            &memory_context,
-            self.limits.max_facts,
-            &channel_ctx.user_id_map,
-        );
-        let memory_section = memory_render.prompt.as_str();
-        if let Err(error) = self
-            .state
-            .record_memory_recall(
-                &memory_render.rendered_fact_ids,
-                &memory_render.rendered_episode_ids,
-            )
-            .await
-        {
-            tracing::debug!(%error, "Failed to record rendered memory recall");
-        }
-
-        if self.record_decision_points {
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                DecisionType::MemoryRetrieval,
-                format!(
-                    "Memory fetched/rendered: facts={}/{} episodes={}/{} procedures={}/{}",
-                    facts.len(),
-                    memory_render.rendered_fact_ids.len(),
-                    episodes.len(),
-                    memory_render.rendered_episode_ids.len(),
-                    procedures.len(),
-                    memory_render.rendered_procedure_ids.len()
-                ),
-                json!({
-                    "policy": if memory_pipeline_allowed { "allowed" } else { "suppressed" },
-                    "pipeline_suppressed": !memory_pipeline_allowed,
-                    "fetched": {
-                        "facts": facts.len(),
-                        "episodes": episodes.len(),
-                        "goals": goals.len(),
-                        "patterns": patterns.len(),
-                        "procedures": procedures.len(),
-                        "error_solutions": error_solutions.len(),
-                        "people": people.len(),
-                        "current_person_facts": current_person_facts.len()
-                    },
-                    "rendered": {
-                        "fact_ids": memory_render.rendered_fact_ids,
-                        "episode_ids": memory_render.rendered_episode_ids,
-                        "goal_ids": memory_render.rendered_goal_ids,
-                        "procedure_ids": memory_render.rendered_procedure_ids,
-                        "error_solution_ids": memory_render.rendered_error_solution_ids,
-                        "pattern_ids": memory_render.rendered_pattern_ids
-                    }
-                }),
-            )
-            .await;
-        }
+        // Matched skill CONTENT. Long-term memory reaches the model through
+        // the memory plugin's note, not this prompt.
+        let skills_content = skills::render_active_skills_content(&active_skills);
 
         // Current date and time — volatile by definition; lives in the tail so
         // message zero (the core) stays byte-stable across turns.
@@ -741,9 +421,6 @@ impl Agent {
         // Resume checkpoint — MOVED out of the core (Pillar A §Tail).
         let resume_section = (user_role == UserRole::Owner && !mandate_context)
             .then(|| resume_checkpoint.map(|checkpoint| checkpoint.render_prompt_section()))
-            .flatten();
-        let session_summary = (!mandate_context && !non_owner_shared_context)
-            .then_some(session_summary)
             .flatten();
 
         // Repository instructions are per-task and per-scope, so they belong
@@ -793,7 +470,7 @@ impl Agent {
             None
         };
 
-        // Mirrors the transcript rule in `message_build_phase`: top-level chat
+        // Mirrors the transcript rule in `message_build`: top-level chat
         // keeps recent dialogue across a new-request boundary, so say how to
         // read it.
         let new_request_dialogue_note = if mandate_context || self.depth > 0 {
@@ -802,21 +479,17 @@ impl Agent {
             NEW_REQUEST_DIALOGUE_NOTE
         };
         let fresh_tail = Self::build_context_tail(
-            critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
-            memory_section,
+            &skills_content,
             channel_ctx.sender_name.as_deref(),
-            None,
             new_request_dialogue_note,
             &date_time_str,
             resume_section.as_deref(),
         );
         let continuation_tail = Self::build_context_tail(
-            critical_facts_block.as_deref(),
             project_instructions_block.as_deref(),
-            memory_section,
+            &skills_content,
             channel_ctx.sender_name.as_deref(),
-            session_summary,
             &session_context_str,
             &date_time_str,
             resume_section.as_deref(),
@@ -893,17 +566,6 @@ impl Agent {
             )
             .await;
         }
-
-        info!(
-            session_id,
-            facts = facts.len(),
-            episodes = episodes.len(),
-            goals = goals.len(),
-            patterns = patterns.len(),
-            procedures = procedures.len(),
-            has_session_context = !session_context_str.is_empty(),
-            "Memory context loaded"
-        );
 
         Ok((
             core_prompt_bytes,
@@ -1033,8 +695,9 @@ impl Agent {
             )
         };
         let role_rules = if fence.worker_task_id == fence.root_task_id {
-            format!(
-                "role: task_lead\nAutonomy: {autonomy_rules}\nProtocol graph: SIGNAL -> OBSERVE -> ASSESS -> ADAPT/ACT/WAIT/ASK/STOP -> VERIFY -> SCHEDULE. Traverse this typed graph once per review; do not create an open-ended reasoning loop. Gather only authorized observations, retain their exact successful receipt identifiers (the tool_call_id or the receipt footer result_id) as evidence_receipt_ids, select one typed activity_level, then record exactly one ACT, WAIT, ASK, or STOP decision. When owner_policy.objective_control is present, the objective is a measured control loop: during OBSERVE read the current metric value from its measurement_source, then call manage_mandates record_measurement with value_micros (millionths of one unit: 25 engagements = 25000000), confidence_bps, the exact evidence_receipt_ids of that read, and attributed_intention_ids for any prior intentions whose effect this value reflects, before recording the decision. Compare current value against baseline_micros and target_micros in the direction given; the untrusted history block lists prior objective_measurements and next_measurement_due. When owner_policy.objective_control is null but a success criterion names a measurable quantity (followers, subscribers, posts published, revenue, response time, or any count/rate/threshold), the objective has no control loop yet: use your authorized observations to read the current value once, then record ASK whose single bounded question proposes a complete objective_control (metric_name, unit, baseline_micros from that receipt, target_micros derived from the criterion, direction, exact in-scope measurement_source, measurement_cadence_secs within the review bounds, minimum_effect_micros, max_stagnant_measurements, run_failure_budget) and states that the owner confirms it through a policy update; do not ACT on a measurable objective that has no control loop, and do not repeat the ASK once it has been recorded until the owner answers. If the metric cannot be read this cycle (the field is absent or the read failed), record value_micros 0 with confidence_bps 0 and never guess; an unreadable metric is a measurement outage, not stagnation and not a reason to ASK or STOP, so continue within current authority. ACT when the expected_benefit names a concrete metric movement of at least minimum_effect_micros or advances an owner-authored success criterion or requested cadence; STOP with success_criteria_satisfied only when the latest measurement reaches the target; if credible measurements (confidence_bps > 0) have not improved across max_stagnant_measurements measurement periods, a WAIT that keeps the same tactic is rejected: ACT when a mutation slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the mutation quota is exhausted or cooling down, WAIT stays admissible. quiet uses the default cadence, active accelerates it, and urgent uses the owner-confirmed minimum; explicit reconsider_minutes is still clamped to the confirmed bounds. Every authenticated http_request observation must carry the exact owner-pinned auth_profile and top-level account_id matching its configured user_id; never guess or infer an account identity. URL queries must match an exact scoped query or use only parameter names present in that operation scope's allowed_query_params. The owner's requested activity and cadence are owner-authored value, not proof on their own that any particular action is good: when a mutation-quota slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that requested cadence is itself a sufficient expected_benefit. Before ACT, compare the smallest useful intervention with WAIT using current evidence; do not act merely to demonstrate activity beyond the requested cadence, maximize output volume, or obey a stale tactic after its assumptions fail. ACT requires a positive mutation budget, at least one current-run evidence receipt, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk assessment, invalidation_criteria, one committed intention, and only the minimum exact run-bound child tasks needed for that intention. If no intervention materially advances a confirmed success criterion after costs and risks, record WAIT and schedule the next useful observation. Create and exact-claim non-root tasks through manage_goal_tasks; do not perform mutations yourself and do not use generic auto-dispatch. WAIT, ASK, and STOP require zero action children and zero mutation attempts. ASK must pose one bounded question. If the latest decision in history is an ASK and the owner has not answered, the mandate resumed on its own: do not repeat that ASK; continue within current authority. Never ASK the owner merely for permission to retry an internal fence/protocol failure. If operation_not_allowed reveals that one specific minimal policy expansion is genuinely necessary, ASK once for that exact tool/operation/effect/account/URL-or-query change and state that it requires a separately confirmed policy update; never suggest that answer_question or ordinary guidance can grant it. If no specific safe expansion can be proposed, record WAIT with no children and identify the exact rejected operation in the rationale. STOP must create no work, name a typed termination_kind, match the exact owner-authored criterion/condition when applicable, and cite current-run structured receipts for evidence-dependent claims. When current-run evidence changes tactics, pair the learning note with a stable canonical strategy_key, typed strategy_kind, and confidence basis points; reinforce, explore, avoid, or retire one graph node per review. Adaptive strategy and learning are advisory, must cite current decision receipt IDs, and can never alter authority."
+            task_lead_rules(
+                autonomy_rules,
+                mandate.autonomy_mode.is_autopilot() && mandate.objective_control.is_some(),
             )
         } else {
             format!(
@@ -1069,7 +732,6 @@ impl Agent {
             Vec::new(),
             bundled_specialists,
             channel_rules,
-            String::new(),
         );
         let core_prompt_bytes = {
             let mut cache = self.core_prompts.write().await;
@@ -1092,7 +754,7 @@ impl Agent {
         // MemoryContext emits owner-memory affordances and a `Your Memory`
         // shell that do not belong in an externally acting mandate worker.
         let date_time_str = prompt_now.format("%A, %B %-d, %Y %H:%M UTC").to_string();
-        let tail = Self::build_context_tail(None, None, "", None, None, "", &date_time_str, None);
+        let tail = Self::build_context_tail(None, "", None, "", &date_time_str, None);
 
         if self.record_decision_points {
             let mut core_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1412,9 +1074,26 @@ impl Agent {
              [Self-Inspection]\n\
              You cannot directly access your own database files. Do NOT use terminal to run `find`, `ls`, `sqlite3`, or any command \
              to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
-             Instead, use your built-in tools for self-inspection:\n\
-             - `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n\
-             - `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
+             Instead, use your built-in tools for self-inspection:\n",
+        );
+        // Memory inspection is the active memory plugin's; goal actions
+        // stay on `manage_memories` under any plugin.
+        if self
+            .memory
+            .owned_daemon_tools()
+            .contains(&"manage_memories")
+        {
+            rules.push_str(
+                "- `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n",
+            );
+        } else {
+            rules.push_str(
+                "- `manage_memories` (goal actions) — for personal goals and scheduled tasks\n\
+                 - your memory recall tool — for stored facts and preferences\n",
+            );
+        }
+        rules.push_str(
+            "- `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
              - `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n\
              When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
              use these tools — never try to find raw database files.",
@@ -1521,51 +1200,26 @@ impl Agent {
     /// checkpoint. Empty sections are dropped.
     #[allow(clippy::too_many_arguments)]
     fn build_context_tail(
-        critical_facts_block: Option<&str>,
         project_instructions_block: Option<&str>,
-        memory_section: &str,
+        skills_content: &str,
         sender_name: Option<&str>,
-        session_summary: Option<&crate::traits::ConversationSummary>,
         session_context_str: &str,
         date_time_str: &str,
         resume_section: Option<&str>,
     ) -> String {
         let mut tail = String::from(crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER);
 
-        if let Some(block) = critical_facts_block {
-            tail.push_str("\n\n");
-            tail.push_str(block);
-        }
-
         if let Some(block) = project_instructions_block {
             tail.push_str("\n\n");
             tail.push_str(block);
         }
 
-        if !memory_section.trim().is_empty() {
-            tail.push_str(memory_section);
+        if !skills_content.trim().is_empty() {
+            tail.push_str(skills_content);
         }
 
         if let Some(name) = sender_name {
             tail.push_str(&format!("\n\n[Current speaker: {}]", name));
-        }
-
-        // Session summary (volatile): MOVED here from the build-stage index-1
-        // insertion (Pillar A). The summary now participates ONLY in the tail.
-        if let Some(summary) = session_summary {
-            if !summary.summary.is_empty() {
-                tail.push_str(&format!(
-                    "\n\n[Context Coverage]\nCompacted through canonical turn {} / message {}. \
-                     Recent raw turns and the immediately preceding exchange are supplied separately. \
-                     If exact wording or evidence is absent below, retrieve the canonical conversation with `search_history`; do not guess.\n\n[Compacted Conversation State]\n",
-                    summary
-                        .last_turn_seq
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "legacy".to_string()),
-                    summary.last_message_id
-                ));
-                tail.push_str(&summary.summary);
-            }
         }
 
         if !session_context_str.is_empty() {
@@ -1589,11 +1243,105 @@ impl Agent {
     }
 }
 
+/// The mandate task lead's protocol rules. The measured control loop
+/// (record_measurement, stagnation, STOP on target) is included only for an
+/// autopilot mandate with an objective control; elsewhere it is advisory and
+/// its rules are noise. Evidence receipts are attached by the runtime.
+pub(super) fn task_lead_rules(autonomy_rules: &str, control_loop: bool) -> String {
+    let mut rules = format!(
+        "role: task_lead\nAutonomy: {autonomy_rules}\n\
+Protocol: OBSERVE -> decide exactly one of ACT, WAIT, ASK, or STOP -> SCHEDULE, once per review; never an open-ended loop. Gather only authorized observations, select one typed activity_level, then record the decision with manage_mandates record_decision. evidence_receipt_ids are optional: omit them and the runtime cites this run's successful observations.\n\
+Every authenticated http_request must carry the exact owner-pinned auth_profile and a top-level account_id matching its configured user_id; never guess or infer an account identity. URL queries must match an exact scoped query or use only parameter names in that operation scope's allowed_query_params.\n\
+The owner's requested activity and cadence are owner-authored value, not proof that any particular action is good: when a mutation slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that cadence is a sufficient expected_benefit. Before ACT, compare the smallest useful intervention with WAIT; do not act to demonstrate activity, maximize volume, or follow a stale tactic.\n\
+ACT requires a positive mutation budget, a successful observation in this run, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk, invalidation_criteria, one committed intention, and only the minimum run-bound child tasks for it. Create and exact-claim those tasks through manage_goal_tasks; never mutate yourself or use generic auto-dispatch. If no intervention materially advances a confirmed success criterion, record WAIT.\n\
+WAIT, ASK, and STOP create no action tasks and no mutation attempts. ASK poses one bounded question; if the latest decision is an unanswered ASK, do not repeat it and continue within current authority. Never ASK for permission to retry an internal fence or protocol failure. If operation_not_allowed shows that one specific minimal policy expansion is necessary, ASK once for that exact change and say it needs a separately confirmed policy update; never suggest that answer_question or ordinary guidance can grant it. Otherwise record WAIT with no children, naming the rejected operation. STOP creates no work, names a typed termination_kind, and matches the exact owner-authored criterion or condition when one applies.\n\
+quiet uses the default cadence, active accelerates it, urgent uses the owner-confirmed minimum; reconsider_minutes is clamped to the confirmed bounds. Learning notes and strategy revisions are advisory, cite this run's receipt ids, pair a stable strategy_key with a typed strategy_kind and confidence, and never alter authority."
+    );
+    if control_loop {
+        rules.push_str(
+            "\nObjective control loop: during OBSERVE read the metric from objective_control.measurement_source, then call manage_mandates record_measurement with measurement_value_micros (millionths of one unit: 25 engagements = 25000000), measurement_confidence_bps, and attributed_intention_ids for prior intentions this value reflects, before the decision. Compare it with baseline_micros and target_micros in the given direction; the history block lists prior objective_measurements and next_measurement_due. If the metric cannot be read, record measurement_value_micros 0 with measurement_confidence_bps 0 and never guess: an unreadable metric is an outage, not stagnation, and no reason to ASK or STOP. ACT when the expected_benefit names a movement of at least minimum_effect_micros or advances an owner-authored criterion or cadence. STOP with success_criteria_satisfied only when the latest measurement reaches the target. If credible measurements (measurement_confidence_bps > 0) have not improved across max_stagnant_measurements periods, a WAIT that keeps the same tactic is rejected: ACT when a slot is free, WAIT with a strategy revision that explores, avoids, or retires a tactic, ASK, or STOP; while the quota is exhausted or cooling down, WAIT stays admissible.",
+        );
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_available_specialists_block, format_goal_context, infer_assistant_name_from_prompt,
+        task_lead_rules,
     };
+
+    /// A bounded mandate's lead carries no control-loop rules and no
+    /// receipt-copying instructions; autopilot with an objective control
+    /// keeps the measured loop.
+    #[test]
+    fn bounded_task_lead_prompt_omits_control_loop_rules() {
+        // The single task-lead rule string before the split.
+        const PREVIOUS_RULES_CHARS: usize = 5_800;
+        let bounded = task_lead_rules("Bounded mode is active.", false);
+        assert!(!bounded.contains("record_measurement"), "{bounded}");
+        assert!(!bounded.contains("proposes a complete objective_control"));
+        assert!(!bounded.contains("retain their exact successful receipt identifiers"));
+        assert!(
+            bounded.len() * 10 <= PREVIOUS_RULES_CHARS * 7,
+            "bounded rules are {} chars",
+            bounded.len()
+        );
+        let autopilot = task_lead_rules("Autopilot is owner-confirmed.", true);
+        assert!(autopilot.contains("record_measurement"), "{autopilot}");
+        assert!(autopilot.contains("max_stagnant_measurements"));
+    }
+
+    /// The rules name manage_mandates arguments; each must be one the tool's
+    /// schema accepts, or a model that follows the prompt is refused by
+    /// `additionalProperties: false`.
+    #[tokio::test]
+    async fn task_lead_rules_name_only_real_manage_mandates_arguments() {
+        use crate::traits::Tool;
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = crate::tools::ManageMandatesTool::new(
+            harness.state.clone(),
+            crate::tools::ApprovalBroker::new(approval_tx),
+        );
+        let schema = tool.schema();
+        let properties = schema["parameters"]["properties"]
+            .as_object()
+            .expect("manage_mandates properties");
+        let rules = task_lead_rules("Autopilot is owner-confirmed.", true);
+        for argument in [
+            "evidence_receipt_ids",
+            "activity_level",
+            "value_criterion",
+            "expected_benefit",
+            "risk",
+            "invalidation_criteria",
+            "intention",
+            "termination_kind",
+            "reconsider_minutes",
+            "strategy_key",
+            "strategy_kind",
+            "measurement_value_micros",
+            "measurement_confidence_bps",
+            "attributed_intention_ids",
+        ] {
+            assert!(rules.contains(argument), "rules no longer name {argument}");
+            assert!(
+                properties.contains_key(argument),
+                "rules name {argument}, which manage_mandates does not accept"
+            );
+        }
+        for retired in [
+            "record value_micros",
+            "with value_micros",
+            " confidence_bps,",
+        ] {
+            assert!(!rules.contains(retired), "rules still say {retired:?}");
+        }
+    }
 
     #[test]
     fn configured_multi_word_agent_name_is_inferred_from_identity_line() {
@@ -1646,7 +1394,6 @@ mod tests {
                 .into_iter()
                 .map(|(n, d)| (n.to_string(), d))
                 .collect(),
-            String::new(),
             String::new(),
         );
         let rendered = render_core_prompt(&core_inputs);
@@ -1729,7 +1476,6 @@ mod tests {
     #[tokio::test]
     async fn new_task_prompt_omits_prior_summary_and_session_activity() {
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::ConversationSummary;
         use crate::types::{ChannelContext, UserRole};
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1739,15 +1485,6 @@ mod tests {
             harness.agent.event_store().clone(),
             "new-task-session".to_string(),
         );
-        let summary = ConversationSummary {
-            session_id: "new-task-session".to_string(),
-            summary: "STALE_OUTPUT_FORMAT phase=OLD package_name=stale".to_string(),
-            message_count: 2,
-            last_message_id: "old-answer".to_string(),
-            last_turn_seq: Some(1),
-            updated_at: chrono::Utc::now(),
-        };
-
         let (_, tail, continuation_tail, _, _) = harness
             .agent
             .build_system_prompt_for_message(
@@ -1759,9 +1496,6 @@ mod tests {
                 &ChannelContext::private("synthetic-owner"),
                 0,
                 None,
-                None,
-                Some(&summary),
-                true,
                 false,
                 None,
             )
@@ -1772,97 +1506,19 @@ mod tests {
         assert!(!tail.contains("package_name=stale"));
         assert!(!tail.contains("Compacted Conversation State"));
         assert!(!tail.contains("Recent Session Context"));
-        assert!(continuation_tail.contains("STALE_OUTPUT_FORMAT"));
-    }
-
-    #[tokio::test]
-    async fn suppressed_memory_pipeline_removes_core_profile_from_the_same_session() {
-        use crate::testing::{setup_test_agent_root, MockProvider};
-        use crate::traits::{FactStore, StateStore};
-        use crate::types::{ChannelContext, FactPrivacy, UserRole};
-
-        let harness = setup_test_agent_root(MockProvider::new())
-            .await
-            .expect("setup test harness");
-        harness
-            .state
-            .upsert_fact(
-                "personal",
-                "private_profile_sentinel",
-                "SYNTHETIC_CORE_PROFILE_VALUE",
-                "owner_dm",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .expect("seed profile fact");
-        let profile_state: std::sync::Arc<dyn StateStore> = harness.state.clone();
-        let (seeded_profile, _, _) =
-            crate::memory::core_profile::build_core_profile(&profile_state, None, false)
-                .await
-                .expect("build seeded profile");
-        assert!(seeded_profile.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
-        let emitter = crate::events::EventEmitter::new(
-            harness.agent.event_store().clone(),
-            "memory-policy-session".to_string(),
-        );
-        let (allowed_core, _, _, _, _) = harness
-            .agent
-            .build_system_prompt_for_message(
-                &emitter,
-                "memory-allowed-task",
-                "memory-policy-session",
-                "Use the current owner context.",
-                UserRole::Owner,
-                &ChannelContext::private("synthetic-owner"),
-                0,
-                None,
-                None,
-                None,
-                true,
-                false,
-                None,
-            )
-            .await
-            .expect("build memory-allowed prompt");
-        assert!(
-            allowed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"),
-            "memory-allowed core omitted seeded profile; profile_header={} core_bytes={}",
-            allowed_core.contains("## Core Profile"),
-            allowed_core.len()
-        );
-
-        let (suppressed_core, suppressed_tail, _, _, _) = harness
-            .agent
-            .build_system_prompt_for_message(
-                &emitter,
-                "memory-suppressed-task",
-                "memory-policy-session",
-                "Answer without persistent personal context.",
-                UserRole::Owner,
-                &ChannelContext::private("synthetic-owner"),
-                0,
-                None,
-                None,
-                None,
-                false,
-                false,
-                None,
-            )
-            .await
-            .expect("build memory-suppressed prompt");
-        assert!(!suppressed_core.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
-        assert!(!suppressed_tail.contains("SYNTHETIC_CORE_PROFILE_VALUE"));
+        // A continuation turn's summary is placed by the SDK summary note
+        // (`conversation_compaction::summary_note`), never in either tail.
+        assert!(!continuation_tail.contains("Compacted Conversation State"));
     }
 
     #[tokio::test]
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{
-            ConversationSummary, Fact, Goal, Mandate, MandateAuthority, MandateObjectiveControl,
-            MandateStore, ObjectiveMetricDirection, TaskAttempt,
+            Goal, Mandate, MandateAuthority, MandateObjectiveControl, MandateStore,
+            ObjectiveMetricDirection, TaskAttempt,
         };
-        use crate::types::{ChannelContext, FactPrivacy, UserRole};
+        use crate::types::{ChannelContext, UserRole};
 
         let mut harness = setup_test_agent(MockProvider::new())
             .await
@@ -1991,31 +1647,6 @@ mod tests {
             &attempt.id,
             &attempt,
         );
-        let now = chrono::Utc::now();
-        let private_fact = Fact {
-            id: 1,
-            category: "identity".to_string(),
-            key: "owner_name".to_string(),
-            value: "Secret Owner Name".to_string(),
-            source: "owner_dm".to_string(),
-            created_at: now,
-            updated_at: now,
-            superseded_at: None,
-            recall_count: 0,
-            last_recalled_at: None,
-            channel_id: None,
-            privacy: FactPrivacy::Private,
-            first_seen_at: None,
-            source_excerpt: None,
-        };
-        let summary = ConversationSummary {
-            session_id: "mandate-session".to_string(),
-            summary: "SECRET PRIOR CONVERSATION".to_string(),
-            message_count: 4,
-            last_message_id: "last-message".to_string(),
-            last_turn_seq: Some(4),
-            updated_at: now,
-        };
         let emitter = crate::events::EventEmitter::new(
             harness.agent.event_store().clone(),
             "mandate-session".to_string(),
@@ -2031,9 +1662,6 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(std::slice::from_ref(&private_fact)),
-                Some(&summary),
-                false,
                 false,
                 project_dir.path().to_str(),
             )
@@ -2089,18 +1717,17 @@ mod tests {
         assert!(prompt.contains("\"max_mutating_actions_per_rolling_24h\":8"));
         assert!(prompt.contains("\"min_seconds_between_mutations\":1800"));
         assert!(prompt.contains("role: task_lead"));
-        assert!(prompt.contains("SIGNAL -> OBSERVE -> ASSESS"));
-        assert!(prompt.contains("do not create an open-ended reasoning loop"));
+        assert!(prompt.contains("OBSERVE -> decide exactly one of ACT, WAIT, ASK, or STOP"));
+        assert!(prompt.contains("never an open-ended loop"));
         assert!(prompt.contains("select one typed activity_level"));
-        assert!(prompt
-            .contains("meeting that requested cadence is itself a sufficient expected_benefit"));
-        assert!(prompt.contains("an unreadable metric is a measurement outage"));
-        assert!(prompt.contains("do not repeat that ASK"));
+        assert!(prompt.contains("meeting that cadence is a sufficient expected_benefit"));
+        assert!(prompt.contains("an unreadable metric is an outage"));
+        assert!(prompt.contains("do not repeat it"));
         assert!(prompt.contains("one exact owner-authored value_criterion"));
-        assert!(prompt.contains("do not act merely to demonstrate activity"));
+        assert!(prompt.contains("do not act to demonstrate activity"));
         assert!(prompt.contains("strategy_key"));
-        assert!(prompt.contains("can never alter authority"));
-        assert!(prompt.contains("Never ASK the owner merely for permission to retry"));
+        assert!(prompt.contains("never alter authority"));
+        assert!(prompt.contains("Never ASK for permission to retry"));
         assert!(prompt.contains("ASK once for that exact"));
         assert!(prompt.contains("answer_question or ordinary guidance"));
         assert!(prompt.contains("record WAIT with no children"));
@@ -2166,9 +1793,6 @@ mod tests {
                 &ChannelContext::internal(),
                 1,
                 None,
-                Some(std::slice::from_ref(&private_fact)),
-                Some(&summary),
-                false,
                 false,
                 project_dir.path().to_str(),
             )
@@ -2199,16 +1823,8 @@ mod tests {
     /// here we assert the date/time block and the marker.
     #[test]
     fn context_tail_carries_all_volatile_sections_and_marker() {
-        let tail = Agent::build_context_tail(
-            None,
-            None,
-            "",
-            None,
-            None,
-            "",
-            "Monday, June 1, 2026 12:00 UTC",
-            None,
-        );
+        let tail =
+            Agent::build_context_tail(None, "", None, "", "Monday, June 1, 2026 12:00 UTC", None);
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
         let needle = "[Current Date & Time]";
         assert!(tail.contains(needle), "missing {needle}");
@@ -2224,9 +1840,7 @@ mod tests {
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
         let tail = Agent::build_context_tail(
             None,
-            None,
             "",
-            None,
             None,
             "",
             "Monday, June 1, 2026 12:00 UTC",
@@ -2294,42 +1908,12 @@ mod tests {
         }
     }
 
-    /// The session summary participates in the tail (not at message index 1).
-    #[test]
-    fn context_tail_includes_session_summary() {
-        let summary = crate::traits::ConversationSummary {
-            session_id: "s".into(),
-            summary: "User likes black coffee.".into(),
-            message_count: 3,
-            last_message_id: "x".into(),
-            last_turn_seq: Some(3),
-            updated_at: chrono::Utc::now(),
-        };
-        let tail = Agent::build_context_tail(
-            None,
-            None,
-            "",
-            None,
-            Some(&summary),
-            "",
-            "Monday, June 1, 2026 12:00 UTC",
-            None,
-        );
-        assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
-        assert!(tail.contains("[Context Coverage]"));
-        assert!(tail.contains("[Compacted Conversation State]"));
-        assert!(tail.contains("turn 3 / message x"));
-        assert!(tail.contains("black coffee"));
-    }
-
     #[test]
     fn context_tail_includes_scoped_project_instructions() {
         let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
         let tail = Agent::build_context_tail(
-            None,
             Some(instructions),
             "",
-            None,
             None,
             "",
             "Monday, June 1, 2026 12:00 UTC",

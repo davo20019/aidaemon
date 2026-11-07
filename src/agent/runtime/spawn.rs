@@ -13,10 +13,28 @@ struct TaskLeadSpec {
     input_text: String,
 }
 
+/// Who authored a child's result: `Untrusted` when the child read (or
+/// started with) untrusted content, by its in-memory flag or by its own
+/// record of tainted turns (its session is fresh per spawn). An unreadable
+/// record counts as tainted, and so does a taint the child saw but could not
+/// record.
+fn child_result_trust(
+    read_untrusted: bool,
+    record: anyhow::Result<Vec<String>>,
+) -> aidaemon_core::SourceTrust {
+    match record {
+        Ok(turns) if turns.is_empty() && !read_untrusted => aidaemon_core::SourceTrust::Trusted,
+        _ => aidaemon_core::SourceTrust::Untrusted,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SpawnChildResult {
     pub response: String,
     pub outcome: TaskOutcome,
+    /// `Untrusted` when the child's run read (or started with) untrusted
+    /// content: its result carries that taint back to the parent.
+    pub trust: aidaemon_core::SourceTrust,
 }
 
 #[derive(Debug)]
@@ -1417,6 +1435,7 @@ impl Agent {
         approval_session_id: Option<String>,
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
+        inherited_authority: crate::agent::authority::InheritedAuthority,
     ) -> Arc<Agent> {
         let spawn_tool = if add_spawn_tool {
             Some(Arc::new(
@@ -1457,7 +1476,8 @@ impl Agent {
         } else {
             self.specialists.clone()
         };
-        let child = Arc::new(Agent::with_depth(
+        #[allow(unused_mut)]
+        let mut child = Agent::with_depth(
             self.llm_runtime.clone(),
             self.state.clone(),
             self.event_store.clone(),
@@ -1487,7 +1507,6 @@ impl Agent {
             hub,
             self.schedule_approved_sessions.clone(),
             self.billing_failed_models.clone(),
-            self.required_tool_choice_ignored_models.clone(),
             self.record_decision_points,
             self.context_window_config.clone(),
             self.policy_config.clone(),
@@ -1500,12 +1519,19 @@ impl Agent {
             self.audio_config.clone(),
             self.stt_config.clone(),
             self.harness_eval_config.clone(),
-            // Share the parent's correction-context registry so a remediation
-            // task lead and its executors (which inherit the remediation goal id)
-            // can all read the same `Arc<CorrectionExecutionContext>` and thread
-            // it into their `ToolExecutionCtx.correction`.
-            self.correction_contexts.clone(),
-        ));
+        );
+        #[cfg(test)]
+        crate::agent::authority::CREATED_CHILD_INHERITANCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(inherited_authority.clone());
+        child.inherited_authority = Some(inherited_authority);
+        child.sdk_engine = self.sdk_engine.clone();
+        child.run_store = self.run_store.clone();
+        child.owner_approvals = self.owner_approvals.clone();
+        child.memory = self.memory.clone();
+        child.transcript_writes = self.transcript_writes.clone();
+        let child = Arc::new(child);
 
         if let Some(spawn_tool) = spawn_tool {
             let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = child.clone();
@@ -1526,7 +1552,7 @@ impl Agent {
     /// - TaskLead: Management + Universal + cli_agent (if available) +
     ///   ManageGoalTasksTool + SpawnAgentTool
     /// - Executor: Action + Universal + ReportBlockerTool, NO SpawnAgentTool
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child(
         &self,
         mission: &str,
@@ -1552,6 +1578,7 @@ impl Agent {
             inherited_project_scope,
             arg_specialist,
             None,
+            None,
         )
         .await
         .map(|result| result.response)
@@ -1571,6 +1598,7 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         self.spawn_child_with_outcome_and_attempt(
             mission,
@@ -1585,6 +1613,7 @@ impl Agent {
             arg_specialist,
             approval_session_id,
             None,
+            parent_authority,
         )
         .await
     }
@@ -1607,6 +1636,7 @@ impl Agent {
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
         bound_task_attempt: Option<crate::traits::TaskAttempt>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         if self.depth >= self.limits.max_depth {
             anyhow::bail!(
@@ -1694,6 +1724,7 @@ impl Agent {
                             cancel_token,
                             inherited_project_scope,
                             approval_session_id,
+                            parent_authority,
                         )
                         .await;
                 }
@@ -1917,6 +1948,7 @@ impl Agent {
                             None, // cancel token override
                             inherited_project_scope,
                             approval_session_id,
+                            parent_authority,
                         )
                         .await;
                 }
@@ -1992,8 +2024,128 @@ impl Agent {
             None,             // cancel token override
             inherited_project_scope,
             approval_session_id,
+            parent_authority,
         )
         .await
+    }
+
+    /// What a child spawned by this agent inherits: the spawning turn's
+    /// actual authority when the dispatcher supplied it (`spawn_agent`), else
+    /// the re-resolution fallback for spawns that do not come from a tool
+    /// call (goal dispatch, mandates).
+    pub(crate) async fn inherited_for_child(
+        &self,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+        goal_id: Option<&str>,
+    ) -> crate::agent::authority::InheritedAuthority {
+        match parent_authority {
+            Some(parent) => parent,
+            None => {
+                self.authority_for_child(user_role, channel_ctx, goal_id)
+                    .await
+            }
+        }
+    }
+
+    /// The fallback for a spawn without the parent turn's authority (goal and
+    /// mandate dispatch): the authority re-resolved from explicit facts,
+    /// narrowed by whatever this agent itself inherited. A root agent's
+    /// dispatch answers to its own session, never to the creating chat's
+    /// `/readonly` (goal runs are not stopped by a chat mode); inside an
+    /// inheritance chain the chat the chain answers to, its live mode, the
+    /// taint and the root request carry on. A child is never wider than its
+    /// parent.
+    pub(crate) async fn authority_for_child(
+        &self,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+        goal_id: Option<&str>,
+    ) -> crate::agent::authority::InheritedAuthority {
+        let inherited = self.inherited_authority.as_ref();
+        // Inside a chain the child receives what the chain trusted. A root
+        // dispatch computes its roots from explicit sources only: owner
+        // config, the execution workspace, and the goal's own
+        // `bind_workspace` binding (never the dispatch scope, which may be
+        // inferred from the mission).
+        let trusted_roots = match inherited {
+            Some(inherited) => inherited.trusted_roots.clone(),
+            None => {
+                let goal_binding = match goal_id {
+                    Some(goal_id) => {
+                        self.state
+                            .get_goal(goal_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|goal| {
+                                super::project_scope::bound_workspace_from_goal_context(
+                                    goal.context.as_deref(),
+                                )
+                            })
+                    }
+                    None => None,
+                };
+                let configured = self.configured_trust_roots();
+                let cwd = super::sdk_engine::turn_cwd();
+                super::sdk_engine::turn_trust_roots(super::sdk_engine::TrustRootSources {
+                    configured: &configured,
+                    cwd: Some(&cwd),
+                    bound_workspace: goal_binding.as_deref(),
+                    ..Default::default()
+                })
+            }
+        };
+        let mode_session = inherited.and_then(|inherited| inherited.mode_session.clone());
+        let session_mode = match mode_session.as_deref() {
+            Some(mode_session) => {
+                crate::agent::authority::session_mode(
+                    self.state.as_ref(),
+                    mode_session,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            None => None,
+        };
+        let resolved =
+            crate::agent::authority::resolve_authority(&crate::agent::authority::AuthorityFacts {
+                user_role,
+                owner_default: self.sdk_engine.owner_default,
+                session_mode,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                bound_workspace: None,
+            });
+        let resolved = match inherited {
+            Some(inherited) => crate::agent::authority::narrow_for_child(inherited, resolved),
+            None => resolved,
+        };
+        crate::agent::authority::InheritedAuthority {
+            authority: resolved.authority,
+            owner_level: resolved.owner_level,
+            task_access: resolved.task_access,
+            mode_session,
+            untrusted_context: inherited.is_some_and(|inherited| inherited.untrusted_context),
+            origin_request: inherited.and_then(|inherited| inherited.origin_request.clone()),
+            // Without a parent constraint the child's own facts decide.
+            origin_trusted: inherited.is_none_or(|inherited| inherited.origin_trusted),
+            trusted_roots,
+            // Inside a chain the declines the chain inherited carry on; a
+            // root dispatch has none (it runs outside any declining run).
+            declined: inherited
+                .map(|inherited| inherited.declined.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The chat whose `/readonly` narrows this turn while it runs: a child
+    /// answers to the chat that started the work, a root turn to its own.
+    pub(crate) fn mode_session_for(&self, session_id: &str) -> String {
+        self.inherited_authority
+            .as_ref()
+            .and_then(|inherited| inherited.mode_session.clone())
+            .unwrap_or_else(|| session_id.to_string())
     }
 
     /// Internal helper to create and run a child agent.
@@ -2020,6 +2172,7 @@ impl Agent {
         cancel_token_override: Option<tokio_util::sync::CancellationToken>,
         inherited_project_scope: Option<&str>,
         approval_session_id: Option<&str>,
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<SpawnChildResult> {
         // Resolve the immutable mandate fence before any child-setup write or
         // filesystem provisioning. A stale/revoked attempt must fail without
@@ -2275,6 +2428,14 @@ impl Agent {
         } else {
             None
         };
+        let parent_authority = self
+            .inherited_for_child(
+                parent_authority,
+                user_role,
+                &channel_ctx,
+                goal_id.as_deref(),
+            )
+            .await;
         let child = self
             .create_child_agent(
                 scoped_tools,
@@ -2292,9 +2453,11 @@ impl Agent {
                 effective_approval_session_id,
                 max_iterations_override,
                 timeout_secs_override,
+                parent_authority,
             )
             .await;
         let child_session_for_events = child_session.clone();
+        let child_read_untrusted = child.read_untrusted.clone();
 
         // Run the child agent on its OWN tokio task instead of awaiting it
         // inline. An inline `.await` nests the child's (very large) agent-loop
@@ -2509,9 +2672,15 @@ impl Agent {
             }
         }
 
+        let trust = child_result_trust(
+            child_read_untrusted.load(std::sync::atomic::Ordering::SeqCst),
+            crate::agent::untrusted::tainted_turns(self.state.as_ref(), &child_session_for_events)
+                .await,
+        );
         result.map(|response| SpawnChildResult {
             response,
             outcome: child_outcome,
+            trust,
         })
     }
 
@@ -2777,6 +2946,23 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    /// A child that saw untrusted content but could not record it, or
+    /// whose record cannot be read, returns an untrusted result.
+    #[test]
+    fn a_childs_unrecorded_or_unreadable_taint_fails_closed() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        assert_eq!(super::child_result_trust(false, Ok(Vec::new())), Trusted);
+        assert_eq!(super::child_result_trust(true, Ok(Vec::new())), Untrusted);
+        assert_eq!(
+            super::child_result_trust(false, Ok(vec!["turn-a".to_string()])),
+            Untrusted
+        );
+        assert_eq!(
+            super::child_result_trust(false, Err(anyhow::anyhow!("unreadable"))),
+            Untrusted
+        );
+    }
+
     use super::{
         bounded_completed_task_results_context, is_sqlite_busy, task_references_parent_context,
         Agent,

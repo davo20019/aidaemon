@@ -437,6 +437,32 @@ impl TaskRegistry {
         Self::drain_and_coalesce(queue)
     }
 
+    /// Take the queued messages a running turn can absorb mid-run: from the
+    /// front of the queue, while each comes from the same principal and
+    /// channel context as the turn (`user_role`, `channel_ctx`) and carries
+    /// no attachments. The first message that differs, and everything after
+    /// it, stays queued for its own turn, so order and authorization hold.
+    pub async fn take_steering_messages(
+        &self,
+        session_id: &str,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+    ) -> Vec<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let Some(queue) = queues.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut taken = Vec::new();
+        while queue.front().is_some_and(|next| {
+            next.user_role == user_role
+                && &next.channel_ctx == channel_ctx
+                && next.attachments.is_empty()
+        }) {
+            taken.extend(queue.pop_front());
+        }
+        taken
+    }
+
     /// Atomically check for a running task and queue the message behind it.
     ///
     /// Closes the race where a session task finishes between the caller's
@@ -559,6 +585,65 @@ mod tests {
         let mut channel_ctx = ChannelContext::private("test");
         channel_ctx.sender_id = Some(sender_id.to_string());
         QueuedMessage::new(text, user_role, channel_ctx, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn steering_takes_only_the_same_principal_from_the_front() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-session";
+        let owner = queued_as("also check the tests", "test:user", UserRole::Public);
+        let ctx = owner.channel_ctx.clone();
+        registry.queue_message(session, owner, None).await;
+        registry
+            .queue_message(
+                session,
+                queued_as("and the docs", "test:user", UserRole::Public),
+                None,
+            )
+            .await;
+        // Another sender stops the take; what follows stays queued too.
+        registry
+            .queue_message(
+                session,
+                queued_as("hijack", "test:other", UserRole::Public),
+                None,
+            )
+            .await;
+        registry
+            .queue_message(
+                session,
+                queued_as("later", "test:user", UserRole::Public),
+                None,
+            )
+            .await;
+
+        let taken = registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await;
+        let texts: Vec<&str> = taken.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["also check the tests", "and the docs"]);
+        assert_eq!(registry.queue_len(session).await, 2);
+
+        // A different role never takes the same sender's messages.
+        assert!(registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_leaves_messages_with_attachments_queued() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-attachments";
+        let mut with_file = queued("see this file");
+        with_file.attachments.push(MessageAttachment::default());
+        let ctx = with_file.channel_ctx.clone();
+        registry.queue_message(session, with_file, None).await;
+        assert!(registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await
+            .is_empty());
+        assert_eq!(registry.queue_len(session).await, 1);
     }
 
     #[tokio::test]

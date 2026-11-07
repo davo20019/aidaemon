@@ -13,7 +13,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    MessageAttachment, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    MessageAttachment, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
@@ -431,10 +431,13 @@ impl DispatchResult {
 
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    /// The agent workspace; `render_pdf` is only offered on a local one.
+    execution_backend: crate::execution::SharedExecutionBackend,
     media_tx: mpsc::Sender<MediaMessage>,
     /// Shared inbox for persisting screenshots for agent vision context.
     inbox_dir: PathBuf,
-    /// Per-session page state, keyed by trusted internal `_session_id`.
+    /// Per-session page state, keyed by the call's typed
+    /// `ToolCallContext::session_id`.
     sessions: BrowserSessionRegistry,
     /// Transport used to prompt the user Allow/Deny at action time.
     ///
@@ -499,6 +502,42 @@ fn validate_pdf_filename(filename: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters of page text returned with `navigate` / `new_tab`.
+const NAVIGATION_PREVIEW_CHARS: usize = 1500;
+
+/// A short, secret-redacted text preview of the page just opened, so one
+/// call shows what loaded (a model otherwise spends a `get_text` or a
+/// screenshot, which is also posted to the chat, just to look). Best effort:
+/// a failed read yields no preview, never a failed navigation.
+async fn page_text_preview(page: &dyn PageHandle) -> String {
+    let Ok(text) = page.body_text().await else {
+        return String::new();
+    };
+    format_page_preview(&text)
+}
+
+fn format_page_preview(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let total = collapsed.chars().count();
+    let shown: String = collapsed.chars().take(NAVIGATION_PREVIEW_CHARS).collect();
+    let more = if total > NAVIGATION_PREVIEW_CHARS {
+        format!(
+            "\n[Preview: first {NAVIGATION_PREVIEW_CHARS} of {total} characters. Use get_text \
+             (optionally with a selector) for the rest.]"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "\n\nPage text:\n{}{}",
+        crate::tools::sanitize::redact_secrets(&shown),
+        more
+    )
+}
+
 impl BrowserTool {
     /// Construct the browser tool, resolving and validating the session
     /// isolation mode up front.
@@ -513,6 +552,7 @@ impl BrowserTool {
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
         inbox_dir: impl Into<PathBuf>,
+        execution_backend: crate::execution::SharedExecutionBackend,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -532,6 +572,7 @@ impl BrowserTool {
         );
         Ok(Self {
             backend: Arc::new(backend),
+            execution_backend,
             media_tx,
             inbox_dir: inbox_dir.into(),
             sessions: BrowserSessionRegistry::new(),
@@ -556,6 +597,7 @@ impl BrowserTool {
             backend,
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
+            execution_backend: crate::execution::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
@@ -580,6 +622,7 @@ impl BrowserTool {
             backend,
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
+            execution_backend: crate::execution::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout,
@@ -956,7 +999,8 @@ impl BrowserTool {
                 .await;
         }
 
-        Ok(format!("Navigated to {}", url))
+        let preview = page_text_preview(page.as_ref()).await;
+        Ok(format!("Navigated to {}{}", url, preview))
     }
 
     async fn action_screenshot(
@@ -1100,9 +1144,7 @@ impl BrowserTool {
     /// gives us one deterministic renderer, a hard timeout, print backgrounds,
     /// and CSS `@page` sizing in a single operation.
     async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, String> {
-        if crate::execution::active_execution_backend().kind()
-            != crate::execution::BackendKind::Local
-        {
+        if self.execution_backend.kind() != crate::execution::BackendKind::Local {
             return Err("render_pdf is only available with local execution".to_string());
         }
 
@@ -1110,7 +1152,7 @@ impl BrowserTool {
             .get("source_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
-        let source = crate::tools::fs_utils::validate_path(raw_source)
+        let source = crate::tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
             .map_err(|e| format!("Invalid source_path: {e}"))?;
         if crate::tools::fs_utils::is_sensitive_path(&source) {
             return Err("Cannot render a sensitive source path".to_string());
@@ -1981,6 +2023,11 @@ impl BrowserTool {
             }
         }
 
+        let preview = if url.is_some() {
+            page_text_preview(page.as_ref()).await
+        } else {
+            String::new()
+        };
         let tab_id = self
             .sessions
             .add_tab(
@@ -1996,7 +2043,7 @@ impl BrowserTool {
             .ok_or_else(|| "failed to register new tab for this session".to_string())?;
 
         match url {
-            Some(url) => Ok(format!("Opened new tab {} at {}", tab_id, url)),
+            Some(url) => Ok(format!("Opened new tab {} at {}{}", tab_id, url, preview)),
             None => Ok(format!("Opened new tab {} (active)", tab_id)),
         }
     }
@@ -2054,7 +2101,11 @@ impl BrowserTool {
         }
     }
 
-    async fn run_action(&self, arguments: &str) -> anyhow::Result<DispatchResult> {
+    async fn run_action(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<DispatchResult> {
         let args: Value = serde_json::from_str(arguments)?;
 
         let action = args
@@ -2062,10 +2113,7 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
 
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = facts.session_id.as_str();
 
         let needs_session = !matches!(action, "close" | "set_mode");
         if needs_session && session_id.is_empty() {
@@ -2110,10 +2158,7 @@ impl BrowserTool {
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
             session_id,
-            trusted_session: args
-                .get("_trusted_session")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            trusted_session: facts.trusted_session,
         };
         if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
             warn!(action, "Browser action blocked by approval gate");
@@ -2216,7 +2261,10 @@ impl Tool for BrowserTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run_action(arguments).await?.text)
+        Ok(self
+            .run_action(arguments, &ToolCallContext::default())
+            .await?
+            .text)
     }
 
     async fn call_with_status_outcome(
@@ -2224,17 +2272,30 @@ impl Tool for BrowserTool {
         arguments: &str,
         status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let result = self.run_action(arguments).await?;
+        let result = self.run_action(arguments, &facts).await?;
         Ok(ToolCallOutcome {
             output: result.text,
             metadata: ToolCallMetadata {
                 attachments: result.attachments,
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
+}
 
+impl crate::traits::ToolSemantics for BrowserTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -2243,6 +2304,10 @@ impl Tool for BrowserTool {
             idempotent: false,
             high_impact_write: false,
         }
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        browser_call_effects(arguments)
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -2274,6 +2339,44 @@ impl Tool for BrowserTool {
             .unwrap_or_default();
 
         browser_call_semantics(action.as_deref(), url, selector, script, output_filename)
+    }
+}
+
+/// The typed effects of a browser call: opening a page is egress to its
+/// host. Acting on the current page (`click`, `fill`, `execute_js`) would be
+/// egress to that page's host, which is tracked per session and not known
+/// from the arguments, so it is undeclared, as is any action that writes or
+/// changes the browser. Actions that only read the open page declare none.
+fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    match (action.as_str(), url) {
+        ("navigate" | "new_tab", Some(url)) => reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            }),
+        // A blank tab.
+        ("new_tab", None) => aidaemon_core::CallEffects::none(),
+        (
+            "screenshot" | "get_text" | "inspect_page" | "list_tabs" | "get_console_logs"
+            | "get_network_errors" | "wait",
+            _,
+        ) => aidaemon_core::CallEffects::none(),
+        _ => aidaemon_core::CallEffects::unknown(),
     }
 }
 

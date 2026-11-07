@@ -6,12 +6,57 @@ use chrono::Utc;
 
 use super::formatting::format_number;
 use crate::config::AppConfig;
+use crate::duration_format::{compact_chrono_duration, ZeroUnitStyle};
 use crate::runtime_ports::ChannelAgentRuntime;
 use crate::tasks::{TaskRegistry, TaskStatus};
 use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
 use crate::types::UserRole;
 
-/// Single source of truth for command definitions.
+/// Whether a chat message is a slash command: `/name` or `/name@bot`, where
+/// `name` is letters, digits and underscores (Telegram's command syntax).
+/// A message that merely starts with a path (`/tmp/x.py is broken`) is not.
+pub(crate) fn is_slash_command(text: &str) -> bool {
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    let Some(rest) = first.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_once('@').map_or(rest, |(name, _bot)| name);
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod slash_command_tests {
+    use super::is_slash_command;
+
+    #[test]
+    fn commands_are_names_and_paths_are_messages() {
+        for command in [
+            "/help",
+            "/model gpt-5.6-terra",
+            "/clear",
+            "/start@aidaemon_bot",
+            "/set_up now",
+        ] {
+            assert!(is_slash_command(command), "{command}");
+        }
+        for message in [
+            "/tmp/aidaemon-live/prime/prime.py has a bug",
+            "/Users/alice/notes.txt",
+            "/ what",
+            "/",
+            "/123",
+            "hello /help",
+        ] {
+            assert!(!is_slash_command(message), "{message}");
+        }
+    }
+}
+
+/// Single source of truth for command definitions./// Single source of truth for command definitions.
 ///
 /// Each command is defined once here; the registry drives Telegram's
 /// `setMyCommands` API, the `/help` output, and (in the future) Slack/Discord
@@ -117,6 +162,18 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
             category: CommandCategory::Core,
         },
         CommandDef {
+            name: "readonly",
+            description: "Make this chat read-only for 4 hours",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "mode",
+            description: "Show or change this chat's access mode",
+            usage: Some("/mode [full|unrestricted|readonly]"),
+            category: CommandCategory::Core,
+        },
+        CommandDef {
             name: "rollback",
             description: "Preview or confirm a checkpoint rollback",
             usage: Some("/rollback [checkpoint-id|confirm TOKEN]"),
@@ -157,8 +214,64 @@ impl CommandContext {
             "/cost" => Some(self.handle_cost().await),
             "/context" => Some(self.handle_context(session_id, user_role).await),
             "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
+            "/readonly" => Some(self.handle_readonly(session_id, user_role).await),
+            "/mode" => Some(self.handle_mode(args, session_id, user_role).await),
             "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
+        }
+    }
+
+    async fn handle_readonly(&self, session_id: &str, user_role: UserRole) -> String {
+        self.handle_mode("readonly", session_id, user_role).await
+    }
+
+    /// `/mode [full|unrestricted|readonly]`: the owner narrows or restores this
+    /// chat's tool authority. Explicit command syntax, persisted with an expiry.
+    async fn handle_mode(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
+        use crate::agent::authority::{
+            session_mode_with_expiry, set_session_mode, SessionMode, SESSION_MODE_TTL_HOURS,
+        };
+        const NOT_OWNER: &str = "Only the owner can change the mode.";
+        const USAGE: &str = "Usage: /mode [full|unrestricted|readonly]";
+        if user_role != UserRole::Owner {
+            return NOT_OWNER.to_string();
+        }
+        let now = Utc::now();
+        let left_suffix = |until: Option<chrono::DateTime<Utc>>| {
+            until.map_or_else(String::new, |at| {
+                format!(
+                    " (about {} left)",
+                    compact_chrono_duration(at - now, ZeroUnitStyle::Trim)
+                )
+            })
+        };
+        let requested = match args.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                return match session_mode_with_expiry(self.state.as_ref(), session_id, now).await {
+                    Some((SessionMode::ReadOnly, until)) => {
+                        format!("Mode: read-only{}.", left_suffix(until))
+                    }
+                    Some((SessionMode::Unrestricted, until)) => {
+                        format!("Mode: unrestricted{}.", left_suffix(until))
+                    }
+                    Some((SessionMode::Full, _)) | None => "Mode: full.".to_string(),
+                };
+            }
+            "full" => SessionMode::Full,
+            "unrestricted" => SessionMode::Unrestricted,
+            "readonly" | "read-only" | "read_only" => SessionMode::ReadOnly,
+            _ => return USAGE.to_string(),
+        };
+        match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
+            Ok(_) => match requested {
+                SessionMode::ReadOnly => format!("Read-only for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."),
+                SessionMode::Unrestricted => format!("Unrestricted for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting with your next message."),
+                SessionMode::Full => "Back to full access from your next message.".to_string(),
+            },
+            Err(error) => {
+                tracing::warn!(session_id, %error, "Could not change the session mode");
+                "Couldn't change the mode right now.".to_string()
+            }
         }
     }
 
@@ -967,4 +1080,108 @@ fn work_usage() -> String {
      /work project <id>\n\
      /work project create <name>"
         .to_string()
+}
+
+#[cfg(test)]
+mod mode_command_tests {
+    use super::*;
+    use crate::traits::store_prelude::*;
+
+    /// No host-local `HH:MM` clock time appears in a reply.
+    fn assert_no_clock_time(reply: &str) {
+        let bytes = reply.as_bytes();
+        for i in 0..bytes.len().saturating_sub(4) {
+            let w = &bytes[i..i + 5];
+            assert!(
+                !(w[0].is_ascii_digit()
+                    && w[1].is_ascii_digit()
+                    && w[2] == b':'
+                    && w[3].is_ascii_digit()
+                    && w[4].is_ascii_digit()),
+                "clock time in {reply:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_commands_owner_only() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state = Arc::clone(&harness.state);
+        let ctx = CommandContext {
+            agent: Arc::new(harness.agent),
+            state: state.clone(),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            config_path: PathBuf::new(),
+        };
+        let session = "telegram:synthetic-user-1";
+        for role in [UserRole::Guest, UserRole::Public] {
+            for (cmd, args) in [
+                ("/readonly", ""),
+                ("/mode", "readonly"),
+                ("/mode", "unrestricted"),
+            ] {
+                assert_eq!(
+                    ctx.dispatch(cmd, args, session, role).await.as_deref(),
+                    Some("Only the owner can change the mode.")
+                );
+            }
+        }
+        assert_eq!(
+            state
+                .get_setting(&format!("authority_mode:{session}"))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let reply = ctx
+            .dispatch("/readonly", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            "Read-only for this chat for the next 4 hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."
+        );
+        let shown = ctx
+            .dispatch("/mode", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(shown.starts_with("Mode: read-only (about "), "{shown}");
+        assert!(shown.ends_with(" left)."), "{shown}");
+        assert_no_clock_time(&shown);
+        assert_eq!(
+            ctx.dispatch("/mode", "bogus", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Usage: /mode [full|unrestricted|readonly]")
+        );
+        assert_eq!(
+            ctx.dispatch("/mode", "full", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Back to full access from your next message.")
+        );
+        assert_eq!(
+            ctx.dispatch("/mode", "", session, UserRole::Owner)
+                .await
+                .as_deref(),
+            Some("Mode: full.")
+        );
+        let unrestricted = ctx
+            .dispatch("/mode", "unrestricted", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            unrestricted,
+            "Unrestricted for this chat for the next 4 hours, starting with your next message."
+        );
+        let shown = ctx
+            .dispatch("/mode", "", session, UserRole::Owner)
+            .await
+            .unwrap();
+        assert!(shown.starts_with("Mode: unrestricted (about "), "{shown}");
+        assert_no_clock_time(&shown);
+    }
 }

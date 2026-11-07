@@ -1064,15 +1064,15 @@ mod tests {
         let runs = crate::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(state.clone());
 
         let mandate_view = mandates
-            .call_with_status_outcome(
-                &serde_json::json!({
-                    "action": "list",
-                    "_session_id": "owner-bot-a:1001",
-                    "_user_role": "owner",
-                    "_channel_visibility": "private"
-                })
-                .to_string(),
+            .call_with_execution_context(
+                &serde_json::json!({ "action": "list" }).to_string(),
                 None,
+                crate::traits::ToolCallContext {
+                    session_id: "owner-bot-a:1001".into(),
+                    user_role: Some(crate::types::UserRole::Owner),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

@@ -24,8 +24,8 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
-    Channel, ChannelCapabilities, ChatOptions, ModelProvider, ProviderResponse, TokenUsage, Tool,
-    ToolCall, ToolRole,
+    Channel, ChannelCapabilities, ChatOptions, ProviderResponse, TokenUsage, Tool, ToolCall,
+    ToolRole,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -53,6 +53,14 @@ pub struct MockProvider {
     reject_non_default_options: bool,
     strict_responses: bool,
     exhausted_response_calls: Mutex<u32>,
+    /// Errors returned, in order, by the next main-loop calls before any
+    /// scripted response is used.
+    leading_errors: Mutex<Vec<String>>,
+    /// Typed provider errors returned, in order, before `leading_errors`.
+    leading_provider_errors: Mutex<Vec<ProviderError>>,
+    /// Calls asking for one of these JSON-schema names fail (after being
+    /// logged), whatever the script holds.
+    failing_response_schemas: Vec<String>,
     /// When true (default), assessment/re-planner LLM calls are silently
     /// intercepted with an empty response (causing generate_task_plan()
     /// to return None). Preserves existing test behavior — no plan
@@ -72,7 +80,10 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
@@ -87,7 +98,10 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
@@ -105,15 +119,46 @@ impl MockProvider {
             reject_non_default_options: false,
             strict_responses: false,
             exhausted_response_calls: Mutex::new(0),
+            leading_errors: Mutex::new(Vec::new()),
+            leading_provider_errors: Mutex::new(Vec::new()),
             skip_planning_calls: true,
+            failing_response_schemas: Vec::new(),
         }
     }
 
     /// Reject unexpected execution-model calls instead of inventing a reply.
     /// Assessment lanes remain independently scripted via with_task_assessments.
+    /// Fail the next main-loop calls with these provider errors (as a 400)
+    /// before the scripted responses start.
+    pub fn with_leading_errors(self, errors: Vec<&str>) -> Self {
+        *self.leading_errors.try_lock().expect("fresh mock") =
+            errors.into_iter().map(str::to_string).collect();
+        self
+    }
+
+    /// Fail the next main-loop calls with these typed provider errors
+    /// before any `with_leading_errors` and scripted responses.
+    pub fn with_leading_provider_errors(self, errors: Vec<ProviderError>) -> Self {
+        *self.leading_provider_errors.try_lock().expect("fresh mock") = errors;
+        self
+    }
+
     pub fn with_strict_responses(mut self) -> Self {
         self.strict_responses = true;
         self
+    }
+
+    /// Fail every call that asks for the JSON schema `name` with a provider
+    /// error (a background lane such as a verifier, mid-run).
+    pub fn with_failing_response_schema(mut self, name: &str) -> Self {
+        self.failing_response_schemas.push(name.to_string());
+        self
+    }
+
+    /// Script the next turn after an earlier one finished; until then an
+    /// empty script answers with the default text.
+    pub async fn push_responses(&self, responses: Vec<ProviderResponse>) {
+        self.responses.lock().await.extend(responses);
     }
 
     /// Check after a run as provider errors may be recovered by the agent loop.
@@ -139,6 +184,11 @@ impl MockProvider {
              {relationships} relationship response(s) left unused"
         );
         Ok(())
+    }
+
+    /// Scripted task-assessment responses nobody requested.
+    pub async fn unconsumed_task_assessments(&self) -> usize {
+        self.task_assessment_responses.lock().await.len()
     }
 
     /// Simulate a provider/model that rejects advanced per-call options.
@@ -334,19 +384,74 @@ impl MockProvider {
     }
 }
 
+/// Make a test type an SDK provider. The type defines
+/// `async fn respond(&self, model: &str, messages: &[Value], tools: &[Value],
+/// options: &ChatOptions) -> anyhow::Result<ProviderResponse>`, working in
+/// the daemon's chat JSON; errors are the daemon's classified
+/// `ProviderError`s.
+macro_rules! chat_json_provider {
+    ($ty:ty) => {
+        #[async_trait::async_trait]
+        impl aidaemon_core::Provider for $ty {
+            fn name(&self) -> &str {
+                stringify!($ty)
+            }
+
+            async fn complete(
+                &self,
+                request: &aidaemon_core::ModelRequest,
+            ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+                use $crate::providers::sdk_backed::{
+                    to_chat_messages, to_chat_options, to_chat_tools, to_sdk_error, to_sdk_response,
+                };
+                let messages = to_chat_messages(&request.messages);
+                let tools = to_chat_tools(&request.tools);
+                let options = to_chat_options(request);
+                self.respond(&request.model, &messages, &tools, &options)
+                    .await
+                    .map(to_sdk_response)
+                    .map_err(
+                        |error| match error.downcast::<$crate::providers::ProviderError>() {
+                            Ok(error) => to_sdk_error(&error),
+                            Err(other) => aidaemon_core::ProviderError::Other(other.to_string()),
+                        },
+                    )
+            }
+        }
+    };
+}
+pub(crate) use chat_json_provider;
+
+/// The mock is an SDK provider like every real backend. It scripts and
+/// records calls in the daemon's chat JSON, which is what the tests read.
 #[async_trait]
-impl ModelProvider for MockProvider {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        self.chat_with_options(model, messages, tools, &ChatOptions::default())
-            .await
+impl aidaemon_core::Provider for MockProvider {
+    fn name(&self) -> &str {
+        "mock"
     }
 
-    async fn chat_with_options(
+    async fn complete(
+        &self,
+        request: &aidaemon_core::ModelRequest,
+    ) -> Result<aidaemon_core::ModelResponse, aidaemon_core::ProviderError> {
+        use crate::providers::sdk_backed::{
+            to_chat_messages, to_chat_options, to_chat_tools, to_sdk_error, to_sdk_response,
+        };
+        let messages = to_chat_messages(&request.messages);
+        let tools = to_chat_tools(&request.tools);
+        let options = to_chat_options(request);
+        self.scripted(&request.model, &messages, &tools, &options)
+            .await
+            .map(to_sdk_response)
+            .map_err(|error| match error.downcast::<ProviderError>() {
+                Ok(error) => to_sdk_error(&error),
+                Err(other) => aidaemon_core::ProviderError::Other(other.to_string()),
+            })
+    }
+}
+
+impl MockProvider {
+    async fn scripted(
         &self,
         model: &str,
         messages: &[Value],
@@ -407,6 +512,11 @@ impl ModelProvider for MockProvider {
             uncommitted_work: false,
             ..options.clone()
         };
+        if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode {
+            if self.failing_response_schemas.contains(name) {
+                return Err(ProviderError::from_status(503, "synthetic schema lane outage").into());
+            }
+        }
         if self.reject_non_default_options && provider_facing != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
         }
@@ -423,6 +533,19 @@ impl ModelProvider for MockProvider {
             tokio::time::sleep(delay).await;
         }
 
+        {
+            let mut typed = self.leading_provider_errors.lock().await;
+            if !typed.is_empty() {
+                return Err(typed.remove(0).into());
+            }
+            drop(typed);
+            let mut errors = self.leading_errors.lock().await;
+            if !errors.is_empty() {
+                let error = errors.remove(0);
+                return Err(ProviderError::from_status(400, &error).into());
+            }
+        }
+
         // Return next scripted response, or a default
         let mut responses = self.responses.lock().await;
         if responses.is_empty() {
@@ -435,10 +558,6 @@ impl ModelProvider for MockProvider {
         } else {
             Ok(responses.remove(0))
         }
-    }
-
-    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        Ok(vec!["mock-model".to_string()])
     }
 }
 
@@ -531,6 +650,58 @@ impl Channel for TestChannel {
 // TestHarness
 // ---------------------------------------------------------------------------
 
+/// One owner-approval card a [`ScriptedApprover`] received.
+#[derive(Debug, Clone)]
+pub struct SeenCard {
+    pub command: String,
+    pub session_id: String,
+    pub risk_level: RiskLevel,
+    pub warnings: Vec<String>,
+    /// The mode the card was sent with: it picks the buttons offered.
+    pub permission_mode: crate::tools::command_risk::PermissionMode,
+}
+
+/// Answers owner-approval cards from a script, in order: `Some(answer)`
+/// answers at once; `None` (or a script that ran out) holds the card
+/// unanswered, keeping its reply channel so a test can answer it late.
+pub struct ScriptedApprover {
+    pub cards: Arc<std::sync::Mutex<Vec<SeenCard>>>,
+    pub held: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<ApprovalResponse>>>>,
+}
+
+impl ScriptedApprover {
+    /// A broker whose cards this approver answers.
+    pub fn start(script: Vec<Option<ApprovalResponse>>) -> (crate::tools::ApprovalBroker, Self) {
+        let (tx, mut rx) = mpsc::channel::<crate::tools::terminal::ApprovalRequest>(8);
+        let cards = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, kept) = (cards.clone(), held.clone());
+        tokio::spawn(async move {
+            let mut script = script.into_iter();
+            while let Some(request) = rx.recv().await {
+                seen.lock().unwrap().push(SeenCard {
+                    command: request.command.clone(),
+                    session_id: request.session_id.clone(),
+                    risk_level: request.risk_level,
+                    warnings: request.warnings.clone(),
+                    permission_mode: request.permission_mode,
+                });
+                match script.next().flatten() {
+                    Some(answer) => {
+                        let _ = request.response_tx.send(answer);
+                    }
+                    None => kept.lock().unwrap().push(request.response_tx),
+                }
+            }
+        });
+        (crate::tools::ApprovalBroker::new(tx), Self { cards, held })
+    }
+
+    pub fn card_count(&self) -> usize {
+        self.cards.lock().unwrap().len()
+    }
+}
+
 /// Everything needed to run integration tests against the agent.
 #[allow(dead_code)]
 pub struct TestHarness {
@@ -547,8 +718,129 @@ pub struct TestHarness {
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
+/// Dispatcher facts for a direct tool test: the call's session, nothing else.
+pub fn call_facts(session_id: &str) -> crate::traits::ToolCallContext {
+    crate::traits::ToolCallContext {
+        session_id: session_id.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Call `tool` the way the dispatcher does, beside `facts`, and return its
+/// output.
+pub async fn call_with_facts<T: Tool + ?Sized>(
+    tool: &T,
+    arguments: &str,
+    facts: crate::traits::ToolCallContext,
+) -> anyhow::Result<String> {
+    tool.call_with_execution_context(arguments, None, facts)
+        .await
+        .map(|outcome| outcome.output)
+}
+
+/// `tool.call_with(arguments, facts)`: [`call_with_facts`] as a method.
+#[async_trait]
+pub trait CallWithFacts {
+    async fn call_with(
+        &self,
+        arguments: &str,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<String>;
+}
+
+#[async_trait]
+impl<T: Tool + ?Sized> CallWithFacts for T {
+    async fn call_with(
+        &self,
+        arguments: &str,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<String> {
+        call_with_facts(self, arguments, facts).await
+    }
+}
+
+/// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
+/// process into its own target directory (so it never waits on the build
+/// lock of the running `cargo test`).
+pub fn fake_mcp_server_path() -> PathBuf {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let exe = std::env::current_exe().expect("test binary path");
+        // target/<profile>/deps/<test binary>
+        let target = exe
+            .ancestors()
+            .nth(3)
+            .expect("test binary under a target directory")
+            .join("fake-mcp");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--quiet",
+                "-p",
+                "aidaemon-mcp",
+                "--features",
+                "test-server",
+                "--bin",
+                "fake_mcp_server",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("run cargo build for fake_mcp_server");
+        assert!(status.success(), "building fake_mcp_server failed");
+        target
+            .join("debug")
+            .join(format!("fake_mcp_server{}", std::env::consts::EXE_SUFFIX))
+    })
+    .clone()
+}
+
+/// An MCP registry with the synthetic `fake` server (`fake_mcp_server`)
+/// running: its tools are named `fake__<tool>` and offered on `mcp:fake`.
+pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpRegistry {
+    let registry = crate::mcp::McpRegistry::new(state);
+    registry
+        .add_server(
+            "fake",
+            crate::config::McpServerConfig {
+                command: fake_mcp_server_path().to_string_lossy().into_owned(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+            false,
+        )
+        .await
+        .expect("start the fake MCP server");
+    registry
+}
+
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
+}
+
+/// Like [`setup_test_agent`], with every turn on the SDK kernel and the mock
+/// provider behind the daemon's provider stack.
+pub async fn setup_test_agent_sdk(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    setup_test_agent_sdk_with_llm_timeout(provider, None).await
+}
+
+/// Like [`setup_test_agent_sdk`], with a per-call model timeout.
+pub async fn setup_test_agent_sdk_with_llm_timeout(
+    provider: MockProvider,
+    llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(
+        provider,
+        vec![],
+        llm_call_timeout_secs,
+        true,
+        true,
+        false,
+        None,
+    )
+    .await
 }
 
 /// Build a chat-path harness with the real mandate management tool and a
@@ -689,7 +981,9 @@ async fn setup_test_agent_internal(
     // Tools — SystemInfoTool + RememberFactTool (no side effects, no approval)
     let mut tools: Vec<Arc<dyn Tool>> = if include_default_tools {
         vec![
-            Arc::new(SystemInfoTool),
+            Arc::new(SystemInfoTool::new(
+                crate::execution::active_execution_backend(),
+            )),
             Arc::new(RememberFactTool::new(
                 state.clone() as Arc<dyn crate::traits::StateStore>
             )),
@@ -723,7 +1017,7 @@ async fn setup_test_agent_internal(
         smart: "mock-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -747,7 +1041,6 @@ async fn setup_test_agent_internal(
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -833,7 +1126,9 @@ pub async fn setup_test_agent_with_models_and_policy(
     let provider = Arc::new(provider);
 
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -848,7 +1143,7 @@ pub async fn setup_test_agent_with_models_and_policy(
         smart: smart_model.to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -872,7 +1167,6 @@ pub async fn setup_test_agent_with_models_and_policy(
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -927,7 +1221,9 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let provider = Arc::new(provider);
 
     let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -942,7 +1238,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         smart: "smart-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -966,7 +1262,6 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -1028,6 +1323,8 @@ pub struct MockTool {
     role: ToolRole,
     available: bool,
     return_metadata: crate::traits::ToolCallMetadata,
+    return_finish: Option<aidaemon_core::Finish>,
+    dispatch_facts: crate::traits::ToolDispatchFacts,
 }
 
 #[allow(dead_code)]
@@ -1040,7 +1337,21 @@ impl MockTool {
             role: ToolRole::Action,
             available: true,
             return_metadata: Default::default(),
+            return_finish: None,
+            dispatch_facts: Default::default(),
         }
+    }
+
+    /// State these dispatch facts, as the real tool of this name does.
+    pub fn with_dispatch_facts(mut self, facts: crate::traits::ToolDispatchFacts) -> Self {
+        self.dispatch_facts = facts;
+        self
+    }
+
+    /// End the run on this tool's call, as a tool's own typed finish.
+    pub fn with_finish(mut self, finish: aidaemon_core::Finish) -> Self {
+        self.return_finish = Some(finish);
+        self
     }
 
     pub fn with_role(mut self, role: ToolRole) -> Self {
@@ -1094,11 +1405,18 @@ impl Tool for MockTool {
         Ok(crate::traits::ToolCallOutcome {
             output,
             metadata: self.return_metadata.clone(),
+            finish: self.return_finish.clone(),
         })
     }
+}
 
+impl crate::traits::ToolSemantics for MockTool {
     fn tool_role(&self) -> ToolRole {
         self.role
+    }
+
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        self.dispatch_facts
     }
 
     fn is_available(&self) -> bool {
@@ -1171,6 +1489,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     // TerminalTool in Yolo mode — auto-approves everything
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -1183,7 +1502,9 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Tools: SystemInfoTool + RememberFactTool + TerminalTool + extras
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -1203,7 +1524,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         smart: "mock-model".to_string(),
     };
     let llm_runtime = SharedLlmRuntime::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        provider.clone() as crate::llm_runtime::ModelBackend,
         router_from_models(models_config.clone()),
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
@@ -1227,7 +1548,6 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -1294,6 +1614,125 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 /// re-planner) off; the harness turns them on so the tests that script those
 /// auxiliary calls keep exercising them. Tests that need the production
 /// default construct `PolicyConfig::default()` explicitly.
+/// A root agent on a REAL provider and model, for ignored live checks of the
+/// agent loop. Tools: system info, remember_fact, read/write file and a
+/// yolo terminal (auto-approved). Nothing here is mocked except the channel.
+pub struct LiveHarness {
+    pub agent: Agent,
+    pub state: Arc<SqliteStateStore>,
+    pub event_store: Arc<EventStore>,
+    _db_file: tempfile::NamedTempFile,
+    _skills_dir: tempfile::TempDir,
+}
+
+pub async fn setup_live_agent(
+    provider: crate::llm_runtime::ModelBackend,
+    provider_kind: ProviderKind,
+    model: &str,
+) -> anyhow::Result<LiveHarness> {
+    let db_file = tempfile::NamedTempFile::new()?;
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let skills_dir = tempfile::TempDir::new()?;
+    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+    let pool = state.pool();
+    let event_store = Arc::new(EventStore::new(pool.clone()).await?);
+
+    let (approval_tx, mut approval_rx) =
+        mpsc::channel::<crate::tools::terminal::ApprovalRequest>(16);
+    tokio::spawn(async move {
+        while let Some(request) = approval_rx.recv().await {
+            let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
+        }
+    });
+    let terminal_tool = Arc::new(
+        TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            60,
+            8000,
+            PermissionMode::Yolo,
+            pool.clone(),
+        )
+        .await,
+    );
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
+        Arc::new(crate::tools::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        Arc::new(crate::tools::WriteFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        terminal_tool,
+    ];
+
+    let models_config = ModelsConfig {
+        default_model: model.to_string(),
+        fallback_models: Vec::new(),
+        primary: model.to_string(),
+        fast: model.to_string(),
+        smart: model.to_string(),
+    };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider,
+        router_from_models(models_config.clone()),
+        provider_kind,
+        models_config.primary.clone(),
+    );
+    let agent = Agent::new(crate::agent::AgentConstruction {
+        dependencies: crate::agent::AgentRuntimeDependencies {
+            llm_runtime,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store: event_store.clone(),
+            tools,
+        },
+        model: model.to_string(),
+        system_prompt: "You are aidaemon, a helpful personal assistant with tools.".to_string(),
+        config_path: PathBuf::from("config.toml"),
+        skills_dir: skills_dir.path().to_path_buf(),
+        max_depth: 3,
+        max_iterations: 50,
+        max_iterations_cap: 100,
+        max_response_chars: 8000,
+        timeout_secs: 120,
+        max_facts: 20,
+        iteration_config: IterationLimitConfig::Unlimited,
+        task_timeout_secs: None,
+        task_token_budget: None,
+        llm_call_timeout_secs: None,
+        mcp_registry: None,
+        goal_token_registry: Some(crate::goal_tokens::GoalTokenRegistry::new()),
+        hub: None,
+        record_decision_points: true,
+        context_window_config: crate::config::ContextWindowConfig::default(),
+        policy_config: crate::config::PolicyConfig::default(),
+        path_aliases: crate::config::PathAliasConfig::default(),
+        inherited_project_scope: None,
+        specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        interactive_slot: None,
+        vision_config: crate::config::VisionConfig::from_files(
+            &crate::config::FilesConfig::default(),
+        ),
+        audio_config: crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
+        harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
+    });
+    Ok(LiveHarness {
+        agent,
+        state,
+        event_store,
+        _db_file: db_file,
+        _skills_dir: skills_dir,
+    })
+}
+
 pub fn test_policy_config() -> crate::config::PolicyConfig {
     crate::config::PolicyConfig {
         pre_execution_supervision: true,

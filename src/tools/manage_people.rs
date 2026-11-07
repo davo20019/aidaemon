@@ -105,14 +105,6 @@ impl Tool for ManagePeopleTool {
         manage_people_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &["status", "list", "view", "brief", "upcoming", "audit"],
-            ToolMutationEffects::NONE,
-        )
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
@@ -150,6 +142,23 @@ impl Tool for ManagePeopleTool {
             other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
         }
     }
+}
+
+impl crate::traits::ToolSemantics for ManagePeopleTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["status", "list", "view", "brief", "upcoming", "audit"],
+            ToolMutationEffects::NONE,
+        )
+    }
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
@@ -158,6 +167,27 @@ impl Tool for ManagePeopleTool {
             needs_approval: true,
             idempotent: false,
             high_impact_write: false,
+        }
+    }
+
+    /// Every action but `enable`/`disable` (a runtime setting) touches only
+    /// the agent's own people store.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        match action.as_deref() {
+            Some(
+                "status" | "add" | "list" | "view" | "brief" | "upcoming" | "reconnect" | "update"
+                | "remove" | "add_fact" | "remove_fact" | "export" | "purge" | "audit" | "confirm",
+            ) => aidaemon_core::CallEffects::none(),
+            // `link` binds a sender to a person, so that person's facts reach
+            // the sender's later turns: it widens who sees the owner's notes.
+            _ => aidaemon_core::CallEffects::unknown(),
         }
     }
 }
@@ -842,6 +872,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolSemantics;
 
     #[test]
     fn schema_fits_payload_budget() {
@@ -857,6 +888,26 @@ mod tests {
             bytes <= 1000,
             "manage_people schema is {bytes} bytes, budget is 1000"
         );
+    }
+
+    /// The people store is the agent's own; the enable/disable setting and
+    /// `link` (which widens who sees a person's facts) stay undeclared.
+    #[tokio::test]
+    async fn people_store_actions_declare_no_effects() {
+        let tool = setup_tool().await;
+        let effects = |action: &str| tool.call_effects(&json!({"action": action}).to_string());
+        for action in [
+            "add", "update", "remove", "add_fact", "purge", "export", "view",
+        ] {
+            assert_eq!(
+                effects(action),
+                aidaemon_core::CallEffects::none(),
+                "{action}"
+            );
+        }
+        for action in ["enable", "disable", "link", "unknown"] {
+            assert!(!effects(action).complete, "{action}");
+        }
     }
 
     async fn setup_tool() -> ManagePeopleTool {

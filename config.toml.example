@@ -116,6 +116,10 @@ smart = "anthropic/claude-sonnet-4"
 
 # Optional direct-provider fallback chain. These entries are tried in order
 # after the primary provider's own model fallback list is exhausted.
+# A provider whose account cannot answer (a subscription plan's usage
+# limit, a daily quota, no credit left, a rejected key) is skipped at once
+# for its other models, and stays skipped until its stated reset (or for a
+# few minutes when it states none), so the next entry here answers instead.
 # Keychain secret names use `provider_fallback_<index>_...`, for example:
 # `provider_fallback_0_api_key`, `provider_fallback_0_gateway_token`.
 #
@@ -171,6 +175,13 @@ working_memory_cap = 50
 # encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
 
+# Long-term memory for agent turns. "daemon" (default) is the built-in memory
+# in the state database; "sdk" uses the aidaemon-memory crate (build with
+# --features sdk-memory) and keeps its facts in a separate SQLite file.
+# [memory]
+# backend = "daemon"
+# path = "aidaemon-memory.db"
+
 # Exact user/assistant recall follows this canonical-event retention window.
 # Set messages_days = 0 for opt-in permanent active-database history.
 # Diagnostic/tool events use a separate, shorter lifecycle.
@@ -181,8 +192,10 @@ working_memory_cap = 50
 # Optional per-model total context windows (input plus output tokens).
 # Use the exact model identifier configured under [provider.models].
 # [state.context_window]
-# summarize_token_threshold = 12000 # compact when unsummarized whole turns reach this estimate
-# summary_recent_tokens = 4000      # keep at least this much recent raw context
+# Compaction runs after a reply once the history fills 60% of the turn model's
+# window (a turn only waits for it at 80%). Both settings are optional caps.
+# summarize_token_threshold = 12000 # compact earlier than 60% of the window
+# summary_recent_tokens = 4000      # recent raw context kept (default: a quarter of the threshold)
 # [state.context_window.model_budgets]
 # local-model-name = 16384
 
@@ -433,7 +446,6 @@ health_port = 8080
 #   scale 3x — while small/local models (gemma, llama, qwen, ...) keep the
 #   full supervision scaffolding. Hard safety caps (iteration/token/wall-clock,
 #   repetition guards, anti-fabrication checks) apply on every tier.
-#   Gate fires are logged under the `heuristic_telemetry` tracing target.
 #
 #   The auto list matches known frontier families only. If you run a capable
 #   open model it doesn't recognize (e.g. kimi-k2.5, large qwen/deepseek
@@ -458,12 +470,6 @@ enabled = false
 record_decision_points = true
 max_events = 200
 include_raw_tool_args = false
-
-# [self_correction]
-# Controls the agent self-correction gate. All flags default to false (safe-off).
-# enabled = false                  # master switch — enables the correction retry loop
-# correction_bypass_enabled = false # allow trusted sessions to skip the correction gate
-# max_attempts = 3                 # maximum correction retries per task
 
 # Nodes are disabled by default. The Gateway binds only to loopback; publish
 # this narrow service through a separately managed HTTPS transport adapter.

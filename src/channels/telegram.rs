@@ -4379,7 +4379,7 @@ impl TelegramChannel {
         // so running it inline would deadlock: the callback can't be delivered
         // until the message handler returns, but the message handler is waiting
         // for that callback.
-        if text.starts_with('/') {
+        if super::commands::is_slash_command(&text) {
             // Slash commands `return` before the message dedup gate below, so a
             // duplicate Telegram delivery of the same update (same message id)
             // would execute the command twice — e.g. two "Context cleared."
@@ -4583,17 +4583,12 @@ impl TelegramChannel {
                             .get_running_task_description(&session_id)
                             .await
                             .unwrap_or_else(|| "processing".to_string());
-                        let preview: String = text.chars().take(50).collect();
-                        let suffix = if text.len() > 50 { "..." } else { "" };
-                        let _ = bot
-                            .send_message(
-                                msg.chat.id,
-                                format!(
-                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                    queue_pos, preview, suffix, current_task
-                                ),
-                            )
-                            .await;
+                        let notice = crate::channels::presentation::queued_message_notice(
+                            &text,
+                            &current_task,
+                            !inbound_attachments.is_empty(),
+                        );
+                        let _ = bot.send_message(msg.chat.id, notice).await;
                     }
                     return;
                 }

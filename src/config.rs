@@ -404,10 +404,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub people: PeopleConfig,
     #[serde(default)]
-    // Used by subsequent plan tasks (3b P2+) that wire correction gate controllers.
-    #[allow(dead_code)]
-    pub self_correction: SelfCorrectionConfig,
-    #[serde(default)]
     pub oauth: OAuthConfig,
     #[serde(default)]
     pub http_auth: HashMap<String, HttpAuthProfile>,
@@ -419,6 +415,68 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub authority: AuthorityConfig,
+}
+
+/// How much the owner may do by default. Both levels act the same at the
+/// tool gate; `unrestricted` records, instead of checking, outward actions
+/// taken after the turn read untrusted content.
+/// Ordered `Full < Unrestricted`: a child takes the lower of its parent's
+/// and its own.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerLevel {
+    #[default]
+    Full,
+    Unrestricted,
+}
+
+/// `[authority]`: the explicit facts tool authority is resolved from.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct AuthorityConfig {
+    #[serde(default)]
+    pub owner_default: OwnerLevel,
+    /// Absolute directories whose files are the owner's own: reading them
+    /// does not mark the run as having seen untrusted content. The turn's
+    /// working directory and project scope are always trusted in addition.
+    #[serde(default)]
+    pub trusted_roots: Vec<String>,
+}
+
+/// Which long-term memory agent turns use.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub backend: MemoryBackend,
+    /// SQLite file for the `sdk` backend.
+    #[serde(default = "default_sdk_memory_path")]
+    pub path: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            backend: MemoryBackend::default(),
+            path: default_sdk_memory_path(),
+        }
+    }
+}
+
+fn default_sdk_memory_path() -> String {
+    "aidaemon-memory.db".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBackend {
+    /// The daemon's own memory in its state database.
+    #[default]
+    Daemon,
+    /// The `aidaemon-memory` crate (needs the `sdk-memory` cargo feature).
+    Sdk,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -775,6 +833,55 @@ pub struct AgentConfig {
     /// Optional Markdown persona file. Relative paths resolve next to config.toml.
     #[serde(default)]
     pub persona_file: Option<PathBuf>,
+    /// `[agent.engine]` settings for the SDK kernel that runs agent turns.
+    #[serde(default)]
+    pub engine: AgentEngineConfig,
+    /// `task_assessment = "on" | "shadow" | "off"` (default `shadow`).
+    #[serde(default)]
+    pub task_assessment: TaskAssessmentSetting,
+}
+
+/// Whether the pre-run task assessment model call runs.
+///
+/// The assessment no longer gates tools: authority comes from explicit facts.
+/// `on` and `shadow` behave alike (the contract is an expectations hint);
+/// `shadow` also records each call the assessor's authority view would have
+/// refused (`assessor_would_refuse`). `off` skips the assessment model call,
+/// so a turn runs without a contract (memory is then recall-only); it is
+/// accepted but not recommended.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskAssessmentSetting {
+    On,
+    #[default]
+    Shadow,
+    Off,
+}
+
+/// `[agent.engine]`: configures the agent kernel.
+///
+/// ```toml
+/// [agent.engine]
+/// model = "gpt-6-sol"   # optional; pins every turn to a model the daemon's provider serves
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AgentEngineConfig {
+    /// Ignored: the SDK kernel is the only agent loop. Kept so older configs
+    /// with `kind = "legacy"` or `kind = "sdk"` still parse.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Pins every SDK turn to this model, served by the daemon's providers.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Ignored: the SDK engine uses the daemon's configured providers. Kept so
+    /// older configs still parse; when set, a `model` pin written for the
+    /// removed Anthropic engine client is ignored unless the provider is
+    /// Anthropic.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model turns per agent turn before the run stops.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 impl AgentConfig {
@@ -803,6 +910,8 @@ impl Default for AgentConfig {
         Self {
             name: default_agent_name(),
             persona_file: None,
+            engine: AgentEngineConfig::default(),
+            task_assessment: TaskAssessmentSetting::default(),
         }
     }
 }
@@ -1579,9 +1688,9 @@ pub struct StateConfig {
     /// remain in the database but are not included in the prompt.
     #[serde(default = "default_max_facts")]
     pub max_facts: usize,
-    /// Optional daily token budget. When set, cumulative daily usage is checked
-    /// before additional LLM work; productive runs may auto-extend temporarily,
-    /// otherwise further calls are rejected. Resets at midnight UTC.
+    /// Ignored: a global daily token cap is not enforced (logged once at
+    /// startup). Kept so older configs still parse. Per-goal daily budgets and
+    /// the per-task token budget still apply; cap total spend at the provider.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
     /// Retention policies for automatic cleanup of old data.
@@ -1624,9 +1733,6 @@ pub struct RetentionConfig {
     /// Delete net-negative error solutions older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub error_solutions_days: u32,
-    /// Delete self-correction attempt rows older than N days (default: 30).
-    #[serde(default = "default_retention_30")]
-    pub self_correction_attempts_days: u32,
 }
 
 impl Default for RetentionConfig {
@@ -1641,7 +1747,6 @@ impl Default for RetentionConfig {
             goals_days: 180,
             procedures_days: 180,
             error_solutions_days: 90,
-            self_correction_attempts_days: 30,
         }
     }
 }
@@ -3212,38 +3317,6 @@ pub struct OAuthProviderConfig {
     pub allowed_domains: Vec<String>,
 }
 
-/// Self-correction gate configuration.
-///
-/// Controls whether the agent is allowed to retry failed outputs through
-/// a correction loop. All flags default to `false` (safe-off) so existing
-/// deployments are unaffected until explicitly opted in.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
-pub struct SelfCorrectionConfig {
-    /// Master switch. When `false` the correction loop is skipped entirely.
-    pub enabled: bool,
-    /// Allow the correction gate to be bypassed for trusted sessions.
-    pub correction_bypass_enabled: bool,
-    /// Maximum number of correction attempts per task (default: 3).
-    pub max_attempts: usize,
-    /// Shadow-first activation. When `true` (default) the correction bridge
-    /// reconstructs intent, builds the context, and runs the gate but LOGS the
-    /// would-be remediation instead of executing/dispatching it. Full autonomous
-    /// execution requires a deliberate flip to `false` after observing shadow logs.
-    pub shadow_mode: bool,
-}
-
-impl Default for SelfCorrectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            correction_bypass_enabled: false,
-            max_attempts: 3,
-            shadow_mode: true,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct PeopleConfig {
     #[serde(default)]
@@ -3404,13 +3477,15 @@ pub struct ContextWindowConfig {
     /// Enable context window management (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default total model context budget used by history fitting (default: 48000).
+    /// Context budget for a model whose family has no known window (default:
+    /// 128000). Known hosted families use their own window; set
+    /// `model_budgets` for a local or unlisted model.
     #[serde(default = "default_context_budget")]
     pub default_budget: usize,
     /// Per-model token budgets (model name → budget). Overrides default_budget.
     #[serde(default)]
     pub model_budgets: HashMap<String, usize>,
-    /// Maximum characters for tool results before truncation (default: 4000).
+    /// Maximum characters for tool results before truncation (default: 16000).
     #[serde(default = "default_tool_result_chars")]
     pub max_tool_result_chars: usize,
     /// Per-model tool result character caps (model name → max chars).
@@ -3432,10 +3507,13 @@ pub struct ContextWindowConfig {
     #[allow(dead_code)]
     #[serde(default = "default_summarize_threshold")]
     pub summarize_threshold: usize,
-    /// Estimated unsummarized conversation tokens that trigger compaction.
+    /// Cap on the estimated unsummarized conversation tokens that trigger
+    /// compaction. Unset, compaction waits until the history fills 60% of the
+    /// turn model's context window.
     #[serde(default = "default_summarize_token_threshold")]
     pub summarize_token_threshold: usize,
-    /// Estimated tokens of recent whole turns to keep verbatim after compaction.
+    /// Cap on the estimated tokens of recent whole turns kept verbatim after
+    /// compaction. Unset, a quarter of the compaction threshold.
     #[serde(default = "default_summary_recent_tokens")]
     pub summary_recent_tokens: usize,
 }
@@ -3480,31 +3558,121 @@ impl ContextWindowConfig {
         self.max_tool_result_chars
     }
 
-    /// Token-pressure high-water mark, clamped for small model windows.
+    /// The model's total context budget: an explicit `model_budgets` entry,
+    /// else the model family's known window (or `default_budget`), lowered
+    /// to what the provider reported if it rejected a request as too long.
+    pub fn context_budget_for(&self, model: &str) -> usize {
+        if let Some(budget) = self.model_budgets.get(model) {
+            return *budget;
+        }
+        let assumed = known_context_budget(model).unwrap_or(self.default_budget);
+        // A window the provider itself reported (it rejected a request as
+        // too long) overrides the assumption when smaller.
+        learned_context_budget(model).map_or(assumed, |learned| learned.min(assumed))
+    }
+
+    /// Token-pressure high-water mark for the model whose window the history
+    /// fills (the turn's model, not the summarizer's): 60% of that window, or
+    /// the configured cap when lower. Compaction runs after a reply, so a
+    /// turn never waits for it below `emergency_compaction_threshold_for`.
     pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
-        let model_budget = self
-            .model_budgets
-            .get(model)
-            .copied()
-            .unwrap_or(self.default_budget);
         self.summarize_token_threshold
-            .min(model_budget.saturating_mul(3) / 5)
+            .min(aidaemon_policies::compaction_threshold(
+                self.context_budget_for(model),
+            ))
             .max(512)
+    }
+
+    /// History size at which a turn waits for compaction before its first
+    /// call: 80% of the model's window, so only a history the background
+    /// pass could not keep up with blocks a reply.
+    pub fn emergency_compaction_threshold_for(&self, model: &str) -> usize {
+        aidaemon_policies::wait_threshold(self.context_budget_for(model))
+            .max(self.summarize_token_threshold_for(model))
     }
 
     /// Raw recent-context overlap, also clamped so a summary can make progress.
     pub fn summary_recent_tokens_for(&self, model: &str) -> usize {
-        self.summary_recent_tokens
-            .min(self.summarize_token_threshold_for(model) / 2)
-            .max(256)
+        let threshold = self.summarize_token_threshold_for(model);
+        let recent = if self.summary_recent_tokens == default_summary_recent_tokens() {
+            aidaemon_policies::verbatim_tokens(threshold)
+        } else {
+            self.summary_recent_tokens.min(threshold / 2)
+        };
+        recent.max(256)
     }
 }
 
+/// Context budgets for hosted model families, by the model name's prefix
+/// (a provider route such as `openrouter/` or `models/` is ignored). Each is
+/// about 85% of the family's input window: the daemon's token count is an
+/// estimate, and reasoning output shares the window on some APIs. GPT models
+/// use the window the ChatGPT/Codex backend serves (272k), not the larger
+/// public API one.
+const KNOWN_CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    ("gpt-6", 272_000),
+    ("gpt-5", 272_000),
+    ("gpt-4.1", 1_000_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("claude-", 200_000),
+    ("gemini-", 1_000_000),
+    ("grok-4", 256_000),
+];
+
+/// Budgets learned this process from providers rejecting a request as too
+/// long, by model.
+fn learned_context_budgets() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    static LEARNED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    LEARNED.get_or_init(Default::default)
+}
+
+fn learned_context_budget(model: &str) -> Option<usize> {
+    learned_context_budgets()
+        .lock()
+        .ok()
+        .and_then(|learned| learned.get(model).copied())
+}
+
+/// Record that `model` rejected a request of about `attempted_tokens` as
+/// too long. The budget becomes 85% of the window the error stated, or 75%
+/// of the attempt when it stated none; it only ever shrinks.
+pub(crate) fn record_context_overflow(
+    model: &str,
+    stated_window: Option<usize>,
+    attempted_tokens: usize,
+) -> usize {
+    let budget = stated_window
+        .map(|window| window / 100 * 85)
+        .unwrap_or(attempted_tokens / 4 * 3)
+        .max(4_000);
+    let mut learned = learned_context_budgets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = learned.entry(model.to_string()).or_insert(budget);
+    *entry = (*entry).min(budget);
+    *entry
+}
+
+/// The budget for a model family listed in [`KNOWN_CONTEXT_WINDOWS`].
+pub(crate) fn known_context_budget(model: &str) -> Option<usize> {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    KNOWN_CONTEXT_WINDOWS
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map(|(_, window)| window / 100 * 85)
+}
+
 fn default_context_budget() -> usize {
-    48000
+    128_000
 }
 fn default_tool_result_chars() -> usize {
-    4000
+    16_000
 }
 fn default_summary_window() -> usize {
     6
@@ -3512,11 +3680,12 @@ fn default_summary_window() -> usize {
 fn default_summarize_threshold() -> usize {
     12
 }
+// No cap: both follow the model's context window.
 fn default_summarize_token_threshold() -> usize {
-    12_000
+    usize::MAX
 }
 fn default_summary_recent_tokens() -> usize {
-    4_000
+    usize::MAX
 }
 
 fn default_heartbeat_tick() -> u64 {
@@ -3823,20 +3992,6 @@ pub struct PolicyConfig {
     pub pre_execution_supervision: bool,
     #[serde(default)]
     pub write_consistency: WriteConsistencyConfig,
-    /// Models that ignore a forced `tool_choice=required` (return text with
-    /// zero tool calls). For these the daemon never forces `required` during
-    /// deferred/no-tool recovery — forcing only burns tokens, and on some
-    /// stacks (llama.cpp + Gemma) degenerates into a ~8k-token repetition loop
-    /// until the token limit. Matched by exact model name. Runtime-learned
-    /// entries are added to (and persisted alongside) this seed list.
-    #[serde(default = "default_required_tool_choice_ignored_models")]
-    pub required_tool_choice_ignored_models: Vec<String>,
-}
-
-/// Known-bad models that ignore forced `tool_choice=required`. Seeded so a
-/// fresh config never re-arms the witnessed `gemma-4-26b` meltdown on restart.
-fn default_required_tool_choice_ignored_models() -> Vec<String> {
-    vec!["gemma-4-26b".to_string()]
 }
 
 impl Default for PolicyConfig {
@@ -3854,7 +4009,6 @@ impl Default for PolicyConfig {
             trust_tier: default_trust_tier(),
             pre_execution_supervision: default_pre_execution_supervision(),
             write_consistency: WriteConsistencyConfig::default(),
-            required_tool_choice_ignored_models: default_required_tool_choice_ignored_models(),
         }
     }
 }
@@ -4021,6 +4175,41 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// The configured API keys, tokens and passwords (static config only;
+    /// dynamically connected bots live in the state store). The kernel's
+    /// outbound secret scan refuses calls whose arguments carry one.
+    pub fn outbound_secret_values(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut providers = vec![&self.provider];
+        providers.extend(self.provider.fallbacks.iter());
+        for provider in providers {
+            values.push(provider.api_key.clone());
+            values.extend(provider.gateway_token.clone());
+        }
+        values.push(self.agent.engine.api_key.clone());
+        values.push(self.search.api_key.clone());
+        values.extend(
+            self.all_telegram_bots()
+                .into_iter()
+                .map(|bot| bot.bot_token),
+        );
+        #[cfg(feature = "discord")]
+        values.extend(self.all_discord_bots().into_iter().map(|bot| bot.bot_token));
+        #[cfg(feature = "slack")]
+        for bot in self.all_slack_bots() {
+            values.push(bot.bot_token);
+            values.push(bot.app_token);
+        }
+        if let Some(email) = &self.triggers.email {
+            values.push(email.password.clone());
+        }
+        for profile in self.http_auth.values() {
+            values.extend(profile.credential_values().into_iter().map(str::to_string));
+        }
+        values.retain(|value| !value.trim().is_empty() && value != "keychain");
+        values
+    }
+
     /// Get all Telegram bot configurations (merges legacy single + array).
     /// Legacy `[telegram]` becomes a bot named "default".
     pub fn all_telegram_bots(&self) -> Vec<TelegramBotConfig> {
@@ -4082,6 +4271,10 @@ impl AppConfig {
     /// Resolve fields set to `"keychain"` by reading them from the OS credential store.
     fn resolve_secrets(&mut self) -> anyhow::Result<()> {
         self.provider.resolve_secrets_recursive(None)?;
+
+        if self.agent.engine.api_key == "keychain" {
+            self.agent.engine.api_key = resolve_from_keychain("agent_engine_api_key")?;
+        }
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram {
@@ -4203,21 +4396,104 @@ mod tests {
     use crate::testing::KeychainIsolation;
     use once_cell::sync::Lazy;
 
+    /// A config written before a policy key was retired must still parse:
+    /// `PolicyConfig` tolerates unknown keys rather than failing startup.
     #[test]
-    fn test_required_tool_choice_ignored_models_default_includes_gemma() {
-        let cfg = PolicyConfig::default();
-        assert!(
-            cfg.required_tool_choice_ignored_models
-                .iter()
-                .any(|m| m == "gemma-4-26b"),
-            "default PolicyConfig must seed the known-bad gemma-4-26b model"
-        );
+    fn policy_config_ignores_retired_keys() {
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+policy_enforce = false
+required_tool_choice_ignored_models = ["gemma-4-26b"]
+"#,
+        )
+        .expect("retired policy key must not break config parsing");
+        assert!(!cfg.policy_enforce);
     }
 
     #[test]
     fn watchdog_task_inactivity_timeout_defaults_to_300() {
         let cfg = WatchdogConfig::default();
         assert_eq!(cfg.task_inactivity_timeout_secs, 300);
+    }
+
+    #[test]
+    fn context_budget_follows_config_then_known_window_then_default() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 231_200);
+        assert_eq!(config.context_budget_for("claude-opus-5-5"), 170_000);
+        assert_eq!(config.context_budget_for("models/gemini-3-pro"), 850_000);
+        assert_eq!(config.context_budget_for("Claude-Sonnet-5-5"), 170_000);
+        assert_eq!(
+            config.context_budget_for("my-local-model"),
+            config.default_budget
+        );
+        config.model_budgets.insert("gpt-6-sol".to_string(), 50_000);
+        assert_eq!(config.context_budget_for("gpt-6-sol"), 50_000);
+    }
+
+    /// Compaction follows each model's own window: a history that fits a
+    /// large-window model is left alone, the same history is compacted for a
+    /// small one, and a turn waits only near the window.
+    #[test]
+    fn compaction_thresholds_follow_each_models_window() {
+        let mut config = ContextWindowConfig::default();
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 138_720);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 34_680);
+        assert_eq!(
+            config.summarize_token_threshold_for("claude-opus-5-5"),
+            102_000
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("claude-opus-5-5"),
+            136_000
+        );
+        assert_eq!(
+            config.summarize_token_threshold_for("models/gemini-3-pro"),
+            510_000
+        );
+        config
+            .model_budgets
+            .insert("synthetic-local-32k".to_string(), 32_000);
+        assert_eq!(
+            config.summarize_token_threshold_for("synthetic-local-32k"),
+            19_200
+        );
+        assert_eq!(
+            config.emergency_compaction_threshold_for("synthetic-local-32k"),
+            25_600
+        );
+        assert_eq!(
+            config.summary_recent_tokens_for("synthetic-local-32k"),
+            4_800
+        );
+
+        // An explicit cap lowers the background threshold, never the point at
+        // which a turn waits.
+        config.summarize_token_threshold = 12_000;
+        config.summary_recent_tokens = 4_000;
+        assert_eq!(config.summarize_token_threshold_for("gpt-6-sol"), 12_000);
+        assert_eq!(config.summary_recent_tokens_for("gpt-6-sol"), 4_000);
+        assert_eq!(
+            config.emergency_compaction_threshold_for("gpt-6-sol"),
+            184_960
+        );
+    }
+
+    #[test]
+    fn a_reported_overflow_lowers_the_budget_and_never_raises_it() {
+        let config = ContextWindowConfig::default();
+        let model = "gpt-6-synthetic-overflow";
+        assert_eq!(config.context_budget_for(model), 231_200);
+        // No stated window: three quarters of the rejected attempt.
+        assert_eq!(record_context_overflow(model, None, 200_000), 150_000);
+        assert_eq!(config.context_budget_for(model), 150_000);
+        // A larger stated window cannot raise it back.
+        assert_eq!(record_context_overflow(model, Some(400_000), 0), 150_000);
+        assert_eq!(config.context_budget_for(model), 150_000);
     }
 
     #[test]
@@ -4286,6 +4562,46 @@ mod tests {
         )
         .unwrap();
         assert!(!config.cli_agents.enabled);
+    }
+
+    #[test]
+    fn task_assessment_parses_and_defaults_to_shadow() {
+        let base = "[provider]\napi_key = \"test\"\n";
+        let config: AppConfig = toml::from_str(base).unwrap();
+        assert_eq!(config.agent.task_assessment, TaskAssessmentSetting::Shadow);
+        for (value, expected) in [
+            ("on", TaskAssessmentSetting::On),
+            ("shadow", TaskAssessmentSetting::Shadow),
+            ("off", TaskAssessmentSetting::Off),
+        ] {
+            let config: AppConfig =
+                toml::from_str(&format!("{base}\n[agent]\ntask_assessment = \"{value}\"\n"))
+                    .unwrap();
+            assert_eq!(config.agent.task_assessment, expected);
+        }
+    }
+
+    #[test]
+    fn authority_owner_default_parses_and_defaults_to_full() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Full);
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+
+            [authority]
+            owner_default = "unrestricted"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.authority.owner_default, OwnerLevel::Unrestricted);
     }
 
     #[test]
@@ -5397,58 +5713,10 @@ session_isolation = "incognito"
     }
 
     #[test]
-    fn test_self_correction_config_defaults_are_safe() {
-        let cfg = SelfCorrectionConfig::default();
-        assert!(!cfg.enabled, "enabled must default to false (safe-off)");
-        assert!(
-            !cfg.correction_bypass_enabled,
-            "correction_bypass_enabled must default to false (safe-off)"
-        );
-        assert_eq!(cfg.max_attempts, 3, "max_attempts must default to 3");
-        assert!(
-            cfg.shadow_mode,
-            "shadow_mode must default to true (shadow-first activation)"
-        );
-
-        // A config without [self_correction] section must still load and use defaults.
-        let toml = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-"#;
-        let app: AppConfig =
-            toml::from_str(toml).expect("parse app config without self_correction");
-        assert!(!app.self_correction.enabled);
-        assert!(!app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 3);
-        assert!(app.self_correction.shadow_mode);
-
-        // shadow_mode = false parses (the deliberate full-autonomy flip).
-        let toml_live = r#"
-[provider]
-kind = "openai_compatible"
-api_key = "test-key"
-
-[provider.models]
-primary = "gpt-4o"
-
-[self_correction]
-enabled = true
-correction_bypass_enabled = true
-shadow_mode = false
-"#;
-        let app_live: AppConfig =
-            toml::from_str(toml_live).expect("parse app config with shadow_mode=false");
-        assert!(app_live.self_correction.enabled);
-        assert!(app_live.self_correction.correction_bypass_enabled);
-        assert!(!app_live.self_correction.shadow_mode);
-    }
-
-    #[test]
-    fn test_self_correction_config_parses_enabled_flags() {
+    fn config_with_removed_correction_sections_still_parses() {
+        // The self-correction feature was removed. An existing config.toml that
+        // still carries its `[self_correction]` section or the retention key for
+        // its attempts table must keep loading; the keys are simply ignored.
         let toml = r#"
 [provider]
 kind = "openai_compatible"
@@ -5461,10 +5729,13 @@ primary = "gpt-4o"
 enabled = true
 correction_bypass_enabled = true
 max_attempts = 5
+shadow_mode = false
+
+[state.retention]
+self_correction_attempts_days = 30
 "#;
-        let app: AppConfig = toml::from_str(toml).expect("parse app config with self_correction");
-        assert!(app.self_correction.enabled);
-        assert!(app.self_correction.correction_bypass_enabled);
-        assert_eq!(app.self_correction.max_attempts, 5);
+        let app: AppConfig =
+            toml::from_str(toml).expect("config with removed sections must still parse");
+        assert_eq!(app.state.retention.error_solutions_days, 90);
     }
 }

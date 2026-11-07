@@ -141,14 +141,6 @@ impl Tool for HealthProbeTool {
         })
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &["list", "status"],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: HealthProbeArgs = serde_json::from_str(arguments)?;
 
@@ -165,6 +157,16 @@ impl Tool for HealthProbeTool {
                 other
             )),
         }
+    }
+}
+
+impl crate::traits::ToolSemantics for HealthProbeTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "status"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

@@ -2,7 +2,6 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum GoalBudgetCheckSource {
-    PreCheck,
     PostLlm,
 }
 
@@ -182,6 +181,8 @@ impl Agent {
         }
     }
 
+    /// The percentage to warn at once a scheduled run has used 80% of its
+    /// per-run budget (not yet exhausted, not already warned).
     pub(super) fn scheduled_run_budget_pressure_pct(
         status: &crate::goal_tokens::GoalRunBudgetStatus,
         warning_already_sent: bool,
@@ -427,11 +428,6 @@ impl Agent {
         };
 
         let (auto_condition, manual_condition, source_label) = match ctx.source {
-            GoalBudgetCheckSource::PreCheck => (
-                "goal_daily_budget_extension",
-                "goal_daily_budget_extension_manual",
-                "pre-check",
-            ),
             GoalBudgetCheckSource::PostLlm => (
                 "goal_daily_budget_extension_post_llm",
                 "goal_daily_budget_extension_manual_post_llm",
@@ -664,93 +660,6 @@ impl Agent {
         }
     }
 
-    async fn append_graceful_assistant_summary(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        summary: String,
-    ) -> anyhow::Result<String> {
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
-        self.append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
-            .await?;
-        Ok(summary)
-    }
-
-    /// Graceful response when task timeout is reached.
-    pub(super) async fn graceful_timeout_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        elapsed: Duration,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_timeout_response(learning_ctx, elapsed);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when task token budget is exhausted.
-    pub(super) async fn graceful_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used: u64,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_budget_response(learning_ctx, tokens_used);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when a scheduled run hits its per-run budget.
-    pub(super) async fn graceful_scheduled_run_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used: i64,
-        budget_per_check: i64,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_scheduled_run_budget_response(
-            learning_ctx,
-            tokens_used,
-            budget_per_check,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when a goal hits its daily token budget.
-    pub(super) async fn graceful_goal_daily_budget_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tokens_used_today: i64,
-        budget_daily: i64,
-        is_scheduled_goal: bool,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_goal_daily_budget_response(
-            learning_ctx,
-            tokens_used_today,
-            budget_daily,
-            is_scheduled_goal,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
     fn dedupe_alert_sessions(sessions: Vec<String>) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -916,138 +825,6 @@ impl Agent {
         )
     }
 
-    /// Graceful response when agent is stalled (no progress).
-    pub(super) async fn graceful_stall_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        sent_file_successfully: bool,
-        tool_failure_count: &HashMap<String, usize>,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_stall_response(
-            learning_ctx,
-            sent_file_successfully,
-            DEFERRED_NO_TOOL_ERROR_MARKER,
-            tool_failure_count,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when agent stalled after making meaningful progress.
-    pub(super) async fn graceful_partial_stall_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        sent_file_successfully: bool,
-        tool_failure_count: &HashMap<String, usize>,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_partial_stall_response(
-            learning_ctx,
-            sent_file_successfully,
-            DEFERRED_NO_TOOL_ERROR_MARKER,
-            tool_failure_count,
-        );
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Attempt a knowledge-only fallback when tools have failed.
-    ///
-    /// Makes one LLM call WITHOUT tools, asking the model to answer from
-    /// its training knowledge. Returns `Some(answer)` if the model gives a
-    /// substantive response (>30 chars), `None` otherwise.
-    pub(super) async fn try_knowledge_fallback(
-        &self,
-        user_text: &str,
-        error_summary: &str,
-    ) -> Option<String> {
-        if self.mandate_execution.is_some() {
-            return None;
-        }
-        let system = format!(
-            "The user asked a question but all tool-based approaches failed ({}).\n\
-             Answer the question from your training knowledge if possible.\n\
-             If you genuinely cannot answer without tools, say so briefly.\n\
-             Do NOT mention tool failures or activity summaries.",
-            error_summary
-        );
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": system}),
-            serde_json::json!({"role": "user", "content": user_text}),
-        ];
-        let provider = self.llm_runtime.provider();
-        let model = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!("Timed out acquiring model lock during knowledge fallback");
-                return None;
-            }
-        };
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            provider.chat(&model, &messages, &[]),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                let text = resp.content.unwrap_or_default();
-                if text.trim().len() > 30 {
-                    Some(text.trim().to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Attempt a knowledge-only fallback and, if successful, append the
-    /// answer as an assistant message.  Returns `Some(answer)` on success.
-    pub(super) async fn graceful_knowledge_fallback(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        user_text: &str,
-        error_summary: &str,
-    ) -> Option<anyhow::Result<String>> {
-        let answer = self
-            .try_knowledge_fallback(user_text, error_summary)
-            .await?;
-        Some(
-            self.append_graceful_assistant_summary(emitter, session_id, answer)
-                .await,
-        )
-    }
-
-    /// Graceful response when repetitive tool calls are detected.
-    pub(super) async fn graceful_repetitive_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        tool_name: &str,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_repetitive_response(learning_ctx, tool_name);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
-    /// Graceful response when hard iteration cap is reached (legacy mode).
-    pub(super) async fn graceful_cap_response(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        learning_ctx: &LearningContext,
-        iterations: usize,
-    ) -> anyhow::Result<String> {
-        let summary = post_task::graceful_cap_response(learning_ctx, iterations);
-        self.append_graceful_assistant_summary(emitter, session_id, summary)
-            .await
-    }
-
     /// Emit TaskEnd after recording an exact bootstrap protocol direct-return.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn emit_direct_return_task_end(
@@ -1117,39 +894,12 @@ impl Agent {
         } else {
             status
         };
-        // At task end there is no loop left to make progress: a `Pending`
-        // ledger whose terminal receipts all succeeded or were credited is
-        // closed by evidence (the still-open obligations are descriptions the
-        // contract could not bind to the work that demonstrably happened).
-        let terminal_decision = match run_aggregate.terminal_decision() {
-            crate::events::RunTerminalDecision::Pending
-                if effective_status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
-            {
-                crate::events::RunTerminalDecision::SucceededByEvidence
-            }
-            decision => decision,
-        };
-        let effective_outcome = match (effective_status, terminal_decision) {
-            (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
-            (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
-                crate::events::TaskOutcome::Partial
-            }
-            (
-                _,
-                crate::events::RunTerminalDecision::Succeeded
-                | crate::events::RunTerminalDecision::SucceededByEvidence
-                | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
-            ) => crate::events::TaskOutcome::Succeeded,
-            (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
-            (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
-            (_, crate::events::RunTerminalDecision::Pending)
-                if outcome == crate::events::TaskOutcome::Succeeded =>
-            {
-                crate::events::TaskOutcome::Partial
-            }
-            (_, crate::events::RunTerminalDecision::Pending) => outcome,
-            (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
-        };
+        let (terminal_decision, effective_outcome) = task_end_decision_and_outcome(
+            &run_aggregate,
+            effective_status,
+            outcome,
+            background_in_flight,
+        );
         let durable_tool_calls_count = self
             .event_store
             .task_event_count(
@@ -1511,31 +1261,170 @@ impl Agent {
         if !self.record_decision_points {
             return;
         }
-        let code = emission
-            .metadata
-            .as_object()
-            .and_then(|obj| {
-                ["condition", "route_reason", "reason"]
-                    .iter()
-                    .find_map(|key| obj.get(*key).and_then(Value::as_str))
-            })
-            .map(|value| value.to_string())
-            .or_else(|| Some(emission.decision_type.as_str().to_string()));
-        let _ = emitter
-            .emit(
-                EventType::DecisionPoint,
-                DecisionPointData {
-                    decision_type: emission.decision_type,
-                    task_id: task_id.to_string(),
-                    iteration: iteration.min(u32::MAX as usize) as u32,
-                    severity: emission.severity,
-                    code,
-                    metadata: emission.metadata,
-                    summary: emission.summary,
-                },
-            )
-            .await;
+        emit_decision_point_event(
+            emitter,
+            task_id,
+            iteration,
+            emission.decision_type,
+            emission.severity,
+            emission.summary,
+            emission.metadata,
+        )
+        .await;
     }
+}
+
+/// Emit one decision point event. Callers check whether decision points are
+/// recorded.
+pub(in crate::agent) async fn emit_decision_point_event(
+    emitter: &crate::events::EventEmitter,
+    task_id: &str,
+    iteration: usize,
+    decision_type: DecisionType,
+    severity: crate::events::DiagnosticSeverity,
+    summary: String,
+    metadata: Value,
+) {
+    let code = metadata
+        .as_object()
+        .and_then(|obj| {
+            ["condition", "route_reason", "reason"]
+                .iter()
+                .find_map(|key| obj.get(*key).and_then(Value::as_str))
+        })
+        .map(|value| value.to_string())
+        .or_else(|| Some(decision_type.as_str().to_string()));
+    let _ = emitter
+        .emit(
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type,
+                task_id: task_id.to_string(),
+                iteration: iteration.min(u32::MAX as usize) as u32,
+                severity,
+                code,
+                metadata,
+                summary,
+            },
+        )
+        .await;
+}
+
+/// The run's terminal decision and semantic outcome at task end, from the
+/// replayed aggregate, the effective transport status, and the outcome the
+/// exit path proposed.
+fn task_end_decision_and_outcome(
+    run_aggregate: &crate::events::RunAggregate,
+    effective_status: TaskStatus,
+    outcome: crate::events::TaskOutcome,
+    background_in_flight: bool,
+) -> (
+    crate::events::RunTerminalDecision,
+    crate::events::TaskOutcome,
+) {
+    // At task end there is no loop left to make progress: a `Pending`
+    // ledger whose terminal receipts all succeeded or were credited is
+    // closed by evidence (the still-open obligations are descriptions the
+    // contract could not bind to the work that demonstrably happened).
+    let terminal_decision = match run_aggregate.terminal_decision() {
+        crate::events::RunTerminalDecision::Pending
+            if effective_status != TaskStatus::Cancelled && run_aggregate.evidence_closed() =>
+        {
+            crate::events::RunTerminalDecision::SucceededByEvidence
+        }
+        // `Unspecified` means no expectations were declared (no assessed
+        // contract and no executor checklist) or none bound to an obligation.
+        // Such a run whose only receipts are typed policy denials, and which
+        // would otherwise close as uncredited plain success, closed at the
+        // authority boundary: record that proof basis. Any other run (failed,
+        // interrupted, cancelled, or proposed failed/partial) keeps its own
+        // outcome; a denial never turns it into success.
+        crate::events::RunTerminalDecision::Unspecified
+            if effective_status == TaskStatus::Completed
+                && outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.terminal_policy_denial()
+                && !run_aggregate.owner_declined() =>
+        {
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        }
+        decision => decision,
+    };
+    let effective_outcome = match (effective_status, terminal_decision) {
+        (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+        (_, crate::events::RunTerminalDecision::Pending) if background_in_flight => {
+            crate::events::TaskOutcome::Partial
+        }
+        // A refused operation is work the owner asked for that did not happen,
+        // whether or not the contract listed it. Obligations only cover what the
+        // contract expected, so a fulfilled contract beside a refused call would
+        // otherwise close the request as answered and drop the refused work.
+        // Stay partial so the request remains open for the owner's follow-up.
+        // `ClosedByPolicyDenial` (nothing else dispatched) keeps its boundary
+        // rule below.
+        (
+            _,
+            crate::events::RunTerminalDecision::Succeeded
+            | crate::events::RunTerminalDecision::SucceededByEvidence,
+        ) if outcome == crate::events::TaskOutcome::Succeeded
+            && run_aggregate.policy_denied_operations() > 0 =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
+        (
+            _,
+            crate::events::RunTerminalDecision::Succeeded
+            | crate::events::RunTerminalDecision::SucceededByEvidence
+            | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
+        ) => crate::events::TaskOutcome::Succeeded,
+        (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
+        (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
+        // The contract's work is still owed and nothing ran at all: there
+        // is no progress to call partial.
+        (_, crate::events::RunTerminalDecision::Pending)
+            if outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.operations.is_empty() =>
+        {
+            crate::events::TaskOutcome::Failed
+        }
+        (_, crate::events::RunTerminalDecision::Pending)
+            if outcome == crate::events::TaskOutcome::Succeeded =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
+        (_, crate::events::RunTerminalDecision::Pending) => outcome,
+        // No contract to judge by: receipts are the only proof, and a run
+        // whose operations all failed accomplished nothing, whether it
+        // ended on a reply or was stopped.
+        (_, crate::events::RunTerminalDecision::Unspecified)
+            if run_aggregate.only_failed_operations() =>
+        {
+            crate::events::TaskOutcome::Failed
+        }
+        // A refused operation is owed work that did not happen. When the run
+        // also dispatched something else, the refusal is not "no proof of
+        // work" (`ClosedByPolicyDenial` handles that case); without this arm
+        // the reply's success would close the owner's request as answered and
+        // the refused work would be lost. Stay partial so the request remains
+        // open for the owner's follow-up.
+        // Same refusal rule for runs whose contract expected nothing.
+        (_, crate::events::RunTerminalDecision::Unspecified)
+            if outcome == crate::events::TaskOutcome::Succeeded
+                && run_aggregate.policy_denied_operations() > 0 =>
+        {
+            crate::events::TaskOutcome::Partial
+        }
+        (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
+    };
+    // The owner declined part of what the run set out to do: whatever the
+    // closing reply says, that work did not happen.
+    let effective_outcome = if effective_outcome == crate::events::TaskOutcome::Succeeded
+        && run_aggregate.owner_declined()
+    {
+        crate::events::TaskOutcome::Partial
+    } else {
+        effective_outcome
+    };
+    (terminal_decision, effective_outcome)
 }
 
 #[cfg(test)]
@@ -1726,5 +1615,132 @@ mod tests {
             "slack:U018EAFV5QR",
             "aidaemon_coding_bot:301753035"
         ));
+    }
+
+    /// A run with no contract whose only operation was a typed policy
+    /// denial (nothing dispatched).
+    fn denial_only_aggregate() -> crate::events::RunAggregate {
+        let mut aggregate = crate::events::RunAggregate::new("task-denied");
+        let operation = serde_json::from_value(serde_json::json!({
+            "operation_id": "op-denied",
+            "tool_name": "write_file",
+            "policy_denied": true,
+            "mutating": true
+        }))
+        .expect("operation");
+        aggregate
+            .operations
+            .insert("op-denied".to_string(), operation);
+        assert!(aggregate.terminal_policy_denial());
+        assert_eq!(
+            aggregate.terminal_decision(),
+            crate::events::RunTerminalDecision::Unspecified
+        );
+        aggregate
+    }
+
+    #[test]
+    fn policy_denial_closes_an_uncredited_success_at_the_boundary() {
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &denial_only_aggregate(),
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(
+            decision,
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn refused_work_beside_a_fulfilled_contract_is_not_a_success() {
+        // The contract's only obligation was satisfied by a read; the refused
+        // call was never in the contract. The run's decision is therefore
+        // `Succeeded`, and the refusal must still keep the request open.
+        let mut aggregate = denial_only_aggregate();
+        aggregate.contract_present = true;
+        let obligation = serde_json::from_value(serde_json::json!({
+            "id": "obligation-read",
+            "class": "perform",
+            "state": "satisfied"
+        }))
+        .expect("obligation");
+        aggregate
+            .obligations
+            .insert("obligation-read".to_string(), obligation);
+        assert_eq!(
+            aggregate.terminal_decision(),
+            crate::events::RunTerminalDecision::Succeeded
+        );
+        let (_, outcome) = task_end_decision_and_outcome(
+            &aggregate,
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn refused_work_beside_dispatched_work_is_not_a_success() {
+        // The refused call is owed work; the dispatched read is not proof that
+        // it happened. The run must not close as an answered success.
+        let mut aggregate = denial_only_aggregate();
+        let read = serde_json::from_value(serde_json::json!({
+            "operation_id": "op-read",
+            "tool_name": "search_memories",
+            "dispatched": true
+        }))
+        .expect("operation");
+        aggregate.operations.insert("op-read".to_string(), read);
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &aggregate,
+            TaskStatus::Completed,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_eq!(
+            decision,
+            crate::events::RunTerminalDecision::Unspecified,
+            "a mixed run is not closed by the denial-only boundary rule"
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn policy_denial_does_not_turn_a_failed_run_into_success() {
+        let aggregate = denial_only_aggregate();
+        for (status, proposed) in [
+            (TaskStatus::Failed, crate::events::TaskOutcome::Failed),
+            (TaskStatus::Completed, crate::events::TaskOutcome::Failed),
+            (TaskStatus::Completed, crate::events::TaskOutcome::Partial),
+            (TaskStatus::Interrupted, crate::events::TaskOutcome::Partial),
+        ] {
+            let (decision, outcome) =
+                task_end_decision_and_outcome(&aggregate, status, proposed, false);
+            assert_eq!(
+                decision,
+                crate::events::RunTerminalDecision::Unspecified,
+                "{status:?}/{proposed:?}"
+            );
+            assert_eq!(outcome, proposed, "{status:?}/{proposed:?}");
+        }
+    }
+
+    #[test]
+    fn policy_denial_does_not_close_a_cancelled_run() {
+        let (decision, outcome) = task_end_decision_and_outcome(
+            &denial_only_aggregate(),
+            TaskStatus::Cancelled,
+            crate::events::TaskOutcome::Succeeded,
+            false,
+        );
+        assert_ne!(
+            decision,
+            crate::events::RunTerminalDecision::ClosedByPolicyDenial
+        );
+        assert_eq!(outcome, crate::events::TaskOutcome::Failed);
     }
 }

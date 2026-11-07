@@ -6,8 +6,8 @@ use std::borrow::Cow;
 const APPENDED_DIAGNOSTIC_MARKER: &str = "\n\n[DIAGNOSTIC]";
 const APPENDED_TOOL_STATS_MARKER: &str = "\n\n[TOOL STATS]";
 const APPENDED_SYSTEM_MARKER: &str = "\n\n[SYSTEM]";
-const UNTRUSTED_EXTERNAL_DATA_PREFIX: &str = "[UNTRUSTED EXTERNAL DATA";
-const UNTRUSTED_EXTERNAL_DATA_SUFFIX: &str = "[END UNTRUSTED EXTERNAL DATA]";
+const UNTRUSTED_EXTERNAL_DATA_PREFIX: &str = aidaemon_policies::UNTRUSTED_PREFIX;
+const UNTRUSTED_EXTERNAL_DATA_SUFFIX: &str = aidaemon_policies::UNTRUSTED_SUFFIX;
 
 /// Structured annotations attached to rendered conversation content.
 ///
@@ -44,39 +44,7 @@ pub enum MessageAnnotation {
     },
 }
 
-/// Where an attachment originated — drives vision retention in archived turns.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentProvenance {
-    /// User sent via a channel (Telegram, Slack, Discord).
-    #[default]
-    Inbound,
-    /// Produced by a tool observation (browser screenshot, MCP image, etc.).
-    ToolObservation,
-    /// Produced as a durable artifact by a tool (PDF, document, archive, etc.).
-    ToolArtifact,
-}
-
-/// Metadata for a file saved from an inbound channel message or tool observation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct MessageAttachment {
-    /// Stable opaque handle used by tools and policy. Legacy attachments omit
-    /// it and receive one when they next cross the canonical event boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<String>,
-    pub local_path: String,
-    pub filename: String,
-    pub mime_type: String,
-    pub size_bytes: u64,
-    #[serde(default)]
-    pub provenance: AttachmentProvenance,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_tool: Option<String>,
-    /// Content digest captured when the attachment was registered. Execution
-    /// re-checks this before sensitive use to detect stale/replaced files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-}
+pub use aidaemon_tools::semantics::{AttachmentProvenance, MessageAttachment};
 
 pub fn infer_message_annotations(content: &str) -> Vec<MessageAnnotation> {
     let mut annotations = Vec::new();

@@ -13,7 +13,24 @@ categories = ["command-line-utilities"]
 exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
 
 [workspace]
-members = ["crates/node-protocol", "crates/node-sdk"]
+members = [
+    "crates/node-protocol",
+    "crates/node-sdk",
+    "crates/aidaemon-core",
+    "crates/aidaemon-providers",
+    "crates/aidaemon-tools",
+    "crates/aidaemon-store-sqlite",
+    "crates/aidaemon-mcp",
+    "crates/aidaemon-agents",
+    "crates/aidaemon-policies",
+    "crates/aidaemon-eval",
+    "crates/aidaemon-memory",
+    "crates/aidaemon-channels",
+    "crates/aidaemon-channel-telegram",
+    "crates/aidaemon-channel-slack",
+    "crates/aidaemon-channel-discord",
+    "crates/aidaemon-sdk",
+]
 resolver = "2"
 
 [[bin]]
@@ -87,6 +104,17 @@ p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 aes-gcm = { version = "0.10", optional = true }
 portable-pty = { version = "0.8", optional = true }
 
+# The agent kernel (workspace crate).
+aidaemon-core = { path = "crates/aidaemon-core" }
+# The kernel's run journal and checkpoints, on the daemon's own pool.
+aidaemon-store-sqlite = { path = "crates/aidaemon-store-sqlite" }
+aidaemon-policies = { path = "crates/aidaemon-policies" }
+# Tool semantics (call descriptions, receipts metadata) live in the SDK.
+aidaemon-tools = { path = "crates/aidaemon-tools" }
+aidaemon-providers = { path = "crates/aidaemon-providers" }
+# Optional SDK memory backend (`[memory] backend = "sdk"`).
+aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
 # refactor is invasive (requires explicit `use_native_store` calls and
@@ -120,6 +148,8 @@ terminal-bridge = [
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+# The aidaemon-memory crate as the memory plugin for agent turns.
+sdk-memory = ["dep:aidaemon-memory", "aidaemon-memory/fastembed"]
 
 [profile.release]
 lto = true
@@ -127,6 +157,7 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

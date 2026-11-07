@@ -16,13 +16,6 @@ pub(super) struct CriticalFactSummary {
     pub assistant_name: Option<String>,
 }
 
-pub(super) fn is_personal_memory_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "manage_people" | "manage_memories" | "remember_fact" | "search_history"
-    )
-}
-
 fn normalize_name_candidate(raw: &str) -> Option<String> {
     let trimmed = raw
         .trim()
@@ -230,23 +223,6 @@ pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
         || (lower.contains("remembered:") && lower.contains("name"))
 }
 
-#[cfg(test)]
-pub(super) fn filter_tool_defs_for_personal_memory(defs: &[Value]) -> Vec<Value> {
-    defs.iter()
-        .filter_map(|def| {
-            let name = def
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())?;
-            if is_personal_memory_tool(name) {
-                Some(def.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 /// Execution tools blocked when delegation mode is active.
 /// Keep spawn_agent available for task-lead orchestration.
 pub(super) fn is_delegation_blocked_tool(name: &str) -> bool {
@@ -294,24 +270,6 @@ mod tests {
             first_seen_at: None,
             source_excerpt: None,
         }
-    }
-
-    #[test]
-    fn filters_tool_defs_to_personal_memory_scope() {
-        let defs = vec![
-            json!({"type":"function","function":{"name":"manage_people"}}),
-            json!({"type":"function","function":{"name":"manage_memories"}}),
-            json!({"type":"function","function":{"name":"browser"}}),
-            json!({"type":"function","function":{"name":"terminal"}}),
-        ];
-        let filtered = filter_tool_defs_for_personal_memory(&defs);
-        let names: Vec<&str> = filtered
-            .iter()
-            .filter_map(|d| d.get("function"))
-            .filter_map(|f| f.get("name"))
-            .filter_map(|n| n.as_str())
-            .collect();
-        assert_eq!(names, vec!["manage_people", "manage_memories"]);
     }
 
     #[test]

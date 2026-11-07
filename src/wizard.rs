@@ -815,6 +815,8 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         let candidate_config = crate::config::AgentConfig {
             name: candidate,
             persona_file: None,
+            engine: Default::default(),
+            task_assessment: Default::default(),
         };
         match candidate_config.validated_name() {
             Ok(name) => break name,
@@ -3149,10 +3151,7 @@ bot_token = "bot-2"
     fn hostname_matches_zone_checks_suffix_boundaries() {
         assert!(hostname_matches_zone("legacy.aidaemon.ai", "aidaemon.ai"));
         assert!(hostname_matches_zone("aidaemon.ai", "aidaemon.ai"));
-        assert!(!hostname_matches_zone(
-            "legacy.aidaemon.ai",
-            "davidloor.com"
-        ));
+        assert!(!hostname_matches_zone("legacy.aidaemon.ai", "example.com"));
     }
 
     #[test]

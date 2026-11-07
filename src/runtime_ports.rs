@@ -23,6 +23,9 @@ use crate::types::{
 pub(crate) struct ChildAgentRun {
     pub response: String,
     pub outcome: TaskOutcome,
+    /// `Untrusted` when the child's run read (or started with) content
+    /// someone other than the owner wrote.
+    pub trust: aidaemon_core::SourceTrust,
 }
 
 /// A terminal task result recovered after a child run timed out.
@@ -46,6 +49,9 @@ pub(crate) struct ChildAgentRequest {
     pub project_scope: Option<String>,
     pub specialist: Option<String>,
     pub approval_session_id: Option<String>,
+    /// The spawning turn's actual authority, taint and root request
+    /// (dispatcher-injected; `None` falls back to re-resolution).
+    pub parent_authority: Option<crate::agent::authority::InheritedAuthority>,
 }
 
 /// Child-delegation capability required by `spawn_agent`.
@@ -77,6 +83,7 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
         router: Option<&Weak<dyn OutboundRouter>>,
         parent_session_id: &str,
         text: &str,
+        trust: aidaemon_core::SourceTrust,
     ) -> anyhow::Result<bool>;
 }
 

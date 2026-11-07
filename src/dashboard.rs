@@ -49,7 +49,6 @@ pub struct DashboardState {
     pub started_at: Instant,
     pub dashboard_token: String,
     pub token_created_at: Instant,
-    pub daily_token_budget: Option<u64>,
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub heartbeat_telemetry: Option<Arc<HeartbeatTelemetry>>,
     pub oauth_gateway: Option<OAuthGateway>,
@@ -289,7 +288,6 @@ async fn api_status(State(state): State<DashboardState>) -> Json<serde_json::Val
         },
         "uptime_secs": uptime,
         "version": env!("CARGO_PKG_VERSION"),
-        "daily_token_budget": state.daily_token_budget,
     }))
 }
 
@@ -767,9 +765,6 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "orchestration_route_acknowledgment_direct_reply_total": metrics.orchestration_route_acknowledgment_direct_reply_total,
         "orchestration_route_default_continue_total": metrics.orchestration_route_default_continue_total,
         "tool_schema_contract_rejections_total": metrics.tool_schema_contract_rejections_total,
-        "route_drift_alert_total": metrics.route_drift_alert_total,
-        "route_drift_failsafe_activation_total": metrics.route_drift_failsafe_activation_total,
-        "route_failsafe_active_turn_total": metrics.route_failsafe_active_turn_total,
         "tokens_failed_tasks_total": metrics.tokens_failed_tasks_total,
         "no_progress_iterations_total": metrics.no_progress_iterations_total,
         "deferred_no_tool_forced_required_total": metrics.deferred_no_tool_forced_required_total,

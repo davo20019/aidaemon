@@ -11,10 +11,10 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
-    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
-    ToolTargetHintKind,
+    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallContext,
+    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
+    ToolTargetHint, ToolTargetHintKind,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -38,8 +38,9 @@ struct ManageOAuthArgs {
     scopes: Option<Vec<String>>,
     allowed_domains: Option<Vec<String>>,
     confirm_disconnect: Option<bool>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 pub struct ManageOAuthTool {
@@ -889,10 +890,10 @@ impl ManageOAuthTool {
                 anyhow::anyhow!("'register_provider' requires 'allowed_domains'")
             })?)?;
         let scopes = Self::normalize_scopes(args.scopes.as_deref().unwrap_or(&[]));
-        let session_id = if args._session_id.is_empty() {
+        let session_id = if args.call_session.is_empty() {
             "unknown"
         } else {
-            args._session_id.as_str()
+            args.call_session.as_str()
         };
         let approval_description = format!(
             "Register custom OAuth provider '{}' (authorize={}, token={})",
@@ -1165,6 +1166,201 @@ impl Tool for ManageOAuthTool {
         manage_oauth_schema()
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.run(arguments, status_tx, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        if args.action == "list" {
+            let (output, members) = self.handle_list_snapshot().await?;
+            let observations = members
+                .iter()
+                .cloned()
+                .map(|subject| {
+                    ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
+                })
+                .collect();
+            return Ok(ToolCallOutcome {
+                output,
+                metadata: ToolCallMetadata {
+                    observations,
+                    collection_observations: vec![ToolCollectionObservation::complete(
+                        Self::connection_collection_hint(),
+                        &[ToolSemanticFacet::Authorization],
+                        members,
+                    )],
+                    ..ToolCallMetadata::default()
+                },
+                finish: None,
+            });
+        }
+        let output = self.run(arguments, status_tx, &facts).await?;
+        let mut outcome = ToolCallOutcome::from_output(output.clone());
+        // A connect that is the whole of a root turn's answer ends the run
+        // with its own message (the dispatcher drops it if the call failed).
+        if args.action == "connect" && facts.lone_root_call {
+            outcome = outcome.with_finish(aidaemon_core::Finish::succeeded(output));
+        }
+        Ok(outcome)
+    }
+}
+
+impl ManageOAuthTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
+        match args.action.as_str() {
+            "providers" => self.handle_providers().await,
+            "describe_provider" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'describe_provider' requires 'service'"))?,
+                )?;
+                self.handle_describe_provider(&service).await
+            }
+            "list" => self.handle_list().await,
+            "bind_account" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_bind_account(
+                    &service,
+                    args.account_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'account_id'"))?,
+                    args.identity_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'identity_url'"))?,
+                    args.account_id_pointer.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'bind_account' requires 'account_id_pointer'")
+                    })?,
+                    session_id,
+                )
+                .await
+            }
+            "connect" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'connect' requires 'service' parameter"))?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_connect(&service, session_id, status_tx).await
+            }
+            "remove" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_remove(
+                    &service,
+                    args.confirm_disconnect.unwrap_or(false),
+                    session_id,
+                )
+                .await
+            }
+            "register_provider" => {
+                let service = Self::validate_service_name(
+                    args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'register_provider' requires 'service' parameter")
+                    })?,
+                )?;
+                self.handle_register_provider(&service, &args).await
+            }
+            "remove_provider" => {
+                let service = Self::validate_service_name(
+                    args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'remove_provider' requires 'service' parameter")
+                    })?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_remove_provider(&service, session_id).await
+            }
+            "set_credentials" => {
+                let service = Self::validate_service_name(
+                    args.service.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'set_credentials' requires 'service' parameter")
+                    })?,
+                )?;
+                let client_id = args
+                    .client_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_id'"))?;
+                let client_secret = args.client_secret.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'set_credentials' requires 'client_secret'")
+                })?;
+                self.handle_set_credentials(&service, client_id, client_secret)
+                    .await
+            }
+            "refresh" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'refresh' requires 'service'"))?,
+                )?;
+                self.handle_refresh(&service).await
+            }
+            other => Ok(format!(
+                "Unknown action '{}'. Use: connect, list, bind_account, remove, set_credentials, refresh, providers, describe_provider, register_provider, remove_provider.",
+                other
+            )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageOAuthTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let mut semantics = semantics_for_exact_read_actions(
             arguments,
@@ -1209,179 +1405,22 @@ impl Tool for ManageOAuthTool {
         }
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    /// Results are the daemon's own status text, never a third party's.
+    /// Failure messages may quote a token endpoint's body; those endpoints
+    /// are owner-configured, so they stay trusted.
+    fn output_trust(
         &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
-        match args.action.as_str() {
-            "providers" => self.handle_providers().await,
-            "describe_provider" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'describe_provider' requires 'service'"))?,
-                )?;
-                self.handle_describe_provider(&service).await
-            }
-            "list" => self.handle_list().await,
-            "bind_account" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_bind_account(
-                    &service,
-                    args.account_id
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'account_id'"))?,
-                    args.identity_url
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'identity_url'"))?,
-                    args.account_id_pointer.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'bind_account' requires 'account_id_pointer'")
-                    })?,
-                    session_id,
-                )
-                .await
-            }
-            "connect" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'connect' requires 'service' parameter"))?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_connect(&service, session_id, status_tx).await
-            }
-            "remove" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_remove(
-                    &service,
-                    args.confirm_disconnect.unwrap_or(false),
-                    session_id,
-                )
-                .await
-            }
-            "register_provider" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'register_provider' requires 'service' parameter")
-                    })?,
-                )?;
-                self.handle_register_provider(&service, &args).await
-            }
-            "remove_provider" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'remove_provider' requires 'service' parameter")
-                    })?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_remove_provider(&service, session_id).await
-            }
-            "set_credentials" => {
-                let service = Self::validate_service_name(
-                    args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'set_credentials' requires 'service' parameter")
-                    })?,
-                )?;
-                let client_id = args
-                    .client_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'set_credentials' requires 'client_id'"))?;
-                let client_secret = args.client_secret.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'set_credentials' requires 'client_secret'")
-                })?;
-                self.handle_set_credentials(&service, client_id, client_secret)
-                    .await
-            }
-            "refresh" => {
-                let service = Self::validate_service_name(
-                    args.service
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("'refresh' requires 'service'"))?,
-                )?;
-                self.handle_refresh(&service).await
-            }
-            other => Ok(format!(
-                "Unknown action '{}'. Use: connect, list, bind_account, remove, set_credentials, refresh, providers, describe_provider, register_provider, remove_provider.",
-                other
-            )),
-        }
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
-        if args.action == "list" {
-            let (output, members) = self.handle_list_snapshot().await?;
-            let observations = members
-                .iter()
-                .cloned()
-                .map(|subject| {
-                    ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
-                })
-                .collect();
-            return Ok(ToolCallOutcome {
-                output,
-                metadata: ToolCallMetadata {
-                    observations,
-                    collection_observations: vec![ToolCollectionObservation::complete(
-                        Self::connection_collection_hint(),
-                        &[ToolSemanticFacet::Authorization],
-                        members,
-                    )],
-                    ..ToolCallMetadata::default()
-                },
-            });
-        }
-        let output = self.call_with_status(arguments, status_tx).await?;
-        let mut outcome = ToolCallOutcome::from_output(output.clone());
-        if args.action == "connect" {
-            outcome.metadata = ToolCallMetadata {
-                direct_response: Some(output),
-                ..ToolCallMetadata::default()
-            };
-        }
-        Ok(outcome)
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1457,6 +1496,19 @@ mod tests {
         std::fs::write(path, "[provider]\napi_key = \"test-key\"\n").unwrap();
     }
 
+    /// Its results are the daemon's own status text, so reading them never
+    /// taints a run.
+    #[tokio::test]
+    async fn its_output_is_trusted() {
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        assert_eq!(
+            tool.output_trust(r#"{"action":"list"}"#, &crate::traits::TrustRoots::new(&[])),
+            aidaemon_core::SourceTrust::Trusted
+        );
+    }
+
     #[tokio::test]
     async fn list_emits_exact_connection_readiness_and_complete_collection_evidence() {
         let config_file = NamedTempFile::new().unwrap();
@@ -1499,7 +1551,7 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.output.contains("twitter"));
-        assert!(outcome.metadata.direct_response.is_none());
+        assert!(outcome.finish.is_none());
         assert!(outcome.metadata.observations.iter().any(|observation| {
             observation.subject.kind == ToolTargetHintKind::ResourceId
                 && observation.subject.value == resource_id
@@ -1616,8 +1668,7 @@ mod tests {
                     "authorize_url": "https://linear.app/oauth/authorize",
                     "token_url": "https://api.linear.app/oauth/token",
                     "scopes": ["read", "write"],
-                    "allowed_domains": ["api.linear.app"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.linear.app"]
                 }"#,
             )
             .await
@@ -1652,8 +1703,7 @@ mod tests {
                     "auth_type": "oauth2_client_credentials",
                     "token_url": "https://auth.example.com/oauth/token",
                     "scopes": ["read"],
-                    "allowed_domains": ["api.example.com"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.example.com"]
                 }"#,
             )
             .await
@@ -1715,7 +1765,7 @@ allowed_domains = ["api.linear.app"]
             .await;
 
         let result = tool
-            .call(r#"{"action":"remove_provider","service":"linear","_session_id":"test"}"#)
+            .call(r#"{"action":"remove_provider","service":"linear"}"#)
             .await
             .unwrap();
 
@@ -1817,9 +1867,13 @@ allowed_domains = ["api.linear.app"]
         let tool_task = {
             let tool = tool.clone();
             tokio::spawn(async move {
-                tool.call_with_status_outcome(
-                    r#"{"action":"connect","service":"linear","_session_id":"telegram:123"}"#,
+                tool.call_with_execution_context(
+                    r#"{"action":"connect","service":"linear"}"#,
                     Some(status_tx),
+                    crate::traits::ToolCallContext {
+                        lone_root_call: true,
+                        ..crate::testing::call_facts("telegram:123")
+                    },
                 )
                 .await
             })
@@ -1867,9 +1921,12 @@ allowed_domains = ["api.linear.app"]
         let tool_outcome = tool_task.await.unwrap().unwrap();
 
         assert!(tool_outcome.output.contains("Connected to Linear"));
+        // The connect message is the turn's final answer.
         assert_eq!(
-            tool_outcome.metadata.direct_response,
-            Some(tool_outcome.output)
+            tool_outcome.finish,
+            Some(aidaemon_core::Finish::succeeded(
+                tool_outcome.output.clone()
+            ))
         );
     }
 
@@ -1944,7 +2001,6 @@ allowed_domains = ["api.linear.app"]
                     "account_id": "2018008573557551105",
                     "identity_url": identity_url,
                     "account_id_pointer": "/data/id",
-                    "_session_id": "test",
                 })
                 .to_string(),
             )
@@ -1970,7 +2026,6 @@ allowed_domains = ["api.linear.app"]
                     "account_id": "different-account",
                     "identity_url": identity_url,
                     "account_id_pointer": "/data/id",
-                    "_session_id": "test",
                 })
                 .to_string(),
             )
@@ -2011,7 +2066,7 @@ allowed_domains = ["api.linear.app"]
             .unwrap();
 
         let result = tool
-            .call(r#"{"action":"remove","service":"twitter","_session_id":"test"}"#)
+            .call(r#"{"action":"remove","service":"twitter"}"#)
             .await
             .unwrap();
 
@@ -2047,9 +2102,7 @@ allowed_domains = ["api.linear.app"]
             .unwrap();
 
         let result = tool
-            .call(
-                r#"{"action":"remove","service":"twitter","confirm_disconnect":true,"_session_id":"test"}"#,
-            )
+            .call(r#"{"action":"remove","service":"twitter","confirm_disconnect":true}"#)
             .await
             .unwrap();
 

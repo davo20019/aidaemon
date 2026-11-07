@@ -91,6 +91,33 @@ fn bound_project_scope_from_context(context: Option<&str>) -> Option<String> {
     super::project_scope::bound_workspace_from_goal_context(context)
 }
 
+/// A scope an earlier recovery carried without a binding behind it
+/// (`context.inferred_project_scope`): it steers where the run works, and is
+/// never read as a binding.
+fn inferred_project_scope_from_context(context: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
+    super::project_scope::typed_workspace_binding(value.get("inferred_project_scope")?.as_str())
+}
+
+/// The context of a terminal-recovery task. The run's binding stays under
+/// `project_scope`, which the next dispatch reads as a binding; a dispatch
+/// scope with no binding behind it goes under `inferred_project_scope`.
+fn recovery_task_context(
+    goal_run_id: Option<&str>,
+    bound_scope: Option<&str>,
+    dispatch_scope: Option<&str>,
+    prior_report: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "recovery_for_run": goal_run_id,
+        "terminal_recovery": true,
+        "project_scope": bound_scope,
+        "inferred_project_scope": dispatch_scope.filter(|scope| Some(*scope) != bound_scope),
+        "prior_report": prior_report.map(|report| report.chars().take(2000).collect::<String>()),
+    })
+    .to_string()
+}
+
 fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
     let mut scopes = Vec::new();
     super::project_scope::extract_explicit_path_scopes_from_text(
@@ -147,9 +174,11 @@ fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Opti
                 continue;
             };
             let host = host.strip_prefix("www.").unwrap_or(host);
-            if let Some(scope) =
-                crate::tools::fs_utils::resolve_named_project_root(host, alias_roots)
-            {
+            if let Some(scope) = crate::tools::fs_utils::resolve_named_project_root(
+                &*crate::execution::active_execution_backend(),
+                host,
+                alias_roots,
+            ) {
                 super::project_scope::push_project_scope(
                     &mut scopes,
                     scope.to_string_lossy().to_string(),
@@ -498,6 +527,7 @@ async fn execute_auto_dispatch_task(
             project_scope.as_deref(),
             None,
             Some(&approval_session_id),
+            None,
         )
         .await
         .map(|run| run.response);
@@ -665,6 +695,17 @@ fn goal_run_terminal_status(
     } else {
         None
     }
+}
+
+/// Whether this dispatch closed its run's work. Child rows that all completed
+/// close it; so does a task lead that finished the mission itself, which
+/// leaves no child rows and only its committed `completed` trigger as the
+/// receipt.
+fn dispatch_closed_run(trigger_completed: bool, work_tasks: &[crate::traits::Task]) -> bool {
+    work_tasks
+        .iter()
+        .all(crate::traits::Task::satisfies_run_completion)
+        && (trigger_completed || !work_tasks.is_empty())
 }
 
 fn task_lead_semantically_succeeded(
@@ -1103,14 +1144,9 @@ pub fn spawn_background_task_lead(
     initial_surface_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        // Teardown handles for the self-correction bridge (3c P3b.3). The body
-        // below has many early `return`s, so the existing logic is wrapped in an
-        // inner future; whichever way it exits, we clear any correction-execution
-        // context registered for this goal id afterward. For non-remediation
-        // goals this is a cheap no-op (the key was never registered); for
-        // dispatched remediations it tears the context down on completion
-        // (success OR error) instead of leaking until bounded FIFO eviction.
-        let teardown_agent = agent.clone();
+        // Teardown handles. The body below has many early `return`s, so the
+        // existing logic is wrapped in an inner future; whichever way it exits,
+        // the scheduled-run teardown below runs afterward.
         let teardown_goal_id = goal.id.clone();
         let teardown_state = state.clone();
         let teardown_goal_token_registry = goal_token_registry.clone();
@@ -1178,8 +1214,15 @@ pub fn spawn_background_task_lead(
                 } else {
                     None
                 };
-            let dispatch_project_scope =
-                bound_project_scope_from_context(trigger_task_context.as_deref()).or_else(|| {
+            // Only a binding is saved back as one: a scope inferred from the
+            // mission (or carried by an earlier recovery) steers where the
+            // run works but is never promoted to `project_scope`.
+            let bound_dispatch_scope =
+                bound_project_scope_from_context(trigger_task_context.as_deref());
+            let dispatch_project_scope = bound_dispatch_scope
+                .clone()
+                .or_else(|| inferred_project_scope_from_context(trigger_task_context.as_deref()))
+                .or_else(|| {
                     resolve_dispatch_project_scope(
                         &mission,
                         &effective_alias_roots(&agent.path_aliases.projects),
@@ -1637,6 +1680,7 @@ pub fn spawn_background_task_lead(
                     None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
                     Some(&session_id),
                     dispatch_attempt.clone(),
+                    None,
                 )
                 .await;
 
@@ -2196,8 +2240,16 @@ pub fn spawn_background_task_lead(
                     .iter()
                     .filter(|task| task.completed_successfully())
                     .count();
-                let all_done =
-                    !tasks.is_empty() && tasks.iter().all(|t| t.satisfies_run_completion());
+                let trigger_completed = match dispatch_trigger_task_id.as_deref() {
+                    Some(trigger_task_id) => state
+                        .get_task(trigger_task_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|task| task.status == "completed"),
+                    None => false,
+                };
+                let all_done = dispatch_closed_run(trigger_completed, &tasks);
 
                 let mut updated_goal = match state.get_goal(&goal_id).await {
                     Ok(Some(g)) => g,
@@ -2764,17 +2816,12 @@ pub fn spawn_background_task_lead(
                     parallel_group: None,
                     depends_on: None,
                     agent_id: None,
-                    context: Some(
-                        serde_json::json!({
-                            "recovery_for_run": goal_run_id.as_deref(),
-                            "terminal_recovery": true,
-                            "project_scope": dispatch_project_scope.as_deref(),
-                            "prior_report": task_lead_response.as_deref().map(|report| {
-                                report.chars().take(2000).collect::<String>()
-                            }),
-                        })
-                        .to_string(),
-                    ),
+                    context: Some(recovery_task_context(
+                        goal_run_id.as_deref(),
+                        bound_dispatch_scope.as_deref(),
+                        dispatch_project_scope.as_deref(),
+                        task_lead_response.as_deref(),
+                    )),
                     result: None,
                     error: None,
                     blocker: None,
@@ -2835,6 +2882,7 @@ pub fn spawn_background_task_lead(
                                 dispatch_project_scope.as_deref(),
                                 Some("executor"),
                                 Some(&session_id),
+                                None,
                             )
                             .await
                     }
@@ -3235,16 +3283,6 @@ pub fn spawn_background_task_lead(
                 );
             }
         }
-
-        // Self-correction bridge teardown (3c P3b.3): clear any correction-
-        // execution context registered under this goal id. Idempotent — for the
-        // overwhelming majority of (non-remediation) goals the key was never
-        // registered, so this is a no-op; for a dispatched remediation it removes
-        // the context now that the task lead (and its executors) have finished,
-        // so contexts don't linger until bounded FIFO eviction.
-        teardown_agent
-            .clear_correction_context(&teardown_goal_id)
-            .await;
     });
 }
 
@@ -3740,6 +3778,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_task_lead_completion_closes_the_run() {
+        let task = |status: &str| crate::traits::Task {
+            id: format!("work-{status}"),
+            goal_id: "goal-1".to_string(),
+            description: "Publish post".to_string(),
+            status: status.to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        // The task lead did the work itself: no child rows, committed trigger.
+        assert!(dispatch_closed_run(true, &[]));
+        // No child rows and no committed trigger is not a receipt.
+        assert!(!dispatch_closed_run(false, &[]));
+        assert!(dispatch_closed_run(false, &[task("completed")]));
+        assert!(!dispatch_closed_run(true, &[task("pending")]));
+        assert!(!dispatch_closed_run(true, &[task("failed")]));
+    }
+
+    #[test]
     fn completed_work_wins_over_task_lead_error_for_stall_accounting() {
         assert_eq!(
             classify_continuous_dispatch_outcome(true, true, true, false),
@@ -4159,6 +4229,25 @@ mod tests {
         assert_eq!(bound_project_scope_from_context(Some(&relative)), None);
         assert_eq!(bound_project_scope_from_context(Some("not json")), None);
         assert_eq!(bound_project_scope_from_context(None), None);
+    }
+
+    #[test]
+    fn recovery_does_not_promote_an_inferred_scope_to_a_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let inferred = dir.path().to_string_lossy().into_owned();
+        let context = recovery_task_context(Some("run-1"), None, Some(&inferred), Some("report"));
+        assert_eq!(bound_project_scope_from_context(Some(&context)), None);
+        assert_eq!(
+            inferred_project_scope_from_context(Some(&context)),
+            Some(inferred.clone())
+        );
+        // A real binding is carried as one.
+        let context = recovery_task_context(None, Some(&inferred), Some(&inferred), None);
+        assert_eq!(
+            bound_project_scope_from_context(Some(&context)),
+            Some(inferred.clone())
+        );
+        assert_eq!(inferred_project_scope_from_context(Some(&context)), None);
     }
 
     #[test]

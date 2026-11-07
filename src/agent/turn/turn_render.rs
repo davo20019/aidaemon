@@ -1,0 +1,1312 @@
+//! Pillar B: pure per-turn rendering. Spec §Rendering.
+//! No timestamps, no map-iteration order, no env-dependent formatting —
+//! enforced by golden tests + the debug re-render assertion (Task 5).
+//!
+//! `render_turn(turn_messages, mode, renderer_version) -> Vec<Value>` is the
+//! single pure renderer. **Current** mode = full append-only conversion (the
+//! same `&Message → Value` logic that `message_build.rs` performs
+//! inline, including the orphan-`tool_calls` filter and the
+//! `tool_call_id`/`name` mapping). **Archived** mode = the single permanent
+//! survivorship form (user text full; last-substantive assistant truncated;
+//! tool results summarized; identity-critical verbatim; terminal-state
+//! placeholder when no substantive assistant remains).
+
+use super::recall_guardrails::text_relates_to_critical_identity;
+use super::sliding_window::summarize_tool_result;
+// `Message`, `ToolCall`, `json` and `Value` live in the `agent` module scope.
+use super::*;
+use crate::config::{AudioConfig, SttConfig, VisionConfig};
+use crate::events::TerminalState;
+use crate::traits::AttachmentProvenance;
+
+/// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
+/// v6: a structurally referenced parent turn retains bounded receipt-bearing
+/// tool evidence; ordinary archived turns remain aggressively compact.
+pub(crate) const RENDERER_VERSION: u32 = 6;
+const MAX_ADJACENT_TOOL_RESULT_CHARS: usize = 4_000;
+pub(crate) const SOURCE_MESSAGE_IDS_KEY: &str = "_aidaemon_source_message_ids";
+pub(crate) const SOURCE_TURN_IDS_KEY: &str = "_aidaemon_source_turn_ids";
+
+pub(crate) fn attach_source_provenance(value: &mut Value, messages: &[&Message]) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let mut message_ids = Vec::new();
+    let mut turn_ids = Vec::new();
+    for message in messages {
+        if !message.id.is_empty() && !message_ids.contains(&message.id) {
+            message_ids.push(message.id.clone());
+        }
+        if let Some(turn_id) = message.turn_id.as_ref() {
+            if !turn_id.is_empty() && !turn_ids.contains(turn_id) {
+                turn_ids.push(turn_id.clone());
+            }
+        }
+    }
+    if !message_ids.is_empty() {
+        object.insert(SOURCE_MESSAGE_IDS_KEY.to_string(), json!(message_ids));
+    }
+    if !turn_ids.is_empty() {
+        object.insert(SOURCE_TURN_IDS_KEY.to_string(), json!(turn_ids));
+    }
+}
+
+fn push_with_source(out: &mut Vec<Value>, mut value: Value, message: &Message) {
+    attach_source_provenance(&mut value, &[message]);
+    out.push(value);
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RenderOptions {
+    pub vision: VisionConfig,
+    pub audio: AudioConfig,
+    pub stt: SttConfig,
+    pub model: String,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            vision: VisionConfig {
+                enabled: true,
+                max_image_bytes: 4 * 1_048_576,
+                mime_types: vec![
+                    "image/jpeg".to_string(),
+                    "image/png".to_string(),
+                    "image/gif".to_string(),
+                    "image/webp".to_string(),
+                ],
+                model_patterns: vec!["gpt-4o".to_string()],
+            },
+            audio: AudioConfig::from_files(&crate::config::FilesConfig::default()),
+            stt: SttConfig::from_files(&crate::config::FilesConfig::default()),
+            model: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderMode {
+    Current,
+    Archived { terminal_state: TerminalState },
+    Adjacent { terminal_state: TerminalState },
+}
+
+/// Pure entry point. Dispatches to the per-mode renderer.
+pub(crate) fn render_turn(
+    turn_messages: &[Message],
+    mode: RenderMode,
+    _version: u32,
+    options: &RenderOptions,
+) -> Vec<Value> {
+    match mode {
+        RenderMode::Current => render_current(turn_messages, options),
+        RenderMode::Archived { terminal_state } => {
+            render_archived(turn_messages, terminal_state, options, false)
+        }
+        RenderMode::Adjacent { terminal_state } => {
+            render_archived(turn_messages, terminal_state, options, true)
+        }
+    }
+}
+
+/// Shared learned-helplessness / budget-exhaustion failure-pattern predicate.
+///
+/// BOTH `render_current` (drops matching assistant text) and `render_archived`
+/// (excludes from winning-assistant selection, uses the terminal placeholder)
+/// call this so the lists cannot drift. This is the list previously inlined in
+/// `message_build.rs`'s `&Message → Value` conversion.
+pub(crate) fn is_failure_boilerplate(content: &str) -> bool {
+    let t = content.trim_start();
+    t.starts_with("I wasn't able to process that request.")
+        || t.starts_with("I wasn't able to complete this task.")
+        || t.starts_with("I made some progress but wasn't able to fully complete")
+        || t.starts_with("I seem to be stuck on this task.")
+        || t.starts_with("I've reached my processing limit")
+        || t.starts_with("This goal hit its daily processing budget")
+        || t.starts_with("This scheduled goal hit its daily processing budget")
+        || t.starts_with("This scheduled run hit its per-run processing budget")
+        || t.starts_with("I sent the requested file(s), but ran into issues")
+        || t.starts_with("I completed the main deliverable but wasn't able to finish")
+}
+
+fn retain_adjacent_tool_result(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= MAX_ADJACENT_TOOL_RESULT_CHARS {
+        return content.to_string();
+    }
+    let head_chars = (MAX_ADJACENT_TOOL_RESULT_CHARS * 2) / 3;
+    let tail_chars = MAX_ADJACENT_TOOL_RESULT_CHARS.saturating_sub(head_chars);
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content.chars().skip(total - tail_chars).collect();
+    format!(
+        "{head}\n[Adjacent tool evidence truncated: retained {MAX_ADJACENT_TOOL_RESULT_CHARS}/{total} characters]\n{tail}"
+    )
+}
+
+/// Truncation for the winning assistant message of an archived turn.
+///
+/// Preserve both the premise and conclusion of every winning response. This
+/// is presentation compaction, not dialogue classification: response wording
+/// never decides whether a request remains open.
+fn truncate_winning_assistant(content: &str) -> String {
+    let count = content.chars().count();
+    if count <= MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS {
+        return content.to_string();
+    }
+    const HEAD_CHARS: usize = 400;
+    let tail_chars = MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS - HEAD_CHARS;
+    let head: String = content.chars().take(HEAD_CHARS).collect();
+    let tail: String = content.chars().skip(count - tail_chars).collect();
+    format!("{head}\n…\n{tail}")
+}
+
+/// Preserve the parent answer the current user can refer to. The cap protects
+/// small-context providers from pathological outputs while retaining both the
+/// answer's premise and source-bearing conclusion.
+fn truncate_adjacent_assistant(content: &str) -> String {
+    let count = content.chars().count();
+    if count <= MAX_ADJACENT_ASSISTANT_CONTENT_CHARS {
+        return content.to_string();
+    }
+    let head_chars = (MAX_ADJACENT_ASSISTANT_CONTENT_CHARS * 2) / 3;
+    let tail_chars = MAX_ADJACENT_ASSISTANT_CONTENT_CHARS - head_chars;
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content.chars().skip(count - tail_chars).collect();
+    format!(
+        "{head}\n\n[Middle of immediately preceding answer omitted: retained {}/{} characters]\n\n{tail}",
+        MAX_ADJACENT_ASSISTANT_CONTENT_CHARS, count
+    )
+}
+
+/// Set of `tool_call_id`s that have a matching `tool` result in this turn.
+/// Used to strip orphan `tool_calls` (whose result is absent) so the payload
+/// stays provider-valid.
+fn tool_result_ids(turn_messages: &[Message]) -> std::collections::HashSet<&str> {
+    turn_messages
+        .iter()
+        .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect()
+}
+
+/// Convert an assistant message's `tool_calls_json` into OpenAI wire-format
+/// `tool_calls`, dropping any whose result is missing from this turn. Returns
+/// the filtered array (possibly empty).
+fn wire_tool_calls(tc_json: &str, result_ids: &std::collections::HashSet<&str>) -> Vec<Value> {
+    let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) else {
+        return Vec::new();
+    };
+    tcs.iter()
+        .filter(|tc| result_ids.contains(tc.id.as_str()))
+        .map(|tc| {
+            let mut val = json!({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": tc.arguments
+                }
+            });
+            if let Some(ref extra) = tc.extra_content {
+                val["extra_content"] = extra.clone();
+            }
+            val
+        })
+        .collect()
+}
+
+/// Attach `name` / `tool_call_id` fields when present.
+fn attach_tool_routing(obj: &mut Value, m: &Message) {
+    if let Some(name) = &m.tool_name {
+        if !name.is_empty() {
+            obj["name"] = json!(name);
+        }
+    }
+    if let Some(tcid) = &m.tool_call_id {
+        obj["tool_call_id"] = json!(tcid);
+    }
+}
+
+/// Append synthetic user messages carrying tool observation images for the LLM.
+/// When `encode_image` is false, emit the label-only stub (used for superseded
+/// tool observations within the same turn — latest-screenshot retention).
+fn append_tool_observation_messages(
+    out: &mut Vec<Value>,
+    m: &Message,
+    options: &RenderOptions,
+    vision_skipped: &mut bool,
+    encode_image: bool,
+) {
+    if m.role != "tool" {
+        return;
+    }
+    if !m
+        .attachments
+        .iter()
+        .any(|a| a.provenance == AttachmentProvenance::ToolObservation)
+    {
+        return;
+    }
+    let tool_name = m.tool_name.as_deref().unwrap_or("tool");
+    let hint = m.content.as_deref().unwrap_or("");
+    let label = crate::agent::vision::format_tool_observation_label(tool_name, hint);
+    let content = if encode_image {
+        let built = crate::agent::vision::build_tool_observation_content(
+            &label,
+            &m.attachments,
+            &options.vision,
+        );
+        if built.vision_skipped {
+            *vision_skipped = true;
+        }
+        built.content
+    } else {
+        json!(label)
+    };
+    let mut value = json!({
+        "role": "user",
+        "content": content,
+    });
+    attach_source_provenance(&mut value, &[m]);
+    out.push(value);
+}
+
+fn latest_tool_observation_indices(
+    messages: &[Message],
+) -> std::collections::HashMap<String, usize> {
+    use std::collections::HashMap;
+    let mut latest = HashMap::new();
+    for (idx, m) in messages.iter().enumerate() {
+        if m.role != "tool" {
+            continue;
+        }
+        for att in &m.attachments {
+            if att.provenance != AttachmentProvenance::ToolObservation {
+                continue;
+            }
+            let source = att
+                .source_tool
+                .as_deref()
+                .or(m.tool_name.as_deref())
+                .unwrap_or("tool");
+            latest.insert(source.to_string(), idx);
+        }
+    }
+    latest
+}
+
+fn should_encode_tool_observation_image(
+    m: &Message,
+    msg_idx: usize,
+    latest: &std::collections::HashMap<String, usize>,
+) -> bool {
+    m.attachments.iter().any(|a| {
+        if a.provenance != AttachmentProvenance::ToolObservation {
+            return false;
+        }
+        let source = a
+            .source_tool
+            .as_deref()
+            .or(m.tool_name.as_deref())
+            .unwrap_or("tool");
+        latest.get(source) == Some(&msg_idx)
+    })
+}
+
+/// **Current** mode: append-only, full content. Single source of truth for the
+/// `&Message → Value` conversion (Task 7 deletes the inline copy in
+/// `message_build.rs` and routes through here).
+fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Value> {
+    let result_ids = tool_result_ids(turn_messages);
+    let mut vision_skipped = false;
+    let mut audio_skipped = false;
+    let mut stt_failed = false;
+    let latest_tool_observations = latest_tool_observation_indices(turn_messages);
+
+    let mut rendered: Vec<Value> = Vec::new();
+
+    for (msg_idx, m) in turn_messages
+        .iter()
+        .enumerate()
+        // Skip tool results with empty/missing tool_name.
+        .filter(|(_, m)| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
+    {
+        // Drop learned-helplessness / budget-exhaustion boilerplate so the
+        // model never reads its own prior "I failed" text and gives up.
+        if m.role == "assistant"
+            && m.tool_calls_json.is_none()
+            && m.content.as_deref().is_some_and(is_failure_boilerplate)
+        {
+            continue;
+        }
+
+        let content = if m.role == "user" && !m.attachments.is_empty() {
+            let text = m.content.as_deref().unwrap_or("");
+            let built = crate::agent::attachment_content::build_attachment_content(
+                text,
+                &m.attachments,
+                RenderMode::Current,
+                &options.vision,
+                &options.audio,
+                &options.model,
+            );
+            if built.vision_skipped {
+                vision_skipped = true;
+            }
+            if built.audio_skipped && !crate::agent::stt::content_has_transcription(text) {
+                if options.stt.enabled
+                    && crate::agent::stt::should_run_stt_fallback(
+                        &options.stt,
+                        &options.audio,
+                        &options.model,
+                        &m.attachments,
+                    )
+                {
+                    stt_failed = true;
+                } else {
+                    audio_skipped = true;
+                }
+            }
+            built.content
+        } else {
+            json!(m.content)
+        };
+
+        let mut obj = json!({
+            "role": m.role,
+            "content": content,
+        });
+
+        if let Some(tc_json) = &m.tool_calls_json {
+            let filtered = wire_tool_calls(tc_json, &result_ids);
+            if !filtered.is_empty() {
+                obj["tool_calls"] = json!(filtered);
+                if m.content.is_none() {
+                    obj["content"] = Value::Null;
+                }
+            } else if m.content.is_none()
+                || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
+            {
+                // All tool_calls orphaned and no text content — replace with
+                // a placeholder to avoid a dangling user message.
+                obj["content"] = json!("[Action completed]");
+            }
+        }
+
+        attach_tool_routing(&mut obj, m);
+        push_with_source(&mut rendered, obj, m);
+        append_tool_observation_messages(
+            &mut rendered,
+            m,
+            options,
+            &mut vision_skipped,
+            should_encode_tool_observation_image(m, msg_idx, &latest_tool_observations),
+        );
+    }
+
+    if vision_skipped {
+        rendered.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+            }),
+        );
+    }
+    if stt_failed {
+        rendered.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::stt::STT_FAILED_SYSTEM_HINT,
+            }),
+        );
+    } else if audio_skipped {
+        rendered.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::audio::AUDIO_SKIPPED_SYSTEM_HINT,
+            }),
+        );
+    }
+
+    rendered
+}
+
+/// **Archived** mode: single pass IN ORDER (chronological, in-place
+/// transforms; NEVER regrouped into user/assistant/tools). The turn's message
+/// order is preserved so assistant `tool_calls` keep immediately preceding
+/// their `tool` results.
+fn render_archived(
+    turn_messages: &[Message],
+    terminal_state: TerminalState,
+    options: &RenderOptions,
+    preserve_winning_assistant: bool,
+) -> Vec<Value> {
+    let result_ids = tool_result_ids(turn_messages);
+
+    // Pre-scan: index of the LAST substantive assistant record — non-empty
+    // trimmed content that is NOT failure boilerplate.
+    let last_substantive_assistant = turn_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == "assistant"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty() && !is_failure_boilerplate(c))
+        })
+        .map(|(i, _)| i)
+        .next_back();
+
+    // Tool-step count feeds the terminal-state placeholder.
+    let tool_step_count = turn_messages
+        .iter()
+        .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
+        .count();
+
+    // Position of the turn's last assistant/tool record — where the synthetic
+    // placeholder is emitted (end of turn) so order stays chronological.
+    let last_assistant_or_tool = turn_messages
+        .iter()
+        .rposition(|m| m.role == "assistant" || m.role == "tool");
+
+    let need_placeholder = last_substantive_assistant.is_none();
+    let mut vision_skipped = false;
+
+    let mut out: Vec<Value> = Vec::with_capacity(turn_messages.len());
+
+    for (idx, m) in turn_messages.iter().enumerate() {
+        // Identity override (precedence): the user's own identity statements
+        // are emitted verbatim in original position, exempt from
+        // truncation/drop/summarization — but exactly ONCE (this REPLACES the
+        // normal transform for that message). Assistant text is never
+        // exempted: an assistant "I am …" is not identity evidence, and the
+        // pinned values come from typed facts.
+        if m.role == "user"
+            && m.content
+                .as_deref()
+                .is_some_and(text_relates_to_critical_identity)
+        {
+            let mut obj = json!({
+                "role": m.role,
+                "content": m.content,
+            });
+            if let Some(tc_json) = &m.tool_calls_json {
+                let filtered = wire_tool_calls(tc_json, &result_ids);
+                if !filtered.is_empty() {
+                    obj["tool_calls"] = json!(filtered);
+                }
+            }
+            attach_tool_routing(&mut obj, m);
+            push_with_source(&mut out, obj, m);
+            maybe_emit_placeholder(
+                &mut out,
+                idx,
+                need_placeholder,
+                last_assistant_or_tool,
+                terminal_state,
+                tool_step_count,
+            );
+            continue;
+        }
+
+        match m.role.as_str() {
+            // 1. user → verbatim full. (A turn may have NO user message — do
+            //    not synthesize one.)
+            "user" => {
+                push_with_source(&mut out, json!({ "role": "user", "content": m.content }), m);
+            }
+
+            // 2. assistant.
+            "assistant" => {
+                if Some(idx) == last_substantive_assistant {
+                    // Winning assistant: truncated content, tool_calls retained.
+                    // Clarifying menus keep their actionable tail (see
+                    // truncate_winning_assistant).
+                    let truncated = m
+                        .content
+                        .as_deref()
+                        .map(|content| {
+                            if preserve_winning_assistant {
+                                truncate_adjacent_assistant(content)
+                            } else {
+                                truncate_winning_assistant(content)
+                            }
+                        })
+                        .unwrap_or_default();
+                    let mut obj = json!({
+                        "role": "assistant",
+                        "content": truncated,
+                    });
+                    if let Some(tc_json) = &m.tool_calls_json {
+                        let filtered = wire_tool_calls(tc_json, &result_ids);
+                        if !filtered.is_empty() {
+                            obj["tool_calls"] = json!(filtered);
+                        }
+                    }
+                    push_with_source(&mut out, obj, m);
+                } else if m.content.as_deref().is_some_and(is_failure_boilerplate) {
+                    // Failure boilerplate: do not emit text, do not treat as a
+                    // winning response. If it carries tool_calls, retain those.
+                    emit_tool_call_only_assistant(&mut out, m, &result_ids);
+                } else if m.tool_calls_json.is_some() {
+                    // Losing (superseded) assistant with tool_calls: keep the
+                    // calls so the call/result pairing survives, drop the text.
+                    emit_tool_call_only_assistant(&mut out, m, &result_ids);
+                }
+                // else: empty / superseded plain assistant → drop.
+            }
+
+            // 3. tool result → tool-role deterministic summary.
+            "tool" if m.tool_name.as_ref().is_some_and(|n| !n.is_empty()) => {
+                let args_json = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|cid| tool_args_for_call(turn_messages, cid))
+                    .unwrap_or_default();
+                let tool_name = m.tool_name.as_deref().unwrap_or("unknown");
+                let result = m.content.as_deref().unwrap_or("");
+                let retained = if preserve_winning_assistant {
+                    retain_adjacent_tool_result(result)
+                } else {
+                    summarize_tool_result(tool_name, &args_json, result)
+                };
+                let mut obj = json!({ "role": "tool", "content": retained });
+                attach_tool_routing(&mut obj, m);
+                push_with_source(&mut out, obj, m);
+                append_tool_observation_messages(&mut out, m, options, &mut vision_skipped, true);
+            }
+
+            _ => {}
+        }
+
+        maybe_emit_placeholder(
+            &mut out,
+            idx,
+            need_placeholder,
+            last_assistant_or_tool,
+            terminal_state,
+            tool_step_count,
+        );
+    }
+
+    if vision_skipped {
+        out.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+            }),
+        );
+    }
+
+    out
+}
+
+/// Emit an assistant message that retains only its (orphan-filtered)
+/// `tool_calls`, dropping the (losing) text content — but only if some
+/// `tool_calls` survive the orphan filter; otherwise nothing is emitted.
+fn emit_tool_call_only_assistant(
+    out: &mut Vec<Value>,
+    m: &Message,
+    result_ids: &std::collections::HashSet<&str>,
+) {
+    if let Some(tc_json) = &m.tool_calls_json {
+        let filtered = wire_tool_calls(tc_json, result_ids);
+        if !filtered.is_empty() {
+            push_with_source(
+                out,
+                json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": filtered,
+                }),
+                m,
+            );
+        }
+    }
+}
+
+/// Emit the single synthetic terminal-state placeholder at the position of the
+/// turn's last assistant/tool record, when no substantive assistant remains.
+fn maybe_emit_placeholder(
+    out: &mut Vec<Value>,
+    idx: usize,
+    need_placeholder: bool,
+    last_assistant_or_tool: Option<usize>,
+    terminal_state: TerminalState,
+    tool_step_count: usize,
+) {
+    if need_placeholder && last_assistant_or_tool == Some(idx) {
+        out.push(json!({
+            "role": "assistant",
+            "content": terminal_state.placeholder(tool_step_count),
+        }));
+    }
+}
+
+/// Look up the arguments JSON for a tool result's `tool_call_id` by scanning
+/// the turn's assistant `tool_calls`.
+fn tool_args_for_call(turn_messages: &[Message], call_id: &str) -> Option<String> {
+    for m in turn_messages.iter() {
+        if m.role == "assistant" {
+            if let Some(tc_json) = &m.tool_calls_json {
+                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                    for tc in &tcs {
+                        if tc.id == call_id {
+                            return Some(tc.arguments.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(c: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(c.to_string()),
+            ..Message::runtime_defaults()
+        }
+    }
+
+    fn assistant(c: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some(c.to_string()),
+            ..Message::runtime_defaults()
+        }
+    }
+
+    fn assistant_empty_with_tool_call() -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls_json: Some(
+                r#"[{"id":"c1","name":"terminal","arguments":"{}"}]"#.to_string(),
+            ),
+            ..Message::runtime_defaults()
+        }
+    }
+
+    fn tool(name: &str, call_id: &str, result: &str) -> Message {
+        // Real terminal output carries an `exit_code: N` line; the golden tests
+        // use the shorthand `"exit 0"`. Normalize that shorthand to the
+        // canonical form so `summarize_tool_result` reproduces `-> exit N`
+        // without touching the production summarizer (which keys off
+        // `exit_code:`). Non-terminal results pass through verbatim.
+        let content = if name == "terminal" {
+            if let Some(code) = result.strip_prefix("exit ") {
+                format!("exit_code: {code}")
+            } else {
+                result.to_string()
+            }
+        } else {
+            result.to_string()
+        };
+        Message {
+            role: "tool".to_string(),
+            content: Some(content),
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(name.to_string()),
+            ..Message::runtime_defaults()
+        }
+    }
+
+    #[test]
+    fn archived_preserves_clarifying_menu_options_in_full() {
+        // Regression for the 2026-07-11 incident: the previous turn ended with
+        // a clarifying menu; head-truncation to the old-assistant cap cut the
+        // options off, so the next turn's "Yes do 1, 2" had nothing to bind to.
+        let menu = "I couldn't find a file named \"Acme resume\" or any file containing \
+                    the word \"Acme\" in your `~/projects/resume` directory.\n\n\
+                    Since many of your resumes are in PDF or Word format, `grep` might \
+                    not have been able to read them.\n\n\
+                    Would you like me to:\n\
+                    1. Search your entire machine for anything related to \"Acme\"?\n\
+                    2. Look in other common folders like `~/Documents` or `~/Downloads`?\n\
+                    3. Send you one of your other recent resumes instead?";
+        // Longer than the 200-char cap old assistant turns were truncated to.
+        assert!(menu.chars().count() > 200);
+        let turn = vec![user("Send me my Acme resume"), assistant(menu)];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("Send you one of your other recent resumes instead?"),
+            "clarifying menu options must survive archival: {joined}"
+        );
+    }
+
+    #[test]
+    fn archived_clarifying_question_over_cap_keeps_head_and_tail() {
+        let filler = "flag ".repeat(600); // ~3000 chars of middle filler
+        let long_menu = format!(
+            "Would you like me to review these findings?\n{filler}\nOr should I stop at option Z?"
+        );
+        assert!(long_menu.chars().count() > MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS);
+        let turn = vec![user("review the flags"), assistant(&long_menu)];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("Would you like me to review these findings?"),
+            "question head survives"
+        );
+        assert!(
+            joined.contains("Or should I stop at option Z?"),
+            "actionable tail survives"
+        );
+        assert!(
+            !joined.contains(&"flag ".repeat(500)),
+            "middle filler is elided to bound the archived turn"
+        );
+    }
+
+    #[test]
+    fn archived_keeps_user_full_and_bounds_winning_assistant_without_classification() {
+        let long_answer = format!(
+            "{}TAIL",
+            "X".repeat(MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS + 500)
+        );
+        let turn = vec![
+            user("please do the long thing with lots of detail ...full text..."),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", "exit 0"),
+            assistant(&long_answer), // last non-empty assistant — wins, bounded
+            assistant(""),           // later empty — loses
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("...full text..."),
+            "user text survives in full"
+        );
+        assert!(
+            joined.contains(&"X".repeat(400)),
+            "assistant head is retained"
+        );
+        assert!(joined.contains("TAIL"), "assistant tail is retained");
+        assert!(!joined.contains(&long_answer));
+        assert!(
+            joined.contains("terminal: -> exit 0"),
+            "tool result summarized deterministically"
+        );
+    }
+
+    #[test]
+    fn archived_no_text_reply_uses_terminal_state_placeholder() {
+        let turn = vec![
+            user("run it"),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", "exit 1"),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Failed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(joined.contains("[failed: 1 tool steps, no text reply]"));
+    }
+
+    #[test]
+    fn archived_interrupted_turn_renders_interrupted_placeholder() {
+        let turn = vec![user("hello"), tool("terminal", "c1", "exit 0")];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Interrupted,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(serde_json::to_string(&out)
+            .unwrap()
+            .contains("[task interrupted]"));
+    }
+
+    #[test]
+    fn archived_preserves_identity_critical_verbatim() {
+        let turn = vec![user("my name is Jordan Lee"), assistant("noted")];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(serde_json::to_string(&out)
+            .unwrap()
+            .contains("my name is Jordan Lee"));
+    }
+
+    #[test]
+    fn render_is_deterministic() {
+        let turn = vec![
+            user("hi"),
+            assistant("there"),
+            tool("read_file", "c1", "12 lines"),
+        ];
+        let a = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let b = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn current_mode_is_append_only_full() {
+        let turn = vec![user("hi"), assistant("there")];
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        // Current keeps full content, both messages, in order.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["content"], "hi");
+        assert_eq!(out[1]["content"], "there");
+    }
+
+    #[test]
+    fn archived_output_order_is_chronological() {
+        let turn = vec![
+            user("u"),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", "exit 0"),
+            assistant("final"),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // user → assistant(tool_calls) → tool → assistant(final): order
+        // preserved, NOT regrouped.
+        assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+    }
+
+    #[test]
+    fn archived_no_user_message_turn_renders_without_synthesizing_user() {
+        // Scheduled/background turn with no user_message.
+        let turn = vec![
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", "exit 0"),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(
+            out.iter().all(|m| m["role"] != "user"),
+            "no synthetic user message"
+        );
+        // tool_step_count = 1 feeds the placeholder if no assistant text exists.
+        assert!(
+            serde_json::to_string(&out)
+                .unwrap()
+                .contains("1 tool steps")
+                || out.iter().any(|m| m["role"] == "assistant")
+        );
+    }
+
+    #[test]
+    fn archived_identity_message_emitted_once_not_duplicated() {
+        // Identity-critical user message followed by assistant replies.
+        let turn = vec![
+            user("my name is Jordan Lee"),
+            assistant("noted"),
+            assistant("ok done"),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("my name is Jordan Lee"),
+            "identity survives verbatim"
+        );
+        assert_eq!(
+            joined.matches("my name is Jordan Lee").count(),
+            1,
+            "emitted once, not duplicated"
+        );
+    }
+
+    #[test]
+    fn archived_assistant_first_person_reply_stays_the_winning_reply() {
+        // An assistant reply that happens to say "I am …" (or mention a son)
+        // is an ordinary reply: it is still the turn's winning answer, so the
+        // archive keeps it instead of a "no reply" placeholder.
+        let turn = vec![
+            user("is the deploy finished?"),
+            assistant("I am done: the deploy finished and your son's site is live."),
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let assistants: Vec<&Value> = out.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(assistants.len(), 1, "{out:?}");
+        assert!(assistants[0]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("the deploy finished")));
+    }
+
+    #[test]
+    fn current_mode_drops_learned_helplessness_but_archived_uses_placeholder() {
+        let turn = vec![
+            user("do it"),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", "exit 1"),
+            assistant("I wasn't able to complete this task."),
+        ];
+        let cur = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(
+            !serde_json::to_string(&cur)
+                .unwrap()
+                .contains("I wasn't able to complete"),
+            "learned-helplessness dropped in Current"
+        );
+        let arch = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Failed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let aj = serde_json::to_string(&arch).unwrap();
+        assert!(aj.contains("[failed: 1 tool steps, no text reply]"));
+        assert!(
+            !aj.contains("I wasn't able to complete"),
+            "Archived failure boilerplate is replaced by the deterministic terminal placeholder"
+        );
+    }
+
+    #[test]
+    fn current_mode_encodes_image_attachments_as_multimodal_array() {
+        use crate::traits::MessageAttachment;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+        let stub = format!(
+            "[File received: photo.png (0 KB, image/png)\nSaved to: {}]",
+            file.path().display()
+        );
+        let turn = vec![Message {
+            role: "user".to_string(),
+            content: Some(stub),
+            attachments: vec![MessageAttachment {
+                local_path: file.path().to_string_lossy().into_owned(),
+                filename: "photo.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 8,
+                ..Default::default()
+            }],
+            ..Message::runtime_defaults()
+        }];
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let user_msg = out
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("user message");
+        let blocks = user_msg["content"].as_array().expect("multimodal array");
+        assert!(blocks.iter().any(|b| b["type"] == "text"));
+        assert!(blocks.iter().any(|b| b["type"] == "image_url"));
+    }
+
+    #[test]
+    fn current_mode_emits_synthetic_user_observation_after_tool_screenshot() {
+        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+
+        let turn = vec![
+            assistant_empty_with_tool_call(),
+            Message {
+                role: "tool".to_string(),
+                content: Some("Screenshot captured and delivered to chat.".to_string()),
+                tool_call_id: Some("c1".to_string()),
+                tool_name: Some("browser".to_string()),
+                attachments: vec![MessageAttachment {
+                    local_path: file.path().to_string_lossy().into_owned(),
+                    filename: "screenshot.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    size_bytes: 8,
+                    provenance: AttachmentProvenance::ToolObservation,
+                    source_tool: Some("browser".to_string()),
+                    ..MessageAttachment::default()
+                }],
+                ..Message::runtime_defaults()
+            },
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let observation = out
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .find(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Tool observation image from browser"))
+                    || m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|text| text.contains("Tool observation image"))
+                        })
+                    })
+            })
+            .expect("synthetic tool observation user message");
+        let blocks = observation["content"]
+            .as_array()
+            .expect("multimodal observation");
+        assert!(blocks.iter().any(|b| b["type"] == "image_url"));
+    }
+
+    #[test]
+    fn current_mode_keeps_only_latest_tool_observation_image() {
+        use crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT;
+        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file1 = NamedTempFile::new().unwrap();
+        file1
+            .write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+        let mut file2 = NamedTempFile::new().unwrap();
+        file2
+            .write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+
+        let attachment = |path: &std::path::Path| MessageAttachment {
+            local_path: path.to_string_lossy().into_owned(),
+            filename: "screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size_bytes: 8,
+            provenance: AttachmentProvenance::ToolObservation,
+            source_tool: Some("computer_use".to_string()),
+            ..MessageAttachment::default()
+        };
+
+        let turn = vec![
+            assistant_empty_with_tool_call(),
+            Message {
+                role: "tool".to_string(),
+                content: Some("step 1".to_string()),
+                tool_call_id: Some("c1".to_string()),
+                tool_name: Some("computer_use".to_string()),
+                attachments: vec![attachment(file1.path())],
+                ..Message::runtime_defaults()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls_json: Some(
+                    r#"[{"id":"c2","type":"function","function":{"name":"computer_use","arguments":"{}"}}]"#
+                        .to_string(),
+                ),
+                ..Message::runtime_defaults()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("step 2".to_string()),
+                tool_call_id: Some("c2".to_string()),
+                tool_name: Some("computer_use".to_string()),
+                attachments: vec![attachment(file2.path())],
+                ..Message::runtime_defaults()
+            },
+        ];
+
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(
+            !out.iter().any(|m| {
+                m["role"] == "system" && m["content"].as_str() == Some(VISION_SKIPPED_SYSTEM_HINT)
+            }),
+            "superseded observations must not inject vision-skipped hint"
+        );
+
+        let observations: Vec<_> = out
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("computer_use"))
+                    || m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|text| text.contains("computer_use"))
+                        })
+                    })
+            })
+            .collect();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0]["content"].is_string());
+        assert!(observations[1]["content"].is_array());
+    }
+
+    #[test]
+    fn archived_mode_keeps_image_attachments_as_text_stub() {
+        let turn = vec![Message {
+            role: "user".to_string(),
+            content: Some(
+                "[File received: photo.png (1 KB, image/png)\nSaved to: /tmp/x.png]".to_string(),
+            ),
+            attachments: vec![crate::traits::MessageAttachment {
+                local_path: "/tmp/x.png".to_string(),
+                filename: "photo.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 1024,
+                ..Default::default()
+            }],
+            ..Message::runtime_defaults()
+        }];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(out[0]["content"].is_string());
+    }
+
+    #[test]
+    fn adjacent_mode_retains_bounded_receipt_bearing_tool_evidence() {
+        let receipt = "[Tool receipt v2: outcome=succeeded; result_id=sha256:synthetic; source=tool_output; model_view=complete; durable_view=complete; requested_range=not_applicable; returned_range=not_applicable]";
+        let evidence = format!("{receipt}\nfirst-value\n{}\nlast-value", "x".repeat(5_000));
+        let turn = vec![
+            user("Generate the synthetic values"),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", &evidence),
+            assistant("The values were generated."),
+        ];
+
+        let adjacent = render_turn(
+            &turn,
+            RenderMode::Adjacent {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let content = adjacent
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("adjacent tool evidence");
+        assert!(content.contains(receipt));
+        assert!(content.contains("first-value"));
+        assert!(content.contains("last-value"));
+        assert!(content.contains("Adjacent tool evidence truncated"));
+
+        let archived = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let archived_content = archived
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("archived tool summary");
+        assert_ne!(archived_content, content);
+    }
+}

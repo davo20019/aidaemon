@@ -61,11 +61,13 @@ impl ChildAgentRuntime for Agent {
                 request.project_scope.as_deref(),
                 request.specialist.as_deref(),
                 request.approval_session_id.as_deref(),
+                request.parent_authority,
             )
             .await?;
         Ok(ChildAgentRun {
             response: result.response,
             outcome: result.outcome,
+            trust: result.trust,
         })
     }
 
@@ -91,14 +93,10 @@ impl ChildAgentRuntime for Agent {
         router: Option<&std::sync::Weak<dyn crate::runtime_ports::OutboundRouter>>,
         parent_session_id: &str,
         text: &str,
+        trust: aidaemon_core::SourceTrust,
     ) -> anyhow::Result<bool> {
         Ok(self
-            .deliver_parent_text_result(
-                router,
-                parent_session_id,
-                text,
-                super::ParentDeliveryKind::BackgroundSpawnResult,
-            )
+            .deliver_background_spawn_result(router, parent_session_id, text, trust)
             .await?
             .sent)
     }

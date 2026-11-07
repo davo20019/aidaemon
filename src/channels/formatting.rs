@@ -326,7 +326,7 @@ fn convert_inline_formatting(s: &str) -> String {
             if let Some(end) = find_double_char(&chars, '*', i + 2) {
                 result.push_str("<b>");
                 let inner: String = chars[i + 2..end].iter().collect();
-                result.push_str(&inner);
+                result.push_str(&convert_inline_formatting(&inner));
                 result.push_str("</b>");
                 i = end + 2;
                 continue;
@@ -339,7 +339,7 @@ fn convert_inline_formatting(s: &str) -> String {
                 result.push_str("<a href=\"");
                 result.push_str(&url);
                 result.push_str("\">");
-                result.push_str(&text);
+                result.push_str(&convert_inline_formatting(&text));
                 result.push_str("</a>");
                 i = end;
                 continue;
@@ -356,7 +356,7 @@ fn convert_inline_formatting(s: &str) -> String {
                 {
                     result.push_str("<i>");
                     let inner: String = chars[i + 1..end].iter().collect();
-                    result.push_str(&inner);
+                    result.push_str(&convert_inline_formatting(&inner));
                     result.push_str("</i>");
                     i = end + 1;
                     continue;
@@ -369,7 +369,7 @@ fn convert_inline_formatting(s: &str) -> String {
             if let Some(end) = find_single_star(&chars, i + 1) {
                 result.push_str("<i>");
                 let inner: String = chars[i + 1..end].iter().collect();
-                result.push_str(&inner);
+                result.push_str(&convert_inline_formatting(&inner));
                 result.push_str("</i>");
                 i = end + 1;
                 continue;
@@ -821,6 +821,18 @@ mod tests {
         let result = markdown_to_telegram_html("```rust\nfn main() {}\n```");
         assert!(result.contains("<pre><code>"));
         assert!(result.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_code_inside_bold() {
+        let result = markdown_to_telegram_html("The Markdown file is **`acme.md`**.");
+        assert_eq!(
+            result.trim(),
+            "The Markdown file is <b><code>acme.md</code></b>."
+        );
+        let result = markdown_to_telegram_html("See [the `README`](https://example.com) or *`x`*");
+        assert!(result.contains(">the <code>README</code></a>"), "{result}");
+        assert!(result.contains("<i><code>x</code></i>"), "{result}");
     }
 
     #[test]

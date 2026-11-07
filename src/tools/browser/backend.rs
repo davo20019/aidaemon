@@ -181,7 +181,8 @@ pub trait BrowserBackend: Send + Sync {
     ///
     /// Unlike the old `current_page()` (which grabbed the first existing tab and
     /// thus shared one page across all sessions), this always creates a distinct
-    /// page so the session registry can give each `_session_id` its own tab.
+    /// page so the session registry can give each session (the call's
+    /// `ToolCallContext::session_id`) its own tab.
     ///
     /// `context_id` is `Some(id)` in `browser_context` isolation mode — the CDP
     /// browser-context id the page was created in, so the session can dispose it

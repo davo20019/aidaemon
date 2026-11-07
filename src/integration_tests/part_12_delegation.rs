@@ -39,7 +39,9 @@ impl crate::traits::Tool for StructuredPatchTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         Ok(format!("Synthetic patch applied: {arguments}"))
     }
+}
 
+impl crate::traits::ToolSemantics for StructuredPatchTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -89,7 +91,9 @@ impl crate::traits::Tool for HighImpactCliAgentMock {
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         Ok("cli agent executed".to_string())
     }
+}
 
+impl crate::traits::ToolSemantics for HighImpactCliAgentMock {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -575,6 +579,18 @@ async fn test_report_blocker_terminates_executor_loop() {
 
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(updated.status, "blocked");
+
+    // The executor's run ends completed with partial work.
+    let ends: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE event_type = 'task_end' ORDER BY id DESC",
+    )
+    .fetch_all(&agent.event_store().pool())
+    .await
+    .unwrap();
+    let end: crate::events::TaskEndData =
+        serde_json::from_str(ends.first().expect("executor task end")).unwrap();
+    assert_eq!(end.status, crate::events::TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), crate::events::TaskOutcome::Partial);
 }
 
 #[tokio::test]
@@ -683,17 +699,19 @@ async fn test_background_spawn_timeout_salvages_persisted_executor_outcome() {
     let spawn_tool =
         crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0)
             .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
-    let ack = crate::traits::Tool::call(
+    let ack = crate::testing::call_with_facts(
         &spawn_tool,
         &json!({
             "mission": "Run the ddev composer update",
             "task": "Run ddev composer update",
             "task_id": task.id,
             "background": true,
-            "_session_id": "delegation-bg-salvage",
-            "_goal_id": goal.id,
         })
         .to_string(),
+        crate::traits::ToolCallContext {
+            goal_id: Some(goal.id.clone()),
+            ..crate::testing::call_facts("delegation-bg-salvage")
+        },
     )
     .await
     .unwrap();

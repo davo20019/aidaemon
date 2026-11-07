@@ -73,14 +73,14 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
             "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.",
         ),
         MockProvider::text_response(
-            "I checked the live ClinicalTrials.gov results. The first matching study in Fairfax, Virginia is Example Skin Trial.",
+            "I checked the live ClinicalTrials.gov results. The first matching study in Springfield, Illinois is Example Skin Trial.",
         ),
     ]);
 
     let http_tool: Arc<dyn crate::traits::Tool> = Arc::new(MockTool::new(
         "http_request",
         "Make HTTP requests",
-        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Fairfax\",\"state\":\"Virginia\"}]}",
+        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Springfield\",\"state\":\"Virginia\"}]}",
     ));
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         provider,
@@ -94,7 +94,7 @@ async fn test_successful_live_receipt_is_not_reopened_by_reply_wording() {
         .agent
         .handle_message(
             "http_retry_session",
-            "Search for clinical trials for skin cancer near Fairfax Virginia for a man.",
+            "Search for clinical trials for skin cancer near Springfield Virginia for a man.",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -390,36 +390,6 @@ async fn test_task_budget_auto_extends_on_short_productive_run() {
     assert_eq!(response, "Short task completed.");
 }
 
-#[tokio::test]
-async fn test_global_daily_budget_auto_extends_on_short_productive_run() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
-        MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
-        MockProvider::text_response("Daily budget task completed."),
-    ]);
-
-    let mut harness = setup_test_agent(provider).await.unwrap();
-    harness.agent.set_test_executor_mode();
-    harness.agent.set_test_daily_token_budget(Some(60));
-
-    let response = harness
-        .agent
-        .handle_message(
-            "daily_budget_test",
-            "Run a short multi-step check against the daily budget",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "Daily budget task completed.");
-}
-
 /// Task token budget stops execution when progress is not productive (stalling).
 /// Script: same tool with same args → stall detection → is_productive=false → stops.
 #[tokio::test]
@@ -553,13 +523,13 @@ impl crate::traits::Tool for TrustProbeTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect whether the agent injected _trusted_session"
+        "Inspect whether the call is a trusted session"
     }
 
     fn schema(&self) -> serde_json::Value {
         json!({
             "name": "trust_probe",
-            "description": "Inspect whether the agent injected _trusted_session",
+            "description": "Inspect whether the call is a trusted session",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -568,13 +538,26 @@ impl crate::traits::Tool for TrustProbeTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        let trusted = args["_trusted_session"].as_bool().unwrap_or(false);
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the dispatcher calls with a context")
+    }
+
+    /// Records the dispatcher's typed trust fact for the call.
+    async fn call_with_execution_context(
+        &self,
+        _arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let trusted = facts.trusted_session;
         self.seen.lock().await.push(trusted);
-        Ok(if trusted { "trusted" } else { "untrusted" }.to_string())
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            if trusted { "trusted" } else { "untrusted" }.to_string(),
+        ))
     }
 }
+
+impl crate::traits::ToolSemantics for TrustProbeTool {}
 
 #[tokio::test]
 async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
@@ -1675,7 +1658,7 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
 #[tokio::test]
 async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
     let fabricated = "Here is the full squad:\n\
-         • Denis Segovia (LDU Quito)\n\
+         • Denis Segovia (LDU Lisbon)\n\
          • Alex Granda (Emelec)\n\
          • Yholen Pichenda (Independiente)\n\
          • Jackson Falconi (Barcelona SC)\n\
@@ -1862,7 +1845,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///
 /// MockProvider call order:
 ///   1) First LLM call → denial text (no tool call)
-///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Caro"]}`
+///   2) Classifier call inside post_turn → `{"intent":"relational","entities":["Caro"]}`
 ///   3) Second LLM call (with directive injected) → corrected answer
 #[cfg(any())]
 #[tokio::test]
@@ -1875,7 +1858,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
     let provider = MockProvider::with_responses(vec![
         // Call 1: First LLM call — model denies knowledge without searching.
         MockProvider::text_response(denial),
-        // Call 2: Classifier call inside completion_phase — consumed by
+        // Call 2: Classifier call inside post_turn — consumed by
         // classify_relational_intent; returns relational intent with "Caro".
         MockProvider::text_response(classifier_json),
         // Call 3: Second LLM call — model has the UnsearchedEntityDenial directive
@@ -2040,7 +2023,7 @@ async fn test_owner_relationship_denial_is_blocked_then_corrected() {
 /// MockProvider call order:
 ///   1) First LLM call → tool call to "find_coworker" (returns "Juan is a coworker")
 ///   2) Second LLM call → grounded partial reply (entity present in evidence)
-///   3) Classifier call inside completion_phase → {"intent":"relational","entities":["Juan"]}
+///   3) Classifier call inside post_turn → {"intent":"relational","entities":["Juan"]}
 ///      (consumed because the pre-filter fires; find_unsearched_denials then returns
 ///      empty since Juan IS in evidence → gate does NOT fire ContinueLoop)
 ///   Total: 3 calls, but no denial directive is injected (gate short-circuits after

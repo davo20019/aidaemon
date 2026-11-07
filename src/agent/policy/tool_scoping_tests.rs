@@ -1,6 +1,7 @@
 use super::*;
 use crate::testing::MockTool;
 use crate::traits::ToolRole;
+use crate::traits::ToolSemantics;
 
 /// Mock tool that returns a specific ToolRole.
 struct MockRoleTool {
@@ -32,11 +33,14 @@ impl Tool for MockRoleTool {
             "parameters": { "type": "object", "properties": {} }
         })
     }
-    fn tool_role(&self) -> ToolRole {
-        self.role
-    }
     async fn call(&self, _args: &str) -> anyhow::Result<String> {
         Ok("ok".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for MockRoleTool {
+    fn tool_role(&self) -> ToolRole {
+        self.role
     }
 }
 
@@ -130,6 +134,6 @@ fn test_tool_role_default() {
 
 #[test]
 fn test_system_info_tool_is_universal() {
-    let tool = crate::tools::SystemInfoTool;
+    let tool = crate::tools::SystemInfoTool::new(crate::execution::active_execution_backend());
     assert_eq!(tool.tool_role(), ToolRole::Universal);
 }

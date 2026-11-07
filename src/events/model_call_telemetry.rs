@@ -103,6 +103,61 @@ pub async fn record_background_model_call_telemetry(
     response: &ProviderResponse,
     latency: Duration,
 ) {
+    record_background_call(
+        event_store,
+        state,
+        session_id,
+        call_purpose,
+        model,
+        response,
+        latency,
+        None,
+    )
+    .await;
+}
+
+/// Like [`record_background_model_call_telemetry`] for a call that failed
+/// or timed out: a failed `llm_call` row with the error and no usage.
+pub async fn record_background_model_call_failure(
+    event_store: Arc<EventStore>,
+    state: &dyn TokenUsageStore,
+    session_id: &str,
+    call_purpose: &str,
+    model: &str,
+    error: &str,
+    latency: Duration,
+) {
+    let empty = ProviderResponse {
+        content: None,
+        tool_calls: Vec::new(),
+        usage: None,
+        thinking: None,
+        response_note: None,
+    };
+    record_background_call(
+        event_store,
+        state,
+        session_id,
+        call_purpose,
+        model,
+        &empty,
+        latency,
+        Some(error),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_background_call(
+    event_store: Arc<EventStore>,
+    state: &dyn TokenUsageStore,
+    session_id: &str,
+    call_purpose: &str,
+    model: &str,
+    response: &ProviderResponse,
+    latency: Duration,
+    failure: Option<&str>,
+) {
     let emitter =
         EventEmitter::new(event_store, session_id.to_string()).with_task_id(session_id.to_string());
     let (
@@ -181,8 +236,8 @@ pub async fn record_background_model_call_telemetry(
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
                 token_usage_evidence: super::TokenUsageEvidence::Unavailable,
-                failed: false,
-                error: None,
+                failed: failure.is_some(),
+                error: failure.map(str::to_string),
                 provider_error_kind: None,
                 provider_status: None,
             },

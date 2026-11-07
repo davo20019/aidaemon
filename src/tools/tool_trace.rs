@@ -71,16 +71,6 @@ impl Tool for ToolTraceTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ToolTraceArgs = serde_json::from_str(arguments)?;
 
@@ -92,6 +82,27 @@ impl Tool for ToolTraceTool {
             "limit": args.limit
         });
         self.inner.call(&delegated.to_string()).await
+    }
+}
+
+impl crate::traits::ToolSemantics for ToolTraceTool {
+    /// Past tool results replay content the tools read, whoever wrote it.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 

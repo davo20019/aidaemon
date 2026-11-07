@@ -1,4 +1,4 @@
-use crate::agent::{CompletionContract, CompletionProgress};
+use crate::agent::CompletionContract;
 use crate::events::{
     HarnessEvalSnapshot, HarnessScoresPayload, QualityEvalPayload, RoutingEvalPayload,
     TaskEfficiencyData, TaskOutcome,
@@ -56,7 +56,6 @@ pub struct RoutingSnapshot {
     pub tools_required_predicted: bool,
     pub tools_actually_used: bool,
     pub direct_return_attempted: bool,
-    pub route_drift_failsafe: bool,
     pub skills_activated: Vec<String>,
     pub policy_profile: Option<String>,
     pub model_escalated: bool,
@@ -130,7 +129,6 @@ pub struct HarnessEvalAccumulator {
     tools_actually_used: bool,
     direct_return_attempted: bool,
     direct_return_succeeded: bool,
-    route_drift_failsafe: bool,
     skills_activated: Vec<String>,
     policy_profile: Option<String>,
     model_escalated: bool,
@@ -164,7 +162,6 @@ impl HarnessEvalAccumulator {
             tools_actually_used: false,
             direct_return_attempted: false,
             direct_return_succeeded: false,
-            route_drift_failsafe: false,
             skills_activated: Vec::new(),
             policy_profile: None,
             model_escalated: false,
@@ -206,13 +203,11 @@ impl HarnessEvalAccumulator {
         orchestration_route: impl Into<String>,
         skills_activated: Vec<String>,
         policy_profile: Option<ModelProfile>,
-        route_failsafe_active: bool,
     ) {
         self.orchestration_route = orchestration_route.into();
         self.skills_activated = skills_activated;
         self.policy_profile = policy_profile.map(model_profile_label);
         self.model_profile = policy_profile;
-        self.route_drift_failsafe = route_failsafe_active;
     }
 
     pub fn record_direct_return(&mut self, attempted: bool, succeeded: bool) {
@@ -223,71 +218,27 @@ impl HarnessEvalAccumulator {
         }
     }
 
-    pub fn record_message_build(
-        &mut self,
-        tool_defs_count: u32,
-        est_input_tokens: u32,
-        context_drops: u32,
-    ) {
-        self.progress.tool_defs_count = tool_defs_count;
-        self.progress.est_input_tokens = est_input_tokens;
-        self.progress.context_drops = context_drops;
-    }
-
-    pub fn record_evidence_gate_block(&mut self) {
-        self.evidence_gate_blocks = self.evidence_gate_blocks.saturating_add(1);
-    }
-
-    pub fn record_critique_replan(&mut self) {
-        self.critique_replan_fires = self.critique_replan_fires.saturating_add(1);
-    }
-
-    pub fn record_deferred_no_tool_event(&mut self) {
-        self.progress.deferred_no_tool_events =
-            self.progress.deferred_no_tool_events.saturating_add(1);
+    /// A repetition guard fired: the same-tool limit denied a call, or the
+    /// kernel's stuck detector saw the run repeating itself.
+    pub fn record_repetition_guard(&mut self) {
+        self.progress.repetition_guard_fires =
+            self.progress.repetition_guard_fires.saturating_add(1);
     }
 
     pub fn record_budget_extension(&mut self) {
         self.progress.budget_extensions = self.progress.budget_extensions.saturating_add(1);
     }
 
-    pub fn record_model_escalated(&mut self) {
-        self.model_escalated = true;
-    }
-
-    pub fn record_iteration_progress(
+    /// Record the turn's contract. Whether mutation is forbidden comes from
+    /// the resolved authority (`mutation_forbidden` = read-only level), never
+    /// from the assessed contract, which is only a hint.
+    pub fn record_completion_contract(
         &mut self,
-        iteration: u32,
-        tool_calls_attempted: u32,
-        tool_calls_succeeded: u32,
-        evidence_gain: u32,
-        no_progress: bool,
+        contract: &CompletionContract,
+        mutation_forbidden: bool,
     ) {
-        self.progress.iterations = iteration;
-        self.progress.tool_calls_attempted = tool_calls_attempted;
-        self.progress.tool_calls_succeeded = tool_calls_succeeded;
-        self.progress.evidence_gain_total = evidence_gain;
-        if no_progress {
-            self.progress.no_progress_iterations =
-                self.progress.no_progress_iterations.saturating_add(1);
-        }
-        if tool_calls_succeeded > 0 {
-            self.tools_actually_used = true;
-        }
-    }
-
-    pub fn record_stall_guard(&mut self) {
-        self.progress.stall_guard_fires = self.progress.stall_guard_fires.saturating_add(1);
-    }
-
-    pub fn record_repetition_guard(&mut self) {
-        self.progress.repetition_guard_fires =
-            self.progress.repetition_guard_fires.saturating_add(1);
-    }
-
-    pub fn record_completion_contract(&mut self, contract: &CompletionContract) {
         self.contract.expects_mutation = contract.expects_mutation;
-        self.contract.forbids_mutation = contract.forbids_mutation;
+        self.contract.forbids_mutation = mutation_forbidden;
         self.contract.requires_observation = contract.requires_observation;
         self.contract.verification_required = contract.explicit_verification_requested
             || contract.requires_reverification_after_mutation;
@@ -299,39 +250,9 @@ impl HarnessEvalAccumulator {
             self.contract.forbidden_mutation_attempts.saturating_add(1);
     }
 
-    pub fn record_plan_progress(&mut self, completed: u32, total: u32) {
-        self.progress.plan_steps_completed = Some(completed);
-        self.progress.plan_steps_total = Some(total);
-    }
-
-    pub fn record_completion_progress(&mut self, progress: &CompletionProgress) {
-        self.contract.mutation_attempt_count = progress.mutation_attempt_count as u32;
-        self.contract.indeterminate_mutation_count = progress.indeterminate_mutation_count as u32;
-        self.contract.mutation_count = progress.mutation_count as u32;
-        self.contract.observation_count = progress.observation_count as u32;
-        self.contract.verification_count = progress.verification_count as u32;
-        self.contract.verification_blocks = progress.verification_block_count as u32;
-        self.contract.evidence_requirements_satisfied =
-            progress.satisfied_evidence_requirements() as u32;
-        self.progress.observation_count = progress.observation_count as u32;
-        self.progress.verification_count = progress.verification_count as u32;
-    }
-
-    pub fn record_post_exec_validation_failure(&mut self) {
-        self.post_exec_validation_failures = self.post_exec_validation_failures.saturating_add(1);
-    }
-
     #[allow(dead_code)] // wired when unrecovered error paths gain eval hooks
     pub fn record_unrecovered_error(&mut self) {
         self.unrecovered_errors = self.unrecovered_errors.saturating_add(1);
-    }
-
-    pub fn record_approval_denied(&mut self) {
-        self.approval_denied = true;
-    }
-
-    pub fn record_stop_reason(&mut self, reason: StopReason) {
-        self.stop_reason = reason;
     }
 
     pub fn record_llm_efficiency(&mut self, efficiency: &TaskEfficiencyData) {
@@ -410,7 +331,6 @@ impl HarnessEvalAccumulator {
             tools_required_predicted: acc.tools_required_predicted,
             tools_actually_used: acc.tools_actually_used,
             direct_return_attempted: acc.direct_return_attempted,
-            route_drift_failsafe: acc.route_drift_failsafe,
             skills_activated: acc.skills_activated.clone(),
             policy_profile: acc.policy_profile.clone(),
             model_escalated: acc.model_escalated,
@@ -460,7 +380,6 @@ impl HarnessEvalAccumulator {
                 tools_required_predicted: routing.tools_required_predicted,
                 tools_actually_used: routing.tools_actually_used,
                 direct_return_attempted: routing.direct_return_attempted,
-                route_drift_failsafe: routing.route_drift_failsafe,
                 skills_activated: routing.skills_activated,
                 policy_profile: routing.policy_profile,
                 model_escalated: routing.model_escalated,
@@ -586,7 +505,6 @@ mod tests {
                 tools_required_predicted: false,
                 tools_actually_used: tool_calls > 0,
                 direct_return_attempted: false,
-                route_drift_failsafe: false,
                 skills_activated: Vec::new(),
                 policy_profile: None,
                 model_escalated: false,
@@ -679,5 +597,52 @@ mod tests {
         assert_eq!(snap.progress.tool_calls_attempted, 3);
         assert_eq!(snap.progress.tool_calls_succeeded, 3);
         assert!(snap.routing.tools_actually_used);
+    }
+
+    fn seed() -> HarnessEvalSeed {
+        HarnessEvalSeed {
+            task_id: "task".to_string(),
+            turn_id: None,
+            depth: 0,
+            parent_task_id: None,
+            goal_id: None,
+            durable_task_id: None,
+            completion_task_kind: "conversational".to_string(),
+            followup_mode: None,
+            config: HarnessEvalConfig::default(),
+        }
+    }
+
+    /// Scoring treats mutation as forbidden by the resolved authority, not by
+    /// the assessed contract: an owner write under an assessed read-only
+    /// contract is not a violation.
+    #[test]
+    fn owner_mutation_under_assessed_read_only_contract_is_not_penalized() {
+        let contract = CompletionContract {
+            forbids_mutation: true,
+            ..Default::default()
+        };
+        let mut acc = HarnessEvalAccumulator::new(seed());
+        acc.record_completion_contract(&contract, false);
+        acc.contract.mutation_count = 1;
+        let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
+        assert!(!snap.quality.contract.forbids_mutation);
+        assert!(snap.scores.contract_fulfillment > 0.0);
+    }
+
+    /// A `/readonly` turn forbids mutation even when the assessed contract
+    /// expected one, so its authority denial scores as a forbidden attempt.
+    #[test]
+    fn readonly_authority_denial_scores_as_forbidden_mutation() {
+        let contract = CompletionContract {
+            expects_mutation: true,
+            ..Default::default()
+        };
+        let mut acc = HarnessEvalAccumulator::new(seed());
+        acc.record_completion_contract(&contract, true);
+        acc.record_forbidden_mutation_attempt();
+        let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
+        assert!(snap.quality.contract.forbids_mutation);
+        assert_eq!(snap.scores.contract_fulfillment, 0.0);
     }
 }

@@ -360,6 +360,12 @@ impl crate::traits::Tool for ExternalActionTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("Created remote record id=abc123".to_string())
+    }
+}
+
+impl crate::traits::ToolSemantics for ExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -368,10 +374,6 @@ impl crate::traits::Tool for ExternalActionTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("Created remote record id=abc123".to_string())
     }
 }
 
@@ -398,6 +400,15 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
         })
     }
 
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(crate::tools::sanitize::wrap_untrusted_output(
+            "prewrapped_external_action",
+            "Created remote record id=wrapped123",
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for PreWrappedExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -406,13 +417,6 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
             idempotent: true,
             high_impact_write: false,
         }
-    }
-
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(crate::tools::sanitize::wrap_untrusted_output(
-            "prewrapped_external_action",
-            "Created remote record id=wrapped123",
-        ))
     }
 }
 
@@ -440,16 +444,6 @@ impl crate::traits::Tool for StructuredExternalActionTool {
         })
     }
 
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         Ok(
             r#"HTTP 201 Created
@@ -469,6 +463,18 @@ Top-level keys: data
 }"#
             .to_string(),
         )
+    }
+}
+
+impl crate::traits::ToolSemantics for StructuredExternalActionTool {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
@@ -548,16 +554,6 @@ impl crate::traits::Tool for UrlProbeTool {
         })
     }
 
-    fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         let url = args
@@ -568,6 +564,18 @@ impl crate::traits::Tool for UrlProbeTool {
             "Checked {} and confirmed the posts are visible.",
             url
         ))
+    }
+}
+
+impl crate::traits::ToolSemantics for UrlProbeTool {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
@@ -585,7 +593,13 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_delayed_responses(
             responses,
-            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+            // The follow-up call and both of its timeout retries hang.
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            ],
         ),
         vec![Arc::new(ExternalActionTool)],
         Some(1),
@@ -595,7 +609,7 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
 
     let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
         harness.agent.handle_message(
             "external_action_timeout",
             "Create the remote record.",
@@ -650,7 +664,13 @@ async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         MockProvider::with_delayed_responses(
             responses,
-            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+            // The follow-up call and both of its timeout retries hang.
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            ],
         ),
         vec![Arc::new(PreWrappedExternalActionTool)],
         Some(1),
@@ -659,7 +679,7 @@ async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
     .unwrap();
 
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
         harness.agent.handle_message(
             "prewrapped_external_action_timeout",
             "Create the remote record.",
@@ -780,6 +800,24 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
         }
+    }
+
+    impl crate::traits::ToolSemantics for CountingSendFileTool {
+        fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+            crate::traits::ToolDispatchFacts {
+                delivers_files: true,
+                ..Default::default()
+            }
+        }
+
+        // Like the real `send_file`: its result is the daemon's own words.
+        fn output_trust(
+            &self,
+            _arguments: &str,
+            _roots: &crate::traits::TrustRoots<'_>,
+        ) -> aidaemon_core::SourceTrust {
+            aidaemon_core::SourceTrust::Trusted
+        }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
             crate::traits::ToolCapabilities {
@@ -875,7 +913,7 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
 /// Regression: once a duplicate send_file is suppressed, the task should be
 /// forced into text-only mode instead of repeatedly attempting more file sends.
 #[tokio::test]
-async fn test_duplicate_send_file_forces_text_closeout() {
+async fn test_repeated_send_file_executes_once() {
     struct CountingSendFileTool {
         calls: Arc<AtomicUsize>,
     }
@@ -908,6 +946,24 @@ async fn test_duplicate_send_file_forces_text_closeout() {
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
+        }
+    }
+
+    impl crate::traits::ToolSemantics for CountingSendFileTool {
+        fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+            crate::traits::ToolDispatchFacts {
+                delivers_files: true,
+                ..Default::default()
+            }
+        }
+
+        // Like the real `send_file`: its result is the daemon's own words.
+        fn output_trust(
+            &self,
+            _arguments: &str,
+            _roots: &crate::traits::TrustRoots<'_>,
+        ) -> aidaemon_core::SourceTrust {
+            aidaemon_core::SourceTrust::Trusted
         }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
@@ -995,9 +1051,11 @@ async fn test_duplicate_send_file_forces_text_closeout() {
                     .is_some_and(|c| c.contains("Duplicate send_file suppressed"))
         })
         .count();
+    // Tools stay available after a duplicate; every repeat of the same
+    // file and caption is suppressed instead of sent.
     assert_eq!(
-        dedupe_msgs, 1,
-        "Expected exactly one duplicate suppression message"
+        dedupe_msgs, 2,
+        "each repeated identical send_file is suppressed"
     );
 }
 
@@ -1228,6 +1286,12 @@ impl crate::traits::Tool for FailingExternalActionTool {
             "parameters": {"type": "object", "properties": {}}
         })
     }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("synthetic external action failure")
+    }
+}
+
+impl crate::traits::ToolSemantics for FailingExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
         crate::traits::ToolCapabilities {
             read_only: false,
@@ -1240,8 +1304,14 @@ impl crate::traits::Tool for FailingExternalActionTool {
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::mutation()
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("synthetic external action failure")
+    // Its failure text is its own, not a third party's: the recovery pass,
+    // not the untrusted-content rule, is under test.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
     }
 }
 
@@ -1312,148 +1382,51 @@ async fn test_failed_mutation_gets_recovery_pass_before_report() {
         .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
         .filter_map(|result| result.receipt.map(|receipt| receipt.outcome_status))
         .collect::<Vec<_>>();
-    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::FailedPermanent));
-    assert!(statuses.contains(&crate::traits::ToolOutcomeStatus::Succeeded));
+    assert!(
+        statuses.contains(&crate::traits::ToolOutcomeStatus::FailedPermanent),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses.contains(&crate::traits::ToolOutcomeStatus::Succeeded),
+        "{statuses:?}"
+    );
 
     // The pivot's success ships — not a failure report.
     assert!(
         response.contains("record is created") || response.contains("abc123"),
         "recovered outcome must ship: {response:?}"
     );
-}
-
-/// End-to-end proof of the runtime self-repair contract: a directory
-/// capability the execution prelude projected on the model's behalf cannot be
-/// prepared (its parent is a file), so the terminal adapter reports a typed
-/// `RuntimePreparationFailure`; the dispatcher drops its own projection and
-/// re-runs the prepared call without consuming a model iteration. The model's
-/// command then runs exactly as declared and the model never sees the
-/// runtime's mistake as a tool error.
-#[tokio::test]
-async fn test_full_stack_runtime_repairs_its_own_unpreparable_projection() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let blocker = workspace.path().join("blocker");
-    std::fs::write(&blocker, "a file, not a directory").expect("blocker");
-    // A future root beneath an existing FILE: passes the pre-projection disk
-    // check (it does not exist) but can never be materialized (ENOTDIR).
-    let impossible_root = blocker.join("sub").to_string_lossy().to_string();
-    let output = workspace.path().join("out.txt").to_string_lossy().to_string();
-    let cwd = workspace.path().to_string_lossy().to_string();
-
-    // The typed assessment declares the impossible root as a write root, so
-    // the contract compiler classifies it as a directory capability and the
-    // prelude projects it into the terminal call's `write_roots`.
-    let base = MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_workspace_write"],
-        "new_request",
-        "local_workspace",
-    );
-    let mut assessment: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["contract"]["filesystem_access"] = serde_json::json!({
-        "execution_cwd": cwd,
-        "read_paths": [],
-        "write_paths": [output],
-        "read_roots": [],
-        "write_roots": [impossible_root],
-    });
-    let assessment = MockProvider::text_response(&assessment.to_string());
-
-    let terminal_args = serde_json::json!({
-        "command": format!("printf SYNTHETIC_REPAIR_OK > '{output}'"),
-        "working_dir": cwd,
-        "write_paths": [output],
-    })
-    .to_string();
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("terminal", &terminal_args),
-        MockProvider::text_response("Wrote the file."),
-    ])
-    .with_task_assessments(vec![assessment]);
-    let harness = setup_full_stack_test_agent(provider).await.unwrap();
-
-    let session_id = "runtime_projection_repair";
-    let response = harness
+    // A later success credits the run: the earlier failure does not make it
+    // partial.
+    let task_end = harness
         .agent
-        .handle_message(
-            session_id,
-            &format!("Write SYNTHETIC_REPAIR_OK to {output} (output root {impossible_root})."),
-            None,
-            UserRole::Owner,
-            ChannelContext {
-                visibility: ChannelVisibility::Private,
-                platform: "telegram".to_string(),
-                channel_name: None,
-                channel_id: None,
-                workspace_id: None,
-                sender_name: Some("Alice".to_string()),
-                sender_id: Some("telegram:synthetic-owner".to_string()),
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                workspace_grant: None,
-                trusted: false,
-            },
-            None,
+        .event_store()
+        .query_events_by_types(
+            "tg_mutation_recovery",
+            &[crate::events::EventType::TaskEnd],
+            5,
         )
         .await
-        .unwrap();
-    assert!(!response.is_empty());
-
-    // The model's command ran exactly as declared.
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end");
     assert_eq!(
-        std::fs::read_to_string(&output).expect("command output must exist"),
-        "SYNTHETIC_REPAIR_OK"
+        task_end.effective_outcome(),
+        crate::events::TaskOutcome::Succeeded
     );
-
-    let decision_rows: Vec<String> = sqlx::query_scalar(
-        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id",
-    )
-    .bind(session_id)
-    .fetch_all(&harness.state.pool())
-    .await
-    .unwrap();
-    let repaired = decision_rows
-        .iter()
-        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
-        .find(|data| {
-            data["metadata"]["condition"].as_str() == Some("runtime_projection_repaired")
-        })
-        .expect("the dispatcher must record that it repaired its own projection");
-    assert_eq!(repaired["metadata"]["field"], "write_roots");
-    assert_eq!(repaired["metadata"]["value"], impossible_root);
-    assert_eq!(repaired["metadata"]["model_iteration_consumed"], false);
-
-    // No tool result carrying the runtime's own preparation error ever
-    // reached the model; the single durable terminal receipt is the
-    // dispatched command.
-    let tool_results: Vec<String> = sqlx::query_scalar(
-        "SELECT data FROM events WHERE session_id = ? AND event_type = 'tool_result' AND tool_name = 'terminal' ORDER BY id",
-    )
-    .bind(session_id)
-    .fetch_all(&harness.state.pool())
-    .await
-    .unwrap();
-    assert_eq!(tool_results.len(), 1, "{tool_results:?}");
-    let receipt: serde_json::Value = serde_json::from_str(&tool_results[0]).unwrap();
-    assert!(
-        !receipt.to_string().contains("could not prepare"),
-        "runtime preparation failure leaked to the model: {receipt}"
-    );
-    assert_eq!(receipt["receipt"]["invocation_stage"], "dispatched");
-    assert_eq!(receipt["receipt"]["exit_code"], 0);
 }
 
 /// A pre-dispatch denial the contract itself asked for (`non_success_terminal`
-/// receipt, read-only contract) is the terminal evidence. The completion gate
-/// must let the model's typed recovery reply through instead of demanding an
-/// evidence-seeking pass that can never succeed.
+/// receipt; here the scope check refusing a write to protected host data) is
+/// the terminal evidence. The completion gate must let the model's typed
+/// recovery reply through instead of demanding an evidence-seeking pass that
+/// can never succeed.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let target = workspace.path().join("denied.txt").to_string_lossy().to_string();
+    let target = "/etc/aidaemon-synthetic-denied.txt".to_string();
     let cwd = workspace.path().to_string_lossy().to_string();
 
     let base = MockProvider::semantic_task_assessment(
@@ -1466,7 +1439,6 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     );
     let mut assessment: serde_json::Value =
         serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["contract"]["mutation_scope"] = serde_json::json!("read_only");
     assessment["contract"]["evidence_requirements"] = serde_json::json!([{
         "summary": "Complete the exact requested machine invocation",
         "acceptable_scopes": ["local_workspace"],
@@ -1531,7 +1503,7 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
 
     assert!(
         !std::path::Path::new(&target).exists(),
-        "the read-only contract must block the write"
+        "the scope check must block the write"
     );
     assert!(
         response.contains(marker),
@@ -1558,14 +1530,6 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     assert!(
         !conditions.iter().any(|c| c == "tools_required_no_tool_response"),
         "gate looped: {conditions:?}"
-    );
-    assert!(
-        conditions.iter().any(|c| c == "negative_completion_contract"),
-        "{conditions:?}"
-    );
-    assert!(
-        conditions.iter().any(|c| c == "policy_denial_terminal_observation"),
-        "denial must be accepted as the terminal observation: {conditions:?}"
     );
     // The ledger-first arbiter (shadow by default) must agree: nothing is
     // reachable after the credited denial, so the run is closed on evidence.

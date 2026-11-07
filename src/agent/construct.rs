@@ -52,7 +52,6 @@ pub(crate) struct AgentConstruction {
     pub max_response_chars: usize,
     pub timeout_secs: u64,
     pub max_facts: usize,
-    pub daily_token_budget: Option<u64>,
     pub iteration_config: IterationLimitConfig,
     pub task_timeout_secs: Option<u64>,
     pub task_token_budget: Option<u64>,
@@ -75,6 +74,43 @@ pub(crate) struct AgentConstruction {
 
 // impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
 impl Agent {
+    /// SDK kernel settings for this agent's turns (and its children's).
+    pub(crate) fn set_sdk_engine(&mut self, settings: super::sdk_engine::SdkEngineSettings) {
+        self.sdk_engine = Arc::new(settings);
+    }
+
+    /// The kernel run store for this agent's turns (and its children's).
+    pub(crate) fn set_run_store(&mut self, store: Arc<aidaemon_store_sqlite::SqliteStore>) {
+        self.run_store = Some(store);
+    }
+
+    /// The owner's approvals for this agent's turns (and its children's).
+    pub(crate) fn owner_approvals(&self) -> Arc<super::approvals::OwnerApprovals> {
+        self.owner_approvals.clone()
+    }
+
+    /// Replace the owner's approvals (tests use a short card timeout).
+    #[cfg(test)]
+    pub(crate) fn set_owner_approvals(&mut self, approvals: Arc<super::approvals::OwnerApprovals>) {
+        self.owner_approvals = approvals;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_transcript_writes(
+        &mut self,
+        writes: Arc<dyn super::memory_plugin::MemoryWrites>,
+    ) {
+        self.transcript_writes = writes;
+    }
+
+    /// The memory backend for this agent's turns (and its children's).
+    pub(crate) fn set_memory_plugin(
+        &mut self,
+        memory: Arc<dyn super::memory_plugin::MemoryPlugin>,
+    ) {
+        self.memory = memory;
+    }
+
     pub(crate) fn new(input: AgentConstruction) -> Self {
         let AgentConstruction {
             dependencies:
@@ -94,7 +130,6 @@ impl Agent {
             max_response_chars,
             timeout_secs,
             max_facts,
-            daily_token_budget,
             iteration_config,
             task_timeout_secs,
             task_token_budget,
@@ -147,6 +182,17 @@ impl Agent {
             info!(timeout_secs = secs, "LLM call watchdog timeout enabled");
         }
 
+        let daemon_memory = super::memory_plugin::DaemonMemory::new(
+            state.clone(),
+            event_store.clone(),
+            llm_runtime.clone(),
+            context_window_config.clone(),
+            max_facts,
+            record_decision_points,
+            &system_prompt,
+        );
+        let transcript_writes = daemon_memory.writes();
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
             state,
@@ -167,7 +213,6 @@ impl Agent {
                 max_response_chars,
                 timeout_secs,
                 max_facts,
-                daily_token_budget,
                 llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
                 task_timeout: task_timeout_secs.map(Duration::from_secs),
                 task_token_budget,
@@ -179,32 +224,28 @@ impl Agent {
             goal_id: None,
             mandate_execution: None,
             cancel_token: None,
+            sdk_engine: Arc::default(),
+            run_store: None,
+            owner_approvals: Arc::default(),
+            memory,
+            transcript_writes,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            // Seed the in-memory ignore-set from config so a fresh start never
-            // forces `tool_choice=required` on a known-bad model. Persisted
-            // runtime-learned entries are merged in later via
-            // `load_required_tool_choice_ignored()` (async, post-construction).
-            required_tool_choice_ignored_models: Arc::new(tokio::sync::RwLock::new(
-                policy_config
-                    .required_tool_choice_ignored_models
-                    .iter()
-                    .cloned()
-                    .collect(),
-            )),
             self_ref: RwLock::new(None),
+            task_registry: std::sync::OnceLock::new(),
             context_window_config,
             policy_config,
             path_aliases,
             inherited_project_scope,
             approval_session_id: None,
+            inherited_authority: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            read_untrusted: Arc::default(),
             window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
@@ -213,15 +254,11 @@ impl Agent {
             turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             interactive_slot,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
             stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
-            correction_contexts: Arc::new(tokio::sync::RwLock::new(
-                super::CorrectionContextRegistry::default(),
-            )),
         }
     }
 
@@ -278,11 +315,6 @@ impl Agent {
     }
 
     #[cfg(test)]
-    pub fn set_test_daily_token_budget(&mut self, budget: Option<u64>) {
-        self.limits.daily_token_budget = budget;
-    }
-
-    #[cfg(test)]
     pub fn set_test_iteration_config(&mut self, config: IterationLimitConfig) {
         self.limits.iteration_config = config;
     }
@@ -291,6 +323,26 @@ impl Agent {
     #[allow(dead_code)]
     pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
         self.limits.task_timeout = timeout;
+    }
+
+    /// Offer and run the tools of `registry`'s MCP servers.
+    #[cfg(test)]
+    pub(crate) fn set_test_mcp_registry(&mut self, registry: crate::mcp::McpRegistry) {
+        self.mcp_registry = Some(registry);
+    }
+
+    /// Offer every authorized tool, whatever the policy profile would prune.
+    #[cfg(test)]
+    pub(crate) fn set_test_tool_filter_enforce(&mut self, enforce: bool) {
+        self.policy_config.tool_filter_enforce = enforce;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_inherited_authority(
+        &mut self,
+        authority: crate::agent::authority::InheritedAuthority,
+    ) {
+        self.inherited_authority = Some(authority);
     }
 
     #[cfg(test)]
@@ -369,7 +421,6 @@ impl Agent {
         hub: Option<Weak<dyn OutboundRouter>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
         billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
-        required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
@@ -382,12 +433,22 @@ impl Agent {
         audio_config: AudioConfig,
         stt_config: SttConfig,
         harness_eval_config: HarnessEvalConfig,
-        correction_contexts: Arc<tokio::sync::RwLock<super::CorrectionContextRegistry>>,
     ) -> Self {
         let fallback = llm_runtime
             .router()
             .and_then(|router| router.first_fallback().map(str::to_string))
             .unwrap_or_else(|| model.clone());
+        let daemon_memory = super::memory_plugin::DaemonMemory::new(
+            state.clone(),
+            event_store.clone(),
+            llm_runtime.clone(),
+            context_window_config.clone(),
+            max_facts,
+            record_decision_points,
+            &system_prompt,
+        );
+        let transcript_writes = daemon_memory.writes();
+        let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
             state,
@@ -408,7 +469,6 @@ impl Agent {
                 max_response_chars,
                 timeout_secs,
                 max_facts,
-                daily_token_budget: None,
                 llm_call_timeout,
                 task_timeout,
                 task_token_budget,
@@ -420,22 +480,28 @@ impl Agent {
             goal_id,
             mandate_execution,
             cancel_token,
+            sdk_engine: Arc::default(),
+            run_store: None,
+            owner_approvals: Arc::default(),
+            memory,
+            transcript_writes,
             goal_token_registry,
             hub: RwLock::new(hub),
             plan_store: RwLock::new(None),
-            checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions,
             billing_failed_models,
-            required_tool_choice_ignored_models,
             self_ref: RwLock::new(None),
+            task_registry: std::sync::OnceLock::new(),
             context_window_config,
             policy_config,
             path_aliases,
             inherited_project_scope,
             approval_session_id,
+            inherited_authority: None,
             root_tools,
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            read_untrusted: Arc::default(),
             window_keep_from_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
@@ -446,15 +512,11 @@ impl Agent {
             // Sub-agents never pin the interactive slot — only the root agent's
             // main generation loop does. They default to the background slot.
             interactive_slot: None,
-            session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
             stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
-            // Shared with the spawning parent so the remediation hierarchy
-            // (task-lead + executors) all see the same registered context.
-            correction_contexts,
         }
     }
 }

@@ -32,6 +32,10 @@ pub struct HarnessEvalFixture {
     /// When true, use non-uniform primary/smart model tiers (routing tests).
     #[serde(default)]
     pub routing_models: bool,
+    /// Session mode set before the turn, as `/readonly` or `/mode` would
+    /// (`"readonly"` or `"unrestricted"`). Unset leaves the owner default.
+    #[serde(default)]
+    pub session_mode: Option<String>,
     #[serde(default)]
     pub mock_responses: Vec<MockResponseSpec>,
     /// Optional semantic task-assessment responses, kept separate from the
@@ -708,6 +712,7 @@ pub fn record_fixture_from_events(
         user_role: "owner".to_string(),
         orchestrator: false,
         routing_models: false,
+        session_mode: None,
         mock_responses,
         task_assessments: Vec::new(),
         seed: FixtureSeed::default(),

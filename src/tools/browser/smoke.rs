@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use crate::config::BrowserConfig;
+use crate::testing::CallWithFacts;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{ApprovalBroker, BrowserTool};
 use crate::traits::Tool;
@@ -72,46 +73,47 @@ async fn browser_smoke_real_chrome() {
         media_tx,
         auto_approve_broker(),
         profile.path().join("inbox"),
+        crate::execution::active_execution_backend(),
     )
     .expect("construct browser tool");
 
     let session = "smoke-session";
 
     let nav = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "navigate",
                 "url": fixture_url,
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("navigate");
     assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
 
     let fill = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "fill",
                 "selector": "#name",
                 "value": "replaced",
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("fill");
     assert_eq!(fill, "Filled '#name'");
 
     let click = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "click",
                 "selector": "#go",
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("click");
@@ -120,13 +122,13 @@ async fn browser_smoke_real_chrome() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let text = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "get_text",
                 "selector": "#out",
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("get_text");
@@ -136,12 +138,12 @@ async fn browser_smoke_real_chrome() {
     );
 
     let logs = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "get_console_logs",
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("get_console_logs");
@@ -151,12 +153,12 @@ async fn browser_smoke_real_chrome() {
     );
 
     let shot = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "screenshot",
-                "_session_id": session
             })
             .to_string(),
+            crate::testing::call_facts(session),
         )
         .await
         .expect("screenshot");
@@ -166,7 +168,10 @@ async fn browser_smoke_real_chrome() {
     );
 
     let close = tool
-        .call(&json!({ "action": "close", "_session_id": session }).to_string())
+        .call_with(
+            &json!({ "action": "close" }).to_string(),
+            crate::testing::call_facts(session),
+        )
         .await
         .expect("close");
     assert!(
@@ -207,18 +212,19 @@ html, body { margin: 0; background: #08352d; color: white }
         media_tx,
         auto_approve_broker(),
         fixture.path().join("inbox"),
+        crate::execution::active_execution_backend(),
     )
     .expect("construct browser tool");
 
     let rendered = tool
-        .call(
+        .call_with(
             &json!({
                 "action": "render_pdf",
                 "source_path": source,
                 "output_filename": "designed-document.pdf",
-                "_session_id": "pdf-smoke"
             })
             .to_string(),
+            crate::testing::call_facts("pdf-smoke"),
         )
         .await
         .expect("render action");

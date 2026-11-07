@@ -5,7 +5,15 @@ use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 use super::fs_utils;
 
-pub struct ServiceStatusTool;
+pub struct ServiceStatusTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl ServiceStatusTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 const VALID_SECTIONS: &[&str] = &["ports", "docker", "processes"];
 
@@ -45,20 +53,6 @@ impl Tool for ServiceStatusTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let filters: Vec<String> = args["services"]
@@ -82,9 +76,9 @@ impl Tool for ServiceStatusTool {
 
         for section in &sections {
             let section_output = match section.as_str() {
-                "ports" => get_listening_ports(&filters).await,
-                "docker" => get_docker_status(&filters).await,
-                "processes" => get_dev_processes(&filters).await,
+                "ports" => get_listening_ports(&*self.backend, &filters).await,
+                "docker" => get_docker_status(&*self.backend, &filters).await,
+                "processes" => get_dev_processes(&*self.backend, &filters).await,
                 _ => continue,
             };
 
@@ -105,6 +99,22 @@ impl Tool for ServiceStatusTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ServiceStatusTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
 fn capitalize_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -113,14 +123,17 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-async fn get_listening_ports(filters: &[String]) -> String {
+async fn get_listening_ports(
+    backend: &dyn crate::execution::ExecutionBackend,
+    filters: &[String],
+) -> String {
     let cmd = if cfg!(target_os = "macos") {
         "lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null"
     } else {
         "ss -tlnp 2>/dev/null"
     };
 
-    match fs_utils::run_cmd(cmd, None, 10).await {
+    match fs_utils::run_cmd(backend, cmd, None, 10).await {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
             if filters.is_empty() {
                 out.stdout
@@ -132,7 +145,10 @@ async fn get_listening_ports(filters: &[String]) -> String {
     }
 }
 
-async fn get_docker_status(filters: &[String]) -> String {
+async fn get_docker_status(
+    backend: &dyn crate::execution::ExecutionBackend,
+    filters: &[String],
+) -> String {
     // Check if docker is available
     let which_result = tokio::process::Command::new("which")
         .arg("docker")
@@ -140,7 +156,7 @@ async fn get_docker_status(filters: &[String]) -> String {
         .await;
 
     if which_result.map(|r| r.status.success()).unwrap_or(false) {
-        match fs_utils::run_cmd(
+        match fs_utils::run_cmd(backend,
             "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null",
             None,
             10,
@@ -161,7 +177,10 @@ async fn get_docker_status(filters: &[String]) -> String {
     }
 }
 
-async fn get_dev_processes(filters: &[String]) -> String {
+async fn get_dev_processes(
+    backend: &dyn crate::execution::ExecutionBackend,
+    filters: &[String],
+) -> String {
     // Look for common dev server processes
     let patterns = [
         "node", "python", "ruby", "java", "go ", "cargo", "npm", "webpack", "vite", "next", "nuxt",
@@ -180,7 +199,7 @@ async fn get_dev_processes(filters: &[String]) -> String {
         grep_pattern
     );
 
-    match fs_utils::run_cmd(&cmd, None, 10).await {
+    match fs_utils::run_cmd(backend, &cmd, None, 10).await {
         Ok(out) if out.exit_code == 0 && !out.stdout.trim().is_empty() => {
             // Format: simplify ps output
             let mut result = String::new();
@@ -230,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = ServiceStatusTool;
+        let tool = ServiceStatusTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "service_status");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -240,7 +259,10 @@ mod tests {
     #[tokio::test]
     async fn test_service_status_runs() {
         let args = json!({"include": ["ports"]}).to_string();
-        let result = ServiceStatusTool.call(&args).await.unwrap();
+        let result = ServiceStatusTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         // Should return something (ports section or "No services")
         assert!(!result.is_empty());
     }

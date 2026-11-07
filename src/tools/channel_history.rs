@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{Tool, ToolCallContext, ToolCapabilities};
 
 /// Tool that reads Slack channel conversation history via the Slack API.
 /// Provides rich message data (text, sender, timestamps, threads, reactions, mentions)
@@ -394,38 +394,50 @@ impl Tool for ReadChannelHistoryTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ReadChannelHistoryTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
-        // Determine channel ID: explicit arg > _channel_id injection
+        // Determine channel ID: explicit arg > the call's channel
         let channel_id = if let Some(cid) = args["channel_id"].as_str() {
             info!(
                 channel_id = cid,
                 "read_channel_history: using explicit channel_id"
             );
             cid.to_string()
-        } else if let Some(injected) = args["_channel_id"].as_str() {
-            // _channel_id is formatted as "slack:C12345" — extract the raw ID
+        } else if let Some(injected) = facts.channel_id.as_deref() {
+            // The call's channel is formatted as "slack:C12345" — extract the raw ID
             if let Some(raw) = injected.strip_prefix("slack:") {
                 info!(
                     channel_id = raw,
-                    injected, "read_channel_history: using injected _channel_id"
+                    injected, "read_channel_history: using the call's channel"
                 );
                 raw.to_string()
             } else {
                 warn!(
                     injected,
-                    "read_channel_history: _channel_id not a slack channel"
+                    "read_channel_history: the call's channel is not a slack channel"
                 );
                 return Ok(
                     "This tool only works in Slack channels. The current channel is not a Slack channel."
@@ -433,7 +445,7 @@ impl Tool for ReadChannelHistoryTool {
                 );
             }
         } else {
-            warn!("read_channel_history: no channel_id available (not injected, not provided)");
+            warn!("read_channel_history: no channel_id available (no channel, not provided)");
             return Ok(
                 "No channel_id provided and not in a Slack channel. Use this tool from a Slack channel, or provide a channel_id parameter."
                     .to_string(),
@@ -484,9 +496,9 @@ impl Tool for ReadChannelHistoryTool {
             .map(|n| format!("#{}", n))
             .unwrap_or_else(|| channel_id.clone());
 
-        // Try to detect the bot owner from _session_id context — not reliable,
+        // Try to detect the bot owner from the session context — not reliable,
         // but user mentions are still highlighted via the ⚠️ marker when the
-        // owner's user ID is known. We'll extract from _channel_id context if available.
+        // owner's user ID is known. We'll extract from the channel context if available.
         let bot_owner_id: Option<String> = None;
 
         // Messages come newest-first from Slack; reverse for chronological order
@@ -547,6 +559,31 @@ impl Tool for ReadChannelHistoryTool {
         );
 
         Ok(format!("{}\n{}", header, formatted.join("\n\n")))
+    }
+}
+
+impl crate::traits::ToolSemantics for ReadChannelHistoryTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// The channel API host (Slack's Web API) the history is read from.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            })
     }
 }
 
@@ -615,6 +652,7 @@ fn parse_relative_time(input: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -746,7 +784,13 @@ mod tests {
     async fn test_non_slack_channel() {
         let tool = ReadChannelHistoryTool::new(vec!["xoxb-test".to_string()]);
         let result = tool
-            .call(r#"{"_channel_id": "telegram:12345"}"#)
+            .call_with(
+                r#"{}"#,
+                crate::traits::ToolCallContext {
+                    channel_id: Some("telegram:12345".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(result.contains("only works in Slack"));
@@ -790,5 +834,15 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["text"].as_str(), Some("from second token"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn channel_history_declares_the_api_host() {
+        use crate::traits::ToolSemantics as _;
+        let tool = ReadChannelHistoryTool::new(vec!["xoxb-synthetic".to_string()]);
+        let effects = tool.call_effects(r#"{"channel_id":"C123"}"#);
+        assert!(effects.complete);
+        assert_eq!(effects.keys.len(), 1);
+        assert_eq!(effects.keys[0].target, "slack.com:443");
     }
 }

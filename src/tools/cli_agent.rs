@@ -23,21 +23,19 @@ use crate::agent::{
 };
 use crate::config::CliAgentsConfig;
 use crate::execution::{
-    active_execution_backend, BackendFileType, BackendPath, ExecutionRequest, ProcessHandle,
-    SharedExecutionBackend,
+    BackendFileType, BackendPath, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
 };
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolArgumentContractViolation,
-    ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
-    ToolVerificationMode,
+    DynamicCliAgent, Message, StateStore, Tool, ToolArgumentContractViolation,
+    ToolCallAccessManifest, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
+use crate::types::{ApprovalResponse, UserRole};
 use crate::utils::{floor_char_boundary, truncate_str, truncate_with_note};
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
@@ -294,6 +292,7 @@ fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<
                 | "--dangerously-bypass-hook-trust"
                 | "--full-auto"
                 | "--ignore-user-config"
+                | "--skip-git-repo-check"
         ) || argument.starts_with("--sandbox=")
             || argument.starts_with("-s=")
             || argument.starts_with("--add-dir=")
@@ -310,6 +309,10 @@ fn apply_read_only_cli_adapter(command: &str, args: &mut Vec<String>) -> Result<
         index = index.saturating_add(1);
     }
     constrained.push("--ignore-user-config".to_string());
+    // Ignoring the user config also drops its trusted-project list, so codex
+    // would refuse every directory outside a git repository; the sandbox set
+    // here is the trust boundary.
+    constrained.push("--skip-git-repo-check".to_string());
     constrained.push("--sandbox".to_string());
     constrained.push("read-only".to_string());
     *args = constrained;
@@ -360,6 +363,7 @@ fn apply_scoped_cli_adapter(
                 | "--dangerously-bypass-hook-trust"
                 | "--full-auto"
                 | "--ignore-user-config"
+                | "--skip-git-repo-check"
         ) || argument.starts_with("--sandbox=")
             || argument.starts_with("-s=")
             || argument.starts_with("--add-dir=")
@@ -400,6 +404,7 @@ fn apply_scoped_cli_adapter(
         .collect::<Vec<_>>()
         .join(",");
     constrained.push("--ignore-user-config".to_string());
+    constrained.push("--skip-git-repo-check".to_string());
     constrained.extend([
         "-c".to_string(),
         format!("default_permissions={}", toml_string(PROFILE)),
@@ -659,6 +664,8 @@ async fn list_backend_files(
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
+/// Any auto-approve flags listed here are stripped at launch
+/// (`strip_permission_bypass_flags`), so descriptions must not promise that mode.
 fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>
 {
     vec![
@@ -672,7 +679,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "stream-json",
                 "--verbose",
             ],
-            "Claude Code — Anthropic's AI coding agent (auto-approve mode)",
+            "Claude Code — Anthropic's AI coding agent",
         ),
         (
             "gemini",
@@ -683,7 +690,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "--output-format",
                 "stream-json",
             ],
-            "Gemini CLI — Google's AI coding agent (auto-approve mode)",
+            "Gemini CLI — Google's AI coding agent",
         ),
         (
             "codex",
@@ -693,13 +700,13 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
             ],
-            "Codex CLI — OpenAI's AI coding agent (auto-approve mode)",
+            "Codex CLI — OpenAI's AI coding agent",
         ),
         (
             "copilot",
             "copilot",
             vec!["-p", "--allow-all-tools", "--allow-all-paths"],
-            "GitHub Copilot CLI (auto-approve mode)",
+            "GitHub Copilot CLI",
         ),
         (
             "aider",
@@ -790,6 +797,88 @@ async fn resolve_executable(backend: &SharedExecutionBackend, executable: &str) 
 /// actual nested agent executable. GUI/launchd processes commonly lack user
 /// install directories such as `~/.local/bin` in PATH; accepting `env` alone
 /// used to defer that mistake until every invocation exited with code 127.
+/// Boolean flags that switch a CLI agent into unattended auto-approve mode,
+/// across every agent we launch. The single list for the cli_agent tool and
+/// the terminal-bridge review profiles.
+pub(crate) const PERMISSION_BYPASS_FLAGS: &[&str] = &[
+    // claude
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--dangerously-bypass-hook-trust",
+    // codex
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--full-auto",
+    // gemini
+    "--yolo",
+    // copilot
+    "--allow-all-tools",
+    "--allow-all-paths",
+    // aider
+    "--yes",
+    "--yes-always",
+];
+
+/// Options whose given value turns them into a bypass: (flag, value).
+const PERMISSION_BYPASS_OPTION_VALUES: &[(&str, &str)] = &[
+    ("--sandbox", "false"),
+    ("--sandbox", "danger-full-access"),
+    ("--approval-mode", "yolo"),
+    ("--permission-mode", "bypassPermissions"),
+];
+
+fn is_permission_bypass_flag(arg: &str, agent: &str) -> bool {
+    if arg == "-y" {
+        // `-y` means something else for most CLIs; it is gemini's --yolo.
+        return agent.eq_ignore_ascii_case("gemini");
+    }
+    PERMISSION_BYPASS_FLAGS.iter().any(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    }) || PERMISSION_BYPASS_OPTION_VALUES.iter().any(|(flag, value)| {
+        arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) == Some(value)
+    })
+}
+
+fn without_permission_bypass(args: &[String], agent: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if is_permission_bypass_flag(arg, agent) {
+            index += 1;
+            continue;
+        }
+        if let Some(value) = args.get(index + 1) {
+            if PERMISSION_BYPASS_OPTION_VALUES
+                .iter()
+                .any(|(flag, v)| arg == *flag && value == v)
+            {
+                index += 2;
+                continue;
+            }
+        }
+        out.push(args[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// Remove auto-approve flags from a launch argument list. `agent` is the
+/// agent's name or executable name (it only matters for gemini's `-y`).
+/// Every launch goes through this function; it refuses if a flag survives.
+pub(crate) fn strip_permission_bypass_flags(
+    args: &mut Vec<String>,
+    agent: &str,
+) -> Result<(), String> {
+    *args = without_permission_bypass(args, agent);
+    if without_permission_bypass(args, agent).len() != args.len() {
+        return Err("its permission-bypass flags could not be removed".to_string());
+    }
+    Ok(())
+}
+
 async fn resolve_agent_launch(
     backend: &SharedExecutionBackend,
     command: &str,
@@ -966,7 +1055,10 @@ impl CliAgentTool {
         }
     }
 
-    async fn build_finished_result(agent: &RunningCliAgent) -> String {
+    async fn build_finished_result(
+        backend: &SharedExecutionBackend,
+        agent: &RunningCliAgent,
+    ) -> String {
         let elapsed = agent.started_at.elapsed().as_secs();
         let stdout_output = agent.stdout_buf.lock().await.clone();
         let display_output = agent.display_buf.lock().await.clone();
@@ -980,7 +1072,7 @@ impl CliAgentTool {
 
         // Capture git diff for finished background tasks.
         let diff_section = if let Some(ref dir) = agent.working_dir {
-            Self::capture_git_diff(dir)
+            Self::capture_git_diff(backend, dir)
                 .await
                 .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
         } else {
@@ -1079,15 +1171,17 @@ impl CliAgentTool {
         compatible.into_iter().next()
     }
 
-    fn is_owner_role(user_role: Option<&str>) -> bool {
-        user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
+    fn is_owner_role(user_role: Option<UserRole>) -> bool {
+        user_role == Some(UserRole::Owner)
     }
 
     /// Normalize a working directory for lock/key comparisons.
     /// Uses canonical paths when possible so aliases like `/repo` and `/repo/`
     /// map to the same lock key.
-    async fn normalize_working_dir(dir: &str) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
+    async fn normalize_working_dir(
+        backend: &SharedExecutionBackend,
+        dir: &str,
+    ) -> anyhow::Result<String> {
         let resolved = backend.resolve_path(dir).await?;
         Ok(backend
             .canonicalize(&resolved)
@@ -1100,10 +1194,10 @@ impl CliAgentTool {
     /// working directory, a write target may not exist yet; canonicalization
     /// is therefore best-effort after backend policy resolution.
     async fn normalize_access_path(
+        backend: &SharedExecutionBackend,
         path: &str,
         working_dir: Option<&str>,
     ) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
         let path = path.trim();
         anyhow::ensure!(!path.is_empty(), "CLI access path cannot be empty");
         let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
@@ -1181,6 +1275,7 @@ impl CliAgentTool {
     }
 
     pub async fn discover(
+        backend: SharedExecutionBackend,
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
         llm_runtime: SharedLlmRuntime,
@@ -1226,7 +1321,6 @@ impl CliAgentTool {
         // Resolve launchers in parallel. This validates a nested executable in
         // `env ... agent` configurations instead of merely proving that
         // `/usr/bin/env` exists.
-        let backend = active_execution_backend();
         let resolution_futures: Vec<_> = candidates
             .iter()
             .map(|(_, command, args, _, _, _)| resolve_agent_launch(&backend, command, args))
@@ -1554,7 +1648,7 @@ impl CliAgentTool {
         };
 
         for (task_id, agent) in finished {
-            let final_result = Self::build_finished_result(&agent).await;
+            let final_result = Self::build_finished_result(&self.backend, &agent).await;
             let mut completed = self.completed.lock().await;
             completed.insert(
                 task_id.clone(),
@@ -1829,28 +1923,44 @@ impl CliAgentTool {
     }
 
     /// Capture git diff after CLI agent completes (for any exit code).
-    async fn capture_git_diff(working_dir: &str) -> Option<String> {
+    async fn capture_git_diff(
+        backend: &SharedExecutionBackend,
+        working_dir: &str,
+    ) -> Option<String> {
         let directory = BackendPath::new(working_dir);
-        let git_check =
-            crate::tools::fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&directory), 5)
-                .await
-                .ok()?;
+        let git_check = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
+            "git rev-parse --git-dir",
+            Some(&directory),
+            5,
+        )
+        .await
+        .ok()?;
         if git_check.exit_code != 0 {
             return None;
         }
 
         // Check for uncommitted changes first
-        let diff_stat =
-            crate::tools::fs_utils::run_cmd_backend("git diff --stat", Some(&directory), 10)
-                .await
-                .ok()?;
+        let diff_stat = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
+            "git diff --stat",
+            Some(&directory),
+            10,
+        )
+        .await
+        .ok()?;
         let stat_output = diff_stat.stdout;
 
         if !stat_output.trim().is_empty() {
             // There are uncommitted changes — capture them
-            let diff = crate::tools::fs_utils::run_cmd_backend("git diff", Some(&directory), 10)
-                .await
-                .ok()?;
+            let diff = crate::tools::fs_utils::run_cmd_backend(
+                backend.as_ref(),
+                "git diff",
+                Some(&directory),
+                10,
+            )
+            .await
+            .ok()?;
             let diff_text = diff.stdout;
             if !diff_text.trim().is_empty() {
                 return Some(truncate_with_note(&diff_text, MAX_DIFF_SIZE));
@@ -1859,6 +1969,7 @@ impl CliAgentTool {
 
         // No uncommitted changes — check if the agent committed something
         let log = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
             "git log -1 --stat --format=%s",
             Some(&directory),
             10,
@@ -1869,6 +1980,7 @@ impl CliAgentTool {
 
         if !log_output.trim().is_empty() {
             let committed_diff = crate::tools::fs_utils::run_cmd_backend(
+                backend.as_ref(),
                 "git diff HEAD~1..HEAD",
                 Some(&directory),
                 10,
@@ -1891,9 +2003,13 @@ impl CliAgentTool {
     /// Return the number of tracked or untracked entries in an existing Git
     /// worktree. A non-repository (or an unavailable backend) is not classified
     /// as dirty here; normal CLI-agent approval and execution policy still apply.
-    async fn dirty_worktree_entry_count(working_dir: &str) -> Option<usize> {
+    async fn dirty_worktree_entry_count(
+        backend: &SharedExecutionBackend,
+        working_dir: &str,
+    ) -> Option<usize> {
         let directory = BackendPath::new(working_dir);
         let status = crate::tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
             "git status --porcelain=v1 --untracked-files=all",
             Some(&directory),
             10,
@@ -2000,71 +2116,6 @@ impl CliAgentTool {
         }
     }
 
-    /// Try to answer a question from a CLI agent using the LLM.
-    /// Currently unused — stdin is null so we kill stuck processes instead.
-    /// Kept for future interactive feedback support.
-    #[allow(dead_code)]
-    async fn answer_cli_question(
-        provider: &Arc<dyn ModelProvider>,
-        task_context: &str,
-        recent_output: &str,
-        question: &str,
-    ) -> Option<String> {
-        // Don't answer auth prompts
-        let lower = question.to_lowercase();
-        if lower.contains("password")
-            || lower.contains("token")
-            || lower.contains("api key")
-            || lower.contains("secret")
-            || lower.contains("credentials")
-        {
-            return None; // Signal to kill the process
-        }
-
-        let prompt = format!(
-            "You are answering on behalf of the user. Based on the task context, \
-             answer this question from a CLI agent. Be concise (1-2 sentences max).\n\n\
-             Task context: {}\n\n\
-             Recent agent output:\n{}\n\n\
-             Question: {}",
-            truncate_str(task_context, 500),
-            truncate_str(recent_output, 500),
-            question
-        );
-
-        let messages = vec![json!({
-            "role": "user",
-            "content": prompt
-        })];
-
-        // Use a fast model for quick responses
-        let models = provider.list_models().await.unwrap_or_default();
-        let model = models.first().map(|m| m.as_str()).unwrap_or("default");
-
-        match provider.chat(model, &messages, &[]).await {
-            Ok(response) => {
-                let answer = response
-                    .content
-                    .as_ref()
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_else(|| "yes".to_string());
-                Some(answer)
-            }
-            Err(_) => {
-                // Fallback: for y/n questions answer "yes", otherwise return None
-                if lower.contains("y/n")
-                    || lower.contains("yes/no")
-                    || lower.contains("confirm")
-                    || lower.ends_with("?")
-                {
-                    Some("yes".to_string())
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
     /// Run a CLI agent with streaming output.
     #[allow(clippy::too_many_arguments)]
     async fn handle_run(
@@ -2159,8 +2210,22 @@ impl CliAgentTool {
             }
         }
 
+        let agent_kind = std::path::Path::new(&command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !is_env_launcher(name))
+            .unwrap_or(tool_name);
+        let agent_kind = if tool_name.eq_ignore_ascii_case("gemini") {
+            "gemini"
+        } else {
+            agent_kind
+        };
+        if strip_permission_bypass_flags(&mut args, agent_kind).is_err() {
+            return Ok("Blocked: CLI delegation was not started because its permission-bypass flags could not be removed.".to_string());
+        }
+
         let canonical_working_dir = match working_dir {
-            Some(dir) => Some(Self::normalize_working_dir(dir).await?),
+            Some(dir) => Some(Self::normalize_working_dir(&self.backend, dir).await?),
             None => None,
         };
         let mut canonical_read_paths = Vec::new();
@@ -2168,14 +2233,18 @@ impl CliAgentTool {
             canonical_read_paths.push(working_dir.clone());
         }
         for path in read_paths {
-            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            let path =
+                Self::normalize_access_path(&self.backend, path, canonical_working_dir.as_deref())
+                    .await?;
             if !canonical_read_paths.contains(&path) {
                 canonical_read_paths.push(path);
             }
         }
         let mut canonical_write_paths = Vec::new();
         for path in write_paths {
-            let path = Self::normalize_access_path(path, canonical_working_dir.as_deref()).await?;
+            let path =
+                Self::normalize_access_path(&self.backend, path, canonical_working_dir.as_deref())
+                    .await?;
             if !canonical_write_paths.contains(&path) {
                 canonical_write_paths.push(path);
             }
@@ -2202,7 +2271,8 @@ impl CliAgentTool {
         // pre-existing work to the child. Read-only runs never need a diff.
         let diff_capture_working_dir = if workspace_mode == CliWorkspaceMode::ReadWrite {
             if let Some(dir) = canonical_working_dir.as_deref() {
-                (Self::dirty_worktree_entry_count(dir).await == Some(0)).then(|| dir.to_string())
+                (Self::dirty_worktree_entry_count(&self.backend, dir).await == Some(0))
+                    .then(|| dir.to_string())
             } else {
                 None
             }
@@ -2482,6 +2552,7 @@ impl CliAgentTool {
         let task_id_for_notify = task_id.clone();
         let delegated_task_id_for_completion = delegated_task_id_owned.clone();
         let should_notify_for_task = Arc::clone(&should_notify);
+        let backend_for_completion = self.backend.clone();
         let slot_permit_for_task = slot_permit;
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;
@@ -2820,7 +2891,7 @@ impl CliAgentTool {
                     let status_word = if success { "completed" } else { "failed" };
                     let notification_summary: String = persisted_output.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
-                        CliAgentTool::capture_git_diff(dir)
+                        CliAgentTool::capture_git_diff(&backend_for_completion, dir)
                             .await
                             .map(|diff| format!("\n\n{}", diff))
                     } else {
@@ -3197,7 +3268,7 @@ impl CliAgentTool {
 
                 // Capture git diff
                 let diff_section = if let Some(ref dir) = working_dir_owned {
-                    Self::capture_git_diff(dir)
+                    Self::capture_git_diff(&self.backend, dir)
                         .await
                         .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
                 } else {
@@ -3460,7 +3531,7 @@ impl CliAgentTool {
         let is_running = !agent.finished.load(Ordering::Acquire);
 
         if !is_running {
-            Ok(Self::build_finished_result(agent).await)
+            Ok(Self::build_finished_result(&self.backend, agent).await)
         } else {
             Ok(format!(
                 "CLI agent '{}' still running ({}s elapsed, pid={}).\n\
@@ -3624,21 +3695,18 @@ struct CliAgentArgs {
     /// If true, start the task in background and return immediately with task_id
     #[serde(default)]
     async_mode: Option<bool>,
-    /// Injected by agent - session ID for cancel_all filtering
-    #[serde(default)]
-    _session_id: Option<String>,
-    /// Injected by agent - goal context for routing async/timeout notifications.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Injected by agent - current task context for delegated task recovery.
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Injected by agent for role-aware safeguards.
-    #[serde(default)]
-    _user_role: Option<String>,
-    /// Injected by the runtime for owner-authorized scheduled automation.
-    #[serde(default)]
-    _trusted_session: bool,
+    /// The dispatcher's facts ([`Self::bind_facts`]), never arguments: the
+    /// session for cancel_all filtering, the goal for routing async/timeout
+    /// notifications, the task for delegated task recovery, and the role
+    /// for role-aware safeguards.
+    #[serde(skip)]
+    call_session: Option<String>,
+    #[serde(skip)]
+    call_goal_id: Option<String>,
+    #[serde(skip)]
+    call_task_id: Option<String>,
+    #[serde(skip)]
+    call_role: Option<UserRole>,
 }
 
 fn non_empty_prompt_field(value: Option<&str>) -> Option<String> {
@@ -3666,6 +3734,14 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
 }
 
 impl CliAgentArgs {
+    /// Take the caller's session, goal, task and role from the dispatcher.
+    fn bind_facts(&mut self, facts: &ToolCallContext) {
+        self.call_session = Some(facts.session_id.clone());
+        self.call_goal_id = facts.goal_id.clone();
+        self.call_task_id = facts.task_id.clone();
+        self.call_role = facts.user_role;
+    }
+
     fn run_prompt(&self) -> Option<String> {
         if let Some(prompt) = non_empty_prompt_field(self.prompt.as_deref()) {
             return Some(prompt);
@@ -3698,14 +3774,14 @@ impl CliAgentArgs {
     }
 
     async fn contextual_run_prompt(&self, state: &Arc<dyn StateStore>) -> Option<String> {
-        let delegated_task = match self._task_id.as_deref() {
+        let delegated_task = match self.call_task_id.as_deref() {
             Some(task_id) if !task_id.trim().is_empty() => {
                 state.get_task(task_id).await.ok().flatten()
             }
             _ => None,
         };
         let delegated_goal_id = self
-            ._goal_id
+            .call_goal_id
             .clone()
             .or_else(|| delegated_task.as_ref().map(|task| task.goal_id.clone()));
         let delegated_goal = match delegated_goal_id.as_deref() {
@@ -4133,6 +4209,54 @@ impl Tool for CliAgentTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome_with_facts(arguments, status_tx, false, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
+            .await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_under_contract(
+            arguments,
+            status_tx,
+            false,
+            false,
+            &ToolCallContext::default(),
+        )
+        .await
+    }
+}
+
+impl crate::traits::ToolSemantics for CliAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            ..Default::default()
+        }
+    }
+
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
             return Ok(());
@@ -4168,6 +4292,11 @@ impl Tool for CliAgentTool {
         }
     }
 
+    /// A delegated agent may do anything its own tools allow.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
     fn receipt_kind(&self, arguments: &str) -> crate::traits::ToolReceiptKind {
         let action = serde_json::from_str::<Value>(arguments)
             .ok()
@@ -4187,11 +4316,6 @@ impl Tool for CliAgentTool {
 
     fn is_available(&self) -> bool {
         self.has_tools()
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender
-        self.call_with_status(arguments, None).await
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
@@ -4306,57 +4430,6 @@ impl Tool for CliAgentTool {
             adapter_read_targets: Vec::new(),
         }
     }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && parsed
-                .as_ref()
-                .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly);
-        let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, false)
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
-        let action = parsed
-            .as_ref()
-            .and_then(|args| args.action.clone())
-            .unwrap_or_else(|| "run".to_string());
-        let read_only_run = action == "run"
-            && (exec_ctx.mutation_forbidden
-                || parsed
-                    .as_ref()
-                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let output = self
-            .call_with_status_under_contract(arguments, status_tx, read_only_run, true)
-            .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
-    }
-
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_under_contract(arguments, status_tx, false, false)
-            .await
-    }
 }
 
 fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolCallOutcome {
@@ -4407,18 +4480,64 @@ fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolC
             ..ToolCallMetadata::default()
         }
     };
-    ToolCallOutcome { output, metadata }
+    // A run the agent moved to background tracking hands the turn off to it.
+    let handed_off = metadata.background_started;
+    let outcome = ToolCallOutcome {
+        output,
+        metadata,
+        finish: None,
+    };
+    if handed_off {
+        outcome.handed_to_background()
+    } else {
+        outcome
+    }
 }
 
 impl CliAgentTool {
+    /// One call's typed outcome with the dispatcher's `facts`. Only the
+    /// dispatcher's path enforces the native access contract.
+    async fn outcome_with_facts(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        enforce_native_access: bool,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
+            .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && (facts.mutation_forbidden
+                || parsed
+                    .as_ref()
+                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
+        let output = self
+            .call_with_status_under_contract(
+                arguments,
+                status_tx,
+                read_only_run,
+                enforce_native_access,
+                facts,
+            )
+            .await?;
+        Ok(cli_agent_outcome(&action, output, read_only_run))
+    }
+
     async fn call_with_status_under_contract(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         read_only_run: bool,
         enforce_native_access: bool,
+        // The dispatcher's typed facts; never the arguments.
+        facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
-        let args: CliAgentArgs = serde_json::from_str(arguments)?;
+        let mut args: CliAgentArgs = serde_json::from_str(arguments)?;
+        args.bind_facts(facts);
+        let trusted_session = facts.trusted_session;
 
         // Reap any finished tasks
         self.reap_finished().await;
@@ -4429,8 +4548,8 @@ impl CliAgentTool {
         // If this CLI agent is running in the context of an orchestration goal,
         // route background notifications and cancel_all scoping to the *origin*
         // session_id (goal.session_id), which is routable via the ChannelHub.
-        let mut session_id = args._session_id.clone().unwrap_or_default();
-        if let Some(ref goal_id) = args._goal_id {
+        let mut session_id = args.call_session.clone().unwrap_or_default();
+        if let Some(ref goal_id) = args.call_goal_id {
             if let Ok(Some(goal)) = self.state.get_goal(goal_id).await {
                 if !goal.session_id.trim().is_empty() {
                     session_id = goal.session_id;
@@ -4466,16 +4585,16 @@ impl CliAgentTool {
                     prompt
                 } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
                     warn!(
-                        task_id = ?args._task_id,
-                        goal_id = ?args._goal_id,
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
                         working_dir = ?args.working_dir,
                         "cli_agent run omitted prompt; synthesized delegated prompt from stored task/goal context"
                     );
                     prompt
                 } else {
                     warn!(
-                        task_id = ?args._task_id,
-                        goal_id = ?args._goal_id,
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
                         has_prompt = args.prompt.as_ref().is_some_and(|s| !s.trim().is_empty()),
                         has_mission = args.mission.as_ref().is_some_and(|s| !s.trim().is_empty()),
                         has_task = args.task.as_ref().is_some_and(|s| !s.trim().is_empty()),
@@ -4494,16 +4613,17 @@ impl CliAgentTool {
                 // prompt wording cannot narrow its effects. Require a concrete
                 // clean repository for every unattended run rather than trying
                 // to recognize deployment verbs or negations in prose.
-                if args._trusted_session {
+                if trusted_session {
                     let Some(working_dir) = args.working_dir.as_deref() else {
                         return Ok(
                             "Blocked: unattended CLI delegation requires an explicit working_dir so repository cleanliness can be verified."
                                 .to_string(),
                         );
                     };
-                    if let Some(entry_count) = Self::dirty_worktree_entry_count(working_dir)
-                        .await
-                        .filter(|count| *count > 0)
+                    if let Some(entry_count) =
+                        Self::dirty_worktree_entry_count(&self.backend, working_dir)
+                            .await
+                            .filter(|count| *count > 0)
                     {
                         return Ok(format!(
                             "Blocked: unattended CLI delegation found {entry_count} pre-existing changed or untracked worktree entries. Use a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not exposed to opaque delegated mutation."
@@ -4520,7 +4640,7 @@ impl CliAgentTool {
                     }
                 }
                 if !daemon_hits.is_empty() {
-                    if !Self::is_owner_role(args._user_role.as_deref()) {
+                    if !Self::is_owner_role(args.call_role) {
                         return Ok(format!(
                             "Blocked: daemonization primitives detected in cli_agent prompt ({}) and only owners can approve detached/background execution.",
                             daemon_hits.join(", ")
@@ -4560,7 +4680,7 @@ impl CliAgentTool {
                 // Goal-scoped cli_agent runs should not detach immediately:
                 // the goal/task lead is already running in the background, and
                 // returning early makes results easy to drop.
-                let async_mode = if args._goal_id.is_some() {
+                let async_mode = if args.call_goal_id.is_some() {
                     false
                 } else {
                     args.async_mode.unwrap_or(false)
@@ -4574,8 +4694,8 @@ impl CliAgentTool {
                             &prompt,
                             args.working_dir.as_deref(),
                             &session_id,
-                            args._goal_id.as_deref(),
-                            args._task_id.as_deref(),
+                            args.call_goal_id.as_deref(),
+                            args.call_task_id.as_deref(),
                             args.system_instruction.as_deref(),
                             if read_only_run {
                                 CliWorkspaceMode::ReadOnly
@@ -4606,7 +4726,7 @@ impl CliAgentTool {
                                 for (name, detail) in &unavailable {
                                     message.push_str(&format!("\n- {name}: {detail}"));
                                 }
-                                if let Some(task_id) = args._task_id.as_deref() {
+                                if let Some(task_id) = args.call_task_id.as_deref() {
                                     self.persist_delegated_cli_result(
                                         task_id,
                                         None,
@@ -4652,6 +4772,19 @@ impl CliAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
+
+    /// The bypass flags in the defaults are stripped at launch, so the
+    /// model-facing descriptions must not promise an auto-approve mode.
+    #[test]
+    fn default_descriptions_do_not_claim_auto_approve() {
+        for (name, _, _, description) in default_tool_definitions() {
+            assert!(
+                !description.to_ascii_lowercase().contains("auto-approve"),
+                "{name}: {description}"
+            );
+        }
+    }
     use crate::config::CliAgentsConfig;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
@@ -4691,6 +4824,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--add-dir"));
         assert!(!args.iter().any(|arg| arg == "/synthetic/extra"));
         assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--sandbox", "read-only"]));
@@ -4727,6 +4861,12 @@ mod tests {
             "permissions.aidaemon-task.filesystem={\":minimal\"=\"read\",\"/synthetic/source/Cargo.toml\"=\"read\",\"/tmp/synthetic-result\"=\"write\"}"
         ));
         assert!(joined.contains("permissions.aidaemon-task.network.enabled=false"));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--skip-git-repo-check")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4734,6 +4874,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let expected = cwd.path().join("output.txt");
         let normalized = CliAgentTool::normalize_access_path(
+            &crate::execution::active_execution_backend(),
             "output.txt",
             Some(cwd.path().to_string_lossy().as_ref()),
         )
@@ -4921,7 +5062,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -4929,7 +5070,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -4979,7 +5120,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -4987,7 +5128,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -5008,6 +5149,164 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic run tests
     // -----------------------------------------------------------------------
+
+    const BYPASS_FLAGS: [&str; 4] = [
+        "--dangerously-skip-permissions",
+        "--yolo",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--allow-all-tools",
+    ];
+
+    async fn echo_tool_with_flags() -> (CliAgentTool, tempfile::NamedTempFile) {
+        let (tool, db) = setup_echo_tool().await;
+        let mut args: Vec<String> = BYPASS_FLAGS.iter().map(|f| f.to_string()).collect();
+        args.push("--keep-synthetic-flag".to_string());
+        tool.tools.write().unwrap().get_mut("echo").unwrap().args = args;
+        (tool, db)
+    }
+
+    #[tokio::test]
+    async fn cli_agent_args_never_contain_bypass_flags() {
+        // Direct call path.
+        let (tool, _db) = echo_tool_with_flags().await;
+        let out = tool
+            .call(r#"{"action":"run","tool":"echo","prompt":"hello"}"#)
+            .await
+            .unwrap();
+        for flag in BYPASS_FLAGS {
+            assert!(!out.contains(flag), "direct path leaked {flag}: {out}");
+        }
+        assert!(out.contains("--keep-synthetic-flag"), "got: {out}");
+    }
+
+    /// Execution-context path: a fake `codex` (the one agent with a native
+    /// sandbox adapter) records the argv it was really launched with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_agent_context_launch_never_passes_bypass_flags() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tool, _db) = setup_echo_tool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let argv_file = dir.path().join("argv.txt");
+        let script = dir.path().join("codex");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args: Vec<String> = ["exec", "--yolo", "--dangerously-skip-permissions"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        args.extend(["--allow-all-tools", "--keep-synthetic-flag"].map(String::from));
+        tool.tools.write().unwrap().insert(
+            "codex".to_string(),
+            CliToolEntry {
+                command: script.to_string_lossy().to_string(),
+                args,
+                description: "fake codex".to_string(),
+                timeout: Duration::from_secs(10),
+                max_output_chars: 10000,
+                is_dynamic: false,
+            },
+        );
+        tool.tool_names.write().unwrap().push("codex".to_string());
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","tool":"codex","prompt":"hello","workspace_mode":"read_only"}"#,
+                None,
+                ToolCallContext::default(),
+            )
+            .await
+            .unwrap();
+        let argv = std::fs::read_to_string(&argv_file)
+            .unwrap_or_else(|_| panic!("agent was not launched: {}", outcome.output));
+        for flag in [
+            "--yolo",
+            "--dangerously-skip-permissions",
+            "--allow-all-tools",
+        ] {
+            assert!(
+                !argv.lines().any(|l| l == flag),
+                "launched with {flag}: {argv}"
+            );
+        }
+        assert!(argv.lines().any(|l| l == "--keep-synthetic-flag"), "{argv}");
+    }
+
+    fn strip(agent: &str, args: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        strip_permission_bypass_flags(&mut args, agent).unwrap();
+        args
+    }
+
+    #[test]
+    fn bypass_flag_stripping_keeps_other_flags() {
+        assert_eq!(
+            strip(
+                "claude",
+                &[
+                    "-p",
+                    "--yolo",
+                    "--model",
+                    "synthetic",
+                    "--allow-all-tools=1"
+                ]
+            ),
+            ["-p", "--model", "synthetic"]
+        );
+    }
+
+    #[test]
+    fn every_known_bypass_flag_is_stripped() {
+        for flag in [
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--dangerously-bypass-hook-trust",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--full-auto",
+            "--yolo",
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--yes",
+            "--yes-always",
+        ] {
+            assert_eq!(strip("any", &["a", flag, "b"]), ["a", "b"], "{flag}");
+            let valued = format!("{flag}=1");
+            assert_eq!(strip("any", &["a", &valued, "b"]), ["a", "b"], "{valued}");
+        }
+        assert_eq!(strip("gemini", &["--sandbox=false", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--sandbox", "false", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--approval-mode", "yolo", "x"]), ["x"]);
+        assert_eq!(strip("gemini", &["--approval-mode=yolo", "x"]), ["x"]);
+        assert_eq!(
+            strip("claude", &["--permission-mode", "bypassPermissions", "x"]),
+            ["x"]
+        );
+        // Non-bypass values of the same options survive.
+        assert_eq!(
+            strip(
+                "gemini",
+                &["--approval-mode", "default", "--sandbox", "true"]
+            ),
+            ["--approval-mode", "default", "--sandbox", "true"]
+        );
+        assert_eq!(
+            strip("claude", &["--permission-mode", "plan"]),
+            ["--permission-mode", "plan"]
+        );
+    }
+
+    #[test]
+    fn short_y_is_stripped_only_for_gemini() {
+        assert_eq!(strip("gemini", &["-y", "x"]), ["x"]);
+        assert_eq!(strip("aider", &["-y", "x"]), ["-y", "x"]);
+        assert_eq!(strip("claude", &["-y"]), ["-y"]);
+    }
 
     #[tokio::test]
     async fn test_run_echo_returns_output() {
@@ -5041,8 +5340,16 @@ mod tests {
     async fn test_run_daemonization_prompt_blocked_for_non_owner() {
         let (tool, _db) = setup_echo_tool().await;
         let result = tool
-            .call(
-                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &","_session_id":"sess1","_user_role":"Guest"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#,
+                None,
+                false,
+                false,
+                &crate::traits::ToolCallContext {
+                    session_id: "sess1".into(),
+                    user_role: Some(crate::types::UserRole::Guest),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -5411,7 +5718,12 @@ mod tests {
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
-        let normalized = CliAgentTool::normalize_working_dir(dir_path).await.unwrap();
+        let normalized = CliAgentTool::normalize_working_dir(
+            &crate::execution::active_execution_backend(),
+            dir_path,
+        )
+        .await
+        .unwrap();
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"echo blocked","working_dir":"{}"}}"#,
             dir_path
@@ -5440,7 +5752,12 @@ mod tests {
         let tool = Arc::new(tool);
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir = tmp_dir.path().to_string_lossy().to_string();
-        let normalized = CliAgentTool::normalize_working_dir(&dir).await.unwrap();
+        let normalized = CliAgentTool::normalize_working_dir(
+            &crate::execution::active_execution_backend(),
+            &dir,
+        )
+        .await
+        .unwrap();
 
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 15","working_dir":"{}"}}"#,
@@ -5691,10 +6008,20 @@ mod tests {
         tool.state.create_task(&task).await.unwrap();
 
         let result = tool
-            .call(&format!(
-                r#"{{"action":"run","tool":"echo","working_dir":"{}","_goal_id":"{}","_task_id":"{}"}}"#,
-                working_dir, goal.id, task.id
-            ))
+            .call_with_status_under_contract(
+                &format!(
+                    r#"{{"action":"run","tool":"echo","working_dir":"{}"}}"#,
+                    working_dir
+                ),
+                None,
+                false,
+                false,
+                &ToolCallContext {
+                    goal_id: Some(goal.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -6224,10 +6551,11 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
+            crate::execution::active_execution_backend(),
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6278,10 +6606,11 @@ mod tests {
         };
 
         let tool = CliAgentTool::discover(
+            crate::execution::active_execution_backend(),
             config,
             state as Arc<dyn StateStore>,
             SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6329,7 +6658,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6337,7 +6666,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6353,9 +6682,15 @@ mod tests {
         };
 
         // Run a command
-        tool.call(r#"{"action":"run","tool":"echo","prompt":"log test","_session_id":"sess1"}"#)
-            .await
-            .unwrap();
+        tool.call_with_status_under_contract(
+            r#"{"action":"run","tool":"echo","prompt":"log test"}"#,
+            None,
+            false,
+            false,
+            &crate::testing::call_facts("sess1"),
+        )
+        .await
+        .unwrap();
 
         // Check invocations were logged
         let invocations = state_clone.get_cli_agent_invocations(10).await.unwrap();
@@ -6402,7 +6737,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6410,7 +6745,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6428,8 +6763,12 @@ mod tests {
         // Run a command that will exceed the short timeout and be moved to background,
         // but should still eventually be logged as completed in the DB.
         let resp = tool
-            .call(
-                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo done","_session_id":"sess1"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo done"}"#,
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -6495,10 +6834,11 @@ mod tests {
         tool.state.create_task(&task).await.unwrap();
 
         let resp = tool
-            .call(&format!(
-                r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok","_session_id":"sess-bg","_goal_id":"{}","_task_id":"{}"}}"#,
-                goal.id, task.id
-            ))
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok"}"#, None, false, false, &ToolCallContext {
+                    goal_id: Some(goal.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    ..crate::testing::call_facts("sess-bg")
+                })
             .await
             .unwrap();
         assert!(
@@ -6569,7 +6909,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -6577,7 +6917,7 @@ mod tests {
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
-                provider as Arc<dyn crate::traits::ModelProvider>,
+                provider as crate::llm_runtime::ModelBackend,
                 None,
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
@@ -6593,8 +6933,12 @@ mod tests {
         };
 
         let resp = tool
-            .call(
-                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo cli-reap-ok","_session_id":"sess1"}"#,
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo cli-reap-ok"}"#,
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("sess1"),
             )
             .await
             .unwrap();
@@ -6604,10 +6948,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","task_id":"{}","_session_id":"sess1"}}"#,
-                task_id
-            ))
+            .call_with_status_under_contract(
+                &format!(r#"{{"action":"check","task_id":"{}"}}"#, task_id),
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("sess1"),
+            )
             .await
             .unwrap();
         assert!(check.contains("cli-reap-ok"));
@@ -6618,18 +6965,20 @@ mod tests {
     async fn check_with_wrong_id_recovers_only_session_task() {
         let (tool, _db) = setup_bash_tool().await;
         let started = tool
-            .call(
-                r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true,"_session_id":"session-recover"}"#,
-            )
+            .call_with_status_under_contract(r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true}"#, None, false, false, &crate::testing::call_facts("session-recover"))
             .await
             .unwrap();
         let real_task_id = extract_task_id_from_background_message(&started);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let recovered = tool
-            .call(&format!(
-                r#"{{"action":"check","task_id":"provider-thread-uuid","_session_id":"session-recover"}}"#
-            ))
+            .call_with_status_under_contract(
+                r#"{"action":"check","task_id":"provider-thread-uuid"}"#,
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("session-recover"),
+            )
             .await
             .unwrap();
 
@@ -6642,9 +6991,11 @@ mod tests {
     async fn missing_check_is_a_typed_negative_result() {
         let (tool, _db) = setup_echo_tool().await;
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"check","task_id":"missing","_session_id":"empty-session"}"#,
+            .outcome_with_facts(
+                r#"{"action":"check","task_id":"missing"}"#,
                 None,
+                false,
+                &crate::testing::call_facts("empty-session"),
             )
             .await
             .unwrap();
@@ -6662,9 +7013,11 @@ mod tests {
     async fn async_run_reports_background_metadata_and_notifications() {
         let (tool, _db) = setup_bash_tool().await;
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true,"_session_id":"session-background"}"#,
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true}"#,
                 None,
+                false,
+                &crate::testing::call_facts("session-background"),
             )
             .await
             .unwrap();
@@ -6683,8 +7036,12 @@ mod tests {
     async fn async_run_queues_chat_visible_progress_while_still_running() {
         let (tool, _db) = setup_bash_tool().await;
         let state = tool.state.clone();
-        tool.call(
-            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true,"_session_id":"session-progress"}"#,
+        tool.call_with_status_under_contract(
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true}"#,
+            None,
+            false,
+            false,
+            &crate::testing::call_facts("session-progress"),
         )
         .await
         .unwrap();
@@ -6710,7 +7067,11 @@ mod tests {
     #[tokio::test]
     async fn test_capture_git_diff_no_repo() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let result = CliAgentTool::capture_git_diff(tmp.path().to_str().unwrap()).await;
+        let result = CliAgentTool::capture_git_diff(
+            &crate::execution::active_execution_backend(),
+            tmp.path().to_str().unwrap(),
+        )
+        .await;
         assert!(result.is_none(), "Non-git directory should return None");
     }
 
@@ -6722,18 +7083,50 @@ mod tests {
             "Build locally but do not deploy",
             "Inspect the code and return a report",
         ] {
-            let args = serde_json::json!({
+            let args = json!({
                 "action": "run",
                 "tool": "echo",
                 "prompt": prompt,
-                "_trusted_session": true
             });
-            let result = tool.call(&args.to_string()).await.unwrap();
+            // A trusted session, as the dispatcher's typed context says
+            // (`ToolCallContext::trusted_session`).
+            let result = tool
+                .call_with_status_under_contract(
+                    &args.to_string(),
+                    None,
+                    false,
+                    false,
+                    &ToolCallContext {
+                        trusted_session: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(
                 result.contains("requires an explicit working_dir"),
                 "prompt wording must not narrow an opaque unattended delegation: {result}"
             );
         }
+    }
+
+    /// Trust comes only from the dispatcher's typed context: a
+    /// `_trusted_session` argument makes the run neither trusted nor
+    /// unattended.
+    #[tokio::test]
+    async fn trusted_session_argument_bypasses_nothing() {
+        let (tool, _db) = setup_echo_tool().await;
+        let args = json!({
+            "action": "run",
+            "tool": "echo",
+            "prompt": "Inspect the code and return a report",
+            "_trusted_session": true
+        });
+        let result = tool.call(&args.to_string()).await.unwrap();
+        assert!(
+            !result.contains("unattended CLI delegation"),
+            "an argument is not the dispatcher's trust: {result}"
+        );
     }
 
     #[tokio::test]
@@ -6779,9 +7172,18 @@ mod tests {
         // Modify the file (uncommitted change)
         std::fs::write(tmp.path().join("file.txt"), "modified content").unwrap();
 
-        assert_eq!(CliAgentTool::dirty_worktree_entry_count(dir).await, Some(1));
+        assert_eq!(
+            CliAgentTool::dirty_worktree_entry_count(
+                &crate::execution::active_execution_backend(),
+                dir
+            )
+            .await,
+            Some(1)
+        );
 
-        let result = CliAgentTool::capture_git_diff(dir).await;
+        let result =
+            CliAgentTool::capture_git_diff(&crate::execution::active_execution_backend(), dir)
+                .await;
         assert!(result.is_some(), "Should capture uncommitted changes");
         let diff = result.unwrap();
         assert!(
@@ -6810,12 +7212,12 @@ mod tests {
     async fn test_has_tools() {
         let (tool, _db) = setup_echo_tool().await;
         assert!(tool.has_tools());
-        assert!(Tool::is_available(&tool));
+        assert!(ToolSemantics::is_available(&tool));
 
         // Clear all tools
         tool.tools.write().unwrap().clear();
         assert!(!tool.has_tools());
-        assert!(!Tool::is_available(&tool));
+        assert!(!ToolSemantics::is_available(&tool));
     }
 
     #[tokio::test]
@@ -6913,13 +7315,21 @@ mod tests {
         let user_prompt = "I need to create a new website about cars. We should push it to cars.example.com. make it modern.";
 
         let start = Instant::now();
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": format!("echo 'Received prompt: {}'; echo 'Task complete'", user_prompt),
-            "_session_id": "telegram_12345"
         });
-        let result = tool.call(&args.to_string()).await.unwrap();
+        let result = tool
+            .call_with_status_under_contract(
+                &args.to_string(),
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("telegram_12345"),
+            )
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -6941,14 +7351,22 @@ mod tests {
         let (tool, _db) = setup_bash_tool().await;
 
         let start = Instant::now();
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "echo 'Building website...'; echo 'Created index.html'; echo 'Done'",
             "system_instruction": "You are a senior web developer. Create a modern, responsive website.",
-            "_session_id": "telegram_12345"
         });
-        let result = tool.call(&args.to_string()).await.unwrap();
+        let result = tool
+            .call_with_status_under_contract(
+                &args.to_string(),
+                None,
+                false,
+                false,
+                &crate::testing::call_facts("telegram_12345"),
+            )
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -6975,7 +7393,7 @@ echo '{"type":"tool_result","content":"Directory created"}'
 echo '{"type":"result","result":"Website created successfully with index.html, style.css, and script.js"}'
 "#;
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": stream_json.trim()
@@ -7017,7 +7435,7 @@ echo '{"type":"result","result":"Website created successfully with index.html, s
     async fn test_stderr_captured_in_error_output() {
         let (tool, _db) = setup_bash_tool().await;
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "echo 'some stdout'; echo 'error detail 1' >&2; echo 'error detail 2' >&2; exit 1"
@@ -7042,7 +7460,7 @@ echo '{"type":"result","result":"Website created successfully with index.html, s
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
 
-        let args = serde_json::json!({
+        let args = json!({
             "action": "run",
             "tool": "bash-agent",
             "prompt": "pwd",

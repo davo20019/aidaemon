@@ -8,6 +8,16 @@ use serde_json::Value;
 
 use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
 
+/// The mandate protocol's own control tools. Their receipts record
+/// bookkeeping, never an observation of the world, so they are never cited as
+/// decision or measurement evidence.
+pub const MANDATE_PROTOCOL_TOOLS: &[&str] = &[
+    "manage_mandates",
+    "manage_goal_tasks",
+    "track_requirements",
+    "report_blocker",
+];
+
 pub(crate) fn is_non_delegable_tool(tool_name: &str) -> bool {
     tool_name.starts_with("mcp__") || MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
 }
@@ -211,10 +221,76 @@ pub(crate) fn role_allows_mandate_call(
         || (class == MandateCallClass::ActControl && tool_name == "report_blocker")
 }
 
+/// The next step a refused mandate call can actually take, by typed denial
+/// reason and role. One generic hint told an executor to record an ACT it
+/// cannot record, and told a run whose fence was gone to keep trying.
+pub(crate) fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'static str {
+    match reason {
+        "mandate_record_missing"
+        | "mandate_inactive"
+        | "mandate_expired"
+        | "mandate_execution_fence_lost"
+        | "mandate_run_missing"
+        | "invalid_mandate_run"
+        | "mandate_role_fence_missing"
+        | "mandate_worker_identity_mismatch"
+        | "mandate_version_mismatch"
+        | "invalid_mandate"
+        | "invalid_authority" => {
+            "This run can no longer act under the mandate and no retry will change that; \
+             stop calling tools and end with a short summary of what was done."
+        }
+        "mandate_task_lead_mutation_forbidden" => {
+            "A task lead never mutates: after a current ACT, create and claim the child task \
+             with manage_goal_tasks and spawn its executor with spawn_agent."
+        }
+        _ if !is_task_lead => {
+            "An executor only performs its granted mutation; it cannot observe or decide. \
+             Perform the mutation the task describes, or call report_blocker naming what is missing."
+        }
+        "act_decision_required" | "current_act_decision_required" | "decision_cycle_not_act" => {
+            "Record a current ACT with manage_mandates record_decision before orchestrating, \
+             or record WAIT or ASK instead."
+        }
+        "cycle_budget_exhausted" | "invalid_cycle_budget" => {
+            "No mutation budget remains in this cycle; record WAIT with manage_mandates."
+        }
+        "mandate_role_forbidden" => {
+            "This call is outside the task-lead protocol: observe, record the decision with \
+             manage_mandates, or orchestrate the ACT's child task."
+        }
+        _ => {
+            "Choose a call inside the mandate's confirmed scopes, or record WAIT or ASK \
+             with manage_mandates."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::traits::ToolMutationEffects;
+
+    #[test]
+    fn mandate_denial_next_step_offers_only_what_the_role_can_do() {
+        let executor = mandate_denial_next_step("current_act_decision_required", false);
+        assert!(executor.contains("report_blocker"), "{executor}");
+        assert!(!executor.contains("record_decision"), "{executor}");
+
+        let lead = mandate_denial_next_step("current_act_decision_required", true);
+        assert!(lead.contains("record_decision"), "{lead}");
+        assert!(!lead.contains("report_blocker"), "{lead}");
+
+        let lead_mutation = mandate_denial_next_step("mandate_task_lead_mutation_forbidden", true);
+        assert!(lead_mutation.contains("spawn_agent"), "{lead_mutation}");
+
+        for terminal in ["mandate_execution_fence_lost", "mandate_inactive"] {
+            for is_task_lead in [true, false] {
+                let step = mandate_denial_next_step(terminal, is_task_lead);
+                assert!(step.contains("no retry"), "{terminal}: {step}");
+            }
+        }
+    }
 
     #[test]
     fn owner_guidance_extraction_ignores_unrelated_controller_context() {

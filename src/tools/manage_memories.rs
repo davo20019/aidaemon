@@ -9,10 +9,10 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     semantics_for_exact_read_actions, StateStore, Tool, ToolArgumentContractViolation,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolOutcomeStatus,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolOutcomeStatus,
 };
-use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy};
+use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy, UserRole};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
 /// boundary. Structured fact keys carry their words behind `_`, `-`, `:` and
@@ -343,26 +343,18 @@ struct ManageArgs {
     goal_id: Option<String>,
     schedule_id: Option<String>,
     schedule: Option<String>,
+    /// A plain reminder's message: delivered as-is when the schedule fires.
+    reminder: Option<String>,
     schedules: Option<Vec<String>>,
     fire_policy: Option<String>,
     is_one_shot: Option<bool>,
     is_paused: Option<bool>,
-    #[serde(default)]
-    _session_id: Option<String>,
-    #[serde(default)]
-    _user_role: Option<String>,
-    #[serde(default)]
-    _channel_visibility: Option<String>,
-    #[serde(default)]
-    _channel_id: Option<String>,
-    #[serde(default)]
-    _trusted_session: bool,
 }
 
 fn manage_memories_schema() -> Value {
     json!({
         "name": "manage_memories",
-        "description": "Memories and goals. search=facts; search_episodes=past conversations. Store via remember_fact.",
+        "description": "Memories/goals. search=facts; search_episodes=past chats. Store via remember_fact.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -380,6 +372,7 @@ fn manage_memories_schema() -> Value {
                 "goal_id": { "type": "string" },
                 "schedule_id": { "type": "string" },
                 "schedule": { "type": "string" },
+                "reminder": { "type": "string" },
                 "schedules": { "type": "array", "items": { "type": "string" } },
                 "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] },
                 "is_one_shot": { "type": "boolean" },
@@ -389,6 +382,28 @@ fn manage_memories_schema() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+/// Typed effects for memory-store mutations. Memory is persistent agent
+/// state, so writes are `configuration` and a forget is also `destructive`;
+/// an untyped receipt could never close a checklist step the model declared
+/// with either label. Scheduled-goal actions keep their existing typing.
+fn memory_action_effects(arguments: &str) -> ToolMutationEffects {
+    let action = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    match action.as_deref() {
+        Some("forget") => {
+            ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::DESTRUCTIVE)
+        }
+        Some("set_privacy") => ToolMutationEffects::CONFIGURATION,
+        _ => ToolMutationEffects::NONE,
+    }
 }
 
 fn canonical_personal_display_key(key: &str) -> String {
@@ -413,6 +428,36 @@ impl Tool for ManageMemoriesTool {
 
     fn schema(&self) -> Value {
         manage_memories_schema()
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        exec_ctx: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome(arguments, &exec_ctx).await
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageMemoriesTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
     }
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
@@ -460,12 +505,61 @@ impl Tool for ManageMemoriesTool {
                 "list_scheduled_matching",
                 "diagnose_scheduled",
             ],
-            ToolMutationEffects::NONE,
+            memory_action_effects(arguments),
         )
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// Reads, `repair` and `forget` touch only the agent's own memory store.
+    /// `set_privacy` widens who may see a fact, and the goal and schedule
+    /// actions start or schedule work, so those stay undeclared.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        match action_of(arguments).as_deref() {
+            Some(
+                "list"
+                | "health"
+                | "search"
+                | "search_episodes"
+                | "list_goals"
+                | "list_scheduled"
+                | "list_scheduled_matching"
+                | "diagnose_scheduled"
+                | "repair"
+                | "forget",
+            ) => aidaemon_core::CallEffects::none(),
+            _ => aidaemon_core::CallEffects::unknown(),
+        }
+    }
+}
+
+/// The `action` argument, if any.
+fn action_of(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_string)
+}
+
+impl ManageMemoriesTool {
+    /// Run one call with the dispatcher's `facts` (session, role, channel,
+    /// trust), never facts from the arguments.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: ManageArgs = serde_json::from_str(arguments)?;
+        let trusted_session = facts.trusted_session;
 
         match args.action.as_str() {
             "health" => {
@@ -547,7 +641,7 @@ impl Tool for ManageMemoriesTool {
                 let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
 
                 // Reject empty / whitespace-only / too-short keys. A blank key would
-                // make substring matching ("fk.contains(&key_lower)") true for every
+                // make partial key matching true for every
                 // fact, wiping the store. A single character is also too broad to be
                 // a safe substring match across all facts.
                 let key = key_raw.trim();
@@ -578,21 +672,27 @@ impl Tool for ManageMemoriesTool {
                 };
 
                 let key_canonical = canon(key);
-                let key_lower = key.to_lowercase();
 
-                // Within the explicitly-requested category, allow fuzzy matching
-                // (exact, canonical, substring) — the caller is targeting a known
-                // category so substring is acceptable.
-                let matches_key_in_category = |f: &crate::traits::Fact| -> bool {
-                    if f.superseded_at.is_some() {
+                // Within the explicitly-requested category an exact or canonical
+                // key match is authoritative. Only when none exists may a partial
+                // key select facts, and then only as whole `_`-separated key
+                // segments ("color" -> "favorite_color"). A fact key contained
+                // in the requested key is never a match: forgetting
+                // `qa_pet_name` used to also delete the owner's `name` fact.
+                let exact_in_category = |f: &crate::traits::Fact| -> bool {
+                    f.superseded_at.is_none()
+                        && (f.key == key || canon(&f.key) == key_canonical)
+                };
+                let key_segments: Vec<&str> = key_canonical.split('_').collect();
+                let partial_in_category = |f: &crate::traits::Fact| -> bool {
+                    if f.superseded_at.is_some() || key_canonical.is_empty() {
                         return false;
                     }
-                    let fk = f.key.to_lowercase();
                     let fk_canon = canon(&f.key);
-                    f.key == key
-                        || fk_canon == key_canonical
-                        || fk.contains(&key_lower)
-                        || key_lower.contains(&fk)
+                    let fact_segments: Vec<&str> = fk_canon.split('_').collect();
+                    fact_segments
+                        .windows(key_segments.len())
+                        .any(|window| window == key_segments.as_slice())
                 };
 
                 // Across OTHER categories (the "duplicate sweep") only accept exact
@@ -609,8 +709,14 @@ impl Tool for ManageMemoriesTool {
                 let mut seen_ids = std::collections::HashSet::new();
 
                 let facts = self.state.get_facts(Some(category)).await?;
+                let has_exact = facts.iter().any(&exact_in_category);
                 for f in &facts {
-                    if matches_key_in_category(f) && seen_ids.insert(f.id) {
+                    let selected = if has_exact {
+                        exact_in_category(f)
+                    } else {
+                        partial_in_category(f)
+                    };
+                    if selected && seen_ids.insert(f.id) {
                         to_delete.push((f.id, f.category.clone(), f.key.clone()));
                     }
                 }
@@ -852,9 +958,9 @@ impl Tool for ManageMemoriesTool {
                 // channel/session scoping for non-private origins.
                 let query = args.query.as_deref().unwrap_or("").trim();
                 let limit = args.limit.unwrap_or(8).clamp(1, 50);
-                let visibility = ChannelVisibility::from_str_lossy(
-                    args._channel_visibility.as_deref().unwrap_or("internal"),
-                );
+                let visibility = facts
+                    .channel_visibility
+                    .unwrap_or(ChannelVisibility::Internal);
                 let episodes = match visibility {
                     ChannelVisibility::Private => {
                         self.state.get_relevant_episodes(query, limit).await?
@@ -864,7 +970,7 @@ impl Tool for ManageMemoriesTool {
                             .get_relevant_episodes_for_channel(
                                 query,
                                 limit,
-                                args._channel_id.as_deref(),
+                                facts.channel_id.as_deref(),
                             )
                             .await?
                     }
@@ -874,11 +980,11 @@ impl Tool for ManageMemoriesTool {
                                 .to_string(),
                         );
                     }
-                    ChannelVisibility::Internal if args._trusted_session => {
+                    ChannelVisibility::Internal if trusted_session => {
                         self.state.get_relevant_episodes(query, limit).await?
                     }
                     ChannelVisibility::Internal => {
-                        let session_id = args._session_id.as_deref().unwrap_or("");
+                        let session_id = facts.session().unwrap_or("");
                         self.state
                             .get_relevant_episodes_for_session(query, limit, session_id)
                             .await?
@@ -931,9 +1037,8 @@ impl Tool for ManageMemoriesTool {
                     return Ok("No active personal goals.".to_string());
                 }
 
-                let owner_session = args
-                    ._session_id
-                    .as_deref()
+                let owner_session = facts
+                    .session()
                     .map(str::trim)
                     .filter(|session| !session.is_empty());
                 goals.sort_by_key(|goal| {
@@ -967,14 +1072,13 @@ impl Tool for ManageMemoriesTool {
                 Ok(output)
             }
             "create_personal_goal" => {
-                let session_id = args
-                    ._session_id
-                    .as_deref()
+                let session_id = facts
+                    .session()
                     .map(str::trim)
                     .filter(|session| !session.is_empty())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Internal error: create_personal_goal requires _session_id."
+                            "Internal error: create_personal_goal: the session fact is missing from the call context."
                         )
                     })?;
                 let desc = args
@@ -1036,22 +1140,16 @@ impl Tool for ManageMemoriesTool {
                 Ok(format!("Goal {} marked as abandoned. It will not be re-created by automatic analysis.", resolved_goal_id))
             }
             "create_scheduled_goal" => {
-                let is_owner = args
-                    ._user_role
-                    .as_deref()
-                    .is_some_and(|r| r.eq_ignore_ascii_case("owner"));
+                let is_owner = facts.user_role == Some(UserRole::Owner);
                 if !is_owner {
                     return Ok("Only owners can create scheduled goals.".to_string());
                 }
 
-                let session_id = args._session_id.as_deref().unwrap_or("");
+                let session_id = facts.session().unwrap_or("");
                 if session_id.trim().is_empty() {
-                    return Ok("Internal error: create_scheduled_goal requires _session_id.".to_string());
+                    return Ok("Internal error: create_scheduled_goal: the session fact is missing from the call context.".to_string());
                 }
-                let is_internal_visibility = args
-                    ._channel_visibility
-                    .as_deref()
-                    .is_some_and(|v| v.eq_ignore_ascii_case("internal"));
+                let is_internal_visibility = facts.channel_visibility == Some(ChannelVisibility::Internal);
                 // `sub-` is the legacy child-session prefix (replaced by
                 // `specialist:`); accept both so an in-flight legacy session
                 // can't bypass this guard.
@@ -1069,22 +1167,26 @@ impl Tool for ManageMemoriesTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_scheduled_goal action"))?;
 
-                let schedule_inputs: Vec<String> = if let Some(list) = args.schedules.as_ref() {
-                    list.iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                } else {
-                    let schedule_raw = args
-                        .schedule
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("'schedule' is required for create_scheduled_goal action"))?;
-                    vec![schedule_raw.to_string()]
-                };
+                // Strict-schema providers send every field, so an unused
+                // `schedules` arrives as `[]` beside the real `schedule`.
+                let mut schedule_inputs: Vec<String> = args
+                    .schedules
+                    .iter()
+                    .flatten()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if schedule_inputs.is_empty() {
-                    return Ok("At least one schedule is required.".to_string());
+                    if let Some(schedule) = args.schedule.as_deref().map(str::trim) {
+                        if !schedule.is_empty() {
+                            schedule_inputs.push(schedule.to_string());
+                        }
+                    }
+                }
+                if schedule_inputs.is_empty() {
+                    anyhow::bail!(
+                        "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
+                    );
                 }
 
                 // Keep tool-path descriptions aligned with fast-path scheduling:
@@ -1187,6 +1289,14 @@ impl Tool for ManageMemoriesTool {
                     crate::traits::Goal::new_deferred_finite(&desc, session_id)
                 };
                 goal.domain = "orchestration".to_string();
+                let reminder_message = args
+                    .reminder
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty());
+                if let Some(message) = reminder_message {
+                    goal.context = Some(crate::reminders::context_for_message(message));
+                }
 
                 self.state.create_goal(&goal).await?;
 
@@ -1230,6 +1340,19 @@ impl Tool for ManageMemoriesTool {
                     .min_by_key(|dt| dt.timestamp())
                     .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
                     .unwrap_or_else(|| "n/a".to_string());
+
+                // A reminder runs no agent and only messages the owner: no
+                // confirmation step.
+                if let Some(message) = reminder_message {
+                    self.state.activate_goal(&goal.id).await?;
+                    return Ok(format!(
+                        "Reminder set: \"{}\". {} schedule(s). Next: {}. System timezone: {}.",
+                        message,
+                        parsed.len(),
+                        next_run,
+                        tz_label
+                    ));
+                }
 
                 // Button-based confirmation via approval channel
                 if let Some(ref tx) = self.approval_tx {
@@ -1317,17 +1440,14 @@ impl Tool for ManageMemoriesTool {
                 }
             }
             "activate_scheduled" => {
-                let is_owner = args
-                    ._user_role
-                    .as_deref()
-                    .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
+                let is_owner = facts.user_role == Some(UserRole::Owner);
                 if !is_owner {
                     return Ok("Only the owner can activate scheduled goals.".to_string());
                 }
-                let session_id = args._session_id.as_deref().unwrap_or("").trim();
+                let session_id = facts.session().unwrap_or("").trim();
                 if session_id.is_empty() {
                     return Ok(
-                        "Internal error: activate_scheduled requires _session_id.".to_string(),
+                        "Internal error: activate_scheduled: the session fact is missing from the call context.".to_string(),
                     );
                 }
                 let goal_id = args.goal_id.as_deref().ok_or_else(|| {
@@ -1378,8 +1498,34 @@ impl Tool for ManageMemoriesTool {
             }
             "list_scheduled" => {
                 let all_goals = self.state.get_scheduled_goals().await?;
+                // Active goals left with no schedule (and no mandate) never run;
+                // show them so they can be cancelled by goal_id.
+                let unscheduled: Vec<crate::traits::Goal> = self
+                    .state
+                    .get_unscheduled_active_goals()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|goal| !Self::is_protected_system_maintenance_goal(goal))
+                    .collect();
+                let mut unscheduled_section = String::new();
+                if !unscheduled.is_empty() {
+                    unscheduled_section.push_str(&format!(
+                        "**Active without a schedule** ({}) — these never run; cancel with cancel_scheduled and the goal_id\n",
+                        unscheduled.len()
+                    ));
+                    for g in &unscheduled {
+                        let desc: String = g.description.chars().take(80).collect();
+                        unscheduled_section.push_str(&format!("- **{}** {}\n", g.id, desc));
+                    }
+                    unscheduled_section.push('\n');
+                }
                 if all_goals.is_empty() {
-                    return Ok("No scheduled goals.".to_string());
+                    return Ok(if unscheduled_section.is_empty() {
+                        "No scheduled goals.".to_string()
+                    } else {
+                        format!("No scheduled goals.\n\n{unscheduled_section}")
+                    });
                 }
                 let limit = args.limit.unwrap_or(50).clamp(1, 200);
                 let mut goals = all_goals;
@@ -1477,6 +1623,7 @@ impl Tool for ManageMemoriesTool {
                     }
                     output.push('\n');
                 }
+                output.push_str(&unscheduled_section);
                 if total_goals > goals.len() {
                     output.push_str(&format!(
                         "(Results truncated to {} goals. Provide a higher `limit` to see more.)\n",
@@ -1632,10 +1779,10 @@ impl Tool for ManageMemoriesTool {
                 let goal_id_trimmed = goal_id_input.trim();
 
                 if goal_id_trimmed.eq_ignore_ascii_case("all") || goal_id_trimmed == "*" {
-                    let session_id = args._session_id.as_deref().unwrap_or("").trim();
+                    let session_id = facts.session().unwrap_or("").trim();
                     if session_id.is_empty() {
                         return Ok(
-                            "Internal error: cancel_scheduled with goal_id='all' requires _session_id."
+                            "Internal error: cancel_scheduled with goal_id='all': the session fact is missing from the call context."
                                 .to_string(),
                         );
                     }
@@ -1707,13 +1854,26 @@ impl Tool for ManageMemoriesTool {
                         ));
                     }
                     let deleted = self.state.delete_goal_schedule(&sched.id).await?;
-                    if deleted {
+                    if !deleted {
+                        return Ok(format!("Schedule {} was already removed.", sched.id));
+                    }
+                    // A goal with no schedule left would stay "active" in
+                    // listings and never run: its last schedule ends it.
+                    let remaining = self.state.get_schedules_for_goal(&goal.id).await?;
+                    if remaining.is_empty() && !Self::is_protected_system_maintenance_goal(&goal) {
+                        goal.status = "cancelled".to_string();
+                        goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        goal.updated_at = chrono::Utc::now().to_rfc3339();
+                        self.state.update_goal(&goal).await?;
                         return Ok(format!(
-                            "Cancelled schedule {} for goal {}.",
+                            "Cancelled schedule {}; it was the last schedule of goal {}, so the goal is cancelled too.",
                             sched.id, goal.id
                         ));
                     }
-                    return Ok(format!("Schedule {} was already removed.", sched.id));
+                    return Ok(format!(
+                        "Cancelled schedule {} for goal {}.",
+                        sched.id, goal.id
+                    ));
                 }
 
                 if Self::is_protected_system_maintenance_goal(&goal) {
@@ -2235,12 +2395,13 @@ impl Tool for ManageMemoriesTool {
         }
     }
 
-    async fn call_with_status_outcome(
+    /// A call's typed outcome, with the dispatcher's `facts`.
+    pub(crate) async fn outcome(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call(arguments).await?;
+        let output = self.run(arguments, facts).await?;
         let trimmed = output.trim_start();
         let outcome_status = if trimmed.starts_with("Internal error:")
             || trimmed.starts_with("Invalid priority")
@@ -2259,17 +2420,8 @@ impl Tool for ManageMemoriesTool {
                 outcome_status: Some(outcome_status),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
     }
 }
 
@@ -2278,6 +2430,8 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::CallWithFacts;
+    use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     #[test]
@@ -2294,6 +2448,26 @@ mod tests {
             bytes <= 1250,
             "manage_memories schema is {bytes} bytes, budget is 1250"
         );
+    }
+
+    /// Memory-store actions declare no effects; privacy, goal and schedule
+    /// actions stay undeclared.
+    #[tokio::test]
+    async fn memory_store_actions_declare_no_effects() {
+        let tool = ManageMemoriesTool::new(setup_state().await);
+        let effects = |args: Value| tool.call_effects(&args.to_string());
+        for action in ["forget", "repair", "list", "search"] {
+            assert!(effects(json!({"action": action})).complete, "{action}");
+        }
+        for action in [
+            "set_privacy",
+            "create_personal_goal",
+            "create_scheduled_goal",
+            "cancel_scheduled",
+            "retry_scheduled",
+        ] {
+            assert!(!effects(json!({"action": action})).complete, "{action}");
+        }
     }
 
     #[tokio::test]
@@ -2775,13 +2949,16 @@ mod tests {
 
         // Empty query → recency browse (no embedding dependency).
         let result = tool
-            .call(
+            .call_with(
                 &json!({
-                    "action": "search_episodes",
-                    "_session_id": "test",
-                    "_channel_visibility": "private"
+                    "action": "search_episodes"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    session_id: "test".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2798,6 +2975,83 @@ mod tests {
             result.contains("just now") || result.contains("ago"),
             "should include a recency label; got:\n{result}"
         );
+    }
+
+    /// Trust comes only from the dispatcher's typed context: a
+    /// `_trusted_session` argument does not widen internal recall to every
+    /// session's episodes.
+    #[tokio::test]
+    async fn trusted_session_argument_bypasses_nothing() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let concrete = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        std::mem::forget(db_file);
+        let tool = ManageMemoriesTool::new(concrete.clone() as Arc<dyn StateStore>);
+        let now = chrono::Utc::now();
+        for (session, summary) in [
+            (
+                "session-alice",
+                "Planned the Acme Corp offsite with Alice Rivera",
+            ),
+            (
+                "session-jordan",
+                "Reviewed the synthetic budget with Jordan Lee",
+            ),
+        ] {
+            let ep = crate::traits::Episode {
+                id: 0,
+                session_id: session.to_string(),
+                summary: summary.to_string(),
+                topics: None,
+                emotional_tone: None,
+                outcome: None,
+                importance: 0.7,
+                recall_count: 0,
+                last_recalled_at: None,
+                message_count: 4,
+                start_time: now,
+                end_time: now,
+                created_at: now,
+                channel_id: None,
+            };
+            concrete.insert_episode(&ep).await.unwrap();
+        }
+        let args = json!({
+            "action": "search_episodes",
+            "_trusted_session": true
+        })
+        .to_string();
+        let facts = crate::traits::ToolCallContext {
+            session_id: "session-alice".into(),
+            channel_visibility: Some(ChannelVisibility::Internal),
+            ..Default::default()
+        };
+        let result = tool
+            .call_with_execution_context(&args, None, facts.clone())
+            .await
+            .unwrap()
+            .output;
+        assert!(result.contains("Acme Corp offsite"), "{result}");
+        assert!(
+            !result.contains("Jordan Lee"),
+            "an argument does not widen recall to other sessions: {result}"
+        );
+        // The dispatcher's typed trust does.
+        let ctx = crate::traits::ToolCallContext {
+            trusted_session: true,
+            ..facts
+        };
+        let trusted = tool
+            .call_with_execution_context(&args, None, ctx)
+            .await
+            .unwrap()
+            .output;
+        assert!(trusted.contains("Jordan Lee"), "{trusted}");
     }
 
     async fn setup_state() -> Arc<dyn StateStore> {
@@ -3037,13 +3291,13 @@ mod tests {
         add_schedule(&state, &protected.id, "0 3 * * *").await;
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "cancel_scheduled",
-                    "goal_id": "all",
-                    "_session_id": "user-session"
+                    "goal_id": "all"
                 })
                 .to_string(),
+                crate::testing::call_facts("user-session"),
             )
             .await
             .unwrap();
@@ -3090,13 +3344,13 @@ mod tests {
         add_schedule(&state, &other_session.id, "0 12 * * *").await;
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "cancel_scheduled",
-                    "goal_id": "all",
-                    "_session_id": "session-a"
+                    "goal_id": "all"
                 })
                 .to_string(),
+                crate::testing::call_facts("session-a"),
             )
             .await
             .unwrap();
@@ -3393,13 +3647,13 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_personal_goal",
-                    "goal": "Learn conversational Spanish",
-                    "_session_id": "owner-session"
+                    "goal": "Learn conversational Spanish"
                 })
                 .to_string(),
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3422,14 +3676,14 @@ mod tests {
         let tool = ManageMemoriesTool::new(state);
 
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
                     "action": "create_personal_goal",
-                    "goal": "Steward a synthetic account under owner-confirmed rate limits",
-                    "_session_id": "owner-session"
+                    "goal": "Steward a synthetic account under owner-confirmed rate limits"
                 })
                 .to_string(),
                 None,
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3451,13 +3705,13 @@ mod tests {
         let tool = ManageMemoriesTool::new(state);
 
         let output = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "list_goals",
-                    "limit": 10,
-                    "_session_id": "owner-session"
+                    "limit": 10
                 })
                 .to_string(),
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3481,14 +3735,14 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_personal_goal",
                     "goal": "Exercise daily",
-                    "priority": "high",
-                    "_session_id": "owner-session"
+                    "priority": "high"
                 })
                 .to_string(),
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3504,14 +3758,14 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_personal_goal",
                     "goal": "Some goal",
-                    "priority": "ultra",
-                    "_session_id": "owner-session"
+                    "priority": "ultra"
                 })
                 .to_string(),
+                crate::testing::call_facts("owner-session"),
             )
             .await
             .unwrap();
@@ -3527,13 +3781,13 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_personal_goal",
-                    "goal": "   ",
-                    "_session_id": "owner-session"
+                    "goal": "   "
                 })
                 .to_string(),
+                crate::testing::call_facts("owner-session"),
             )
             .await;
 
@@ -3559,7 +3813,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("create_personal_goal requires _session_id"));
+            .contains("create_personal_goal: the session fact is missing from the call context"));
         assert!(state
             .get_active_personal_goals(50)
             .await
@@ -3575,15 +3829,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Check API health",
-                    "schedule": "every 6h",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "every 6h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3614,15 +3871,18 @@ mod tests {
     async fn activate_scheduled_is_typed_owner_and_session_scoped() {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
-        tool.call(
+        tool.call_with(
             &json!({
                 "action": "create_scheduled_goal",
                 "goal": "Review operational health",
-                "schedule": "every 6h",
-                "_user_role": "owner",
-                "_session_id": "owner-session"
+                "schedule": "every 6h"
             })
             .to_string(),
+            crate::traits::ToolCallContext {
+                user_role: Some(crate::types::UserRole::Owner),
+                session_id: "owner-session".into(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -3635,14 +3895,17 @@ mod tests {
             .unwrap();
 
         let wrong_session = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "activate_scheduled",
-                    "goal_id": goal.id,
-                    "_user_role": "owner",
-                    "_session_id": "different-session"
+                    "goal_id": goal.id
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "different-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3653,14 +3916,17 @@ mod tests {
         );
 
         let activated = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "activate_scheduled",
-                    "goal_id": goal.id,
-                    "_user_role": "owner",
-                    "_session_id": "owner-session"
+                    "goal_id": goal.id
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "owner-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3676,14 +3942,17 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state);
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "activate_scheduled",
-                    "goal_id": "goal-id",
-                    "_user_role": "guest",
-                    "_session_id": "owner-session"
+                    "goal_id": "goal-id"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Guest),
+                    session_id: "owner-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3702,15 +3971,18 @@ mod tests {
         });
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Check confirmation transport",
-                    "schedule": "every 6h",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "every 6h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3738,15 +4010,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Deploy release",
-                    "schedule": "in 2h",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "in 2h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3765,21 +4040,223 @@ mod tests {
         assert!(schedules[0].is_one_shot);
     }
 
+    /// Strict-schema providers send every field, so an unused `schedules`
+    /// arrives as `[]` next to the real `schedule`.
+    #[tokio::test]
+    async fn create_scheduled_goal_uses_schedule_when_schedules_is_empty() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call_with(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check the oven",
+                    "schedule": "in 2h",
+                    "schedules": []
+                })
+                .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Created scheduled goal"), "{result}");
+
+        let missing = tool
+            .call_with(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check the oven",
+                    "schedule": "",
+                    "schedules": []
+                })
+                .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(missing.is_err(), "a missing schedule is a failed call");
+    }
+
+    /// A typed reminder runs no agent and only messages the owner, so it is
+    /// active at once (no confirmation prompt) and carries its message.
+    #[tokio::test]
+    async fn create_scheduled_goal_with_reminder_message_is_active_at_once() {
+        let state = setup_state().await;
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_approval_tx(crate::tools::ApprovalBroker::new(approval_tx));
+
+        let result = tool
+            .call_with(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Remind Alice Rivera to check the oven",
+                    "schedule": "in 2h",
+                    "reminder": "Check the oven."
+                })
+                .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Reminder set"), "{result}");
+        assert!(approval_rx.try_recv().is_err(), "no confirmation prompt");
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description.contains("oven"))
+            .unwrap();
+        assert_eq!(goal.status, "active");
+        assert_eq!(
+            crate::reminders::message_from_context(goal.context.as_deref()).as_deref(),
+            Some("Check the oven.")
+        );
+    }
+
+    /// Cancelling a goal's only schedule cancels the goal: an active goal
+    /// with no schedule would linger in listings and never run.
+    #[tokio::test]
+    async fn cancelling_the_last_schedule_cancels_the_goal() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        tool.call_with(
+            &json!({
+                "action": "create_scheduled_goal",
+                "goal": "Review the inbox",
+                "schedule": "every weekday at 9am",
+                "reminder": "Review your inbox."
+            })
+            .to_string(),
+            crate::traits::ToolCallContext {
+                user_role: Some(crate::types::UserRole::Owner),
+                session_id: "test-session".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let goal = state
+            .get_scheduled_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.description.contains("inbox"))
+            .unwrap();
+        let schedule = state.get_schedules_for_goal(&goal.id).await.unwrap()[0].clone();
+
+        let result = tool
+            .call_with(
+                &json!({
+                    "action": "cancel_scheduled",
+                    "goal_id": goal.id,
+                    "schedule_id": schedule.id
+                })
+                .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("cancelled"), "{result}");
+        let goal = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "cancelled");
+    }
+
+    /// An active continuous goal with no schedule never runs; the listing
+    /// shows it so it can be cancelled, and cancelling by goal_id works.
+    #[tokio::test]
+    async fn list_scheduled_shows_and_cancels_unscheduled_active_goals() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        let mut orphan = crate::traits::Goal::new_continuous(
+            "Post one synthetic update for Acme Corp",
+            "telegram:synthetic-user-1",
+            None,
+            None,
+        );
+        orphan.status = "active".to_string();
+        state.create_goal(&orphan).await.unwrap();
+
+        let listing = tool
+            .call_with(
+                &json!({"action": "list_scheduled"}).to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(listing.contains("Active without a schedule"), "{listing}");
+        assert!(listing.contains(&orphan.id), "{listing}");
+
+        tool.call_with(
+            &json!({
+                "action": "cancel_scheduled",
+                "goal_id": orphan.id
+            })
+            .to_string(),
+            crate::traits::ToolCallContext {
+                user_role: Some(crate::types::UserRole::Owner),
+                session_id: "test-session".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.get_goal(&orphan.id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        let listing = tool
+            .call_with(
+                &json!({"action": "list_scheduled"}).to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!listing.contains(&orphan.id), "{listing}");
+    }
+
     #[tokio::test]
     async fn create_scheduled_goal_cleans_filler_and_schedule_from_goal_text() {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "in 2 hours remind me to send release notes",
-                    "schedule": "in 2 hours",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "in 2 hours"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3800,15 +4277,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Steal data",
-                    "schedule": "every 1h",
-                    "_user_role": "guest",
-                    "_session_id": "test-session"
+                    "schedule": "every 1h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Guest),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3824,19 +4304,23 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Do something",
-                    "schedule": "daily at 9am",
-                    "_user_role": "owner"
+                    "schedule": "daily at 9am"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("requires _session_id"));
+        assert!(result.contains("the session fact is missing from the call context"));
+        assert!(!result.contains("_session_id"), "{result}");
         let goals = state.get_scheduled_goals().await.unwrap();
         assert!(goals.is_empty());
     }
@@ -3847,15 +4331,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Do something",
-                    "schedule": "whenever the moon is full",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "whenever the moon is full"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3871,14 +4358,17 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
-                    "goal": "Do something",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "goal": "Do something"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -3891,15 +4381,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Multi-slot monitoring",
-                    "schedules": ["daily at 8am", "daily at 2pm", "daily at 9pm"],
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedules": ["daily at 8am", "daily at 2pm", "daily at 9pm"]
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3928,16 +4421,19 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Paused from start",
                     "schedule": "daily at 9am",
-                    "is_paused": true,
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "is_paused": true
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3959,16 +4455,19 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Nested schedule",
-                    "schedule": "in 1 minute",
-                    "_user_role": "owner",
-                    "_session_id": "sub-1-abc123",
-                    "_channel_visibility": "internal"
+                    "schedule": "in 1 minute"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "sub-1-abc123".into(),
+                    channel_visibility: Some(crate::types::ChannelVisibility::Internal),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -3986,30 +4485,36 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let first = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Check API health",
-                    "schedule": "every 6h",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "every 6h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         assert!(first.contains("Created scheduled goal"));
 
         let second = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "  check   api HEALTH ",
-                    "schedule": "every 6h",
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedule": "every 6h"
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4029,15 +4534,18 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
-            .call(
+            .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
                     "goal": "Partial failure",
-                    "schedules": ["daily at 8am", "whenever I feel like it"],
-                    "_user_role": "owner",
-                    "_session_id": "test-session"
+                    "schedules": ["daily at 8am", "whenever I feel like it"]
                 })
                 .to_string(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Owner),
+                    session_id: "test-session".into(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4194,6 +4702,65 @@ mod tests {
         assert_eq!(active.len(), 1, "got: {active:?}");
         assert_eq!(active[0].category, "personal");
         assert_eq!(active[0].key, "color_of_car");
+    }
+
+    /// Regression: forgetting `qa_pet_name` also deleted the owner's `name`
+    /// fact because a fact key contained in the requested key matched, and
+    /// partial matching ran even when an exact key existed.
+    #[tokio::test]
+    async fn forget_never_deletes_keys_contained_in_the_requested_key() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        for (key, value) in [
+            ("qa_pet_name", "SYNTH-FINCH"),
+            ("name", "Alice Rivera"),
+            ("pet_name_history", "Rex"),
+        ] {
+            state
+                .upsert_fact("user", key, value, "test", None, FactPrivacy::Global)
+                .await
+                .unwrap();
+        }
+
+        let result = tool
+            .call(
+                &json!({"action": "forget", "category": "user", "key": "qa_pet_name"}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten 1 fact"), "got: {result}");
+
+        let active: Vec<_> = state
+            .get_facts(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.superseded_at.is_none())
+            .map(|f| f.key)
+            .collect();
+        assert!(active.contains(&"name".to_string()), "got: {active:?}");
+        assert!(active.contains(&"pet_name_history".to_string()));
+        assert!(!active.contains(&"qa_pet_name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn forget_partial_key_matches_whole_segments_only() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        for key in ["favorite_color", "colorado_trip"] {
+            state
+                .upsert_fact("preferences", key, "x", "test", None, FactPrivacy::Global)
+                .await
+                .unwrap();
+        }
+        let result = tool
+            .call(
+                &json!({"action": "forget", "category": "preferences", "key": "color"}).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten 1 fact"), "got: {result}");
+        assert!(result.contains("favorite_color"), "got: {result}");
     }
 
     /// Cross-category sweep should still catch exact-key duplicates (the

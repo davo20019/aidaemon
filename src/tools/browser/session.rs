@@ -5,7 +5,8 @@
 //! users/chats) implicitly shared one tab — session A's navigation moved the
 //! page out from under session B's next action.
 //!
-//! [`BrowserSessionRegistry`] gives each trusted internal `_session_id` its own
+//! [`BrowserSessionRegistry`] gives each session (the call's typed
+//! `ToolCallContext::session_id`, never an argument) its own
 //! set of [`PageHandle`]s (tabs) plus a per-session action lock. The action lock
 //! serializes a single session's own actions (so its calls don't race each
 //! other) while letting DIFFERENT sessions run concurrently — the registry never
@@ -73,8 +74,8 @@ impl BrowserSessionState {
     }
 }
 
-/// A registry of per-session browser tabs, keyed by the trusted internal
-/// `_session_id`. The map is guarded by a `tokio::sync::Mutex` that is held only
+/// A registry of per-session browser tabs, keyed by the call's typed
+/// `ToolCallContext::session_id`. The map is guarded by a `tokio::sync::Mutex` that is held only
 /// briefly to read or insert a session entry — never across the running action.
 #[derive(Default)]
 pub struct BrowserSessionRegistry {
@@ -104,7 +105,7 @@ pub struct TabView {
 /// appears once even if the session had several tabs sharing it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvictedSession {
-    /// The internal `_session_id` that was evicted (for logging).
+    /// The session id that was evicted (for logging).
     pub session_id: String,
     /// Backend target ids of every tab the session held — to `close_target`.
     pub tab_target_ids: Vec<String>,

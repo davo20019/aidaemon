@@ -221,7 +221,7 @@ mod tests {
         // Live repro (task 6331508b): a pretty-printed clinical-trials JSON
         // response stayed inline (under the spill cap) and its whitespace
         // inflation helped time out the compose call.
-        let pretty = "HTTP 200 OK\ncontent-type: application/json\n\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Study\",\n    \"locations\": [\n      {\n        \"city\": \"Fairfax\",\n        \"state\": \"Virginia\"\n      }\n    ]\n  }\n]\n";
+        let pretty = "HTTP 200 OK\ncontent-type: application/json\n\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Study\",\n    \"locations\": [\n      {\n        \"city\": \"Springfield\",\n        \"state\": \"Virginia\"\n      }\n    ]\n  }\n]\n";
         let compacted = compact_embedded_json(pretty).expect("compaction applies");
         assert!(compacted.chars().count() < pretty.chars().count());
         assert!(compacted.starts_with("HTTP 200 OK"), "prefix preserved");

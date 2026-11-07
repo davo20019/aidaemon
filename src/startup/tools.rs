@@ -129,6 +129,7 @@ pub async fn setup_tools(
         health_store,
         approval_tx.clone(),
         media_tx.clone(),
+        execution_backend.clone(),
     )
     .await?;
 
@@ -216,6 +217,7 @@ enum BaseToolId {
     RememberFact,
     ShareMemory,
     ManageMemories,
+    SetReminder,
     ManageMandates,
     SearchHistory,
     ScheduledGoalRuns,
@@ -262,6 +264,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
         name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::SetReminder,
+        name: "set_reminder",
     },
     BaseToolSpec {
         id: BaseToolId::ManageMandates,
@@ -642,6 +648,7 @@ pub async fn build_base_tools(
         }
         let built = build_base_tool(
             spec.id,
+            execution_backend.clone(),
             config,
             &config_path,
             state.clone(),
@@ -691,6 +698,7 @@ pub async fn register_optional_tools(
     health_store: Option<Arc<HealthProbeStore>>,
     approval_tx: ApprovalBroker,
     media_tx: mpsc::Sender<MediaMessage>,
+    execution_backend: crate::execution::SharedExecutionBackend,
 ) -> anyhow::Result<OptionalToolsOutcome> {
     let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
     let mut has_cli_agents = false;
@@ -763,6 +771,7 @@ pub async fn register_optional_tools(
                     media_tx.clone(),
                     approval_tx.clone(),
                     inbox_dir.clone(),
+                    execution_backend.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
                 tools.push(Arc::new(browser_tool));
@@ -789,8 +798,13 @@ pub async fn register_optional_tools(
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(
-                    SendFileTool::new(media_tx.clone(), &config.files.outbox_dirs, &inbox_dir)
-                        .with_event_store(event_store.clone()),
+                    SendFileTool::new(
+                        execution_backend.clone(),
+                        media_tx.clone(),
+                        &config.files.outbox_dirs,
+                        &inbox_dir,
+                    )
+                    .with_event_store(event_store.clone()),
                 ));
             }
             OptionalToolId::GenerateImage => {
@@ -811,6 +825,7 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 let cli_tool = CliAgentTool::discover(
+                    execution_backend.clone(),
                     config.cli_agents.clone(),
                     state.clone(),
                     llm_runtime.clone(),
@@ -983,7 +998,7 @@ async fn register_runtime_tool_by_id(
 ) -> anyhow::Result<()> {
     match tool_id {
         RuntimeToolId::ManageMcp => {
-            let manage_mcp = ManageMcpTool::new(mcp_registry, approval_tx);
+            let manage_mcp = ManageMcpTool::new(mcp_registry);
             tools.push(Arc::new(manage_mcp));
         }
         RuntimeToolId::ManagePeople => {
@@ -1003,7 +1018,7 @@ async fn register_runtime_tool_by_id(
             }
         }
         RuntimeToolId::HttpRequest => {
-            let tool = Arc::new(HttpRequestTool::new(http_profiles, approval_tx));
+            let tool = Arc::new(HttpRequestTool::new(http_profiles));
             tools.push(tool.clone());
             *http_request_tool = Some(tool);
         }
@@ -1098,8 +1113,10 @@ async fn register_runtime_tool_by_id(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_base_tool(
     tool_id: BaseToolId,
+    execution_backend: crate::execution::SharedExecutionBackend,
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
@@ -1109,7 +1126,7 @@ async fn build_base_tool(
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
         BaseToolId::SystemInfo => BuiltBaseTool {
-            tool: Arc::new(SystemInfoTool),
+            tool: Arc::new(SystemInfoTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::Terminal => {
@@ -1125,6 +1142,7 @@ async fn build_base_tool(
                 .collect();
             let terminal = Arc::new(
                 TerminalTool::new(
+                    execution_backend,
                     config.terminal.allowed_prefixes.clone(),
                     approval_tx,
                     config.terminal.initial_timeout_secs,
@@ -1136,7 +1154,6 @@ async fn build_base_tool(
                 .with_confinement(config.terminal.confinement)
                 .with_event_store(event_store)
                 .with_state(state)
-                .with_self_correction(config.self_correction.clone())
                 .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
             BuiltBaseTool {
@@ -1154,6 +1171,10 @@ async fn build_base_tool(
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
             tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            terminal_tool: None,
+        },
+        BaseToolId::SetReminder => BuiltBaseTool {
+            tool: Arc::new(crate::tools::SetReminderTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
@@ -1206,43 +1227,43 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ReadFile => BuiltBaseTool {
-            tool: Arc::new(ReadFileTool),
+            tool: Arc::new(ReadFileTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::WriteFile => BuiltBaseTool {
-            tool: Arc::new(WriteFileTool),
+            tool: Arc::new(WriteFileTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::EditFile => BuiltBaseTool {
-            tool: Arc::new(EditFileTool),
+            tool: Arc::new(EditFileTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::SearchFiles => BuiltBaseTool {
-            tool: Arc::new(SearchFilesTool),
+            tool: Arc::new(SearchFilesTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::ProjectInspect => BuiltBaseTool {
-            tool: Arc::new(ProjectInspectTool),
+            tool: Arc::new(ProjectInspectTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::RunCommand => BuiltBaseTool {
-            tool: Arc::new(RunCommandTool),
+            tool: Arc::new(RunCommandTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::GitInfo => BuiltBaseTool {
-            tool: Arc::new(GitInfoTool),
+            tool: Arc::new(GitInfoTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::GitCommit => BuiltBaseTool {
-            tool: Arc::new(GitCommitTool),
+            tool: Arc::new(GitCommitTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::CheckEnvironment => BuiltBaseTool {
-            tool: Arc::new(CheckEnvironmentTool),
+            tool: Arc::new(CheckEnvironmentTool::new(execution_backend)),
             terminal_tool: None,
         },
         BaseToolId::ServiceStatus => BuiltBaseTool {
-            tool: Arc::new(ServiceStatusTool),
+            tool: Arc::new(ServiceStatusTool::new(execution_backend)),
             terminal_tool: None,
         },
     };
@@ -1258,7 +1279,6 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
-    use crate::traits::ModelProvider;
     use proptest::prelude::*;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1299,7 +1319,7 @@ mod tests {
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
-        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
+        let model_provider = Arc::new(MockProvider::new()) as crate::llm_runtime::ModelBackend;
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
@@ -1326,6 +1346,7 @@ mod tests {
             None,
             bundle.approval_tx.clone(),
             bundle.media_tx.clone(),
+            bundle.execution_backend.clone(),
         )
         .await?;
 

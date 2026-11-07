@@ -44,6 +44,9 @@ pub(super) struct TurnContext {
     /// reference in the request and is the filesystem authority boundary the
     /// compiled access manifest may attenuate within but never relocate.
     pub bound_workspace: Option<String>,
+    /// Where `bound_workspace` came from: only an explicit binding is a
+    /// trusted root (`explicit_workspace`).
+    pub bound_workspace_origin: Option<super::project_scope::WorkspaceBindingOrigin>,
     pub primary_project_scope: Option<String>,
     /// Exact path authorities named by the current request (or inherited from
     /// its structurally-linked open request). Unlike `primary_project_scope`,
@@ -69,6 +72,17 @@ pub(super) struct TurnContext {
     /// from a completed antecedent whose durable safety constraints alone may
     /// carry into a related turn.
     pub inherited_outstanding_obligations: bool,
+}
+
+impl TurnContext {
+    /// The workspace binding that vouches for its files: the bound
+    /// workspace, only when it was bound explicitly.
+    pub(in crate::agent) fn explicit_workspace(&self) -> Option<&str> {
+        (self.bound_workspace_origin
+            == Some(super::project_scope::WorkspaceBindingOrigin::Explicit))
+        .then_some(self.bound_workspace.as_deref())
+        .flatten()
+    }
 }
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
@@ -459,9 +473,16 @@ impl Agent {
         } else {
             None
         };
-        let bound_workspace = bound_goal_scope.or_else(|| {
-            super::project_scope::typed_workspace_binding(self.inherited_project_scope.as_deref())
-        });
+        use super::project_scope::WorkspaceBindingOrigin;
+        let (bound_workspace, bound_workspace_origin) = match bound_goal_scope {
+            Some(scope) => (Some(scope), Some(WorkspaceBindingOrigin::Explicit)),
+            None => match super::project_scope::typed_workspace_binding(
+                self.inherited_project_scope.as_deref(),
+            ) {
+                Some(scope) => (Some(scope), Some(WorkspaceBindingOrigin::Inferred)),
+                None => (None, None),
+            },
+        };
         let workspace_anchor = bound_workspace.as_deref().map(std::path::Path::new);
 
         // For the current user message, only extract explicit filesystem paths
@@ -489,6 +510,29 @@ impl Agent {
             &self.path_aliases.projects,
             workspace_anchor,
         );
+        // A carried-over turn that names no path inherits the scope of the
+        // request it continues before any older history. Whole-history
+        // extraction prefers whichever scope looks like a project root, so an
+        // unrelated repository mentioned turns ago used to outrank the
+        // antecedent's own workspace (e.g. a scratch dir under /tmp), and the
+        // scope lock then refused the files the antecedent had just created.
+        let mut antecedent_project_scopes = Vec::new();
+        if allow_scope_carryover && current_project_scopes.is_empty() {
+            let request_anchor = continuation_request_anchor.or_else(|| {
+                related_open_request(dialogue_state.as_ref(), followup_mode)
+                    .map(|request| request.text.as_str())
+                    .or(prev_user.as_deref())
+            });
+            if let Some(anchor) = request_anchor {
+                extract_explicit_path_scopes_from_text_anchored(
+                    anchor,
+                    &mut antecedent_project_scopes,
+                    GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+                    &self.path_aliases.projects,
+                    workspace_anchor,
+                );
+            }
+        }
         let allow_multi_project_scope = current_project_scopes.len() > 1;
         // For current-turn scopes, unify all explicitly mentioned paths into a
         // single scope that encompasses them all.  When the user mentions paths
@@ -506,6 +550,7 @@ impl Agent {
         let primary_project_scope = bound_workspace.clone().or_else(|| {
             resolve_primary_project_scope(
                 unify_current_turn_scopes(&current_project_scopes)
+                    .or_else(|| unify_current_turn_scopes(&antecedent_project_scopes))
                     .or_else(|| choose_primary_project_scope(&project_scopes)),
                 self.inherited_project_scope.as_deref(),
                 allow_multi_project_scope,
@@ -583,6 +628,7 @@ impl Agent {
             ),
             visible_antecedent_user_message_id: None,
             bound_workspace,
+            bound_workspace_origin,
             primary_project_scope,
             authorized_project_scopes,
             filesystem_access: None,
@@ -919,53 +965,6 @@ impl Agent {
         Ok(())
     }
 
-    pub(super) fn resolve_tool_call_semantics(&self, tool_call: &ToolCall) -> ToolCallSemantics {
-        self.tools
-            .iter()
-            .find(|tool| tool.name() == tool_call.name && tool.is_available())
-            .map(|tool| tool.call_semantics(&tool_call.arguments))
-            .unwrap_or_default()
-    }
-
-    /// Persist a deterministic refusal or synthetic pre-dispatch result through
-    /// the same attempt/receipt protocol as adapter I/O.
-    ///
-    /// Guard layers must not write bare `tool_result` events: event counts,
-    /// operation cardinality, task outcome, and recovery all derive from the
-    /// correlated call/result pair and its typed disposition.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn persist_pre_dispatch_outcome(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        task_id: &str,
-        tool_call: &ToolCall,
-        effective_arguments: &str,
-        result_text: String,
-        outcome_status: crate::traits::ToolOutcomeStatus,
-        invocation_stage: crate::traits::ToolInvocationStage,
-        contract_rejected: bool,
-        semantics: ToolCallSemantics,
-        access_manifest: Option<ToolCallAccessManifest>,
-    ) -> anyhow::Result<()> {
-        self.persist_pre_dispatch_outcome_with_kernel_claim(
-            emitter,
-            session_id,
-            task_id,
-            tool_call,
-            effective_arguments,
-            result_text,
-            outcome_status,
-            invocation_stage,
-            contract_rejected,
-            semantics,
-            access_manifest,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// Persist a typed policy denial: the operation was refused before
     /// dispatch by an authority boundary (read-only contract, capability
     /// constraint, mandate gate, scope lock). The receipt carries the typed
@@ -1105,7 +1104,7 @@ impl Agent {
     // Pillar B (Task 7): `load_initial_history` and `load_recent_history` were
     // removed. Historical conversation retention is now owned entirely by the
     // turn-anchored fetch (`EventStore::get_turns_from_anchor`) in
-    // `message_build_phase`; the legacy "load N recent events then age-collapse"
+    // `message_build`; the legacy "load N recent events then age-collapse"
     // path no longer exists.
 }
 
@@ -1129,67 +1128,6 @@ mod tests {
             importance: 0.5,
             ..Message::runtime_defaults()
         }
-    }
-
-    #[tokio::test]
-    async fn pre_dispatch_outcome_always_persists_correlated_call_and_typed_receipt() {
-        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
-            .await
-            .expect("test harness");
-        let task_id = "task-pre-dispatch";
-        let emitter = crate::events::EventEmitter::new(
-            harness.agent.event_store.clone(),
-            "session-pre-dispatch",
-        )
-        .with_task_id(task_id);
-        let call = ToolCall {
-            id: "call-pre-dispatch".to_string(),
-            name: "terminal".to_string(),
-            arguments: r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#.to_string(),
-            extra_content: None,
-        };
-
-        harness
-            .agent
-            .persist_pre_dispatch_outcome(
-                &emitter,
-                "session-pre-dispatch",
-                task_id,
-                &call,
-                &call.arguments,
-                "synthetic scope refusal".to_string(),
-                crate::traits::ToolOutcomeStatus::Blocked,
-                crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
-                ToolCallSemantics::default(),
-                None,
-            )
-            .await
-            .expect("persist pre-dispatch outcome");
-
-        let events = harness
-            .agent
-            .event_store
-            .query_task_events_for_session("session-pre-dispatch", task_id)
-            .await
-            .expect("query events");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, EventType::ToolCall);
-        assert_eq!(events[1].event_type, EventType::ToolResult);
-        let result = events[1]
-            .parse_data::<ToolResultData>()
-            .expect("typed result");
-        assert_eq!(result.tool_call_id, "call-pre-dispatch");
-        assert!(!result.success);
-        let receipt = result.receipt.expect("canonical receipt");
-        assert_eq!(
-            receipt.outcome_status,
-            crate::traits::ToolOutcomeStatus::Blocked
-        );
-        assert_eq!(
-            receipt.invocation_stage,
-            crate::traits::ToolInvocationStage::RejectedBeforeDispatch
-        );
     }
 
     #[tokio::test]
@@ -1480,6 +1418,11 @@ mod tests {
             "typed goal workspace binding must be the authoritative scope"
         );
         assert_eq!(
+            turn_context.explicit_workspace(),
+            Some(workspace_path.as_str()),
+            "a goal's bind_workspace binding is explicit"
+        );
+        assert_eq!(
             turn_context.authorized_project_scopes,
             vec![workspace_path.clone()],
             "text-extracted paths outside the binding are not authorized"
@@ -1596,6 +1539,11 @@ mod tests {
                 turn_context.bound_workspace.as_deref(),
                 Some(workspace_path.as_str()),
                 "{handoff}"
+            );
+            assert_eq!(
+                turn_context.explicit_workspace(),
+                None,
+                "a workspace a parent handed down is inferred: {handoff}"
             );
             assert_eq!(
                 turn_context.primary_project_scope.as_deref(),
@@ -1839,6 +1787,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn followup_inherits_antecedent_scope_over_older_project_root() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{
+            DialogueState, DialogueStateStore, MessageStore, UserTurnKind, UserTurnSummary,
+        };
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        // An older turn names a real project root (has a manifest); the
+        // antecedent request names a scratch dir with no project marker.
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let scratch_path = scratch.path().to_string_lossy().to_string();
+
+        let turns = [
+            ("user", format!("Look at the build script in {repo_path}")),
+            ("assistant", "Done.".to_string()),
+            (
+                "user",
+                format!("In {scratch_path} build a tiny Python package with tests"),
+            ),
+            (
+                "assistant",
+                "Created the package; 6 tests pass.".to_string(),
+            ),
+        ];
+        for (index, (role, text)) in turns.iter().enumerate() {
+            harness
+                .state
+                .append_message(&Message {
+                    content: Some(text.clone()),
+                    ..Message::new_runtime(format!("m{index}"), "test-session", *role)
+                })
+                .await
+                .expect("append history");
+        }
+        let current = "now add a command-line entry point and prove it works";
+        harness
+            .state
+            .append_message(&Message {
+                content: Some(current.to_string()),
+                ..Message::new_runtime("m-current", "test-session", "user")
+            })
+            .await
+            .expect("append current");
+        let mut state = DialogueState::new("test-session");
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "m-current".to_string(),
+            kind: UserTurnKind::Followup,
+            text: current.to_string(),
+        });
+        harness
+            .state
+            .upsert_dialogue_state(&state)
+            .await
+            .expect("persist dialogue state");
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", current)
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(scratch_path.as_str())
+        );
+        assert_eq!(turn_context.authorized_project_scopes, vec![scratch_path]);
+    }
+
+    #[tokio::test]
     async fn build_turn_context_does_not_reuse_old_local_scope_for_external_followup() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
@@ -1850,7 +1872,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "user",
-                "Please work in /Users/davidloor/projects/fairfax-va-site and inspect the logs.",
+                "Please work in /Users/jordan/projects/springfield-il-site and inspect the logs.",
             ))
             .await
             .expect("append old local user");
@@ -1858,7 +1880,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "assistant",
-                "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+                "I am currently locked to /Users/jordan/projects/springfield-il-site.",
             ))
             .await
             .expect("append old local assistant");
@@ -1866,7 +1888,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "user",
-                "Find melanoma clinical trials recruiting near Fairfax, Virginia.",
+                "Find melanoma clinical trials recruiting near Springfield, Illinois.",
             ))
             .await
             .expect("append external user");
@@ -1874,7 +1896,7 @@ mod tests {
             .state
             .append_message(&msg(
                 "assistant",
-                "I found 10 recruiting trials near Fairfax, VA with male participants.",
+                "I found 10 recruiting trials near Springfield, VA with male participants.",
             ))
             .await
             .expect("append external assistant");

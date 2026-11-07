@@ -15,9 +15,10 @@ use crate::tools::http_request::HttpRequestTool;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolCollectionObservation, ToolMutationEffects,
-    ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint, ToolTargetHintKind,
+    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
+    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
+    ToolTargetHintKind,
 };
 use crate::types::ApprovalResponse;
 
@@ -36,8 +37,9 @@ struct ManageHttpAuthArgs {
     url: Option<String>,
     method: Option<String>,
     timeout_secs: Option<u64>,
-    #[serde(default)]
-    _session_id: String,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: String,
 }
 
 #[derive(Clone)]
@@ -650,10 +652,10 @@ impl ManageHttpAuthTool {
             ));
         }
 
-        let session_id = if args._session_id.is_empty() {
+        let session_id = if args.call_session.is_empty() {
             "unknown"
         } else {
-            args._session_id.as_str()
+            args.call_session.as_str()
         };
         let mut doc = self.load_config_doc().await?;
         let existing_auth_type = Self::profile_table(&doc, profile_name)
@@ -1095,6 +1097,137 @@ impl Tool for ManageHttpAuthTool {
         manage_http_auth_schema()
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
+        let (output, list_members) = if args.action == "list" {
+            let (output, members) = self.handle_list_snapshot().await?;
+            (output, Some(members))
+        } else {
+            (self.run(arguments, &facts).await?, None)
+        };
+        let mut observations = Vec::new();
+        let mut collections = Vec::new();
+        if let Some(members) = list_members {
+            observations.extend(members.iter().cloned().map(|subject| {
+                ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
+            }));
+            collections.push(ToolCollectionObservation::complete(
+                ToolTargetHint::new(
+                    ToolTargetHintKind::ResourceId,
+                    Self::AUTH_PROFILE_COLLECTION_ID,
+                )
+                .expect("auth profile collection ID is nonempty"),
+                &[ToolSemanticFacet::Authorization],
+                members,
+            ));
+        } else if matches!(args.action.as_str(), "describe" | "verify") {
+            if let Some(profile) = args.profile.as_deref() {
+                if let Ok(profile) = Self::validate_profile_name(profile) {
+                    if let Some(subject) = ToolTargetHint::new(
+                        ToolTargetHintKind::ResourceId,
+                        HttpRequestTool::auth_profile_resource_id(&profile),
+                    ) {
+                        observations.push(ToolObservationEvidence::new(
+                            subject,
+                            &[ToolSemanticFacet::Authorization],
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                observations,
+                collection_observations: collections,
+                ..ToolCallMetadata::default()
+            },
+            finish: None,
+        })
+    }
+}
+
+impl ManageHttpAuthTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
+        args.call_session = facts.session_id.clone();
+        match args.action.as_str() {
+            "list" => self.handle_list().await,
+            "describe" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='describe' requires 'profile'"))?,
+                )?;
+                self.handle_describe(&profile).await
+            }
+            "upsert" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
+                )?;
+                self.handle_upsert(&profile, &args).await
+            }
+            "remove" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
+                )?;
+                let session_id = if args.call_session.is_empty() {
+                    "unknown"
+                } else {
+                    args.call_session.as_str()
+                };
+                self.handle_remove(&profile, session_id).await
+            }
+            "verify" => {
+                let profile = Self::validate_profile_name(
+                    args.profile
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
+                )?;
+                self.handle_verify(
+                    &profile,
+                    args.url.as_deref(),
+                    args.method.as_deref(),
+                    args.timeout_secs,
+                )
+                .await
+            }
+            other => Ok(format!(
+                "Unknown action '{}'. Use: list, describe, upsert, remove, verify.",
+                other
+            )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageHttpAuthTool {
     fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
         vec![crate::traits::StableObservationSubject::collection(
             Self::AUTH_PROFILE_COLLECTION_ID,
@@ -1139,116 +1272,35 @@ impl Tool for ManageHttpAuthTool {
         }
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
-        match args.action.as_str() {
-            "list" => self.handle_list().await,
-            "describe" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='describe' requires 'profile'"))?,
-                )?;
-                self.handle_describe(&profile).await
-            }
-            "upsert" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
-                )?;
-                self.handle_upsert(&profile, &args).await
-            }
-            "remove" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
-                )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
-                self.handle_remove(&profile, session_id).await
-            }
-            "verify" => {
-                let profile = Self::validate_profile_name(
-                    args.profile
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
-                )?;
-                self.handle_verify(
-                    &profile,
-                    args.url.as_deref(),
-                    args.method.as_deref(),
-                    args.timeout_secs,
-                )
-                .await
-            }
-            other => Ok(format!(
-                "Unknown action '{}'. Use: list, describe, upsert, remove, verify.",
-                other
-            )),
-        }
-    }
-
-    async fn call_with_status_outcome(
+    /// Results are the daemon's own status text, except `verify` with a
+    /// url: it previews the remote body, which someone else may have written.
+    fn output_trust(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
-        let (output, list_members) = if args.action == "list" {
-            let (output, members) = self.handle_list_snapshot().await?;
-            (output, Some(members))
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let previews_remote_body = serde_json::from_str::<ManageHttpAuthArgs>(arguments)
+            .map(|args| {
+                args.action == "verify"
+                    && args
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty())
+            })
+            // Unreadable arguments: assume the worst.
+            .unwrap_or(true);
+        if previews_remote_body {
+            aidaemon_core::SourceTrust::Untrusted
         } else {
-            (self.call(arguments).await?, None)
-        };
-        let mut observations = Vec::new();
-        let mut collections = Vec::new();
-        if let Some(members) = list_members {
-            observations.extend(members.iter().cloned().map(|subject| {
-                ToolObservationEvidence::new(subject, &[ToolSemanticFacet::Authorization])
-            }));
-            collections.push(ToolCollectionObservation::complete(
-                ToolTargetHint::new(
-                    ToolTargetHintKind::ResourceId,
-                    Self::AUTH_PROFILE_COLLECTION_ID,
-                )
-                .expect("auth profile collection ID is nonempty"),
-                &[ToolSemanticFacet::Authorization],
-                members,
-            ));
-        } else if matches!(args.action.as_str(), "describe" | "verify") {
-            if let Some(profile) = args.profile.as_deref() {
-                if let Ok(profile) = Self::validate_profile_name(profile) {
-                    if let Some(subject) = ToolTargetHint::new(
-                        ToolTargetHintKind::ResourceId,
-                        HttpRequestTool::auth_profile_resource_id(&profile),
-                    ) {
-                        observations.push(ToolObservationEvidence::new(
-                            subject,
-                            &[ToolSemanticFacet::Authorization],
-                        ));
-                    }
-                }
-            }
+            aidaemon_core::SourceTrust::Trusted
         }
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                observations,
-                collection_observations: collections,
-                ..ToolCallMetadata::default()
-            },
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
     use tempfile::{NamedTempFile, TempDir};
 
     use crate::memory::embeddings::EmbeddingService;
@@ -1307,6 +1359,39 @@ mod tests {
         .unwrap();
     }
 
+    /// Its results are the daemon's own status text, except a `verify` with
+    /// a url, which previews a remote body.
+    #[tokio::test]
+    async fn its_output_is_trusted_unless_it_previews_a_remote_body() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path(), "");
+        let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tool = test_tool(config_file.path().to_path_buf(), profiles)
+            .await
+            .unwrap();
+        let roots = crate::traits::TrustRoots::new(&[]);
+        assert_eq!(
+            tool.output_trust(r#"{"action":"list"}"#, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        assert_eq!(
+            tool.output_trust(r#"{"action":"verify","profile":"demo"}"#, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        // A verify with a url returns a preview of the remote body.
+        assert_eq!(
+            tool.output_trust(
+                r#"{"action":"verify","profile":"demo","url":"https://api.example.invalid/issues/1"}"#,
+                &roots
+            ),
+            aidaemon_core::SourceTrust::Untrusted
+        );
+        assert_eq!(
+            tool.output_trust(r#"{"action":"verify","profile":"demo","url":"  "}"#, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+    }
+
     #[tokio::test]
     async fn upsert_creates_profile_and_reports_missing_secret_commands() {
         let config_file = NamedTempFile::new().unwrap();
@@ -1316,18 +1401,18 @@ mod tests {
             .await
             .unwrap();
 
-        let result = tool
-            .call(
-                r#"{
+        let result = crate::testing::call_with_facts(
+            &tool,
+            r#"{
                     "action": "upsert",
                     "profile": "stripe",
                     "auth_type": "bearer",
-                    "allowed_domains": ["api.stripe.com"],
-                    "_session_id": "test"
+                    "allowed_domains": ["api.stripe.com"]
                 }"#,
-            )
-            .await
-            .unwrap();
+            crate::testing::call_facts("test"),
+        )
+        .await
+        .unwrap();
 
         assert!(result.contains("Saved manual API auth profile `stripe`."));
         assert!(result.contains("aidaemon keychain set http_auth_stripe_token"));

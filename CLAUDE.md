@@ -111,8 +111,10 @@ Where to look first:
 - `src/core.rs` wires the daemon together and coordinates startup modules.
 - `src/startup/` owns most subsystem setup: stores, provider/router, tools,
   skills, MCP, memory pipeline, channel startup, DB security, and final wiring.
-- `src/agent/` contains the agent runtime. Important subareas are `loop/`,
-  `runtime/`, `intent/`, `policy/`, `tools/`, `specialists/`, and `eval/`.
+- `src/agent/` contains the agent runtime. Important subareas are `turn/`
+  (per-turn bootstrap, assessment, tool offering and closeout, which hands
+  every turn to the SDK engine in `runtime/sdk_engine.rs`), `runtime/`,
+  `intent/`, `policy/`, `tools/`, `specialists/`, and `eval/`.
 - `src/tools/` contains LLM-callable tools plus deterministic local tools such
   as file read/write/edit/search, command execution, git helpers, browser,
   computer-use, MCP, OAuth/API management, memory, goals, and diagnostics.
@@ -264,21 +266,32 @@ coverage for a genuinely separate request or an explicit user constraint.
 The completion contract (`RunAggregate` obligations, cardinalities, evidence
 scopes, dispatch-stop rules, response contracts) is an LLM-proposed description
 of the work, produced by a small model several times per turn. It is a planning
-hint and a fail-closed safety boundary, not the arbiter of whether work
-happened. Observed receipts are the ground truth: a run whose terminal receipts
-all succeeded or were credited closes as `succeeded` with
-`proof_basis=evidence` even when the contract could not credit it
-(`RunAggregate::evidence_closed`, `RunTerminalDecision::SucceededByEvidence`).
+hint (and, while `task_assessment = "shadow"`, a logged comparison), not the
+arbiter of whether work happened and not a source of tool authority: that comes
+only from the explicit `Authority` (role, workspace grant, goal workspace,
+session mode, config) enforced by the kernel `AuthorityHook`, and a no-tools
+contract may only reduce what the loop demands. Observed receipts are the
+ground truth: a run whose terminal receipts all succeeded or were credited
+closes as `succeeded` with `proof_basis=evidence` even when the contract could
+not credit it (`RunAggregate::evidence_closed`,
+`RunTerminalDecision::SucceededByEvidence`).
 
 The ledger-first arbiter (`RunAggregate::closeout`, admissibility in
-`src/agent/loop/closeout.rs`) is the intended home for any new "may the loop
-demand more work?" decision: authority gates admission, expectations are
-verified by receipts, and only a *reachable* expectation may ask for another
-pass. It is authoritative: the completion phase asks for more work only on a
-`reachable` verdict (`ledger_expectations_required`), and records every
-verdict as a `ledger_closeout` decision point. `CompletionContract::authority()`
-is the only contract view a gate may read; `expectations()` is verified by
-receipts, never enforced directly. Do not add a gate anywhere else.
+`src/agent/turn/closeout.rs`) is the intended home for any new "may the loop
+demand more work?" decision: the explicit Authority gates admission,
+expectations are verified by receipts, and only a *reachable* expectation may
+ask for another pass. It is authoritative: the completion phase asks for more
+work only on a `reachable` verdict (`ledger_expectations_required`), and
+records every verdict as a `ledger_closeout` decision point. The SDK engine's
+other stop-time asks (mandate decision commit, GUI click verification, reply
+repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against the
+same authority and visible tools, each with a budget, and recorded as
+`stop_demand` decision points; a new stop-time ask is a new `StopDemand`, not a
+new check. Tool authority is never read from the assessed contract:
+`CompletionContract::authority()` is no longer a gate, and
+`authority_as_assessed()` exists only for `assessor_would_refuse` shadow
+logging. `expectations()` is verified by receipts, never enforced directly. Do
+not add a gate anywhere else.
 
 Do not add new obligation classes, cardinality features, stop-trigger kinds,
 or response-projection rules to make a single live test pass. If a live
@@ -293,8 +306,77 @@ and may under-describe the request; the executing model's `track_requirements`
 checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
 model's own typed statement of what it will do, so open reachable checklist
 items are demanded even after other work completed and a run that ends with
-one open is `partial`, not evidence-closed. Only receipts close either kind;
-the assessor keeps the authority lane (forbids, allowed tools, scopes).
+one open is `partial`, not evidence-closed. Only receipts close either kind.
+An item the model marks `deferred`/`skipped` or drops from its list becomes
+`RunObligationState::Deferred`: the closeout never demands it (stopping is
+permitted, `UnreachableReason::ExecutorDeferred`), but it never counts toward
+`is_fulfilled`, `work_is_fulfilled` or `evidence_closed`, so the run ends
+`partial`. Editing a checklist never turns unperformed work into
+accomplished work. In the SDK kernel the same split is
+`StopDecision::AcceptUnmet` and `RunOutcome::is_succeeded()`: `Completed`
+means the run stopped, not that its objective was met.
+`task_assessment` defaults to `"shadow"` (assess and log what the assessor
+would have refused); `on` behaves the same without recording, and `off` skips
+the assessment call.
+
+## Untrusted Content Rule
+
+After a run reads content someone other than the owner wrote (web pages,
+trigger input, other people's messages, MCP results, files outside the trusted
+roots), its egress calls are interrupted by the kernel's `UntrustedHook` and
+run only if a clean, tool-less verifier
+(`src/agent/runtime/untrusted.rs`) that sees just the original request and the
+proposed call finds them consistent. Owner level `unrestricted` records these
+calls instead of checking them.
+
+- Source trust is typed per adapter: each tool declares `output_trust` from
+  its capabilities and arguments. `sanitize.rs::is_trusted_tool` only decides
+  wrapping, never trust.
+- Egress is the `ToolAnnotations.egress` bit, derived per call from typed
+  mutation effects (`call_annotations`).
+- A turn starts tainted from explicit facts only (`starts_tainted`): role,
+  channel visibility, trigger session, a tainted turn still in the projected
+  prefix, or a tainted parent.
+- Never key trust, egress or taint on tool names or on request/content
+  wording.
+
+## Owner Approval Rule
+
+The rule: every safeguard that can refuse, approve or scan a tool call is a
+kernel hook judging typed effects. A tool must not prompt the owner or refuse
+on policy inside `call()`; a decline binds the run for that effect and target
+across tools. Do not add a new in-tool prompt or policy refusal.
+
+Not yet everywhere: `cli_agent`, `browser`, `computer_use` and the `manage_*`
+tools still prompt inside `call()` until Phase 3c moves them onto the kernel.
+
+A call whose only effect is the agent's own internal state (its memory,
+people store, checklist or goal bookkeeping) declares `CallEffects::none()`,
+so a decline never makes it ask. Anything that sends, schedules, spawns work,
+changes config or credentials, or widens who can see data keeps declaring its
+effects (or `unknown()`).
+
+- Tools declare a call's effects (`EffectKey`: egress `host:port`, absolute
+  paths for delete/write/configuration, named credential/process). The
+  kernel refuses any call overlapping `RunState::declined` with
+  `[OWNER DECLINED]` before any hook runs, and sends no new card.
+- `aidaemon_policies::ApprovalPolicy` asks; the app supplies only its rules
+  (`AppApprovalRules` in `src/agent/runtime/approvals.rs`: the http_request
+  and terminal ladders, with turn facts, never `_` arguments), its grant
+  stores, and the resolver that sends the card. Timeout, send failure and
+  Deny all decline. `EgressGuard` refuses secrets in outbound calls with
+  `[EGRESS BLOCKED]` before anyone is asked.
+- After a decline, a call whose effects are incomplete is asked again even
+  when a rule or grant would allow it: an egress or destructive one after any
+  decline, any non-read-only one after a declined delete, write,
+  configuration or call.
+- A child agent starts with its parent run's declines
+  (`InheritedAuthority::declined`, seeded into the child's `RunState` after
+  its user message is set). Session grants are shared with children.
+- The dispatcher runs a terminal call exactly as the kernel judged it,
+  keyed by run and call id, with the judged scope; a terminal call with no
+  judgment is refused ("requires approval through the agent kernel").
+- A run in which the owner declined something never ends `Succeeded`.
 
 ## Test & Fixture Data Hygiene
 
@@ -384,6 +466,7 @@ cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
 cargo run --bin db_probe --features encryption -- --token-hours 24
 cargo run --bin db_probe --features encryption -- --fabrication-audit --eval-hours 72
 cargo run --bin db_probe --features encryption -- --gate-outcomes --eval-hours 168
+cargo run --bin db_probe --features encryption -- --cache-reuse --eval-hours 72
 ```
 
 `--fabrication-audit` is a post-hoc trace check: it flags tasks whose final
@@ -391,8 +474,16 @@ assistant reply claims a side-effecting action (posted/ran/deployed/wrote a
 file, etc.) while the task made zero tool calls — a candidate fabricated
 completion. It verifies outcomes rather than predicting tool-need up front.
 
+`--cache-reuse` (with `--eval-hours N`) reports prompt-cache reuse of agent
+turns by model, first call versus later calls of a run. Later calls resend an
+append-only transcript, so low reuse there means something rewrote the prefix
+(or the provider routed the call to a cold cache); check it before and after
+any change to message assembly or provider request building.
+
 `--gate-outcomes` (with `--eval-hours N`) measures gates by what happened after
-they intervened: each gate decision point or tool refusal is grouped by gate and
+they intervened (while `task_assessment = "shadow"`, `assessor_would_refuse`
+rows appear there too: calls the assessor's authority view would have refused,
+which ran anyway): each gate decision point or tool refusal is grouped by gate and
 its task labelled with the goal run's terminal status (else its `task_end`
 status). Check it before calling a gate "too strict" or "working".
 

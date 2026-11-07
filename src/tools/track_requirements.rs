@@ -11,8 +11,8 @@ use crate::events::{ExecutorExpectationItem, ExecutorExpectationsDeclaredData};
 use crate::plans::{ChecklistItem, PlanStore, StepStatus};
 use crate::traits::{
     RequestObservationTarget, RequestVerificationTargetKind, StableObservationSubject, Tool,
-    ToolArgumentContractViolation, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolSemanticFacet,
+    ToolArgumentContractViolation, ToolCallContext, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolSemanticFacet,
 };
 
 /// Item-level key under which canonicalization records resource-ID targets
@@ -26,7 +26,7 @@ pub const UNBOUND_TARGETS_KEY: &str = "_unbound_targets";
 pub const CHECKLIST_HEADER: &str = "Checklist updated";
 
 /// Union of the exact receipt subjects every registered tool advertises via
-/// `Tool::stable_observation_subjects`. Checklist resource-ID targets are bound
+/// `ToolSemantics::stable_observation_subjects`. Checklist resource-ID targets are bound
 /// against it: a value outside every advertised ID and member namespace can
 /// never be credited by a receipt, so it is never compiled into an obligation.
 #[derive(Debug, Clone, Default)]
@@ -323,6 +323,16 @@ pub(crate) fn executor_expectations_from_checklist_arguments(
             targets,
             observation_targets,
             unbound_targets: unbound_targets_of(item),
+            depends_on: item
+                .get("depends_on")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             status: item
                 .get("status")
                 .and_then(Value::as_str)
@@ -398,7 +408,8 @@ impl Tool for TrackRequirementsTool {
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
-         Mark items 'completed' as you finish them, or 'deferred' if you intentionally skip one. \
+         Mark items 'completed' as you finish them, or 'deferred' if you will not do one: the run \
+         may then end, but a deferred or removed item is reported as not done, never as done. \
          Skip this only for a single direct operation or when the user forbids it."
     }
 
@@ -508,33 +519,32 @@ impl Tool for TrackRequirementsTool {
         })
     }
 
-    fn canonicalize_arguments(
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
         &self,
         arguments: &str,
-    ) -> Result<String, ToolArgumentContractViolation> {
-        bind_checklist_targets(arguments, &self.vocabulary)
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
     }
+}
 
-    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
-        let value: Value = serde_json::from_str(arguments).map_err(|error| {
-            ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
-        })?;
-        if let Some(items) = value.get("items").and_then(Value::as_array) {
-            for (index, item) in items.iter().enumerate() {
-                parse_expectation_targets(item.get("targets")).map_err(|error| {
-                    ToolArgumentContractViolation::new(format!(
-                        "item {index} has invalid evidence targets: {error}"
-                    ))
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+impl TrackRequirementsTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let v: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-        let session_id = match v.get("_session_id").and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => s.to_string(),
+        let session_id = match facts.session_id.as_str() {
+            s if !s.is_empty() => s.to_string(),
             _ => {
                 return Ok(
                     "track_requirements: no session context available; checklist not saved."
@@ -542,10 +552,7 @@ impl Tool for TrackRequirementsTool {
                 )
             }
         };
-        let task_id = v
-            .get("_task_id")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
+        let task_id = facts.task_id.clone();
 
         let Some(raw_items) = v.get("items").and_then(Value::as_array) else {
             return Ok("track_requirements: no items provided.".to_string());
@@ -667,6 +674,38 @@ impl Tool for TrackRequirementsTool {
         ));
         Ok(output)
     }
+}
+
+impl crate::traits::ToolSemantics for TrackRequirementsTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            requirement_checklist: true,
+            ..Default::default()
+        }
+    }
+
+    fn canonicalize_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<String, ToolArgumentContractViolation> {
+        bind_checklist_targets(arguments, &self.vocabulary)
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let value: Value = serde_json::from_str(arguments).map_err(|error| {
+            ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
+        })?;
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                parse_expectation_targets(item.get("targets")).map_err(|error| {
+                    ToolArgumentContractViolation::new(format!(
+                        "item {index} has invalid evidence targets: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         // Checklist bookkeeping cannot prove a requested mutation occurred.
@@ -687,6 +726,8 @@ impl Tool for TrackRequirementsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
+    use crate::traits::ToolSemantics;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_tool() -> (TrackRequirementsTool, Arc<PlanStore>) {
@@ -782,14 +823,16 @@ mod tests {
     async fn test_track_requirements_persists_and_returns_rendered_list() {
         let (tool, plan_store) = test_tool().await;
         let args = json!({
-            "_session_id": "sess-1",
             "items": [
                 {"text": "create script", "status": "in_progress"},
                 {"text": "send the file", "status": "pending"}
             ]
         })
         .to_string();
-        let out = tool.call(&args).await.unwrap();
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-1"))
+            .await
+            .unwrap();
         assert!(out.contains("create script"));
         assert!(out.contains("send the file"));
         let plan = plan_store
@@ -806,12 +849,13 @@ mod tests {
         let (tool, plan_store) = test_tool().await;
         let mk = |status: &str| {
             json!({
-                "_session_id": "sess-2",
                 "items": [{"text": "send the file", "status": status}]
             })
             .to_string()
         };
-        tool.call(&mk("pending")).await.unwrap();
+        tool.call_with(&mk("pending"), crate::testing::call_facts("sess-2"))
+            .await
+            .unwrap();
         // While still pending it is the session's active (incomplete) checklist.
         let id = plan_store
             .get_incomplete_for_session("sess-2")
@@ -820,7 +864,9 @@ mod tests {
             .unwrap()
             .id;
 
-        tool.call(&mk("completed")).await.unwrap();
+        tool.call_with(&mk("completed"), crate::testing::call_facts("sess-2"))
+            .await
+            .unwrap();
         // Once all items are completed the plan is auto-completed (no longer
         // "incomplete"), so fetch it by id to verify the final state.
         let plan = plan_store.get(&id).await.unwrap().unwrap();
@@ -865,8 +911,6 @@ mod tests {
     /// no adapter reports.
     fn audit_checklist_arguments(status: &str) -> Value {
         json!({
-            "_session_id": "sess-audit",
-            "_task_id": "task-audit",
             "items": [
                 {
                     "text": "Audit the schedule state and latest run outcome.",
@@ -930,7 +974,11 @@ mod tests {
             "the drop must be recorded, never silent"
         );
 
-        let out = tool.call(&canonical).await.unwrap();
+        let facts = crate::traits::ToolCallContext {
+            task_id: Some("task-audit".into()),
+            ..crate::testing::call_facts("sess-audit")
+        };
+        let out = tool.call_with(&canonical, facts).await.unwrap();
         assert!(
             out.contains("x_owner_credential_state"),
             "the model must be told which target was unbound: {out}"
@@ -1051,7 +1099,7 @@ mod tests {
             }]
         })
         .to_string();
-        let violation = tool.prepare_invocation(&raw).unwrap_err();
+        let violation = crate::traits::prepare_invocation(&tool, &raw).unwrap_err();
         assert!(violation.reason.contains("item 0"), "{violation:?}");
     }
 

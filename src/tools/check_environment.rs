@@ -1,12 +1,18 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{
-    active_execution_backend, BackendPath, ExecutionRequest, SharedExecutionBackend,
-};
+use crate::execution::{BackendPath, ExecutionRequest, SharedExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
-pub struct CheckEnvironmentTool;
+pub struct CheckEnvironmentTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl CheckEnvironmentTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 /// Runtimes/tools to check with their version flags.
 const TOOLS_TO_CHECK: &[(&str, &str)] = &[
@@ -83,24 +89,10 @@ impl Tool for CheckEnvironmentTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let path_str = args["path"].as_str().unwrap_or(".");
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let check_dir = backend.resolve_path(path_str).await?;
 
         let mut output = String::new();
@@ -171,6 +163,29 @@ impl Tool for CheckEnvironmentTool {
         }
 
         Ok(output)
+    }
+}
+
+impl crate::traits::ToolSemantics for CheckEnvironmentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 
@@ -303,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = CheckEnvironmentTool;
+        let tool = CheckEnvironmentTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "check_environment");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -312,7 +327,10 @@ mod tests {
     #[tokio::test]
     async fn test_check_environment_runs() {
         let args = json!({}).to_string();
-        let result = CheckEnvironmentTool.call(&args).await.unwrap();
+        let result = CheckEnvironmentTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         // Should at least find git (we're in a git repo)
         assert!(result.contains("Available Tools"));
     }
@@ -324,7 +342,10 @@ mod tests {
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:18").unwrap();
 
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = CheckEnvironmentTool.call(&args).await.unwrap();
+        let result = CheckEnvironmentTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains(".nvmrc"));
         assert!(result.contains("18.17.0"));
         assert!(result.contains("Dockerfile"));
@@ -361,7 +382,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_tool_git() {
-        let result = check_tool(active_execution_backend(), "git", "--version").await;
+        let result = check_tool(
+            crate::execution::active_execution_backend(),
+            "git",
+            "--version",
+        )
+        .await;
         assert!(result.is_some());
         let (path, version) = result.unwrap();
         assert!(path.contains("git"));
@@ -371,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_tool_nonexistent() {
         let result = check_tool(
-            active_execution_backend(),
+            crate::execution::active_execution_backend(),
             "nonexistent_tool_xyz_12345",
             "--version",
         )

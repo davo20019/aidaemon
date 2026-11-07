@@ -1452,6 +1452,26 @@ pub struct MandateDecisionCycle {
 }
 
 impl MandateDecisionCycle {
+    /// The durable summary a committed non-action decision (WAIT, ASK,
+    /// STOP) closes its review with; `None` for ACT, whose review goes on.
+    pub fn non_action_summary(&self) -> Option<String> {
+        match self.outcome {
+            MandateDecisionOutcome::Act => None,
+            MandateDecisionOutcome::Wait => Some(format!(
+                "WAIT recorded: {} Review again at {}.",
+                self.rationale,
+                self.reconsider_at
+                    .as_deref()
+                    .unwrap_or("the bounded default")
+            )),
+            MandateDecisionOutcome::Ask => Some(format!(
+                "ASK recorded: {}",
+                self.question.as_deref().unwrap_or(&self.rationale)
+            )),
+            MandateDecisionOutcome::Stop => Some(format!("STOP recorded: {}", self.rationale)),
+        }
+    }
+
     pub fn new(
         mandate_id: &str,
         goal_run_id: &str,
@@ -2086,16 +2106,6 @@ pub enum MandateMutationAttemptStatus {
 }
 
 impl MandateMutationAttemptStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reserved => "reserved",
-            Self::NeverDispatched => "never_dispatched",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Ambiguous => "ambiguous",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "reserved" => Some(Self::Reserved),
@@ -2116,13 +2126,6 @@ pub enum MandateMutationEvidence {
 }
 
 impl MandateMutationEvidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ToolReported => "tool_reported",
-            Self::StructuredMetadata => "structured_metadata",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "tool_reported" => Some(Self::ToolReported),
@@ -2157,29 +2160,6 @@ pub struct MandateMutationAttempt {
     pub exit_code: Option<i32>,
     pub reserved_at: String,
     pub completed_at: Option<String>,
-}
-
-/// Strict, content-free receipt projection emitted by the common dispatcher
-/// after the durable ToolResult event append succeeds.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MandateMutationOutcomeProjection {
-    pub grant: MandateAuthorityGrant,
-    pub goal_run_id: String,
-    pub task_id: String,
-    pub task_attempt_id: String,
-    pub tool_call_id: String,
-    pub status: MandateMutationAttemptStatus,
-    pub receipt_schema_version: u16,
-    pub outcome_evidence: Option<MandateMutationEvidence>,
-    pub timed_out: bool,
-    pub background_started: bool,
-    pub detached: bool,
-    pub completion_notifications_enabled: bool,
-    pub transport_error_present: bool,
-    pub semantics_match: bool,
-    pub http_status: Option<u16>,
-    pub exit_code: Option<i32>,
-    pub completed_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2529,18 +2509,22 @@ impl MandateRunNotification {
                     humanize_reason(reason.as_str()),
                 )
             }
-            MandateRunNotificationKind::ReviewFailed { reason }
-                if matches!(
-                    reason,
-                    MandateFinalizationRejectReason::DecisionMissing
-                        | MandateFinalizationRejectReason::DeliberatorFailed
-                ) =>
-            {
-                format!(
-                    "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
-                    humanize_reason(reason.as_str()),
-                )
-            }
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DecisionMissing,
+            } => format!(
+                "{label}: a review was interrupted before it decided anything ({}). Nothing was done. It's still active and will retry automatically. {reference}",
+                humanize_reason(MandateFinalizationRejectReason::DecisionMissing.as_str()),
+            ),
+            // The deliberator may fail after committing an ACT and starting an
+            // executor, so this notice claims neither "nothing decided" nor
+            // "nothing done"; an unconfirmed external change takes the
+            // reconciliation path instead.
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed,
+            } => format!(
+                "{label}: a review failed before it finished ({}). Ask me what it got to if you want the details. It's still active and will retry automatically. {reference}",
+                humanize_reason(MandateFinalizationRejectReason::DeliberatorFailed.as_str()),
+            ),
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
                 "{label}: a review could not be verified ({}), so nothing was done. {reference}",
                 humanize_reason(reason.as_str()),
@@ -2569,6 +2553,7 @@ impl MandateRunNotification {
             expires_at: None,
             task_id: None,
             action_token: Some(id),
+            untrusted: false,
         }
     }
 }
@@ -2592,9 +2577,29 @@ mod tests {
             "2026-08-11T12:00:00Z",
         );
         let message = notice.message();
-        assert!(message.contains("Nothing was done"));
+        // A deliberator can fail after committing an ACT and starting an
+        // executor, so its notice claims neither "decided nothing" nor
+        // "nothing was done".
+        assert!(!message.contains("decided anything"), "{message}");
+        assert!(!message.contains("Nothing was done"), "{message}");
         assert!(message.contains("still active"));
         assert!(message.contains("retry automatically"));
+
+        let missing = MandateRunNotification::new(
+            "08012d3d-synthetic",
+            1,
+            "goal-synthetic",
+            "566978b6-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DecisionMissing,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        )
+        .message();
+        assert!(missing.contains("before it decided anything"), "{missing}");
+        assert!(missing.contains("Nothing was done"), "{missing}");
     }
 
     #[test]

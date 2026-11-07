@@ -1,0 +1,18 @@
+[package]
+name = "aidaemon-agents"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: agents (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[dependencies]
+aidaemon-core = { path = "../aidaemon-core" }
+async-trait = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+tokio = { version = "1", features = ["full"] }

@@ -34,6 +34,17 @@ impl Agent {
         session_id: &str,
         content: &str,
     ) -> anyhow::Result<()> {
+        self.record_auxiliary_assistant_note_in_turn(session_id, content, None)
+            .await
+    }
+
+    /// `turn_id` stamps the note; `None` joins the session's current turn.
+    async fn record_auxiliary_assistant_note_in_turn(
+        &self,
+        session_id: &str,
+        content: &str,
+        turn_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -50,6 +61,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.2,
+            turn_id: turn_id.map(str::to_string),
             ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(&emitter, &msg, "system", None, None)
@@ -62,13 +74,24 @@ impl Agent {
         prefix: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.record_parent_visible_result_note_in_turn(session_id, prefix, text, None)
+            .await
+    }
+
+    pub(crate) async fn record_parent_visible_result_note_in_turn(
+        &self,
+        session_id: &str,
+        prefix: &str,
+        text: &str,
+        turn_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(());
         }
 
         let summary = format!("{}:\n\n{}", prefix, trimmed);
-        self.record_auxiliary_assistant_note(session_id, &summary)
+        self.record_auxiliary_assistant_note_in_turn(session_id, &summary, turn_id)
             .await
     }
 }

@@ -55,16 +55,6 @@ impl Tool for SkillResourcesTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
@@ -124,6 +114,28 @@ impl Tool for SkillResourcesTool {
                 "Unknown action '{}'. Use 'list' or 'read'.",
                 action
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for SkillResourcesTool {
+    /// A skill's bundled files are its author's; a skill's declared source
+    /// is a field of the skill's own file, so it cannot vouch for itself.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
         }
     }
 }

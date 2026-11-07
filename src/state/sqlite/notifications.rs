@@ -98,8 +98,9 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         sqlx::query(
             "INSERT INTO notification_queue
                 (id, goal_id, session_id, notification_type, priority, message,
-                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token,
+                 untrusted)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.goal_id)
@@ -113,6 +114,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         .bind(&entry.expires_at)
         .bind(&entry.task_id)
         .bind(&entry.action_token)
+        .bind(entry.untrusted)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -143,8 +145,9 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         sqlx::query(
             "INSERT INTO notification_queue
                 (id, goal_id, session_id, notification_type, priority, message,
-                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token,
+                 untrusted)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.goal_id)
@@ -158,6 +161,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         .bind(&entry.expires_at)
         .bind(&entry.task_id)
         .bind(&entry.action_token)
+        .bind(entry.untrusted)
         .execute(&mut *tx)
         .await?;
 
@@ -171,7 +175,8 @@ impl crate::traits::NotificationStore for SqliteStateStore {
     ) -> anyhow::Result<Vec<crate::traits::NotificationEntry>> {
         let rows = sqlx::query(
             "SELECT id, goal_id, session_id, notification_type, priority, message,
-                    created_at, delivered_at, attempts, expires_at, task_id, action_token
+                    created_at, delivered_at, attempts, expires_at, task_id, action_token,
+                    untrusted
              FROM notification_queue
              WHERE delivered_at IS NULL
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
@@ -231,6 +236,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
                 expires_at: row.get("expires_at"),
                 task_id: row.get("task_id"),
                 action_token: row.get("action_token"),
+                untrusted: row.get("untrusted"),
             });
         }
         Ok(entries)

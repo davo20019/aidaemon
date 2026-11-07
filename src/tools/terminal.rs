@@ -1,3 +1,4 @@
+use crate::traits::ToolSemantics;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,20 +16,17 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::SelfCorrectionConfig;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
     DecisionType, DiagnosticSeverity, EventStore, EventType,
 };
-use crate::execution::{
-    active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
-};
+use crate::execution::{BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
-    StateStore, Tool, ToolArgumentContractViolation, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolMutationEffects,
-    ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    StateStore, Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -59,6 +57,8 @@ const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// still reported synchronously with its exit code, then it is handed to
 /// background tracking with a typed `process_state` receipt.
 const DETACH_STARTUP_GRACE: Duration = Duration::from_millis(1500);
+/// Per-stream tail of startup output returned with a background launch.
+const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 
 /// A disowned background process (notifier-active, non-detached) that makes no
 /// progress (no CPU time, disk I/O, output growth, or process-tree change) for
@@ -470,12 +470,13 @@ fn format_deliverable_paths(paths: &[PathBuf]) -> String {
 /// Uses exact write targets from the enforced process manifest. Shell source,
 /// referenced scripts, and checklist prose cannot create artifact authority.
 async fn attribute_background_deliverable(
+    backend: &SharedExecutionBackend,
     declared_write_paths: &[String],
     command_start: std::time::SystemTime,
     command_end: std::time::SystemTime,
 ) -> DeliverableAttribution {
     let ctx = crate::tools::background_deliverable::attribute_declared_deliverables_backend(
-        active_execution_backend(),
+        backend.clone(),
         declared_write_paths,
         command_start,
         command_end,
@@ -514,6 +515,28 @@ fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> 
     }
 }
 
+/// Text files up to this size are quoted in the delivery caption (Telegram
+/// captions stop at 1024 characters).
+const SMALL_TEXT_PREVIEW_BYTES: usize = 600;
+
+/// The trimmed content of a small UTF-8 text file without control
+/// characters, so a delivery can answer "what does it contain" inline.
+fn small_text_preview(path: &std::path::Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() as usize > SMALL_TEXT_PREVIEW_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(std::fs::read(path).ok()?).ok()?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Build the user-facing caption for an auto-delivered background result file.
 /// Never embeds the shell command — only the filename and an optional summary.
 fn build_deliverable_caption(filename: &str, summary: Option<&str>) -> String {
@@ -531,6 +554,7 @@ fn build_deliverable_caption(filename: &str, summary: Option<&str>) -> String {
 /// not. Returns nothing; all paths are best-effort with logging.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_attributed_background_file(
+    backend: &SharedExecutionBackend,
     path: &std::path::Path,
     session_id: &str,
     _command_summary: &str,
@@ -547,7 +571,6 @@ async fn deliver_attributed_background_file(
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let backend = active_execution_backend();
     let mut delivery_path = path.to_path_buf();
     if backend.kind() != BackendKind::Local {
         let backend_path = match backend.resolve_path(&path.to_string_lossy()).await {
@@ -636,7 +659,9 @@ async fn deliver_attributed_background_file(
         }
     };
 
-    let caption = build_deliverable_caption(&ready.filename, None);
+    let preview = small_text_preview(&ready.canonical_path)
+        .map(|text| format!("Done. {} contains:\n{}", ready.filename, text));
+    let caption = build_deliverable_caption(&ready.filename, preview.as_deref());
     let msg = MediaMessage {
         session_id: session_id.to_string(),
         caption: caption.clone(),
@@ -778,6 +803,15 @@ pub(crate) async fn deliver_background_completion_ping(
                 }
             }
         }
+        // A fresh ping is still a status surface: return its id so the
+        // post-delivery transition can resolve it instead of leaving
+        // "Preparing your result" in the chat forever.
+        match hub.send_text_tracked(session_id, message).await {
+            Ok(surface_id) => return surface_id,
+            Err(error) => {
+                warn!(pid, session_id, %error, "Fresh background completion ping failed");
+            }
+        }
     }
     deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
     None
@@ -864,15 +898,18 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
-    /// Permission persistence mode
+    /// Permission persistence mode: picks the buttons on the owner's cards.
     permission_mode: PermissionMode,
     /// Host vs sandbox execution.
     confinement: crate::types::TerminalConfinement,
-    approval_tx: super::ApprovalBroker,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
     task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
     completed: Arc<Mutex<HashMap<u32, CompletedProcess>>>,
+    /// The trust judged for each background process when it was launched,
+    /// by pid: `check` and `kill` output carries it; an unknown pid is
+    /// untrusted. Daemon-held; the model can only name a pid.
+    launch_trust: Arc<std::sync::Mutex<HashMap<u32, aidaemon_core::SourceTrust>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
@@ -900,17 +937,12 @@ pub struct TerminalTool {
     inbox_dir: PathBuf,
     /// Allowed outbox directories for harness-side file delivery validation.
     outbox_dirs: Vec<PathBuf>,
-    /// Self-correction bridge config. Consulted by the idle-reaper: when a hung
-    /// background command is stopped, this config decides whether an autonomous
-    /// remediation task is dispatched (live), shadow-logged, or skipped
-    /// (disabled / unsafe scope). Defaults to the safe-off
-    /// [`SelfCorrectionConfig::default`] unless wired via
-    /// [`TerminalTool::with_self_correction`].
-    self_correction: SelfCorrectionConfig,
     /// Configured model runtime used to assess novel shell commands by their
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
     command_risk_runtime: OnceLock<SharedLlmRuntime>,
+    /// How long the semantic assessment may take before it fails closed.
+    assessment_timeout: Duration,
 }
 
 /// Check if a command string contains shell operators.
@@ -1290,143 +1322,6 @@ fn is_broad_scan_root(path: &str) -> bool {
     false
 }
 
-/// Expand a leading `~` / `$HOME` in a shell path operand to the absolute home
-/// directory. Returns `None` if `HOME` is unset. UTF-8-safe (operates on
-/// `char`/`str` boundaries, never raw byte indices).
-fn expand_home_in_operand(operand: &str, home: &str) -> Option<String> {
-    if home.is_empty() {
-        return None;
-    }
-    let home = home.trim_end_matches('/');
-    if operand == "~" || operand == "$HOME" {
-        return Some(home.to_string());
-    }
-    if let Some(rest) = operand.strip_prefix("~/") {
-        return Some(format!("{home}/{rest}"));
-    }
-    if let Some(rest) = operand.strip_prefix("$HOME/") {
-        return Some(format!("{home}/{rest}"));
-    }
-    None
-}
-
-/// Derive the read-only remediation scope (working_dir) from the FAILED
-/// command's actual target, rather than always using the daemon cwd.
-///
-/// Semantics (3c scope relax):
-/// - A target over home (`~`, `$HOME`, the home path, or a glob beneath it,
-///   e.g. `du ~/*`, `find ~ …`) → the home directory.
-/// - A target over `/` (e.g. `du /`, `find / …`) → `/`.
-/// - A specific bounded dir (e.g. a path under home/projects) → that dir,
-///   canonicalized when it exists.
-/// - Indeterminate (no path operand) → the daemon cwd fallback (canonicalized),
-///   as before.
-///
-/// The safety for broad scopes lives in the sandbox's read-only allowlist +
-/// sensitive-file guards, not in this derived working_dir. UTF-8-safe: parsing
-/// goes through `shell_words` + `str` ops, no raw byte slicing.
-fn derive_correction_scope_from_command(command: &str) -> std::path::PathBuf {
-    let fallback = || TerminalTool::correction_working_dir();
-
-    let backend = active_execution_backend();
-    let home = Some(
-        backend
-            .home_hint()
-            .as_str()
-            .trim_end_matches('/')
-            .to_string(),
-    );
-
-    // Walk every chained segment; take the first segment that has a usable path
-    // operand, preferring the broadest scope it implies.
-    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
-        let Ok(tokens) = shell_words::split(&segment) else {
-            continue;
-        };
-        // Skip the leading tool name; inspect its operands.
-        for tok in tokens.iter().skip(1) {
-            if tok.starts_with('-') {
-                continue; // flag, not a path
-            }
-
-            // Broad root: `/`, `~`, `$HOME`, the home path, or a glob over them.
-            if is_broad_scan_root(tok) {
-                if tok.trim() == "/" {
-                    return std::path::PathBuf::from("/");
-                }
-                // `~`, `$HOME`, or the literal home path → home dir.
-                if let Some(h) = &home {
-                    let p = std::path::PathBuf::from(h);
-                    return if backend.kind() == BackendKind::Local {
-                        std::fs::canonicalize(&p).unwrap_or(p)
-                    } else {
-                        p
-                    };
-                }
-                return fallback();
-            }
-
-            // A glob/path beneath home (e.g. `~/*`, `$HOME/*`, `<home>/*`).
-            // Strip a trailing glob component so `~/*` resolves to home itself.
-            let expanded = home
-                .as_deref()
-                .and_then(|home| expand_home_in_operand(tok, home))
-                .unwrap_or_else(|| tok.to_string());
-            let scope = scope_dir_from_path_operand(&expanded, home.as_deref());
-            if let Some(dir) = scope {
-                let p = std::path::PathBuf::from(&dir);
-                return if backend.kind() == BackendKind::Local {
-                    std::fs::canonicalize(&p).unwrap_or(p)
-                } else {
-                    p
-                };
-            }
-        }
-    }
-
-    fallback()
-}
-
-/// Reduce a (home-expanded) path operand to the directory scope it targets.
-/// A trailing glob segment (e.g. `*`, `foo*`) is dropped so `<home>/*` →
-/// `<home>`. Returns `None` for operands that carry no usable absolute path.
-fn scope_dir_from_path_operand(expanded: &str, home: Option<&str>) -> Option<String> {
-    let trimmed = expanded.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Drop a trailing glob component so `/home/u/*` → `/home/u`.
-    let without_glob = if let Some(idx) = trimmed.rfind('/') {
-        let (parent, last) = trimmed.split_at(idx); // last starts with '/'
-        let last = &last[1..];
-        if last.contains('*') || last.contains('?') || last == "." {
-            parent
-        } else {
-            trimmed
-        }
-    } else if trimmed.contains('*') || trimmed.contains('?') {
-        // Bare glob with no slash and not home-rooted → indeterminate.
-        return None;
-    } else {
-        trimmed
-    };
-
-    let candidate = without_glob.trim_end_matches('/');
-    let candidate = if candidate.is_empty() { "/" } else { candidate };
-
-    // Only absolute paths are usable scopes. If the operand collapsed to the
-    // home dir, return that; otherwise require an absolute path.
-    if let Some(h) = home {
-        if candidate == h {
-            return Some(h.to_string());
-        }
-    }
-    if std::path::Path::new(candidate).is_absolute() {
-        return Some(candidate.to_string());
-    }
-    None
-}
-
 /// Detect an unbounded whole-disk/whole-home scan in a single shell segment.
 /// `du` over a broad root is always flagged (it walks the full subtree to sum
 /// sizes; `-d` only limits output depth). `find` over a broad root is flagged
@@ -1570,10 +1465,12 @@ fn format_background_progress_message(elapsed_secs: u64, output: &str) -> String
 /// One deterministic transition after the frequent progress-ping budget is
 /// exhausted. This deliberately does not re-enter the agent loop: doing that
 /// from inside the process-monitoring `select!` used to block observation of
-/// the process exit and could strand the promised final result.
+/// the process exit and could strand the promised final result. It is the last
+/// edit the card gets, so its duration is a floor ("over") that stays true
+/// rather than a clock that silently stops.
 fn format_background_monitoring_notice(elapsed_secs: u64, output: &str) -> String {
     let mut message = format!(
-        "⏳ **Taking longer than expected** · {}\n\nIt's still running and I'm still monitoring it. I'll let you know when it finishes or if it needs attention.",
+        "⏳ **Taking longer than expected** · running for over {}\n\nI'm still monitoring it and will let you know when it finishes or if it needs attention. Ask me for its status or to stop it anytime.",
         humanize_elapsed(elapsed_secs)
     );
     if let Some(note) = output_count_note(output) {
@@ -3501,15 +3398,17 @@ fn build_background_reengagement_followup(command_summary: &str, output: &str) -
 }
 
 impl TerminalTool {
+    /// `_approval_tx` is unused: the owner's approval cards come from the
+    /// agent kernel (`AppApprovalRules`), never from the tool.
     pub async fn new(
+        backend: SharedExecutionBackend,
         allowed_prefixes: Vec<String>,
-        approval_tx: super::ApprovalBroker,
+        _approval_tx: super::ApprovalBroker,
         initial_timeout_secs: u64,
         max_output_chars: usize,
         permission_mode: PermissionMode,
         pool: SqlitePool,
     ) -> Self {
-        let backend = active_execution_backend();
         // Log permission mode on startup
         match permission_mode {
             PermissionMode::Yolo => {
@@ -3615,11 +3514,11 @@ impl TerminalTool {
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
             permission_mode,
             confinement: crate::types::TerminalConfinement::default(),
-            approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
             task_processes: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
+            launch_trust: Arc::new(std::sync::Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
@@ -3633,8 +3532,8 @@ impl TerminalTool {
             plan_store: OnceLock::new(),
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
-            self_correction: SelfCorrectionConfig::default(),
             command_risk_runtime: OnceLock::new(),
+            assessment_timeout: super::semantic_command_risk::ASSESSMENT_TIMEOUT,
         }
     }
 
@@ -3645,15 +3544,6 @@ impl TerminalTool {
     pub fn with_delivery_dirs(mut self, inbox_dir: PathBuf, outbox_dirs: Vec<PathBuf>) -> Self {
         self.inbox_dir = inbox_dir;
         self.outbox_dirs = outbox_dirs;
-        self
-    }
-
-    /// Wire the self-correction config so the idle-reaper can dispatch
-    /// autonomous remediation when it stops a hung background command. Without
-    /// this, `self_correction` is the safe-off default and the reaper only ever
-    /// sends the existing user notification.
-    pub fn with_self_correction(mut self, config: SelfCorrectionConfig) -> Self {
-        self.self_correction = config;
         self
     }
 
@@ -3689,6 +3579,14 @@ impl TerminalTool {
             self.command_risk_runtime.set(runtime).is_ok(),
             "TerminalTool::set_command_risk_runtime called more than once"
         );
+    }
+
+    /// Semantic assessments that fail closed after `timeout` instead of
+    /// fifteen seconds.
+    #[cfg(test)]
+    pub(crate) fn with_assessment_timeout(mut self, timeout: Duration) -> Self {
+        self.assessment_timeout = timeout;
+        self
     }
 
     /// Set channel hub reference for immediate background progress/completion delivery.
@@ -3824,14 +3722,358 @@ impl TerminalTool {
         }
     }
 
-    async fn request_approval(
+    /// The hard blocks a `run` meets before any approval (T2–T7, in order):
+    /// unscoped recursive grep and unbounded disk scans, large unquoted
+    /// heredocs, AppleScript UI scripting, daemonization by a non-owner or
+    /// without `detach=true`, irreversible broad deletes, and detached runs
+    /// in trusted scheduled sessions. The tool refuses these whatever the
+    /// owner said, so the kernel's rules never ask about them.
+    fn pre_approval_block(
         &self,
-        session_id: &str,
+        args: &TerminalArgs,
         command: &str,
-        risk_level: RiskLevel,
-        mut warnings: Vec<String>,
-        task_id: Option<&str>,
-    ) -> anyhow::Result<ApprovalResponse> {
+        trust: &TerminalTrust,
+    ) -> Option<String> {
+        if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
+            return Some(recursive_grep_block_message(&pattern, &path));
+        }
+        if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
+            return Some(unbounded_scan_block_message(&tool_name, &root));
+        }
+        // Soft-block large heredoc file creation: redirects to write_file
+        // which writes atomically without shell quoting issues. Allow quoted
+        // heredoc delimiters (<<'EOF' or << 'EOF') since they avoid shell
+        // expansion issues and serve as a fallback when write_file fails
+        // with JSON escaping errors on complex content.
+        if command.contains("<<") && command.len() > 500 {
+            let uses_quoted_heredoc = command.contains("<<'")
+                || command.contains("<< '")
+                || command.contains("<<\"")
+                || command.contains("<< \"");
+            if !uses_quoted_heredoc {
+                return Some(
+                    "Large heredoc file creation is unreliable through the terminal. \
+                     Use the `write_file` tool instead — it writes files atomically \
+                     and avoids shell quoting issues. If write_file fails with JSON \
+                     encoding errors, use a quoted heredoc: cat > file << 'EOF'"
+                        .to_string(),
+                );
+            }
+        }
+        // Hard-redirect AppleScript GUI automation to computer_use: the
+        // terminal path has none of its safety layer (approvals, blocked
+        // apps, action confirmation, lock detection) and System Events input
+        // fails against a locked screen exactly like synthetic input.
+        if is_system_events_ui_scripting(command) {
+            return Some(
+                "Blocked: AppleScript System Events UI scripting (click/keystroke) \
+                 through the terminal bypasses the computer_use safety layer and \
+                 cannot deliver input when the screen is locked.\n\n\
+                 Use the `computer_use` tool for GUI automation — it is \
+                 approval-gated, lock-aware, and works from screenshots and the \
+                 accessibility tree. If computer_use is unavailable or blocked \
+                 (e.g. the screen is locked), stop and tell the user what you \
+                 need instead of scripting around it."
+                    .to_string(),
+            );
+        }
+        let daemon_hits = detect_daemonization_primitives(command);
+        if !daemon_hits.is_empty() {
+            if !trust.owner {
+                return Some(format!(
+                    "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
+                    daemon_hits.join(", ")
+                ));
+            }
+            if !args.detach {
+                return Some(format!(
+                    "Blocked: daemonization primitives detected ({}). \
+                     Set `detach=true` explicitly for intentional long-lived background execution.",
+                    daemon_hits.join(", ")
+                ));
+            }
+        }
+        // Deterministic hard block for irreversible broad-path deletes.
+        if let Some(reason) = hard_block_reason(command, self.backend.workspace_root().as_str()) {
+            warn!(
+                session_id = %trust.session_id,
+                command = %command,
+                reason = %reason,
+                "Blocked dangerous irreversible command"
+            );
+            return Some(format!(
+                "{} Use scoped, non-destructive commands instead.",
+                reason
+            ));
+        }
+        if args.detach && trust.trusted_session {
+            // Intentional: trusted scheduled sessions are auto-approved, so
+            // disallow detached long-lived processes in that mode.
+            return Some(
+                "Blocked: detach=true is not allowed for trusted scheduled sessions.".to_string(),
+            );
+        }
+        None
+    }
+
+    /// The owner-approval ladder for a `run` past the hard blocks: what the
+    /// owner must approve, or `None` when it runs without asking.
+    ///
+    /// Order (load-bearing; do not reorder):
+    ///   1. capability escalation  → new authority always asks
+    ///   2. daemonization          → the owner's Critical daemonization card
+    ///   3. untrusted trigger      → external triggers always ask
+    ///   4. detach && !allowed     → novel detached commands ask
+    ///   5. trusted session        → scheduled tasks run without asking; this
+    ///      precedes the floor on purpose (an explicit owner grant: unattended
+    ///      deploys use `ssh -i ~/.ssh/key`)
+    ///   6. approval floor         → protected credential path, never
+    ///      downgraded; before the explicit allow, so no grant skips it
+    ///   7. explicit allow         → a prior owner grant (session or persisted)
+    ///   8. semantic assessment    → ask only for dangerous effects; a failure
+    ///      or a timeout fails closed to Critical
+    ///   9. no assessor configured → Critical
+    async fn approval_ladder(
+        &self,
+        args: &TerminalArgs,
+        command: &str,
+        trust: &TerminalTrust,
+    ) -> Option<LadderAsk> {
+        let daemon_hits = detect_daemonization_primitives(command);
+        let daemonization = !daemon_hits.is_empty();
+        let deterministic_approval_floor = approval_floor_reason(command);
+        let mut approval_risk = RiskLevel::High;
+        let mut approval_warnings = Vec::new();
+        if args.detach && !daemonization {
+            approval_warnings.push(
+                "Detached execution requested (process may outlive task boundaries).".to_string(),
+            );
+        }
+        // `is_allowed` checks both permanent AND session-approved prefixes.
+        let is_allowed = self.is_allowed(command).await;
+        let requested_capabilities =
+            Self::requested_capabilities(run_is_confined(self.confinement), args, trust);
+        let capability_escalation_pending = !requested_capabilities.is_empty()
+            && !trust.trusted_session
+            && !self
+                .capabilities_granted(command, &requested_capabilities)
+                .await;
+        let needs_approval = if capability_escalation_pending {
+            // Elevated capability is new authority; no command-prefix grant
+            // or dispatcher preapproval stands in for the user seeing exactly
+            // what is being requested.
+            approval_warnings.push(format!(
+                "Requests elevated capabilities beyond the task scope: {}",
+                Self::describe_capabilities(&requested_capabilities)
+            ));
+            info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
+            true
+        } else if daemonization {
+            false
+        } else if trust.untrusted_source {
+            // External triggers always need approval regardless of mode
+            approval_warnings
+                .push("Command originated from an untrusted external trigger.".to_string());
+            info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
+            true
+        } else if args.detach && !is_allowed {
+            // Allowlisted commands (permanent or session approvals) may run
+            // detached without asking again; only novel detached commands do.
+            info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
+            true
+        } else if trust.trusted_session {
+            info!(command = %command, session = %trust.session_id, "Auto-approved: trusted scheduled task");
+            false
+        } else if let Some(reason) = deterministic_approval_floor {
+            // Before the explicit allow (owner ruling): an allowlisted or
+            // session-granted command touching a credential path still asks.
+            approval_warnings.push(reason);
+            true
+        } else if is_allowed {
+            info!(command = %command, "Auto-approved: explicit command grant");
+            false
+        } else if let Some(runtime) = self.command_risk_runtime.get() {
+            match assess_command(
+                runtime,
+                command,
+                &self.backend,
+                &trust.session_id,
+                self.state.as_ref(),
+                self.event_store.clone(),
+                self.assessment_timeout,
+            )
+            .await
+            {
+                Ok(semantic) => {
+                    approval_risk = semantic.risk_level;
+                    approval_warnings = semantic.warnings;
+                    if semantic.requires_approval {
+                        info!(command = %command, risk = %approval_risk, "Semantic command assessment requires owner approval");
+                        true
+                    } else {
+                        info!(command = %command, risk = %approval_risk, "Auto-approved by semantic command assessment");
+                        false
+                    }
+                }
+                Err(error) => {
+                    warn!(command = %command, %error, "Semantic command assessment failed; requesting approval");
+                    approval_risk = RiskLevel::Critical;
+                    approval_warnings.push(format!(
+                        "Semantic safety assessment unavailable; failed closed: {}",
+                        error
+                    ));
+                    true
+                }
+            }
+        } else {
+            approval_risk = RiskLevel::Critical;
+            approval_warnings
+                .push("Semantic safety assessment is not configured; failed closed.".to_string());
+            true
+        };
+
+        if daemonization {
+            // The owner's daemonization card (Critical); a capability
+            // escalation of the same run is asked on the same card.
+            let mut warnings = vec![
+                format!(
+                    "Daemonization primitives detected: {}",
+                    daemon_hits.join(", ")
+                ),
+                "Detached/background processes may survive cancellation and continue running."
+                    .to_string(),
+                "Approve only if this is intentional and necessary.".to_string(),
+            ];
+            if capability_escalation_pending {
+                warnings.extend(approval_warnings);
+            }
+            return Some(LadderAsk {
+                risk: RiskLevel::Critical,
+                warnings,
+            });
+        }
+        if !needs_approval {
+            return None;
+        }
+        // Approval history is useful context for the owner, but it never
+        // changes the decision or lowers risk.
+        if let Some(ref pool) = self.pool {
+            if let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
+                approval_warnings.push(format!(
+                    "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
+                    pattern.pattern,
+                    similarity * 100.0,
+                    pattern.approval_count,
+                    pattern.denial_count,
+                    pattern.confidence() * 100.0,
+                    pattern.is_trusted(),
+                ));
+            }
+        }
+        Some(LadderAsk {
+            risk: approval_risk,
+            warnings: approval_warnings,
+        })
+    }
+
+    /// The command a `run` call executes, if it is one.
+    fn run_command(args: &TerminalArgs) -> Option<&str> {
+        if !matches!(
+            TerminalAction::parse(&args.action),
+            TerminalAction::Run | TerminalAction::Unrecognized
+        ) {
+            return None;
+        }
+        let command = args
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let script = args
+            .script
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (command, script) {
+            (Some(command), None) => Some(command),
+            (None, Some(script)) => Some(script),
+            _ => None,
+        }
+    }
+
+    /// A terminal call's arguments, or why they cannot be read.
+    fn read_arguments(arguments: &Value) -> Result<TerminalArgs, String> {
+        serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())
+    }
+
+    /// Why a terminal call's arguments cannot be read, if they cannot.
+    pub(crate) fn unreadable_reason(arguments: &Value) -> Option<String> {
+        Self::read_arguments(arguments).err()
+    }
+
+    /// The card for a terminal call whose arguments cannot be read: nothing
+    /// about it can be judged, so the owner sees the raw arguments, Critical.
+    pub(crate) fn unreadable_request(
+        &self,
+        raw: &Value,
+        reason: &str,
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        let shown = raw.to_string();
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("terminal {shown}"),
+            subject: format!("terminal {shown}"),
+            risk: aidaemon_core::ApprovalRisk::Critical,
+            warnings: vec![
+                format!(
+                    "Execution target: {} ({}) workspace {}",
+                    self.backend.kind().as_str(),
+                    self.backend.id(),
+                    self.backend.workspace_root()
+                ),
+                format!(
+                    "The call's arguments could not be read ({reason}); nothing about what it \
+                     does could be judged."
+                ),
+            ],
+        }
+    }
+
+    /// The owner approval a terminal call needs, for the daemon's kernel
+    /// approval rules: the T8 ladder for `run` (after the hard blocks, which
+    /// the tool refuses on its own), the trust-all card, or `None`. The
+    /// subject is the full command line, which the terminal's grants match.
+    pub(crate) async fn owner_approval_request(
+        &self,
+        arguments: &Value,
+        trust: &TerminalTrust,
+    ) -> Result<Option<aidaemon_core::OwnerApprovalRequest>, String> {
+        let args: TerminalArgs = Self::read_arguments(arguments)?;
+        let (subject, ask) = match TerminalAction::parse(&args.action) {
+            // Always asked: the card is the only way trust-all turns on.
+            TerminalAction::TrustAll => (
+                Self::TRUST_ALL_SUBJECT.to_string(),
+                LadderAsk {
+                    risk: RiskLevel::Critical,
+                    warnings: Self::trust_all_warnings(),
+                },
+            ),
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                // Neither or both of command and script: the tool refuses it.
+                let Some(command) = Self::run_command(&args) else {
+                    return Ok(None);
+                };
+                if self.pre_approval_block(&args, command, trust).is_some() {
+                    return Ok(None);
+                }
+                let Some(ask) = self.approval_ladder(&args, command, trust).await else {
+                    return Ok(None);
+                };
+                (command.to_string(), ask)
+            }
+            _ => return Ok(None),
+        };
+        let mut warnings = ask.warnings;
         warnings.insert(
             0,
             format!(
@@ -3842,129 +4084,134 @@ impl TerminalTool {
             ),
         );
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
             let _ = emitter
                 .emit(
                     EventType::ApprovalRequested,
                     ApprovalRequestedData {
-                        command: command.to_string(),
-                        risk_level: risk_level.to_string(),
+                        command: subject.clone(),
+                        risk_level: ask.risk.to_string(),
                         warnings: warnings.clone(),
-                        task_id: task_id.map(str::to_string),
+                        task_id: None,
                     },
                 )
                 .await;
         }
+        Ok(Some(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: subject.clone(),
+            subject,
+            risk: match ask.risk {
+                RiskLevel::Critical => aidaemon_core::ApprovalRisk::Critical,
+                RiskLevel::High => aidaemon_core::ApprovalRisk::High,
+                _ => aidaemon_core::ApprovalRisk::Medium,
+            },
+            warnings,
+        }))
+    }
 
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if let Err(send_err) = self
-            .approval_tx
-            .send(ApprovalRequest {
-                command: command.to_string(),
-                session_id: session_id.to_string(),
-                risk_level,
-                warnings,
-                permission_mode: self.permission_mode,
-                response_tx,
-                kind: Default::default(),
-            })
-            .await
-        {
-            return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
-        }
-
-        // Child sessions are routed to their originating human conversation by
-        // ChannelHub, so they receive the same response window as root turns.
-        // A timeout remains fail-closed but is infrastructure state, not a user
-        // denial, and must be reported distinctly.
-        let timeout_secs = 300;
-        let response: ApprovalResponse =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx)
-                .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
-                    tracing::warn!(command, "Approval response channel closed");
-                    return Err(anyhow::anyhow!(
-                        "approval response unavailable because the channel closed"
-                    ));
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        command,
-                        timeout_secs,
-                        "Approval request timed out; action remains blocked"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "approval request timed out after {timeout_secs} seconds"
-                    ));
-                }
-            };
-
+    /// Apply the owner's answer to a terminal card the kernel asked, as the
+    /// in-tool prompt did: Allow Once only learns; Allow Session adds the
+    /// session prefix and capability grants; Allow Always persists the
+    /// prefix and the capability grants; an explicit Deny is learned as a
+    /// denial (`None`: the card timed out or never arrived). A daemonization
+    /// card grants nothing beyond the run, as before.
+    pub(crate) async fn record_owner_answer(
+        &self,
+        arguments: &Value,
+        trust: &TerminalTrust,
+        response: Option<ApprovalResponse>,
+    ) {
+        let Ok(args) = serde_json::from_value::<TerminalArgs>(arguments.clone()) else {
+            return;
+        };
+        let Some(command) = Self::run_command(&args) else {
+            return;
+        };
         if let Some(store) = &self.event_store {
-            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
-            match response {
-                ApprovalResponse::AllowOnce => {
-                    let _ = emitter
+            let emitter = crate::events::EventEmitter::new(store.clone(), trust.session_id.clone());
+            let approval_type = match response {
+                Some(ApprovalResponse::AllowOnce) => Some("once"),
+                Some(ApprovalResponse::AllowSession) => Some("session"),
+                Some(ApprovalResponse::AllowAlways) => Some("always"),
+                _ => None,
+            };
+            let _ = match approval_type {
+                Some(approval_type) => {
+                    emitter
                         .emit(
                             EventType::ApprovalGranted,
                             ApprovalGrantedData {
                                 command: command.to_string(),
-                                approval_type: "once".to_string(),
-                                task_id: task_id.map(str::to_string),
+                                approval_type: approval_type.to_string(),
+                                task_id: None,
                             },
                         )
-                        .await;
+                        .await
                 }
-                ApprovalResponse::AllowSession => {
-                    let _ = emitter
-                        .emit(
-                            EventType::ApprovalGranted,
-                            ApprovalGrantedData {
-                                command: command.to_string(),
-                                approval_type: "session".to_string(),
-                                task_id: task_id.map(str::to_string),
-                            },
-                        )
-                        .await;
-                }
-                ApprovalResponse::AllowAlways => {
-                    let _ = emitter
-                        .emit(
-                            EventType::ApprovalGranted,
-                            ApprovalGrantedData {
-                                command: command.to_string(),
-                                approval_type: "always".to_string(),
-                                task_id: task_id.map(str::to_string),
-                            },
-                        )
-                        .await;
-                }
-                ApprovalResponse::Deny => {
-                    let _ = emitter
+                None => {
+                    emitter
                         .emit(
                             EventType::ApprovalDenied,
                             ApprovalDeniedData {
                                 command: command.to_string(),
-                                task_id: task_id.map(str::to_string),
+                                task_id: None,
                             },
                         )
-                        .await;
+                        .await
                 }
-            }
+            };
         }
-
-        Ok(response)
+        let requested_capabilities =
+            Self::requested_capabilities(run_is_confined(self.confinement), &args, trust);
+        let capability_escalation = !requested_capabilities.is_empty() && !trust.trusted_session;
+        if !detect_daemonization_primitives(command).is_empty() && !capability_escalation {
+            return;
+        }
+        match response {
+            Some(ApprovalResponse::AllowOnce) => {}
+            Some(ApprovalResponse::AllowSession) => {
+                // Session-only storage (cleared on restart).
+                self.add_session_prefix(command).await;
+                self.add_capability_grants(command, &requested_capabilities, false)
+                    .await;
+            }
+            Some(ApprovalResponse::AllowAlways) => {
+                self.add_prefix(command).await;
+                self.add_capability_grants(command, &requested_capabilities, true)
+                    .await;
+            }
+            Some(ApprovalResponse::Deny) => {
+                if let Some(ref pool) = self.pool {
+                    let _ = record_denial(pool, command).await;
+                }
+                return;
+            }
+            None => return,
+        }
+        if let Some(ref pool) = self.pool {
+            let _ = record_approval(pool, command).await;
+        }
     }
 
     /// Elevated capabilities a run asks for beyond its task scope, as stable
     /// grant keys: `network`, `read:<path>`, `write:<path>`.
-    fn requested_capabilities(args: &TerminalArgs) -> Vec<String> {
+    /// On the host the process already has the user's environment, network
+    /// and (non-secret) files; there is no sandbox grant to escalate.
+    /// Credential stores stay rejected upstream.
+    fn requested_capabilities(
+        confined: bool,
+        args: &TerminalArgs,
+        trust: &TerminalTrust,
+    ) -> Vec<String> {
+        if !confined {
+            return Vec::new();
+        }
         let mut capabilities = Vec::new();
         if args.network {
             capabilities.push("network".to_string());
         }
-        if let Some(escalation) = &args._scope_escalation {
+        if let Some(escalation) = &trust.scope_escalation {
             capabilities.extend(escalation.read_paths.iter().map(|p| format!("read:{p}")));
             capabilities.extend(escalation.write_paths.iter().map(|p| format!("write:{p}")));
         }
@@ -4290,8 +4537,23 @@ impl TerminalTool {
 
     /// Enable trust-all mode: auto-approve all commands without prompting.
     /// Requires user approval since this is a security-sensitive action.
-    async fn handle_trust_all(&self, session_id: &str) -> anyhow::Result<String> {
-        // Check if already in trust-all mode
+    /// The owner's card for enabling trust-all mode (asked by the kernel).
+    const TRUST_ALL_SUBJECT: &'static str = "ENABLE TRUST-ALL MODE";
+
+    fn trust_all_warnings() -> Vec<String> {
+        vec![
+            "All future commands will run without approval".to_string(),
+            "This includes dangerous commands (rm, sudo, etc.)".to_string(),
+            "Persists across restarts".to_string(),
+        ]
+    }
+
+    /// Enable trust-all mode: only with the kernel's approval (the owner
+    /// approved the card its rules asked for this call).
+    async fn handle_trust_all(
+        &self,
+        kernel_approved: Option<&crate::traits::ApprovalScope>,
+    ) -> anyhow::Result<String> {
         {
             let prefixes = self.allowed_prefixes.read().await;
             if prefixes.iter().any(|p| p == "*") {
@@ -4301,56 +4563,33 @@ impl TerminalTool {
                 );
             }
         }
-
-        // Request user approval
-        match self
-            .request_approval(
-                session_id,
-                "ENABLE TRUST-ALL MODE",
-                RiskLevel::Critical,
-                vec![
-                    "All future commands will run without approval".to_string(),
-                    "This includes dangerous commands (rm, sudo, etc.)".to_string(),
-                    "Persists across restarts".to_string(),
-                ],
-                None,
-            )
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => {
-                // Add * to allowed prefixes
-                let mut prefixes = self.allowed_prefixes.write().await;
-                if !prefixes.iter().any(|p| p == "*") {
-                    prefixes.push("*".to_string());
-                    info!("Trust-all mode enabled: all commands will be auto-approved");
-
-                    // Persist to database
-                    if let Some(ref pool) = self.pool {
-                        if let Err(e) = sqlx::query(
-                            "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                                (backend_scope, prefix) VALUES (?, '*')",
-                        )
-                        .bind(self.backend.approval_scope())
-                        .execute(pool)
-                        .await
-                        {
-                            warn!("Failed to persist trust-all mode: {}", e);
-                        }
-                    }
-                }
-                Ok(
-                    "Trust-all mode enabled. All commands will now run without approval prompts."
-                        .to_string(),
-                )
-            }
-            Ok(ApprovalResponse::Deny) => Ok(
-                "Trust-all mode was denied. Commands will continue to require approval."
-                    .to_string(),
-            ),
-            Err(e) => Ok(format!("Could not get approval for trust-all mode: {}", e)),
+        if kernel_approved != Some(&crate::traits::ApprovalScope::Call) {
+            anyhow::bail!(
+                "terminal trust_all requires approval through the agent kernel; it was called \
+                 outside an approved agent call"
+            );
         }
+        let mut prefixes = self.allowed_prefixes.write().await;
+        if !prefixes.iter().any(|p| p == "*") {
+            prefixes.push("*".to_string());
+            info!("Trust-all mode enabled: all commands will be auto-approved");
+            if let Some(ref pool) = self.pool {
+                if let Err(e) = sqlx::query(
+                    "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                        (backend_scope, prefix) VALUES (?, '*')",
+                )
+                .bind(self.backend.approval_scope())
+                .execute(pool)
+                .await
+                {
+                    warn!("Failed to persist trust-all mode: {}", e);
+                }
+            }
+        }
+        Ok(
+            "Trust-all mode enabled. All commands will now run without approval prompts."
+                .to_string(),
+        )
     }
 
     fn prune_completed_map(completed: &mut HashMap<u32, CompletedProcess>) {
@@ -4430,150 +4669,6 @@ impl TerminalTool {
             );
             Self::prune_completed_map(&mut completed);
             info!(pid, command = %proc.command, "Reaped finished background process");
-        }
-    }
-
-    /// Determine the bounded `working_dir` handed to the correction bridge for a
-    /// reaped background command, then canonicalize it.
-    ///
-    /// We do NOT know the actual project scope of a reaped command — terminal
-    /// commands run via `sh -c` inheriting the daemon's cwd, and neither
-    /// `RunningProcess` nor the owning task/goal record a project directory. The
-    /// honest "working_dir we have" is therefore the daemon's current working
-    /// directory. Per the bridge contract we pass it through unchanged in spirit
-    /// (no `$HOME` substitution to force a dispatch) and rely on the bridge's
-    /// `is_unsafe_correction_working_dir` gate to REFUSE when that turns out to be
-    /// `/`, `$HOME`, or unbounded — the correct safe outcome.
-    ///
-    /// Canonicalization is done HERE because the bridge guard does not canonicalize:
-    /// resolving `.`/`..`/symlinks before the guard sees the path is what lets the
-    /// equality checks (`== "/"`, `== $HOME`) fire reliably. If canonicalization
-    /// fails (path missing), we fall back to the raw cwd so the guard still runs.
-    fn correction_working_dir() -> std::path::PathBuf {
-        let backend = active_execution_backend();
-        if backend.kind() != BackendKind::Local {
-            return std::path::PathBuf::from(backend.workspace_root().as_str());
-        }
-        let raw = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        std::fs::canonicalize(&raw).unwrap_or(raw)
-    }
-
-    /// Attempt autonomous remediation for a just-reaped hung background command.
-    ///
-    /// Returns `true` only when a remediation task was actually dispatched (live
-    /// mode, safe scope, factory accepted) — in which case the caller sends a
-    /// quieter "retrying a different way" note instead of the alarming "stopped,
-    /// no results" message. Returns `false` for every other outcome
-    /// (correction disabled, no agent wired, unsafe scope, shadow mode, factory
-    /// refused, or any error), in which case the caller MUST send the existing
-    /// user notification — byte-identical to today.
-    ///
-    /// This is best-effort and self-contained: any failure to remediate one
-    /// reaped process is swallowed here so it can never break reaping of others.
-    async fn try_dispatch_idle_reap_remediation(
-        &self,
-        command: &str,
-        session_id: &str,
-        owner_task_id: Option<&str>,
-        idle_secs: u64,
-    ) -> bool {
-        use crate::agent::correction_dispatch::{
-            decide_correction_bridge_action, dispatch_correction_remediation,
-            CorrectionBridgeAction,
-        };
-        use crate::agent::correction_intent::reconstruct_subject_context;
-        use crate::traits::SelfCorrectionSubjectKind;
-
-        // Fast exit when the bridge is off — keeps behavior byte-identical and
-        // avoids upgrading the agent Weak / touching the event store needlessly.
-        if !self.self_correction.enabled {
-            return false;
-        }
-
-        // 1. Reach the agent (and through it the event store + state). No agent
-        //    wired (e.g. unit tests that build TerminalTool directly) → skip
-        //    remediation, keep the existing notification.
-        let Some(agent) = self.agent.get().and_then(|w| w.upgrade()) else {
-            return false;
-        };
-
-        // 2. Working_dir for the retry, derived from the FAILED command's actual
-        //    target scope (home / `/` / a bounded dir; canonicalized). The gate
-        //    refuses only genuinely-invalid scopes — broad read-only scopes are
-        //    allowed and protected by the sandbox's read-only + sensitive-file
-        //    guards.
-        let working_dir = derive_correction_scope_from_command(command);
-
-        // 3. Recent history for subject reconstruction (best-effort; an empty
-        //    history just yields the generic original-request fallback).
-        let history = agent
-            .event_store()
-            .get_conversation_history(session_id, 50)
-            .await
-            .unwrap_or_default();
-
-        // Subject id: prefer the owning task id, fall back to the session id.
-        let subject_id = owner_task_id
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or(session_id);
-
-        let subject = reconstruct_subject_context(
-            &history,
-            session_id,
-            subject_id,
-            SelfCorrectionSubjectKind::BackgroundCommand,
-            working_dir.clone(),
-            command,
-        );
-
-        // 4. Decide. Disabled was handled above; Disabled/UnsafeScope/Shadowed
-        //    all fall through to the existing notification (return false).
-        match decide_correction_bridge_action(&self.self_correction, &subject, command, idle_secs) {
-            CorrectionBridgeAction::Disabled | CorrectionBridgeAction::UnsafeScope => false,
-            CorrectionBridgeAction::Shadowed { .. } => {
-                info!(
-                    reconstructed_request = %subject.original_request,
-                    working_dir = %working_dir.display(),
-                    command = %truncate_str(command, 160),
-                    idle_secs,
-                    "SHADOW: would dispatch correction remediation"
-                );
-                false
-            }
-            CorrectionBridgeAction::Dispatch { remediation_prompt } => {
-                let state = agent.state_arc();
-                let hub = self.hub.get().cloned();
-                match dispatch_correction_remediation(
-                    agent,
-                    state,
-                    hub,
-                    &self.self_correction,
-                    subject,
-                    remediation_prompt,
-                )
-                .await
-                {
-                    Ok(Some(goal_id)) => {
-                        info!(
-                            %goal_id,
-                            working_dir = %working_dir.display(),
-                            command = %truncate_str(command, 160),
-                            idle_secs,
-                            "Dispatched autonomous remediation for idle-reaped command"
-                        );
-                        true
-                    }
-                    Ok(None) => {
-                        // Factory refused (kill-switch / no-bypass) — fall back to
-                        // the existing notification.
-                        false
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Correction remediation dispatch failed; falling back to notification");
-                        false
-                    }
-                }
-            }
         }
     }
 
@@ -4918,12 +5013,9 @@ impl TerminalTool {
             let session_id = proc.notify_session_id.clone();
             let goal_id = proc.notify_goal_id.clone();
             let command_summary = truncate_str(&proc.command, 160);
-            // Full command + owning task id are captured here because `proc` is
-            // moved into `terminate_running_process` below; the correction bridge
-            // needs the untruncated command and the task scope.
-            let proc_command = proc.command.clone();
+            // Captured here because `proc` is moved into
+            // `terminate_running_process` below.
             let declared_write_paths = proc.declared_write_paths.clone();
-            let owner_task_id = proc.owner_task_id.clone();
             // For the stall path, idle_secs = time since last progress. For the
             // max-runtime path, the meaningful number is total runtime.
             let idle_secs = proc.last_progress_at.elapsed().as_secs();
@@ -4948,45 +5040,20 @@ impl TerminalTool {
             // Close the loop with the user: the screenshot's failure was the bot
             // silently waiting forever. Tell them it was stopped and why.
             if !session_id.is_empty() {
-                // Self-correction bridge: when enabled+safe+live, dispatch an
-                // autonomous remediation instead of the alarming "stopped, no
-                // results" message. Best-effort and per-process — a failure to
-                // remediate this one process never breaks reaping of the others
-                // (all error paths inside return `false`, falling back to the
-                // existing notification). When correction is off/unsafe/shadow,
-                // this is a no-op and the message below is byte-identical to
-                // today.
-                // The elapsed figure handed to the correction bridge: time-since-
-                // progress for a stall, total runtime for the max-runtime backstop.
-                let reason_secs = match reason {
-                    ReapReason::Stalled => idle_secs,
-                    ReapReason::MaxRuntime => runtime_secs,
-                };
-                let remediating = self
-                    .try_dispatch_idle_reap_remediation(
-                        &proc_command,
-                        &session_id,
-                        owner_task_id.as_deref(),
-                        reason_secs,
-                    )
-                    .await;
-
                 // Task 6: honest closeout for an unfulfilled deliverable. If this
                 // command was structured to produce an explicit output file
                 // (attributable) but the file never appeared and nothing was
                 // delivered for this session, say so plainly instead of the generic
                 // whole-disk-scan guidance — that command was not a scan, it was
-                // supposed to hand back a file. Skipped when remediation is running
-                // (it will follow up) or when nothing is attributable (servers,
-                // watchers, scans → unchanged behavior).
-                let unfulfilled_deliverable: Option<String> = if remediating {
-                    None
-                } else {
+                // supposed to hand back a file. Skipped when nothing is
+                // attributable (servers, watchers, scans → unchanged behavior).
+                let unfulfilled_deliverable: Option<String> = {
                     let command_end = std::time::SystemTime::now();
                     let command_start = command_end
                         .checked_sub(Duration::from_secs(runtime_secs))
                         .unwrap_or(command_end);
                     match attribute_background_deliverable(
+                        &self.backend,
                         &declared_write_paths,
                         command_start,
                         command_end,
@@ -5048,23 +5115,6 @@ impl TerminalTool {
                             humanize_elapsed(runtime_secs),
                             command_summary,
                             filename
-                        ),
-                    }
-                } else if remediating {
-                    match reason {
-                        ReapReason::Stalled => format!(
-                            "⚠️ That background command stopped making progress \
-                             (no CPU/disk activity for {}): `{}`. I'm retrying this a \
-                             different way — I'll follow up with the result.",
-                            humanize_elapsed(idle_secs),
-                            command_summary
-                        ),
-                        ReapReason::MaxRuntime => format!(
-                            "⚠️ That background command ran for over {} without finishing: \
-                             `{}`. I'm retrying this a different way — I'll follow up with \
-                             the result.",
-                            humanize_elapsed(runtime_secs),
-                            command_summary
                         ),
                     }
                 } else {
@@ -5129,6 +5179,7 @@ impl TerminalTool {
             network,
             confined,
             status_tx,
+            launch_trust,
         } = request;
         let has_write_targets = !write_paths.is_empty() || !write_roots.is_empty();
         let command_semantics = terminal_run_semantics_from_access(true, has_write_targets);
@@ -5159,6 +5210,8 @@ impl TerminalTool {
         let dedupe_key =
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
+            // The work is already running in the background: the run hands
+            // off to it.
             return Ok(ToolCallOutcome {
                 output: format!(
                     "Equivalent command is already running in this scope (pid={}). \
@@ -5171,7 +5224,9 @@ impl TerminalTool {
                     semantics: command_semantics,
                     ..ToolCallMetadata::default()
                 },
-            });
+                finish: None,
+            }
+            .handed_to_background());
         }
 
         let capabilities = ConfinedCapabilities { network };
@@ -5392,7 +5447,11 @@ impl TerminalTool {
                     }
                 }
                 metadata.access_denial = sandbox_access_denial(stderr.as_ref(), exit_code);
-                Ok(ToolCallOutcome { metadata, output })
+                Ok(ToolCallOutcome {
+                    metadata,
+                    output,
+                    finish: None,
+                })
             }
             Err(_) => {
                 // Timeout — check if this is a daemon/background command where the
@@ -5434,19 +5493,27 @@ impl TerminalTool {
                             ..ToolCallMetadata::default()
                         },
                         output,
+                        finish: None,
                     });
                 }
 
                 // Non-daemon command: move process to background tracking.
                 let elapsed = foreground_wait.as_secs();
-                let partial_stdout = {
-                    let b = stdout_buf.lock().await;
-                    let tail = if b.len() > 500 {
-                        &b[b.len() - 500..]
-                    } else {
-                        &b
+                // Both streams: many services (cloudflared, ngrok, dev
+                // servers) log their URL or ready line on stderr only.
+                let partial_output = {
+                    let tail_of = |b: &[u8]| {
+                        let start = b.len().saturating_sub(PARTIAL_OUTPUT_TAIL_BYTES);
+                        String::from_utf8_lossy(&b[start..]).trim().to_string()
                     };
-                    String::from_utf8_lossy(tail).to_string()
+                    let stdout = tail_of(&stdout_buf.lock().await);
+                    let stderr = tail_of(&stderr_buf.lock().await);
+                    match (stdout.is_empty(), stderr.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => stdout,
+                        (true, false) => stderr,
+                        (false, false) => format!("{stdout}\n{stderr}"),
+                    }
                 };
                 let notify_on_completion = Arc::new(AtomicBool::new(true));
                 let owner_task_id = task_id
@@ -5488,6 +5555,10 @@ impl TerminalTool {
                     progress_contract,
                 };
 
+                self.launch_trust
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(pid, launch_trust);
                 self.running.lock().await.insert(pid, proc);
                 self.insert_indexes_for_process(
                     pid,
@@ -5526,6 +5597,7 @@ impl TerminalTool {
                 let owner_task_id_for_notify = owner_task_id.clone();
                 let tool_call_id_for_notify = tool_call_id.map(str::to_string);
                 let event_store_for_notify = self.event_store.clone();
+                let backend_for_notify = self.backend.clone();
                 // The completion receipt terminates the same invocation whose
                 // launch receipt declared the process-state change. The
                 // launch receipt is provisional and proves nothing on its
@@ -5546,6 +5618,7 @@ impl TerminalTool {
                         running.get(&pid).map(|p| p.stderr_buf.clone())
                     };
                     let started_at_for_notify = Instant::now() - foreground_wait;
+                    let detached_for_notify = detach;
                     let max_output_chars = self.max_output_chars;
                     let status_tx_for_notify = status_tx.clone();
                     if let (Some(stdout_buf), Some(stderr_buf)) =
@@ -5738,6 +5811,7 @@ impl TerminalTool {
                                             .checked_sub(started_at_for_notify.elapsed())
                                             .unwrap_or(command_end);
                                         deliverable_attribution = attribute_background_deliverable(
+                                            &backend_for_notify,
                                             &declared_write_paths_for_notify,
                                             command_start,
                                             command_end,
@@ -5862,6 +5936,13 @@ impl TerminalTool {
                                                 "Terminal background progress pings suppressed (check/kill already handled notification)"
                                             );
                                             return;
+                                        }
+                                        // A detached service runs until killed:
+                                        // "still working, I'll share the result"
+                                        // cards promise an end that never comes.
+                                        // Only its exit is news.
+                                        if detached_for_notify {
+                                            continue;
                                         }
 
                                         ping_count += 1;
@@ -5990,6 +6071,7 @@ impl TerminalTool {
                                 // design targets: a command that writes only to a result file.
                                 if let DeliverableAttribution::One(path) = deliverable_attribution {
                                     deliver_attributed_background_file(
+                                        &backend_for_notify,
                                         &path,
                                         &session_for_notify,
                                         &command_summary,
@@ -6494,8 +6576,7 @@ impl TerminalTool {
                 let mut msg = if detach {
                     format!(
                         "Detached launch: the process passed its {:.1}s startup check and is running in the background (pid={}).\n\
-                         IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
-                         Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
+                         It keeps running until killed; do not launch it again. If its startup output below does not yet show what you need (a URL, port, or ready line), wait briefly and use action=\"check\" with pid={} to read it. Use action=\"kill\" with pid={} to stop it.",
                         foreground_wait.as_secs_f32(),
                         pid,
                         pid,
@@ -6514,6 +6595,14 @@ impl TerminalTool {
                     msg.push_str(
                         "\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
                     );
+                    // The notifier also watches detached processes and
+                    // delivers their result; say so, or the model tells the
+                    // user it cannot notify them.
+                    if notifier_started {
+                        msg.push_str(
+                            " Completion notifications are enabled. The user will be notified when this process finishes.",
+                        );
+                    }
                 } else if notifier_started {
                     msg.push_str(
                         "\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
@@ -6523,21 +6612,30 @@ impl TerminalTool {
                         "\n\nThis process is task-owned and will be auto-killed when the current task ends.",
                     );
                 }
-                if !partial_stdout.is_empty() {
-                    msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
+                if !partial_output.is_empty() {
+                    msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_output));
                 }
                 let background_semantics = background_process_semantics(&command_semantics);
-                Ok(ToolCallOutcome {
+                let outcome = ToolCallOutcome {
                     metadata: ToolCallMetadata {
                         outcome_status: Some(ToolOutcomeStatus::Backgrounded),
                         background_started: true,
                         timed_out: !detach,
                         detached: detach,
-                        completion_notifications_enabled: !detach && notifier_started,
+                        completion_notifications_enabled: notifier_started,
                         semantics: background_semantics,
                         ..ToolCallMetadata::default()
                     },
                     output: msg,
+                    finish: None,
+                };
+                // Work the daemon moved to background tracking hands the run
+                // off; a launch the model detached on purpose is a running
+                // service whose startup output the model reports.
+                Ok(if detach {
+                    outcome
+                } else {
+                    outcome.handed_to_background()
                 })
             }
         }
@@ -6554,6 +6652,7 @@ impl TerminalTool {
                 return Ok(ToolCallOutcome {
                     output: done.output,
                     metadata: done.metadata,
+                    finish: None,
                 });
             }
             return Ok(ToolCallOutcome::completed_negative_result(format!(
@@ -6586,7 +6685,11 @@ impl TerminalTool {
             let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
             metadata.semantics = semantics;
-            Ok(ToolCallOutcome { output, metadata })
+            Ok(ToolCallOutcome {
+                output,
+                metadata,
+                finish: None,
+            })
         } else {
             // Still running — return tail of buffer.
             let elapsed = proc.started_at.elapsed().as_secs();
@@ -6627,7 +6730,11 @@ impl TerminalTool {
                 proc.notifier_active && !proc.detached,
             );
             metadata.semantics = proc.semantics.clone();
-            Ok(ToolCallOutcome { output, metadata })
+            Ok(ToolCallOutcome {
+                output,
+                metadata,
+                finish: None,
+            })
         }
     }
 
@@ -6652,29 +6759,27 @@ impl TerminalTool {
         let mut metadata =
             background_observation_metadata(ToolOutcomeStatus::Succeeded, detached, false);
         metadata.truncation = truncation;
-        Ok(ToolCallOutcome { output, metadata })
+        Ok(ToolCallOutcome {
+            output,
+            metadata,
+            finish: None,
+        })
     }
 
     /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.
     ///
-    /// `correction_preapproved` is a Rust-side control-plane flag set by the
-    /// correction gate — it is NEVER derived from tool arguments, model output, or
-    /// any JSON field.  When true (and action=="run"), the user-approval prompt is
-    /// bypassed after all hard blocks and command-safety checks have passed.
-    ///
-    /// Approval ordering for action="run":
-    ///   1. Hard blocks (dangerous irreversible commands)  → always enforced
-    ///   2. Safety soft-blocks (heredoc, python -c, etc.) → always enforced
-    ///   3. Daemonization block / daemonization approval   → always enforced
-    ///   4. `correction_preapproved`                       → skips prompt if true
-    ///   5. `_untrusted_source` / `_trusted_session` / allowlists / normal prompt
+    /// For action="run": the hard blocks (`pre_approval_block`) always run
+    /// here; the owner's approval ladder (`approval_ladder`) ran in the
+    /// agent kernel before a call that carries
+    /// `ToolCallContext::kernel_approved`, and refuses any other call
+    /// it would ask about. Trust facts come only from `exec_ctx`.
     async fn execute_terminal(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        correction_preapproved: bool,
-        mutation_forbidden: bool,
+        exec_ctx: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
+        let mutation_forbidden = exec_ctx.mutation_forbidden;
         let args: TerminalArgs = serde_json::from_str(arguments)?;
         // Keep exact paths and directory capabilities separate until the
         // sandbox request is built. The native adapter receives both as
@@ -6691,8 +6796,8 @@ impl TerminalTool {
 
         // Route background completion notifications to the origin session
         // when this terminal run is tied to a goal/task lead.
-        let mut notify_session_id = args._session_id.clone();
-        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), args._goal_id.as_deref()) {
+        let mut notify_session_id = exec_ctx.session_id.clone();
+        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), exec_ctx.goal_id.as_deref()) {
             if let Ok(Some(goal)) = state.get_goal(goal_id).await {
                 if !goal.session_id.trim().is_empty() {
                     notify_session_id = goal.session_id;
@@ -6700,24 +6805,25 @@ impl TerminalTool {
             }
         }
 
-        let mut outcome = match args.action.as_str() {
-            "check" => {
+        let mut outcome = match TerminalAction::parse(&args.action) {
+            TerminalAction::Check => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
                 self.handle_check(pid).await?
             }
-            "kill" => {
+            TerminalAction::Kill => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await?
             }
-            "trust_all" => {
-                ToolCallOutcome::from_output(self.handle_trust_all(&args._session_id).await?)
-            }
-            _ => {
-                // "run" or default
+            TerminalAction::TrustAll => ToolCallOutcome::from_output(
+                self.handle_trust_all(exec_ctx.kernel_approved.as_ref())
+                    .await?,
+            ),
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                // "run", the default, or any other spelling
                 let command = args
                     .command
                     .as_deref()
@@ -6741,383 +6847,35 @@ impl TerminalTool {
 
                 let command_semantics =
                     terminal_run_semantics_from_access(true, !declared_write_paths.is_empty());
-                let mut precomputed_semantic_assessment = None;
                 if mutation_forbidden
-                    && (command_semantics.mutates_state()
-                        || command_semantics.effect == crate::traits::ToolCallEffect::Unknown)
-                {
-                    if command_semantics.mutates_state() {
-                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
-                    }
-                    let Some(runtime) = self.command_risk_runtime.get() else {
-                        return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: this command's effects are ambiguous and semantic assessment is unavailable.").with_semantics(command_semantics));
-                    };
-                    match assess_command(
-                        runtime,
-                        command,
-                        &self.backend,
-                        &args._session_id,
-                        self.state.as_ref(),
-                        self.event_store.clone(),
+                    && !terminal_run_annotations(
+                        &args,
+                        self.confinement,
+                        &crate::traits::TrustRoots::new(&[]),
                     )
-                    .await
-                    {
-                        Ok(semantic) if semantic.observation_only => {
-                            precomputed_semantic_assessment = Some(semantic);
-                        }
-                        Ok(_) => {
-                            return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: semantic effect assessment did not prove that every command effect is observational.").with_semantics(command_semantics));
-                        }
-                        Err(error) => {
-                            return Ok(ToolCallOutcome::blocked(format!("Blocked by the explicit read-only contract: semantic effect assessment failed closed ({error}).")).with_semantics(command_semantics));
-                        }
-                    }
-                }
-
-                if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
-                    return Ok(ToolCallOutcome::blocked(recursive_grep_block_message(
-                        &pattern, &path,
-                    )));
-                }
-
-                if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
-                    return Ok(ToolCallOutcome::blocked(unbounded_scan_block_message(
-                        &tool_name, &root,
-                    )));
-                }
-
-                // Soft-block large heredoc file creation: redirects to write_file
-                // which writes atomically without shell quoting issues.
-                // Allow quoted heredoc delimiters (<<'EOF' or << 'EOF') since they
-                // avoid shell expansion issues and serve as a fallback when write_file
-                // fails with JSON escaping errors on complex content.
-                if command.contains("<<") && command.len() > 500 {
-                    let uses_quoted_heredoc = command.contains("<<'")
-                        || command.contains("<< '")
-                        || command.contains("<<\"")
-                        || command.contains("<< \"");
-                    if !uses_quoted_heredoc {
-                        return Ok(ToolCallOutcome::blocked(
-                            "Large heredoc file creation is unreliable through the terminal. \
-                             Use the `write_file` tool instead — it writes files atomically \
-                             and avoids shell quoting issues. If write_file fails with JSON \
-                             encoding errors, use a quoted heredoc: cat > file << 'EOF'"
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                // Hard-redirect AppleScript GUI automation to computer_use: the
-                // terminal path has none of its safety layer (approvals, blocked
-                // apps, action confirmation, lock detection) and System Events
-                // input fails against a locked screen exactly like synthetic input.
-                if is_system_events_ui_scripting(command) {
-                    return Ok(ToolCallOutcome::blocked(
-                        "Blocked: AppleScript System Events UI scripting (click/keystroke) \
-                         through the terminal bypasses the computer_use safety layer and \
-                         cannot deliver input when the screen is locked.\n\n\
-                         Use the `computer_use` tool for GUI automation — it is \
-                         approval-gated, lock-aware, and works from screenshots and the \
-                         accessibility tree. If computer_use is unavailable or blocked \
-                         (e.g. the screen is locked), stop and tell the user what you \
-                         need instead of scripting around it."
-                            .to_string(),
-                    ));
-                }
-
-                let daemon_hits = detect_daemonization_primitives(command);
-                let mut daemonization_approved = false;
-                if !daemon_hits.is_empty() {
-                    let is_owner = args
-                        ._user_role
-                        .as_deref()
-                        .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
-                    if !is_owner {
-                        return Ok(ToolCallOutcome::blocked(format!(
-                            "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
-                            daemon_hits.join(", ")
-                        )));
-                    }
-
-                    if !args.detach {
-                        return Ok(ToolCallOutcome::blocked(format!(
-                            "Blocked: daemonization primitives detected ({}). \
-                             Set `detach=true` explicitly for intentional long-lived background execution.",
-                            daemon_hits.join(", ")
-                        )));
-                    }
-
-                    let mut warnings = vec![
-                        format!(
-                            "Daemonization primitives detected: {}",
-                            daemon_hits.join(", ")
-                        ),
-                        "Detached/background processes may survive cancellation and continue running.".to_string(),
-                    ];
-                    warnings.push("Approve only if this is intentional and necessary.".to_string());
-
-                    match self
-                        .request_approval(
-                            &args._session_id,
-                            command,
-                            RiskLevel::Critical,
-                            warnings,
-                            args._task_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(ApprovalResponse::AllowOnce)
-                        | Ok(ApprovalResponse::AllowSession)
-                        | Ok(ApprovalResponse::AllowAlways) => {
-                            daemonization_approved = true;
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            return Ok(ToolCallOutcome::blocked(
-                                "Daemonizing command denied by owner.".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Ok(ToolCallOutcome::blocked(format!(
-                                "Could not get owner approval for daemonizing command: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-
-                let deterministic_approval_floor = approval_floor_reason(command);
-                let mut approval_risk = RiskLevel::High;
-                let mut approval_warnings = Vec::new();
-
-                // Deterministic hard block for irreversible broad-path deletes.
-                if let Some(reason) =
-                    hard_block_reason(command, self.backend.workspace_root().as_str())
+                    .read_only
                 {
-                    warn!(
-                        session_id = %args._session_id,
-                        task_id = ?args._task_id,
-                        command = %command,
-                        reason = %reason,
-                        "Blocked dangerous irreversible command"
-                    );
-                    return Ok(ToolCallOutcome::blocked(format!(
-                        "{} Use scoped, non-destructive commands instead.",
-                        reason
-                    )));
+                    return Ok(ToolCallOutcome::blocked("Blocked by the explicit read-only contract: the command is not proven observation-only. Use an observational command or ask the user to change the constraint.").with_semantics(command_semantics));
                 }
 
-                // Check if this is a trusted session (explicitly set by ChannelContext,
-                // not derived from session ID strings — prevents session ID spoofing).
-                let is_trusted_session = args._trusted_session;
-                if args.detach && is_trusted_session {
-                    // Intentional: trusted scheduled sessions are auto-approved, so
-                    // disallow detached long-lived processes in that mode.
-                    return Ok(ToolCallOutcome::blocked(
-                        "Blocked: detach=true is not allowed for trusted scheduled sessions."
-                            .to_string(),
-                    ));
+                let trust = TerminalTrust::from_execution_context(&exec_ctx.session_id, exec_ctx);
+                if let Some(block) = self.pre_approval_block(&args, command, &trust) {
+                    return Ok(ToolCallOutcome::blocked(block));
                 }
 
-                if args.detach && !daemonization_approved {
-                    approval_warnings.push(
-                        "Detached execution requested (process may outlive task boundaries)."
-                            .to_string(),
+                // The owner's approval comes from the agent kernel: its
+                // `ApprovalPolicy` ran this ladder (`owner_approval_request`)
+                // before the call and asked the owner where it requires it.
+                // The tool never asks. Outside the kernel, a command the
+                // ladder would ask about is refused.
+                if exec_ctx.kernel_approved != Some(crate::traits::ApprovalScope::Call)
+                    && self.approval_ladder(&args, command, &trust).await.is_some()
+                {
+                    anyhow::bail!(
+                        "terminal command `{}` requires approval through the agent kernel; it \
+                         was called outside an approved agent call",
+                        truncate_str(command, 200)
                     );
-                }
-
-                // Determine if approval is needed.
-                // Note: is_allowed() checks both permanent AND session-approved prefixes.
-                //
-                // Ordering (enforced here; do not reorder):
-                //   1. daemonization_approved  → never re-prompt after daemonization gate
-                //   2. correction_preapproved  → dispatcher-owned one-shot bypass (Rust side only)
-                //   3. _untrusted_source       → external triggers always re-prompt
-                //   4. detach && !is_allowed   → novel detached commands re-prompt
-                //   5. _trusted_session        → scheduled tasks skip prompt
-                //   6. explicit allowlist      → prior owner grant
-                //   7. protected credential path → non-downgradable approval floor
-                //   8. semantic model          → approve only dangerous effects
-                //   9. classifier failure      → fail closed to approval
-                let is_allowed = self.is_allowed(command).await;
-                let confined = run_is_confined(self.confinement);
-                // On the host the process already has the user's environment,
-                // network, and (non-secret) files; there is no sandbox grant
-                // to escalate. Credential stores stay rejected upstream.
-                let requested_capabilities = if confined {
-                    Self::requested_capabilities(&args)
-                } else {
-                    Vec::new()
-                };
-                let capability_escalation_pending = !requested_capabilities.is_empty()
-                    && !is_trusted_session
-                    && !self
-                        .capabilities_granted(command, &requested_capabilities)
-                        .await;
-                let needs_approval = if capability_escalation_pending {
-                    // Elevated capability is new authority; no command-prefix
-                    // grant or dispatcher preapproval stands in for the user
-                    // seeing exactly what is being requested.
-                    approval_warnings.push(format!(
-                        "Requests elevated capabilities beyond the task scope: {}",
-                        Self::describe_capabilities(&requested_capabilities)
-                    ));
-                    info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
-                    true
-                } else if daemonization_approved {
-                    false
-                } else if correction_preapproved {
-                    // Dispatcher classified this call as safe; skip the user prompt.
-                    // _untrusted_source is intentionally overridden here: the correction
-                    // gate is only active for trigger sessions, so if we reach this
-                    // branch, the gate has already confirmed safety.
-                    info!(command = %command, "Auto-approved: correction gate preapproval");
-                    false
-                } else if args._untrusted_source {
-                    // External triggers always need approval regardless of mode
-                    approval_warnings
-                        .push("Command originated from an untrusted external trigger.".to_string());
-                    info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
-                    true
-                } else if args.detach && !is_allowed {
-                    // Allowlisted commands (permanent or session approvals)
-                    // may run detached without re-prompting; only novel
-                    // detached commands force approval.
-                    info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
-                    true
-                } else if is_trusted_session {
-                    // Trusted scheduled tasks bypass approval
-                    info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
-                    false
-                } else if is_allowed {
-                    info!(command = %command, "Auto-approved: explicit command grant");
-                    false
-                } else if let Some(reason) = deterministic_approval_floor {
-                    approval_warnings.push(reason);
-                    true
-                } else if let Some(semantic) = precomputed_semantic_assessment {
-                    approval_risk = semantic.risk_level;
-                    approval_warnings = semantic.warnings;
-                    semantic.requires_approval
-                } else if let Some(runtime) = self.command_risk_runtime.get() {
-                    match assess_command(
-                        runtime,
-                        command,
-                        &self.backend,
-                        &args._session_id,
-                        self.state.as_ref(),
-                        self.event_store.clone(),
-                    )
-                    .await
-                    {
-                        Ok(semantic) => {
-                            approval_risk = semantic.risk_level;
-                            approval_warnings = semantic.warnings;
-                            if semantic.requires_approval {
-                                info!(
-                                    command = %command,
-                                    risk = %approval_risk,
-                                    "Semantic command assessment requires owner approval"
-                                );
-                                true
-                            } else {
-                                info!(
-                                    command = %command,
-                                    risk = %approval_risk,
-                                    "Auto-approved by semantic command assessment"
-                                );
-                                false
-                            }
-                        }
-                        Err(error) => {
-                            warn!(
-                                command = %command,
-                                %error,
-                                "Semantic command assessment failed; requesting approval"
-                            );
-                            approval_risk = RiskLevel::Critical;
-                            approval_warnings.push(format!(
-                                "Semantic safety assessment unavailable; failed closed: {}",
-                                error
-                            ));
-                            true
-                        }
-                    }
-                } else {
-                    approval_risk = RiskLevel::Critical;
-                    approval_warnings.push(
-                        "Semantic safety assessment is not configured; failed closed.".to_string(),
-                    );
-                    true
-                };
-
-                if needs_approval {
-                    // Approval history is useful context for the owner, but it
-                    // never changes the semantic decision or lowers risk.
-                    if let Some(ref pool) = self.pool {
-                        if let Ok(Some((pattern, similarity))) =
-                            find_matching_pattern(pool, command).await
-                        {
-                            approval_warnings.push(format!(
-                                "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
-                                pattern.pattern,
-                                similarity * 100.0,
-                                pattern.approval_count,
-                                pattern.denial_count,
-                                pattern.confidence() * 100.0,
-                                pattern.is_trusted(),
-                            ));
-                        }
-                    }
-                    match self
-                        .request_approval(
-                            &args._session_id,
-                            command,
-                            approval_risk,
-                            approval_warnings.clone(),
-                            args._task_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(ApprovalResponse::AllowOnce) => {
-                            // Just run this once, but still learn from it
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::AllowSession) => {
-                            // Save to session-only storage (cleared on restart)
-                            self.add_session_prefix(command).await;
-                            self.add_capability_grants(command, &requested_capabilities, false)
-                                .await;
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::AllowAlways) => {
-                            // Save to permanent storage (DB)
-                            self.add_prefix(command).await;
-                            self.add_capability_grants(command, &requested_capabilities, true)
-                                .await;
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_approval(pool, command).await;
-                            }
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            // Record denial for learning
-                            if let Some(ref pool) = self.pool {
-                                let _ = record_denial(pool, command).await;
-                            }
-                            return Ok(ToolCallOutcome::blocked(
-                                "Command denied by user.".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Ok(ToolCallOutcome::blocked(format!(
-                                "Could not get approval: {}",
-                                e
-                            )));
-                        }
-                    }
                 }
 
                 // The checkpoint belongs after every command-safety and
@@ -7125,7 +6883,7 @@ impl TerminalTool {
                 if let Some(manager) = crate::checkpoints::active_manager() {
                     let access_manifest = terminal_access_manifest(arguments);
                     manager
-                        .begin_for_access_manifest("terminal", arguments, &access_manifest)
+                        .begin_for_access_manifest("terminal", &access_manifest, exec_ctx)
                         .await?;
                 }
 
@@ -7201,6 +6959,14 @@ impl TerminalTool {
                     }
                 }
 
+                let launch_trust = match exec_ctx.trust_roots.as_deref() {
+                    Some(roots) => self.output_trust(
+                        arguments,
+                        &crate::traits::TrustRoots::new(roots)
+                            .with_cwd(exec_ctx.trust_cwd.as_deref()),
+                    ),
+                    None => aidaemon_core::SourceTrust::Untrusted,
+                };
                 let run_outcome = self
                     .handle_run(TerminalRunRequest {
                         command,
@@ -7210,13 +6976,14 @@ impl TerminalTool {
                         write_paths: &declared_write_paths,
                         write_roots: &declared_write_roots,
                         notify_session_id: &notify_session_id,
-                        notify_goal_id: args._goal_id.as_deref(),
-                        task_id: args._task_id.as_deref(),
-                        tool_call_id: args._tool_call_id.as_deref(),
+                        notify_goal_id: exec_ctx.goal_id.as_deref(),
+                        task_id: exec_ctx.task_id.as_deref(),
+                        tool_call_id: exec_ctx.tool_call_id.as_deref(),
                         detach: args.detach,
                         network: args.network,
-                        confined,
+                        confined: run_is_confined(self.confinement),
                         status_tx,
+                        launch_trust,
                     })
                     .await;
                 // A future root the runtime created is the runtime's own
@@ -7253,7 +7020,9 @@ impl TerminalTool {
         if outcome.metadata.exit_code.is_none() {
             outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
         }
-        if args.action == "run" && outcome.metadata.invocation_stage.reached_dispatch() {
+        if TerminalAction::parse(&args.action).runs_command()
+            && outcome.metadata.invocation_stage.reached_dispatch()
+        {
             outcome.metadata.access_enforcement = if run_is_confined(self.confinement) {
                 confined_process_access_enforcement()
             } else {
@@ -7282,6 +7051,9 @@ struct TerminalRunRequest<'a> {
     /// Sandbox this run (false = host execution).
     confined: bool,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    /// The trust of this run's output under the turn's roots, recorded
+    /// with the process if it moves to the background.
+    launch_trust: aidaemon_core::SourceTrust,
 }
 
 /// Whether a run is confined: a single configuration switch. Commands from
@@ -7386,29 +7158,52 @@ struct TerminalArgs {
     /// capability grant for the command.
     #[serde(default)]
     network: bool,
-    /// Injected by the execution loop: exact declared targets outside the
-    /// compiled task scope that the user may authorize. Never model-supplied.
-    #[serde(default)]
-    _scope_escalation: Option<crate::traits::ScopeEscalation>,
-    #[serde(default)]
-    _untrusted_source: bool,
-    #[serde(default)]
-    _session_id: String,
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Injected by the dispatcher; never accepted from model-supplied input.
-    #[serde(default)]
-    _tool_call_id: Option<String>,
-    /// Injected by agent - goal context for routing background notifications.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Injected by agent for role-aware safeguards.
-    #[serde(default)]
-    _user_role: Option<String>,
-    /// Explicitly set by the agent from ChannelContext.trusted — never derived
-    /// from session ID strings. Only trusted scheduled tasks set this to true.
-    #[serde(default)]
-    _trusted_session: bool,
+}
+
+/// The turn's facts the terminal's approval ladder and hard blocks read:
+/// from the dispatcher's typed [`ToolCallContext`], or from the
+/// kernel's per-turn approval rules. Never from the call's arguments.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TerminalTrust {
+    pub session_id: String,
+    /// The turn's user is the owner (an unknown caller is not).
+    pub owner: bool,
+    /// A trusted scheduled session: runs without asking, never detached.
+    pub trusted_session: bool,
+    /// Started by an automated trigger: every run asks.
+    pub untrusted_source: bool,
+    /// Out-of-scope targets routed to the owner (a confined capability).
+    pub scope_escalation: Option<crate::traits::ScopeEscalation>,
+}
+
+impl TerminalTrust {
+    /// The facts the kernel's approval rules judge a call with: exactly
+    /// the turn's, the escalation as the dispatcher judged it.
+    fn for_approval(ctx: &ToolCallContext) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            trusted_session: ctx.trusted_session,
+            untrusted_source: ctx.untrusted_source,
+            scope_escalation: ctx.scope_escalation.clone(),
+        }
+    }
+
+    fn from_execution_context(session_id: &str, ctx: &ToolCallContext) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            owner: ctx.user_role == Some(crate::types::UserRole::Owner),
+            trusted_session: ctx.trusted_session,
+            untrusted_source: ctx.untrusted_source,
+            scope_escalation: ctx.scope_escalation.clone().filter(|e| !e.is_empty()),
+        }
+    }
+}
+
+/// What the owner is asked to approve before a run.
+struct LadderAsk {
+    risk: RiskLevel,
+    warnings: Vec<String>,
 }
 
 fn default_action() -> String {
@@ -7479,7 +7274,6 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
         completion_notifications_enabled: false,
         transport_error: None,
         http_status: None,
-        direct_response: None,
         semantics: ToolCallSemantics::default(),
         read_file: None,
         ..Default::default()
@@ -7538,10 +7332,10 @@ fn terminal_receipt_kind(arguments: &str) -> crate::traits::ToolReceiptKind {
             value
                 .get("action")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(TerminalAction::parse)
         })
-        .unwrap_or_else(|| "run".to_string());
-    if action == "run" {
+        .unwrap_or(TerminalAction::Run);
+    if action.runs_command() {
         crate::traits::ToolReceiptKind::Process
     } else {
         crate::traits::ToolReceiptKind::Generic
@@ -7622,20 +7416,92 @@ fn terminal_run_semantics_from_access(
     ToolCallSemantics::default()
 }
 
+/// Authority view of a `run`: typed from the command's structure, not from
+/// the declared write targets alone (the ledger view,
+/// `terminal_call_semantics`, deliberately stays separate).
+fn terminal_run_annotations(
+    args: &TerminalArgs,
+    confinement: crate::types::TerminalConfinement,
+    roots: &crate::traits::TrustRoots<'_>,
+) -> aidaemon_core::ToolAnnotations {
+    let text = match (args.command.as_deref(), args.script.as_deref()) {
+        (Some(command), None) => command,
+        (None, Some(script)) => script,
+        // Neither or both is an invalid run; never read-only.
+        _ => "",
+    };
+    let effects = crate::tools::command_effects::command_effects(text);
+    let has_write_targets = args
+        .write_paths
+        .iter()
+        .chain(args.write_roots.iter())
+        .any(|path| !path.trim().is_empty());
+    let read_only = !has_write_targets && !args.network && effects.observation_only;
+    // Writing into git configuration changes what later git commands run:
+    // a declared target that is git configuration, a declared root holding a
+    // repository, or a command word naming git configuration.
+    let plants_git_config = args
+        .write_paths
+        .iter()
+        .chain(args.write_roots.iter())
+        .any(|path| crate::tools::command_effects::is_git_config_path(path))
+        || args.write_roots.iter().any(|root| {
+            crate::tools::command_effects::root_holds_repository(root, args.working_dir.as_deref())
+        })
+        // An observation-only command cannot write by construction.
+        || (!effects.observation_only
+            && crate::tools::command_effects::command_names_git_config_path(text));
+    // A delete is egress unless every target is inside the trusted roots.
+    // Relative targets resolve against the call's own absolute working
+    // directory; without one (the dispatcher may still pick it) they are
+    // unknown.
+    let base = args
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| std::path::Path::new(dir).is_absolute());
+    let deletes_outside_roots = effects.deletes
+        && effects.delete_targets.as_ref().is_none_or(|targets| {
+            targets.is_empty()
+                || targets.iter().any(|target| {
+                    let resolved =
+                        if std::path::Path::new(target).is_absolute() || target.starts_with('~') {
+                            Some(target.clone())
+                        } else {
+                            base.map(|base| format!("{}/{target}", base.trim_end_matches('/')))
+                        };
+                    resolved.is_none_or(|path| !roots.contains(&path))
+                })
+        });
+    // On the host every program can reach the network; only observations
+    // and ordinary local work (builds, tests, local git) are not egress.
+    let host_beyond_local_work =
+        !run_is_confined(confinement) && !effects.observation_only && !effects.local_work_only;
+    aidaemon_core::ToolAnnotations {
+        read_only,
+        destructive: effects.deletes,
+        idempotent: read_only,
+        egress: plants_git_config
+            || args.network
+            || deletes_outside_roots
+            || crate::tools::command_effects::fetches_network(text)
+            || host_beyond_local_work,
+    }
+}
+
 fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
     let args = serde_json::from_str::<Value>(arguments).ok();
     let action = args
         .as_ref()
         .and_then(|value| value.get("action"))
         .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "run".to_string());
-    match action.as_str() {
-        "check" => ToolCallSemantics::observation()
+        .map_or(TerminalAction::Run, TerminalAction::parse);
+    match action {
+        TerminalAction::Check => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
-        "kill" => ToolCallSemantics::mutation(),
-        "trust_all" => ToolCallSemantics::administrative(),
-        _ => {
+        TerminalAction::Kill => ToolCallSemantics::mutation(),
+        TerminalAction::TrustAll => ToolCallSemantics::administrative(),
+        TerminalAction::Run | TerminalAction::Unrecognized => {
             let has_write_targets = args.as_ref().is_some_and(|value| {
                 ["write_paths", "write_roots"].into_iter().any(|field| {
                     value
@@ -7786,6 +7652,103 @@ fn validate_terminal_argument_contract(
     Ok(())
 }
 
+/// A terminal call's action, read once for execution, effects, semantics
+/// and annotations so they agree on every input. Only the exact schema
+/// spellings are recognized; execution runs anything else as `run` (its
+/// historical default), and effects declare such a call as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalAction {
+    Run,
+    Check,
+    Kill,
+    TrustAll,
+    /// Not an exact schema spelling (`"Check"`, `" run "`).
+    Unrecognized,
+}
+
+impl TerminalAction {
+    pub(crate) fn parse(action: &str) -> Self {
+        match action {
+            "run" => Self::Run,
+            "check" => Self::Check,
+            "kill" => Self::Kill,
+            "trust_all" => Self::TrustAll,
+            _ => Self::Unrecognized,
+        }
+    }
+
+    /// Execution runs the command or script.
+    pub(crate) fn runs_command(self) -> bool {
+        matches!(self, Self::Run | Self::Unrecognized)
+    }
+}
+
+/// The typed effects of a terminal call: `check` reads a tracked process,
+/// `run` declares what its command does (see
+/// `command_effects::shell_call_effects`), anything else is undeclared.
+fn terminal_call_effects(
+    backend: &dyn crate::execution::ExecutionBackend,
+    arguments: &str,
+) -> aidaemon_core::CallEffects {
+    terminal_call_effects_on(
+        arguments,
+        crate::tools::command_effects::execution_backend_is_local(backend),
+    )
+}
+
+/// `terminal_call_effects` for a backend that is (`local`) or is not the
+/// daemon's own machine. On a remote (SSH, Docker) workspace the paths a
+/// command touches live there, so they are not resolved on the local disk:
+/// path effects are left undeclared and the call is incomplete.
+fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::CallEffects {
+    use crate::tools::command_effects::{path_effect, shell_call_effects, without_local_paths};
+    let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+        return aidaemon_core::CallEffects::unknown();
+    };
+    match TerminalAction::parse(&args.action) {
+        TerminalAction::Check => aidaemon_core::CallEffects::none(),
+        TerminalAction::Run => {
+            let Some(text) = args
+                .command
+                .as_deref()
+                .or(args.script.as_deref())
+                .filter(|text| !text.trim().is_empty())
+            else {
+                return aidaemon_core::CallEffects::unknown();
+            };
+            // Only an explicit absolute directory is known here: a run
+            // without one executes wherever the dispatcher anchors it.
+            let cwd = args
+                .working_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|dir| dir.starts_with('/'));
+            // Never complete (see `shell_call_effects`): the keys are best
+            // effort and bind the owner's declines.
+            let mut effects = shell_call_effects(text, cwd);
+            // Declared write targets are what a confined run may change.
+            for target in args.write_paths.iter().chain(args.write_roots.iter()) {
+                if let Some(key) = path_effect(aidaemon_core::EffectClass::Write, target, cwd) {
+                    if !effects.keys.contains(&key) {
+                        effects.keys.push(key);
+                    }
+                }
+            }
+            effects.complete = false;
+            if local {
+                effects
+            } else {
+                without_local_paths(effects)
+            }
+        }
+        // `kill` signals a process and `trust_all` changes a standing rule;
+        // a non-canonical spelling is executed as a run nobody declared.
+        TerminalAction::Kill | TerminalAction::TrustAll | TerminalAction::Unrecognized => {
+            aidaemon_core::CallEffects::unknown()
+        }
+    }
+}
+
 fn canonicalize_terminal_arguments(
     arguments: &str,
 ) -> Result<String, ToolArgumentContractViolation> {
@@ -7817,6 +7780,22 @@ fn canonicalize_terminal_arguments(
 impl Tool for TerminalTool {
     fn name(&self) -> &str {
         "terminal"
+    }
+
+    /// The terminal's cards go out in its configured mode (which picks the
+    /// buttons offered).
+    fn approval_card_mode(&self) -> Option<PermissionMode> {
+        Some(self.permission_mode)
+    }
+
+    async fn record_owner_answer(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+        response: Option<ApprovalResponse>,
+    ) {
+        let trust = TerminalTrust::for_approval(facts);
+        TerminalTool::record_owner_answer(self, call.arguments, &trust, response).await;
     }
 
     fn description(&self) -> &str {
@@ -7886,6 +7865,42 @@ impl Tool for TerminalTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender.
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute_terminal(arguments, status_tx, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute_terminal(arguments, status_tx, &exec_ctx).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for TerminalTool {
     fn canonicalize_arguments(
         &self,
         arguments: &str,
@@ -7895,6 +7910,41 @@ impl Tool for TerminalTool {
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
         validate_terminal_argument_contract(arguments)
+    }
+
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            runs_as_judged: true,
+            keeps_own_grants: true,
+            shell_command_line: true,
+            always_offered: true,
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
+    /// The T8 ladder on the call as the dispatcher will run it, with the
+    /// turn's facts. A call whose arguments cannot be read asks, Critical,
+    /// with the arguments as the model sent them; a call the dispatcher
+    /// refuses needs nobody.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        if let Some(reason) = Self::unreadable_reason(call.arguments) {
+            return OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason));
+        }
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let trust = TerminalTrust::for_approval(facts);
+        match TerminalTool::owner_approval_request(self, call.arguments, &trust).await {
+            Ok(Some(request)) => OwnerApprovalNeed::Ask(request),
+            Ok(None) => OwnerApprovalNeed::NotNeeded,
+            Err(reason) => OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason)),
+        }
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -7913,6 +7963,100 @@ impl Tool for TerminalTool {
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         terminal_call_semantics(arguments)
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        terminal_call_effects(&*self.backend, arguments)
+    }
+
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+            return aidaemon_core::ToolAnnotations::WRITE;
+        };
+        match TerminalAction::parse(&args.action) {
+            TerminalAction::Check => aidaemon_core::ToolAnnotations::READ_ONLY,
+            TerminalAction::Kill => aidaemon_core::ToolAnnotations::WRITE,
+            // Changes a standing rule.
+            TerminalAction::TrustAll => aidaemon_core::ToolAnnotations {
+                egress: true,
+                ..aidaemon_core::ToolAnnotations::WRITE
+            },
+            // A non-canonical spelling executes as a run.
+            TerminalAction::Run | TerminalAction::Unrecognized => {
+                terminal_run_annotations(&args, self.confinement, roots)
+            }
+        }
+    }
+
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+            return aidaemon_core::SourceTrust::Untrusted;
+        };
+        // `check` and `kill` return a background process's output: it
+        // carries the trust judged when that process was launched.
+        if matches!(
+            TerminalAction::parse(&args.action),
+            TerminalAction::Check | TerminalAction::Kill
+        ) {
+            return args
+                .pid
+                .and_then(|pid| {
+                    self.launch_trust
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&pid)
+                        .copied()
+                })
+                .unwrap_or(aidaemon_core::SourceTrust::Untrusted);
+        }
+        let text = args
+            .command
+            .as_deref()
+            .or(args.script.as_deref())
+            .unwrap_or("");
+        if args.network || crate::tools::command_effects::fetches_network(text) {
+            return aidaemon_core::SourceTrust::Untrusted;
+        }
+        // The run's own absolute directory, else the turn's cwd (where a
+        // run without one executes).
+        let working_dir = args
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| std::path::Path::new(dir).is_absolute())
+            .or(roots.cwd());
+        let roots = roots.anchored_at(working_dir);
+        let trusted = if run_is_confined(self.confinement) {
+            // The sandbox enforces the declared read set, so it decides.
+            args.read_paths
+                .iter()
+                .chain(args.read_roots.iter())
+                .all(|path| roots.contains(path))
+        } else {
+            // On the host nothing enforces declared reads: trust comes from
+            // the command's structure. An observation or ordinary local work,
+            // run inside the roots, on operands that all resolve inside them.
+            let effects = crate::tools::command_effects::command_effects(text);
+            (effects.observation_only
+                || effects.local_work_only
+                || crate::tools::command_effects::is_observation_reading_input(text))
+                && working_dir.is_some_and(|dir| roots.contains(dir))
+                && crate::tools::command_effects::path_operands(text)
+                    .is_some_and(|operands| operands.iter().all(|path| roots.contains(path)))
+        };
+        if trusted {
+            aidaemon_core::SourceTrust::Trusted
+        } else {
+            aidaemon_core::SourceTrust::Untrusted
+        }
     }
 
     fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
@@ -7946,82 +8090,6 @@ impl Tool for TerminalTool {
         }
     }
 
-    fn project_contract_mutation_effects(
-        &self,
-        mut semantics: ToolCallSemantics,
-        required_effects: ToolMutationEffects,
-    ) -> ToolCallSemantics {
-        if semantics.mutates_state() && !required_effects.is_empty() {
-            // A terminal is an opaque bounded workspace adapter. It may be
-            // assigned the contract's derived/workspace lane when the typed
-            // obligation explicitly names this operation, but it can never
-            // masquerade as a path-aware source edit or a remote mutation.
-            let local_output = required_effects.intersect(
-                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
-                    .union(ToolMutationEffects::LOCAL_DERIVED_WRITE),
-            );
-            semantics.mutation_effects = if local_output.is_empty() {
-                ToolMutationEffects::LOCAL_WORKSPACE_WRITE
-            } else {
-                local_output
-            };
-        }
-        semantics
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender.
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_outcome(arguments, status_tx)
-            .await
-            .map(|outcome| outcome.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, false, false)
-            .await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        // Correction preapproval is only honored for action="run".  For check/kill/trust_all,
-        // the normal path (no preapproval) is used because:
-        //   - check/kill have no user-approval gate to bypass.
-        //   - trust_all must never be silently executed by the correction gate.
-        let correction_preapproved = if exec_ctx.correction_preapproved {
-            // Peek at the action field without fully parsing the args yet.
-            let action = serde_json::from_str::<serde_json::Value>(arguments)
-                .ok()
-                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "run".to_string());
-            action == "run" || action.is_empty()
-        } else {
-            false
-        };
-        self.execute_terminal(
-            arguments,
-            status_tx,
-            correction_preapproved,
-            exec_ctx.mutation_forbidden,
-        )
-        .await
-    }
-
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
         let cleaned = self.cleanup_task_processes(task_id).await?;
         if cleaned > 0 {
@@ -8032,6 +8100,49 @@ impl Tool for TerminalTool {
         }
         Ok(())
     }
+
+    async fn session_context_note(&self, session_id: &str) -> Option<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        let mut lines: Vec<(u32, String)> = Vec::new();
+        for (pid, proc) in self.running.lock().await.iter() {
+            if proc.notify_session_id != session_id || proc.reader_handle.is_finished() {
+                continue;
+            }
+            let mode = if proc.detached {
+                "detached, runs until killed"
+            } else {
+                "background, user is notified when it finishes"
+            };
+            lines.push((
+                *pid,
+                format!(
+                    "- pid={} ({}), running for {}: `{}`",
+                    pid,
+                    mode,
+                    humanize_elapsed(proc.started_at.elapsed().as_secs()),
+                    truncate_str(&proc.command, 160)
+                ),
+            ));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        lines.sort_by_key(|(pid, _)| *pid);
+        let mut note = String::from(
+            "Background processes started earlier in this conversation are still running:\n",
+        );
+        for (_, line) in lines {
+            note.push_str(&line);
+            note.push('\n');
+        }
+        note.push_str(
+            "Read one's output with terminal action=\"check\" and its pid, and stop it with action=\"kill\". Do not launch a running one again.",
+        );
+        Some(note)
+    }
 }
 
 #[cfg(test)]
@@ -8041,11 +8152,30 @@ mod tests {
     use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::CallWithFacts;
     use crate::testing::MockProvider;
+    use crate::traits::ToolSemantics;
     use crate::traits::{NotificationStore, StateStore, Tool};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// The dispatcher's context for an owner's call the kernel approved.
+    fn kernel_owner_ctx() -> ToolCallContext {
+        ToolCallContext {
+            kernel_approved: Some(crate::traits::ApprovalScope::Call),
+            user_role: Some(crate::types::UserRole::Owner),
+            ..Default::default()
+        }
+    }
+
+    fn owner_trust() -> TerminalTrust {
+        TerminalTrust {
+            session_id: "telegram:synthetic-owner".to_string(),
+            owner: true,
+            ..TerminalTrust::default()
+        }
+    }
 
     fn semantic_runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
         SharedLlmRuntime::new(
@@ -8128,7 +8258,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_manifest_denies_undeclared_system_file_read() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8153,7 +8283,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn empty_manifest_is_fail_closed_not_ambient_access() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/usr/bin/head -n 1 /etc/hosts",
@@ -8192,7 +8322,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn execution_cwd_does_not_implicitly_grant_child_file_reads() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let private_child = root.path().join("private.txt");
         std::fs::write(&private_child, "NOT_AUTHORIZED").expect("private fixture");
@@ -8218,7 +8348,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_read_grant_does_not_expose_a_sibling() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed.txt");
         let sibling = root.path().join("sibling.txt");
@@ -8266,7 +8396,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn exact_write_grant_cannot_mutate_a_sibling() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let sibling = root.path().join("sibling.txt");
@@ -8307,7 +8437,7 @@ mod tests {
     async fn manifest_grants_cannot_escape_through_an_internal_symlink() {
         use std::os::unix::fs::symlink;
 
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let root = tempfile::tempdir().expect("root");
         let allowed = root.path().join("allowed");
         let outside = root.path().join("outside.txt");
@@ -8383,7 +8513,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_request_runs_the_command_unwrapped_in_the_working_dir() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request =
             host_terminal_execution_request(&backend, "npx wrangler deploy", false, Some("/tmp"))
                 .await
@@ -8446,11 +8576,19 @@ mod tests {
     fn requested_capabilities_are_typed_grant_keys() {
         let args: TerminalArgs = serde_json::from_str(
             r#"{"action":"run","command":"npx wrangler deploy","network":true,
-                "_scope_escalation":{"read_paths":["/Users/alice/Library/Preferences/.wrangler"],
-                                     "write_paths":["/Users/alice/Library/Preferences/.wrangler/logs"]}}"#,
+                "_scope_escalation":{"read_paths":["/Users/alice/Library/Preferences/.spoofed"]}}"#,
         )
         .unwrap();
-        let caps = TerminalTool::requested_capabilities(&args);
+        // The escalation comes from the dispatcher's typed context; an
+        // argument naming one is ignored.
+        let trust = TerminalTrust {
+            scope_escalation: Some(crate::traits::ScopeEscalation {
+                read_paths: vec!["/Users/alice/Library/Preferences/.wrangler".to_string()],
+                write_paths: vec!["/Users/alice/Library/Preferences/.wrangler/logs".to_string()],
+            }),
+            ..TerminalTrust::default()
+        };
+        let caps = TerminalTool::requested_capabilities(true, &args, &trust);
         assert_eq!(
             caps,
             vec![
@@ -8467,7 +8605,12 @@ mod tests {
             .contains("write outside task scope: /Users/alice/Library/Preferences/.wrangler/logs"));
         let plain: TerminalArgs =
             serde_json::from_str(r#"{"action":"run","command":"ls"}"#).unwrap();
-        assert!(TerminalTool::requested_capabilities(&plain).is_empty());
+        assert!(
+            TerminalTool::requested_capabilities(true, &plain, &TerminalTrust::default())
+                .is_empty()
+        );
+        // On the host there is no sandbox grant to escalate.
+        assert!(TerminalTool::requested_capabilities(false, &args, &trust).is_empty());
     }
 
     #[test]
@@ -8592,7 +8735,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_root_cwd_preserves_compound_negative_process_result() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let request = confined_terminal_execution_request(
             &backend,
             "/bin/sh -c 'printf SYNTHETIC_BEFORE; /usr/bin/false'",
@@ -8688,7 +8831,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_uses_stdin_and_stops_after_negative_step() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -8789,7 +8932,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_run_does_not_turn_a_declared_descendant_root_into_a_directory() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("printf")
@@ -8844,7 +8987,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_script_prepares_future_declared_scratch_before_heredoc() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cat").await.unwrap().is_none()
         {
@@ -8897,7 +9040,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_managed_runtime_executes_through_combined_shell_flags() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -8962,7 +9105,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_node_libraries_for_package_runners() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let Some(node) = backend.resolve_executable("node").await.unwrap() else {
             return;
         };
@@ -8995,7 +9138,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_read_only_command_still_gets_a_writable_managed_scratch() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.kind() != crate::execution::BackendKind::Local {
             return;
         }
@@ -9047,7 +9190,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_a_conda_prefix_by_its_marker() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         // Find any resolvable executable whose prefix carries `conda-meta`.
         let mut conda_prefix = None;
         for program in ["node", "python3", "python"] {
@@ -9087,7 +9230,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_grants_git_its_own_config_files_only_for_git() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("git").await.unwrap().is_none() {
             return;
         }
@@ -9117,7 +9260,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_sandbox_runtime_supports_local_rust_toolchain_without_home_access() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9192,7 +9335,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_project_creation_uses_exact_runtime_config_grant() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9238,7 +9381,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_cargo_lifecycle_can_create_and_remove_exact_absent_root() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend.resolve_executable("cargo").await.unwrap().is_none()
         {
@@ -9320,7 +9463,7 @@ mod tests {
 
     #[tokio::test]
     async fn confined_managed_python_can_create_run_and_remove_exact_venv_root() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none()
             || backend
                 .resolve_executable("python3")
@@ -9370,6 +9513,45 @@ mod tests {
         assert!(writable.mutates_state());
     }
 
+    /// Trust markers in the arguments stand in for nothing: a command the
+    /// ladder asks about is refused outside the kernel whatever they say.
+    #[tokio::test]
+    async fn trust_arguments_bypass_nothing() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let args = serde_json::json!({
+            "action": "run",
+            "command": "printf synthetic-spoofed",
+            "_trusted_session": true,
+            "_user_role": "Owner",
+            "_untrusted_source": false,
+        });
+        let error = tool
+            .call(&args.to_string())
+            .await
+            .expect_err("arguments are not the dispatcher's trust");
+        assert!(
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn semantic_safe_command_runs_without_owner_approval() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -9383,6 +9565,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9395,8 +9578,9 @@ mod tests {
         tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
 
         let output = tool
-            .call(
-                r#"{"action":"run","command":"echo semantic-ok","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo semantic-ok"}"#,
+                crate::testing::call_facts("telegram:synthetic-owner"),
             )
             .await
             .unwrap();
@@ -9407,7 +9591,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_run_undoes_a_future_root_the_runtime_created() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9429,6 +9613,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9452,11 +9637,19 @@ mod tests {
             "action": "run",
             "command": format!("printf SYNTHETIC_LONE_OK > '{}'", file.display()),
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [file.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
-        let output = tool.call(&args.to_string()).await.unwrap();
+            "write_roots": [file.to_string_lossy()]});
+        let output = tool
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
+            .await
+            .unwrap()
+            .output;
         assert!(!output.contains("Is a directory"), "{output}");
         assert!(
             file.is_file(),
@@ -9476,11 +9669,19 @@ mod tests {
             "action": "run",
             "command": "exit 7",
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [failed_leaf.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
-        let _ = tool.call(&args.to_string()).await.unwrap();
+            "write_roots": [failed_leaf.to_string_lossy()]});
+        let _ = tool
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
+            .await
+            .unwrap()
+            .output;
         assert!(
             !failed_root.exists(),
             "runtime-created chain must be removed after the failed run"
@@ -9489,7 +9690,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_preparation_failure_is_typed_and_names_the_declaration() {
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         if backend.resolve_executable("codex").await.unwrap().is_none() {
             return;
         }
@@ -9508,6 +9709,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9528,12 +9730,16 @@ mod tests {
             "action": "run",
             "command": "printf SYNTHETIC_NEVER_RUNS",
             "working_dir": parent.path().to_string_lossy(),
-            "write_roots": [impossible_root.to_string_lossy()],
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
-        });
+            "write_roots": [impossible_root.to_string_lossy()]});
         let outcome = tool
-            .execute_terminal(&args.to_string(), None, false, false)
+            .execute_terminal(
+                &args.to_string(),
+                None,
+                &ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..kernel_owner_ctx()
+                },
+            )
             .await
             .expect("typed outcome, not a transport error");
         let failure = outcome
@@ -9554,13 +9760,14 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let provider = Arc::new(MockProvider::with_responses(vec![
             MockProvider::text_response(
                 r#"{"dangerous":true,"risk_level":"high","effects":["external_mutation"],"reasons":["Pushes commits to a remote repository"]}"#,
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9572,24 +9779,594 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         tool.set_command_risk_runtime(semantic_runtime(provider));
 
-        let call = tool.call(
-            r#"{"action":"run","command":"git push synthetic-remote main","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
-        );
-        let respond = async {
-            let request = approval_rx.recv().await.expect("approval request");
-            assert_eq!(request.risk_level, RiskLevel::High);
-            assert!(request
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("external_mutation")));
-            request.response_tx.send(ApprovalResponse::Deny).unwrap();
-        };
-        let (output, ()) = tokio::join!(call, respond);
-        assert!(output.unwrap().contains("denied"));
+        let args = serde_json::json!({"action":"run","command":"git push synthetic-remote main"});
+        // The kernel's rules get the card from the ladder; the tool never asks.
+        let request = tool
+            .owner_approval_request(&args, &owner_trust())
+            .await
+            .unwrap()
+            .expect("a dangerous command asks the owner");
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
+        assert_eq!(request.subject, "git push synthetic-remote main");
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("external_mutation")));
+        assert!(request.warnings[0].starts_with("Execution target:"));
     }
 
     #[tokio::test]
-    async fn read_only_contract_allows_semantically_proven_novel_observation() {
+    async fn readonly_terminal_backstop_blocks_an_undeclared_redirect_write() {
+        let dir = std::env::temp_dir()
+            .join("aidaemon-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-change, a run with no declared write targets was typed
+        // observation, so this redirect would have executed.
+        let target = dir.join("out");
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("ls {} > {}", dir.display(), target.display()),
+        })
+        .to_string();
+        let outcome = tool
+            .call_with_execution_context(
+                &args,
+                None,
+                ToolCallContext {
+                    mutation_forbidden: true,
+                    ..crate::testing::call_facts("telegram:synthetic-owner")
+                },
+            )
+            .await
+            .expect("typed blocked outcome");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
+        assert!(!target.exists(), "the redirect must not have run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_trust_follows_network_and_roots() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let sandboxed = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool.clone(),
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let trust = |tool: &TerminalTool, args: serde_json::Value| {
+            tool.output_trust(&args.to_string(), &roots)
+        };
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"ls","network":true})
+            ),
+            SourceTrust::Untrusted
+        );
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"cat f","read_paths":["/tmp/aidaemon-other/f"]})
+            ),
+            SourceTrust::Untrusted
+        );
+        assert_eq!(
+            trust(
+                &sandboxed,
+                serde_json::json!({"action":"run","command":"cat f","read_paths":["/tmp/aidaemon-test/project/f"]})
+            ),
+            SourceTrust::Trusted
+        );
+    }
+
+    /// Redirect forms the scan does not read structurally (read-write,
+    /// heredoc, here-string, process substitution, a numbered descriptor)
+    /// fail closed: their output is untrusted on the host.
+    #[tokio::test]
+    async fn odd_redirects_fail_closed() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        for command in [
+            "cat <> f",
+            "cat << EOF\nx\nEOF",
+            "cat <<< x",
+            "cat <(ls)",
+            // Inside the roots: only the numbered-descriptor redirect makes
+            // it untrusted, so this fails if the parser ignores `N<`.
+            "cat 3< /tmp/aidaemon-test/project/x",
+        ] {
+            let args = serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Untrusted,
+                "{command}"
+            );
+        }
+        // Controls: the same reads inside the roots without the odd
+        // redirect are trusted.
+        for command in [
+            "cat /tmp/aidaemon-test/project/x",
+            "cat < /tmp/aidaemon-test/project/x",
+        ] {
+            let args = serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Trusted,
+                "{command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_terminal_output_is_trusted_without_network_or_outside_reads() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let run = |command: &str| {
+            serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": "/tmp/aidaemon-test/project",
+            })
+            .to_string()
+        };
+        assert_eq!(
+            host.output_trust(&run("mkdir -p x && echo ok > x/f"), &roots),
+            SourceTrust::Trusted
+        );
+        let status = run("git status");
+        assert_eq!(host.output_trust(&status, &roots), SourceTrust::Trusted);
+        assert!(
+            host.call_annotations_in(&status, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
+        assert_eq!(
+            host.output_trust(&run("cat /etc/hosts"), &roots),
+            SourceTrust::Untrusted
+        );
+    }
+
+    /// On the host nothing enforces declared read paths, so trust comes
+    /// from the command's structure: an observation or local work, no
+    /// network, run inside the roots on operands inside the roots.
+    #[tokio::test]
+    async fn host_terminal_trust_comes_from_the_command_structure() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let project = "/tmp/aidaemon-test/project";
+        let roots_list = vec![project.to_string()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let run = |command: &str, working_dir: &str| {
+            serde_json::json!({"action":"run","command":command,"working_dir":working_dir})
+                .to_string()
+        };
+        let outside = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        for (command, working_dir, expected) in [
+            ("cat ~/Downloads/x", project, Untrusted),
+            ("cat src/lib.rs", project, Trusted),
+            (&*format!("rg foo {outside}"), project, Untrusted),
+            ("cargo test", project, Trusted),
+            ("curl https://example.invalid/x", project, Untrusted),
+            ("cat src/lib.rs", "/tmp/aidaemon-test/elsewhere", Untrusted),
+            ("cat ../other/x", project, Untrusted),
+            ("cat src/*.rs", project, Untrusted),
+            ("cd /etc && cat hosts", project, Untrusted),
+            ("cat $HOME/x", project, Untrusted),
+            ("python3 -c 'print(1)'", project, Untrusted),
+            ("cat < ~/Downloads/x", project, Untrusted),
+            ("head <~/Downloads/x", project, Untrusted),
+            ("wc 0< /etc/hosts", project, Untrusted),
+            ("cat < src/lib.rs", project, Trusted),
+            ("xargs cat < list.txt", project, Untrusted),
+            ("cat list.txt | xargs cat", project, Untrusted),
+        ] {
+            assert_eq!(
+                host.output_trust(&run(command, working_dir), &roots),
+                expected,
+                "{command} in {working_dir}"
+            );
+        }
+        // Declared read paths do not vouch for a host run.
+        let declared = serde_json::json!({
+            "action": "run",
+            "command": "cat /etc/hosts",
+            "working_dir": project,
+            "read_paths": [format!("{project}/f")],
+        })
+        .to_string();
+        assert_eq!(host.output_trust(&declared, &roots), Untrusted);
+        // Without its own directory the run is judged at the turn's cwd.
+        let bare = serde_json::json!({"action":"run","command":"cat src/lib.rs"}).to_string();
+        assert_eq!(
+            host.output_trust(&bare, &roots.anchored_at(Some(project))),
+            Trusted
+        );
+        assert_eq!(host.output_trust(&bare, &roots), Untrusted);
+    }
+
+    #[tokio::test]
+    async fn network_programs_taint_even_on_host() {
+        use aidaemon_core::SourceTrust;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let roots_list: Vec<String> = vec![];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        for command in [
+            "curl https://example.invalid",
+            "git clone https://example.invalid/r.git",
+            "npm install x",
+            "ls && wget https://example.invalid",
+        ] {
+            let args = serde_json::json!({"action":"run","command":command}).to_string();
+            assert_eq!(
+                host.output_trust(&args, &roots),
+                SourceTrust::Untrusted,
+                "{command}"
+            );
+            let ann = host.call_annotations_in(&args, &crate::traits::TrustRoots::new(&[]));
+            assert!(ann.egress && !ann.read_only, "{command}");
+        }
+    }
+
+    async fn host_and_sandboxed_terminals() -> (TerminalTool, TerminalTool) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let host = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx.clone()),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool.clone(),
+        )
+        .await;
+        let sandboxed = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        (host, sandboxed)
+    }
+
+    /// Ordinary local work on the host (builds, tests, local git, file
+    /// shuffling) is not egress; programs outside the local-work table,
+    /// inline interpreters and remote git are.
+    #[tokio::test]
+    async fn host_local_work_is_not_egress() {
+        let (host, _) = host_and_sandboxed_terminals().await;
+        let ann = |command: &str| {
+            host.call_annotations_in(
+                &serde_json::json!({"action":"run","command":command}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
+        for local in [
+            "cargo test",
+            "cargo +nightly build --release",
+            "cargo test 2>&1 | tail -n 50",
+            "git add -A && git commit -m x",
+            "mkdir -p build && cp a build/",
+            "npm run build",
+            "python3 scripts/check.py --fast",
+            "go test ./...",
+            "make -j4 && ls build",
+        ] {
+            let annotations = ann(local);
+            assert!(!annotations.egress, "{local} is local work");
+            assert!(!annotations.read_only, "{local} still mutates");
+        }
+        for egress in [
+            "python3 -c \"print(1)\"",
+            "python3 -m http.server",
+            "node -e \"fetch(1)\"",
+            "curl https://example.invalid",
+            "git push",
+            "git -c core.sshCommand=x status",
+            "git fetch origin",
+            "cargo install ripgrep",
+            "npm publish",
+            "bash build.sh",
+            "./target/debug/app",
+            "RUSTC_WRAPPER=x cargo build",
+            "cargo build < /dev/tcp/example.invalid/80",
+            "echo $(curl example.invalid) > f",
+            "timeout 60 cargo test",
+        ] {
+            assert!(ann(egress).egress, "{egress} is egress on the host");
+        }
+    }
+
+    /// A delete is egress only when a target is outside the trusted roots or
+    /// cannot be determined, on the host and in the sandbox alike.
+    #[tokio::test]
+    async fn deletes_inside_the_trusted_roots_are_not_egress() {
+        let (host, sandboxed) = host_and_sandboxed_terminals().await;
+        let base = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let project = format!("{base}/project");
+        let roots_list = vec![project.clone()];
+        let roots = crate::traits::TrustRoots::new(&roots_list);
+        for tool in [&host, &sandboxed] {
+            let ann = |command: &str, working_dir: Option<&str>| {
+                let mut args = serde_json::json!({"action":"run","command":command});
+                if let Some(dir) = working_dir {
+                    args["working_dir"] = serde_json::json!(dir);
+                }
+                tool.call_annotations_in(&args.to_string(), &roots)
+            };
+            let inside = ann("rm src/old.rs", Some(&project));
+            assert!(!inside.egress && inside.destructive, "{inside:?}");
+            assert!(!ann(&format!("rm -rf {project}/build"), None).egress);
+            assert!(!ann("find build -name '*.o' -delete", Some(&project)).egress);
+            assert!(ann(&format!("rm -rf {base}/outside"), Some(&project)).egress);
+            assert!(ann("rm -rf ../outside", Some(&project)).egress);
+            // No absolute working directory: a relative target is unknown.
+            assert!(ann("rm src/old.rs", None).egress);
+            assert!(ann("rm $TARGET", Some(&project)).egress);
+            assert!(ann("ls | xargs rm", Some(&project)).egress);
+            assert!(ann("find . -exec rm {} ;", Some(&project)).egress);
+            // The shell deletes somewhere the call's directory does not say.
+            for undeterminable in [
+                "cd .. && rm -rf sibling",
+                "pushd .. && rm -rf sibling",
+                "(cd .. && rm -rf sibling)",
+                "find -L / -delete",
+                "find -delete",
+                "rm -rf {build,../../victim}",
+                "rm -rf *",
+                "rm -rf build/?",
+                "rm -rf ~/x",
+            ] {
+                assert!(
+                    ann(undeterminable, Some(&project)).egress,
+                    "{undeterminable} must be egress"
+                );
+            }
+            assert!(!ann("rm -rf build", Some(&project)).egress);
+            assert!(!ann("find ./target -name '*.o' -delete", Some(&project)).egress);
+            // An absolute target stays judgeable after a directory change.
+            assert!(!ann(&format!("cd /tmp && rm -rf {project}/build"), None).egress);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_writes_into_git_config_are_egress() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |args: serde_json::Value| {
+            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+        };
+        let config = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.git/config"]
+        }));
+        assert!(config.egress && !config.read_only);
+        let root = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_roots":["/tmp/aidaemon-test/r/.git"]
+        }));
+        assert!(root.egress);
+        let plain = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/x"]
+        }));
+        assert!(!plain.egress);
+    }
+
+    #[tokio::test]
+    async fn terminal_write_root_containing_a_repo_is_egress() {
+        let dir = std::env::temp_dir()
+            .join("aidaemon-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        let repo = dir.join("repo");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |command: &str, root: &std::path::Path| {
+            tool.call_annotations_in(
+                &serde_json::json!({
+                    "action":"run","command":command,
+                    "write_roots":[root.to_string_lossy()]
+                })
+                .to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
+        let planted = ann("cp x .git/config", &repo);
+        assert!(planted.egress && !planted.read_only);
+        // The command never names `.git`; the root itself holds a repository.
+        let copied = ann("cp -R payload/. .", &repo);
+        assert!(copied.egress && !copied.read_only);
+        let ordinary = ann("cp -R payload/. .", &plain);
+        assert!(!ordinary.egress);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_command_naming_git_config_is_egress() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await
+        .with_confinement(crate::types::TerminalConfinement::Sandbox);
+        let ann = |args: serde_json::Value| {
+            tool.call_annotations_in(&args.to_string(), &crate::traits::TrustRoots::new(&[]))
+        };
+        let global = ann(serde_json::json!({"action":"run","command":"cp x ~/.gitconfig"}));
+        assert!(global.egress && !global.read_only);
+        let declared = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["~/.config/git/attributes"]
+        }));
+        assert!(declared.egress);
+        let cased = ann(serde_json::json!({
+            "action":"run","command":"touch x","write_paths":["/tmp/aidaemon-test/r/.GIT/config"]
+        }));
+        assert!(cased.egress);
+        let plain = ann(serde_json::json!({"action":"run","command":"cp x y"}));
+        assert!(!plain.egress);
+        let reading = ann(serde_json::json!({"action":"run","command":"cat .git/config"}));
+        assert!(reading.read_only && !reading.egress);
+    }
+
+    #[tokio::test]
+    async fn read_only_contract_blocks_commands_outside_the_observation_table() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
@@ -9601,6 +10378,7 @@ mod tests {
             ),
         ]));
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9614,21 +10392,30 @@ mod tests {
 
         let outcome = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"seq 1 3","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"seq 1 3"}"#,
                 None,
-                ToolExecutionContext {
-                    mutation_forbidden: true,
-                    ..Default::default()
+                ToolCallContext {
+                    session_id: "telegram:synthetic-owner".into(),
+                    ..ToolCallContext {
+                        mutation_forbidden: true,
+                        ..Default::default()
+                    }
                 },
             )
             .await
-            .expect("read-only observation executes");
-        assert!(outcome.output.contains("1\n2\n3"), "{}", outcome.output);
+            .expect("typed blocked outcome");
+        // An unlisted executable is not proven observation-only, whatever a
+        // model-based assessment would say; no assessment is requested.
         assert_eq!(
             outcome.metadata.outcome_status,
-            Some(ToolOutcomeStatus::Succeeded)
+            Some(ToolOutcomeStatus::Blocked)
         );
-        assert_eq!(provider.call_count().await, 1);
+        assert!(
+            outcome.output.contains("read-only contract"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(provider.call_count().await, 0);
     }
 
     #[tokio::test]
@@ -9641,6 +10428,7 @@ mod tests {
         let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         drop(approval_rx);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             crate::tools::ApprovalBroker::new(approval_tx),
             1,
@@ -9653,8 +10441,6 @@ mod tests {
         let args = serde_json::json!({
             "action": "run",
             "command": format!("touch {}", target.display()),
-            "_session_id": "telegram:synthetic-owner",
-            "_user_role": "Owner"
         })
         .to_string();
 
@@ -9662,9 +10448,9 @@ mod tests {
             .call_with_execution_context(
                 &args,
                 None,
-                ToolExecutionContext {
-                    mutation_forbidden: true,
-                    ..Default::default()
+                ToolCallContext {
+                    mutation_forbidden: false,
+                    ..crate::testing::call_facts("telegram:synthetic-owner")
                 },
             )
             .await
@@ -9758,7 +10544,7 @@ mod tests {
     #[test]
     fn monitoring_notice_is_terminally_honest() {
         let notice = format_background_monitoring_notice(170, "192.0.2.31\n192.0.2.32\n192.0.2.45");
-        assert!(notice.contains("**Taking longer than expected** · 2m 50s"));
+        assert!(notice.contains("**Taking longer than expected** · running for over 2m 50s"));
         assert!(notice.contains("I'm still monitoring it"));
         assert!(notice.contains("if it needs attention"));
         assert!(notice.contains("_3 lines received so far._"));
@@ -9806,6 +10592,30 @@ mod tests {
             "caption must not contain backticked command"
         );
         assert!(cap.contains("netprobe_results3.txt"));
+    }
+
+    #[test]
+    fn small_text_deliverable_caption_shows_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("bg.txt");
+        std::fs::write(&small, "build-ok\n").unwrap();
+        let preview = small_text_preview(&small);
+        assert_eq!(preview.as_deref(), Some("build-ok"));
+        let cap = build_deliverable_caption(
+            "bg.txt",
+            Some(&format!("Done. bg.txt contains:\n{}", preview.unwrap())),
+        );
+        assert!(cap.contains("build-ok"), "{cap}");
+
+        let large = dir.path().join("big.txt");
+        std::fs::write(&large, "x".repeat(SMALL_TEXT_PREVIEW_BYTES + 1)).unwrap();
+        assert_eq!(small_text_preview(&large), None);
+        let binary = dir.path().join("img.png");
+        std::fs::write(&binary, [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        assert_eq!(small_text_preview(&binary), None);
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "  \n").unwrap();
+        assert_eq!(small_text_preview(&empty), None);
     }
 
     #[test]
@@ -9975,6 +10785,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -9992,11 +10803,13 @@ mod tests {
             "action": "run",
             "command": format!("rm -rf {}", root.to_string_lossy()),
             "write_roots": [root.to_string_lossy()],
-            "_session_id": "sess_del_receipt",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                crate::testing::call_facts("sess_del_receipt"),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -10023,11 +10836,13 @@ mod tests {
             "action": "run",
             "command": format!("ls {}", keep.to_string_lossy()),
             "write_roots": [keep.to_string_lossy()],
-            "_session_id": "sess_del_receipt",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                crate::testing::call_facts("sess_del_receipt"),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -10074,6 +10889,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10085,9 +10901,10 @@ mod tests {
         .with_state(state as Arc<dyn StateStore>);
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo notify-meta","_session_id":"sess_meta","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo notify-meta"}"#,
                 None,
+                crate::testing::call_facts("sess_meta"),
             )
             .await
             .unwrap();
@@ -10096,6 +10913,77 @@ mod tests {
         assert!(outcome.metadata.timed_out);
         assert!(!outcome.metadata.detached);
         assert!(outcome.metadata.completion_notifications_enabled);
+    }
+
+    /// A service that logs its URL on stderr (cloudflared does) must show it
+    /// in the launch result, and the session's next turn must see the running
+    /// process so a follow-up checks it rather than relaunching it.
+    #[tokio::test]
+    async fn detached_service_shows_stderr_startup_and_is_listed_for_its_session() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_execution_context(r#"{"action":"run","command":"echo 'ready at https://synthetic-tunnel.example.test' >&2; sleep 30","detach":true}"#, None, crate::testing::call_facts("sess_service"))
+            .await
+            .unwrap();
+        assert!(outcome.metadata.detached);
+        assert!(
+            outcome
+                .output
+                .contains("ready at https://synthetic-tunnel.example.test"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            !outcome.output.contains("do NOT wait or repeatedly check"),
+            "{}",
+            outcome.output
+        );
+
+        let note = tool
+            .session_context_note("sess_service")
+            .await
+            .expect("a running detached process is listed for its session");
+        assert!(note.contains("detached, runs until killed"), "{note}");
+        assert!(note.contains("sleep 30"), "{note}");
+        assert!(tool.session_context_note("sess_other").await.is_none());
+
+        let pid = tool
+            .running
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("tracked pid");
+        tool.call_with_execution_context(
+            &format!(r#"{{"action":"kill","pid":{pid}}}"#),
+            None,
+            crate::testing::call_facts("sess_service"),
+        )
+        .await
+        .unwrap();
+        assert!(tool.session_context_note("sess_service").await.is_none());
     }
 
     #[tokio::test]
@@ -10114,6 +11002,7 @@ mod tests {
         // A 30s foreground window: without launch-and-return, `sleep 5`
         // would run to completion and be reported synchronously.
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10125,9 +11014,10 @@ mod tests {
 
         let started = Instant::now();
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 5","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 5","detach":true}"#,
                 None,
+                crate::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -10156,9 +11046,10 @@ mod tests {
 
         // An immediate failure inside the startup check is still synchronous.
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"exit 3","detach":true,"_session_id":"sess_detach","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"exit 3","detach":true}"#,
                 None,
+                crate::testing::call_facts("sess_detach"),
             )
             .await
             .unwrap();
@@ -10180,6 +11071,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10190,9 +11082,10 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo done-marker","_session_id":"sess_check_done","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo done-marker"}"#,
                 None,
+                crate::testing::call_facts("sess_check_done"),
             )
             .await
             .unwrap();
@@ -10241,6 +11134,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10251,9 +11145,10 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo reap-marker","_session_id":"sess_reap_done","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo reap-marker"}"#,
                 None,
+                crate::testing::call_facts("sess_reap_done"),
             )
             .await
             .unwrap();
@@ -10300,6 +11195,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10310,9 +11206,10 @@ mod tests {
         .await;
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 30","_session_id":"sess_check_kill","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 30"}"#,
                 None,
+                crate::testing::call_facts("sess_check_kill"),
             )
             .await
             .unwrap();
@@ -10356,6 +11253,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10376,11 +11274,13 @@ mod tests {
             "action": "run",
             "command": format!("mkdir {}", root_str),
             "write_roots": [root_str],
-            "_session_id": "sess_own_root",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                crate::testing::call_facts("sess_own_root"),
+            )
             .await
             .unwrap();
         assert!(
@@ -10411,6 +11311,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -10431,11 +11332,13 @@ mod tests {
             "command": "pwd",
             "working_dir": root_str,
             "write_roots": [root_str],
-            "_session_id": "sess_cwd_root",
-            "_user_role": "Owner",
         });
         let outcome = tool
-            .call_with_status_outcome(&args.to_string(), None)
+            .call_with_execution_context(
+                &args.to_string(),
+                None,
+                crate::testing::call_facts("sess_cwd_root"),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.metadata.exit_code, Some(0), "{}", outcome.output);
@@ -10456,6 +11359,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10467,9 +11371,10 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let outcome = tool
-            .call_with_status_outcome(
-                r#"{"action":"run","command":"sleep 2; echo no-notify-meta","_session_id":"sess_meta2","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 2; echo no-notify-meta"}"#,
                 None,
+                crate::testing::call_facts("sess_meta2"),
             )
             .await
             .unwrap();
@@ -10572,81 +11477,6 @@ mod tests {
         assert!(!is_broad_scan_root("/var/log"));
         assert!(!is_broad_scan_root("/usr"));
         assert!(!is_broad_scan_root("."));
-    }
-
-    // ── correction-scope derivation (3c) ──
-
-    #[test]
-    fn derive_correction_scope_home_targets() {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .map(|h| std::fs::canonicalize(&h).unwrap_or(h))
-            .expect("HOME set in test env");
-
-        // `du -sh ~/* | sort` — glob over home → home dir.
-        assert_eq!(
-            derive_correction_scope_from_command("du -sh ~/* | sort"),
-            home,
-            "du over ~/* should derive the home dir"
-        );
-        // `find ~ -type f` — root is home itself.
-        assert_eq!(
-            derive_correction_scope_from_command("find ~ -type f"),
-            home,
-            "find ~ should derive the home dir"
-        );
-        // `du ~` — bare home.
-        assert_eq!(
-            derive_correction_scope_from_command("du ~"),
-            home,
-            "du ~ should derive the home dir"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_root_target() {
-        assert_eq!(
-            derive_correction_scope_from_command("find / -type f"),
-            std::path::PathBuf::from("/"),
-            "find / should derive /"
-        );
-        assert_eq!(
-            derive_correction_scope_from_command("du /"),
-            std::path::PathBuf::from("/"),
-            "du / should derive /"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_bounded_dir() {
-        // A specific bounded dir under home → that dir (expanded + canonicalized
-        // if it exists, else the expanded path).
-        let home = std::env::var("HOME").expect("HOME set");
-        let target = format!("{}/projects", home.trim_end_matches('/'));
-        let expected =
-            std::fs::canonicalize(&target).unwrap_or_else(|_| std::path::PathBuf::from(&target));
-        assert_eq!(
-            derive_correction_scope_from_command(&format!("du -sh {target}/foo")),
-            std::fs::canonicalize(format!("{target}/foo"))
-                .unwrap_or_else(|_| std::path::PathBuf::from(format!("{target}/foo"))),
-            "du of a specific bounded dir should derive that dir"
-        );
-        // Sanity: the bounded dir is not the broad home scope.
-        assert_ne!(
-            expected,
-            std::path::PathBuf::from("/"),
-            "bounded dir must not collapse to /"
-        );
-    }
-
-    #[test]
-    fn derive_correction_scope_no_path_falls_back_to_cwd() {
-        let cwd = TerminalTool::correction_working_dir();
-        assert_eq!(
-            derive_correction_scope_from_command("echo hi"),
-            cwd,
-            "a command with no path operand should fall back to the daemon cwd"
-        );
     }
 
     #[test]
@@ -10956,6 +11786,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10967,8 +11798,9 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"nohup sleep 1 &","_session_id":"s1","_user_role":"Guest"}"#,
+            .call_with(
+                r#"{"action":"run","command":"nohup sleep 1 &"}"#,
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -10983,6 +11815,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -10995,9 +11828,12 @@ mod tests {
 
         let outcome = tool
             .call_with_execution_context(
-                r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"find / -delete"}"#,
                 None,
-                ToolExecutionContext::default(),
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..ToolCallContext::default()
+                },
             )
             .await
             .unwrap();
@@ -11017,6 +11853,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11028,8 +11865,9 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"grep -rc \"async fn\" .","_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"grep -rc \"async fn\" ."}"#,
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -11052,6 +11890,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11063,8 +11902,9 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok","_session_id":"sess_notify","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok"}"#,
+                crate::testing::call_facts("sess_notify"),
             )
             .await
             .unwrap();
@@ -11103,6 +11943,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11116,9 +11957,7 @@ mod tests {
         // Emit output early so a periodic ping has something NEW to report —
         // no-output commands are now intentionally quiet until completion.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok","_session_id":"sess_seq","_user_role":"Owner"}"#,
-            )
+            .call_with(r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok"}"#, crate::testing::call_facts("sess_seq"))
             .await
             .unwrap();
         assert!(
@@ -11189,6 +12028,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11200,8 +12040,9 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3","_session_id":"sess_quiet","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3"}"#,
+                crate::testing::call_facts("sess_quiet"),
             )
             .await
             .unwrap();
@@ -11523,6 +12364,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11536,8 +12378,9 @@ mod tests {
         // No-output, long-running command — stands in for a whole-disk scan that
         // never exits. It is moved to background after the 1s initial timeout.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 120"}"#,
+                crate::testing::call_facts("sess_reap"),
             )
             .await
             .unwrap();
@@ -11586,117 +12429,6 @@ mod tests {
         );
     }
 
-    /// The correction-bridge working_dir helper returns an absolute, canonical
-    /// path (so `.`/`..`/symlinks are resolved before the bridge's
-    /// `is_unsafe_correction_working_dir` guard — which does NOT canonicalize —
-    /// sees it). Canonicalization is what makes the `== "/"` / `== $HOME`
-    /// equality checks fire reliably.
-    #[test]
-    fn test_correction_working_dir_is_canonical_absolute() {
-        let dir = TerminalTool::correction_working_dir();
-        assert!(
-            dir.is_absolute(),
-            "correction working_dir must be absolute, got {dir:?}"
-        );
-        // Canonicalizing an already-canonical path is a fixed point.
-        if let Ok(canon) = std::fs::canonicalize(&dir) {
-            assert_eq!(
-                canon, dir,
-                "correction working_dir must already be canonical"
-            );
-        }
-    }
-
-    /// Self-correction bridge: when correction is ENABLED but no agent is wired
-    /// (the bridge can't reach the event store / dispatch path), the idle-reaper
-    /// must fall back to the EXISTING user notification and dispatch nothing.
-    /// This is the safety floor: a misconfigured/half-wired bridge degrades to
-    /// today's behavior rather than silently swallowing the notice.
-    #[tokio::test]
-    async fn test_idle_reap_correction_enabled_no_agent_falls_back_to_notice() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().display().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        let pool = state.pool();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-
-        // Correction ENABLED + bypass + live (shadow off) — but NO agent wired.
-        let live_cfg = SelfCorrectionConfig {
-            enabled: true,
-            correction_bypass_enabled: true,
-            max_attempts: 3,
-            shadow_mode: false,
-        };
-        let tool = TerminalTool::new(
-            vec!["*".to_string()],
-            approval_tx,
-            1,
-            4000,
-            PermissionMode::Yolo,
-            pool,
-        )
-        .await
-        .with_state(state.clone() as Arc<dyn StateStore>)
-        .with_self_correction(live_cfg);
-
-        // Direct unit check of the bridge entry point: no agent → no dispatch.
-        let dispatched = tool
-            .try_dispatch_idle_reap_remediation(
-                "find / -type f -size +100M",
-                "sess_reap_noagent",
-                None,
-                300,
-            )
-            .await;
-        assert!(!dispatched, "no agent wired must NOT dispatch remediation");
-
-        // End-to-end: reap a hung process and confirm the EXISTING notice fires.
-        let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap_noagent","_user_role":"Owner"}"#,
-            )
-            .await
-            .unwrap();
-        assert!(response.contains("Moved to background (pid="));
-
-        let mut reaped = 0;
-        for _ in 0..40 {
-            reaped = tool
-                .reap_stale_background_processes(Duration::from_millis(1))
-                .await;
-            if reaped > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(reaped, 1, "expected the hung process to be reaped");
-
-        // The EXISTING "I stopped a background command" notice must still fire —
-        // NOT the quieter "retrying a different way" remediation note.
-        let mut saw_stopped_notice = false;
-        for _ in 0..20 {
-            let pending = state.get_pending_notifications(50).await.unwrap();
-            if pending.iter().any(|entry| {
-                entry.session_id == "sess_reap_noagent"
-                    && entry.message.contains("I stopped a background command")
-            }) {
-                saw_stopped_notice = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            saw_stopped_notice,
-            "enabled-but-no-agent must fall back to the existing stopped-command notice"
-        );
-    }
-
     /// A background command that keeps streaming output is NOT reaped: each new
     /// byte refreshes its idle clock, so a healthy long-running process survives.
     #[tokio::test]
@@ -11713,6 +12445,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11726,9 +12459,7 @@ mod tests {
         // Emits a line roughly every 0.2s for a while — a stand-in for a dev server
         // or a scan that is genuinely making progress.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done","_session_id":"sess_stream","_user_role":"Owner"}"#,
-            )
+            .call_with(r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done"}"#, crate::testing::call_facts("sess_stream"))
             .await
             .unwrap();
         assert!(response.contains("Moved to background (pid="));
@@ -11758,7 +12489,7 @@ mod tests {
         assert!(is_short_complete_output("42"));
         assert!(is_short_complete_output("207"));
         assert!(is_short_complete_output(
-            "/Users/davidloor/projects/resume/google"
+            "/Users/jordan/projects/resume/google"
         ));
         assert!(is_short_complete_output("Build complete"));
         assert!(is_short_complete_output("a\nb\nc")); // 3 lines, tiny
@@ -11805,6 +12536,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11818,8 +12550,9 @@ mod tests {
         // Output "42" (2 chars) — the command text contains 40 and 2 but not 42,
         // so finding "42" in a notification proves the OUTPUT was delivered.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo $((40 + 2))","_session_id":"sess_short","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo $((40 + 2))"}"#,
+                crate::testing::call_facts("sess_short"),
             )
             .await
             .unwrap();
@@ -11863,6 +12596,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11874,16 +12608,18 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let first = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo duplicate-result"}"#,
+                crate::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
         assert!(first.contains("Moved to background (pid="));
 
         let second = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result"}"#,
+                crate::testing::call_facts("sess_dupe_result"),
             )
             .await
             .unwrap();
@@ -11941,6 +12677,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -11954,8 +12691,9 @@ mod tests {
         // Stay alive past the frequent-ping budget, then finish. The final
         // output must still arrive after the one-time monitoring transition.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished","_session_id":"sess_server","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished"}"#,
+                crate::testing::call_facts("sess_server"),
             )
             .await
             .unwrap();
@@ -12004,6 +12742,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12015,18 +12754,19 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 10","_session_id":"sess_kill","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 10"}"#,
+                crate::testing::call_facts("sess_kill"),
             )
             .await
             .unwrap();
         let pid = extract_pid_from_background_message(&response);
 
         let kill_response = tool
-            .call(&format!(
-                r#"{{"action":"kill","pid":{},"_session_id":"sess_kill","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
+                crate::testing::call_facts("sess_kill"),
+            )
             .await
             .unwrap();
         assert!(kill_response.contains("stopped"));
@@ -12051,6 +12791,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12062,8 +12803,9 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 2; echo post-reap-ok","_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 2; echo post-reap-ok"}"#,
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12072,14 +12814,80 @@ mod tests {
 
         // This call will reap finished processes first; check must still return final output.
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(check.contains("post-reap-ok"));
         assert!(check.contains(&format!("pid={}", pid)));
+    }
+
+    /// `check` returns output of a command judged when it was launched: it
+    /// carries that judgment; an unknown process is untrusted.
+    #[tokio::test]
+    async fn background_check_inherits_the_launch_trust() {
+        use aidaemon_core::SourceTrust::{Trusted, Untrusted};
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("slow_build.py"),
+            "import time\ntime.sleep(3)\nprint('built')\n",
+        )
+        .unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let roots_list = vec![project_dir.clone()];
+        let roots = crate::traits::TrustRoots::new(&roots_list).with_cwd(Some(&project_dir));
+        let launch = |command: &str| {
+            serde_json::json!({
+                "action": "run",
+                "command": command,
+                "working_dir": project_dir,
+            })
+            .to_string()
+        };
+        // The dispatcher's facts for the launch: the turn's trust roots.
+        let launch_facts = ToolCallContext {
+            trust_roots: Some(vec![project_dir.clone()]),
+            trust_cwd: Some(project_dir.clone()),
+            ..crate::testing::call_facts("s1")
+        };
+        let check = |pid: u32| serde_json::json!({"action": "check", "pid": pid}).to_string();
+        for (command, expected) in [
+            ("python3 slow_build.py", Trusted),
+            ("sleep 3; curl -s https://example.invalid/x", Untrusted),
+        ] {
+            let response = tool
+                .call_with(&launch(command), launch_facts.clone())
+                .await
+                .unwrap();
+            assert!(response.contains("Moved to background (pid="), "{response}");
+            let pid = extract_pid_from_background_message(&response);
+            assert_eq!(
+                tool.output_trust(&check(pid), &roots),
+                expected,
+                "{command}"
+            );
+            let kill = serde_json::json!({"action": "kill", "pid": pid}).to_string();
+            assert_eq!(tool.output_trust(&kill, &roots), expected, "{command}");
+            tool.call(&kill).await.unwrap();
+        }
+        assert_eq!(tool.output_trust(&check(4_000_000), &roots), Untrusted);
     }
 
     #[tokio::test]
@@ -12090,6 +12898,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12101,8 +12910,13 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 10","_session_id":"s1","_task_id":"task-clean","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 10"}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    task_id: Some("task-clean".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12113,10 +12927,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(
@@ -12140,6 +12954,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12151,8 +12966,13 @@ mod tests {
         .with_state(state.clone() as Arc<dyn StateStore>);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3; echo disown-ok","_session_id":"sess_disown","_task_id":"task-disown","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3; echo disown-ok"}"#,
+                ToolCallContext {
+                    session_id: "sess_disown".into(),
+                    task_id: Some("task-disown".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12167,10 +12987,10 @@ mod tests {
 
         // Process should still be tracked (disowned, not removed).
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"sess_disown","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                crate::testing::call_facts("sess_disown"),
+            )
             .await
             .unwrap();
         assert!(
@@ -12205,6 +13025,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12216,16 +13037,28 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let first = tool
-            .call(
-                r#"{"action":"run","command":"sleep 5","_session_id":"sub-a","_task_id":"task-a","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 5"}"#,
+                ToolCallContext {
+                    session_id: "sub-a".into(),
+                    task_id: Some("task-a".into()),
+                    goal_id: Some("goal-1".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         let pid = extract_pid_from_background_message(&first);
 
         let second = tool
-            .call(
-                r#"{"action":"run","command":"sleep   5","_session_id":"sub-b","_task_id":"task-b","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep   5"}"#,
+                ToolCallContext {
+                    session_id: "sub-b".into(),
+                    task_id: Some("task-b".into()),
+                    goal_id: Some("goal-1".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12252,6 +13085,7 @@ mod tests {
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12269,8 +13103,13 @@ mod tests {
         });
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 3","detach":true,"_session_id":"s1","_task_id":"task-detach","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"sleep 3","detach":true}"#,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    task_id: Some("task-detach".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -12280,10 +13119,10 @@ mod tests {
 
         tool.on_task_end("task-detach", "s1").await.unwrap();
         let check = tool
-            .call(&format!(
-                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"check","pid":{}}}"#, pid),
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(
@@ -12292,10 +13131,10 @@ mod tests {
         );
 
         let _ = tool
-            .call(&format!(
-                r#"{{"action":"kill","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
-                pid
-            ))
+            .call_with(
+                &format!(r#"{{"action":"kill","pid":{}}}"#, pid),
+                crate::testing::call_facts("s1"),
+            )
             .await;
     }
 
@@ -12315,6 +13154,7 @@ mod tests {
         let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             2, // 2 second timeout
@@ -12333,12 +13173,19 @@ mod tests {
         });
 
         let start = Instant::now();
+        // The owner approved the daemonization card in the kernel.
         let response = tool
-            .call(
-                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 5 & echo $!","detach":true}"#,
+                None,
+                ToolCallContext {
+                    session_id: "s1".into(),
+                    ..kernel_owner_ctx()
+                },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         let elapsed = start.elapsed();
 
         // Should return promptly (within the timeout + small margin) rather than
@@ -12368,6 +13215,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12383,12 +13231,12 @@ mod tests {
         let command = format!("cat > /tmp/test.html << EOF\n{}\nEOF", large_content);
         let args = serde_json::json!({
             "action": "run",
-            "command": command,
-            "_session_id": "s1",
-            "_user_role": "Owner"
-        });
+            "command": command});
 
-        let response = tool.call(&args.to_string()).await.unwrap();
+        let response = tool
+            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
+            .await
+            .unwrap();
         assert!(
             response.contains("write_file"),
             "expected heredoc soft-block to recommend write_file, got: {}",
@@ -12409,6 +13257,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12427,12 +13276,12 @@ mod tests {
         );
         let args = serde_json::json!({
             "action": "run",
-            "command": command,
-            "_session_id": "s1",
-            "_user_role": "Owner"
-        });
+            "command": command});
 
-        let response = tool.call(&args.to_string()).await.unwrap();
+        let response = tool
+            .call_with(&args.to_string(), crate::testing::call_facts("s1"))
+            .await
+            .unwrap();
         assert!(
             !response.contains("unreliable"),
             "quoted heredoc should NOT be soft-blocked, got: {}",
@@ -12505,8 +13354,16 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         // Empty permanent prefix list — only session approvals exist.
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
         std::mem::forget(db_file);
         tool
     }
@@ -12608,6 +13465,7 @@ mod tests {
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let original = "cd /Users/u/proj && npm run dev -- --port 3000";
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![original.to_string()],
             approval_tx,
             1,
@@ -12645,6 +13503,7 @@ mod tests {
         drop(approval_rx);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -12657,8 +13516,9 @@ mod tests {
         std::mem::forget(db_file);
 
         let response = tool
-            .call(
-                r#"{"action":"run","command":"echo hi","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
+            .call_with(
+                r#"{"action":"run","command":"echo hi","detach":true}"#,
+                crate::testing::call_facts("s1"),
             )
             .await
             .unwrap();
@@ -12681,6 +13541,7 @@ mod tests {
         drop(approval_rx);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["echo".to_string()],
             approval_tx,
             1,
@@ -12692,17 +13553,29 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
         std::mem::forget(db_file);
 
-        let response = tool
-            .call(
-                r#"{"action":"run","command":"echo hi","detach":true,"_untrusted_source":true,"_session_id":"s1","_user_role":"Owner"}"#,
-            )
+        let args = serde_json::json!({"action":"run","command":"echo hi","detach":true});
+        let trust = TerminalTrust {
+            untrusted_source: true,
+            ..owner_trust()
+        };
+        let request = tool
+            .owner_approval_request(&args, &trust)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("untrusted-source command must ask even when allowlisted");
         assert!(
-            response.contains("Could not get approval"),
-            "untrusted-source command must force approval even when allowlisted, got: {}",
-            response
+            request
+                .warnings
+                .iter()
+                .any(|w| w.contains("untrusted external trigger")),
+            "{request:?}"
         );
+        // The same command from the owner runs without asking.
+        assert!(tool
+            .owner_approval_request(&args, &owner_trust())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -12723,6 +13596,7 @@ mod tests {
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1,
@@ -12734,7 +13608,10 @@ mod tests {
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
 
         let resp = tool
-            .call(r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10","_session_id":"s","_user_role":"Owner"}"#)
+            .call_with(
+                r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10"}"#,
+                crate::testing::call_facts("s"),
+            )
             .await
             .unwrap();
         assert!(
@@ -12751,7 +13628,10 @@ mod tests {
 
         // A scoped command is NOT blocked by this guard (it may still run/echo).
         let ok = tool
-            .call(r#"{"action":"run","command":"echo scoped-ok","_session_id":"s","_user_role":"Owner"}"#)
+            .call_with(
+                r#"{"action":"run","command":"echo scoped-ok"}"#,
+                crate::testing::call_facts("s"),
+            )
             .await
             .unwrap();
         assert!(ok.contains("scoped-ok"));
@@ -12771,203 +13651,49 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.unwrap();
         let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(4);
         let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec![],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
         std::mem::forget(db_file);
         (tool, approval_rx)
     }
 
-    /// correction_preapproved=true bypasses the `_untrusted_source` prompt for
-    /// a safe `action="run"` command.
-    ///
-    /// Without preapproval, `_untrusted_source=true` forces an approval request
-    /// which blocks until the channel is answered.  With preapproval the command
-    /// must run without hitting the approval channel.
+    /// The dispatcher-owned execution-context path must not weaken approval:
+    /// an untrusted-source `run` without the kernel's approval is refused.
     #[tokio::test]
-    async fn correction_preapproval_bypasses_untrusted_source_for_run() {
-        // Close the approval receiver so any approval attempt errors immediately.
-        // If the preapproval gate works, the tool should NOT attempt approval and
-        // should succeed with the command output.
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_url = format!("sqlite:{}", db_file.path().display());
-        let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        drop(approval_rx); // <-- closed; any approval attempt would error
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
-        std::mem::forget(db_file);
+    async fn untrusted_source_run_via_execution_context_still_prompts() {
+        let (tool, _approval_rx) = make_tool_with_open_approval_channel().await;
 
-        // args include _untrusted_source=true which would normally force approval.
-        let args = r#"{"action":"run","command":"echo preapproved-ok","_untrusted_source":true,"_session_id":"s1","_user_role":"Owner"}"#;
-
-        let exec_ctx = ToolExecutionContext {
-            correction_preapproved: true,
+        // The untrusted-source rung asks, so outside the kernel the call is
+        // refused; the dispatcher's typed fact, not an argument, says so.
+        let ctx = ToolCallContext {
+            untrusted_source: true,
+            user_role: Some(crate::types::UserRole::Owner),
             ..Default::default()
         };
-
-        let result = tool
-            .call_with_execution_context(args, None, exec_ctx)
-            .await
-            .expect("preapproved run should succeed without approval");
-
-        assert!(
-            result.output.contains("preapproved-ok"),
-            "preapproved run should execute the command, got: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("Could not get approval"),
-            "preapproved run must not have hit the approval gate, got: {}",
-            result.output
-        );
-    }
-
-    /// correction_preapproved=true does NOT bypass approval for non-run actions.
-    ///
-    /// `trust_all` must require an explicit owner interaction even when
-    /// correction_preapproved is set — it cannot be silently executed by the
-    /// correction gate.
-    #[tokio::test]
-    async fn correction_preapproval_does_not_bypass_non_run_actions() {
-        // trust_all doesn't use the approval channel — it just returns output.
-        // Test that trust_all still behaves correctly (runs, not blocked) when
-        // preapproved, but also that check/kill don't crash without pid.
-        // The key invariant: non-run actions go through the normal path.
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_url = format!("sqlite:{}", db_file.path().display());
-        let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool =
-            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
-        std::mem::forget(db_file);
-
-        let exec_ctx = ToolExecutionContext {
-            correction_preapproved: true,
-            ..Default::default()
-        };
-
-        // "check" with no pid should return an error (normal path), not be silently
-        // auto-approved or crash.  correction_preapproved must not turn this into
-        // a run action.
-        let check_result = tool
+        let error = tool
             .call_with_execution_context(
-                r#"{"action":"check","_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"echo ordinary-unsafe"}"#,
                 None,
-                exec_ctx,
-            )
-            .await;
-
-        // Should be Err (pid required) or contain an error message — never a panic
-        // and never treated as "run".
-        match check_result {
-            Err(e) => assert!(
-                e.to_string().contains("pid"),
-                "check without pid should fail with pid-related error, got: {}",
-                e
-            ),
-            Ok(outcome) => assert!(
-                outcome.output.contains("pid") || outcome.output.contains("required"),
-                "check without pid output should mention pid, got: {}",
-                outcome.output
-            ),
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // P2.5-C: next ordinary unsafe command still prompts after a preapproved call
-    //
-    // After a correction-preapproved call succeeds, the next call with
-    // correction_preapproved=false and _untrusted_source=true must still reach
-    // the approval channel.  We prove this by:
-    //   1. Making a preapproved call (approval_rx has a closed receiver — no
-    //      approval request should arrive).
-    //   2. Dropping that tool and creating a fresh tool with an open approval
-    //      channel.
-    //   3. Calling with correction_preapproved=false + _untrusted_source=true.
-    //   4. Asserting that an approval request IS received on the channel.
-    //
-    // The freshness of the tool is intentional: TerminalTool's session_approved
-    // HashSet is per-instance.  The structural invariant is that correction_
-    // preapproved never touches session_approved (see terminal.rs:2853 — the
-    // `else if correction_preapproved` branch does NOT call add_session_prefix
-    // or add_prefix; it only sets needs_approval=false and logs).  Therefore
-    // even on the same instance, no residue would pollute session_approved.
-    //
-    // Using a fresh instance makes the "still prompts" proof self-contained and
-    // independent of any cross-call state.
-    // ─────────────────────────────────────────────────────────────────────────
-    #[tokio::test]
-    async fn test_next_ordinary_unsafe_command_still_prompts() {
-        // --- Part 1: correction-preapproved call on a tool with a closed receiver ---
-        // We intentionally close the approval_rx; if the preapproval gate works,
-        // no approval request is sent and the command executes.
-        {
-            let db_file = tempfile::NamedTempFile::new().unwrap();
-            let db_url = format!("sqlite:{}", db_file.path().display());
-            let pool = SqlitePool::connect(&db_url).await.unwrap();
-            let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-            drop(approval_rx); // closed — any approval attempt would error
-            let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-            let tool =
-                TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool)
-                    .await;
-            std::mem::forget(db_file);
-
-            let exec_ctx = ToolExecutionContext {
-                correction_preapproved: true,
-                ..Default::default()
-            };
-            let result = tool
-                .call_with_execution_context(
-                    r#"{"action":"run","command":"echo p25-preapproved","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
-                    None,
-                    exec_ctx,
-                )
-                .await
-                .expect("preapproved run must succeed without hitting closed approval channel");
-            assert!(
-                result.output.contains("p25-preapproved"),
-                "preapproved call must execute the command, got: {}",
-                result.output
-            );
-        } // tool dropped; any session_approved state is dropped with it
-
-        // --- Part 2: ordinary (non-preapproved) call must reach the approval channel ---
-        // Fresh tool with an OPEN approval channel.  We answer on a background task
-        // so the call can complete; we then verify the request was received.
-        let (tool, mut approval_rx) = make_tool_with_open_approval_channel().await;
-
-        // Answer the approval request from a background task so the tool call
-        // can complete without blocking forever.
-        tokio::spawn(async move {
-            if let Some(req) = approval_rx.recv().await {
-                // Deny it — we only care that the request WAS sent, not the outcome.
-                let _ = req.response_tx.send(ApprovalResponse::Deny);
-            }
-        });
-
-        // This call has correction_preapproved=false and _untrusted_source=true.
-        // The untrusted-source branch forces needs_approval=true, so an approval
-        // request MUST be sent to the channel.
-        let result = tool
-            .call_with_execution_context(
-                r#"{"action":"run","command":"echo ordinary-unsafe","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
-                None,
-                ToolExecutionContext {
-                    correction_preapproved: false,
-                    ..Default::default()
+                ToolCallContext {
+                    session_id: "p25-sess".into(),
+                    ..ctx
                 },
             )
             .await
-            .expect("call should complete (denied, not error)");
-
+            .expect_err("an untrusted-source run needs the kernel's approval");
         assert!(
-            result.output.contains("denied") || result.output.contains("Deny"),
-            "ordinary unsafe command must have gone through the approval gate \
-             (expected denial message), got: {}",
-            result.output
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
         );
     }
 }
@@ -12990,7 +13716,7 @@ mod policy_dump_probe {
         };
         let command =
             std::env::var("AIDAEMON_POLICY_PROBE_CMD").unwrap_or_else(|_| "npm run build".into());
-        let backend = active_execution_backend();
+        let backend = crate::execution::active_execution_backend();
         let writes = std::env::var("AIDAEMON_POLICY_PROBE_WRITES")
             .ok()
             .map(|w| w.split(':').map(str::to_string).collect::<Vec<_>>())
@@ -13030,6 +13756,152 @@ mod policy_dump_probe {
                 );
             }
             other => println!("NON-ARGV: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod call_effects_tests {
+    use super::{terminal_call_effects, terminal_call_effects_on};
+    use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+
+    fn run(command: &str) -> CallEffects {
+        terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
+            &serde_json::json!({"action": "run", "command": command}).to_string(),
+        )
+    }
+
+    fn egress(target: &str) -> EffectKey {
+        EffectKey {
+            class: EffectClass::Egress,
+            target: target.to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_curl_post_declares_egress_host() {
+        let effects = run("curl -X POST https://h.example.invalid:8443/x -d '{}'");
+        assert_eq!(effects.keys, vec![egress("h.example.invalid:8443")]);
+        assert!(!effects.complete);
+    }
+
+    #[test]
+    fn terminal_curl_default_port() {
+        let effects = run("curl https://h.example.invalid/x");
+        assert_eq!(effects.keys, vec![egress("h.example.invalid:443")]);
+        assert!(!effects.complete);
+    }
+
+    #[test]
+    fn terminal_script_is_incomplete() {
+        for command in ["bash run.sh", "python3 tool.py"] {
+            assert!(!run(command).complete, "{command}");
+        }
+        let script = terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
+            &serde_json::json!({"action": "run", "script": "ls\nbash run.sh"}).to_string(),
+        );
+        assert!(!script.complete);
+    }
+
+    #[test]
+    fn terminal_redirect_declares_write() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/f");
+        let effects = run(&format!("echo x >> {path}"));
+        assert!(!effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![
+                crate::tools::command_effects::path_effect(EffectClass::Write, &path, None)
+                    .unwrap()
+            ]
+        );
+        assert!(effects.keys[0].target.ends_with("/f"));
+    }
+
+    #[test]
+    fn terminal_relative_paths_resolve_against_working_dir() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let effects = terminal_call_effects(&*crate::execution::active_execution_backend(),
+            &serde_json::json!({"action": "run", "command": "echo x > out.txt", "working_dir": dir})
+                .to_string(),
+        );
+        assert!(!effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![crate::tools::command_effects::path_effect(
+                EffectClass::Write,
+                &format!("{dir}/out.txt"),
+                None
+            )
+            .unwrap()]
+        );
+        // Without a working directory the target is undeterminable.
+        assert!(run("echo x > out.txt").keys.is_empty());
+    }
+
+    #[test]
+    fn terminal_remote_backend_paths_are_incomplete() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!("curl -o {dir}/page https://h.example.invalid/ && rm -rf {dir}/old"),
+        })
+        .to_string();
+        let local = terminal_call_effects_on(&arguments, true);
+        assert!(!local.complete);
+        assert_eq!(local.keys.len(), 3);
+        // On an SSH or Docker workspace the paths are not on this disk.
+        let remote = terminal_call_effects_on(&arguments, false);
+        assert!(!remote.complete);
+        assert_eq!(remote.keys, vec![egress("h.example.invalid:443")]);
+    }
+
+    /// C2: effects and execution read the action through one parser; an
+    /// action execution would run but that is not spelled canonically is
+    /// undeclared rather than read as `check`.
+    #[test]
+    fn terminal_action_is_parsed_once() {
+        use super::TerminalAction;
+        for action in ["Check", " run ", "RUN", "check ", "Kill"] {
+            assert_eq!(TerminalAction::parse(action), TerminalAction::Unrecognized);
+            // Execution runs the command for these, as before.
+            assert!(TerminalAction::parse(action).runs_command(), "{action}");
+            let arguments = serde_json::json!({
+                "action": action,
+                "command": "curl -d @/tmp/x https://a.example.invalid/"
+            })
+            .to_string();
+            assert_eq!(
+                terminal_call_effects(&*crate::execution::active_execution_backend(), &arguments),
+                CallEffects::unknown(),
+                "{action}"
+            );
+        }
+        assert_eq!(TerminalAction::parse("check"), TerminalAction::Check);
+        assert_eq!(TerminalAction::parse("run"), TerminalAction::Run);
+        assert!(!TerminalAction::parse("check").runs_command());
+    }
+
+    #[test]
+    fn terminal_check_reads_and_other_actions_are_undeclared() {
+        let check = terminal_call_effects(
+            &*crate::execution::active_execution_backend(),
+            r#"{"action":"check","pid":42}"#,
+        );
+        assert_eq!(check, CallEffects::none());
+        for other in [
+            r#"{"action":"kill","pid":42}"#,
+            r#"{"action":"trust_all"}"#,
+            "{",
+        ] {
+            assert_eq!(
+                terminal_call_effects(&*crate::execution::active_execution_backend(), other),
+                CallEffects::unknown(),
+                "{other}"
+            );
         }
     }
 }

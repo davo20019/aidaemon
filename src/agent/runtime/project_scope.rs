@@ -68,7 +68,12 @@ fn is_likely_filename(token: &str) -> bool {
 
 #[cfg(test)]
 pub(in crate::agent) fn token_looks_like_filesystem_path(token: &str) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(token, &[]).is_some()
+    crate::tools::fs_utils::resolve_structural_filesystem_reference(
+        &*crate::execution::active_execution_backend(),
+        token,
+        &[],
+    )
+    .is_some()
 }
 
 fn token_looks_like_project_scope_path(
@@ -77,6 +82,7 @@ fn token_looks_like_project_scope_path(
     workspace_anchor: Option<&Path>,
 ) -> bool {
     crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        &*crate::execution::active_execution_backend(),
         token,
         alias_roots,
         workspace_anchor,
@@ -230,7 +236,12 @@ pub(super) fn extract_project_hints_from_text(
         }
         let uri_like = raw.contains("://");
         let path_like = uri_like
-            || crate::tools::fs_utils::resolve_structural_filesystem_reference(raw, &[]).is_some();
+            || crate::tools::fs_utils::resolve_structural_filesystem_reference(
+                &*crate::execution::active_execution_backend(),
+                raw,
+                &[],
+            )
+            .is_some();
         if path_only && !path_like {
             continue;
         }
@@ -288,6 +299,7 @@ fn normalize_project_scope_path_anchored(
     workspace_anchor: Option<&Path>,
 ) -> Option<String> {
     crate::tools::fs_utils::resolve_project_scope_reference_from(
+        &*crate::execution::active_execution_backend(),
         raw_path,
         alias_roots,
         workspace_anchor,
@@ -357,6 +369,7 @@ pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
     let mut resources = Vec::new();
     for token in structural_filesystem_reference_tokens(text) {
         let Some(path) = crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+            &*crate::execution::active_execution_backend(),
             &token,
             alias_roots,
             workspace_anchor,
@@ -443,14 +456,20 @@ fn extract_project_scopes_from_text_inner(
 fn scope_looks_like_project_root(scope: &str) -> bool {
     let backend = crate::execution::active_execution_backend();
     if backend.kind() != crate::execution::BackendKind::Local {
-        let Ok(path) = crate::execution::normalize_active_path_lexically(scope) else {
+        let Ok(path) = crate::execution::normalize_path_lexically(
+            &*crate::execution::active_execution_backend(),
+            scope,
+        ) else {
             return false;
         };
         return std::path::Path::new(path.as_str())
             .starts_with(std::path::Path::new(backend.workspace_root().as_str()));
     }
 
-    let Ok(path) = crate::tools::fs_utils::validate_path(scope) else {
+    let Ok(path) = crate::tools::fs_utils::validate_path(
+        &*crate::execution::active_execution_backend(),
+        scope,
+    ) else {
         return false;
     };
     if !path.is_dir() {
@@ -525,6 +544,17 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
 /// written by `scheduled_goal_runs bind_workspace` or an earlier recovery).
 /// Typed durable state: it must be an existing absolute directory. This
 /// binding outranks anything inferred from mission or request text.
+/// Where a turn's workspace binding came from. Only an `Explicit` binding
+/// (the goal's `bind_workspace` action, written to `goal.context`) vouches
+/// for the files under it; an `Inferred` one (a scope a parent handed down,
+/// one resolved from mission or request text, an attempt workspace) still
+/// steers where tools run but is never a trusted root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceBindingOrigin {
+    Explicit,
+    Inferred,
+}
+
 pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
     typed_workspace_binding(value.get("project_scope")?.as_str())
@@ -728,7 +758,7 @@ mod tests {
     fn project_scope_extraction_ignores_history_for_new_tasks() {
         let history = vec![msg(
             "assistant",
-            "Found symlink: /Users/davidloor/.openclaw and other directories.",
+            "Found symlink: /Users/jordan/.openclaw and other directories.",
         )];
         let current = "Find all Rust files in the aidaemon project that contain async fn.";
         let scopes = extract_project_scopes_from_history(&history, current, 4, false, &[]);
@@ -902,24 +932,24 @@ mod tests {
     }
     #[test]
     fn explicit_scope_wins_over_inherited_scope_when_present() {
-        let extracted = Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string());
+        let extracted = Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string());
         let resolved = resolve_primary_project_scope(
             extracted,
-            Some("/Users/davidloor/Library/Logs/aidaemon"),
+            Some("/Users/jordan/Library/Logs/aidaemon"),
             false,
             true,
         );
         assert_eq!(
             resolved,
-            Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string())
+            Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string())
         );
     }
     #[test]
     fn inherited_project_scope_yields_to_explicit_scope_for_multi_project_requests() {
-        let extracted = Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string());
+        let extracted = Some("/Users/jordan/projects/terminal.aidaemon.ai".to_string());
         let resolved = resolve_primary_project_scope(
             extracted.clone(),
-            Some("/Users/davidloor/Library/Logs/aidaemon"),
+            Some("/Users/jordan/Library/Logs/aidaemon"),
             true,
             true,
         );
@@ -929,7 +959,7 @@ mod tests {
     fn inherited_project_scope_is_ignored_when_turn_is_not_local_project_work() {
         let resolved = resolve_primary_project_scope(
             None,
-            Some("/Users/davidloor/projects/fairfax-va-site"),
+            Some("/Users/jordan/projects/springfield-il-site"),
             false,
             false,
         );
@@ -939,7 +969,7 @@ mod tests {
     fn project_scope_extraction_ignores_assistant_paths_for_non_local_followup() {
         let history = vec![msg(
             "assistant",
-            "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+            "I am currently locked to /Users/jordan/projects/springfield-il-site.",
         )];
 
         let scopes = extract_project_scopes_from_history(
@@ -1093,14 +1123,15 @@ mod tests {
     fn project_scope_extraction_rejects_plain_word_nickname_without_local_scope_cues() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let scopes = extract_project_scopes_from_history(
             &[],
-            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            "Find recruiting studies in Springfield, Illinois and summarize them.",
             4,
             false,
             &alias_roots,
@@ -1116,14 +1147,15 @@ mod tests {
     fn project_scope_words_do_not_turn_plain_nicknames_into_hard_scope() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
-        let project = alias_root.join("fairfax-va-site");
+        let project = alias_root.join("springfield-il-site");
         std::fs::create_dir_all(&project).expect("create project");
-        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        std::fs::write(project.join("wrangler.toml"), "name = \"springfield\"\n")
+            .expect("wrangler");
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let scopes = extract_project_scopes_from_history(
             &[],
-            "Check the Fairfax project for broken links.",
+            "Check the Springfield project for broken links.",
             4,
             false,
             &alias_roots,

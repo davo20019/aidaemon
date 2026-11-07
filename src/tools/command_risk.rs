@@ -6,6 +6,7 @@ pub use crate::types::{PermissionMode, RiskLevel};
 /// Explicit credential/private-key path segments form a narrow deterministic
 /// floor. Open-ended command danger is assessed semantically elsewhere.
 const SENSITIVE_PATH_SEGMENTS: &[&str] = &[
+    ".ssh",
     ".env",
     "id_rsa",
     "id_ed25519",

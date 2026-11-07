@@ -12,8 +12,11 @@ use tracing::{info, warn};
 
 use crate::events::TaskOutcome;
 use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime, OutboundRouter};
-use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
+use crate::traits::{
+    AgentRole, StateStore, Tool, ToolCallContext, ToolCallOutcome, ToolCapabilities,
+};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
+use aidaemon_core::SourceTrust;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -271,6 +274,7 @@ fn strip_leading_wait(task: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_background_notification(
     hub: Option<&Arc<dyn OutboundRouter>>,
     state: Option<&Arc<dyn StateStore>>,
@@ -279,6 +283,7 @@ async fn deliver_background_notification(
     notification_type: &str,
     message: &str,
     context: &str,
+    untrusted: bool,
 ) {
     let message = crate::channels::present_notification(notification_type, message);
     let mut delivered = false;
@@ -302,7 +307,8 @@ async fn deliver_background_notification(
 
     if let Some(state_store) = state {
         let entry =
-            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message);
+            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message)
+                .with_untrusted(untrusted);
         if let Err(e) = state_store.enqueue_notification(&entry).await {
             warn!(
                 session_id = %session_id,
@@ -340,35 +346,13 @@ struct SpawnArgs {
     /// through `spawn_child`; Task 12 wires it into kind resolution.
     #[serde(default)]
     specialist: Option<String>,
-    /// Session ID injected by execute_tool — used for background completion notifications.
-    #[serde(default)]
-    _session_id: Option<String>,
-    /// Channel visibility injected by execute_tool — propagated to child agents.
-    #[serde(default)]
-    _channel_visibility: Option<String>,
-    /// User role injected by execute_tool — propagated to child agents to prevent
-    /// privilege escalation (e.g., Guest user spawning Owner-level sub-agent).
-    #[serde(default)]
-    _user_role: Option<String>,
-    /// Task ID injected by execute_tool for task-lead → executor spawning.
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Goal ID injected by execute_tool for task-lead → executor spawning.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Explicit trust flag injected by execute_tool for trusted scheduled runs.
-    #[serde(default)]
-    _trusted_session: Option<bool>,
-    /// Parent project scope injected by execute_tool for child scope inheritance.
-    #[serde(default)]
-    _project_scope: Option<String>,
 }
 
-fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
-    let visibility = args
-        ._channel_visibility
-        .as_deref()
-        .map(ChannelVisibility::from_str_lossy)
+/// The child's channel context: the parent call's visibility and trust,
+/// from the dispatcher's facts.
+fn build_child_channel_context(facts: &ToolCallContext) -> ChannelContext {
+    let visibility = facts
+        .channel_visibility
         .unwrap_or(ChannelVisibility::Internal);
     ChannelContext {
         visibility,
@@ -381,7 +365,7 @@ fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
         channel_member_names: vec![],
         user_id_map: std::collections::HashMap::new(),
         workspace_grant: None,
-        trusted: args._trusted_session.unwrap_or(false),
+        trusted: facts.trusted_session,
     }
 }
 
@@ -458,16 +442,6 @@ impl Tool for SpawnAgentTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.call_with_status(arguments, None).await
     }
@@ -477,7 +451,29 @@ impl Tool for SpawnAgentTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
+        let project_scope = facts.project_scope.clone();
+        let parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         let agent = self.get_agent()?;
 
         info!(
@@ -488,14 +484,13 @@ impl Tool for SpawnAgentTool {
             "spawn_agent tool invoked"
         );
 
-        // Preserve execution context that was injected by the parent agent.
-        let channel_ctx = build_child_channel_context(&args);
+        // Preserve the parent call's execution context.
+        let channel_ctx = build_child_channel_context(&facts);
 
         // Propagate parent's user role to prevent privilege escalation.
         // Default to Guest (least privilege) if not provided.
-        let user_role = match args._user_role.as_deref() {
-            Some("Owner") => UserRole::Owner,
-            Some("Guest") => UserRole::Guest,
+        let user_role = match facts.user_role {
+            Some(UserRole::Owner) => UserRole::Owner,
             _ => UserRole::Guest,
         };
 
@@ -506,9 +501,9 @@ impl Tool for SpawnAgentTool {
             None
         };
 
-        // LLM-provided task_id takes priority; fall back to injected _task_id
-        let task_id_ref = args.task_id.or(args._task_id.clone());
-        let goal_id_ref = args._goal_id.clone();
+        // LLM-provided task_id takes priority; fall back to the call's task
+        let task_id_ref = args.task_id.or(facts.task_id.clone());
+        let goal_id_ref = facts.goal_id.clone();
 
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
         // are deduplicated per task_id so the same work is not launched twice.
@@ -557,7 +552,10 @@ impl Tool for SpawnAgentTool {
                 if let Some(ref task_id) = executor_task_id {
                     self.finish_executor_task(task_id).await;
                 }
-                return Ok(format!("Waited for {} second(s).", wait_secs));
+                return Ok(reported(
+                    format!("Waited for {} second(s).", wait_secs),
+                    SourceTrust::Trusted,
+                ));
             }
 
             effective_task = remainder.clone();
@@ -571,7 +569,7 @@ impl Tool for SpawnAgentTool {
             }
         }
 
-        let approval_session_id = args._session_id.clone();
+        let approval_session_id = facts.session().map(str::to_string);
 
         if !args.background {
             let result = self
@@ -585,9 +583,10 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
-                    args._project_scope.as_deref(),
+                    project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
+                    parent_authority.clone(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -615,9 +614,10 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
-                    args._project_scope.as_deref(),
+                    project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
+                    parent_authority.clone(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -640,9 +640,10 @@ impl Tool for SpawnAgentTool {
                         child_role,
                         goal_id_ref.as_deref(),
                         task_id_ref.as_deref(),
-                        args._project_scope.as_deref(),
+                        project_scope.as_deref(),
                         args.specialist.as_deref(),
                         approval_session_id.as_deref(),
+                        parent_authority.clone(),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -678,9 +679,10 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id: goal_id_ref.clone(),
                     task_id: task_id_ref.clone(),
-                    project_scope: args._project_scope.clone(),
+                    project_scope: project_scope.clone(),
                     specialist: args.specialist.clone(),
                     approval_session_id: Some(session_id.clone()),
+                    parent_authority: parent_authority.clone(),
                 }),
             ));
             let result = loop {
@@ -709,12 +711,20 @@ impl Tool for SpawnAgentTool {
                             "progress",
                             &progress_message,
                             "spawn_agent background progress notifier",
+                            false,
                         )
                         .await;
                     }
                 }
             };
 
+            // Only a finished child's own record decides; any other result
+            // may carry child-written text and counts as untrusted.
+            let trust = match &result {
+                Ok(Ok(run)) => run.trust,
+                Err(_) if task_id_ref.is_none() => SourceTrust::Trusted,
+                _ => SourceTrust::Untrusted,
+            };
             let (notification_type, message) = match result {
                 Ok(Ok(run)) => format_background_completion(
                     &mission,
@@ -773,14 +783,17 @@ impl Tool for SpawnAgentTool {
                     }
                 }
             };
-            let delivered = match agent
-                .deliver_background_child_result(
-                    hub_for_parent_delivery.as_ref(),
-                    &session_id,
-                    &message,
-                )
-                .await
-            {
+            // Without a hub the queue delivers it (and the heartbeat records
+            // it in the parent session then), so it is recorded once.
+            let direct = match hub_for_parent_delivery.as_ref() {
+                Some(hub) => {
+                    agent
+                        .deliver_background_child_result(Some(hub), &session_id, &message, trust)
+                        .await
+                }
+                None => Ok(false),
+            };
+            let delivered = match direct {
                 Ok(sent) => sent,
                 Err(e) => {
                     warn!(
@@ -795,6 +808,8 @@ impl Tool for SpawnAgentTool {
             };
 
             if !delivered {
+                // The queued copy carries the child's taint into whichever
+                // parent turn records it.
                 deliver_background_notification(
                     None,
                     state.as_ref(),
@@ -803,6 +818,7 @@ impl Tool for SpawnAgentTool {
                     notification_type,
                     &message,
                     "spawn_agent background completion notifier",
+                    trust == SourceTrust::Untrusted,
                 )
                 .await;
             }
@@ -812,12 +828,58 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        Ok(format!(
-            "Sub-agent spawned in background for mission: \"{}\". \
-             The result will be delivered through the parent session when it completes.",
-            args.mission
-        ))
+        Ok(background_spawn_outcome(&args.mission))
     }
+}
+
+/// A sub-agent now running in the background: the turn hands off to it, and
+/// its result reaches the parent session when it completes.
+fn background_spawn_outcome(mission: &str) -> ToolCallOutcome {
+    reported(
+        format!(
+            "Sub-agent spawned in background for mission: \"{mission}\". \
+             The result will be delivered through the parent session when it completes."
+        ),
+        SourceTrust::Trusted,
+    )
+    .handed_to_background()
+}
+
+impl crate::traits::ToolSemantics for SpawnAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// A child's result carries the child's taint; anything the call does
+    /// not report (errors) counts as untrusted.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> SourceTrust {
+        SourceTrust::Untrusted
+    }
+}
+
+/// A spawn result with the trust of its content stamped for the dispatcher.
+fn reported(output: String, trust: SourceTrust) -> ToolCallOutcome {
+    let mut outcome = ToolCallOutcome::from_output(output);
+    outcome.metadata.output_trust = Some(trust);
+    outcome
 }
 
 impl SpawnAgentTool {
@@ -837,7 +899,8 @@ impl SpawnAgentTool {
         project_scope: Option<&str>,
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
-    ) -> anyhow::Result<String> {
+        parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
@@ -853,6 +916,7 @@ impl SpawnAgentTool {
                 project_scope: project_scope.map(str::to_string),
                 specialist: arg_specialist.map(str::to_string),
                 approval_session_id: approval_session_id.map(str::to_string),
+                parent_authority,
             }),
         )
         .await;
@@ -869,15 +933,16 @@ impl SpawnAgentTool {
                     }
                 };
                 let max_len = self.max_response_chars;
-                if response.len() > max_len {
+                let response = if response.len() > max_len {
                     let truncated = truncate_utf8(&response, max_len);
-                    Ok(format!(
+                    format!(
                         "{}\n\n[Sub-agent response truncated at {} chars]",
                         truncated, max_len
-                    ))
+                    )
                 } else {
-                    Ok(response)
-                }
+                    response
+                };
+                Ok(reported(response, run.trust))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
             Err(_) => {
@@ -894,7 +959,12 @@ impl SpawnAgentTool {
                             "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
                             _ => "\u{274c} Sub-agent failed",
                         };
-                        return Ok(format!("{prefix}\n\n{}", salvaged.details));
+                        // The child wrote these details; its taint is
+                        // unknown after a timeout.
+                        return Ok(reported(
+                            format!("{prefix}\n\n{}", salvaged.details),
+                            SourceTrust::Untrusted,
+                        ));
                     }
                     if child_role == Some(AgentRole::Executor) {
                         agent
@@ -918,6 +988,25 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{NotificationStore, StateStore};
     use std::sync::Arc;
+
+    /// A background spawn ends the turn from the tool's typed outcome, not
+    /// from its wording: the finish and the handoff fact are set whatever
+    /// the message says.
+    #[test]
+    fn background_spawn_hands_the_turn_off() {
+        let outcome = background_spawn_outcome("Summarize the synthetic report");
+        assert!(outcome.metadata.background_handoff);
+        assert!(
+            !outcome.metadata.background_started,
+            "a sub-agent is not a tracked process launch"
+        );
+        let finish = outcome.finish.expect("the turn hands off");
+        assert_eq!(finish.outcome, aidaemon_core::FinishOutcome::Partial);
+        assert_eq!(
+            finish.reply, None,
+            "the dispatcher writes the handoff reply"
+        );
+    }
 
     #[test]
     fn truncate_utf8_ascii() {
@@ -1012,32 +1101,77 @@ mod tests {
         let json = r#"{"mission": "test", "task": "do stuff"}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(!args.background);
-        assert!(args._session_id.is_none());
-        assert!(args._channel_visibility.is_none());
     }
 
     #[test]
     fn spawn_args_background_true() {
-        let json = r#"{"mission": "test", "task": "do stuff", "background": true, "_session_id": "tg:123"}"#;
+        let json = r#"{"mission": "test", "task": "do stuff", "background": true}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
-        assert_eq!(args._session_id.as_deref(), Some("tg:123"));
+    }
+
+    /// The parent turn's authority reaches spawn_agent only through the
+    /// dispatcher's typed facts; an argument of the same name is ignored.
+    #[test]
+    fn parent_authority_comes_from_the_call_facts() {
+        let parent = crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::read_only(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: Some("tg:123".to_string()),
+            untrusted_context: true,
+            origin_request: Some("Summarize the synthetic notes.".to_string()),
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "h.example.invalid",
+                None,
+            )],
+        };
+        let mut facts = ToolCallContext::default();
+        assert!(crate::agent::authority::parent_authority(&facts).is_none());
+        facts.extensions.insert(parent.clone());
+        assert_eq!(
+            crate::agent::authority::parent_authority(&facts),
+            Some(&parent)
+        );
+        // The model cannot supply one: SpawnArgs has no such argument.
+        let json = serde_json::json!({
+            "mission": "test",
+            "task": "do stuff",
+            "_parent_authority": parent,
+        });
+        assert!(serde_json::from_value::<SpawnArgs>(json).is_ok());
     }
 
     #[test]
-    fn spawn_args_with_channel_visibility() {
-        let json = r#"{"mission": "test", "task": "do stuff", "_channel_visibility": "public"}"#;
-        let args: SpawnArgs = serde_json::from_str(json).unwrap();
-        assert_eq!(args._channel_visibility.as_deref(), Some("public"));
+    fn child_channel_context_takes_the_call_visibility() {
+        let facts = ToolCallContext {
+            channel_visibility: Some(ChannelVisibility::Public),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_child_channel_context(&facts).visibility,
+            ChannelVisibility::Public
+        );
+        assert_eq!(
+            build_child_channel_context(&ToolCallContext::default()).visibility,
+            ChannelVisibility::Internal
+        );
     }
 
     #[test]
-    fn spawn_args_with_trusted_session() {
-        let json = r#"{"mission":"test","task":"do stuff","_trusted_session":true,"_channel_visibility":"internal"}"#;
-        let args: SpawnArgs = serde_json::from_str(json).unwrap();
-        let channel_ctx = build_child_channel_context(&args);
+    fn child_channel_context_takes_the_call_trust() {
+        let facts = ToolCallContext {
+            trusted_session: true,
+            channel_visibility: Some(ChannelVisibility::Internal),
+            ..Default::default()
+        };
+        let channel_ctx = build_child_channel_context(&facts);
         assert_eq!(channel_ctx.visibility, ChannelVisibility::Internal);
         assert!(channel_ctx.trusted);
+        assert!(!build_child_channel_context(&ToolCallContext::default()).trusted);
     }
 
     #[test]
@@ -1095,6 +1229,7 @@ mod tests {
             "progress",
             "Background sub-agent still running after 20s.\nMission: test",
             "spawn_test",
+            false,
         )
         .await;
 

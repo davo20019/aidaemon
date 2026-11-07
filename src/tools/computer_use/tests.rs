@@ -62,12 +62,16 @@ async fn schema_includes_action_enum() {
     assert!(actions.iter().any(|v| v == "get_app_state"));
 }
 
-fn test_model_args() -> serde_json::Value {
-    json!({
-        "_model": "gpt-4o",
-        "_model_chain": ["gpt-4o"],
-        "_provider_kind": "OpenaiCompatible"
-    })
+/// The dispatcher's facts for a computer_use call on `task`: the session
+/// and the live vision-capable model.
+fn cu_facts(task: &str) -> crate::traits::ToolCallContext {
+    crate::traits::ToolCallContext {
+        task_id: Some(task.to_string()),
+        model: Some("gpt-4o".to_string()),
+        model_chain: Some(vec!["gpt-4o".to_string()]),
+        provider_kind: Some("OpenaiCompatible".to_string()),
+        ..crate::testing::call_facts("telegram:1")
+    }
 }
 
 #[tokio::test]
@@ -81,17 +85,12 @@ async fn mock_get_app_state_returns_generation_and_attachment() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-1"
+        "app": "Calculator"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-1"))
         .await
         .unwrap();
     assert!(outcome.output.contains("snapshot_generation="));
@@ -113,34 +112,24 @@ async fn stale_generation_is_rejected() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut inspect = json!({
+    let inspect = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-1"
+        "app": "Calculator"
     });
-    if let Some(obj) = inspect.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
-    tool.call_with_status_outcome(&inspect.to_string(), None)
+    tool.call_with_execution_context(&inspect.to_string(), None, cu_facts("task-1"))
         .await
         .unwrap();
-    tool.call_with_status_outcome(&inspect.to_string(), None)
+    tool.call_with_execution_context(&inspect.to_string(), None, cu_facts("task-1"))
         .await
         .unwrap();
-    let mut click = json!({
+    let click = json!({
         "action": "click",
         "app": "Calculator",
         "snapshot_generation": 1,
-        "element_index": 1,
-        "_session_id": "telegram:1",
-        "_task_id": "task-1"
+        "element_index": 1
     });
-    if let Some(obj) = click.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&click.to_string(), None)
+        .call_with_execution_context(&click.to_string(), None, cu_facts("task-1"))
         .await
         .unwrap();
     assert!(outcome.output.contains("Stale snapshot_generation"));
@@ -162,31 +151,22 @@ async fn coordinate_click_flags_unverified_and_observation_clears_it() {
     let task = "task-coord-verify-1";
     let reg = ComputerUsePinRegistry::shared();
 
-    let with_meta = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
-
     // Pin the task + get a generation.
-    let inspect = with_meta(json!({
-        "action": "get_app_state", "app": "Calculator",
-        "_session_id": "telegram:1", "_task_id": task
-    }));
-    tool.call_with_status_outcome(&inspect.to_string(), None)
+    let inspect = json!({
+        "action": "get_app_state", "app": "Calculator"
+    });
+    tool.call_with_execution_context(&inspect.to_string(), None, cu_facts(task))
         .await
         .unwrap();
     assert!(!reg.has_unverified_coordinate_click(task).await);
 
     // A coordinate click: flags the result unverified and marks the task.
-    let click = with_meta(json!({
+    let click = json!({
         "action": "click", "app": "Calculator",
-        "snapshot_generation": 1, "x": 500.0, "y": 500.0,
-        "_session_id": "telegram:1", "_task_id": task
-    }));
+        "snapshot_generation": 1, "x": 500.0, "y": 500.0
+    });
     let outcome = tool
-        .call_with_status_outcome(&click.to_string(), None)
+        .call_with_execution_context(&click.to_string(), None, cu_facts(task))
         .await
         .unwrap();
     assert!(
@@ -200,7 +180,7 @@ async fn coordinate_click_flags_unverified_and_observation_clears_it() {
     );
 
     // A deliberate follow-up observation clears the flag.
-    tool.call_with_status_outcome(&inspect.to_string(), None)
+    tool.call_with_execution_context(&inspect.to_string(), None, cu_facts(task))
         .await
         .unwrap();
     assert!(
@@ -243,16 +223,11 @@ async fn model_pin_is_set_on_first_gui_action() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-pin"
+        "app": "Calculator"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
-    tool.call_with_status_outcome(&args.to_string(), None)
+    tool.call_with_execution_context(&args.to_string(), None, cu_facts("task-pin"))
         .await
         .unwrap();
     let pinned = ComputerUsePinRegistry::shared()
@@ -297,17 +272,12 @@ async fn activate_app_without_generation_succeeds() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "activate_app",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-activate"
+        "app": "Calculator"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-activate"))
         .await
         .unwrap();
     assert!(
@@ -333,18 +303,13 @@ async fn activate_app_treats_zero_generation_as_omitted() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "activate_app",
         "app": "Calculator",
-        "snapshot_generation": 0,
-        "_session_id": "telegram:1",
-        "_task_id": "task-activate-zero"
+        "snapshot_generation": 0
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-activate-zero"))
         .await
         .unwrap();
     assert!(
@@ -366,18 +331,13 @@ async fn missing_app_error_is_instructional() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "click",
         "snapshot_generation": 1,
-        "element_index": 2,
-        "_session_id": "telegram:1",
-        "_task_id": "task-noapp"
+        "element_index": 2
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-noapp"))
         .await
         .unwrap();
     assert!(
@@ -398,18 +358,13 @@ async fn missing_generation_error_is_instructional() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "click",
         "app": "Calculator",
-        "element_index": 2,
-        "_session_id": "telegram:1",
-        "_task_id": "task-nogen"
+        "element_index": 2
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-nogen"))
         .await
         .unwrap();
     assert!(
@@ -486,17 +441,12 @@ async fn not_running_app_error_points_to_launch_app() {
     )
     .await;
     // The mock only knows Calculator, so any other app resolves as "not running".
-    let mut args = json!({
+    let args = json!({
         "action": "get_app_state",
-        "app": "Slack",
-        "_session_id": "telegram:1",
-        "_task_id": "task-notrunning"
+        "app": "Slack"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-notrunning"))
         .await
         .unwrap();
     assert!(
@@ -517,17 +467,12 @@ async fn launch_app_returns_tree_for_running_app() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "launch_app",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-launch"
+        "app": "Calculator"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let outcome = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-launch"))
         .await
         .unwrap();
     assert!(
@@ -557,35 +502,25 @@ async fn screenshot_does_not_invalidate_generation() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
 
     // Fresh cache: the first get_app_state stores generation 1.
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-shot"
-    }));
+        "app": "Calculator"
+    });
     let gs_out = tool
-        .call_with_status_outcome(&gs.to_string(), None)
+        .call_with_execution_context(&gs.to_string(), None, cu_facts("task-shot"))
         .await
         .unwrap();
     assert!(gs_out.output.contains("snapshot_generation=1"));
 
     // A screenshot in between must report the current generation and not bump it.
-    let shot = merge(json!({
+    let shot = json!({
         "action": "screenshot",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-shot"
-    }));
+        "app": "Calculator"
+    });
     let shot_out = tool
-        .call_with_status_outcome(&shot.to_string(), None)
+        .call_with_execution_context(&shot.to_string(), None, cu_facts("task-shot"))
         .await
         .unwrap();
     assert!(
@@ -600,16 +535,14 @@ async fn screenshot_does_not_invalidate_generation() {
     );
 
     // Reusing generation 1 (what get_app_state reported) must still be valid.
-    let tt = merge(json!({
+    let tt = json!({
         "action": "type_text",
         "app": "Calculator",
         "snapshot_generation": 1,
-        "text": "hello",
-        "_session_id": "telegram:1",
-        "_task_id": "task-shot"
-    }));
+        "text": "hello"
+    });
     let tt_out = tool
-        .call_with_status_outcome(&tt.to_string(), None)
+        .call_with_execution_context(&tt.to_string(), None, cu_facts("task-shot"))
         .await
         .unwrap();
     assert!(
@@ -633,34 +566,24 @@ async fn type_text_by_descriptor_resolves_and_focuses() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-desc"
-    }));
-    tool.call_with_status_outcome(&gs.to_string(), None)
+        "app": "Calculator"
+    });
+    tool.call_with_execution_context(&gs.to_string(), None, cu_facts("task-desc"))
         .await
         .unwrap();
 
     // Mock snapshot has buttons titled "7" (index 1) and "+" (index 2).
-    let tt = merge(json!({
+    let tt = json!({
         "action": "type_text",
         "app": "Calculator",
         "snapshot_generation": 1,
         "element_title": "+",
-        "text": "hi",
-        "_session_id": "telegram:1",
-        "_task_id": "task-desc"
-    }));
+        "text": "hi"
+    });
     let out = tool
-        .call_with_status_outcome(&tt.to_string(), None)
+        .call_with_execution_context(&tt.to_string(), None, cu_facts("task-desc"))
         .await
         .unwrap();
     assert!(
@@ -681,32 +604,22 @@ async fn descriptor_with_no_match_is_actionable() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-nomatch"
-    }));
-    tool.call_with_status_outcome(&gs.to_string(), None)
+        "app": "Calculator"
+    });
+    tool.call_with_execution_context(&gs.to_string(), None, cu_facts("task-nomatch"))
         .await
         .unwrap();
 
-    let click = merge(json!({
+    let click = json!({
         "action": "click",
         "app": "Calculator",
         "snapshot_generation": 1,
-        "element_title": "Nonexistent Button",
-        "_session_id": "telegram:1",
-        "_task_id": "task-nomatch"
-    }));
+        "element_title": "Nonexistent Button"
+    });
     let out = tool
-        .call_with_status_outcome(&click.to_string(), None)
+        .call_with_execution_context(&click.to_string(), None, cu_facts("task-nomatch"))
         .await
         .unwrap();
     assert!(
@@ -751,32 +664,22 @@ async fn scroll_without_a_target_element_succeeds() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-scroll"
-    }));
-    tool.call_with_status_outcome(&gs.to_string(), None)
+        "app": "Calculator"
+    });
+    tool.call_with_execution_context(&gs.to_string(), None, cu_facts("task-scroll"))
         .await
         .unwrap();
 
-    let scroll = merge(json!({
+    let scroll = json!({
         "action": "scroll",
         "app": "Calculator",
         "snapshot_generation": 1,
-        "direction": "down",
-        "_session_id": "telegram:1",
-        "_task_id": "task-scroll"
-    }));
+        "direction": "down"
+    });
     let out = tool
-        .call_with_status_outcome(&scroll.to_string(), None)
+        .call_with_execution_context(&scroll.to_string(), None, cu_facts("task-scroll"))
         .await
         .unwrap();
     assert!(
@@ -801,32 +704,22 @@ async fn click_with_no_target_change_is_flagged_for_verification() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-verify"
-    }));
-    tool.call_with_status_outcome(&gs.to_string(), None)
+        "app": "Calculator"
+    });
+    tool.call_with_execution_context(&gs.to_string(), None, cu_facts("task-verify"))
         .await
         .unwrap();
 
-    let click = merge(json!({
+    let click = json!({
         "action": "click",
         "app": "Calculator",
         "snapshot_generation": 1,
-        "element_index": 1,
-        "_session_id": "telegram:1",
-        "_task_id": "task-verify"
-    }));
+        "element_index": 1
+    });
     let out = tool
-        .call_with_status_outcome(&click.to_string(), None)
+        .call_with_execution_context(&click.to_string(), None, cu_facts("task-verify"))
         .await
         .unwrap();
     assert!(
@@ -849,34 +742,24 @@ async fn repeated_identical_click_is_cautioned() {
         dir.path().to_path_buf(),
     )
     .await;
-    let merge = |mut v: serde_json::Value| {
-        if let Some(obj) = v.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        v
-    };
     let mk = |gen: u64| {
-        merge(json!({
+        json!({
             "action": "click",
             "app": "Calculator",
             "snapshot_generation": gen,
-            "element_index": 1,
-            "_session_id": "telegram:1",
-            "_task_id": "task-dup"
-        }))
+            "element_index": 1
+        })
     };
-    let gs = merge(json!({
+    let gs = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-dup"
-    }));
-    tool.call_with_status_outcome(&gs.to_string(), None)
+        "app": "Calculator"
+    });
+    tool.call_with_execution_context(&gs.to_string(), None, cu_facts("task-dup"))
         .await
         .unwrap();
 
     let first = tool
-        .call_with_status_outcome(&mk(1).to_string(), None)
+        .call_with_execution_context(&mk(1).to_string(), None, cu_facts("task-dup"))
         .await
         .unwrap();
     assert!(
@@ -885,7 +768,7 @@ async fn repeated_identical_click_is_cautioned() {
         first.output
     );
     let second = tool
-        .call_with_status_outcome(&mk(2).to_string(), None)
+        .call_with_execution_context(&mk(2).to_string(), None, cu_facts("task-dup"))
         .await
         .unwrap();
     assert!(
@@ -908,17 +791,12 @@ async fn results_carry_the_gui_task_anchor() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut args = json!({
+    let args = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-anchor"
+        "app": "Calculator"
     });
-    if let Some(obj) = args.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
     let out = tool
-        .call_with_status_outcome(&args.to_string(), None)
+        .call_with_execution_context(&args.to_string(), None, cu_facts("task-anchor"))
         .await
         .unwrap();
     assert!(
@@ -940,42 +818,31 @@ async fn mutation_budget_blocks_after_limit() {
         dir.path().to_path_buf(),
     )
     .await;
-    let mut inspect = json!({
+    let inspect = json!({
         "action": "get_app_state",
-        "app": "Calculator",
-        "_session_id": "telegram:1",
-        "_task_id": "task-budget"
+        "app": "Calculator"
     });
-    if let Some(obj) = inspect.as_object_mut() {
-        obj.extend(test_model_args().as_object().unwrap().clone());
-    }
-    tool.call_with_status_outcome(&inspect.to_string(), None)
+    tool.call_with_execution_context(&inspect.to_string(), None, cu_facts("task-budget"))
         .await
         .unwrap();
 
     let click = |generation: u64, index: u32| {
-        let mut args = json!({
+        json!({
             "action": "click",
             "app": "Calculator",
             "snapshot_generation": generation,
-            "element_index": index,
-            "_session_id": "telegram:1",
-            "_task_id": "task-budget"
-        });
-        if let Some(obj) = args.as_object_mut() {
-            obj.extend(test_model_args().as_object().unwrap().clone());
-        }
-        args
+            "element_index": index
+        })
     };
 
     let first = tool
-        .call_with_status_outcome(&click(1, 1).to_string(), None)
+        .call_with_execution_context(&click(1, 1).to_string(), None, cu_facts("task-budget"))
         .await
         .unwrap();
     assert!(!first.output.contains("budget exceeded"));
 
     let second = tool
-        .call_with_status_outcome(&click(2, 2).to_string(), None)
+        .call_with_execution_context(&click(2, 2).to_string(), None, cu_facts("task-budget"))
         .await
         .unwrap();
     assert!(second.output.contains("budget exceeded"));

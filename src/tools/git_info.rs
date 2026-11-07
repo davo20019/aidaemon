@@ -1,12 +1,20 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, BackendPath};
+use crate::execution::{BackendPath, ExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 use super::fs_utils;
 
-pub struct GitInfoTool;
+pub struct GitInfoTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl GitInfoTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 const VALID_SECTIONS: &[&str] = &["status", "log", "branches", "remotes", "diff", "stash"];
 
@@ -45,28 +53,15 @@ impl Tool for GitInfoTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let path_str = args["path"].as_str().unwrap_or(".");
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let repo_dir = backend.resolve_path(path_str).await?;
 
         let check =
-            fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&repo_dir), 5).await?;
+            fs_utils::run_cmd_backend(&*backend, "git rev-parse --git-dir", Some(&repo_dir), 5)
+                .await?;
         if check.exit_code != 0 {
             anyhow::bail!("Not a git repository: {}", path_str);
         }
@@ -83,12 +78,12 @@ impl Tool for GitInfoTool {
 
         for section in &sections {
             let section_output = match section.as_str() {
-                "status" => get_status(&repo_dir).await,
-                "log" => get_log(&repo_dir).await,
-                "branches" => get_branches(&repo_dir).await,
-                "remotes" => get_remotes(&repo_dir).await,
-                "diff" => get_diff(&repo_dir).await,
-                "stash" => get_stash(&repo_dir).await,
+                "status" => get_status(&*backend, &repo_dir).await,
+                "log" => get_log(&*backend, &repo_dir).await,
+                "branches" => get_branches(&*backend, &repo_dir).await,
+                "remotes" => get_remotes(&*backend, &repo_dir).await,
+                "diff" => get_diff(&*backend, &repo_dir).await,
+                "stash" => get_stash(&*backend, &repo_dir).await,
                 _ => continue,
             };
 
@@ -105,6 +100,22 @@ impl Tool for GitInfoTool {
     }
 }
 
+impl crate::traits::ToolSemantics for GitInfoTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -113,12 +124,12 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-async fn get_status(dir: &BackendPath) -> String {
+async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
     let mut result = String::new();
 
     // Branch
     if let Ok(out) =
-        fs_utils::run_cmd_backend("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
+        fs_utils::run_cmd_backend(backend, "git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
     {
         if out.exit_code == 0 {
             result.push_str(&format!("Branch: {}\n", out.stdout.trim()));
@@ -126,7 +137,9 @@ async fn get_status(dir: &BackendPath) -> String {
     }
 
     // Status
-    if let Ok(out) = fs_utils::run_cmd_backend("git status --porcelain", Some(dir), 5).await {
+    if let Ok(out) =
+        fs_utils::run_cmd_backend(backend, "git status --porcelain", Some(dir), 5).await
+    {
         if out.exit_code == 0 {
             let lines: Vec<&str> = out.stdout.lines().collect();
             if lines.is_empty() {
@@ -145,6 +158,7 @@ async fn get_status(dir: &BackendPath) -> String {
 
     // Ahead/behind
     if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
         "git rev-list --left-right --count HEAD...@{upstream}",
         Some(dir),
         5,
@@ -166,8 +180,9 @@ async fn get_status(dir: &BackendPath) -> String {
     result
 }
 
-async fn get_log(dir: &BackendPath) -> String {
+async fn get_log(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
     if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
         "git log --oneline -10 --format='%h %s (%cr, %an)'",
         Some(dir),
         5,
@@ -181,8 +196,9 @@ async fn get_log(dir: &BackendPath) -> String {
     String::new()
 }
 
-async fn get_branches(dir: &BackendPath) -> String {
+async fn get_branches(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
     if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
         "git branch -a --format='%(refname:short) %(upstream:short) %(upstream:track)'",
         Some(dir),
         5,
@@ -196,8 +212,8 @@ async fn get_branches(dir: &BackendPath) -> String {
     String::new()
 }
 
-async fn get_remotes(dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend("git remote -v", Some(dir), 5).await {
+async fn get_remotes(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git remote -v", Some(dir), 5).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
@@ -205,8 +221,8 @@ async fn get_remotes(dir: &BackendPath) -> String {
     String::new()
 }
 
-async fn get_diff(dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend("git diff --stat", Some(dir), 10).await {
+async fn get_diff(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git diff --stat", Some(dir), 10).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
@@ -214,8 +230,8 @@ async fn get_diff(dir: &BackendPath) -> String {
     String::new()
 }
 
-async fn get_stash(dir: &BackendPath) -> String {
-    if let Ok(out) = fs_utils::run_cmd_backend("git stash list", Some(dir), 5).await {
+async fn get_stash(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git stash list", Some(dir), 5).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
@@ -229,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = GitInfoTool;
+        let tool = GitInfoTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "git_info");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -240,7 +256,9 @@ mod tests {
     async fn test_git_info_on_current_repo() {
         // This test assumes we're running from within a git repo
         let args = json!({"include": ["status"]}).to_string();
-        let result = GitInfoTool.call(&args).await;
+        let result = GitInfoTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         // Should succeed if running from aidaemon project
         if let Ok(output) = result {
             assert!(output.contains("Status") || output.contains("Branch"));
@@ -251,7 +269,9 @@ mod tests {
     async fn test_git_info_not_a_repo() {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = GitInfoTool.call(&args).await;
+        let result = GitInfoTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Not a git"));
     }

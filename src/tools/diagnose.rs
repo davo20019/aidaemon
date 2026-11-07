@@ -13,7 +13,7 @@ use crate::events::{
 };
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::sanitize::redact_secrets;
-use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCapabilities};
+use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCallContext, ToolCapabilities};
 use crate::utils::truncate_str;
 
 pub struct DiagnoseTool {
@@ -842,11 +842,11 @@ Rules: no invented event IDs; confidence 0..1.",
         ];
 
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let model = runtime_snapshot.primary_model();
+        // Background work does not need the strongest model.
+        let model = runtime_snapshot.cheap_model();
         let call_start = std::time::Instant::now();
         let resp: ProviderResponse = match runtime_snapshot
-            .provider()
-            .chat(&model, &messages, &[])
+            .background_chat(&model, &messages, &[])
             .await
         {
             Ok(r) => r,
@@ -1289,18 +1289,6 @@ Rules: no invented event IDs; confidence 0..1.",
         out.push_str(&format!(
             "- cross_scope_blocked_total: {}\n",
             metrics.cross_scope_blocked_total
-        ));
-        out.push_str(&format!(
-            "- route_drift_alert_total: {}\n",
-            metrics.route_drift_alert_total
-        ));
-        out.push_str(&format!(
-            "- route_drift_failsafe_activation_total: {}\n",
-            metrics.route_drift_failsafe_activation_total
-        ));
-        out.push_str(&format!(
-            "- route_failsafe_active_turn_total: {}\n",
-            metrics.route_failsafe_active_turn_total
         ));
 
         if total_guard_interventions >= CONTEXT_SCOPE_ALERT_THRESHOLD {
@@ -1839,8 +1827,6 @@ struct DiagnoseArgs {
     limit: Option<usize>,
     #[serde(default)]
     failures_only: Option<bool>,
-    #[serde(default)]
-    _session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1936,23 +1922,33 @@ impl Tool for DiagnoseTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl DiagnoseTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: DiagnoseArgs = serde_json::from_str(arguments)?;
-        let session_id = args
-            ._session_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("self_diagnose requires internal _session_id"))?;
+        let session_id = facts.session().ok_or_else(|| {
+            anyhow::anyhow!("self_diagnose: the session fact is missing from the call context")
+        })?;
 
         match args.action.as_str() {
             "list_tasks" => {
@@ -1990,9 +1986,22 @@ impl Tool for DiagnoseTool {
     }
 }
 
+impl crate::traits::ToolSemantics for DiagnoseTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use chrono::{Duration, Utc};
 
     use crate::config::ProviderKind;
@@ -2000,19 +2009,21 @@ mod tests {
     use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{ModelProvider, TokenUsage};
+    use crate::traits::TokenUsage;
 
     struct MockProvider {
         content: String,
     }
 
-    #[async_trait]
-    impl ModelProvider for MockProvider {
-        async fn chat(
+    crate::testing::chat_json_provider!(MockProvider);
+
+    impl MockProvider {
+        async fn respond(
             &self,
             _model: &str,
             _messages: &[Value],
             _tools: &[Value],
+            _options: &crate::traits::ChatOptions,
         ) -> anyhow::Result<ProviderResponse> {
             Ok(ProviderResponse {
                 content: Some(self.content.clone()),
@@ -2029,10 +2040,6 @@ mod tests {
                 response_note: None,
             })
         }
-
-        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-            Ok(vec!["mock-fast".to_string()])
-        }
     }
 
     async fn setup_tool() -> DiagnoseTool {
@@ -2047,7 +2054,7 @@ mod tests {
         std::mem::forget(db_file);
 
         let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider {
+        let provider: crate::llm_runtime::ModelBackend = Arc::new(MockProvider {
             content: json!({
                 "what_failed":"Tool execution failed",
                 "candidates":[
@@ -2155,7 +2162,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"list_tasks","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"list_tasks"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(res.contains("t1"));
@@ -2196,7 +2206,10 @@ mod tests {
         )
         .await;
         let res = tool
-            .call(r#"{"action":"timeline","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"timeline","task_id":"t1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(res.contains("Task Timeline"));
@@ -2255,7 +2268,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(res.contains("Diagnosis for Task t1"));
@@ -2367,7 +2383,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t-replay","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t-replay"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(res.contains("### Execution Replay Summary"));
@@ -2472,7 +2491,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(res.contains("### Route Health Alerts"));
@@ -2530,7 +2552,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t-ctx","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t-ctx"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
 
@@ -2667,7 +2692,10 @@ mod tests {
         }
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"t1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
 
@@ -2796,7 +2824,10 @@ mod tests {
         .await;
 
         let res = tool
-            .call(r#"{"action":"diagnose","task_id":"child-1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"diagnose","task_id":"child-1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
 
@@ -2831,7 +2862,10 @@ mod tests {
         )
         .await;
         let res = tool
-            .call(r#"{"action":"timeline","task_id":"t1","_session_id":"s1"}"#)
+            .call_with(
+                r#"{"action":"timeline","task_id":"t1"}"#,
+                crate::testing::call_facts("s1"),
+            )
             .await
             .unwrap();
         assert!(!res.contains("sk-abc"));

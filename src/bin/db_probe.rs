@@ -943,6 +943,7 @@ const GATE_INTERVENTION_CODES: &[&str] = &[
     "negative_completion_contract",
     "verification_pending",
     "scheduled_run_budget_pressure",
+    "assessor_would_refuse",
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1016,6 +1017,57 @@ fn refusal_gate_label(tool: &str, message: &str) -> String {
             .join(" ")
     });
     format!("{tool}: {label}")
+}
+
+/// Prompt-cache reuse of agent-turn model calls (no `call_purpose`), by
+/// model, split into a run's first call and its later ones. Later calls
+/// resend an append-only transcript, so their reuse should approach the
+/// share of input that the previous call already sent.
+async fn print_cache_reuse(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Prompt-Cache Reuse (Last {} Hours) ==", hours);
+    println!("(successful agent-turn calls; reuse = cached input / input)\n");
+    let rows = sqlx::query(
+        "SELECT COALESCE(json_extract(data, '$.final_model'), json_extract(data, '$.model')) AS model,
+                CASE WHEN json_extract(data, '$.iteration') = 1 THEN 'first' ELSE 'later' END AS position,
+                COUNT(*) AS calls,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0) = 0) AS cold,
+                SUM(json_extract(data, '$.input_tokens')) AS input,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0)) AS cached
+         FROM events
+         WHERE event_type = 'llm_call' AND created_at >= ?
+           AND json_extract(data, '$.call_purpose') IS NULL
+           AND json_extract(data, '$.failed') = 0
+         GROUP BY model, position
+         ORDER BY calls DESC",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    println!(
+        "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+        "model", "call", "calls", "cold", "input", "cached", "reuse"
+    );
+    for row in rows {
+        let input: i64 = row.try_get("input").unwrap_or(0);
+        let cached: i64 = row.try_get("cached").unwrap_or(0);
+        let reuse = if input > 0 {
+            format!("{:.0}%", cached as f64 * 100.0 / input as f64)
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+            row.try_get::<String, _>("model").unwrap_or_default(),
+            row.try_get::<String, _>("position").unwrap_or_default(),
+            row.try_get::<i64, _>("calls").unwrap_or(0),
+            row.try_get::<i64, _>("cold").unwrap_or(0),
+            input,
+            cached,
+            reuse
+        );
+    }
+    Ok(())
 }
 
 async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
@@ -1416,6 +1468,7 @@ async fn main() -> anyhow::Result<()> {
     let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
     let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
     let gate_outcomes = args.iter().any(|arg| arg == "--gate-outcomes");
+    let cache_reuse = args.iter().any(|arg| arg == "--cache-reuse");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -1695,6 +1748,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if fabrication_audit {
         print_fabrication_audit(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if cache_reuse {
+        print_cache_reuse(&pool, eval_hours).await?;
         return Ok(());
     }
     if gate_outcomes {

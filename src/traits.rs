@@ -14,7 +14,6 @@ mod mandates;
 mod memory;
 mod people;
 mod provider;
-mod self_correction;
 mod tools;
 mod trigger_event;
 
@@ -58,15 +57,15 @@ pub use mandates::{
     MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
     MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
     MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
-    MandateObjectiveControl, MandateObjectiveMeasurement, MandateOperatingUpdates,
-    MandateOperationKind, MandateOperationScope, MandateReconciliationReason,
-    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
-    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
-    MandateStrategyRevision, MandateStrategyRevisionKind, MandateStrategySnapshot,
-    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
-    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
+    MandateMutationEvidence, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
+    MandateMutationReservation, MandateMutationTarget, MandateObjectiveControl,
+    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationKind,
+    MandateOperationScope, MandateReconciliationReason, MandateReconciliationResolution,
+    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
+    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategyRevision,
+    MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind,
+    MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
+    SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[allow(unused_imports)]
 pub use memory::{
@@ -77,26 +76,24 @@ pub use memory::{
 };
 pub use people::{Person, PersonFact};
 pub use provider::{
-    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
-    ToolChoiceMode,
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 #[allow(unused_imports)]
-pub use self_correction::*;
-#[allow(unused_imports)]
 pub use tools::{
-    semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
-    AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
-    EvidenceTemporalScope, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, RuntimePreparationFailure, ScopeEscalation, SpecialistKind,
+    default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
+    ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
+    DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope,
+    OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    RuntimePreparationFailure, SameToolStreak, ScopeEscalation, SpecialistKind,
     StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
-    ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallEffect, ToolCallMetadata,
-    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolCollectionCompleteness, ToolCollectionObservation, ToolEvidenceCapability,
-    ToolExecutionContext, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
+    ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallContext, ToolCallEffect,
+    ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolCollectionCompleteness, ToolCollectionObservation, ToolDispatchFacts,
+    ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
     ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
-    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
-    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticFacet, ToolSemanticScope,
+    ToolSemantics, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 

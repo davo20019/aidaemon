@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::traits::{
     FactStore, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
-    PersonalMemoryWrite, Tool, ToolCapabilities, ToolRole,
+    PersonalMemoryWrite, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
 use crate::types::FactPrivacy;
 
@@ -62,8 +62,40 @@ const PERSONA_PATTERNS: &[&str] = &[
 ];
 
 fn is_persona_manipulation(category: &str, key: &str, value: &str) -> bool {
-    let combined = format!("{} {} {}", category, key, value).to_ascii_lowercase();
-    PERSONA_PATTERNS.iter().any(|p| combined.contains(p))
+    // Word-boundary match: a substring check rejected every fact in the
+    // "personal" category because it contains "persona". Keys are snake_case,
+    // so split them into words first.
+    let combined = format!("{} {} {}", category, key, value).replace(['_', '-'], " ");
+    PERSONA_PATTERNS
+        .iter()
+        .any(|p| crate::agent::keyword_match(&combined, p))
+}
+
+/// Empty/whitespace-only values and explicit markers delete the fact.
+fn is_deletion_marker(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || [
+            "none", "null", "n/a", "delete", "remove", "deleted", "removed",
+        ]
+        .iter()
+        .any(|marker| trimmed.eq_ignore_ascii_case(marker))
+}
+
+/// True when this exact call would delete at least one fact. Mirrors the
+/// entry selection in `call`: a non-empty `facts` batch wins, otherwise the
+/// single key/value pair.
+fn call_deletes_facts(arguments: &str) -> bool {
+    let Ok(args) = serde_json::from_str::<RememberArgs>(arguments) else {
+        return false;
+    };
+    match args.facts.filter(|facts| !facts.is_empty()) {
+        Some(facts) => facts.iter().any(|entry| is_deletion_marker(&entry.value)),
+        None => {
+            args.key.is_some_and(|key| !key.trim().is_empty())
+                && args.value.as_deref().is_some_and(is_deletion_marker)
+        }
+    }
 }
 
 fn is_goal_fact(category: &str, key: &str, value: &str) -> bool {
@@ -197,15 +229,24 @@ impl Tool for RememberFactTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
         let channel_id = self.current_channel_id.read().await.clone();
 
-        if let Some(mut personal) = args.personal_memory {
+        let mut results = Vec::new();
+
+        // An empty personal_memory block (models often send every schema
+        // section) carries nothing to reconcile. Treating it as present used
+        // to short-circuit the call and silently drop the plain facts beside
+        // it while reporting "No changes (already current)".
+        let personal = args.personal_memory.filter(|personal| {
+            !(personal.entities.is_empty()
+                && personal.aliases.is_empty()
+                && personal.facts.is_empty()
+                && personal.relationships.is_empty())
+        });
+        let has_personal = personal.is_some();
+        if let Some(mut personal) = personal {
             personal.direct_user_statement = true;
             let result = self
                 .state
@@ -217,22 +258,24 @@ impl Tool for RememberFactTool {
                     FactPrivacy::Private,
                 )
                 .await?;
-            return Ok(format!("Personal memory: {}", result.concise_summary()));
+            results.push(format!("Personal memory: {}", result.concise_summary()));
+        }
+
+        let facts = args.facts.filter(|facts| !facts.is_empty());
+        let single_key = args.key.filter(|key| !key.trim().is_empty());
+        if has_personal && facts.is_none() && single_key.is_none() {
+            return Ok(results.join("\n"));
         }
 
         // Build the list of facts to store (batch or single)
-        let entries: Vec<FactEntry> = if let Some(facts) = args.facts {
-            if facts.is_empty() {
-                anyhow::bail!("'facts' array is empty — provide at least one fact");
-            }
+        let entries: Vec<FactEntry> = if let Some(facts) = facts {
             facts
         } else {
             // Single-fact mode: require all three fields
             let category = args
                 .category
                 .ok_or_else(|| anyhow::anyhow!("'category' is required (or use 'facts' array)"))?;
-            let key = args
-                .key
+            let key = single_key
                 .ok_or_else(|| anyhow::anyhow!("'key' is required (or use 'facts' array)"))?;
             let value = args
                 .value
@@ -328,7 +371,6 @@ impl Tool for RememberFactTool {
             structured_indices.insert(index);
         }
 
-        let mut results = Vec::new();
         if !structured.entities.is_empty() {
             let result = self
                 .state
@@ -373,16 +415,7 @@ impl Tool for RememberFactTool {
             }
 
             // Empty/whitespace-only value or explicit deletion markers → delete the fact
-            let trimmed = entry.value.trim();
-            let is_deletion = trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("none")
-                || trimmed.eq_ignore_ascii_case("null")
-                || trimmed.eq_ignore_ascii_case("n/a")
-                || trimmed.eq_ignore_ascii_case("delete")
-                || trimmed.eq_ignore_ascii_case("remove")
-                || trimmed.eq_ignore_ascii_case("deleted")
-                || trimmed.eq_ignore_ascii_case("removed");
-            if is_deletion {
+            if is_deletion_marker(&entry.value) {
                 let deleted = self
                     .state
                     .delete_fact_by_key(&entry.category, &entry.key)
@@ -416,6 +449,34 @@ impl Tool for RememberFactTool {
 
         Ok(results.join("\n"))
     }
+}
+
+impl crate::traits::ToolSemantics for RememberFactTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    /// Memory is persistent agent state: a write is typed `configuration`
+    /// and a deletion is also `destructive`, so the receipt can prove a
+    /// checklist step declared with either label. An untyped receipt could
+    /// not, which made the model report a deletion it had just performed as
+    /// "already deleted".
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        if call_deletes_facts(arguments) {
+            ToolCallSemantics::mutation_with(
+                ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::DESTRUCTIVE),
+            )
+        } else {
+            ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION)
+        }
+    }
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
@@ -425,5 +486,130 @@ impl Tool for RememberFactTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    /// Only the agent's own memory store changes, so a decline earlier in
+    /// the run never puts a fact to the owner.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::ToolSemantics;
+
+    async fn setup() -> (
+        RememberFactTool,
+        Arc<SqliteStateStore>,
+        tempfile::NamedTempFile,
+    ) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        (RememberFactTool::new(state.clone()), state, db_file)
+    }
+
+    #[tokio::test]
+    async fn empty_personal_memory_block_does_not_drop_batch_facts() {
+        let (tool, state, _db) = setup().await;
+        // Shape a live model sent: every schema section filled in, with the
+        // real content only in the top-level `facts` array.
+        let args = json!({
+            "category": "preference",
+            "key": "",
+            "value": "",
+            "facts": [
+                {"category": "personal", "key": "qa_codename", "value": "SYNTH-CODE-7"},
+                {"category": "preference", "key": "favorite_test_number", "value": "1729"}
+            ],
+            "personal_memory": {
+                "aliases": [], "entities": [], "facts": [], "relationships": [],
+                "correction": false, "direct_user_statement": true
+            }
+        });
+        let out = tool.call(&args.to_string()).await.unwrap();
+        assert!(!out.contains("already current"), "{out}");
+        assert!(out.contains("qa_codename = SYNTH-CODE-7"), "{out}");
+
+        let facts = state.get_facts(None).await.unwrap();
+        assert!(facts
+            .iter()
+            .any(|f| f.key == "qa_codename" && f.value == "SYNTH-CODE-7"));
+        assert!(facts
+            .iter()
+            .any(|f| f.key == "favorite_test_number" && f.value == "1729"));
+    }
+
+    #[tokio::test]
+    async fn empty_personal_memory_and_no_facts_is_an_error_not_a_noop() {
+        let (tool, _state, _db) = setup().await;
+        let args = json!({
+            "key": "",
+            "value": "",
+            "personal_memory": {"entities": [], "aliases": [], "facts": [], "relationships": []}
+        });
+        assert!(tool.call(&args.to_string()).await.is_err());
+    }
+
+    #[test]
+    fn persona_guard_uses_word_boundaries() {
+        assert!(!is_persona_manipulation(
+            "personal",
+            "qa_codename",
+            "SYNTH-CODE-7"
+        ));
+        assert!(!is_persona_manipulation(
+            "user",
+            "favorite_drink",
+            "Sharpie accents"
+        ));
+        assert!(is_persona_manipulation("preference", "persona", "grumpy"));
+        assert!(is_persona_manipulation(
+            "preference",
+            "style",
+            "talk like a pirate"
+        ));
+        assert!(is_persona_manipulation("preference", "act_as", "my lawyer"));
+    }
+
+    #[tokio::test]
+    async fn memory_receipts_are_typed_for_checklist_credit() {
+        let (tool, _state, _db) = setup().await;
+        let effects = |args: Value| tool.call_semantics(&args.to_string()).mutation_effects;
+
+        let batch_delete = effects(json!({
+            "facts": [{"category": "user", "key": "qa_codename", "value": "delete"}],
+            "key": "", "value": ""
+        }));
+        assert!(batch_delete.satisfies(ToolMutationEffects::DESTRUCTIVE));
+        assert!(batch_delete.satisfies(ToolMutationEffects::CONFIGURATION));
+        assert!(
+            effects(json!({"category": "user", "key": "qa_codename", "value": ""}))
+                .satisfies(ToolMutationEffects::DESTRUCTIVE)
+        );
+
+        let store = effects(json!({
+            "facts": [{"category": "user", "key": "qa_codename", "value": "SYNTH-CODE-7"}],
+            "key": "", "value": ""
+        }));
+        assert!(store.satisfies(ToolMutationEffects::CONFIGURATION));
+        assert!(!store.satisfies(ToolMutationEffects::DESTRUCTIVE));
+        // An empty key/value pair names nothing to delete.
+        assert!(
+            !effects(json!({"key": "", "value": ""})).satisfies(ToolMutationEffects::DESTRUCTIVE)
+        );
     }
 }

@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use crate::execution::{active_execution_backend, BackendKind, WriteMode};
+use crate::execution::{BackendKind, ExecutionBackend, WriteMode};
 
 /// Base directory for spilled tool results, under the OS temp dir
 /// (`std::env::temp_dir()` honors `TMPDIR`/`%TEMP%`, cross-platform). Spilled
@@ -20,6 +20,29 @@ use crate::execution::{active_execution_backend, BackendKind, WriteMode};
 /// future failure mode.
 pub fn spill_dir() -> Option<PathBuf> {
     Some(std::env::temp_dir().join("aidaemon").join("tool_results"))
+}
+
+/// The directory holding one session's spilled results on the active
+/// backend: the same path `build_spilled_preview_for_backend` writes to. The
+/// spill notice tells the model to read these files, so the scope check
+/// grants a session reads of its own directory and of nothing beside it.
+pub fn session_spill_dir_for_backend(
+    backend: &dyn ExecutionBackend,
+    session_id: &str,
+) -> Option<String> {
+    if backend.kind() == BackendKind::Local {
+        let dir = spill_dir()?.join(sanitize_session_id(session_id));
+        return Some(dir.to_string_lossy().into_owned());
+    }
+    Some(
+        backend
+            .workspace_root()
+            .join(".aidaemon")
+            .join("tool_results")
+            .join(sanitize_session_id(session_id))
+            .as_str()
+            .to_string(),
+    )
 }
 
 /// Characters reserved from the per-model cap for the summary + notice so the
@@ -55,12 +78,12 @@ pub fn build_spilled_preview(
 /// historical OS-temp behavior; Docker/SSH store the recovery artifact inside
 /// the execution workspace so both `read_file` and `terminal` can see it.
 pub async fn build_spilled_preview_for_backend(
+    backend: &dyn ExecutionBackend,
     tool_name: &str,
     session_id: &str,
     full_text: &str,
     max_chars: usize,
 ) -> Option<String> {
-    let backend = active_execution_backend();
     if backend.kind() == BackendKind::Local {
         return build_spilled_preview(tool_name, session_id, full_text, max_chars);
     }
@@ -343,8 +366,7 @@ pub fn prune_spill_dir() {
 }
 
 /// Prune spill files from the same filesystem that stores them.
-pub async fn prune_spill_dir_for_backend() {
-    let backend = active_execution_backend();
+pub async fn prune_spill_dir_for_backend(backend: &dyn ExecutionBackend) {
     if backend.kind() == BackendKind::Local {
         prune_spill_dir();
         return;
@@ -449,7 +471,7 @@ mod tests {
     #[test]
     fn json_result_spills_full_body_and_preview_points_to_file() {
         let dir = tempfile::tempdir().unwrap();
-        // Synthetic clinical-trial-style payload; "Fairfax" sits deep enough to be
+        // Synthetic clinical-trial-style payload; "Springfield" sits deep enough to be
         // dropped by head+tail compression but must survive in the spilled file.
         let mut locations = String::new();
         for i in 0..200 {
@@ -459,7 +481,7 @@ mod tests {
             ));
         }
         let full = format!(
-            "{{\"locations\":[{}{{\"city\":\"Fairfax\",\"facility\":\"Synthetic Cancer Center\"}}]}}",
+            "{{\"locations\":[{}{{\"city\":\"Springfield\",\"facility\":\"Synthetic Cancer Center\"}}]}}",
             locations
         );
 
@@ -491,9 +513,9 @@ mod tests {
         assert!(preview.contains(&path.to_string_lossy().into_owned()));
         // The full body — including the would-be-dropped middle — is on disk.
         let on_disk = std::fs::read_to_string(path).unwrap();
-        assert!(on_disk.contains("Fairfax"));
+        assert!(on_disk.contains("Springfield"));
         // ...but NOT in the bounded preview.
-        assert!(!preview.contains("Fairfax"));
+        assert!(!preview.contains("Springfield"));
     }
 
     #[test]
@@ -593,7 +615,7 @@ mod tests {
              items: array(2 item(s))\n\
              \n\
              {{\n\
-               \"locations\": [{}{{\"city\":\"Fairfax\",\"facility\":\"Synthetic Cancer Center\"}}]\n\
+               \"locations\": [{}{{\"city\":\"Springfield\",\"facility\":\"Synthetic Cancer Center\"}}]\n\
              }}\n\
              [END UNTRUSTED EXTERNAL DATA]",
             locations
@@ -623,10 +645,10 @@ mod tests {
             "wrapped output must be stored as .txt"
         );
 
-        // Full body preserved on disk (including "Fairfax" which is deep in the payload).
+        // Full body preserved on disk (including "Springfield" which is deep in the payload).
         let on_disk = std::fs::read_to_string(path).unwrap();
         assert!(
-            on_disk.contains("Fairfax"),
+            on_disk.contains("Springfield"),
             "full body must be written to disk"
         );
 

@@ -7,11 +7,12 @@
 // produced file and deliver it directly via `send_media` (Document), guarded by
 // a process-scoped deliver-once ledger.
 
+use crate::testing::CallWithFacts;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::terminal::{ApprovalRequest, TerminalTool};
-use crate::traits::{Channel, ChannelCapabilities, Tool};
+use crate::traits::{Channel, ChannelCapabilities};
 use crate::types::{MediaKind, MediaMessage};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -117,7 +118,7 @@ async fn make_terminal_with_hub(
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
 
     let tool = Arc::new(
-        TerminalTool::new(
+        TerminalTool::new(crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1, // 1-second initial timeout — moves long commands to background fast
@@ -178,12 +179,10 @@ async fn empty_stdout_background_command_delivers_result_file() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have been moved to background: {response}"
@@ -263,12 +262,10 @@ async fn reaped_command_without_produced_file_sends_honest_failure() {
         "command": command,
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "write_paths": [missing_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have been moved to background: {response}"
@@ -343,12 +340,10 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [a_path.to_string_lossy(), b_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have detached: {response}"
@@ -402,11 +397,9 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let mut got_failure = false;
@@ -422,7 +415,7 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     assert_eq!(channel.document_count().await, 0);
 
     channel.fail_next_media_sends(false);
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let mut delivered = false;
@@ -472,12 +465,10 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have detached: {response}"
@@ -532,12 +523,10 @@ async fn reaped_script_declared_missing_output_reports_honest_failure() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [missing_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let reaped = tool

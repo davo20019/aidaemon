@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
-use crate::config::{AppConfig, IterationLimitConfig, ProviderKind};
+use crate::config::{AppConfig, IterationLimitConfig};
 use crate::events::EventStore;
 use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
@@ -26,7 +26,7 @@ use crate::testing::TestChannel;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
-use crate::traits::{Channel, ModelProvider};
+use crate::traits::Channel;
 use crate::types::{ChannelContext, UserRole};
 
 /// Check if live tests should run.
@@ -64,34 +64,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let config = load_live_test_config(&config_path)?;
 
     // Create real provider
-    let provider: Arc<dyn ModelProvider> = match config.provider.kind {
-        ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::XaiNative => Arc::new(
-            crate::providers::XaiNativeProvider::new_with_options(
-                &config.provider.api_key,
-                Some(&config.provider.base_url),
-                config.provider.max_tokens,
-                config.provider.extra_headers.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None)
-                .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-    };
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     // Temp DB for isolation
     let db_file = tempfile::NamedTempFile::new()?;
@@ -108,6 +81,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -119,7 +93,9 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     );
 
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -153,7 +129,6 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -270,34 +245,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
 
     let config = load_live_test_config(&config_path)?;
 
-    let provider: Arc<dyn ModelProvider> = match config.provider.kind {
-        ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::XaiNative => Arc::new(
-            crate::providers::XaiNativeProvider::new_with_options(
-                &config.provider.api_key,
-                Some(&config.provider.base_url),
-                config.provider.max_tokens,
-                config.provider.extra_headers.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
-            &config.provider.api_key,
-        )),
-        ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None)
-                .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-    };
+    let (provider, _models) = crate::providers::factory::build_provider(&config.provider)?;
 
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
@@ -312,6 +260,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             30,
@@ -323,7 +272,9 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     );
 
     let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
-        Arc::new(SystemInfoTool),
+        Arc::new(SystemInfoTool::new(
+            crate::execution::active_execution_backend(),
+        )),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
@@ -355,7 +306,6 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         max_response_chars: 8000,
         timeout_secs: 30,
         max_facts: 20,
-        daily_token_budget: None,
         iteration_config: IterationLimitConfig::Unlimited,
         task_timeout_secs: None,
         task_token_budget: None,
@@ -787,4 +737,115 @@ async fn test_live_behavior_no_web_search_for_local_files() {
         "Agent should NOT ask for clarification when given an explicit path. Got: {}",
         &response[..response.len().min(500)]
     );
+}
+
+/// A capped primary plan falls over to the real Claude and Gemini backends
+/// at once: the capped account is sent one request, its other model none,
+/// and no backoff is spent.
+///
+/// Keys come from `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (the environment
+/// or `.env`); models from `AIDAEMON_LIVE_ANTHROPIC_MODEL` /
+/// `AIDAEMON_LIVE_GEMINI_MODEL`. A provider without a key is left out, and
+/// the test fails when neither has one.
+///
+/// ```bash
+/// AIDAEMON_LIVE_TEST=1 cargo test test_live_capped_plan -- --nocapture
+/// ```
+#[tokio::test]
+async fn test_live_capped_plan_falls_over_to_other_providers() {
+    use aidaemon_core::{
+        Failover, FailoverStep, ModelRequest, Provider, ProviderError, QuotaGuard,
+    };
+    if !should_run_live_tests() {
+        return;
+    }
+    let _ = dotenvy::from_path(".env");
+    let key = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+    };
+    let model = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+
+    let mut others: Vec<(String, Arc<dyn Provider>)> = Vec::new();
+    if let Some(api_key) = key("ANTHROPIC_API_KEY") {
+        let backend = aidaemon_providers::Anthropic::builder()
+            .api_key(api_key)
+            .build()
+            .expect("anthropic backend");
+        let model = model("AIDAEMON_LIVE_ANTHROPIC_MODEL", "claude-haiku-5-5");
+        others.push((model, Arc::new(QuotaGuard::new(backend))));
+    }
+    if let Some(api_key) = key("GEMINI_API_KEY").or_else(|| key("GOOGLE_API_KEY")) {
+        let backend = aidaemon_providers::GoogleGenai::builder()
+            .api_key(api_key)
+            .build()
+            .expect("gemini backend");
+        let model = model("AIDAEMON_LIVE_GEMINI_MODEL", "gemini-2.5-flash");
+        others.push((model, Arc::new(QuotaGuard::new(backend))));
+    }
+    assert!(
+        !others.is_empty(),
+        "set ANTHROPIC_API_KEY and/or GEMINI_API_KEY (environment or .env)"
+    );
+
+    let request = |model: &str| ModelRequest {
+        model: model.into(),
+        messages: vec![aidaemon_core::Message::user(
+            "Reply with exactly one word: pong",
+        )],
+        max_output_tokens: Some(256),
+        ..Default::default()
+    };
+
+    // Each real provider answers on its own.
+    for (model, provider) in &others {
+        let started = std::time::Instant::now();
+        match provider.complete(&request(model)).await {
+            Ok(response) => println!(
+                "{} {model}: {:?} in {:?}",
+                provider.name(),
+                response.text.trim(),
+                started.elapsed()
+            ),
+            Err(error) => panic!("{} {model} failed on its own: {error}", provider.name()),
+        }
+    }
+
+    // The capped plan, then each real provider in turn.
+    for (model, provider) in &others {
+        let capped_inner = Arc::new(aidaemon_core::testing::ScriptedProvider::with_results(
+            vec![Err(ProviderError::QuotaExhausted {
+                message: "The usage limit has been reached".into(),
+                resets_at: Some(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+                per_model: false,
+            })],
+        ));
+        let capped: Arc<dyn Provider> = Arc::new(QuotaGuard::from_arc(capped_inner.clone()));
+        let chain = Failover::new(vec![
+            FailoverStep::from_arc(capped.clone())
+                .model("plan-model")
+                .attempts(3),
+            FailoverStep::from_arc(capped)
+                .model("plan-model-small")
+                .attempts(3),
+            FailoverStep::from_arc(provider.clone()).model(model.clone()),
+        ]);
+        let started = std::time::Instant::now();
+        let response = chain
+            .complete(&request("plan-model"))
+            .await
+            .unwrap_or_else(|error| panic!("chain to {model} failed: {error}"));
+        let elapsed = started.elapsed();
+        println!(
+            "capped plan -> {} {model}: {:?} in {elapsed:?}",
+            provider.name(),
+            response.text.trim()
+        );
+        assert!(response.text.to_ascii_lowercase().contains("pong"));
+        assert_eq!(capped_inner.requests().len(), 1, "capped account sent once");
+        assert!(elapsed < std::time::Duration::from_secs(60));
+    }
 }

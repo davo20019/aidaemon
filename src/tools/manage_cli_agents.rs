@@ -10,8 +10,8 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, DynamicCliAgentStore, Tool, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, DynamicCliAgentStore, Tool, ToolCallContext,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
 use crate::types::ApprovalResponse;
 
@@ -176,8 +176,6 @@ struct ManageCliAgentsArgs {
     max_output_chars: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
-    #[serde(default)]
-    _session_id: Option<String>,
 }
 
 fn manage_cli_agents_schema() -> Value {
@@ -242,29 +240,33 @@ impl Tool for ManageCliAgentsTool {
         manage_cli_agents_schema()
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(
-            arguments,
-            &["list", "history"],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageCliAgentsTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: ManageCliAgentsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
 
-        let session_id = args._session_id.as_deref().unwrap_or("");
+        let session_id = facts.session_id.as_str();
 
         match args.action.as_str() {
             "add" => {
@@ -318,6 +320,26 @@ impl Tool for ManageCliAgentsTool {
                 "Unknown action '{}'. Valid actions: add, remove, list, enable, disable, history",
                 other
             )),
+        }
+    }
+}
+
+impl crate::traits::ToolSemantics for ManageCliAgentsTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "history"],
+            ToolMutationEffects::CONFIGURATION,
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

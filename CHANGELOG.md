@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Used-up quotas fall over to other providers at once.** A ChatGPT plan's usage limit, a Gemini daily quota, an account out of credit (OpenAI `insufficient_quota`, Anthropic "credit balance is too low") or a rejected key now skips that account's other models without sending them and moves to the next `[[provider.fallbacks]]` entry, instead of retrying each model with backoff (about 90 seconds on a capped ChatGPT plan). The account stays skipped by every caller until the quota's stated reset (a few minutes when none is stated). When every provider fails, the reply names the limit and when it resets instead of the last fallback's error.
+
+- **Swappable long-term memory.** Agent turns reach memory only through a memory plugin: recall is injected by a `before_model` hook, extraction and learning run at run end, and the plugin owns its tools. `[memory] backend = "sdk"` (with the `sdk-memory` cargo feature) uses the `aidaemon-memory` crate instead of the daemon's own memory (`remember` / `recall` tools, a separate SQLite file at `[memory] path`). Default `daemon`. Background memory jobs (consolidation, retention, people intelligence, `/memory`) still use the daemon store.
+
+### Changed
+
+- **A tool must now explicitly signal that it has finished.** A phrase like "Moved to background" in its output no longer ends a run.
+
+- **A request that fails on the provider is queued again.** Since every turn moved to the SDK kernel, a turn that failed on the model provider before any tool ran was no longer queued for an automatic re-run. It is again, for a person's own request (not goal runs, sub-agents or automated triggers). After a plan's usage limit, the re-run waits until just after the stated reset, as long as that is within 12 hours, and the reply says when.
+
+- **A rejected key moves on to the fallback providers.** Authentication failures used to end the call; other configured providers are now tried.
+
+- **Recalled memory is its own system message.** Facts, episodes, the core profile and the critical-facts block moved out of the system prompt into one note placed after the per-task context, so the core prompt stays byte-stable across turns.
+- **`[state] daily_token_budget` is ignored** (logged once at startup). The SDK kernel never enforced it; per-goal daily budgets and `subagents.task_token_budget` still apply. Cap total spend with a provider spend limit.
+- **A scheduled run's per-check budget is its only token limit.** When a scheduled goal sets `budget_per_check`, `subagents.task_token_budget` no longer stacks on top of it, so the run budget's extension and alert decide when it stops. Without a per-check budget the task budget applies as before.
+- **The legacy loop's code is deleted** (about 37,000 lines): its phases, gates, forcing ladder, recovery builders and the tests that only exercised them. The replay-note learning channel, which only the dropped gates fed, is gone with them.
+- **Every agent turn runs on the aidaemon SDK kernel.** The legacy iteration loop is gone; turn setup (assessment, contract, prompt, tool filtering) is unchanged and the kernel drives model calls, tool dispatch and the ledger closeout. The `sdk-engine` cargo feature is removed, and `[agent.engine] kind` is accepted but ignored (logged once). Not carried over: the intent gate, pre-execution plan / critique / evidence gates, the reflection side call, the semantic read cache and guided `tool_choice` forcing.
+- **Plain reminders skip the agent.** `create_scheduled_goal` takes a typed `reminder` message; such a goal is active at once (no confirmation prompt, since it only messages you) and fires as "⏰ Reminder: …" instead of running a task lead and an executor.
+- **`set_reminder` tool.** A plain reminder takes two required fields, `message` and `when`, instead of an action inside the 24-action `manage_memories` (where cheaper models picked the wrong action or dropped the schedule).
+- **Browser navigation shows the page.** `navigate` and `new_tab` return a short text preview, so the agent no longer needs a `get_text` or a screenshot (which was also posted to the chat) after every page it opens.
+- **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
+
+### Fixed
+
+- **SDK turns keep the legacy tool boundary.** Behavior the old dispatcher owned is back on every turn:
+  - Untrusted tool output (web, MCP, terminal, channel history) is wrapped as data and sanitized again before the model sees it, and an oversized result is paged, spilled to a file, or compressed to the per-model cap.
+  - A call without a directory runs in the request's project directory (a scheduled goal's bound workspace), not the daemon's cwd.
+  - The controller refuses protected host data and undeclared writes outside the task boundary, and an exact out-of-scope terminal target goes to the approval prompt.
+  - Tools run under the configured call timeout.
+  - A tool that returns an error, and a call the kernel refuses itself (unknown tool, invalid arguments, the same-tool limit), now leave a typed receipt in the run ledger.
+  - A `computer_use` loop's pinned vision model serves the rest of its task, and a GUI success claim waits for a look after an unverified coordinate click.
+- **Task outcomes follow receipts.** A run with no contract whose operations all failed is recorded as failed, and a run that owed work but ran nothing is failed rather than partial. Before, both could read as succeeded or partial.
+- **Budget pressure is visible again.** A task or scheduled run gets one warning at 80% of its token budget before it is stopped.
+- **Finished checklists don't come back.** Advisory checklist steps are closed when the run completes, so a restart no longer pauses the plan and asks to resume finished work.
+- **Mandate reviews end on their decision.** A committed WAIT, ASK or STOP ends the review without another model call, and an exhausted cycle balance closes from that decision (or a bounded WAIT) instead of failing as a provider error.
+- **Stopped runs reply in plain language.** A run that hits a limit, gets stuck or loses the provider no longer shows internal debug text; its reply is sanitized, provider errors are redacted, and secrets are filtered on public channels.
+- **Learning sees failures again.** Tool errors and the recoveries that follow feed error solutions and failure patterns; failed model calls are recorded in telemetry; token estimates are calibrated; a provider blip before any work gets the longer retry ladder; and a reply cut off while thinking lowers reasoning effort for the next call.
+- **`web_fetch` keeps listing pages whole.** On download and release pages readability kept a side section (python.org: "verify your download") and dropped the release list, so the agent reported an older version as current. A short extract cut from a large page now returns the whole page text.
+- **A silent model no longer replaces a real answer with "I completed N actions."** When the closeout sends a correct final answer back for more work and the model then replies with nothing, that answer ships instead of a generic activity summary.
+- **Folder-scoped checklist steps close.** A write or read inside a folder the checklist named now counts for that folder.
+- **Cancelling a goal's last schedule cancels the goal**, and `list_scheduled` shows active goals that have no schedule (they never run) so they can be cancelled.
+- **Read-only requests can use the terminal again.** The authority check judged `terminal` as a whole (not read-only) and refused even a plain `find`; it now judges each call, and the terminal still enforces read-only itself.
+- **Recall of earlier work works with models that fill every field.** Optional tool arguments left as `""` or `[]` are dropped before dispatch, so `search_history` no longer filters on an empty session and `create_scheduled_goal` no longer loses `schedule` behind an empty `schedules`.
+- **An inspection step is not reopened by the edit built on it.** A checklist observation that a later item depends on is no longer invalidated by that item's changes, so "inspect → edit → verify" turns stop looping on an impossible pre-edit inspection.
+- **Background jobs hand off in plain language**, and a small text result file is quoted in its delivery caption.
+- **Scheduled-run cards show the outcome**, not the "Goal completed:" label.
+- **`/model` leads the task assessment** as well as the turn.
+- **Telegram:** inline code inside bold, italic or link text no longer shows literal backticks.
+
+### Security
+
+- **MCP servers no longer receive session, role or channel details in tool arguments.**
+- **An MCP server's own hints (read-only, closed-world) no longer relax any safety check.**
+
 ## [0.12.9] - 2026-10-22
 
 ### Fixed

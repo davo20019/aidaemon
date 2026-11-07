@@ -1,0 +1,33 @@
+[package]
+name = "aidaemon-core"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Experimental sketch of a small, hook-driven agent loop kernel for AIdaemon"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+# Exposes `aidaemon_core::testing` (ScriptedProvider and helpers) so users can
+# test their own tools and hooks without a real model, and
+# `aidaemon_core::conformance` (tool and provider conformance kits).
+testing = []
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+aidaemon-core = { path = ".", features = ["testing"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[example]]
+name = "quickstart"
+required-features = ["testing"]

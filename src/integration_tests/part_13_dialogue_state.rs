@@ -1,52 +1,5 @@
 // ==================== Dialogue State Projection ====================
 
-struct DialogueStateWebSearchTool {
-    queries: Arc<tokio::sync::Mutex<Vec<String>>>,
-}
-
-impl DialogueStateWebSearchTool {
-    fn new(queries: Arc<tokio::sync::Mutex<Vec<String>>>) -> Self {
-        Self { queries }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::traits::Tool for DialogueStateWebSearchTool {
-    fn name(&self) -> &str {
-        "web_search"
-    }
-
-    fn description(&self) -> &str {
-        "Search the web and return canned results for tests"
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        json!({
-            "name": "web_search",
-            "description": "Search the web and return canned results for tests",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"],
-                "additionalProperties": true
-            }
-        })
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: serde_json::Value = serde_json::from_str(arguments)?;
-        let query = args["query"].as_str().unwrap_or("").to_string();
-        self.queries.lock().await.push(query.clone());
-        Ok(format!(
-            "1. [Result](https://example.com/{})\n   Evidence for {}",
-            query.replace(' ', "-"),
-            query
-        ))
-    }
-}
-
 #[tokio::test]
 async fn test_semantic_followup_uses_dialogue_state_projection() {
     let provider = MockProvider::with_responses(vec![
@@ -148,7 +101,7 @@ async fn test_semantic_followup_uses_dialogue_state_projection() {
 
 #[tokio::test]
 async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() {
-    let location_answer = "You live in Fairfax, VA.";
+    let location_answer = "You live in Springfield, VA.";
     let job_prep_answer = format!(
         "We've mainly been working on your 2026 AI job preparation and interview briefing. {}\n\nSource artifact: /tmp/synthetic-ai-job-prep/briefing.md",
         "Detailed preparation context covering agent systems, production reliability, evaluated projects, RAG, MLOps, system design, technical interviews, behavioral interviews, market updates, and application tracking. ".repeat(8)
@@ -250,103 +203,6 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
     assert!(
         !serialized.contains(location_answer),
         "the continuation must retain its structural parent without resurrecting an older unrelated task"
-    );
-}
-
-#[tokio::test]
-async fn test_schedule_trigger_followup_blocks_off_topic_web_search() {
-    let queries = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "Schedules trigger at:\n- 9:00 AM\n- 12:00 PM\n- 6:00 PM\nThese are daily recurring tasks for posting tweets about aidaemon.",
-        ),
-        MockProvider::tool_call_response(
-            "web_search",
-            r#"{"query":"top 3 tallest buildings in the world 2025 height"}"#,
-        ),
-        MockProvider::text_response(
-            "I need to check the scheduled run state for that 9:00 AM trigger instead of searching the web.",
-        ),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "goal_state",
-        ),
-        MockProvider::semantic_task_assessment(
-            "check",
-            false,
-            true,
-            &[],
-            "continuation",
-            "goal_state",
-        ),
-    ]);
-
-    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(DialogueStateWebSearchTool::new(queries.clone()))
-            as Arc<dyn crate::traits::Tool>],
-        None,
-    )
-    .await
-    .unwrap();
-    let session_id = "dialogue_state_schedule_trigger_followup";
-
-    let _ = harness
-        .agent
-        .handle_message(
-            session_id,
-            "What times does the tweet posting schedule trigger?",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let response = harness
-        .agent
-        .handle_message(
-            session_id,
-            "Did it trigger the 9:00 am today?",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !response.contains("What I need from you"),
-        "an unavailable in-scope observation must not ask the user to manufacture a receipt: {response}"
-    );
-    let event_store = crate::events::EventStore::new(harness.state.pool())
-        .await
-        .expect("event store from harness pool");
-    let events = event_store
-        .query_recent_events(session_id, 100)
-        .await
-        .expect("recent events");
-    assert!(
-        events.iter().any(|event| {
-            event
-                .parse_data::<crate::events::TaskEndData>()
-                .ok()
-                .and_then(|data| data.outcome)
-                == Some(crate::events::TaskOutcome::Failed)
-        }),
-        "the unavailable observation must end with a typed failed outcome"
-    );
-    assert!(
-        queries.lock().await.is_empty(),
-        "off-topic web_search should be blocked before execution"
     );
 }
 

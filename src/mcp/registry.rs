@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
-use crate::mcp::{capabilities_from_tool_definition, McpClient, McpTool};
+use crate::mcp::{mcp_tool_capabilities, McpClient, McpTool};
 use crate::traits::{DynamicMcpServer, MandateAuthority, McpRegistryStore, Tool};
 
 /// A running MCP server entry in the registry.
@@ -125,6 +125,10 @@ impl McpRegistry {
             // Strip $schema — Google Gemini API rejects it in function parameters
             if let Some(obj) = schema.as_object_mut() {
                 obj.remove("$schema");
+                // MCP allows a bare `{"type": "object"}` for a tool without
+                // arguments; the tool contract wants `properties`.
+                obj.entry("properties")
+                    .or_insert_with(|| serde_json::json!({}));
             }
 
             let tool_schema = serde_json::json!({
@@ -141,7 +145,7 @@ impl McpRegistry {
                 Arc::clone(&client),
                 name.to_string(),
                 self.clone(),
-                capabilities_from_tool_definition(td),
+                mcp_tool_capabilities(),
             )));
         }
 

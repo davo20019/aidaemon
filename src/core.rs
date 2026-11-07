@@ -57,6 +57,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         router,
         provider_kind,
         failover_targets,
+        models,
     } = crate::providers::factory::build_provider_router(&config)?;
     let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
@@ -64,7 +65,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         provider_kind,
         model.clone(),
         failover_targets,
-    );
+    )
+    .with_models(models);
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,
@@ -161,7 +163,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists_dir.as_deref(),
     ));
 
-    let agent = Arc::new(Agent::new(crate::agent::AgentConstruction {
+    let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config);
+
+    #[allow(unused_mut)]
+    let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             llm_runtime: llm_runtime.clone(),
             state: state.clone(),
@@ -178,7 +183,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         max_response_chars: config.subagents.max_response_chars,
         timeout_secs: config.subagents.timeout_secs,
         max_facts: config.state.max_facts,
-        daily_token_budget: config.state.daily_token_budget,
         iteration_config: config.subagents.effective_iteration_limit(),
         task_timeout_secs: config.subagents.task_timeout_secs,
         task_token_budget: config.subagents.task_token_budget,
@@ -204,15 +208,32 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         audio_config: AudioConfig::from_files(&config.files),
         stt_config: SttConfig::from_files(&config.files),
         harness_eval_config: (&config.diagnostics.harness_eval).into(),
-    }));
+    });
+    agent.set_sdk_engine(sdk_engine);
+    // The kernel's run store shares the daemon's pool, so runs inherit its
+    // encryption and WAL settings and live in the same database file.
+    agent.set_run_store(Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?,
+    ));
+    // Owner-approval cards from the kernel go out on the same channel the
+    // tools' cards use.
+    agent.owner_approvals().set_broker(approval_tx.clone());
+    if let Some(memory) = crate::agent::memory_plugin::configured_plugin(
+        &config.memory,
+        &llm_runtime,
+        state.clone(),
+        event_store.clone(),
+    )
+    .await
+    {
+        agent.set_memory_plugin(memory);
+    }
+    let agent = Arc::new(agent);
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;
-
-    // Merge persisted runtime-learned "ignores tool_choice=required" models into
-    // the config-seeded in-memory set, so a model that melted down once stays
-    // flagged across restarts (the 264s gemma meltdown never re-arms).
-    agent.load_required_tool_choice_ignored().await;
 
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
@@ -265,6 +286,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
+    agent.set_task_registry(task_registry.clone());
 
     // 11. Channels
     let channel_agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> = agent.clone();

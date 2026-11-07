@@ -97,12 +97,70 @@ impl Agent {
             .await
     }
 
+    /// Deliver a backgrounded child's result. A result from a child that
+    /// read untrusted content lands in a turn recorded tainted before the
+    /// note exists (`tainted_note_turn`), so every later turn that still
+    /// sees it starts tainted.
+    pub(crate) async fn deliver_background_spawn_result(
+        &self,
+        hub: Option<&Weak<dyn OutboundRouter>>,
+        parent_session_id: &str,
+        text: &str,
+        trust: aidaemon_core::SourceTrust,
+    ) -> anyhow::Result<ParentDeliveryOutcome> {
+        let turn_id = match trust {
+            aidaemon_core::SourceTrust::Trusted => None,
+            aidaemon_core::SourceTrust::Untrusted => {
+                Some(self.tainted_note_turn(parent_session_id).await?)
+            }
+        };
+        self.deliver_parent_text_result_in_turn(
+            hub,
+            parent_session_id,
+            text,
+            ParentDeliveryKind::BackgroundSpawnResult,
+            turn_id.as_deref(),
+        )
+        .await
+    }
+
+    /// The turn an untrusted note joins, recorded tainted before the note
+    /// is written: the session's running turn if there is one, else a turn
+    /// of its own. Fails if the taint cannot be recorded; callers then do
+    /// not write the note.
+    pub(crate) async fn tainted_note_turn(&self, session_id: &str) -> anyhow::Result<String> {
+        let turn_id = self
+            .current_turn_ids
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::agent::untrusted::record_tainted_turn(self.state.as_ref(), session_id, &turn_id)
+            .await?;
+        Ok(turn_id)
+    }
+
     pub(crate) async fn deliver_parent_text_result(
         &self,
         hub: Option<&Weak<dyn OutboundRouter>>,
         parent_session_id: &str,
         text: &str,
         kind: ParentDeliveryKind,
+    ) -> anyhow::Result<ParentDeliveryOutcome> {
+        self.deliver_parent_text_result_in_turn(hub, parent_session_id, text, kind, None)
+            .await
+    }
+
+    /// `turn_id` stamps the recorded note; `None` joins the session's
+    /// current turn, if any.
+    async fn deliver_parent_text_result_in_turn(
+        &self,
+        hub: Option<&Weak<dyn OutboundRouter>>,
+        parent_session_id: &str,
+        text: &str,
+        kind: ParentDeliveryKind,
+        turn_id: Option<&str>,
     ) -> anyhow::Result<ParentDeliveryOutcome> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -115,8 +173,13 @@ impl Agent {
         // Persistence-only mode: caller passed no hub. Record so the parent
         // LLM can reason about the produced text (tests, headless flows).
         let Some(hub_weak) = hub else {
-            self.record_parent_visible_result_note(parent_session_id, kind.note_prefix(), trimmed)
-                .await?;
+            self.record_parent_visible_result_note_in_turn(
+                parent_session_id,
+                kind.note_prefix(),
+                trimmed,
+                turn_id,
+            )
+            .await?;
             return Ok(ParentDeliveryOutcome {
                 sent: false,
                 recorded: true,
@@ -135,10 +198,11 @@ impl Agent {
 
         match hub_arc.send_text(parent_session_id, trimmed).await {
             Ok(()) => {
-                self.record_parent_visible_result_note(
+                self.record_parent_visible_result_note_in_turn(
                     parent_session_id,
                     kind.note_prefix(),
                     trimmed,
+                    turn_id,
                 )
                 .await?;
                 Ok(ParentDeliveryOutcome {
@@ -271,5 +335,61 @@ mod tests {
                 "✅ **Scheduled run complete**\n\nPublished.".to_string()
             )]
         );
+    }
+
+    /// The recorded note's turn id and the session's tainted turns after a
+    /// background child's result is delivered with `trust`.
+    async fn delivered_note_turn(
+        trust: aidaemon_core::SourceTrust,
+    ) -> (Option<String>, Vec<String>) {
+        use crate::traits::store_prelude::*;
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let session_id = "telegram:test_bot:synthetic-owner";
+        let outcome = harness
+            .agent
+            .deliver_background_spawn_result(
+                None,
+                session_id,
+                "Background task complete\nMission: Summarize\n\nA synthetic summary.",
+                trust,
+            )
+            .await
+            .expect("deliver background result");
+        assert!(outcome.recorded);
+        let history = harness
+            .state
+            .get_history(session_id, 10)
+            .await
+            .expect("history");
+        let note = history
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("A synthetic summary."))
+            })
+            .expect("the note is recorded");
+        let tainted = crate::agent::untrusted::tainted_turns(harness.state.as_ref(), session_id)
+            .await
+            .expect("tainted turns");
+        (note.turn_id.clone(), tainted)
+    }
+
+    /// A tainted background child's result enters the parent session as a
+    /// turn recorded tainted, so the next turn that sees it starts tainted.
+    #[tokio::test]
+    async fn a_tainted_background_childs_result_is_a_tainted_turn() {
+        let (turn, tainted) = delivered_note_turn(aidaemon_core::SourceTrust::Untrusted).await;
+        let turn = turn.expect("the note carries its own turn");
+        assert_eq!(tainted, vec![turn]);
+    }
+
+    #[tokio::test]
+    async fn a_clean_background_childs_result_taints_nothing() {
+        let (_, tainted) = delivered_note_turn(aidaemon_core::SourceTrust::Trusted).await;
+        assert!(tainted.is_empty(), "{tainted:?}");
     }
 }

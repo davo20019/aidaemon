@@ -3,10 +3,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, ExecutionRequest, SharedExecutionBackend};
+use crate::execution::{ExecutionRequest, SharedExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
-pub struct SystemInfoTool;
+pub struct SystemInfoTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl SystemInfoTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 #[async_trait]
 impl Tool for SystemInfoTool {
@@ -31,22 +39,8 @@ impl Tool for SystemInfoTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let mut info = format!(
             "Execution target: {} ({})\nWorkspace: {}\n",
             backend.kind().as_str(),
@@ -88,6 +82,22 @@ impl Tool for SystemInfoTool {
         }
 
         Ok(info)
+    }
+}
+
+impl crate::traits::ToolSemantics for SystemInfoTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 

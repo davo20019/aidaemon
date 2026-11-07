@@ -70,38 +70,22 @@ impl McpTool {
     }
 }
 
-/// Derive execution semantics from MCP's structured ToolAnnotations.
+/// The capabilities of an MCP server's tool: always the conservative ones
+/// (mutating, open-world, destructive, non-idempotent, needs approval).
 ///
-/// MCP defines these fields as hints with conservative defaults. AIdaemon MCP
-/// servers are explicitly configured/installed by the owner (dynamic installs
-/// are approval-gated), so their annotations are treated as trusted adapter
-/// metadata. Missing annotations retain the MCP defaults: mutating,
-/// destructive, non-idempotent, and open-world.
-pub(crate) fn capabilities_from_tool_definition(definition: &Value) -> ToolCapabilities {
-    let annotations = definition.get("annotations");
-    let read_only = annotations
-        .and_then(|value| value.get("readOnlyHint"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let destructive = annotations
-        .and_then(|value| value.get("destructiveHint"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let idempotent = annotations
-        .and_then(|value| value.get("idempotentHint"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let open_world = annotations
-        .and_then(|value| value.get("openWorldHint"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-
+/// MCP `ToolAnnotations` (`readOnlyHint`, `openWorldHint`,
+/// `destructiveHint`, `idempotentHint`) are hints the server declares about
+/// itself; the MCP specification says to treat them as untrusted. They never
+/// relax a safeguard here: nothing that gates a decision (the authority
+/// hook's read-only level, the profile's tool pruning, the untrusted-content
+/// verifier, transport retries) reads them.
+pub(crate) fn mcp_tool_capabilities() -> ToolCapabilities {
     ToolCapabilities {
-        read_only,
-        external_side_effect: open_world || !read_only,
-        needs_approval: !read_only,
-        idempotent: read_only || idempotent,
-        high_impact_write: !read_only && destructive,
+        read_only: false,
+        external_side_effect: true,
+        needs_approval: true,
+        idempotent: false,
+        high_impact_write: true,
     }
 }
 
@@ -139,22 +123,6 @@ impl Tool for McpTool {
 
     fn schema(&self) -> Value {
         self.tool_schema.clone()
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        self.capabilities
-    }
-
-    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        if self.capabilities.read_only {
-            return ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent);
-        }
-        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
-        if self.capabilities.high_impact_write {
-            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
-        }
-        ToolCallSemantics::mutation_with(effects)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -258,6 +226,54 @@ impl Tool for McpTool {
     }
 }
 
+impl crate::traits::ToolSemantics for McpTool {
+    fn capabilities(&self) -> ToolCapabilities {
+        self.capabilities
+    }
+
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
+    /// An MCP server is opaque: whatever a call does, its effects are not
+    /// declared, so a decline in the run always asks again.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
+    /// Never from the server's hints: every call is egress, not read-only,
+    /// destructive and non-idempotent, so the authority hook, the untrusted
+    /// verifier and the approval policy judge it at its worst.
+    fn call_annotations_in(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        aidaemon_core::ToolAnnotations {
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            egress: true,
+        }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        if self.capabilities.read_only {
+            return ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent);
+        }
+        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
+        if self.capabilities.high_impact_write {
+            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
+        }
+        ToolCallSemantics::mutation_with(effects)
+    }
+}
+
 /// Discover and register all tools from configured MCP servers.
 #[allow(dead_code)] // Kept for backward compatibility; static configs now go through McpRegistry
 pub async fn discover_mcp_tools(
@@ -294,7 +310,7 @@ pub async fn discover_mcp_tools(
                                 name,
                                 tool_schema,
                                 Arc::clone(&client),
-                                capabilities_from_tool_definition(&td),
+                                mcp_tool_capabilities(),
                             )));
                         }
                     }
@@ -316,41 +332,91 @@ pub async fn discover_mcp_tools(
 mod annotation_tests {
     use super::*;
 
-    #[test]
-    fn mcp_annotations_map_to_typed_capabilities_without_name_guessing() {
-        let read = capabilities_from_tool_definition(&serde_json::json!({
-            "name": "delete_everything_but_actually_read_only",
-            "annotations": {
-                "readOnlyHint": true,
-                "openWorldHint": false
-            }
-        }));
-        assert!(read.read_only);
-        assert!(read.idempotent);
-        assert!(!read.needs_approval);
-        assert!(!read.high_impact_write);
+    fn mcp_tool(annotations: Value) -> McpTool {
+        McpTool::new(
+            "synthetic_tool".to_string(),
+            // The server's hints travel with the definition; nothing reads them.
+            serde_json::json!({
+                "name": "synthetic_tool",
+                "description": "",
+                "parameters": {"type": "object"},
+                "annotations": annotations,
+            }),
+            Arc::new(McpClient::idle_for_test()),
+            mcp_tool_capabilities(),
+        )
+    }
 
-        let write = capabilities_from_tool_definition(&serde_json::json!({
-            "name": "list_but_actually_mutates",
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false
-            }
-        }));
-        assert!(!write.read_only);
-        assert!(write.needs_approval);
-        assert!(write.idempotent);
-        assert!(!write.high_impact_write);
+    fn hook_ctx(untrusted_seen: bool) -> aidaemon_core::HookContext<'static> {
+        aidaemon_core::HookContext {
+            run_id: aidaemon_core::RunId::new(),
+            agent_id: "aidaemon",
+            session_id: "telegram:synthetic-user-1",
+            turn: 1,
+            messages: &[],
+            receipts: &[],
+            usage: aidaemon_core::Usage::default(),
+            run_usage: aidaemon_core::Usage::default(),
+            untrusted_seen,
+            declined: &[],
+        }
+    }
 
-        let unspecified = capabilities_from_tool_definition(&serde_json::json!({
-            "name": "unknown"
-        }));
-        assert!(!unspecified.read_only);
-        assert!(unspecified.needs_approval);
-        assert!(!unspecified.idempotent);
-        assert!(unspecified.high_impact_write);
+    /// A server's hints are its own claims: a tool claiming to be read-only
+    /// and closed-world is still egress, refused under read-only authority,
+    /// checked by the untrusted verifier after untrusted content, opaque in
+    /// its effects and untrusted in its output.
+    #[tokio::test]
+    async fn mcp_hints_never_loosen_safeguards() {
+        use crate::traits::ToolSemantics;
+        use aidaemon_core::Hook;
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let claims_read_only =
+            mcp_tool(serde_json::json!({"readOnlyHint": true, "openWorldHint": false}));
+        let unhinted = mcp_tool(serde_json::json!({}));
+        for tool in [&claims_read_only, &unhinted] {
+            let annotations = tool.call_annotations_in("{}", &roots);
+            assert!(annotations.egress, "{annotations:?}");
+            assert!(!annotations.read_only, "{annotations:?}");
+            let caps = tool.capabilities();
+            assert!(!caps.read_only && caps.needs_approval && caps.external_side_effect);
+            assert!(!caps.idempotent && caps.high_impact_write);
+            assert_eq!(
+                tool.call_effects("{}"),
+                aidaemon_core::CallEffects::unknown()
+            );
+            assert_eq!(
+                tool.output_trust("{}", &roots),
+                aidaemon_core::SourceTrust::Untrusted
+            );
+
+            let info = aidaemon_core::ToolInfo {
+                annotations,
+                access: aidaemon_core::AccessManifest::default(),
+                effects: tool.call_effects("{}"),
+            };
+            let call = aidaemon_core::ToolCall::new("c1", "synthetic_tool", serde_json::json!({}));
+            let read_only =
+                aidaemon_core::AuthorityHook::new(aidaemon_core::Authority::read_only());
+            assert!(
+                matches!(
+                    read_only.before_tool(&hook_ctx(false), &call, &info).await,
+                    aidaemon_core::ToolDecision::Deny { .. }
+                ),
+                "read-only authority must refuse it"
+            );
+            let untrusted = aidaemon_core::UntrustedHook::new(
+                aidaemon_core::UntrustedMode::Enforce,
+                |_, content| content.to_string(),
+            );
+            assert!(
+                matches!(
+                    untrusted.before_tool(&hook_ctx(true), &call, &info).await,
+                    aidaemon_core::ToolDecision::Interrupt { .. }
+                ),
+                "after untrusted content it must go through the verifier"
+            );
+        }
     }
 }
 

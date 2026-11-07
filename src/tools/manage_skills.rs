@@ -19,8 +19,8 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, SkillsStore, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+    semantics_for_exact_read_actions, SkillsStore, Tool, ToolCallContext, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects,
 };
 use crate::types::ApprovalResponse;
 
@@ -3057,8 +3057,9 @@ struct ManageSkillsArgs {
     draft_id: Option<i64>,
     approve: Option<bool>,
     dry_run: Option<bool>,
-    #[serde(default)]
-    _session_id: Option<String>,
+    /// The calling session, from the dispatcher's facts (never an argument).
+    #[serde(skip)]
+    call_session: Option<String>,
 }
 
 #[async_trait]
@@ -3125,45 +3126,38 @@ impl Tool for ManageSkillsTool {
         })
     }
 
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let parsed = serde_json::from_str::<Value>(arguments).ok();
-        let review_without_decision = parsed.as_ref().is_some_and(|args| {
-            args.get("action").and_then(Value::as_str) == Some("review")
-                && args.get("approve").and_then(Value::as_bool).is_none()
-        });
-        if review_without_decision {
-            return semantics_for_exact_read_actions(
-                r#"{"action":"review"}"#,
-                &["review"],
-                ToolMutationEffects::CONFIGURATION,
-            );
-        }
-        semantics_for_exact_read_actions(
-            arguments,
-            &["list", "browse"],
-            ToolMutationEffects::CONFIGURATION,
-        )
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageSkillsArgs = serde_json::from_str(arguments)
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.run(arguments, &facts)
+            .await
+            .map(crate::traits::ToolCallOutcome::from_output)
+    }
+}
+
+impl ManageSkillsTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: ManageSkillsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
+        args.call_session = facts.session().map(str::to_string);
 
         match args.action.as_str() {
             "add" => {
                 let url = args.url.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'add' action"))?;
-                let session_id = args._session_id.as_deref().ok_or_else(|| {
+                let session_id = args.call_session.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Missing session context for approval on 'add' action")
                 })?;
                 let approval = self
@@ -3189,7 +3183,7 @@ impl Tool for ManageSkillsTool {
             "learn_api" => {
                 let url = args.url.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'learn_api' action"))?;
-                let session_id = args._session_id.as_deref().ok_or_else(|| {
+                let session_id = args.call_session.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Missing session context for approval on 'learn_api' action")
                 })?;
                 let approval = self
@@ -3243,7 +3237,7 @@ impl Tool for ManageSkillsTool {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'install' action"))?;
                 if !self.registry_urls.is_empty() {
-                    let session_id = args._session_id.as_deref().ok_or_else(|| {
+                    let session_id = args.call_session.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("Missing session context for approval on 'install' action")
                     })?;
                     let approval = self
@@ -3265,7 +3259,7 @@ impl Tool for ManageSkillsTool {
             "update" => {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'update' action"))?;
-                let session_id = args._session_id.as_deref().ok_or_else(|| {
+                let session_id = args.call_session.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Missing session context for approval on 'update' action")
                 })?;
                 let approval = self
@@ -3291,9 +3285,42 @@ impl Tool for ManageSkillsTool {
     }
 }
 
+impl crate::traits::ToolSemantics for ManageSkillsTool {
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let review_without_decision = parsed.as_ref().is_some_and(|args| {
+            args.get("action").and_then(Value::as_str) == Some("review")
+                && args.get("approve").and_then(Value::as_bool).is_none()
+        });
+        if review_without_decision {
+            return semantics_for_exact_read_actions(
+                r#"{"action":"review"}"#,
+                &["review"],
+                ToolMutationEffects::CONFIGURATION,
+            );
+        }
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "browse"],
+            ToolMutationEffects::CONFIGURATION,
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::CallWithFacts;
     use std::sync::Arc;
 
     use crate::memory::embeddings::EmbeddingService;
@@ -3730,13 +3757,13 @@ mutation CreateWidget {
         });
 
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"learn_api",
                     "url":"https://example.com/openapi.json",
-                    "profile":"demo",
-                    "_session_id":"test:owner"
+                    "profile":"demo"
                 }"#,
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();
@@ -3756,12 +3783,12 @@ mutation CreateWidget {
         });
 
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"add",
-                    "url":"https://example.com/skill.md",
-                    "_session_id":"test:owner"
+                    "url":"https://example.com/skill.md"
                 }"#,
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();
@@ -3794,12 +3821,12 @@ mutation CreateWidget {
         });
 
         let result = tool
-            .call(
+            .call_with(
                 r#"{
                     "action":"update",
-                    "name":"updatable",
-                    "_session_id":"test:owner"
+                    "name":"updatable"
                 }"#,
+                crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();

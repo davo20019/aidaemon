@@ -153,6 +153,26 @@ pub struct McpClient {
 }
 
 impl McpClient {
+    /// A client over an idle `cat` process, for tests that need an
+    /// `McpTool` but never call the server.
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        Self {
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            _child: Mutex::new(child),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
     /// Spawn an MCP server subprocess and initialize the connection.
     ///
     /// The subprocess environment is scrubbed to a safe allowlist to prevent

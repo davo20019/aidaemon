@@ -765,6 +765,11 @@ pub struct NotificationEntry {
     /// Opaque token reserved for channel-native actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_token: Option<String>,
+    /// The message carries content someone other than the owner wrote (a
+    /// tainted child's result): delivering it into the session taints the
+    /// turn that records it.
+    #[serde(default)]
+    pub untrusted: bool,
 }
 
 impl NotificationEntry {
@@ -808,7 +813,14 @@ impl NotificationEntry {
             expires_at,
             task_id: None,
             action_token: None,
+            untrusted: false,
         }
+    }
+
+    /// Mark the message as carrying untrusted content.
+    pub fn with_untrusted(mut self, untrusted: bool) -> Self {
+        self.untrusted = untrusted;
+        self
     }
 
     pub fn with_task(mut self, task_id: &str) -> Self {

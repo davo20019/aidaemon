@@ -298,7 +298,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
-            heartbeat.register_deferrable_job(
+            heartbeat.register_job(
                 "skill_promotion",
                 Duration::from_secs(12 * 3600),
                 move || {
@@ -324,7 +324,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                     state.clone(),
                     config.people.clone(),
                 ));
-            heartbeat.register_deferrable_job(
+            heartbeat.register_job(
                 "people_intelligence",
                 Duration::from_secs(24 * 3600),
                 move || {
@@ -355,7 +355,10 @@ pub(crate) async fn init_heartbeat_coordinator(
             "tool_result_cleanup",
             Duration::from_secs(3600),
             move || async move {
-                crate::tools::result_spill::prune_spill_dir_for_backend().await;
+                crate::tools::result_spill::prune_spill_dir_for_backend(
+                    &*crate::execution::active_execution_backend(),
+                )
+                .await;
                 Ok(())
             },
         );
@@ -646,7 +649,6 @@ pub(crate) fn spawn_dashboard_or_health_server(
                     started_at: std::time::Instant::now(),
                     dashboard_token: dashboard_token_info.token,
                     token_created_at: dashboard_token_info.created_at,
-                    daily_token_budget: config.state.daily_token_budget,
                     health_store,
                     heartbeat_telemetry,
                     oauth_gateway,

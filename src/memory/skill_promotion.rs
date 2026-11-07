@@ -319,11 +319,11 @@ impl SkillPromoter {
         ];
 
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let model = runtime_snapshot.primary_model();
+        // Background work does not need the strongest model.
+        let model = runtime_snapshot.cheap_model();
         let call_start = std::time::Instant::now();
         let response = runtime_snapshot
-            .provider()
-            .chat(&model, &messages, &[])
+            .background_chat(&model, &messages, &[])
             .await?;
 
         crate::events::record_background_model_call_telemetry(

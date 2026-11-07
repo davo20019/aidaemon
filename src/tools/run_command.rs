@@ -1,8 +1,8 @@
+use crate::traits::ToolSemantics;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::execution::active_execution_backend;
 use crate::traits::{
     Tool, ToolCallAccessManifest, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolTargetHint,
@@ -13,7 +13,15 @@ use crate::types::StatusUpdate;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
-pub struct RunCommandTool;
+pub struct RunCommandTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl RunCommandTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 const SAFE_NPM_PREFIX_HINT: &str =
     "`npm test`, `npm ls`, `npm outdated`, `npm audit` (note: `npm run` and `npx` require `terminal` approval)";
 
@@ -207,6 +215,20 @@ impl Tool for RunCommandTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.run_outcome(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.run_outcome(arguments).await
+    }
+}
+
+impl crate::traits::ToolSemantics for RunCommandTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -231,18 +253,6 @@ impl Tool for RunCommandTool {
 
     fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
         run_command_access_manifest(arguments)
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run_outcome(arguments).await?.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.run_outcome(arguments).await
     }
 }
 
@@ -292,7 +302,7 @@ impl RunCommandTool {
             ));
         }
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let dir = if let Some(d) = working_dir {
             backend.resolve_path(d).await?
         } else {
@@ -306,8 +316,13 @@ impl RunCommandTool {
         let is_git_command = trimmed == "git" || trimmed.starts_with("git ");
         let mut adapter_read_paths = Vec::new();
         if is_git_command {
-            let preflight =
-                fs_utils::run_cmd_backend("git rev-parse --show-toplevel", Some(&dir), 5).await?;
+            let preflight = fs_utils::run_cmd_backend(
+                &*backend,
+                "git rev-parse --show-toplevel",
+                Some(&dir),
+                5,
+            )
+            .await?;
             if preflight.exit_code != 0 {
                 anyhow::bail!(
                     "Git preflight failed: execution directory '{}' is not inside a repository. Configure execution.workspace_root or pass working_dir explicitly.",
@@ -315,6 +330,7 @@ impl RunCommandTool {
                 );
             }
             let metadata = fs_utils::run_cmd_backend(
+                &*backend,
                 "git rev-parse --path-format=absolute --git-dir --git-common-dir",
                 Some(&dir),
                 5,
@@ -339,7 +355,8 @@ impl RunCommandTool {
         // adapter/environment normalization, not a write grant.
         #[cfg(target_os = "macos")]
         let executable_command = if is_git_command {
-            let resolved = fs_utils::run_cmd_backend("xcrun --find git", Some(&dir), 5).await?;
+            let resolved =
+                fs_utils::run_cmd_backend(&*backend, "xcrun --find git", Some(&dir), 5).await?;
             if resolved.exit_code != 0 {
                 anyhow::bail!("Could not resolve the macOS Git executable before confinement.");
             }
@@ -419,6 +436,7 @@ impl RunCommandTool {
                 access_enforcement: crate::tools::terminal::confined_process_access_enforcement(),
                 ..ToolCallMetadata::default()
             },
+            finish: None,
         })
     }
 }
@@ -440,6 +458,7 @@ fn routing_rejection(message: String, route_to: &str) -> ToolCallOutcome {
             access_enforcement: crate::traits::ToolAccessEnforcement::ControllerEnforced,
             ..ToolCallMetadata::default()
         },
+        finish: None,
     }
 }
 
@@ -582,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = RunCommandTool;
+        let tool = RunCommandTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "run_command");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -667,14 +686,17 @@ mod tests {
     #[tokio::test]
     async fn test_run_safe_command() {
         let args = json!({"command": "ls"}).to_string();
-        let result = RunCommandTool.call(&args).await.unwrap();
+        let result = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("exit: 0"));
     }
 
     #[tokio::test]
     async fn completed_negative_command_is_a_typed_observation() {
         let args = json!({"command": "/usr/bin/false"}).to_string();
-        let outcome = RunCommandTool
+        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -706,7 +728,7 @@ mod tests {
             "working_dir": dir.path().to_str().unwrap()
         })
         .to_string();
-        let outcome = RunCommandTool
+        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
@@ -723,7 +745,11 @@ mod tests {
         })
         .to_string();
 
-        let error = RunCommandTool.call(&args).await.unwrap_err().to_string();
+        let error = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("Git preflight failed"));
         assert!(error.contains("execution.workspace_root"));
     }
@@ -733,14 +759,20 @@ mod tests {
         let args = json!({"command": "rm -rf /"}).to_string();
         // A routing rejection is a typed outcome, not an error, so a later
         // successful terminal retry can supersede it.
-        let out = RunCommandTool.call(&args).await.unwrap();
+        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(out.contains("not in the safe command list"));
     }
 
     #[tokio::test]
     async fn test_run_npm_install_rejected_with_actionable_guidance() {
         let args = json!({"command": "npm install tailwindcss"}).to_string();
-        let out = RunCommandTool.call(&args).await.unwrap();
+        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(out.contains("not in the safe command list for run_command"));
         assert!(out.contains("Allowed npm prefixes"));
         assert!(out.contains("npm test"));
@@ -750,14 +782,20 @@ mod tests {
     #[tokio::test]
     async fn test_run_shell_operator_rejected() {
         let args = json!({"command": "ls | grep foo"}).to_string();
-        let out = RunCommandTool.call(&args).await.unwrap();
+        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(out.contains("Shell operators"));
     }
 
     #[tokio::test]
     async fn test_run_daemonization_rejected() {
         let args = json!({"command": "cargo test &"}).to_string();
-        let out = RunCommandTool.call(&args).await.unwrap();
+        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(out.contains("Daemonization primitives"));
     }
 
@@ -770,7 +808,10 @@ mod tests {
         })
         .to_string();
 
-        let result = RunCommandTool.call(&args).await.unwrap();
+        let result = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("exit: 0"));
     }
 
@@ -779,7 +820,7 @@ mod tests {
         // `npm run build` is not on the safe list; the rejection routes to
         // terminal and must not read as a dispatched, failed mutation — else
         // a later successful terminal retry is overwritten by this rejection.
-        let outcome = RunCommandTool
+        let outcome = RunCommandTool::new(crate::execution::active_execution_backend())
             .run_outcome(&serde_json::json!({ "command": "npm run build" }).to_string())
             .await
             .expect("routing rejection is a typed outcome, not an error");

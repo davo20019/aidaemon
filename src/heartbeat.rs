@@ -446,11 +446,6 @@ pub struct HeartbeatJob {
     pub consecutive_failures: Arc<AtomicU32>,
     /// The async function to call. Runs in a spawned tokio task.
     pub run: HeartbeatRunFn,
-    /// Deferrable LLM work (memory pipeline): skip ticks while an agent task
-    /// is in flight so it can't evict the task's KV prefix or steal compute.
-    /// NEVER set for correctness-critical jobs (watchdogs, goal dispatch,
-    /// orphan reclaim) — those must run while tasks are active.
-    pub defer_while_agent_busy: bool,
 }
 
 /// Coordinates all background periodic tasks in a single tick loop.
@@ -540,24 +535,9 @@ impl HeartbeatCoordinator {
             is_running: Arc::new(AtomicBool::new(false)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             run: Box::new(move || Box::pin(f())),
-            defer_while_agent_busy: false,
         });
         if let Some(telemetry) = &self.telemetry {
             telemetry.register_job(name, interval);
-        }
-    }
-
-    /// Like `register_job`, but the job yields to in-flight agent tasks
-    /// (interactive turns, goal runs, specialists). Use for the deferrable
-    /// memory pipeline only — see `HeartbeatJob::defer_while_agent_busy`.
-    pub fn register_deferrable_job<F, Fut>(&mut self, name: &str, interval: Duration, f: F)
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        self.register_job(name, interval, f);
-        if let Some(job) = self.jobs.last_mut() {
-            job.defer_while_agent_busy = true;
         }
     }
 
@@ -738,22 +718,6 @@ impl HeartbeatCoordinator {
                 // Skip if previous invocation is still running
                 if job.is_running.load(Ordering::Relaxed) {
                     tracing::debug!(job = %job.name, "Skipping — previous invocation still running");
-                    continue;
-                }
-
-                // Deferrable memory-pipeline work yields to in-flight agent
-                // tasks (KV-slot and compute contention — measured 5x budget
-                // inflation on a goal run, 2026-07-03). `last_run` stays
-                // untouched, so the job remains due and fires on the first
-                // idle tick; the 3x-interval starvation cap inside the policy
-                // lets a long-starved job run regardless.
-                if crate::agent::activity_gate::should_defer_heartbeat_job(
-                    job.defer_while_agent_busy,
-                    crate::agent::activity_gate::agent_busy(),
-                    job.last_run.map(|l| now.duration_since(l)),
-                    job.interval,
-                ) {
-                    tracing::debug!(job = %job.name, "Deferring — agent task in flight");
                     continue;
                 }
 
@@ -1704,7 +1668,7 @@ impl HeartbeatCoordinator {
     /// (timeout, tool cooldown, orchestrator misjudgment, a bug nobody's hit
     /// yet) can never turn into a repeated real-world side effect. It reads
     /// task_activity rows that are already logged for every tool call
-    /// (`src/agent/loop/tool_execution/run.rs`), so it needs no schema change.
+    /// (`src/agent/turn/tool_execution/run.rs`), so it needs no schema change.
     /// Fails closed toward "don't block" on any parse/lookup miss — a false
     /// negative here just falls back to prior behavior, never a false positive
     /// that would wrongly skip real unfinished work. Scoping by `goal_run_id`
@@ -1907,7 +1871,7 @@ impl HeartbeatCoordinator {
     /// Queue delivery bypasses `deliver_parent_text_result`, so persist every
     /// delivered notice in owner history: a reply to it must reach an agent
     /// that can see what it answers.
-    async fn record_delivered_notification(
+    pub(crate) async fn record_delivered_notification(
         &self,
         entry: &crate::traits::NotificationEntry,
         delivered_text: &str,
@@ -1915,11 +1879,30 @@ impl HeartbeatCoordinator {
         let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) else {
             return;
         };
+        // An untrusted notice joins a turn recorded tainted before the note
+        // exists; if the record cannot be written the note is not written
+        // either (it would read as clean).
+        let turn_id = if entry.untrusted {
+            match agent.tainted_note_turn(&entry.session_id).await {
+                Ok(turn_id) => Some(turn_id),
+                Err(error) => {
+                    warn!(
+                        notification_id = %entry.id,
+                        %error,
+                        "Untrusted notification not recorded in owner history: its taint could not be recorded"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = agent
-            .record_parent_visible_result_note(
+            .record_parent_visible_result_note_in_turn(
                 &entry.session_id,
                 QUEUED_NOTIFICATION_NOTE_PREFIX,
                 delivered_text,
+                turn_id.as_deref(),
             )
             .await
         {
@@ -2919,8 +2902,9 @@ impl HeartbeatCoordinator {
         // and the task-lead pipeline (which adds a minute-plus of dispatch and
         // LLM latency). Falls through to the normal pipeline if the message
         // can't be delivered.
-        if let Some(reminder) = crate::reminders::parse_reminder(&goal.description) {
-            let fire_text = crate::reminders::fire_message(&reminder);
+        if let Some(fire_text) =
+            crate::reminders::fire_text_for_goal(goal.context.as_deref(), &goal.description)
+        {
             let delivered = if let Some(hub_arc) = self.hub.as_ref().and_then(|w| w.upgrade()) {
                 hub_arc
                     .send_text(&goal.session_id, &fire_text)
@@ -3918,6 +3902,31 @@ mod tests {
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "completed");
+    }
+
+    /// The typed reminder message decides the fast path, whatever wording
+    /// the model used for the description.
+    #[tokio::test]
+    async fn test_typed_reminder_message_uses_fast_path() {
+        let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+        let mut goal =
+            Goal::new_deferred_finite("Remind Alice Rivera to check the oven", "test_session");
+        goal.status = "active".to_string();
+        goal.context = Some(crate::reminders::context_for_message("Check the oven."));
+        state.create_goal(&goal).await.unwrap();
+        let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        let msgs = channel.messages_for("test_session").await;
+        assert_eq!(msgs, vec!["⏰ Reminder: Check the oven.".to_string()]);
+        let g = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(g.status, "completed");
     }
 
     #[tokio::test]

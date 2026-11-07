@@ -39,8 +39,12 @@ fn infer_open_request_scope(text: &str, alias_roots: &[String]) -> Option<ToolSe
         if token.starts_with("http://") || token.starts_with("https://") {
             return Some(ToolSemanticScope::ExternalRemote);
         }
-        if crate::tools::fs_utils::resolve_structural_filesystem_reference(token, alias_roots)
-            .is_some()
+        if crate::tools::fs_utils::resolve_structural_filesystem_reference(
+            &*crate::execution::active_execution_backend(),
+            token,
+            alias_roots,
+        )
+        .is_some()
         {
             return Some(ToolSemanticScope::LocalWorkspace);
         }
@@ -63,6 +67,21 @@ const OPEN_QUESTION_IMPLICIT_BIND_TTL_MINUTES: i64 = 30;
 /// wider bounded lineage window lets those IDs survive intervening tool and
 /// assistant rows without allowing dialogue state to grow without bound.
 const RECENT_REQUEST_BINDING_LIMIT: usize = 32;
+/// Owed owner requests kept beside the open request. Oldest entries drop first.
+const UNFINISHED_REQUEST_LIMIT: usize = 4;
+/// Recent user messages kept so a request's referents can be resolved.
+const RECENT_USER_MESSAGE_LIMIT: usize = 6;
+
+/// A request whose owner work has not been answered yet.
+fn request_is_owed(request: &OpenRequest) -> bool {
+    matches!(
+        request.status,
+        OpenRequestStatus::Open
+            | OpenRequestStatus::InProgress
+            | OpenRequestStatus::PartiallyAnswered
+            | OpenRequestStatus::Blocked
+    )
+}
 
 fn bind_user_message_to_request(
     state: &mut DialogueState,
@@ -129,6 +148,131 @@ pub(in crate::agent) fn resolved_followup_mode(
     })
 }
 
+/// The owner's request text an untrusted-call verifier must judge a turn
+/// against, read from the persisted request lineage rather than from the
+/// current message alone.
+///
+/// A follow-up or clarification answer is judged against the open request it
+/// advances, with the follow-up quoted as the owner's refinement. A turn the
+/// classifier calls a new request still sees the owner's earlier request when
+/// that request is unfinished, so a short continuation such as "try again" is
+/// not judged as if the earlier work never existed. The earlier text is quoted
+/// context for the verifier, never a grant: the verifier still decides whether
+/// the exact proposed call is consistent with what the owner asked for.
+///
+/// Returns `None` when there is no unfinished owner request to add, in which
+/// case the current message is the whole request.
+pub(in crate::agent) fn owner_request_for_verifier(
+    state: &DialogueState,
+    current_user_text: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    let current = current_user_text.trim();
+    let current_message_id = state
+        .last_user_turn
+        .as_ref()
+        .filter(|turn| turn.text.trim().eq_ignore_ascii_case(current))
+        .map(|turn| turn.message_id.as_str());
+    // Every owed request in the lineage, oldest first. A single root chosen
+    // by timestamp is wrong: continuations are themselves owed requests, so
+    // the oldest-by-clock entry can be a bare "try again" that names nothing.
+    // Passing the whole owed set keeps the original, content-bearing request
+    // visible however the entries were stamped.
+    let mut owed: Vec<&OpenRequest> = state
+        .open_request
+        .iter()
+        .chain(state.unfinished_requests.iter())
+        .filter(|request| {
+            request_is_owed(request)
+                && Some(request.user_message_id.as_str()) != current_message_id
+                && !request.text.trim().is_empty()
+                && !open_request_anchor_expired(request, now)
+        })
+        .collect();
+    owed.sort_by_key(|request| request.opened_at);
+    let mut earlier: Vec<&str> = Vec::new();
+    for request in &owed {
+        let text = request.text.trim();
+        if !earlier.contains(&text) {
+            earlier.push(text);
+        }
+    }
+    if earlier.is_empty() {
+        return None;
+    }
+    let neighbours: Vec<String> = state
+        .recent_user_messages
+        .iter()
+        .filter(|text| text.trim() != current)
+        .map(|text| format!("- {}", serde_json::Value::from(text.trim())))
+        .collect();
+    let context = if neighbours.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRecent messages from the owner in this conversation, oldest first \
+             (use them to resolve references such as \"it\" or \"them\"):\n{}",
+            neighbours.join("\n")
+        )
+    };
+    let listed = earlier
+        .iter()
+        .map(|text| format!("- {}", serde_json::Value::from(*text)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(match resolved_followup_mode(state, current_user_text) {
+        Some(super::followup::FollowupMode::Followup)
+        | Some(super::followup::FollowupMode::ClarificationAnswer) => format!(
+            "The owner's unfinished requests in this conversation, oldest first:\n{listed}\n\n\
+             The owner's follow-up in the same conversation: {current}{context}"
+        ),
+        Some(super::followup::FollowupMode::NewTask) | None => format!(
+            "{current}\n\nThe owner's earlier requests in this conversation are still \
+             unfinished, oldest first, so this message may continue one of them:\n{listed}{context}"
+        ),
+    })
+}
+
+/// The owner's owed requests as continuation candidates for the relationship
+/// assessor, oldest first, each under its own stable message id. Continuations
+/// of unfinished work are otherwise invisible once the transcript window moves
+/// on, and the assessor could only name what it can see.
+pub(in crate::agent) fn owed_request_candidate_rows(
+    state: &DialogueState,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    let mut owed: Vec<&OpenRequest> = state
+        .open_request
+        .iter()
+        .chain(state.unfinished_requests.iter())
+        .filter(|request| {
+            request_is_owed(request)
+                && !request.text.trim().is_empty()
+                && !open_request_anchor_expired(request, now)
+        })
+        .collect();
+    owed.sort_by_key(|request| request.opened_at);
+    let mut seen = std::collections::HashSet::new();
+    owed.retain(|request| seen.insert(request.user_message_id.clone()));
+    if owed.is_empty() {
+        return None;
+    }
+    let rows = owed
+        .iter()
+        .map(|request| {
+            format!(
+                "USER message_id=\"{}\" (unfinished request): {}",
+                request.user_message_id,
+                serde_json::Value::from(request.text.trim())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Unfinished owner requests that a continuation may advance (copy the exact message_id):\n{rows}"
+    ))
+}
+
 /// Canonicalize a recent conversational user-message ID to the live request
 /// node it advances. The binding alone is never authority: its target must
 /// still be one of the request nodes currently eligible for adoption.
@@ -157,6 +301,7 @@ pub(in crate::agent) fn resolve_request_antecedent<'a>(
         .as_ref()
         .into_iter()
         .chain(state.antecedent_request.as_ref())
+        .chain(state.unfinished_requests.iter())
         .find(|request| request.user_message_id == canonical_id)
 }
 
@@ -173,14 +318,28 @@ pub(in crate::agent) fn unambiguous_request_antecedent(
         .last_user_turn
         .as_ref()
         .map(|turn| turn.message_id.as_str());
-    let mut candidates = state
+    // One request can sit in several slots (the open request, its antecedent
+    // and the owed list); it is one candidate, not an ambiguity.
+    let mut distinct: Vec<&OpenRequest> = Vec::new();
+    for request in state
         .open_request
         .as_ref()
         .into_iter()
         .chain(state.antecedent_request.as_ref())
-        .filter(|request| Some(request.user_message_id.as_str()) != current_message_id);
-    let candidate = candidates.next()?;
-    candidates.next().is_none().then_some(candidate)
+        .chain(state.unfinished_requests.iter())
+        .filter(|request| Some(request.user_message_id.as_str()) != current_message_id)
+    {
+        if !distinct
+            .iter()
+            .any(|known| known.user_message_id == request.user_message_id)
+        {
+            distinct.push(request);
+        }
+    }
+    match distinct.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 fn classify_user_turn(
@@ -277,6 +436,16 @@ fn apply_user_message(
     if trimmed.is_empty() {
         return;
     }
+    // Ingestion runs once per user message. The same message can reach this
+    // point again (bootstrap records it, then turn-context assembly does); a
+    // second pass must not re-open, re-classify or re-queue the request.
+    if state
+        .last_user_turn
+        .as_ref()
+        .is_some_and(|turn| turn.message_id == message_id)
+    {
+        return;
+    }
     // Expire stale request anchors BEFORE classification so a long-finished
     // request cannot capture this turn's kind, tool scope, or injection.
     if state
@@ -286,6 +455,15 @@ fn apply_user_message(
     {
         state.open_request = None;
     }
+    state
+        .unfinished_requests
+        .retain(|request| !open_request_anchor_expired(request, observed_at));
+    state.recent_user_messages.push(trimmed.to_string());
+    let excess = state
+        .recent_user_messages
+        .len()
+        .saturating_sub(RECENT_USER_MESSAGE_LIMIT);
+    state.recent_user_messages.drain(..excess);
     let turn_kind = classify_user_turn(state, trimmed, alias_roots, observed_at);
     state.last_user_turn = Some(UserTurnSummary {
         message_id: message_id.to_string(),
@@ -327,6 +505,24 @@ fn apply_user_message(
             }
         }
         UserTurnKind::NewRequest => {
+            // Owed work is not answered by a later message. Keep it in the
+            // bounded owed list before the open slot is superseded, so a
+            // continuation can still reach the owner's earlier request.
+            if let Some(open_request) = state.open_request.as_ref() {
+                if request_is_owed(open_request)
+                    && !state
+                        .unfinished_requests
+                        .iter()
+                        .any(|owed| owed.user_message_id == open_request.user_message_id)
+                {
+                    state.unfinished_requests.push(open_request.clone());
+                    let excess = state
+                        .unfinished_requests
+                        .len()
+                        .saturating_sub(UNFINISHED_REQUEST_LIMIT);
+                    state.unfinished_requests.drain(..excess);
+                }
+            }
             if let Some(open_request) = state.open_request.as_mut() {
                 if !matches!(
                     open_request.status,
@@ -637,6 +833,18 @@ fn apply_task_end(
                                 open_request.status = OpenRequestStatus::Answered;
                                 open_request.resolved_at = Some(observed_at);
                                 state.open_question = None;
+                                // A continuation that completes successfully
+                                // discharges the owed work of its chain: the
+                                // owner followed up on the same work and it
+                                // is done. A new, unrelated request does not
+                                // discharge anything; owed entries still expire.
+                                if state
+                                    .last_user_turn
+                                    .as_ref()
+                                    .is_some_and(|turn| turn.kind == UserTurnKind::Followup)
+                                {
+                                    state.unfinished_requests.clear();
+                                }
                             }
                         }
                         TaskOutcome::Partial => {
@@ -1373,7 +1581,7 @@ mod tests {
     #[test]
     fn stale_answered_request_does_not_capture_short_new_request() {
         // Incident shape: "What's a contract vehicle?" was answered hours ago,
-        // yet "Send me my makpar resume" kept anchoring to it as a followup,
+        // yet "Send me my acme resume" kept anchoring to it as a followup,
         // so the open_request never rotated.
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
@@ -1382,7 +1590,7 @@ mod tests {
             now - chrono::Duration::hours(2),
             Some(now - chrono::Duration::hours(2)),
         ));
-        apply_user_message(&mut state, "u2", "Send me my makpar resume", &[], now);
+        apply_user_message(&mut state, "u2", "Send me my acme resume", &[], now);
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::NewRequest)
@@ -1399,7 +1607,7 @@ mod tests {
 
     #[test]
     fn fresh_open_question_does_not_capture_imperative_request() {
-        // Live 2026-07-12: the makpar clarifying question was only seconds old
+        // Live 2026-07-12: the acme clarifying question was only seconds old
         // when "Send me my Microsoft resume" arrived; the non-ack fallthrough
         // captured it as a clarification answer. A self-contained imperative
         // that names its own object supersedes the question instead.
@@ -1435,7 +1643,7 @@ mod tests {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         state.open_question = Some(question_with(now - chrono::Duration::hours(2), true));
-        apply_user_message(&mut state, "u2", "Send me my makpar resume", &[], now);
+        apply_user_message(&mut state, "u2", "Send me my acme resume", &[], now);
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::NewRequest)
@@ -1811,5 +2019,252 @@ mod tests {
             Some(UserTurnKind::NewRequest),
             "a concrete separate request must supersede rather than inherit"
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_lineage_tests {
+    use super::*;
+
+    fn request(status: OpenRequestStatus, text: &str) -> OpenRequest {
+        OpenRequest {
+            user_message_id: "request-1".to_string(),
+            text: text.to_string(),
+            status,
+            task_id: Some("task-1".to_string()),
+            project_scope: None,
+            semantic_scope: None,
+            completion_contract: None,
+            opened_at: Utc::now(),
+            resolved_at: None,
+        }
+    }
+
+    fn state_with(
+        open: OpenRequest,
+        current_id: &str,
+        current_text: &str,
+        kind: UserTurnKind,
+    ) -> DialogueState {
+        let mut state = DialogueState::new("session-1");
+        state.open_request = Some(open);
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: current_id.to_string(),
+            kind,
+            text: current_text.to_string(),
+        });
+        state
+    }
+
+    const EARLIER: &str = "Remove the three incorrect entries from the synthetic list.";
+
+    #[test]
+    fn followup_is_judged_against_the_open_request_it_advances() {
+        let state = state_with(
+            request(OpenRequestStatus::PartiallyAnswered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::Followup,
+        );
+        let origin = owner_request_for_verifier(&state, "Try again", Utc::now())
+            .expect("unfinished request is the verifier's origin");
+        assert!(origin.contains(EARLIER), "{origin}");
+        assert!(origin.contains("Try again"), "{origin}");
+    }
+
+    #[test]
+    fn new_task_still_sees_an_unfinished_earlier_request() {
+        // A classifier that calls a short continuation a new request must not
+        // strip the owner's unfinished request from the verifier's view.
+        let state = state_with(
+            request(OpenRequestStatus::PartiallyAnswered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::NewRequest,
+        );
+        let origin = owner_request_for_verifier(&state, "Try again", Utc::now())
+            .expect("unfinished request is still context");
+        assert!(origin.starts_with("Try again"), "{origin}");
+        assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn answered_request_adds_nothing() {
+        let state = state_with(
+            request(OpenRequestStatus::Answered, EARLIER),
+            "msg-2",
+            "Try again",
+            UserTurnKind::NewRequest,
+        );
+        assert_eq!(
+            owner_request_for_verifier(&state, "Try again", Utc::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_current_message_is_never_its_own_antecedent() {
+        let state = state_with(
+            request(OpenRequestStatus::InProgress, EARLIER),
+            "request-1",
+            EARLIER,
+            UserTurnKind::NewRequest,
+        );
+        assert_eq!(
+            owner_request_for_verifier(&state, EARLIER, Utc::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn continuation_resolves_to_the_earliest_owed_request_not_the_latest() {
+        // The owner's CloudPets request was never answered. A later "try
+        // again" became the open request, and a further "try again" must
+        // still be judged against the original request.
+        let now = Utc::now();
+        let mut original = request(OpenRequestStatus::PartiallyAnswered, EARLIER);
+        original.user_message_id = "request-1".to_string();
+        original.opened_at = now - chrono::Duration::minutes(5);
+        let mut latest = request(OpenRequestStatus::PartiallyAnswered, "Try again");
+        latest.user_message_id = "request-2".to_string();
+        latest.opened_at = now - chrono::Duration::minutes(1);
+        let mut state = DialogueState::new("session-1");
+        state.open_request = Some(latest);
+        state.unfinished_requests = vec![original];
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "msg-3".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Try again".to_string(),
+        });
+        let origin = owner_request_for_verifier(&state, "Try again", now)
+            .expect("owed work is the verifier's origin");
+        assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn original_request_stays_visible_when_a_bare_continuation_is_older() {
+        // A repaired or late-recorded original request can carry a newer
+        // timestamp than an older bare "try again" entry. Both must reach the
+        // verifier, so the original's words are never hidden by ordering.
+        let now = Utc::now();
+        let mut bare = request(OpenRequestStatus::PartiallyAnswered, "Try again");
+        bare.user_message_id = "request-2".to_string();
+        bare.opened_at = now - chrono::Duration::minutes(30);
+        let mut original = request(OpenRequestStatus::PartiallyAnswered, EARLIER);
+        original.user_message_id = "request-1".to_string();
+        original.opened_at = now - chrono::Duration::minutes(1);
+        let mut state = DialogueState::new("session-1");
+        state.unfinished_requests = vec![bare, original];
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "msg-9".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Try again".to_string(),
+        });
+        let origin = owner_request_for_verifier(&state, "Try again", now)
+            .expect("owed work is the verifier's origin");
+        assert!(origin.contains(EARLIER), "{origin}");
+    }
+
+    #[test]
+    fn owed_request_carries_the_owners_recent_referents() {
+        // "Remove it from memory" names nothing on its own. The owner's
+        // neighbouring messages are what "it" refers to, so the verifier must
+        // see them with the owed request.
+        let now = Utc::now();
+        let mut owed = request(
+            OpenRequestStatus::PartiallyAnswered,
+            "Remove it from memory",
+        );
+        owed.user_message_id = "request-1".to_string();
+        owed.opened_at = now;
+        let mut state = DialogueState::new("session-1");
+        state.unfinished_requests = vec![owed];
+        state.recent_user_messages = vec![
+            "Cloud pets?".to_string(),
+            "Isn't a project of mine".to_string(),
+            "Remove it from memory".to_string(),
+            "Try again".to_string(),
+        ];
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "msg-9".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "Try again".to_string(),
+        });
+        let origin = owner_request_for_verifier(&state, "Try again", now)
+            .expect("owed work is the verifier's origin");
+        assert!(origin.contains("Cloud pets?"), "{origin}");
+        assert!(origin.contains("Isn't a project of mine"), "{origin}");
+    }
+
+    #[test]
+    fn a_successful_continuation_discharges_its_chain_but_a_new_request_does_not() {
+        let now = Utc::now();
+        let owed = |id: &str, text: &str| {
+            let mut request = request(OpenRequestStatus::PartiallyAnswered, text);
+            request.user_message_id = id.to_string();
+            request.opened_at = now;
+            request
+        };
+        let mut continuation = state_with(
+            owed("request-2", "Try again"),
+            "msg-3",
+            "Try again",
+            UserTurnKind::Followup,
+        );
+        continuation.open_request.as_mut().unwrap().status = OpenRequestStatus::InProgress;
+        continuation.open_request.as_mut().unwrap().task_id = Some("task-3".to_string());
+        continuation.active_task = Some(ActiveTaskRef {
+            task_id: "task-3".to_string(),
+            status: ActiveTaskStatus::Running,
+            started_at: now,
+        });
+        continuation.unfinished_requests = vec![owed("request-1", EARLIER)];
+        apply_task_end(
+            &mut continuation,
+            "task-3",
+            TaskStatus::Completed,
+            TaskOutcome::Succeeded,
+            now,
+        );
+        assert!(
+            continuation.unfinished_requests.is_empty(),
+            "continuation discharges owed work"
+        );
+
+        let mut unrelated = continuation.clone();
+        unrelated.unfinished_requests = vec![owed("request-1", EARLIER)];
+        unrelated.last_user_turn.as_mut().unwrap().kind = UserTurnKind::NewRequest;
+        unrelated.open_request.as_mut().unwrap().status = OpenRequestStatus::InProgress;
+        unrelated.open_request.as_mut().unwrap().resolved_at = None;
+        apply_task_end(
+            &mut unrelated,
+            "task-3",
+            TaskStatus::Completed,
+            TaskOutcome::Succeeded,
+            now,
+        );
+        assert_eq!(
+            unrelated.unfinished_requests.len(),
+            1,
+            "a new request leaves owed work alone"
+        );
+    }
+
+    #[test]
+    fn an_owed_request_is_a_resolvable_continuation_target() {
+        // The assessor may name an owed request by its message id. Resolution
+        // must find it; otherwise a correct continuation is downgraded to a new
+        // request for lack of an antecedent.
+        let now = Utc::now();
+        let mut owed = request(OpenRequestStatus::PartiallyAnswered, EARLIER);
+        owed.user_message_id = "request-1".to_string();
+        owed.opened_at = now;
+        let mut state = DialogueState::new("session-1");
+        state.open_request = Some(request(OpenRequestStatus::Answered, "Unrelated"));
+        state.open_request.as_mut().unwrap().user_message_id = "request-9".to_string();
+        state.unfinished_requests = vec![owed];
+        let found = resolve_request_antecedent(&state, "request-1")
+            .expect("owed request must resolve by id");
+        assert_eq!(found.text, EARLIER);
     }
 }

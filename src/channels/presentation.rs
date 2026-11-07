@@ -170,9 +170,12 @@ fn concise_scheduled_outcome(text: &str) -> String {
     let without_urls = URL_RE.replace_all(text, "");
     let shortened = shorten_local_paths(&without_urls);
     for line in shortened.lines().map(str::trim) {
+        // Headings and lead-in labels ("Goal completed:") introduce the
+        // outcome; they are not it.
         if line.is_empty()
             || TASK_COUNT_RE.is_match(line)
             || (line.starts_with("**") && line.ends_with("**"))
+            || line.ends_with(':')
         {
             continue;
         }
@@ -363,6 +366,17 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_completion_skips_lead_in_labels() {
+        let input = "Goal completed:\n\n**Deliver the scheduled reminder now.**\nPrepared \
+                     reminder: Check the oven now. No rescheduling.";
+
+        let output = present_scheduled_run_notification("completed", input, false);
+
+        assert!(output.contains("Check the oven"), "{output}");
+        assert!(!output.contains("Goal completed:"), "{output}");
+    }
+
+    #[test]
     fn scheduled_completion_skips_task_count_and_internal_urls() {
         let input = "2/2 tasks completed.\n\n**Publish the article**\nPublished the article. \
                      Previewed at http://localhost:4173/ and deployed to \
@@ -387,5 +401,43 @@ mod tests {
         assert!(output.contains("refresh the deployment token"));
         assert!(!output.contains("/Users/synthetic"));
         assert!(output.contains("_Recurring schedule remains active._"));
+    }
+}
+
+/// The reply to a message that arrives while a task runs in its session.
+/// Without attachments the running task takes it in at its next step when
+/// it is from the same sender (`TaskRegistry::take_steering_messages`);
+/// otherwise it runs as its own turn once the current one ends.
+pub(crate) fn queued_message_notice(
+    text: &str,
+    current_task: &str,
+    has_attachments: bool,
+) -> String {
+    let preview: String = text.chars().take(50).collect();
+    let suffix = if text.chars().count() > 50 { "..." } else { "" };
+    if has_attachments {
+        format!(
+            "📥 Got \"{preview}{suffix}\". I'll handle it right after the current task: {current_task}"
+        )
+    } else {
+        format!(
+            "📥 Got \"{preview}{suffix}\". I'll take it into account in the current task \
+             ({current_task}), or handle it right after if it can't join."
+        )
+    }
+}
+
+#[cfg(test)]
+mod queued_notice_tests {
+    use super::queued_message_notice;
+
+    #[test]
+    fn the_notice_says_what_will_happen_to_the_message() {
+        let joining = queued_message_notice("Also count the lines", "Read four files", false);
+        assert!(joining.contains("take it into account in the current task (Read four files)"));
+        let waiting = queued_message_notice("see the attached log", "Read four files", true);
+        assert!(waiting.contains("right after the current task: Read four files"));
+        let long = queued_message_notice(&"x".repeat(80), "t", false);
+        assert!(long.contains(&format!("{}...", "x".repeat(50))));
     }
 }

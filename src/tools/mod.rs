@@ -4,7 +4,7 @@ pub mod background_deliverable;
 pub mod browser;
 #[cfg(feature = "slack")]
 mod channel_history;
-mod cli_agent;
+pub(crate) mod cli_agent;
 #[cfg(feature = "computer_use")]
 #[allow(dead_code)]
 pub mod computer_use;
@@ -25,6 +25,7 @@ pub mod sanitize;
 mod scheduled_goal_runs;
 mod search_history;
 mod send_file;
+mod set_reminder;
 mod share_memory;
 pub mod spawn;
 mod system;
@@ -55,6 +56,7 @@ pub use policy_metrics::PolicyMetricsTool;
 pub use scheduled_goal_runs::ScheduledGoalRunsTool;
 pub use search_history::SearchHistoryTool;
 pub use send_file::SendFileTool;
+pub use set_reminder::SetReminderTool;
 pub use share_memory::ShareMemoryTool;
 pub use spawn::SpawnAgentTool;
 pub use system::SystemInfoTool;
@@ -86,6 +88,7 @@ pub use manage_skills::ManageSkillsTool;
 pub use report_blocker::ReportBlockerTool;
 pub use skill_resources::SkillResourcesTool;
 pub use use_skill::UseSkillTool;
+pub(crate) mod command_effects;
 pub mod command_patterns;
 pub mod command_risk;
 pub mod daemon_guard;
@@ -94,8 +97,8 @@ mod semantic_command_risk;
 // Deterministic tools
 pub(crate) mod fs_utils;
 mod read_file;
+pub(crate) use read_file::render_read_file_output_within;
 pub use read_file::ReadFileTool;
-pub(crate) use read_file::{render_read_file_output, render_read_file_output_within};
 mod write_file;
 pub use write_file::WriteFileTool;
 mod edit_file;
@@ -118,5 +121,7 @@ pub use check_environment::CheckEnvironmentTool;
 mod service_status;
 pub use service_status::ServiceStatusTool;
 
+#[cfg(test)]
+mod execution_backend_injection_tests;
 #[cfg(test)]
 mod schema_lint_tests;

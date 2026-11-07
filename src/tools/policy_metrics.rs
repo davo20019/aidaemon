@@ -41,20 +41,6 @@ impl Tool for PolicyMetricsTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Universal
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args_input = if arguments.trim().is_empty() {
             "{}"
@@ -145,9 +131,6 @@ impl Tool for PolicyMetricsTool {
                  - followup_mode_overrides_total: {}\n\
                  - cross_scope_blocked_total: {}\n\
                  - tool_schema_contract_rejections_total: {}\n\
-                 - route_drift_alert_total: {}\n\
-                 - route_drift_failsafe_activation_total: {}\n\
-                 - route_failsafe_active_turn_total: {}\n\
                  - tokens_failed_tasks_total: {}\n\
                  - est_input_token_samples: {}\n\
                  - est_input_tokens_total: {}\n\
@@ -182,9 +165,6 @@ impl Tool for PolicyMetricsTool {
                 metrics.followup_mode_overrides_total,
                 metrics.cross_scope_blocked_total,
                 metrics.tool_schema_contract_rejections_total,
-                metrics.route_drift_alert_total,
-                metrics.route_drift_failsafe_activation_total,
-                metrics.route_failsafe_active_turn_total,
                 metrics.tokens_failed_tasks_total,
                 metrics.est_input_token_samples,
                 metrics.est_input_tokens_total,
@@ -215,7 +195,6 @@ impl Tool for PolicyMetricsTool {
                 "orchestration_route_reason_total": route_reason_total,
                 "orchestration_route_tools_required_rate": route_reason_tools_required_rate,
                 "orchestration_route_return_rate": route_reason_return_rate,
-                "route_drift_total": metrics.route_drift_alert_total,
                 "context_integrity_guard_events_total": metrics.context_bleed_prevented_total
                     + metrics.context_mismatch_preflight_drop_total
                     + metrics.followup_mode_overrides_total
@@ -236,6 +215,22 @@ impl Tool for PolicyMetricsTool {
             }
         });
         Ok(serde_json::to_string_pretty(&payload)?)
+    }
+}
+
+impl crate::traits::ToolSemantics for PolicyMetricsTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 

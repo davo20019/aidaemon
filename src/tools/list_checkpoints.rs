@@ -39,6 +39,22 @@ impl Tool for ListCheckpointsTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let root = args.get("root").and_then(Value::as_str);
+        Ok(match crate::checkpoints::active_manager() {
+            Some(manager) => manager.list_text(limit, root).await,
+            None => "Filesystem checkpoints are disabled.".to_string(),
+        })
+    }
+}
+
+impl crate::traits::ToolSemantics for ListCheckpointsTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -55,19 +71,5 @@ impl Tool for ListCheckpointsTool {
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
         ToolCallSemantics::observation()
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 100) as usize;
-        let root = args.get("root").and_then(Value::as_str);
-        Ok(match crate::checkpoints::active_manager() {
-            Some(manager) => manager.list_text(limit, root).await,
-            None => "Filesystem checkpoints are disabled.".to_string(),
-        })
     }
 }

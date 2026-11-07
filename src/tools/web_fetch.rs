@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
 
@@ -564,6 +564,57 @@ impl Tool for WebFetchTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.execute(arguments, false)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments, false).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+            finish: None,
+        })
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+            finish: None,
+        })
+    }
+}
+
+impl crate::traits::ToolSemantics for WebFetchTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -590,43 +641,20 @@ impl Tool for WebFetchTool {
             .with_target_hint(ToolTargetHintKind::Url, url)
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments, false)
-            .await
-            .map(|(output, _)| output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = status_tx;
-        let (output, truncation) = self.execute(arguments, false).await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                truncation,
-                ..Default::default()
-            },
-        })
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolExecutionContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = status_tx;
-        let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                truncation,
-                ..Default::default()
-            },
-        })
+    /// The page's host.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                let url = reqwest::Url::parse(args.get("url")?.as_str()?.trim()).ok()?;
+                crate::tools::command_effects::url_host_effect(&url)
+            })
+            .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
+                aidaemon_core::CallEffects {
+                    keys: vec![key],
+                    complete: true,
+                }
+            })
     }
 }
 
@@ -682,11 +710,34 @@ fn extract_page_text(html: &str, url: &str) -> String {
     let parsed_url = reqwest::Url::parse(url)
         .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
     let mut cursor = Cursor::new(cleaned.as_bytes());
+    let full_page = || htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone());
     match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
-        Ok(product) if !product.text.trim().is_empty() => product.text,
-        _ => htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone()),
+        Ok(product) if !product.text.trim().is_empty() => {
+            // Readability keeps one block. On an article that is the content;
+            // on a listing page (downloads, release lists, tables) it is a
+            // side section, and the answer is in what it dropped. A short
+            // extract cut from a much larger page gets the whole page.
+            let article_chars = product.text.trim().chars().count();
+            if article_chars >= MIN_ARTICLE_CHARS {
+                return product.text;
+            }
+            let full = full_page();
+            let full_chars = full.trim().chars().count();
+            if (article_chars as f64) >= MIN_ARTICLE_COVERAGE * full_chars as f64 {
+                product.text
+            } else {
+                full
+            }
+        }
+        _ => full_page(),
     }
 }
+
+/// Readability output at least this long is an article in its own right.
+const MIN_ARTICLE_CHARS: usize = 8_000;
+/// A shorter extract must cover at least this share of the page's text to
+/// count as its main content.
+const MIN_ARTICLE_COVERAGE: f64 = 0.35;
 
 /// Remove `<script>`, `<style>`, and `<noscript>` blocks (case-insensitive,
 /// unclosed blocks dropped to end-of-input).
@@ -979,6 +1030,65 @@ mod format_tests {
         assert!(!hint.contains("wc -l"));
     }
 
+    /// A synthetic download page: a short release list, one long prose
+    /// section and a lot of navigation, shaped like real listing pages.
+    fn listing_page() -> String {
+        let nav: String = (0..400)
+            .map(|i| format!("<li><a href=\"/nav/{i}\">Section {i} overview</a></li>"))
+            .collect();
+        let prose: String = (0..12)
+            .map(|i| {
+                format!(
+                    "<p>Paragraph {i} explains how release artifacts are signed and how a \
+                     careful user can check that a downloaded installer is genuine before \
+                     running it on their machine, step by step.</p>"
+                )
+            })
+            .collect();
+        format!(
+            "<html><body><nav><ul>{nav}</ul></nav>\
+             <div class=\"releases\"><h2>Downloads</h2><ul>\
+             <li><a href=\"/r/9.4.2\">Download Acme 9.4.2</a></li>\
+             <li><a href=\"/r/9.4.1\">Acme 9.4.1</a></li></ul></div>\
+             <div class=\"article\"><h2>Verifying downloads</h2>{prose}</div>\
+             </body></html>"
+        )
+    }
+
+    #[test]
+    fn listing_page_keeps_content_readability_would_drop() {
+        let text = extract_page_text(&listing_page(), "https://acme.example/downloads/");
+        assert!(
+            text.contains("Download Acme 9.4.2"),
+            "{}",
+            &text[..text.len().min(400)]
+        );
+    }
+
+    #[test]
+    fn long_article_still_uses_readability() {
+        let nav: String = (0..200)
+            .map(|i| format!("<li><a href=\"/nav/{i}\">Menu entry {i}</a></li>"))
+            .collect();
+        let body: String = (0..120)
+            .map(|i| {
+                format!(
+                    "<p>Paragraph {i} of a long synthetic article about mountain cities, \
+                     their climate, history and the people who live there today.</p>"
+                )
+            })
+            .collect();
+        let html = format!(
+            "<html><body><nav><ul>{nav}</ul></nav><article><h1>Mountain cities</h1>{body}</article></body></html>"
+        );
+        let text = extract_page_text(&html, "https://wiki.example/mountain");
+        assert!(text.contains("Paragraph 119"));
+        assert!(
+            !text.contains("Menu entry 150"),
+            "navigation leaked into an article"
+        );
+    }
+
     #[test]
     fn untruncated_fetch_has_no_notice() {
         let (out, truncation) = format_fetch_result("https://example.com", "short content", 1000);
@@ -1013,6 +1123,7 @@ mod format_tests {
 #[cfg(test)]
 mod extraction_tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     /// Mimics the observed Wikipedia failure: a large inline <script> block
     /// ahead of the real content leaked into the "extracted" text and
@@ -1120,5 +1231,23 @@ mod extraction_tests {
         assert_eq!(buf.len(), 3);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.starts_with("ab"));
+    }
+
+    #[test]
+    fn web_fetch_declares_egress_host() {
+        let tool = WebFetchTool::new();
+        let effects =
+            tool.call_effects(&json!({"url": "https://Docs.Example.Invalid/guide"}).to_string());
+        assert!(effects.complete);
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "docs.example.invalid",
+                None
+            )]
+        );
+        let bad = tool.call_effects(&json!({"url": "::"}).to_string());
+        assert!(!bad.complete);
     }
 }

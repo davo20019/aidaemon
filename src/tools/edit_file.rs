@@ -1,14 +1,22 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{active_execution_backend, WriteMode};
+use crate::execution::WriteMode;
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
 };
 
 use super::fs_utils;
 
-pub struct EditFileTool;
+pub struct EditFileTool {
+    backend: crate::execution::SharedExecutionBackend,
+}
+
+impl EditFileTool {
+    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
 
 #[async_trait]
 impl Tool for EditFileTool {
@@ -50,40 +58,6 @@ impl Tool for EditFileTool {
         })
     }
 
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            // Not high-impact: find-and-replace with safe failure on ambiguity.
-            // Dedicated file tools are intentionally available without terminal
-            // approval. Sensitive paths are blocked before editing.
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                for key in ["path", "file_path", "file", "filename"] {
-                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
-                        return Some(path.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_default();
-
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
-            .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -108,7 +82,7 @@ impl Tool for EditFileTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: new_text"))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
 
         // Block sensitive paths (~/.ssh/*, ~/.aws/*, ~/.gnupg/*, *.env, etc.)
@@ -171,12 +145,7 @@ impl Tool for EditFileTool {
         };
 
         // Backup + atomic write
-        let backup_extension = format!(
-            "{}.bak",
-            path.extension().map(str::to_string).unwrap_or_default()
-        );
-        let backup = path.with_extension(&backup_extension);
-        let _ = backend.copy(&path, &backup).await;
+        fs_utils::backup_before_overwrite(&backend, &path).await;
         backend
             .write(&path, new_content.as_bytes(), WriteMode::Overwrite, false)
             .await?;
@@ -186,7 +155,7 @@ impl Tool for EditFileTool {
         let context = get_change_context(&new_content, &effective_new_text);
         let used_newline_recovery = effective_old_text != old_text;
         let diagnostics =
-            fs_utils::post_write_diagnostics(std::path::Path::new(path.as_str())).await;
+            fs_utils::post_write_diagnostics(&*backend, std::path::Path::new(path.as_str())).await;
 
         Ok(format!(
             "Edited {}: replaced {} occurrence{}{}\n\n{}{}",
@@ -201,6 +170,73 @@ impl Tool for EditFileTool {
             context,
             diagnostics
         ))
+    }
+}
+
+impl crate::traits::ToolSemantics for EditFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            ..Default::default()
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            // Not high-impact: find-and-replace with safe failure on ambiguity.
+            // Dedicated file tools are intentionally available without terminal
+            // approval. Sensitive paths are blocked before editing.
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                for key in ["path", "file_path", "file", "filename"] {
+                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
+                        return Some(path.to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .with_target_hint(ToolTargetHintKind::Path, path)
+    }
+
+    /// A write of the target path (absolute; a relative path resolves where
+    /// the execution backend puts it, which is not known here).
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        super::command_effects::file_tool_write_effects(&*self.backend, arguments)
+    }
+
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        let semantics = self.call_semantics(arguments);
+        let mut annotations =
+            crate::traits::default_call_annotations(self.capabilities(), &semantics);
+        // A write that can plant git configuration changes what later
+        // "read-only" git commands execute: treat it as a configuration change.
+        let plants_git_config = semantics
+            .target_hints
+            .iter()
+            .any(|hint| super::command_effects::is_git_config_path(&hint.value));
+        annotations.egress |= plants_git_config;
+        annotations
     }
 }
 
@@ -303,11 +339,28 @@ fn get_change_context(content: &str, new_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolSemantics;
+
+    #[test]
+    fn git_config_targets_are_configuration_egress() {
+        let tool = EditFileTool::new(crate::execution::active_execution_backend());
+        let ann = |path: &str| {
+            tool.call_annotations_in(
+                &json!({"path": path}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
+        let config = ann("/tmp/aidaemon-test/repo/.git/config");
+        assert!(config.egress && !config.read_only);
+        assert!(ann("/tmp/aidaemon-test/repo/.gitattributes").egress);
+        let plain = ann("/tmp/aidaemon-test/repo/src/lib.rs");
+        assert!(!plain.egress && !plain.read_only);
+    }
     use std::io::Write;
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = EditFileTool;
+        let tool = EditFileTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "edit_file");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -325,7 +378,10 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await.unwrap();
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("replaced 1 occurrence"));
 
         let content = tokio::fs::read_to_string(f.path()).await.unwrap();
@@ -344,7 +400,9 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await;
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("3 occurrences"));
     }
@@ -361,7 +419,10 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await.unwrap();
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("replaced 3 occurrences"));
 
         let content = tokio::fs::read_to_string(f.path()).await.unwrap();
@@ -379,7 +440,9 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await;
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found"));
@@ -397,7 +460,10 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await.unwrap();
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("replaced 1 occurrence"));
         assert!(result.contains("newline-normalized match"));
 
@@ -415,7 +481,9 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await;
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
     }
 
@@ -436,7 +504,9 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool.call(&args).await;
+        let result = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err(), "expected error for sensitive path");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -445,13 +515,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn edit_file_allows_unrelated_config_toml_and_refuses_the_daemons_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config.toml");
+        let own = dir.path().join("daemon-config.toml");
+        std::fs::write(&project, "mode = \"a\"\n").unwrap();
+        std::fs::write(&own, "mode = \"a\"\n").unwrap();
+        let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
+        let edit = |p: &std::path::Path| {
+            json!({"path": p.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string()
+        };
+        EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&edit(&project))
+            .await
+            .unwrap();
+        let err = EditFileTool::new(crate::execution::active_execution_backend())
+            .call(&edit(&own))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sensitive"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "mode = \"a\"\n");
+    }
+
     #[test]
     fn test_edit_file_capabilities_match_no_approval_tool_guidance() {
-        let caps = EditFileTool.capabilities();
+        let caps = EditFileTool::new(crate::execution::active_execution_backend()).capabilities();
         assert!(
             !caps.needs_approval,
             "edit_file is documented as a dedicated file tool that does not require approval"
         );
         assert!(!caps.high_impact_write);
+    }
+
+    #[test]
+    fn declares_write_of_the_absolute_path() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/notes/../acme.md");
+        for key in ["path", "file_path"] {
+            let effects = EditFileTool::new(crate::execution::active_execution_backend())
+                .call_effects(&json!({key: path}).to_string());
+            assert!(effects.complete, "{key}");
+            assert_eq!(
+                effects.keys,
+                vec![crate::tools::command_effects::path_effect(
+                    aidaemon_core::EffectClass::Write,
+                    &format!("{dir}/acme.md"),
+                    None
+                )
+                .unwrap()]
+            );
+        }
+        // A relative path has no known working directory here.
+        let relative = EditFileTool::new(crate::execution::active_execution_backend())
+            .call_effects(&json!({"path": "acme.md"}).to_string());
+        assert_eq!(relative, aidaemon_core::CallEffects::unknown());
     }
 }

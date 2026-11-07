@@ -20,6 +20,7 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
+use crate::providers::ChatJson;
 use crate::traits::{Episode, ErrorSolution, Procedure};
 
 /// Statistics from a consolidation run

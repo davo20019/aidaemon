@@ -8,15 +8,16 @@ use tokio::sync::mpsc;
 use crate::events::{
     Event, EventStore, EventType, ResourceInvalidatedData, ResourceRegisteredData,
 };
-use crate::execution::{active_execution_backend, BackendKind};
+use crate::execution::{BackendKind, SharedExecutionBackend};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
+    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolOutcomeStatus, ToolSemantics, ToolTargetHintKind,
 };
 use crate::types::{MediaKind, MediaMessage};
 
 pub struct SendFileTool {
+    backend: SharedExecutionBackend,
     media_tx: mpsc::Sender<MediaMessage>,
     outbox_dirs: Vec<PathBuf>,
     inbox_dir: PathBuf,
@@ -31,6 +32,7 @@ const DELIVERY_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 impl SendFileTool {
     pub fn new(
+        backend: SharedExecutionBackend,
         media_tx: mpsc::Sender<MediaMessage>,
         outbox_dirs: &[String],
         inbox_dir: &str,
@@ -44,6 +46,7 @@ impl SendFileTool {
             .collect();
         let inbox_dir = PathBuf::from(shellexpand::tilde(inbox_dir).to_string());
         Self {
+            backend,
             media_tx,
             outbox_dirs,
             inbox_dir,
@@ -150,53 +153,64 @@ impl Tool for SendFileTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
-        vec![crate::traits::StableObservationSubject::namespace(
-            crate::channels::attachments::RESOURCE_ID_PREFIX,
-            "session resource handles returned by tools",
-        )]
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let args = serde_json::from_str::<Value>(arguments).ok();
-        let resource_id = args
-            .as_ref()
-            .and_then(|args| args.get("resource_id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let path = args
-            .as_ref()
-            .and_then(|args| args.get("file_path"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let semantics = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
-        if resource_id.is_empty() {
-            semantics.with_target_hint(ToolTargetHintKind::Path, path)
-        } else {
-            semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run(arguments, &ToolCallContext::default()).await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.run(arguments, &facts).await?;
+        let outcome_status = if output.starts_with("File sent:") {
+            ToolOutcomeStatus::Succeeded
+        } else if output.starts_with("File queued for delivery:") {
+            ToolOutcomeStatus::Backgrounded
+        } else {
+            ToolOutcomeStatus::FailedPermanent
+        };
+        let outcome = ToolCallOutcome {
+            metadata: ToolCallMetadata {
+                outcome_status: Some(outcome_status),
+                background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+            output,
+            finish: None,
+        };
+        // A file queued for later delivery hands the turn off to the queue.
+        Ok(if outcome_status == ToolOutcomeStatus::Backgrounded {
+            outcome.handed_to_background()
+        } else {
+            outcome
+        })
+    }
+}
+
+impl SendFileTool {
+    /// Run one call with the dispatcher's `facts`.
+    pub(crate) async fn run(
+        &self,
+        arguments: &str,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
         let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
 
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = facts.session_id.as_str();
 
         let resource_id = args
             .get("resource_id")
@@ -230,7 +244,7 @@ impl Tool for SendFileTool {
             return Ok("Error: Missing resource_id or file_path.".to_string());
         };
 
-        let backend = active_execution_backend();
+        let backend = self.backend.clone();
         let mut requested_for_delivery = file_path.to_string();
         let mut exported_from_backend = false;
         if registered_resource.is_none() && backend.kind() != BackendKind::Local {
@@ -399,29 +413,61 @@ impl Tool for SendFileTool {
             Ok(format!("File sent: {} ({})", ready.filename, size_display))
         }
     }
+}
 
-    async fn call_with_status_outcome(
+impl crate::traits::ToolSemantics for SendFileTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            always_offered: true,
+            delivers_files: true,
+            ..Default::default()
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+        vec![crate::traits::StableObservationSubject::namespace(
+            crate::channels::attachments::RESOURCE_ID_PREFIX,
+            "session resource handles returned by tools",
+        )]
+    }
+
+    fn output_trust(
         &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call(arguments).await?;
-        let outcome_status = if output.starts_with("File sent:") {
-            ToolOutcomeStatus::Succeeded
-        } else if output.starts_with("File queued for delivery:") {
-            ToolOutcomeStatus::Backgrounded
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let resource_id = args
+            .as_ref()
+            .and_then(|args| args.get("resource_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = args
+            .as_ref()
+            .and_then(|args| args.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let semantics = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
+        if resource_id.is_empty() {
+            semantics.with_target_hint(ToolTargetHintKind::Path, path)
         } else {
-            ToolOutcomeStatus::FailedPermanent
-        };
-        Ok(ToolCallOutcome {
-            metadata: ToolCallMetadata {
-                outcome_status: Some(outcome_status),
-                background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
-                semantics: self.call_semantics(arguments),
-                ..ToolCallMetadata::default()
-            },
-            output,
-        })
+            semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
+        }
     }
 }
 
@@ -429,6 +475,7 @@ impl Tool for SendFileTool {
 mod tests {
     use super::*;
     use crate::events::{ResourceProvenance, ResourceRegisteredData};
+    use crate::testing::CallWithFacts;
     use crate::tools::file_delivery::is_recoverable_source;
     use std::path::Path;
 
@@ -495,14 +542,22 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
 
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
+                .await
+        });
         // Deliver the receipt like the hub's media_listener does.
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg
@@ -529,13 +584,21 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
+                .await
+        });
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg.result_tx.take().expect("receipt requested");
         receipt
@@ -563,12 +626,17 @@ mod tests {
         std::fs::write(&f, b"data").expect("write");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-            .with_receipt_timeout(std::time::Duration::from_millis(100));
-        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        )
+        .with_receipt_timeout(std::time::Duration::from_millis(100));
+        let args = json!({ "file_path": f.to_string_lossy()}).to_string();
         // Nobody answers the receipt (congested channel) → honest pending text.
         let outcome = tool
-            .call_with_status_outcome(&args, None)
+            .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
             .await
             .expect("call ok");
         let _keep_queue_alive = rx.recv().await; // message was still enqueued
@@ -598,18 +666,25 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = std::sync::Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
 
         let args = json!({
-            "_session_id": "sess-1",
-            "file_path": src.to_string_lossy(),
+            "file_path": src.to_string_lossy()
         })
         .to_string();
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(&args, None, crate::testing::call_facts("sess-1"))
+                .await
+        });
         let mut msg = rx.recv().await.expect("media message sent");
         msg.result_tx
             .take()
@@ -654,19 +729,30 @@ mod tests {
         register_file_resource(&store, "sess-resource", "res_exact", &artifact).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let tool = Arc::new(
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
-                .with_event_store(store)
-                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+            SendFileTool::new(
+                crate::execution::active_execution_backend(),
+                tx,
+                &[],
+                &inbox.to_string_lossy(),
+            )
+            .with_event_store(store)
+            .with_receipt_timeout(std::time::Duration::from_secs(5)),
         );
         let args = json!({
-            "_session_id": "sess-resource",
             "resource_id": "res_exact"
         })
         .to_string();
 
         let call_tool = tool.clone();
-        let call =
-            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let call = tokio::spawn(async move {
+            call_tool
+                .call_with_execution_context(
+                    &args,
+                    None,
+                    crate::testing::call_facts("sess-resource"),
+                )
+                .await
+        });
         let mut message = rx.recv().await.expect("media enqueued");
         match &message.kind {
             MediaKind::Document { file_path, .. } => {
@@ -703,16 +789,21 @@ mod tests {
         std::fs::write(&artifact, b"%PDF-1.7 replaced").expect("replace artifact");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool =
-            SendFileTool::new(tx, &[], &inbox.to_string_lossy()).with_event_store(store.clone());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        )
+        .with_event_store(store.clone());
         let outcome = tool
-            .call_with_status_outcome(
+            .call_with_execution_context(
                 &json!({
-                    "_session_id": "sess-resource",
                     "resource_id": "res_changed"
                 })
                 .to_string(),
                 None,
+                crate::testing::call_facts("sess-resource"),
             )
             .await
             .expect("call");
@@ -733,7 +824,12 @@ mod tests {
     #[test]
     fn send_file_schema_prefers_resource_id_without_requiring_a_path() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], "/tmp/aidaemon-inbox");
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            "/tmp/aidaemon-inbox",
+        );
         let schema = tool.schema();
         assert!(schema["parameters"]["properties"]["resource_id"].is_object());
         assert!(schema["parameters"].get("required").is_none());
@@ -769,13 +865,20 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        );
         let args = json!({
-            "_session_id": "s",
-            "file_path": manifest.to_string_lossy(),
+            "file_path": manifest.to_string_lossy()
         })
         .to_string();
-        let out = tool.call(&args).await.expect("call ok");
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("s"))
+            .await
+            .expect("call ok");
         assert!(out.contains("outside allowed directories"), "got: {out}");
         assert!(
             !inbox.join("Cargo.toml").exists(),
@@ -795,14 +898,21 @@ mod tests {
         std::fs::write(&src, b"SECRET=1").expect("write src");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let tool = SendFileTool::new(
+            crate::execution::active_execution_backend(),
+            tx,
+            &[],
+            &inbox.to_string_lossy(),
+        );
 
         let args = json!({
-            "_session_id": "s",
-            "file_path": src.to_string_lossy(),
+            "file_path": src.to_string_lossy()
         })
         .to_string();
-        let out = tool.call(&args).await.expect("call ok");
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("s"))
+            .await
+            .expect("call ok");
         assert!(out.contains("blocked for security"), "got: {out}");
         assert!(
             !inbox.join(".env").exists(),

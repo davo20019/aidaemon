@@ -46,11 +46,10 @@ pub fn format_eval_task_report(row: &EvalTaskRow) -> String {
         eval.orchestration_route
     ));
     out.push_str(&format!(
-        "- routing: predicted_tools={} used_tools={} direct_return={} drift_failsafe={} escalated={}\n",
+        "- routing: predicted_tools={} used_tools={} direct_return={} escalated={}\n",
         eval.routing.tools_required_predicted,
         eval.routing.tools_actually_used,
         eval.routing.direct_return_attempted,
-        eval.routing.route_drift_failsafe,
         eval.routing.model_escalated
     ));
     out.push_str(&format!(
@@ -226,9 +225,6 @@ fn routing_mismatch_warnings(eval: &HarnessEvalSnapshot) -> String {
     }
     if eval.scores.cost_efficiency < 0.15 {
         out.push_str("- ⚠️ severe cost inefficiency: overall score is hard-capped\n");
-    }
-    if eval.routing.route_drift_failsafe {
-        out.push_str("- ⚠️ route drift failsafe was active this turn\n");
     }
     out
 }

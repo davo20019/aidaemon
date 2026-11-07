@@ -120,7 +120,11 @@ impl Agent {
             let mcp_tools = registry.match_tools(user_message).await;
             for tool in mcp_tools {
                 let name = tool.name().to_string();
-                capabilities.entry(name.clone()).or_default();
+                // The server's own hints, as for a daemon tool (a daemon tool
+                // of the same name keeps its capabilities).
+                capabilities
+                    .entry(name.clone())
+                    .or_insert_with(|| tool.capabilities());
                 let candidate = json!({
                     "type": "function",
                     "function": tool.schema()
@@ -213,6 +217,22 @@ impl Agent {
                 Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
             });
         }
+        // Daemon memory tools follow the active memory plugin, as on turns.
+        let owned_memory_tools = self.memory.owned_daemon_tools();
+        defs = defs
+            .into_iter()
+            .filter_map(|d| {
+                let offer = Self::tool_name_from_definition(&d)
+                    .map(|name| super::memory_plugin::daemon_tool_offer(name, owned_memory_tools));
+                match offer {
+                    Some(super::memory_plugin::DaemonToolOffer::Hidden) => None,
+                    Some(super::memory_plugin::DaemonToolOffer::GoalActions) => {
+                        Some(super::memory_plugin::goal_actions_view(&d))
+                    }
+                    _ => Some(d),
+                }
+            })
+            .collect();
         // Keep the core-prompt roster consistent with the per-turn tool set:
         // desktop control is never advertised outside DMs/internal sessions.
         if !Self::visibility_allows_desktop_control(channel_ctx.visibility) {
@@ -277,33 +297,22 @@ impl Agent {
             })
             .collect();
 
-        // Essential tools that must always be available regardless of profile/approval filters.
-        // Without these, the agent can read files but never write them — rendering coding useless.
-        // Memory tools are included because the agent's core personal-assistant function
-        // depends on being able to store and manage facts/people at any risk level.
-        // Web tools are essential because a personal assistant must be able to search the web
-        // and fetch URLs — without these, the model resorts to terminal curl/grep workarounds.
-        const ESSENTIAL_TOOLS: &[&str] = &[
-            "write_file",
-            "edit_file",
-            "terminal",
-            "remember_fact",
-            "manage_memories",
-            "manage_mandates",
-            "search_history",
-            "manage_people",
-            "web_search",
-            "web_fetch",
-            "http_request",
-            "send_file",
-        ];
-        let role_required_tools: &[&str] = match self.role() {
-            // Task leads must retain their delegation surface after policy pruning.
-            AgentRole::TaskLead => &["spawn_agent", "cli_agent", "manage_goal_tasks"],
-            _ => &[],
-        };
-        let is_policy_essential =
-            |name: &str| ESSENTIAL_TOOLS.contains(&name) || role_required_tools.contains(&name);
+        // Essential tools (`dispatch_facts().always_offered`) survive every
+        // profile and approval filter: without them the agent can read files
+        // but never write them, cannot keep memory or reach the web (the
+        // model then resorts to terminal curl/grep workarounds). Task leads
+        // also keep their delegation surface (`task_lead_delegation`).
+        let task_lead = matches!(self.role(), AgentRole::TaskLead);
+        let essential: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .filter(|tool| {
+                let facts = tool.dispatch_facts();
+                facts.always_offered || (task_lead && facts.task_lead_delegation)
+            })
+            .map(|tool| tool.name())
+            .collect();
+        let is_policy_essential = |name: &str| essential.contains(name);
 
         // Stable prioritization: essential tools first, then read-only + idempotent.
         // Essential tools must sort before truncation cuts them off.
@@ -485,7 +494,9 @@ mod tests {
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
+    }
 
+    impl crate::traits::ToolSemantics for UnavailableMockTool {
         fn is_available(&self) -> bool {
             false
         }
@@ -816,9 +827,27 @@ mod tests {
 
     #[tokio::test]
     async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
-        let mut harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
+        // The delegation surface, stating the fact the real tools state.
+        let delegation = |name: &str| -> Arc<dyn crate::traits::Tool> {
+            Arc::new(
+                crate::testing::MockTool::new(name, "delegation", "ok").with_dispatch_facts(
+                    crate::traits::ToolDispatchFacts {
+                        task_lead_delegation: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+        };
+        let mut harness = setup_full_stack_test_agent_with_extra_tools(
+            MockProvider::new(),
+            vec![
+                delegation("manage_goal_tasks"),
+                delegation("cli_agent"),
+                delegation("spawn_agent"),
+            ],
+        )
+        .await
+        .unwrap();
         harness.agent.set_test_task_lead_mode();
 
         let defs = vec![
