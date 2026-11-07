@@ -235,36 +235,42 @@ Order:
       execute the instance judged at turn start, and their annotation
       hints never loosen a safeguard. The approval rules and the
       dispatcher no longer match tools by name or downcast.
-- [ ] 8.3 The dispatcher bridge becomes SDK hooks. Today every call goes
-      back over a channel to `src/agent/runtime/sdk_engine/tool_calls.rs`,
-      which does about ten steps per call: idempotency and replay, ledger
-      events, result fitting, instruction deferral, the mandate gate,
-      `send_file` dedupe and more. Until these are hooks, the daemon is not
-      really built on the SDK. Working-directory injection must become a
-      kernel `Rewrite` hook that runs before call effects are computed
-      (today a terminal call's relative paths are declared incomplete
-      because the directory is injected after the kernel judged it).
-      The daemon `Tool` trait and `BridgedTool` are deleted here. Parked
-      from 8.2:
-      - the global `active_execution_backend()` readers outside
-        `src/tools` (runtime, slack, checkpoints, workspaces, and
-        `tool_exec`'s guest-scoped file tools);
-      - `cli_agent` and `send_file` detecting a background handoff from
-        their output text;
-      - `stop.rs` closeout lookups that see daemon tools only;
-      - a background handoff that bypasses a typed `FailedPermanent`;
-      - name checks left in `tool_exec.rs`: checkpoints for
-        `write_file`/`edit_file`, `cli_agent`'s watchdog bypass, the
-        terminal's trust roots, `spawn_agent`'s turn authority, the
-        goal-context tool list (`spawn_agent`, `cli_agent`, `terminal`,
-        `manage_mandates`, `manage_goal_tasks`) and `computer_use`'s live
-        model; and the `manage_memories`/`manage_people` status summary
-        in `tool_calls.rs`;
-      - `semantics_for_exact_tool_call` resolves an MCP tool with a fresh
-        `registry.find_tool`, which can disagree with the instance judged
-        at turn start after a server reload;
-      - the goals/mandates store slice and the concrete `EventStore`
-        (8.8).
+- [ ] 8.3 The dispatcher bridge becomes SDK hooks. Done 2026-11-07:
+      - `2134409`: the kernel's `ToolDecision::Answer` lets a hook answer in
+        the tool's place (`ReceiptStatus::Answered`: not a success, never
+        ends the run).
+      - `a68d1e1`: `CanonicalCallHook`, first in the chain, rewrites each
+        call into the form the dispatcher executes (project directory
+        injected, model keys and unauthorized read roots dropped) before
+        effects, scope and approvals are judged. The approval rules and the
+        dispatcher read its per-call record instead of canonicalizing again.
+      - `1885349`: `DispatchGate`, last in the chain (after approval, as
+        before), runs the dispatcher's gates once per call: unjudged
+        terminal call, live session mode, untrusted-reference block, scope
+        check and mandate authority `Deny`; nested-instruction deferral,
+        duplicate `send_file` and durable replay `Answer`. Kernel receipts
+        now say what happened; the ledger records each refusal once.
+      - `613718c`: call semantics come from the tool judged at turn start,
+        not a fresh MCP registry lookup.
+      - `3a22100`: the dispatcher's name checks are typed
+        `ToolDispatchFacts` (`manages_own_timeout`, `records_launch_trust`,
+        `goal_context`, `checkpoints_writes`, `needs_live_model`,
+        `status_from_arguments`); the guest workspace file tools keep their
+        deliberate name match.
+      - `0b321da`: `cli_agent` and `send_file` type a background handoff
+        where it happens instead of reading their own output text.
+      - `cb89795`: a call typed `FailedPermanent` never hands the run off.
+      - `c4df424`: the closeout counts the turn's MCP tools as reachable.
+      Remaining:
+      - after-call bookkeeping (result fitting, receipts, status line,
+        learning, taint) still runs inside the bridged tool's dispatch; it
+        needs daemon metadata the kernel does not carry;
+      - the daemon `Tool` trait and `BridgedTool` go with 8.4 (tools on the
+        kernel `Tool`);
+      - about 45 readers of the global `active_execution_backend()`
+        outside `src/tools` (one backend per process, so plumbing it is
+        cleanup, not a behavior change);
+      - the goals/mandates store slice and the concrete `EventStore` (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
       daemon tool can wrap today's thin crate tools without behavior
       changes. The crate tools implement only the kernel `Tool` and do I/O
