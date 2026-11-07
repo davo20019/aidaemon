@@ -116,7 +116,7 @@ aidaemon-providers = { path = "crates/aidaemon-providers" }
 aidaemon-mcp = { path = "crates/aidaemon-mcp" }
 # Channel contract and platform adapters (formatting today; transport next).
 aidaemon-channels = { path = "crates/aidaemon-channels" }
-aidaemon-channel-telegram = { path = "crates/aidaemon-channel-telegram" }
+aidaemon-channel-telegram = { path = "crates/aidaemon-channel-telegram", features = ["webhook"] }
 aidaemon-channel-slack = { path = "crates/aidaemon-channel-slack", optional = true }
 aidaemon-channel-discord = { path = "crates/aidaemon-channel-discord", optional = true }
 # Long-term memory: shared primitives today; the `sdk` backend with `sdk-memory`.

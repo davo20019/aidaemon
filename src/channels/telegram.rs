@@ -93,6 +93,8 @@ pub struct TelegramChannel {
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
     transports: crate::config::ChannelsConfig,
+    /// The Bot API server (a test points it at a mock); `None`: Telegram's.
+    api_url: Option<String>,
     /// URL for the Telegram Mini App terminal frontend.
     terminal_web_app_url: String,
     /// Terminal-lite session manager.
@@ -258,6 +260,7 @@ impl TelegramChannel {
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
             transports: runtime.transports,
+            api_url: None,
             terminal_web_app_url,
             terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
                 terminal_allowed_prefixes,
@@ -594,6 +597,11 @@ impl TelegramChannel {
             warn!(error = %e, "Failed to register bot commands with Telegram");
         }
 
+        if self.transports.telegram == crate::config::ChannelTransport::Sdk {
+            self.start_sdk(&bot_username).await;
+            return;
+        }
+
         let handler = dptree::entry()
             .branch(Update::filter_message().endpoint({
                 let channel = Arc::clone(&self);
@@ -699,6 +707,103 @@ impl TelegramChannel {
         tokio::select! {
             _ = dispatcher.dispatch_with_listener(listener, err_handler) => {}
             _ = poll_health_watchdog(error_count, bot_username.clone()) => {}
+        }
+    }
+
+    /// The SDK adapter receives updates (webhook or long polling, offsets,
+    /// backoff, the webhook fallback) and hands each one over as the Bot API
+    /// sent it; the handlers below read teloxide's types, so they are
+    /// unchanged. Each chat's updates are handled in order, one at a time, as
+    /// teloxide's dispatcher does; different chats run concurrently.
+    async fn start_sdk(self: Arc<Self>, bot_username: &str) {
+        let mut transport = aidaemon_channel_telegram::TelegramChannel::new(self.bot_token.clone())
+            .bot_username(bot_username)
+            .poll_timeout_secs(30);
+        if let Some(api_url) = &self.api_url {
+            transport = transport.api_base(api_url.clone()).poll_timeout_secs(1);
+        }
+        if let Some((listen, options)) = self.build_webhook_options(bot_username) {
+            let mut webhook =
+                aidaemon_channel_telegram::WebhookConfig::new(listen, options.url.to_string());
+            webhook.secret = options.secret_token.clone();
+            webhook.max_connections = options.max_connections;
+            webhook.drop_pending_updates = options.drop_pending_updates;
+            transport = transport.with_webhook(webhook);
+        } else {
+            // A webhook left from an earlier setup would starve long polling.
+            info!(name = %bot_username, "Clearing any existing webhook before starting long polling");
+            if let Err(err) = self.bot.delete_webhook().send().await {
+                warn!(
+                    name = %bot_username,
+                    error = %err,
+                    "Failed to delete webhook before long polling (updates may not arrive)"
+                );
+            }
+        }
+        let (updates_tx, mut updates) = mpsc::channel::<serde_json::Value>(64);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runner = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { transport.run_updates(updates_tx, shutdown).await })
+        };
+        info!(name = %bot_username, "Telegram updates received by the SDK adapter");
+        // One worker per chat keeps that chat's updates in order.
+        let mut chats: HashMap<i64, mpsc::UnboundedSender<teloxide::types::Update>> =
+            HashMap::new();
+        while let Some(raw) = updates.recv().await {
+            let update = match parse_update(raw) {
+                Ok(update) => update,
+                Err(error) => {
+                    warn!(name = %bot_username, %error, "Unreadable Telegram update dropped");
+                    continue;
+                }
+            };
+            let chat = update.chat().map(|chat| chat.id.0).unwrap_or_default();
+            let mut update = Some(update);
+            if let Some(worker) = chats.get(&chat) {
+                match worker.send(update.take().expect("set above")) {
+                    Ok(()) => continue,
+                    // The worker ended; start a new one below.
+                    Err(returned) => update = Some(returned.0),
+                }
+            }
+            let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+            let channel = Arc::clone(&self);
+            tokio::spawn(async move {
+                while let Some(update) = worker_rx.recv().await {
+                    channel.dispatch_update(update).await;
+                }
+            });
+            let _ = worker_tx.send(update.take().expect("set above"));
+            chats.insert(chat, worker_tx);
+        }
+        shutdown.cancel();
+        match runner.await {
+            Ok(Err(e)) => warn!(name = %bot_username, error = %e, "Telegram updates stopped"),
+            Err(e) => warn!(name = %bot_username, error = %e, "Telegram updates task failed"),
+            Ok(Ok(())) => {}
+        }
+    }
+
+    /// Talk to this Bot API server instead of Telegram's (tests).
+    #[cfg(test)]
+    fn with_api_url(mut self, api_url: &str) -> Self {
+        self.bot = Bot::new(&self.bot_token)
+            .set_api_url(reqwest::Url::parse(api_url).expect("a valid URL"));
+        self.api_url = Some(api_url.to_string());
+        self
+    }
+
+    /// Run the handler for one update.
+    async fn dispatch_update(self: &Arc<Self>, update: teloxide::types::Update) {
+        match update.kind {
+            teloxide::types::UpdateKind::Message(msg) => {
+                self.handle_message(msg, self.bot.clone()).await;
+            }
+            teloxide::types::UpdateKind::CallbackQuery(query) => {
+                self.handle_callback(query, self.bot.clone()).await;
+            }
+            _ => {}
         }
     }
 
@@ -5131,6 +5236,31 @@ impl TelegramChannel {
     }
 }
 
+/// A Bot API update as teloxide's type. teloxide reads `update_id` before
+/// the update's kind and a `serde_json::Value` keeps its keys sorted
+/// (`message` before `update_id`), so the text is rebuilt with `update_id`
+/// first.
+fn parse_update(raw: serde_json::Value) -> serde_json::Result<teloxide::types::Update> {
+    let serde_json::Value::Object(mut fields) = raw else {
+        return serde_json::from_value(raw);
+    };
+    let mut text = String::from("{");
+    if let Some(id) = fields.remove("update_id") {
+        text.push_str("\"update_id\":");
+        text.push_str(&id.to_string());
+    }
+    for (key, value) in fields {
+        if text.len() > 1 {
+            text.push(',');
+        }
+        text.push_str(&serde_json::Value::String(key).to_string());
+        text.push(':');
+        text.push_str(&value.to_string());
+    }
+    text.push('}');
+    serde_json::from_str(&text)
+}
+
 fn fallback_session_namespace_from_token(bot_token: &str) -> String {
     let raw_id = bot_token
         .split_once(':')
@@ -6073,6 +6203,10 @@ async fn poll_health_watchdog(error_count: Arc<AtomicU64>, bot_username: String)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "telegram_sdk_tests.rs"]
+mod sdk_tests;
 
 #[cfg(test)]
 mod tests {
