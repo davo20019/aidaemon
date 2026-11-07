@@ -15,9 +15,13 @@ struct Workspace {
     root: String,
 }
 
+/// One call's view of its context: the root, the workspace, and whether the
+/// extension was present.
+type SeenContext = (String, Option<Workspace>, bool);
+
 /// Records what each call saw in its context.
 struct Reader {
-    seen: Arc<Mutex<Vec<(String, Option<Workspace>, bool)>>>,
+    seen: Arc<Mutex<Vec<SeenContext>>>,
 }
 
 #[async_trait]

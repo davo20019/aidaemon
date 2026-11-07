@@ -262,8 +262,12 @@ pub aidaemon_core::SourceTrust::Trusted
 pub aidaemon_core::SourceTrust::Untrusted
 pub enum aidaemon_core::StopDecision
 pub aidaemon_core::StopDecision::Accept
+pub aidaemon_core::StopDecision::AcceptUnmet
+pub aidaemon_core::StopDecision::AcceptUnmet::unmet: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::StopDecision::Continue
 pub aidaemon_core::StopDecision::Continue::message: alloc::string::String
+impl aidaemon_core::StopDecision
+pub fn aidaemon_core::StopDecision::permits_stop(&self) -> bool
 pub enum aidaemon_core::StreamEvent
 pub aidaemon_core::StreamEvent::Done(aidaemon_core::ModelResponse)
 pub aidaemon_core::StreamEvent::Switched(aidaemon_core::ProviderSwitch)
@@ -595,9 +599,11 @@ pub aidaemon_core::RunOutcome::state: aidaemon_core::RunState
 pub aidaemon_core::RunOutcome::status: aidaemon_core::RunStatus
 impl aidaemon_core::RunOutcome
 pub fn aidaemon_core::RunOutcome::is_completed(&self) -> bool
+pub fn aidaemon_core::RunOutcome::is_succeeded(&self) -> bool
 pub fn aidaemon_core::RunOutcome::receipts(&self) -> &[aidaemon_core::Receipt]
 pub fn aidaemon_core::RunOutcome::run_usage(&self) -> aidaemon_core::Usage
 pub fn aidaemon_core::RunOutcome::turns(&self) -> u32
+pub fn aidaemon_core::RunOutcome::unmet(&self) -> &[alloc::string::String]
 pub fn aidaemon_core::RunOutcome::usage(&self) -> aidaemon_core::Usage
 pub struct aidaemon_core::RunSnapshot
 pub aidaemon_core::RunSnapshot::elapsed: core::time::Duration
@@ -619,6 +625,7 @@ pub aidaemon_core::RunState::run_usage: aidaemon_core::Usage
 pub aidaemon_core::RunState::session_id: alloc::string::String
 pub aidaemon_core::RunState::tool_calls: u32
 pub aidaemon_core::RunState::turn: u32
+pub aidaemon_core::RunState::unmet: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::RunState::untrusted_seen: bool
 pub aidaemon_core::RunState::usage: aidaemon_core::Usage
 impl aidaemon_core::RunState
