@@ -333,20 +333,21 @@ Order:
           learning (`04bf06d`), progressive extraction (`b959de3`);
         - phrase lists replaced by structure: `turn_importance`,
           `worth_extracting`, `procedure_base_name` (`f6b9d8d`).
+        Done since: `ConversationSource` + `ConsolidationCursors`
+        (`aidaemon_memory::history`, implemented by the daemon's
+        `EventHistory`), fact consolidation (`d26bb8e`), episodes with typed
+        error/decision signals (`2571c57`), profile verbosity, tool-sequence
+        habits and decay as policy (`4835cd2`); the dead people-routing path
+        is deleted. `memory/manager.rs` is now daemon orchestration only
+        (heartbeat jobs, idle/long session selection, embedding backfill,
+        goal review).
         Remaining, in order:
-        1. A `ConversationSource` contract in the crate: a session's turns
-           since a cursor with typed role, origin (owner, internal
-           continuation, mandate) and visibility; the daemon implements it
-           over its event store. Consolidation cursors get a small store
-           trait instead of raw settings keys.
-        2. Port `memory/manager.rs` (fact consolidation, people routing,
-           episodes for idle and long sessions, session analysis,
-           communication style, patterns, decay) and
-           `events/consolidation.rs` (procedures, error solutions,
-           expertise and episodes from events) onto it, with model calls
-           through `aidaemon_core::Provider`. Goal review and goal
-           extraction are not memory and stay in the daemon; scheduling
-           stays on the heartbeat.
+        1. A task-trajectory contract (a session's unconsolidated tasks:
+           request, tool calls with results, outcome, errors, decision
+           points, completed plans), close to kernel receipts, and the port
+           of `events/consolidation.rs` (procedures, error solutions,
+           expertise, failure patterns, event episodes, the pruner) onto it.
+        2. (was 3, below)
         3. Move the SQLite implementation of the stores
            (`state/sqlite/{facts,memory,structured_memory,episodes,people,
            learning}.rs`) into the crate, add the memory half of retention
