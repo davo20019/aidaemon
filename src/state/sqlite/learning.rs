@@ -63,6 +63,12 @@ impl crate::traits::LearningStore for SqliteStateStore {
             .map_err(store_error)
     }
 
+    async fn update_user_profile(&self, profile: &UserProfile) -> MemoryResult<()> {
+        SqliteStateStore::update_user_profile(self, profile)
+            .await
+            .map_err(store_error)
+    }
+
     async fn increment_expertise(
         &self,
         domain: &str,
@@ -105,6 +111,44 @@ impl crate::traits::LearningStore for SqliteStateStore {
         SqliteStateStore::update_error_solution(self, solution_id, success)
             .await
             .map_err(store_error)
+    }
+}
+
+/// Fading of unrecalled facts, episodes and behavior patterns.
+#[async_trait]
+impl aidaemon_memory::stores::MemoryDecay for SqliteStateStore {
+    async fn decay(
+        &self,
+        policy: &aidaemon_memory::stores::DecayPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        let fact_cutoff = (now - chrono::Duration::days(policy.fact_idle_days)).to_rfc3339();
+        sqlx::query(
+            "UPDATE facts SET recall_count = MAX(0, recall_count - MAX(1, recall_count / ?))
+             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
+        )
+        .bind(policy.fact_decay_divisor)
+        .bind(&fact_cutoff)
+        .execute(&self.pool)
+        .await?;
+        let episode_cutoff = (now - chrono::Duration::days(policy.episode_idle_days)).to_rfc3339();
+        sqlx::query(
+            "UPDATE episodes SET recall_count = MAX(0, recall_count - 1)
+             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
+        )
+        .bind(&episode_cutoff)
+        .execute(&self.pool)
+        .await?;
+        let pattern_cutoff = (now - chrono::Duration::days(policy.pattern_idle_days)).to_rfc3339();
+        sqlx::query(
+            "UPDATE behavior_patterns SET confidence = MAX(0.1, confidence - ?)
+             WHERE confidence > 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)",
+        )
+        .bind(policy.pattern_step)
+        .bind(&pattern_cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

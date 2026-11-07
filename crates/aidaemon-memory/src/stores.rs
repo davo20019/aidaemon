@@ -441,3 +441,51 @@ pub trait MemoryGraphStore: Send + Sync {
         scope: &GraphSearchScope,
     ) -> anyhow::Result<Vec<GraphNeighbor>>;
 }
+
+/// How unrecalled memory fades. Facts not recalled for `fact_idle_days`
+/// lose `1 / fact_decay_divisor` of their recall count per pass (at least
+/// one); episodes not recalled for `episode_idle_days` lose one; behavior
+/// patterns not seen for `pattern_idle_days` lose `pattern_step`
+/// confidence (down to 0.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecayPolicy {
+    pub fact_idle_days: i64,
+    pub fact_decay_divisor: i64,
+    pub episode_idle_days: i64,
+    pub pattern_idle_days: i64,
+    pub pattern_step: f32,
+}
+
+impl Default for DecayPolicy {
+    fn default() -> Self {
+        Self {
+            fact_idle_days: 14,
+            fact_decay_divisor: 10,
+            episode_idle_days: 30,
+            pattern_idle_days: 30,
+            pattern_step: 0.05,
+        }
+    }
+}
+
+/// Fading of unrecalled memory, applied by the store.
+#[async_trait]
+pub trait MemoryDecay: Send + Sync {
+    async fn decay(
+        &self,
+        policy: &DecayPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()>;
+}
+
+/// One maintenance pass: merge restated facts, then let unrecalled memory
+/// fade, so decay sees one row per piece of knowledge.
+pub async fn decay_memory<S>(store: &S, policy: &DecayPolicy) -> anyhow::Result<()>
+where
+    S: FactStore + MemoryDecay + ?Sized,
+{
+    if let Err(error) = store.fold_restated_facts().await {
+        tracing::warn!(%error, "Failed to fold restated facts");
+    }
+    store.decay(policy, chrono::Utc::now()).await
+}

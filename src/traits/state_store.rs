@@ -1543,6 +1543,7 @@ pub trait StateStore:
     + OAuthGatewayStore
     + TokenUsageStore
     + LearningStore
+    + aidaemon_memory::stores::MemoryDecay
     + SkillStore
     + DynamicBotStore
     + SessionChannelStore
@@ -1585,6 +1586,7 @@ impl<T> StateStore for T where
         + OAuthGatewayStore
         + TokenUsageStore
         + LearningStore
+        + aidaemon_memory::stores::MemoryDecay
         + SkillStore
         + DynamicBotStore
         + SessionChannelStore

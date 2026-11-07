@@ -7,7 +7,7 @@ use crate::memory::embedding_index::{
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::history_source::EventHistory;
-use crate::traits::{BehaviorPattern, Message, MessageAnnotation, StateStore, UserProfile};
+use crate::traits::{Message, MessageAnnotation, StateStore};
 use crate::types::UserRole;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
@@ -469,300 +469,17 @@ impl MemoryManager {
 
     // ==================== Communication Style Analysis ====================
 
-    /// Analyze user's communication style from recent sessions.
-    pub async fn analyze_communication_style(
-        &self,
-        recent_messages: &[Message],
-    ) -> anyhow::Result<UserProfile> {
-        let user_messages: Vec<&Message> = recent_messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .collect();
-
-        if user_messages.is_empty() {
-            return self.get_or_create_profile().await;
-        }
-
-        // Analyze verbosity (average message length)
-        let avg_length: f32 = user_messages
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .map(|c| c.len() as f32)
-            .sum::<f32>()
-            / user_messages.len() as f32;
-
-        let verbosity = if avg_length > 200.0 {
-            "detailed"
-        } else if avg_length > 50.0 {
-            "medium"
-        } else {
-            "brief"
-        };
-
-        // Analyze tone (check for politeness markers)
-        let politeness_count: usize = user_messages
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .filter(|c| {
-                let lower = c.to_lowercase();
-                lower.contains("please") || lower.contains("thank") || lower.contains("could you")
-            })
-            .count();
-
-        let tone = if politeness_count > user_messages.len() / 2 {
-            "formal"
-        } else {
-            "casual"
-        };
-
-        // Analyze explanation preference
-        let question_count: usize = user_messages
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .filter(|c| {
-                let lower = c.to_lowercase();
-                lower.contains("why") || lower.contains("explain") || lower.contains("how does")
-            })
-            .count();
-
-        let prefers_explanations = question_count > user_messages.len() / 4;
-
-        // Get or create profile
-        let mut profile = self.get_or_create_profile().await?;
-        profile.verbosity_preference = verbosity.to_string();
-        profile.tone_preference = tone.to_string();
-        profile.prefers_explanations = prefers_explanations;
-        profile.updated_at = Utc::now();
-
-        // Update in database
-        self.update_profile(&profile).await?;
-
-        Ok(profile)
-    }
-
-    async fn get_or_create_profile(&self) -> anyhow::Result<UserProfile> {
-        let row = sqlx::query(
-            "SELECT id, verbosity_preference, explanation_depth, tone_preference, emoji_preference, typical_session_length, active_hours, common_workflows, asks_before_acting, prefers_explanations, likes_suggestions, updated_at
-             FROM user_profile LIMIT 1"
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row {
-            let active_hours_json: Option<String> = row.get("active_hours");
-            let workflows_json: Option<String> = row.get("common_workflows");
-            let updated_str: String = row.get("updated_at");
-
-            Ok(UserProfile {
-                id: row.get("id"),
-                verbosity_preference: row.get("verbosity_preference"),
-                explanation_depth: row.get("explanation_depth"),
-                tone_preference: row.get("tone_preference"),
-                emoji_preference: row.get("emoji_preference"),
-                typical_session_length: row.get("typical_session_length"),
-                active_hours: active_hours_json.and_then(|j| serde_json::from_str(&j).ok()),
-                common_workflows: workflows_json.and_then(|j| serde_json::from_str(&j).ok()),
-                asks_before_acting: row.get::<i32, _>("asks_before_acting") == 1,
-                prefers_explanations: row.get::<i32, _>("prefers_explanations") == 1,
-                likes_suggestions: row.get::<i32, _>("likes_suggestions") == 1,
-                updated_at: DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-            })
-        } else {
-            let now = Utc::now().to_rfc3339();
-            sqlx::query("INSERT INTO user_profile (updated_at) VALUES (?)")
-                .bind(&now)
-                .execute(&self.pool)
-                .await?;
-
-            Ok(UserProfile {
-                id: 1,
-                verbosity_preference: "medium".to_string(),
-                explanation_depth: "moderate".to_string(),
-                tone_preference: "neutral".to_string(),
-                emoji_preference: "none".to_string(),
-                typical_session_length: None,
-                active_hours: None,
-                common_workflows: None,
-                asks_before_acting: false,
-                prefers_explanations: true,
-                likes_suggestions: false,
-                updated_at: Utc::now(),
-            })
-        }
-    }
-
-    async fn update_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
-        let active_hours_json = profile
-            .active_hours
-            .as_ref()
-            .map(|h| serde_json::to_string(h).unwrap_or_default());
-        let workflows_json = profile
-            .common_workflows
-            .as_ref()
-            .map(|w| serde_json::to_string(w).unwrap_or_default());
-        let now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            "UPDATE user_profile SET verbosity_preference = ?, explanation_depth = ?, tone_preference = ?, emoji_preference = ?, typical_session_length = ?, active_hours = ?, common_workflows = ?, asks_before_acting = ?, prefers_explanations = ?, likes_suggestions = ?, updated_at = ? WHERE id = ?"
-        )
-        .bind(&profile.verbosity_preference)
-        .bind(&profile.explanation_depth)
-        .bind(&profile.tone_preference)
-        .bind(&profile.emoji_preference)
-        .bind(profile.typical_session_length)
-        .bind(&active_hours_json)
-        .bind(&workflows_json)
-        .bind(profile.asks_before_acting as i32)
-        .bind(profile.prefers_explanations as i32)
-        .bind(profile.likes_suggestions as i32)
-        .bind(&now)
-        .bind(profile.id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    // ==================== Behavior Pattern Detection ====================
-
-    /// Detect behavior patterns from recent tool usage.
-    pub async fn detect_patterns(
-        &self,
-        recent_messages: &[Message],
-    ) -> anyhow::Result<Vec<BehaviorPattern>> {
-        // Extract tool call sequences
-        let mut tool_sequences: Vec<(String, DateTime<Utc>)> = Vec::new();
-
-        for msg in recent_messages {
-            if let Some(tc_json) = &msg.tool_calls_json {
-                if let Ok(tool_calls) = serde_json::from_str::<Vec<serde_json::Value>>(tc_json) {
-                    for tc in tool_calls {
-                        if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-                            tool_sequences.push((name.to_string(), msg.created_at));
-                        }
-                    }
-                }
-            }
-        }
-
-        if tool_sequences.len() < 3 {
-            return Ok(vec![]);
-        }
-
-        // Detect sequential patterns (A → B happens frequently)
-        let mut pair_counts: HashMap<(String, String), i32> = HashMap::new();
-        for window in tool_sequences.windows(2) {
-            let pair = (window[0].0.clone(), window[1].0.clone());
-            *pair_counts.entry(pair).or_insert(0) += 1;
-        }
-
-        let mut patterns = Vec::new();
-        let now = Utc::now();
-
-        for ((tool_a, tool_b), count) in pair_counts {
-            if count >= 3 {
-                let confidence = (count as f32 / tool_sequences.len() as f32).min(0.9);
-
-                // Check if pattern already exists
-                let existing = sqlx::query(
-                    "SELECT id FROM behavior_patterns WHERE pattern_type = 'sequence' AND trigger_context = ? AND action = ?"
-                )
-                .bind(&tool_a)
-                .bind(&tool_b)
-                .fetch_optional(&self.pool)
-                .await?;
-
-                if let Some(row) = existing {
-                    let id: i64 = row.get("id");
-                    sqlx::query(
-                        "UPDATE behavior_patterns SET occurrence_count = occurrence_count + ?, confidence = MIN(0.95, confidence + ?), last_seen_at = ? WHERE id = ?"
-                    )
-                    .bind(count)
-                    .bind(confidence * 0.1)
-                    .bind(now.to_rfc3339())
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-                } else {
-                    sqlx::query(
-                        "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
-                         VALUES ('sequence', ?, ?, ?, ?, ?, ?, ?)"
-                    )
-                    .bind(format!("After {} often use {}", tool_a, tool_b))
-                    .bind(&tool_a)
-                    .bind(&tool_b)
-                    .bind(confidence)
-                    .bind(count)
-                    .bind(now.to_rfc3339())
-                    .bind(now.to_rfc3339())
-                    .execute(&self.pool)
-                    .await?;
-                }
-
-                patterns.push(BehaviorPattern {
-                    id: 0,
-                    pattern_type: "sequence".to_string(),
-                    description: format!("After {} often use {}", tool_a, tool_b),
-                    trigger_context: Some(tool_a),
-                    action: Some(tool_b),
-                    confidence,
-                    occurrence_count: count,
-                    last_seen_at: Some(now),
-                    created_at: now,
-                });
-            }
-        }
-
-        Ok(patterns)
-    }
-
-    // ==================== Memory Decay ====================
-
-    /// Apply decay to old memories (reduce recall counts over time).
+    /// Merge restated facts, then let unrecalled memory fade (the SDK
+    /// memory crate's decay over the daemon store).
     pub async fn decay_memories(&self) -> anyhow::Result<()> {
-        // Merge paraphrased duplicates first so decay and salience see one
-        // row per piece of knowledge.
-        if let Some(state) = &self.state {
-            if let Err(error) = state.fold_restated_facts().await {
-                warn!(%error, "Failed to fold restated facts");
-            }
-        }
-
-        // Facts not shown to the model for two weeks lose a tenth of their
-        // salience per day (at least one point). A linear one-point decay let
-        // a fact recalled a hundred times stay pinned for months after it
-        // stopped mattering.
-        let fourteen_days_ago = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
-        sqlx::query(
-            "UPDATE facts SET recall_count = MAX(0, recall_count - MAX(1, recall_count / 10))
-             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        aidaemon_memory::stores::decay_memory(
+            state.as_ref(),
+            &aidaemon_memory::stores::DecayPolicy::default(),
         )
-        .bind(&fourteen_days_ago)
-        .execute(&self.pool)
         .await?;
-
-        let thirty_days_ago = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-        // Decay episodes
-        sqlx::query(
-            "UPDATE episodes SET recall_count = MAX(0, recall_count - 1)
-             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
-        )
-        .bind(&thirty_days_ago)
-        .execute(&self.pool)
-        .await?;
-
-        // Decay behavior pattern confidence
-        sqlx::query(
-            "UPDATE behavior_patterns SET confidence = MAX(0.1, confidence - 0.05)
-             WHERE confidence > 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)",
-        )
-        .bind(&thirty_days_ago)
-        .execute(&self.pool)
-        .await?;
-
         info!("Applied memory decay");
         Ok(())
     }
@@ -1051,17 +768,37 @@ impl MemoryManager {
             return Ok(());
         }
 
-        // Detect behavior patterns
-        let patterns = self.detect_patterns(&recent_messages).await?;
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        // Habitual tool sequences, from the calls in order.
+        let tools: Vec<String> = recent_messages
+            .iter()
+            .filter_map(|msg| msg.tool_calls_json.as_deref())
+            .filter_map(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+            .flatten()
+            .filter_map(|call| {
+                call.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let patterns =
+            aidaemon_memory::record_tool_sequence_patterns(state.as_ref(), &tools).await?;
         if !patterns.is_empty() {
             info!(count = patterns.len(), "Detected behavior patterns");
         }
 
-        // Update communication style profile
-        if !owner_user_messages.is_empty() {
-            let _profile = self
-                .analyze_communication_style(&owner_user_messages)
-                .await?;
+        // Communication verbosity from the owner's own messages.
+        let owner_texts: Vec<&str> = owner_user_messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        if aidaemon_memory::update_communication_profile(state.as_ref(), &owner_texts)
+            .await?
+            .is_some()
+        {
             info!("Updated user communication profile");
         }
 

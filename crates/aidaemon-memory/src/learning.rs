@@ -141,6 +141,11 @@ pub trait LearningStore: Send + Sync {
         Ok(None)
     }
 
+    /// Store the user profile.
+    async fn update_user_profile(&self, _profile: &UserProfile) -> Result<()> {
+        Ok(())
+    }
+
     /// Increment expertise counters and update level for a domain.
     async fn increment_expertise(
         &self,
@@ -401,8 +406,141 @@ fn truncate_bytes(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Communication verbosity from the average length of the user's
+/// messages: `brief` up to 50 bytes, `medium` up to 200, `detailed` above.
+/// `None` when there are no messages.
+pub fn verbosity_from_messages(messages: &[&str]) -> Option<&'static str> {
+    if messages.is_empty() {
+        return None;
+    }
+    let average = messages.iter().map(|m| m.len() as f32).sum::<f32>() / messages.len() as f32;
+    Some(if average > 200.0 {
+        "detailed"
+    } else if average > 50.0 {
+        "medium"
+    } else {
+        "brief"
+    })
+}
+
+/// Update the stored profile's verbosity from the owner's recent messages.
+/// Tone and explanation preferences are not inferred from wording, so they
+/// keep their stored values.
+pub async fn update_communication_profile<S>(
+    store: &S,
+    owner_messages: &[&str],
+) -> Result<Option<UserProfile>>
+where
+    S: LearningStore + ?Sized,
+{
+    let Some(verbosity) = verbosity_from_messages(owner_messages) else {
+        return Ok(None);
+    };
+    let Some(mut profile) = store.get_user_profile().await? else {
+        return Ok(None);
+    };
+    profile.verbosity_preference = verbosity.to_string();
+    profile.updated_at = Utc::now();
+    store.update_user_profile(&profile).await?;
+    Ok(Some(profile))
+}
+
+/// Tool sequences seen often enough to be a habit: each pair "after A, B"
+/// that occurs at least three times in `tools` (calls in order), with a
+/// confidence from its share of all calls (capped at 0.9).
+pub fn tool_sequence_patterns(tools: &[String]) -> Vec<(String, String, i32, f32)> {
+    if tools.len() < 3 {
+        return Vec::new();
+    }
+    let mut counts: std::collections::HashMap<(&str, &str), i32> = std::collections::HashMap::new();
+    for pair in tools.windows(2) {
+        *counts
+            .entry((pair[0].as_str(), pair[1].as_str()))
+            .or_insert(0) += 1;
+    }
+    let mut patterns: Vec<(String, String, i32, f32)> = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 3)
+        .map(|((a, b), count)| {
+            let confidence = (count as f32 / tools.len() as f32).min(0.9);
+            (a.to_string(), b.to_string(), count, confidence)
+        })
+        .collect();
+    patterns.sort_by(|x, y| {
+        y.2.cmp(&x.2)
+            .then_with(|| x.0.cmp(&y.0))
+            .then_with(|| x.1.cmp(&y.1))
+    });
+    patterns
+}
+
+/// Record the habitual tool sequences in `tools` as behavior patterns.
+pub async fn record_tool_sequence_patterns<S>(
+    store: &S,
+    tools: &[String],
+) -> Result<Vec<BehaviorPattern>>
+where
+    S: LearningStore + ?Sized,
+{
+    let now = Utc::now();
+    let mut recorded = Vec::new();
+    for (tool_a, tool_b, count, confidence) in tool_sequence_patterns(tools) {
+        let description = format!("After {tool_a} often use {tool_b}");
+        store
+            .record_behavior_pattern(
+                "sequence",
+                &description,
+                Some(&tool_a),
+                Some(&tool_b),
+                confidence,
+                count,
+            )
+            .await?;
+        recorded.push(BehaviorPattern {
+            id: 0,
+            pattern_type: "sequence".to_string(),
+            description,
+            trigger_context: Some(tool_a),
+            action: Some(tool_b),
+            confidence,
+            occurrence_count: count,
+            last_seen_at: Some(now),
+            created_at: now,
+        });
+    }
+    Ok(recorded)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn verbosity_reads_message_length_only() {
+        assert_eq!(verbosity_from_messages(&[]), None);
+        assert_eq!(verbosity_from_messages(&["ok", "thanks"]), Some("brief"));
+        let long = "x".repeat(300);
+        assert_eq!(verbosity_from_messages(&[long.as_str()]), Some("detailed"));
+    }
+
+    #[test]
+    fn habits_are_pairs_seen_three_times() {
+        let calls: Vec<String> = ["read", "edit", "read", "edit", "read", "edit", "test"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let patterns = tool_sequence_patterns(&calls);
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(
+            (
+                patterns[0].0.as_str(),
+                patterns[0].1.as_str(),
+                patterns[0].2
+            ),
+            ("read", "edit", 3)
+        );
+        assert!(tool_sequence_patterns(&calls[..2]).is_empty());
+    }
+
     #[test]
     fn error_patterns_drop_locations() {
         let pattern = error_pattern(
