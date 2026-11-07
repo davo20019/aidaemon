@@ -9,6 +9,11 @@ use crate::traits::{
     ToolMutationEffects,
 };
 
+/// The process effect key naming an MCP server, whatever its command.
+fn server_process_key(name: &str) -> String {
+    format!("mcp-server:{name}")
+}
+
 /// Allowed commands for MCP server spawning.
 const ALLOWED_COMMANDS: &[&str] = &["npx", "uvx", "node", "python", "python3"];
 
@@ -71,7 +76,40 @@ impl ManageMcpTool {
                     .push(EffectKey::named(EffectClass::Process, &command));
             }
         }
+        // Every call that can start a server's process names that server, so
+        // a declined add, restart or enable binds the others for it.
+        if matches!(args.action.as_str(), "add" | "restart" | "enable") {
+            if let Some(name) = args.name.filter(|name| !name.trim().is_empty()) {
+                effects.keys.push(EffectKey::named(
+                    EffectClass::Process,
+                    &server_process_key(&name),
+                ));
+            }
+        }
         effects
+    }
+
+    /// The owner approval for a `restart` or `enable` that would start a
+    /// process: the stored command runs again, so the owner sees it and
+    /// approves those exact arguments.
+    async fn respawn_approval(&self, action: &str, name: &str) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        let Some((command, args)) = self.registry.pending_launch(action, name).await else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let verb = if action == "restart" {
+            "Restart"
+        } else {
+            "Start"
+        };
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("{verb} MCP server '{name}' ({command} {})", args.join(" ")),
+            subject: json!({"action": action, "name": name, "command": command, "args": args})
+                .to_string(),
+            risk: aidaemon_core::ApprovalRisk::Medium,
+            warnings: vec!["This runs the server's stored command as a local process.".to_string()],
+        })
     }
 
     /// Starts a server. The owner was asked by the kernel before this runs.
@@ -352,6 +390,14 @@ impl crate::traits::ToolSemantics for ManageMcpTool {
         if call.refused {
             return crate::traits::OwnerApprovalNeed::NotNeeded;
         }
+        if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone()) {
+            if matches!(args.action.as_str(), "restart" | "enable") {
+                let Some(name) = args.name.as_deref().filter(|name| !name.trim().is_empty()) else {
+                    return crate::traits::OwnerApprovalNeed::NotNeeded;
+                };
+                return self.respawn_approval(&args.action, name).await;
+            }
+        }
         Self::owner_approval(call.arguments)
     }
 
@@ -385,11 +431,28 @@ mod tests {
         );
         assert_eq!(
             effects.keys,
-            vec![aidaemon_core::EffectKey::named(
-                aidaemon_core::EffectClass::Process,
-                "node"
-            )]
+            vec![
+                aidaemon_core::EffectKey::named(aidaemon_core::EffectClass::Process, "node"),
+                aidaemon_core::EffectKey::named(
+                    aidaemon_core::EffectClass::Process,
+                    "mcp-server:synthetic"
+                ),
+            ]
         );
+        for action in ["restart", "enable"] {
+            let effects = ManageMcpTool::effects_for(&format!(
+                r#"{{"action":"{action}","name":"synthetic"}}"#
+            ));
+            assert_eq!(
+                effects.keys,
+                vec![aidaemon_core::EffectKey::named(
+                    aidaemon_core::EffectClass::Process,
+                    "mcp-server:synthetic"
+                )],
+                "{action}"
+            );
+            assert!(!effects.complete);
+        }
         assert!(!effects.complete);
         assert_eq!(
             ManageMcpTool::effects_for(r#"{"action":"list"}"#),
@@ -420,6 +483,43 @@ mod tests {
             ManageMcpTool::owner_approval(
                 &json!({"action":"add","name":"synthetic","command":"sh"})
             ),
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_asks_with_the_command_it_will_run() {
+        use crate::traits::OwnerApprovalNeed;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let embeddings =
+            std::sync::Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+        let state = std::sync::Arc::new(
+            crate::state::SqliteStateStore::new(db.path().to_str().unwrap(), 100, None, embeddings)
+                .await
+                .unwrap(),
+        );
+        let registry = crate::testing::fake_mcp_registry(state).await;
+        let tool = ManageMcpTool::new(registry);
+
+        let OwnerApprovalNeed::Ask(request) = tool.respawn_approval("restart", "fake").await else {
+            panic!("restarting a running server must ask");
+        };
+        let subject: Value = serde_json::from_str(&request.subject).unwrap();
+        assert_eq!(subject["action"], "restart");
+        assert_eq!(subject["name"], "fake");
+        assert!(subject["command"]
+            .as_str()
+            .unwrap()
+            .contains("fake_mcp_server"));
+        assert!(request.summary.starts_with("Restart MCP server 'fake'"));
+
+        // Nothing would start: no card.
+        assert!(matches!(
+            tool.respawn_approval("restart", "missing").await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+        assert!(matches!(
+            tool.respawn_approval("enable", "fake").await,
             OwnerApprovalNeed::NotNeeded
         ));
     }

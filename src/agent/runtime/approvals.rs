@@ -1052,7 +1052,10 @@ mod tests {
             if !approve {
                 assert_eq!(
                     finished.state.declined,
-                    vec![sdk::EffectKey::named(sdk::EffectClass::Process, "node")]
+                    vec![
+                        sdk::EffectKey::named(sdk::EffectClass::Process, "node"),
+                        sdk::EffectKey::named(sdk::EffectClass::Process, "mcp-server:synthetic"),
+                    ]
                 );
                 assert!(finished
                     .receipts()

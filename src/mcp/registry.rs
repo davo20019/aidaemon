@@ -306,6 +306,34 @@ impl McpRegistry {
         Ok(tool_names)
     }
 
+    /// The command and arguments `restart` or `enable` would start for
+    /// `name`, or `None` when the call would start nothing (an unknown
+    /// server, or `enable` of a server already enabled and running).
+    /// `restart` respawns the running entry's command; `enable` starts the
+    /// stored record's.
+    pub async fn pending_launch(&self, action: &str, name: &str) -> Option<(String, Vec<String>)> {
+        match action {
+            "restart" => {
+                let servers = self.servers.read().await;
+                let entry = servers.get(name)?;
+                Some((entry.config.command.clone(), entry.config.args.clone()))
+            }
+            "enable" => {
+                let record = self
+                    .find_dynamic_server_by_name(name)
+                    .await
+                    .ok()
+                    .flatten()?;
+                if record.enabled && self.servers.read().await.contains_key(name) {
+                    return None;
+                }
+                let args = serde_json::from_str(&record.args_json).unwrap_or_default();
+                Some((record.command, args))
+            }
+            _ => None,
+        }
+    }
+
     async fn find_dynamic_server_by_name(
         &self,
         name: &str,
