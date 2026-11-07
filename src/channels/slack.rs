@@ -339,6 +339,9 @@ pub struct SlackChannel {
     channel_name_cache: RwLock<HashMap<String, String>>,
     /// Cache of channel ID → (member display names, fetched_at). TTL: 10 minutes.
     channel_members_cache: RwLock<HashMap<String, (Vec<String>, Instant)>>,
+    /// `sdk`: the Socket Mode connection is held by `aidaemon-channel-slack`;
+    /// `legacy`: by the hand-written client below.
+    transport: crate::config::ChannelTransport,
 }
 
 fn determine_slack_role(
@@ -400,6 +403,7 @@ impl SlackChannel {
             team_id: std::sync::RwLock::new(None),
             channel_hub: std::sync::RwLock::new(None),
             watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
+            transport: runtime.transports.slack,
             user_cache: RwLock::new(HashMap::new()),
             channel_name_cache: RwLock::new(HashMap::new()),
             channel_members_cache: RwLock::new(HashMap::new()),
@@ -941,6 +945,9 @@ impl SlackChannel {
     async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         // Resolve our own bot user ID (for filtering self-messages)
         self.resolve_bot_info().await;
+        if self.transport == crate::config::ChannelTransport::Sdk {
+            return self.start_sdk().await;
+        }
 
         // Request a WebSocket URL from Slack
         let wss_url = self.open_connection().await?;
@@ -1019,6 +1026,40 @@ impl SlackChannel {
         }
 
         Ok(())
+    }
+
+    /// The SDK adapter holds the connection (acks, pings, reconnects) and
+    /// hands each envelope over as Slack sent it; the handling below reads
+    /// Slack's own event shapes, so it is unchanged.
+    async fn start_sdk(self: Arc<Self>) -> anyhow::Result<()> {
+        let transport = Arc::new(aidaemon_channel_slack::SlackChannel::new(
+            self.bot_token.clone(),
+            self.app_token.clone(),
+        ));
+        let (envelopes_tx, mut envelopes) = tokio::sync::mpsc::channel(64);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runner = {
+            let transport = transport.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { transport.run_envelopes(envelopes_tx, shutdown).await })
+        };
+        info!("Slack Socket Mode connection held by the SDK adapter");
+        while let Some(envelope) = envelopes.recv().await {
+            let channel = Arc::clone(&self);
+            tokio::spawn(async move {
+                channel
+                    .handle_envelope(serde_json::json!({
+                        "type": envelope.kind,
+                        "payload": envelope.payload,
+                    }))
+                    .await;
+            });
+        }
+        shutdown.cancel();
+        match runner.await {
+            Ok(result) => result.map_err(|e| anyhow::anyhow!("Slack connection: {e}")),
+            Err(e) => Err(anyhow::anyhow!("Slack connection task failed: {e}")),
+        }
     }
 
     /// Call `apps.connections.open` to get a WebSocket URL.
