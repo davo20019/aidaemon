@@ -322,15 +322,42 @@ Order:
         Done 2026-11-07: embedding encoding and cosine (`c8bad7e`), scoring
         and fusion (`966582c`), the learning contract and expertise
         (`d0f011c`), procedure and error-solution helpers (`a7db714`).
-        Blocked on a decision: the SDK has two fact/episode contracts,
-        `aidaemon_tools::services::{FactStore, EpisodeStore, PeopleStore}`
-        (daemon-shaped: privacy, channels, provenance, graph, health) and
-        `aidaemon_memory::MemoryStore` (scope-based). Extraction, task
-        learning, retention, consolidation and the graph store all read
-        and write through the first, so they port once one contract wins
-        and its crate home is chosen. Not ported on purpose:
-        `score_message`/`score_turn` and `generate_procedure_name` decide
-        from phrase lists and need typed replacements.
+        Decided 2026-11-07: the daemon-shaped contract wins and lives in
+        `aidaemon-memory`. Done:
+        - `ChannelVisibility`/`UserRole` are kernel vocabulary (`34c7ad7`);
+        - `aidaemon_memory::{records, stores}` hold FactStore, EpisodeStore,
+          HistorySearchStore, PeopleStore and the graph store (`eadc260`,
+          `f62e870`); `aidaemon-tools` keeps only settings and OAuth;
+        - ported onto them: neighborhoods, the core profile, the embedding
+          index, people upkeep, retrieval metrics (`941bb96`), task
+          learning (`04bf06d`), progressive extraction (`b959de3`);
+        - phrase lists replaced by structure: `turn_importance`,
+          `worth_extracting`, `procedure_base_name` (`f6b9d8d`).
+        Remaining, in order:
+        1. A `ConversationSource` contract in the crate: a session's turns
+           since a cursor with typed role, origin (owner, internal
+           continuation, mandate) and visibility; the daemon implements it
+           over its event store. Consolidation cursors get a small store
+           trait instead of raw settings keys.
+        2. Port `memory/manager.rs` (fact consolidation, people routing,
+           episodes for idle and long sessions, session analysis,
+           communication style, patterns, decay) and
+           `events/consolidation.rs` (procedures, error solutions,
+           expertise and episodes from events) onto it, with model calls
+           through `aidaemon_core::Provider`. Goal review and goal
+           extraction are not memory and stay in the daemon; scheduling
+           stays on the heartbeat.
+        3. Move the SQLite implementation of the stores
+           (`state/sqlite/{facts,memory,structured_memory,episodes,people,
+           learning}.rs`) into the crate, add the memory half of retention
+           as a store method, and retire the crate's scope-keyed
+           `MemoryStore`, `Fact` and `Episode` (`ScopedMemory` runs on the
+           unified stores).
+        4. Migrate the owner's data, run live N-of-M against the current
+           daemon, then delete the old daemon modules.
+        Not memory, noted on the way: `memory/context_window.rs` now holds
+        only token budgeting, which belongs with the policies crate's
+        `ContextWindow`; `memory/skill_promotion.rs` belongs to skills.
 - [ ] 8.7b Services: an SDK extension point for background work. It
       covers start and stop, scheduled ticks, and every agent run built
       through `AgentBuilder`, so background runs carry the same safeguards.
