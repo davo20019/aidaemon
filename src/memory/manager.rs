@@ -7,12 +7,9 @@ use crate::memory::embedding_index::{
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::history_source::EventHistory;
-use crate::memory::scoring::calculate_episode_importance;
 use crate::traits::{BehaviorPattern, Message, MessageAnnotation, StateStore, UserProfile};
 use crate::types::UserRole;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use serde_json::json;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -317,69 +314,11 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Generate a clean transcript from messages, compressing tool calls.
-    pub fn get_clean_transcript(messages: &[Message]) -> String {
-        let mut transcript = String::new();
-
-        for msg in messages {
-            if msg
-                .effective_annotations()
-                .contains(&MessageAnnotation::InternalContinuation)
-            {
-                continue;
-            }
-            match msg.role.as_str() {
-                "user" => {
-                    if let Some(content) = &msg.content {
-                        transcript.push_str(&format!("User: {}\n\n", content));
-                    }
-                }
-                "assistant" => {
-                    // Check for tool calls
-                    if let Some(tc_json) = &msg.tool_calls_json {
-                        if let Ok(tool_calls) =
-                            serde_json::from_str::<Vec<serde_json::Value>>(tc_json)
-                        {
-                            for tc in &tool_calls {
-                                if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-                                    transcript.push_str(&format!("[Action: {}]\n", name));
-                                }
-                            }
-                        }
-                    }
-                    // Include text content if present
-                    if let Some(content) = &msg.content {
-                        if !content.trim().is_empty() {
-                            let truncated = crate::utils::truncate_str(content, 500);
-                            transcript.push_str(&format!("Assistant: {}\n\n", truncated));
-                        }
-                    }
-                }
-                "tool" => {
-                    // Compress tool outputs
-                    if let Some(content) = &msg.content {
-                        if let Some(name) = &msg.tool_name {
-                            let summary = if content.len() > 200 {
-                                format!("[{} output: {} chars]", name, content.len())
-                            } else {
-                                format!(
-                                    "[{}: {}]",
-                                    name,
-                                    content.chars().take(100).collect::<String>()
-                                )
-                            };
-                            transcript.push_str(&format!("{}\n", summary));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        transcript
-    }
-
-    /// Create an episode from a session's messages.
+    /// Create an episode from a session's messages: the SDK memory crate's
+    /// [`SessionAnalyst`] summarizes and records it, then the daemon files the
+    /// goals it found.
+    ///
+    /// [`SessionAnalyst`]: aidaemon_memory::episodes::SessionAnalyst
     pub async fn create_episode(
         &self,
         session_id: &str,
@@ -389,40 +328,10 @@ impl MemoryManager {
             !self.history.session_is_memory_isolated(session_id).await?,
             "Memory-isolated worker sessions cannot create global episodes"
         );
-        if messages.is_empty() {
-            return Err(anyhow::anyhow!("No messages to create episode from"));
-        }
-
-        let clean_transcript = Self::get_clean_transcript(messages);
-
-        // Call LLM to analyze the session
-        let analysis = self.analyze_session(&clean_transcript).await?;
-
-        // Calculate importance
-        let has_errors = messages.iter().any(|m| {
-            m.content.as_ref().is_some_and(|c| {
-                c.to_lowercase().contains("error") || c.to_lowercase().contains("failed")
-            })
-        });
-        let has_decisions = messages.iter().any(|m| {
-            m.content.as_ref().is_some_and(|c| {
-                let lower = c.to_lowercase();
-                lower.contains("decided")
-                    || lower.contains("let's go with")
-                    || lower.contains("i'll use")
-            })
-        });
-        let has_goals = !analysis.goals_mentioned.is_empty();
-
-        let importance = calculate_episode_importance(
-            messages.len() as i32,
-            has_errors,
-            has_decisions,
-            has_goals,
-            analysis.emotional_intensity,
-        );
-
-        // Get time bounds
+        let Some(state) = self.state.clone() else {
+            anyhow::bail!("No memory store to record the episode in");
+        };
+        let entries = transcript_entries(messages);
         let start_time = messages
             .first()
             .map(|m| m.created_at)
@@ -431,183 +340,39 @@ impl MemoryManager {
             .last()
             .map(|m| m.created_at)
             .unwrap_or_else(Utc::now);
-        let now = Utc::now();
-        let bounds = sqlx::query(
-            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
-             FROM events
-             WHERE session_id = ?
-               AND event_type IN ('user_message', 'assistant_response')
-               AND created_at >= ? AND created_at <= ?",
-        )
-        .bind(session_id)
-        .bind(start_time.to_rfc3339())
-        .bind(end_time.to_rfc3339())
-        .fetch_one(&self.pool)
-        .await?;
-        let start_event_id: Option<i64> = bounds.try_get("start_event_id").unwrap_or(None);
-        let end_event_id: Option<i64> = bounds.try_get("end_event_id").unwrap_or(None);
-        let channel_id = crate::memory::derive_channel_id_from_session(session_id);
-
-        // Insert episode. Multiple episodes per session are allowed (mid-session
-        // episodes for long-running conversations + final idle-session episode).
-        let topics_json = serde_json::to_string(&analysis.topics).ok();
-        let result = sqlx::query(
-            "INSERT INTO episodes
-                (session_id, summary, topics, emotional_tone, outcome, importance,
-                 recall_count, message_count, start_time, end_time, created_at,
-                 channel_id, start_event_id, end_event_id)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(session_id)
-        .bind(&analysis.summary)
-        .bind(&topics_json)
-        .bind(&analysis.emotional_tone)
-        .bind(&analysis.outcome)
-        .bind(importance)
-        .bind(messages.len() as i32)
-        .bind(start_time.to_rfc3339())
-        .bind(end_time.to_rfc3339())
-        .bind(now.to_rfc3339())
-        .bind(channel_id)
-        .bind(start_event_id)
-        .bind(end_event_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            // Shouldn't happen now that unique constraint is removed, but handle gracefully.
-            info!(session_id, "Episode insert returned 0 rows affected");
-            let existing: Option<(i64,)> = sqlx::query_as(
-                "SELECT id FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
-            )
-            .bind(session_id)
-            .fetch_optional(&self.pool)
-            .await?;
-            let episode_id = existing.map(|(id,)| id).unwrap_or(0);
-            return Ok(episode_id);
-        }
-
-        let episode_id = result.last_insert_rowid();
-
-        // Generate and store embedding for the summary
-        if let Ok(embedding) = self.embedding_service.embed(analysis.summary.clone()).await {
-            let blob = encode_embedding(&embedding);
-            sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
-                .bind(blob)
-                .bind(episode_id)
-                .execute(&self.pool)
+        let snapshot = self.llm_runtime.snapshot();
+        // An episode is a short summary of a finished session: fast-tier work.
+        let model = snapshot.cheap_model();
+        let chain: Arc<dyn aidaemon_core::Provider> = Arc::new(snapshot.background_chain(&model));
+        let provider: Arc<dyn aidaemon_core::Provider> = match &self.event_store {
+            Some(event_store) => Arc::new(crate::agent::AccountedProvider {
+                inner: chain,
+                accounting: crate::agent::ModelCallAccounting {
+                    state: state.clone(),
+                    event_store: event_store.clone(),
+                    purpose: "episode_creation",
+                },
+            }),
+            None => chain,
+        };
+        let (episode_id, analysis) =
+            aidaemon_memory::episodes::SessionAnalyst::new(provider, model)
+                .record_episode(
+                    state.as_ref(),
+                    session_id,
+                    &entries,
+                    messages.len(),
+                    start_time,
+                    end_time,
+                    crate::memory::derive_channel_id_from_session(session_id),
+                )
                 .await?;
-            // Keep the canonical span and replaceable embedding index in sync
-            // with the legacy episode column during the rolling migration.
-            if let Some(state) = &self.state {
-                let _ = state.project_episode_memory(episode_id).await;
-            }
-        }
-
-        // Extract goals
         for goal_text in &analysis.goals_mentioned {
             if let Err(e) = self.extract_goal(goal_text, episode_id, session_id).await {
                 warn!("Failed to extract goal '{}': {}", goal_text, e);
             }
         }
-
-        info!(
-            session_id,
-            episode_id,
-            topics = ?analysis.topics,
-            emotional_tone = ?analysis.emotional_tone,
-            outcome = ?analysis.outcome,
-            goals = analysis.goals_mentioned.len(),
-            "Created episode"
-        );
-
         Ok(episode_id)
-    }
-
-    /// Analyze a session transcript using LLM.
-    async fn analyze_session(&self, transcript: &str) -> anyhow::Result<SessionAnalysis> {
-        let system_prompt = r#"You are a memory system analyzing a conversation. Extract:
-1. A brief summary (1-2 sentences)
-2. Main topics discussed (list of keywords)
-3. Emotional tone (one of: neutral, productive, frustrated, exploratory, celebratory)
-4. Outcome (one of: resolved, ongoing, abandoned, learning)
-5. Possible enduring personal goals the user explicitly stated for themselves
-
-For goals_mentioned, return an empty list for ordinary one-off requests, implementation
-steps, delegated work, quoted examples, prohibitions, review checklists, or specialist/system
-instructions. Only include a goal when the user's own words describe an intention that should
-remain relevant beyond this conversation.
-
-Respond with ONLY valid JSON:
-{
-  "summary": "...",
-  "topics": ["topic1", "topic2"],
-  "emotional_tone": "...",
-  "outcome": "...",
-  "goals_mentioned": ["goal1", "goal2"],
-  "emotional_intensity": 0.5
-}
-
-emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
-
-        let llm_messages = vec![
-            json!({"role": "system", "content": system_prompt}),
-            json!({"role": "user", "content": format!("Analyze this conversation:\n\n{}", transcript)}),
-        ];
-
-        let runtime_snapshot = self.llm_runtime.snapshot();
-        // An episode is a short summary of a finished session: fast-tier work.
-        // Running it on the primary model spent the most expensive tokens on
-        // the least read memory.
-        let model = runtime_snapshot
-            .router()
-            .map(|router| router.select(crate::router::Tier::Fast).to_string())
-            .unwrap_or_else(|| runtime_snapshot.primary_model());
-        let call_start = std::time::Instant::now();
-        let response = runtime_snapshot
-            .background_chat(&model, &llm_messages, &[])
-            .await?;
-
-        if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
-            crate::events::record_background_model_call_telemetry(
-                event_store.clone(),
-                state.as_ref(),
-                "background:episode_creation",
-                "episode_creation",
-                &model,
-                &response,
-                call_start.elapsed(),
-            )
-            .await;
-        }
-
-        let text = response
-            .content
-            .ok_or_else(|| anyhow::anyhow!("Empty response from LLM"))?;
-
-        // Parse JSON response
-        let trimmed = text.trim();
-        let json_str = if let Some(start) = trimmed.find('{') {
-            if let Some(end) = trimmed.rfind('}') {
-                &trimmed[start..=end]
-            } else {
-                trimmed
-            }
-        } else {
-            trimmed
-        };
-
-        let analysis: SessionAnalysis =
-            serde_json::from_str(json_str).unwrap_or_else(|_| SessionAnalysis {
-                summary: "Session with various tasks".to_string(),
-                topics: vec!["general".to_string()],
-                emotional_tone: "neutral".to_string(),
-                outcome: "ongoing".to_string(),
-                goals_mentioned: vec![],
-                emotional_intensity: 0.3,
-            });
-
-        Ok(analysis)
     }
 
     /// Extract or update a goal from episode analysis.
@@ -1531,112 +1296,44 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 ///   - "slack:CHANNEL_ID:thread_ts" or "slack:CHANNEL_ID"
 ///   - "bot:telegram:CHAT_ID" or "telegram:CHAT_ID" or just "CHAT_ID"
 ///   - "discord:ch:ID" or "discord:dm:ID"
-#[derive(Debug, Deserialize)]
-struct SessionAnalysis {
-    #[serde(
-        default = "default_session_summary",
-        deserialize_with = "deserialize_session_summary"
-    )]
-    summary: String,
-    #[serde(default, deserialize_with = "deserialize_lossy_string_vec")]
-    topics: Vec<String>,
-    #[serde(
-        default = "default_emotional_tone",
-        deserialize_with = "deserialize_emotional_tone"
-    )]
-    emotional_tone: String,
-    #[serde(
-        default = "default_session_outcome",
-        deserialize_with = "deserialize_session_outcome"
-    )]
-    outcome: String,
-    #[serde(default, deserialize_with = "deserialize_lossy_string_vec")]
-    goals_mentioned: Vec<String>,
-    #[serde(
-        default = "default_emotional_intensity",
-        deserialize_with = "deserialize_emotional_intensity"
-    )]
-    emotional_intensity: f32,
-}
-
-fn default_session_summary() -> String {
-    "Session with various tasks".to_string()
-}
-
-fn default_emotional_tone() -> String {
-    "neutral".to_string()
-}
-
-fn default_session_outcome() -> String {
-    "ongoing".to_string()
-}
-
-fn default_emotional_intensity() -> f32 {
-    0.3
-}
-
-fn deserialize_string_value<'de, D>(deserializer: D, fallback: &str) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
-        .to_string())
-}
-
-fn deserialize_session_summary<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_string_value(deserializer, "Session with various tasks")
-}
-
-fn deserialize_emotional_tone<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_string_value(deserializer, "neutral")
-}
-
-fn deserialize_session_outcome<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_string_value(deserializer, "ongoing")
-}
-
-fn deserialize_lossy_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let values = match value {
-        serde_json::Value::Array(values) => values,
-        serde_json::Value::String(value) => vec![serde_json::Value::String(value)],
-        _ => return Ok(Vec::new()),
-    };
-    Ok(values
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
-        .filter(|value| !value.is_empty())
-        .collect())
-}
-
-fn deserialize_emotional_intensity<'de, D>(deserializer: D) -> Result<f32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let intensity = value
-        .as_f64()
-        .map(|value| value as f32)
-        .or_else(|| value.as_str().and_then(|value| value.parse::<f32>().ok()))
-        .unwrap_or_else(default_emotional_intensity);
-    Ok(intensity.clamp(0.0, 1.0))
+/// A session's messages as episode transcript entries. Internal
+/// continuations are the daemon talking to itself, never owner speech.
+fn transcript_entries(messages: &[Message]) -> Vec<aidaemon_memory::episodes::TranscriptEntry> {
+    use aidaemon_memory::episodes::TranscriptEntry;
+    use aidaemon_memory::history::TurnRole;
+    messages
+        .iter()
+        .filter(|msg| {
+            !msg.effective_annotations()
+                .contains(&MessageAnnotation::InternalContinuation)
+        })
+        .filter_map(|msg| {
+            let role = match msg.role.as_str() {
+                "user" => TurnRole::User,
+                "assistant" => TurnRole::Assistant,
+                "tool" => TurnRole::Tool,
+                _ => return None,
+            };
+            let tool_calls = msg
+                .tool_calls_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+                .into_iter()
+                .flatten()
+                .filter_map(|call| {
+                    call.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+            Some(TranscriptEntry {
+                role,
+                content: msg.content.clone(),
+                tool_calls,
+                tool_name: msg.tool_name.clone(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1668,7 +1365,8 @@ mod tests {
             },
         ];
 
-        let transcript = MemoryManager::get_clean_transcript(&messages);
+        let transcript =
+            aidaemon_memory::episodes::clean_transcript(&transcript_entries(&messages));
         assert!(transcript.contains("Find the synthetic product specifications."));
         assert!(!transcript.contains("Worker output from an internal retry."));
     }
@@ -1902,27 +1600,6 @@ mod tests {
                 .expect("mandate episode count");
         assert_eq!(ordinary_count, 1);
         assert_eq!(mandate_count, 0);
-    }
-
-    #[test]
-    fn session_analysis_preserves_valid_fields_when_siblings_are_null_or_malformed() {
-        let analysis: SessionAnalysis = serde_json::from_str(
-            r#"{
-                "summary": {"unexpected":"object"},
-                "topics": ["deployments", null, {"bad":true}, "reliability"],
-                "emotional_tone": null,
-                "outcome": "",
-                "goals_mentioned": "Improve release reliability",
-                "emotional_intensity": "1.7"
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(analysis.summary, "Session with various tasks");
-        assert_eq!(analysis.topics, ["deployments", "reliability"]);
-        assert_eq!(analysis.emotional_tone, "neutral");
-        assert_eq!(analysis.outcome, "ongoing");
-        assert_eq!(analysis.goals_mentioned, ["Improve release reliability"]);
-        assert_eq!(analysis.emotional_intensity, 1.0);
     }
 
     #[tokio::test]

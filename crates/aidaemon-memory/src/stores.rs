@@ -273,6 +273,15 @@ pub trait EpisodeStore: Send + Sync {
     ) -> anyhow::Result<Vec<Episode>> {
         Ok(vec![])
     }
+
+    /// Record a session episode; returns its id. A store that keeps
+    /// episodes also embeds the summary for recall.
+    async fn record_session_episode(
+        &self,
+        _episode: &crate::episodes::SessionEpisode,
+    ) -> anyhow::Result<i64> {
+        anyhow::bail!("this store does not record session episodes")
+    }
 }
 
 /// People persistence (social graph).

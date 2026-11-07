@@ -74,6 +74,7 @@ pub mod conformance;
 pub mod consolidation;
 mod embed;
 pub mod embedding_index;
+pub mod episodes;
 mod error;
 mod extract;
 pub mod history;

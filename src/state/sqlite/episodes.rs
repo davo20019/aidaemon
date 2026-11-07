@@ -2,6 +2,75 @@ use super::*;
 
 #[async_trait]
 impl crate::traits::EpisodeStore for SqliteStateStore {
+    /// Insert the episode with the event span it covers, then embed its
+    /// summary and project it into the memory index. Multiple episodes per
+    /// session are allowed (mid-session ones for long conversations, then a
+    /// final one when the session goes idle).
+    async fn record_session_episode(
+        &self,
+        episode: &aidaemon_memory::episodes::SessionEpisode,
+    ) -> anyhow::Result<i64> {
+        let bounds = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events
+             WHERE session_id = ?
+               AND event_type IN ('user_message', 'assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(&episode.session_id)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        let start_event_id: Option<i64> = bounds.try_get("start_event_id").unwrap_or(None);
+        let end_event_id: Option<i64> = bounds.try_get("end_event_id").unwrap_or(None);
+        let topics_json = serde_json::to_string(&episode.topics).ok();
+        let result = sqlx::query(
+            "INSERT INTO episodes
+                (session_id, summary, topics, emotional_tone, outcome, importance,
+                 recall_count, message_count, start_time, end_time, created_at,
+                 channel_id, start_event_id, end_event_id)
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&episode.session_id)
+        .bind(&episode.summary)
+        .bind(&topics_json)
+        .bind(&episode.emotional_tone)
+        .bind(&episode.outcome)
+        .bind(episode.importance)
+        .bind(episode.message_count as i32)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&episode.channel_id)
+        .bind(start_event_id)
+        .bind(end_event_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            tracing::info!(session_id = %episode.session_id, "Episode insert returned 0 rows affected");
+            let existing: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&episode.session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok(existing.map(|(id,)| id).unwrap_or(0));
+        }
+        let episode_id = result.last_insert_rowid();
+        if let Ok(embedding) = self.embedding_service.embed(episode.summary.clone()).await {
+            sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
+                .bind(crate::memory::binary::encode_embedding(&embedding))
+                .bind(episode_id)
+                .execute(&self.pool)
+                .await?;
+            // Keep the canonical span and the embedding index in sync with
+            // the legacy episode column.
+            let _ = self.project_episode_memory(episode_id).await;
+        }
+        Ok(episode_id)
+    }
+
     async fn project_episode_memory(&self, episode_id: i64) -> anyhow::Result<()> {
         SqliteStateStore::project_episode_memory(self, episode_id).await
     }
