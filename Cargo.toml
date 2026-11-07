@@ -112,6 +112,8 @@ aidaemon-policies = { path = "crates/aidaemon-policies" }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { path = "crates/aidaemon-tools" }
 aidaemon-providers = { path = "crates/aidaemon-providers" }
+# The MCP transport; the daemon keeps its registry and result rendering.
+aidaemon-mcp = { path = "crates/aidaemon-mcp" }
 # Optional SDK memory backend (`[memory] backend = "sdk"`).
 aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
 

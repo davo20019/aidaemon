@@ -109,7 +109,8 @@ impl McpRegistry {
         Self::validate_server_name(name)?;
 
         // Spawn the MCP client
-        let client = Arc::new(McpClient::spawn(&config.command, &config.args, &config.env).await?);
+        let client =
+            Arc::new(McpClient::spawn(name, &config.command, &config.args, &config.env).await?);
 
         // List tools from the server
         let tool_defs = client.list_tools().await?;

@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::config::McpServerConfig;
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolVerificationMode,
 };
@@ -272,60 +271,6 @@ impl crate::traits::ToolSemantics for McpTool {
         }
         ToolCallSemantics::mutation_with(effects)
     }
-}
-
-/// Discover and register all tools from configured MCP servers.
-#[allow(dead_code)] // Kept for backward compatibility; static configs now go through McpRegistry
-pub async fn discover_mcp_tools(
-    mcp_configs: &std::collections::HashMap<String, McpServerConfig>,
-) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-
-    for (server_name, config) in mcp_configs {
-        info!(server_name, command = %config.command, "Connecting to MCP server");
-
-        match McpClient::spawn(&config.command, &config.args, &config.env).await {
-            Ok(client) => {
-                let client = Arc::new(client);
-
-                match client.list_tools().await {
-                    Ok(tool_defs) => {
-                        for td in tool_defs {
-                            let name = td["name"].as_str().unwrap_or("unknown").to_string();
-                            let desc = td["description"].as_str().unwrap_or("").to_string();
-                            let mut schema = td["inputSchema"].clone();
-                            // Strip $schema — Google Gemini API rejects it
-                            if let Some(obj) = schema.as_object_mut() {
-                                obj.remove("$schema");
-                            }
-
-                            let tool_schema = serde_json::json!({
-                                "name": name,
-                                "description": desc,
-                                "parameters": schema,
-                            });
-
-                            info!(server_name, tool_name = %name, "Registered MCP tool");
-                            tools.push(Arc::new(McpTool::new(
-                                name,
-                                tool_schema,
-                                Arc::clone(&client),
-                                mcp_tool_capabilities(),
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(server_name, "Failed to list MCP tools: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(server_name, "Failed to spawn MCP server: {}", e);
-            }
-        }
-    }
-
-    Ok(tools)
 }
 
 #[cfg(test)]
