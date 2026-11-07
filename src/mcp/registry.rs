@@ -144,8 +144,6 @@ impl McpRegistry {
                 prefixed_name,
                 tool_schema,
                 Arc::clone(&client),
-                name.to_string(),
-                self.clone(),
                 mcp_tool_capabilities(),
             )));
         }
@@ -607,29 +605,6 @@ impl McpRegistry {
             }
         }
         None
-    }
-
-    /// Call a specific raw MCP tool on a named server.
-    pub async fn call_server_tool(
-        &self,
-        server_name: &str,
-        raw_tool_name: &str,
-        arguments: Value,
-    ) -> anyhow::Result<String> {
-        let prefixed_name = format!("{server_name}__{raw_tool_name}");
-        anyhow::ensure!(
-            self.allows_tool_name(&prefixed_name),
-            "MCP tool is outside the mandate registry view"
-        );
-        let client = {
-            let servers = self.servers.read().await;
-            let entry = servers
-                .get(server_name)
-                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?;
-            entry.client.clone()
-        };
-
-        client.call_tool(raw_tool_name, arguments).await
     }
 
     /// Return all MCP tool definitions (for listing purposes).
