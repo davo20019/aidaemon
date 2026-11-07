@@ -104,6 +104,7 @@ fn receipt_word(status: ReceiptStatus) -> &'static str {
         ReceiptStatus::InvalidArguments => "invalid arguments",
         ReceiptStatus::Indeterminate => "outcome unknown",
         ReceiptStatus::Skipped => "skipped",
+        ReceiptStatus::Answered => "answered without running",
     }
 }
 

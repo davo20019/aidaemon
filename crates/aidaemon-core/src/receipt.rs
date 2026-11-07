@@ -33,6 +33,9 @@ pub enum ReceiptStatus {
     /// The call may or may not have completed: the process stopped while it
     /// was running and the tool is not idempotent, so it was not re-run.
     Indeterminate,
+    /// A hook answered in the tool's place ([`crate::ToolDecision::Answer`]):
+    /// the tool did not run now. Not a success: no work happened.
+    Answered,
 }
 
 /// The durable record of one tool call. Every call produces exactly one,

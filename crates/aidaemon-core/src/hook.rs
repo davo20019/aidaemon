@@ -66,6 +66,14 @@ pub enum ToolDecision {
         /// own.
         kind: InterruptKind,
     },
+    /// Answer in the tool's place: the tool does not run and the model sees
+    /// `output`. For results the host already holds (a replayed receipt, a
+    /// suppressed duplicate) or a call deferred on purpose. The receipt is
+    /// [`crate::ReceiptStatus::Answered`]; an answer never ends the run (its
+    /// `finish` is dropped) and never counts as work done.
+    Answer {
+        output: ToolOutput,
+    },
 }
 
 /// What an `on_stop` hook decides when the model replies without tool calls.
@@ -123,7 +131,8 @@ pub trait Hook: Send + Sync {
     /// change the model or tool choice.
     async fn before_model(&self, _ctx: &HookContext<'_>, _request: &mut ModelRequest) {}
 
-    /// Decide whether a call may run. The first `Deny` or `Interrupt` wins;
+    /// Decide whether a call may run. The first `Deny`, `Interrupt` or
+    /// `Answer` wins;
     /// `Rewrite` changes the arguments seen by later hooks and the tool.
     async fn before_tool(
         &self,

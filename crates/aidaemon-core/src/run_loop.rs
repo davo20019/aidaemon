@@ -69,6 +69,8 @@ enum Verdict {
     Deny(String),
     /// The reason, its kind, and the index of the hook that interrupted.
     Interrupt(String, InterruptKind, usize),
+    /// A hook answered in the tool's place.
+    Answer(ToolOutput),
 }
 
 /// A call that passed checks and policy, waiting to execute.
@@ -509,6 +511,33 @@ impl<'a> Driver<'a> {
                     receipt.after_untrusted = self.state.untrusted_seen;
                     track(self.record(receipt, output).await?, &mut nudge, &mut stop);
                 }
+                Verdict::Answer(mut output) => {
+                    if let Some(end) = self
+                        .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                        .await?
+                    {
+                        return Ok(end);
+                    }
+                    // An answer is not the tool's result: it never ends the
+                    // run.
+                    output.finish = None;
+                    let receipt = Receipt {
+                        run_id: self.state.run_id,
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        turn,
+                        stage: InvocationStage::RejectedBeforeDispatch,
+                        status: ReceiptStatus::Answered,
+                        read_only: annotations.read_only,
+                        duration_ms: 0,
+                        reason: None,
+                        details: output.details.clone(),
+                        source: output.trust.unwrap_or(SourceTrust::Trusted),
+                        after_untrusted: self.state.untrusted_seen,
+                    };
+                    track(self.record(receipt, output).await?, &mut nudge, &mut stop);
+                }
                 Verdict::Interrupt(reason, kind, hook_index) => {
                     if let Some(end) = self
                         .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
@@ -597,6 +626,7 @@ impl<'a> Driver<'a> {
                 ToolDecision::Interrupt { reason, kind } => {
                     return Verdict::Interrupt(reason, kind, hook_index)
                 }
+                ToolDecision::Answer { output } => return Verdict::Answer(output),
                 ToolDecision::Rewrite { arguments } if arguments != call.arguments => {
                     rewrites += 1;
                     if rewrites > 16 {
@@ -819,7 +849,11 @@ impl<'a> Driver<'a> {
         self.state.messages.push(
             Message::tool_result(receipt.call_id.clone(), output.content.clone())
                 .with_images(output.images.iter().cloned())
-                .with_error(!receipt.succeeded()),
+                .with_error(match receipt.status {
+                    // A hook's answer is an error only when it says so.
+                    ReceiptStatus::Answered => output.is_error,
+                    _ => !receipt.succeeded(),
+                }),
         );
         // Results are appended in call order, so the first finish kept is
         // the first in call order.

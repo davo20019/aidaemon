@@ -524,6 +524,81 @@ async fn deny_hook_blocks_the_tool_and_tells_the_model_why() {
         .contains("destructive tools are disabled"));
 }
 
+/// Answers every call in the tool's place, with a finish that must be
+/// ignored.
+struct AnswerInPlace {
+    is_error: bool,
+}
+
+#[async_trait]
+impl Hook for AnswerInPlace {
+    async fn before_tool(&self, _: &HookContext<'_>, _: &ToolCall, _: &ToolInfo) -> ToolDecision {
+        let output = if self.is_error {
+            ToolOutput::error("deferred: read the new guidance first")
+        } else {
+            ToolOutput::text("already sent earlier; not sent again")
+        };
+        ToolDecision::Answer {
+            output: output.finish(aidaemon_core::Finish::succeeded("must not end the run")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn answer_hook_replies_in_the_tools_place_without_running_it() {
+    let (send, calls) = counting("send", ToolAnnotations::DESTRUCTIVE);
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "send", json!({}))]),
+        text("noted"),
+    ]))
+    .tool(send)
+    .hook(AnswerInPlace { is_error: false })
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the tool never ran");
+    let r = &out.receipts()[0];
+    assert_eq!(r.status, ReceiptStatus::Answered);
+    assert_eq!(r.stage, InvocationStage::RejectedBeforeDispatch);
+    assert!(!r.succeeded(), "an answer is not work done");
+    let tool = out
+        .state
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert_eq!(tool.content, "already sent earlier; not sent again");
+    assert!(!tool.is_error, "a plain answer is not shown as an error");
+    // The answer's finish was dropped: the model's own reply ended the run.
+    assert_eq!(out.final_text.as_deref(), Some("noted"));
+}
+
+#[tokio::test]
+async fn an_error_answer_is_shown_as_an_error() {
+    let (read, _) = counting("read", ToolAnnotations::READ_ONLY);
+    let agent = base(ScriptedProvider::new([
+        tool_calls([call("c1", "read", json!({}))]),
+        text("retrying later"),
+    ]))
+    .tool(read)
+    .hook(AnswerInPlace { is_error: true })
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    let tool = out
+        .state
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert!(tool.is_error);
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Answered);
+}
+
 #[tokio::test]
 async fn rewrite_hook_changes_arguments() {
     struct ForcePrefix;

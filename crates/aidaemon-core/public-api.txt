@@ -216,6 +216,7 @@ pub aidaemon_core::ProviderError::Transient(alloc::string::String)
 impl aidaemon_core::ProviderError
 pub fn aidaemon_core::ProviderError::is_retryable(&self) -> bool
 pub enum aidaemon_core::ReceiptStatus
+pub aidaemon_core::ReceiptStatus::Answered
 pub aidaemon_core::ReceiptStatus::Cancelled
 pub aidaemon_core::ReceiptStatus::Denied
 pub aidaemon_core::ReceiptStatus::Failed
@@ -313,6 +314,8 @@ pub aidaemon_core::ToolChoice::Required
 pub aidaemon_core::ToolChoice::Specific(alloc::string::String)
 pub enum aidaemon_core::ToolDecision
 pub aidaemon_core::ToolDecision::Allow
+pub aidaemon_core::ToolDecision::Answer
+pub aidaemon_core::ToolDecision::Answer::output: aidaemon_core::ToolOutput
 pub aidaemon_core::ToolDecision::Deny
 pub aidaemon_core::ToolDecision::Deny::reason: alloc::string::String
 pub aidaemon_core::ToolDecision::Interrupt
