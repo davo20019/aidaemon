@@ -265,7 +265,32 @@ Order:
         at turn start after a server reload;
       - the goals/mandates store slice and the concrete `EventStore`
         (8.8).
-- [ ] 8.4 Tools converge into `aidaemon-tools`.
+- [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
+      daemon tool can wrap today's thin crate tools without behavior
+      changes. The crate tools implement only the kernel `Tool` and do I/O
+      through `Workspace`, not `ExecutionBackend`. So the daemon versions
+      move into the crate and replace the thin ones. Steps, one commit each:
+      1. Add a generic adapter: crate `Tool + ToolSemantics` as daemon
+         `Tool`.
+      2. Move `file_output_trust` and path-key extraction into
+         `semantics.rs`.
+      3. Move the sensitive and secret path patterns in as a
+         `PathClassifier` set by constructors, replacing the global in
+         `fs_utils.rs`.
+      4. Move `read_file` over `ExecutionBackend`, keeping its schema,
+         metadata and tests.
+      5. Move `edit_file`, with backups and diagnostics as a post-write
+         hook.
+      6. Move `write_file`, with append and replay, and fix the crate's
+         `idempotent: true`.
+      7. Move `search_files`.
+      8. Move the SSRF classifier and capped body reader.
+      9. Move `web_fetch`, with readability and the mandate no-redirect
+         mode.
+      10. Share one quote-aware `contains_shell_operator`.
+      The terminal, `http_request` and `web_search` stay in the daemon.
+      Steps 4-7 depend on 8.3's name checks staying valid; the tool names
+      do not change.
 - [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
@@ -279,6 +304,17 @@ Order:
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
       assessor is retired).
+      - [x] Memory is replaceable as one unit: `aidaemon_policies::MemorySystem`
+        (`MemoryTurn` in, `MemoryParts` out). `aidaemon_memory::ScopedMemory`
+        implements it, and the daemon's `SystemMemory` plugs any
+        implementation into turns, keeping the daemon's scope and permission
+        rules.
+      - [ ] Owner ruling (2026-11-07): port all of `src/memory/` into
+        `aidaemon-memory`, including people intelligence, graph store,
+        procedures, skill promotion, task learning, expertise, core profile
+        and retention. Delete the old module only after parity tests and
+        live N-of-M runs match the current daemon. Existing data must be
+        migrated from the daemon database to the crate's store.
 - [ ] 8.7b Services: an SDK extension point for background work. It
       covers start and stop, scheduled ticks, and every agent run built
       through `AgentBuilder`, so background runs carry the same safeguards.
@@ -289,6 +325,50 @@ Order:
       Providers are done: every daemon model call runs on an
       `aidaemon-providers` backend and the daemon `ModelProvider` trait is
       deleted (`e0e8899`..`29c3824`).
+      - MCP map (2026-11-07). The daemon client (`src/mcp/client.rs`) is
+        weaker than the crate's:
+        - it reads the next stdout line as the reply, so a notification or
+          a late reply puts later calls out of step;
+        - it has no cancellation and no pagination;
+        - it caps lines at 512 KiB.
+        Its retry-after-restart path is dead code. Steps, one commit each:
+        1. Crate: an annotation override (hints ignored, worst case) and
+           schema normalization.
+        2. Crate: `McpServerSpec`, `respawn`, and a stderr callback.
+        3. Daemon: wrap `aidaemon_mcp::McpTool` behind the old interface,
+           and port the hints-never-loosen test.
+        4. `McpRegistry` holds crate servers.
+        5. Delete the daemon client and the dead paths.
+        Separate fixes: `restart` and `enable` respawn a stored command with
+        no approval card; `is_non_delegable_tool` checks an `mcp__` prefix
+        no real name has.
+      - Channels map (2026-11-07). The daemon uses teloxide, serenity and
+        hand-written Slack code, and does not depend on the channel crates.
+        Use the crate adapters for transport only, not `ChannelRunner`: the
+        daemon owns access, sessions, queueing, approvals and dynamic bots.
+        Generic features the crates need first:
+        - delete, file send and attachment download;
+        - `Action` and `Command` events, with command registration;
+        - Telegram webhook mode and `setMyCommands`;
+        - name lookups, a Slack typing substitute, LaTeX stripping and a
+          configurable max message length.
+        Order: formatter golden tests, then a daemon bridge with
+        session-id mapping, then Discord, then Slack, then Telegram.
+        Daemon Discord has no tests today. Live behavior needs a manual
+        smoke test per bot.
+- [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
+      scenario format and the trajectory assertions are duplicated.
+      `src/harness_eval/report.rs` formats live telemetry and is not a
+      duplicate. The crate needs:
+      - a `Subject` seam returning a neutral `Trajectory`;
+      - typed `setup:` and `expect.ext:` blocks;
+      - a proposed-call lane next to the dispatched one;
+      - script arguments as a string or an object.
+      The daemon then keeps a `DaemonSubject`, its snapshot assertions and
+      the recorder. A differential test runs old and new checks over all
+      fixtures before the old checks are deleted. Watch two differences:
+      `response_contains` is case-sensitive in the daemon, and the daemon
+      counts proposals where the crate counts receipts.
 
 ## Parallel track: fixes found in the daemon
 
