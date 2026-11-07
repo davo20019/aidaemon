@@ -426,9 +426,31 @@ Order:
           downloads (20 MiB cap), `deleteMessage`, `setMyCommands`, and a
           webhook mode (feature `webhook`) with a secret token that falls
           back to long polling like the daemon's.
-        Not done: name lookups, a Slack typing substitute (needs the
-        inbound message's ts) and a configurable max message length.
-        Next: the daemon bridge. Each daemon channel's inbound handlers
+        Since (`1083c06`): name lookups, a configurable message length and
+        Slack's typing substitute.
+        The bots (`[channels] telegram|discord|slack = "sdk"`, the default;
+        `"legacy"` keeps the old transport until each is checked live):
+        - Discord (`5863020`): runs on the adapter; its logic is transport
+          neutral (an `Outlet` for replies, normalized inbound), with the
+          first daemon-level Discord tests. Fixed on the way: session ids
+          never resolved to a conversation, so proactive Discord sends
+          (approvals, notifications) failed;
+        - Slack (`e60a672`): the adapter holds the Socket Mode connection
+          (`run_envelopes`) and hands raw envelopes to the unchanged
+          handling, which reads Slack's own event shapes;
+        - Telegram (`1a3be8a`): the adapter receives updates (webhook or
+          polling, `run_updates`); the daemon parses them into teloxide
+          types (rebuilt with `update_id` first) and runs its handlers per
+          chat in order. Outbound still uses teloxide's `Bot`.
+        Remaining, the structural part: the daemon still has its own
+        `Channel` trait and 2,000-6,500 lines of inbound handling per
+        platform (access, sessions, commands, files, approvals), so adding a
+        platform to the daemon still means copying a module. The fix is one
+        inbound handler written once against `aidaemon_channels::Channel`,
+        each platform shrinking to its adapter plus platform-only features
+        (Telegram web apps and reply keyboards, Slack workspace grants).
+        Then delete the legacy transports and the daemon `Channel` trait.
+        Earlier note on the bridge: Each daemon channel's inbound handlers
         (access, auto-claim, commands, files, dispatch) are written against
         serenity, teloxide or raw Slack payloads and must be ported onto
         `ChannelEvent`, with session-id mapping, behind a per-platform
