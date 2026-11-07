@@ -71,10 +71,12 @@
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod consolidation;
 mod embed;
 pub mod embedding_index;
 mod error;
 mod extract;
+pub mod history;
 mod learning;
 mod memory;
 pub mod neighborhood;

@@ -54,8 +54,7 @@ pub fn build_memory_pipeline(
             Some(consolidator.clone()),
         )
         .with_event_store(event_store)
-        .with_state(state)
-        .with_people_config(config.people.clone()),
+        .with_state(state),
     );
 
     MemoryPipelineBundle {

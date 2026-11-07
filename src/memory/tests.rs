@@ -69,7 +69,7 @@ fn fact_lifetime_is_durable_unless_explicitly_transient() {
     #[derive(serde::Deserialize)]
     struct Row {
         #[serde(default)]
-        lifetime: crate::memory::FactLifetime,
+        lifetime: aidaemon_memory::task_learning::FactLifetime,
     }
     let parse = |json: &str| serde_json::from_str::<Row>(json).unwrap().lifetime;
     assert!(parse(r#"{"lifetime":"transient"}"#).is_transient());

@@ -86,6 +86,40 @@ impl RuntimeProvider {
     }
 }
 
+/// Any kernel provider (for example the runtime's background failover
+/// chain) with each successful call's tokens and `llm_call` event filed
+/// under the session `background:<purpose>`.
+pub(crate) struct AccountedProvider {
+    pub(crate) inner: std::sync::Arc<dyn sdk::Provider>,
+    pub(crate) accounting: ModelCallAccounting,
+}
+
+#[async_trait]
+impl sdk::Provider for AccountedProvider {
+    fn name(&self) -> &str {
+        "daemon-accounted"
+    }
+
+    async fn complete(
+        &self,
+        request: &sdk::ModelRequest,
+    ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
+        let started = std::time::Instant::now();
+        let response = self.inner.complete(request).await?;
+        crate::events::record_background_model_call_telemetry(
+            self.accounting.event_store.clone(),
+            self.accounting.state.as_ref(),
+            &format!("background:{}", self.accounting.purpose),
+            self.accounting.purpose,
+            &request.model,
+            &crate::providers::sdk_backed::to_provider_response(response.clone(), &request.model),
+            started.elapsed(),
+        )
+        .await;
+        Ok(response)
+    }
+}
+
 /// Where a [`RuntimeProvider`] records each call's tokens and `llm_call`
 /// event, and the purpose they are filed under.
 pub(crate) struct ModelCallAccounting {

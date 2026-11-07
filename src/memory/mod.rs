@@ -4,6 +4,7 @@ pub mod embedding_index;
 pub mod embeddings;
 pub mod expertise;
 pub mod graph_store;
+pub mod history_source;
 pub mod manager;
 pub mod math;
 pub mod neighborhood;
@@ -15,8 +16,6 @@ pub mod retention;
 pub mod retrieval_eval;
 pub mod scoring;
 pub mod task_learning;
-
-pub use aidaemon_memory::task_learning::{FactLifetime, FACT_LIFETIME_INSTRUCTION};
 
 /// Derive a canonical `channel_id` from a `session_id` string.
 ///

@@ -1,4 +1,3 @@
-use crate::config::PeopleConfig;
 use crate::events::{Consolidator, EventStore};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
@@ -7,9 +6,10 @@ use crate::memory::embedding_index::{
 };
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
+use crate::memory::history_source::EventHistory;
 use crate::memory::scoring::calculate_episode_importance;
-use crate::traits::{BehaviorPattern, Message, MessageAnnotation, Person, StateStore, UserProfile};
-use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
+use crate::traits::{BehaviorPattern, Message, MessageAnnotation, StateStore, UserProfile};
+use crate::types::UserRole;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
@@ -17,17 +17,17 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 pub struct MemoryManager {
     pool: SqlitePool,
+    history: EventHistory,
     embedding_service: Arc<EmbeddingService>,
     llm_runtime: SharedLlmRuntime,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
-    people_config: PeopleConfig,
 }
 
 impl MemoryManager {
@@ -39,6 +39,7 @@ impl MemoryManager {
         consolidator: Option<Arc<Consolidator>>,
     ) -> Self {
         Self {
+            history: EventHistory::new(pool.clone(), None),
             pool,
             embedding_service,
             llm_runtime,
@@ -46,7 +47,6 @@ impl MemoryManager {
             consolidator,
             event_store: None,
             state: None,
-            people_config: PeopleConfig::default(),
         }
     }
 
@@ -55,15 +55,10 @@ impl MemoryManager {
         self
     }
 
-    /// Set the state store for people fact routing.
+    /// Set the state store memory is written to.
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
+        self.history = EventHistory::new(self.pool.clone(), Some(state.clone()));
         self.state = Some(state);
-        self
-    }
-
-    /// Set the people config for controlling auto-extraction.
-    pub fn with_people_config(mut self, config: PeopleConfig) -> Self {
-        self.people_config = config;
         self
     }
 
@@ -270,721 +265,45 @@ impl MemoryManager {
         Ok(true)
     }
 
-    async fn session_visibility_from_events(&self, session_id: &str) -> Option<ChannelVisibility> {
-        let row = sqlx::query(
-            r#"
-            SELECT data
-            FROM events
-            WHERE session_id = ?
-              AND event_type = 'user_message'
-            ORDER BY id DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await;
-
-        let row = match row {
-            Ok(r) => r,
-            Err(e) => {
-                if e.to_string().contains("no such table: events") {
-                    return None;
-                }
-                warn!(session_id, error = %e, "Failed to fetch session visibility from events");
-                return None;
-            }
-        }?;
-
-        let raw: String = row.get("data");
-        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let vis = val.get("channel_visibility").and_then(|v| v.as_str())?;
-        Some(ChannelVisibility::from_str_lossy(vis))
-    }
-
-    fn parse_event_user_role(data: &serde_json::Value) -> Option<UserRole> {
-        match data.get("user_role").and_then(|v| v.as_str()) {
-            Some("owner") => Some(UserRole::Owner),
-            Some("guest") => Some(UserRole::Guest),
-            Some("public") => Some(UserRole::Public),
-            _ => None,
-        }
-    }
-
-    async fn session_is_memory_isolated(&self, session_id: &str) -> anyhow::Result<bool> {
-        if crate::events::is_memory_isolated_worker_session(session_id) {
-            return Ok(true);
-        }
-        crate::events::session_has_mandate_execution_provenance(&self.pool, session_id).await
-    }
-
-    async fn fact_consolidation_batch_is_owner_only(
-        &self,
-        session_id: &str,
-        cutoff: &str,
-        after_event_id: i64,
-    ) -> anyhow::Result<bool> {
-        if self.session_is_memory_isolated(session_id).await? {
-            return Ok(false);
-        }
-        let rows = sqlx::query(
-            r#"
-            SELECT data
-            FROM events
-            WHERE session_id = ?
-              AND event_type = 'user_message'
-              AND id > ?
-              AND created_at < ?
-            ORDER BY id ASC
-            "#,
-        )
-        .bind(session_id)
-        .bind(after_event_id)
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut saw_owner_message = false;
-        for row in rows {
-            let data_raw: String = row.get("data");
-            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
-                Ok(val) => val,
-                Err(_) => return Ok(false),
-            };
-
-            match Self::parse_event_user_role(&data) {
-                Some(role) if role.can_persist_owner_memory() => {
-                    saw_owner_message = true;
-                }
-                _ => return Ok(false),
-            }
-        }
-
-        Ok(saw_owner_message)
-    }
-
-    async fn session_since_last_episode_is_owner_only(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<bool> {
-        if self.session_is_memory_isolated(session_id).await? {
-            return Ok(false);
-        }
-        let last_episode = sqlx::query(
-            "SELECT end_event_id, end_time FROM episodes
-             WHERE session_id = ?
-             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let rows = if let Some(end_event_id) = last_episode
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
-            .flatten()
-        {
-            sqlx::query(
-                "SELECT data FROM events
-                 WHERE session_id = ?
-                   AND event_type = 'user_message'
-                   AND id > ?
-                 ORDER BY id ASC",
-            )
-            .bind(session_id)
-            .bind(end_event_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else if let Some(since) = last_episode
-            .as_ref()
-            .and_then(|row| row.try_get::<String, _>("end_time").ok())
-        {
-            sqlx::query(
-                "SELECT data FROM events
-                 WHERE session_id = ?
-                   AND event_type = 'user_message'
-                   AND created_at > ?
-                 ORDER BY created_at ASC",
-            )
-            .bind(session_id)
-            .bind(&since)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT data FROM events
-                 WHERE session_id = ?
-                   AND event_type = 'user_message'
-                 ORDER BY created_at ASC",
-            )
-            .bind(session_id)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut saw_owner_message = false;
-        for row in rows {
-            let data_raw: String = row.get("data");
-            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
-                Ok(val) => val,
-                Err(_) => return Ok(false),
-            };
-
-            match Self::parse_event_user_role(&data) {
-                Some(role) if role.can_persist_owner_memory() => {
-                    saw_owner_message = true;
-                }
-                _ => return Ok(false),
-            }
-        }
-
-        Ok(saw_owner_message)
-    }
-
-    fn fact_consolidation_cursor_key(session_id: &str) -> String {
-        format!("memory_fact_consolidation_cursor:{}", session_id)
-    }
-
-    async fn get_fact_consolidation_cursor(&self, session_id: &str) -> i64 {
-        let Some(state) = &self.state else {
-            return 0;
-        };
-        let key = Self::fact_consolidation_cursor_key(session_id);
-        match state.get_setting(&key).await {
-            Ok(Some(raw)) => raw.parse::<i64>().unwrap_or(0),
-            _ => 0,
-        }
-    }
-
-    async fn set_fact_consolidation_cursor(
-        &self,
-        session_id: &str,
-        event_id: i64,
-    ) -> anyhow::Result<()> {
-        let Some(state) = &self.state else {
-            return Ok(());
-        };
-        let key = Self::fact_consolidation_cursor_key(session_id);
-        state.set_setting(&key, &event_id.to_string()).await
-    }
-
-    async fn list_candidate_sessions_for_fact_consolidation(
-        &self,
-        cutoff: &str,
-    ) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT DISTINCT session_id
-            FROM events
-            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
-              AND created_at < ?
-            "#,
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-        self.exclude_memory_isolated_sessions(rows).await
-    }
-
-    async fn exclude_memory_isolated_sessions(
-        &self,
-        candidates: Vec<String>,
-    ) -> anyhow::Result<Vec<String>> {
-        let mut eligible = Vec::with_capacity(candidates.len());
-        for session_id in candidates {
-            if !self.session_is_memory_isolated(&session_id).await? {
-                eligible.push(session_id);
-            }
-        }
-        Ok(eligible)
-    }
-
-    async fn memory_suppressed_tasks_for_session(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<std::collections::HashSet<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT DISTINCT task_id
-             FROM events
-             WHERE session_id = ? AND event_type = 'memory_policy_compiled'
-               AND task_id IS NOT NULL
-               AND json_extract(data, '$.access') = 'suppressed'",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .collect())
-    }
-
-    async fn all_memory_suppressed_tasks(
-        &self,
-    ) -> anyhow::Result<std::collections::HashSet<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT DISTINCT task_id
-             FROM events
-             WHERE event_type = 'memory_policy_compiled' AND task_id IS NOT NULL
-               AND json_extract(data, '$.access') = 'suppressed'",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .collect())
-    }
-
-    async fn fetch_fact_consolidation_messages(
-        &self,
-        session_id: &str,
-        cutoff: &str,
-        after_event_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<crate::events::ConversationTurn>> {
-        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
-        let rows = sqlx::query(
-            r#"
-            SELECT id, event_type, data, created_at, task_id
-            FROM events
-            WHERE session_id = ?
-              AND event_type IN ('user_message', 'assistant_response', 'tool_result')
-              AND id > ?
-              AND created_at < ?
-            ORDER BY id ASC
-            LIMIT ?
-            "#,
-        )
-        .bind(session_id)
-        .bind(after_event_id)
-        .bind(cutoff)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            if row
-                .try_get::<Option<String>, _>("task_id")?
-                .is_some_and(|task_id| suppressed_tasks.contains(&task_id))
-            {
-                continue;
-            }
-            let event_id: i64 = row.get("id");
-            let event_type: String = row.get("event_type");
-            let created_str: String = row.get("created_at");
-            let created_at = DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            let data_raw: String = row.get("data");
-            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        session_id,
-                        event_id,
-                        event_type = %event_type,
-                        error = %e,
-                        "Skipping malformed event payload during memory consolidation"
-                    );
-                    continue;
-                }
-            };
-
-            if let Some(turn) =
-                crate::events::turn_from_event(event_id, session_id, &event_type, &data, created_at)
-            {
-                out.push(turn);
-            }
-        }
-        Ok(out)
-    }
-
+    /// Consolidate durable facts from owner history (the SDK memory crate's
+    /// [`FactConsolidator`] over the daemon's event log), then run the
+    /// event-based extraction (procedures, error solutions, expertise) for
+    /// the same sessions.
+    ///
+    /// [`FactConsolidator`]: aidaemon_memory::consolidation::FactConsolidator
     async fn consolidate_memories(&self) -> anyhow::Result<()> {
-        // Consolidate conversation events older than 1 hour.
-        // Per-session cursors avoid rescanning already-processed history.
-        let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-        let cutoff = one_hour_ago.to_rfc3339();
-
-        let candidate_sessions = self
-            .list_candidate_sessions_for_fact_consolidation(&cutoff)
+        let Some(state) = self.state.clone() else {
+            return Ok(());
+        };
+        let snapshot = self.llm_runtime.snapshot();
+        // Background work does not need the strongest model.
+        let model = snapshot.cheap_model();
+        let chain: Arc<dyn aidaemon_core::Provider> = Arc::new(snapshot.background_chain(&model));
+        let provider: Arc<dyn aidaemon_core::Provider> = match &self.event_store {
+            Some(event_store) => Arc::new(crate::agent::AccountedProvider {
+                inner: chain,
+                accounting: crate::agent::ModelCallAccounting {
+                    state: state.clone(),
+                    event_store: event_store.clone(),
+                    purpose: "memory_consolidation",
+                },
+            }),
+            None => chain,
+        };
+        let report = aidaemon_memory::consolidation::FactConsolidator::new(provider, model)
+            .consolidate(
+                &self.history,
+                &self.history,
+                state.as_ref(),
+                chrono::Utc::now(),
+            )
             .await?;
-        if candidate_sessions.is_empty() {
-            return Ok(());
-        }
 
-        // session_id -> selected candidate messages (event_id, role, content)
-        let mut sessions: std::collections::HashMap<String, Vec<(i64, String, String)>> =
-            std::collections::HashMap::new();
-        // session_id -> max event id seen this cycle (for cursor advancement)
-        let mut session_max_seen: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-
-        for session_id in candidate_sessions {
-            let cursor = self.get_fact_consolidation_cursor(&session_id).await;
-            if !self
-                .fact_consolidation_batch_is_owner_only(&session_id, &cutoff, cursor)
-                .await?
-            {
-                let max_seen: Option<i64> = sqlx::query_scalar(
-                    r#"
-                    SELECT MAX(id)
-                    FROM events
-                    WHERE session_id = ?
-                      AND event_type IN ('user_message', 'assistant_response', 'tool_result')
-                      AND id > ?
-                      AND created_at < ?
-                    "#,
-                )
-                .bind(&session_id)
-                .bind(cursor)
-                .bind(&cutoff)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten();
-                if let Some(max_seen) = max_seen {
-                    let _ = self
-                        .set_fact_consolidation_cursor(&session_id, max_seen)
-                        .await;
-                }
-                continue;
-            }
-            let events = self
-                .fetch_fact_consolidation_messages(&session_id, &cutoff, cursor, 300)
-                .await?;
-            if events.is_empty() {
-                continue;
-            }
-
-            if let Some(max_seen) = events.last().map(|turn| turn.event_id) {
-                session_max_seen.insert(session_id.clone(), max_seen);
-            }
-
-            let entry = sessions.entry(session_id).or_default();
-            for turn in events {
-                // CRITICAL: Skip assistant messages to prevent hallucination
-                // feedback loops.  If the bot hallucinates a wrong fact value
-                // (e.g. "cat name is Pixel" when the real answer is "Luna"),
-                // including that text here causes the consolidation LLM to
-                // extract the hallucinated value, which then overwrites the
-                // correct user-originated fact.  Only user messages and tool
-                // results contain ground-truth information.
-                if turn.role.as_str() == "assistant" {
-                    continue;
-                }
-                let Some(content) = turn.content.clone() else {
-                    continue;
-                };
-                if content.trim().is_empty() {
-                    continue;
-                }
-                // Every user message long enough to hold a fact is a
-                // candidate; the consolidation model decides what is durable.
-                if aidaemon_memory::progressive::worth_extracting(&content) && entry.len() < 30 {
-                    entry.push((turn.event_id, turn.role.as_str().to_string(), content));
-                }
-            }
-        }
-
-        let total_messages: usize = sessions.values().map(|v| v.len()).sum();
-        info!(
-            "Consolidation: processing {} messages from {} sessions (event-native)",
-            total_messages,
-            sessions.len()
-        );
-
-        // If no candidates were found, advance cursors so we
-        // don't repeatedly rescan low-signal events.
-        if sessions.is_empty() {
-            for (session_id, max_seen) in &session_max_seen {
-                let _ = self
-                    .set_fact_consolidation_cursor(session_id, *max_seen)
-                    .await;
-            }
-            return Ok(());
-        }
-
-        for (session_id, max_seen) in &session_max_seen {
-            if !sessions.contains_key(session_id) {
-                let _ = self
-                    .set_fact_consolidation_cursor(session_id, *max_seen)
-                    .await;
-            }
-        }
-
-        // PublicExternal sessions are untrusted: do not learn durable facts from them.
-        // (Progressive extraction is already disabled; this closes the consolidation path.)
-        let mut skipped_public_external: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut skipped_memory_isolated: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
-            extract durable facts worth remembering long-term. Output ONLY a JSON array. Each item has \
-            category, key, value, privacy, and an optional graph or personal_memory object. Graph entities have local_id, \
-            name, entity_type, aliases, confidence. Relationships have source_id, target_id, relation, \
-            confidence. Use owner for the user. Include graph data only when directly supported by the \
-            owner's words; never infer entity types from category or key names. For names, aliases, handles, dates of birth, residence, accounts, or family relationships, emit personal_memory with entities, aliases, facts, relationships, direct_user_statement, and correction instead of dynamic person-name keys. Use owner as the owner's local_id, stable entity references, ISO dates, and typed relationships PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT. \
-            Categories:\n\
-            - user: Personal info about the OWNER (name, location, job)\n\
-            - preference: Tool, workflow, and communication preferences\n\
-            - project: Projects, tech stacks, goals\n\
-            - technical: Environment details, installed tools\n\
-            - relationship: Communication patterns with the AI\n\
-            - behavior: Observed tool-usage patterns and recurring workflows\n\
-            - people: Information about OTHER individuals mentioned or participating in conversation\n\n\
-            ONLY learn from owner-authenticated user messages. NEVER extract or store facts from guest/public speakers, and NEVER treat another person's self-description as owner data. \
-            A name mentioned in conversation belongs in \"people\" — it is NEVER the owner's \"name\" unless the owner explicitly states it as their own.\n\n\
-            For \"behavior\", look for:\n\
-            - Which tools the user prefers for specific tasks\n\
-            - Recurring workflows or action sequences\n\
-            - Types of tasks frequently delegated\n\n\
-            For \"people\", extract:\n\
-            - Names and relationships mentioned (e.g., \"my wife Alice\", \"coworker Juan\")\n\
-            - Personal details about others (birthdays, preferences, interests, jobs)\n\
-            - Important dates related to people\n\
-            - Always include personal_memory; never encode a person's name in key\n\
-            - Give each person a local entity ID, store nicknames/handles as aliases, attach dates/properties as facts, and model family/residence links as relationships\n\
-            - Keep separate people as separate entities and normalize dates to YYYY-MM-DD\n\
-            - Set person_name only as a legacy display hint, not as an identity key\n\
-            - NEVER extract health info, financial details, political opinions, or religious beliefs about people\n\
-            Example: represent \"My daughter Alice, nicknamed Allie, was born March 15, 2015\" with one Alice entity, an Allie nickname alias, a 2015-03-15 birth_date fact, and PARENT_OF(owner, Alice)\n\n\
-            Also classify each fact's privacy:\n\
-            - \"global\": General facts useful anywhere (name, job, timezone, tech preferences)\n\
-            - \"channel\": Context-specific facts from this conversation\n\
-            - \"private\": Sensitive personal info the user would want kept private\n\
-            Default to \"channel\" if unsure. People facts should default to \"private\".\n\n\
-            Only extract facts useful in future conversations. If nothing worth remembering, return [].";
-        let system_prompt = format!(
-            "{system_prompt}\n\n{}",
-            crate::memory::FACT_LIFETIME_INSTRUCTION
-        );
-
-        for (session_id, messages) in &sessions {
-            // Defense in depth immediately before the provider call. Candidate
-            // selection already applies this gate, but durable provenance may
-            // have arrived between selection and execution.
-            if self.session_is_memory_isolated(session_id).await? {
-                skipped_memory_isolated.insert(session_id.clone());
-                info!(
-                    session_id = session_id.as_str(),
-                    "Skipping memory fact consolidation for isolated worker session"
-                );
-                continue;
-            }
-            if self
-                .session_visibility_from_events(session_id)
-                .await
-                .is_some_and(|v| v == ChannelVisibility::PublicExternal)
-            {
-                skipped_public_external.insert(session_id.clone());
-                if let Some(max_seen) = session_max_seen.get(session_id) {
-                    let _ = self
-                        .set_fact_consolidation_cursor(session_id, *max_seen)
-                        .await;
-                }
-                info!(
-                    session_id = session_id.as_str(),
-                    "Skipping memory fact consolidation for PublicExternal session"
-                );
-                continue;
-            }
-
-            // Build conversation text for this session batch
-            let conversation: String = messages
-                .iter()
-                .map(|(_event_id, role, content)| format!("{}: {}", role, content))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // User-authored text only, for identity-fact evidence checks below.
-            let user_messages_text: String = messages
-                .iter()
-                .filter(|(_event_id, role, _content)| role.as_str() == "user")
-                .map(|(_event_id, _role, content)| content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let llm_messages = vec![
-                json!({"role": "system", "content": system_prompt.as_str()}),
-                json!({"role": "user", "content": conversation}),
-            ];
-
-            // Background LLM call, no tools
-            let runtime_snapshot = self.llm_runtime.snapshot();
-            // Background work does not need the strongest model.
-            let model = runtime_snapshot.cheap_model();
-            let call_start = std::time::Instant::now();
-            match runtime_snapshot
-                .background_chat(&model, &llm_messages, &[])
-                .await
-            {
-                Ok(response) => {
-                    if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
-                        crate::events::record_background_model_call_telemetry(
-                            event_store.clone(),
-                            state.as_ref(),
-                            "background:memory_consolidation",
-                            "memory_consolidation",
-                            &model,
-                            &response,
-                            call_start.elapsed(),
-                        )
-                        .await;
-                    }
-                    if let Some(text) = &response.content {
-                        match parse_consolidation_response(text) {
-                            Ok(facts) => {
-                                let ch_id =
-                                    crate::memory::derive_channel_id_from_session(session_id);
-                                for fact in &facts {
-                                    if let (Some(state), Some(personal)) =
-                                        (&self.state, &fact.personal_memory)
-                                    {
-                                        let excerpt =
-                                            crate::utils::truncate_str(&user_messages_text, 200);
-                                        let privacy = fact
-                                            .privacy
-                                            .as_deref()
-                                            .map(FactPrivacy::from_str_lossy)
-                                            .unwrap_or(FactPrivacy::Private);
-                                        if let Err(error) = state
-                                            .reconcile_personal_memory(
-                                                personal,
-                                                "consolidation",
-                                                Some(excerpt.as_str()),
-                                                ch_id.as_deref(),
-                                                privacy,
-                                            )
-                                            .await
-                                        {
-                                            warn!(%error, "Failed to reconcile consolidated personal memory");
-                                        }
-                                        continue;
-                                    }
-                                    if fact.lifetime.is_transient() {
-                                        debug!(
-                                            key = fact.key,
-                                            "Skipping transient consolidated fact"
-                                        );
-                                        continue;
-                                    }
-                                    // Route "people" facts to the person_facts table
-                                    if fact.category == "people" {
-                                        warn!(
-                                            key = fact.key,
-                                            "Skipping unstructured people fact; extractor must emit personal_memory"
-                                        );
-                                        continue;
-                                    }
-
-                                    // Identity facts (user.name etc.) must appear in
-                                    // the user's own messages — never adopt a name the
-                                    // model lifted from elsewhere in the conversation.
-                                    if aidaemon_memory::progressive::identity_fact_lacks_user_evidence(
-                                        &fact.category,
-                                        &fact.key,
-                                        &fact.value,
-                                        &user_messages_text,
-                                    ) {
-                                        warn!(
-                                            "Skipping consolidated user identity fact [{}={}] — no evidence in user messages",
-                                            fact.key, fact.value
-                                        );
-                                        continue;
-                                    }
-
-                                    let privacy = fact
-                                        .privacy
-                                        .as_deref()
-                                        .map(FactPrivacy::from_str_lossy)
-                                        .unwrap_or(FactPrivacy::Channel);
-                                    // The shared store path owns dedup, the
-                                    // user-originated overwrite guard, the
-                                    // deletion tombstone, and the embedding.
-                                    let Some(state) = &self.state else {
-                                        continue;
-                                    };
-                                    let excerpt =
-                                        crate::utils::truncate_str(&user_messages_text, 200);
-                                    if let Err(e) = state
-                                        .upsert_fact_with_provenance(
-                                            &fact.category,
-                                            &fact.key,
-                                            &fact.value,
-                                            "consolidation",
-                                            ch_id.as_deref(),
-                                            privacy,
-                                            Some(chrono::Utc::now()),
-                                            Some(excerpt.as_str()),
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            "Failed to upsert consolidated fact [{}/{}]: {}",
-                                            fact.category, fact.key, e
-                                        );
-                                    } else {
-                                        if let Err(e) = state
-                                            .refresh_fact_memory(&fact.category, &fact.key)
-                                            .await
-                                        {
-                                            debug!(error = %e, key = fact.key, "Failed to refresh consolidated fact projection");
-                                        } else if let Err(e) = state
-                                            .project_extracted_fact_graph(
-                                                &fact.category,
-                                                &fact.key,
-                                                excerpt.as_str(),
-                                                &fact.graph,
-                                            )
-                                            .await
-                                        {
-                                            debug!(error = %e, key = fact.key, "Failed to project consolidated graph");
-                                        }
-                                    }
-                                }
-                                info!(
-                                    "Consolidation: extracted {} facts from session {}",
-                                    facts.len(),
-                                    session_id
-                                );
-                                if let Some(max_seen) = session_max_seen.get(session_id) {
-                                    let _ = self
-                                        .set_fact_consolidation_cursor(session_id, *max_seen)
-                                        .await;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to parse consolidation response for session {}: {} — events will be retried next cycle",
-                                    session_id, e
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "LLM call failed during consolidation for session {}: {}",
-                        session_id, e
-                    );
-                    // Don't mark as consolidated — retry next cycle
-                }
-            }
-        }
-
-        // After fact extraction, run event-based extraction (procedures, errors, expertise)
-        // via the Consolidator. This unifies both pipelines into a single cycle.
-        if let Some(ref consolidator) = self.consolidator {
-            let session_ids: Vec<String> = sessions
-                .keys()
-                .filter(|sid| !skipped_public_external.contains(*sid))
-                .filter(|sid| !skipped_memory_isolated.contains(*sid))
-                .cloned()
-                .collect();
-            for session_id in &session_ids {
-                // Consolidator enforces the same boundary itself. Recheck here
-                // as well so this background caller never knowingly enters a
-                // learning pipeline for a newly classified mandate session.
-                if self.session_is_memory_isolated(session_id).await? {
+        if let Some(consolidator) = &self.consolidator {
+            for session_id in &report.consolidated_sessions {
+                // The consolidator enforces the same boundary; recheck so a
+                // newly classified mandate session never enters learning.
+                if self.history.session_is_memory_isolated(session_id).await? {
                     continue;
                 }
                 if let Err(e) = consolidator.consolidate_session(session_id).await {
@@ -995,224 +314,8 @@ impl MemoryManager {
                 }
             }
         }
-
         Ok(())
     }
-
-    /// Check if two person names likely refer to the same person.
-    /// Handles first-name-only match, case-insensitive, prefix match.
-    fn names_likely_match(candidate: &str, existing: &str) -> bool {
-        let c = candidate.trim().to_lowercase();
-        let e = existing.trim().to_lowercase();
-
-        if c == e {
-            return true;
-        }
-
-        // First-name match: "John" matches "John Smith"
-        let c_parts: Vec<&str> = c.split_whitespace().collect();
-        let e_parts: Vec<&str> = e.split_whitespace().collect();
-
-        // Single-name candidate matches multi-name existing (first name)
-        if c_parts.len() == 1 && e_parts.len() > 1 && c_parts[0] == e_parts[0] {
-            return true;
-        }
-        // Multi-name candidate matches single-name existing (first name)
-        if e_parts.len() == 1 && c_parts.len() > 1 && c_parts[0] == e_parts[0] {
-            return true;
-        }
-
-        false
-    }
-
-    /// Find a person by exact name first, then fuzzy match against all people + aliases.
-    /// Returns the matched person and upgrades name to more complete form when found.
-    async fn find_or_match_person(
-        state: &Arc<dyn StateStore>,
-        name: &str,
-    ) -> anyhow::Result<Option<Person>> {
-        // Exact match first
-        if let Some(person) = state.find_person_by_name(name).await? {
-            return Ok(Some(person));
-        }
-
-        // Fuzzy match against all people
-        let all_people = state.get_all_people().await?;
-        for person in &all_people {
-            if Self::names_likely_match(name, &person.name) {
-                return Ok(Some(person.clone()));
-            }
-            // Check aliases too
-            for alias in &person.aliases {
-                if Self::names_likely_match(name, alias) {
-                    return Ok(Some(person.clone()));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Normalize a person name: trim, title-case.
-    fn normalize_person_name(name: &str) -> String {
-        name.split_whitespace()
-            .map(|word| {
-                let mut chars = word.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => {
-                        first.to_uppercase().to_string() + &chars.as_str().to_lowercase()
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// Route a "people" category fact to the person_facts table.
-    #[allow(dead_code)]
-    async fn route_people_fact(&self, fact: &ExtractedFact) {
-        let state = match &self.state {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Check runtime setting first, fall back to config
-        let people_enabled = match state.get_setting("people_enabled").await {
-            Ok(Some(val)) => val == "true",
-            _ => self.people_config.enabled,
-        };
-        if !people_enabled || !self.people_config.auto_extract {
-            return;
-        }
-
-        let raw_name = match &fact.person_name {
-            Some(name) if !name.is_empty() => name.clone(),
-            _ => {
-                // Try to extract person name from the key (format: "person_name:detail_type")
-                match fact.key.split(':').next() {
-                    Some(name) if !name.is_empty() => name.to_string(),
-                    _ => return,
-                }
-            }
-        };
-
-        // Name normalization: trim, title-case, reject single-char names
-        let person_name = Self::normalize_person_name(&raw_name);
-        if person_name.len() < 2 {
-            return;
-        }
-
-        // Extract the detail type from the key
-        let detail_key = fact.key.split(':').nth(1).unwrap_or(&fact.key);
-
-        // Check restricted categories
-        if self
-            .people_config
-            .restricted_categories
-            .iter()
-            .any(|rc| rc == detail_key)
-        {
-            info!("Skipping restricted people fact category: {}", detail_key);
-            return;
-        }
-
-        // Check if this detail type is in allowed auto-extract categories
-        if !self
-            .people_config
-            .auto_extract_categories
-            .iter()
-            .any(|ac| ac == detail_key)
-        {
-            // Still allow common detail types not in the explicit list
-            let always_allowed = ["name", "relationship", "nickname", "job", "role"];
-            if !always_allowed.contains(&detail_key) {
-                return;
-            }
-        }
-
-        // Find or create the person (with fuzzy name matching)
-        let person_id = match Self::find_or_match_person(state, &person_name).await {
-            Ok(Some(p)) => {
-                // If we matched via fuzzy and the new name is more complete, upgrade
-                if p.name.len() < person_name.len()
-                    && Self::names_likely_match(&person_name, &p.name)
-                {
-                    let mut updated = p.clone();
-                    updated.name = person_name.clone();
-                    updated.updated_at = chrono::Utc::now();
-                    if let Err(e) = state.upsert_person(&updated).await {
-                        warn!("Failed to upgrade person name to '{}': {}", person_name, e);
-                    } else {
-                        info!(
-                            "Upgraded person name '{}' → '{}' (ID: {})",
-                            p.name, person_name, p.id
-                        );
-                    }
-                }
-                p.id
-            }
-            Ok(None) => {
-                // Auto-create with minimal info
-                let person = Person {
-                    id: 0,
-                    name: person_name.clone(),
-                    aliases: vec![],
-                    relationship: None,
-                    platform_ids: std::collections::HashMap::new(),
-                    notes: None,
-                    communication_style: None,
-                    language_preference: None,
-                    last_interaction_at: None,
-                    interaction_count: 0,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                };
-                match state.upsert_person(&person).await {
-                    Ok(id) => {
-                        info!(
-                            "Auto-created person '{}' (ID: {}) from consolidation",
-                            person_name, id
-                        );
-                        id
-                    }
-                    Err(e) => {
-                        warn!("Failed to auto-create person '{}': {}", person_name, e);
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to look up person '{}': {}", person_name, e);
-                return;
-            }
-        };
-
-        // Store the fact with low confidence (auto-extracted)
-        if let Err(e) = state
-            .upsert_person_fact(
-                person_id,
-                detail_key,
-                &fact.key,
-                &fact.value,
-                "consolidation",
-                0.7,
-            )
-            .await
-        {
-            warn!(
-                "Failed to store people fact [{}/{}] for '{}': {}",
-                detail_key, fact.key, person_name, e
-            );
-        } else {
-            debug!(
-                "Stored people fact [{}/{}] for '{}' (confidence: 0.7)",
-                detail_key, fact.key, person_name
-            );
-        }
-    }
-
-    // ==================== Episode Creation ====================
 
     /// Generate a clean transcript from messages, compressing tool calls.
     pub fn get_clean_transcript(messages: &[Message]) -> String {
@@ -1283,7 +386,7 @@ impl MemoryManager {
         messages: &[Message],
     ) -> anyhow::Result<i64> {
         anyhow::ensure!(
-            !self.session_is_memory_isolated(session_id).await?,
+            !self.history.session_is_memory_isolated(session_id).await?,
             "Memory-isolated worker sessions cannot create global episodes"
         );
         if messages.is_empty() {
@@ -1953,7 +1056,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .bind(&thirty_mins_ago)
         .fetch_all(&self.pool)
         .await?;
-        let idle_sessions = self.exclude_memory_isolated_sessions(idle_sessions).await?;
+        let idle_sessions = self
+            .history
+            .exclude_memory_isolated_sessions(idle_sessions)
+            .await?;
 
         if idle_sessions.is_empty() {
             return Ok(());
@@ -1966,6 +1072,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         for session_id in idle_sessions {
             if !self
+                .history
                 .session_since_last_episode_is_owner_only(&session_id)
                 .await?
             {
@@ -2011,10 +1118,14 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         )
         .fetch_all(&self.pool)
         .await?;
-        let session_ids = self.exclude_memory_isolated_sessions(session_ids).await?;
+        let session_ids = self
+            .history
+            .exclude_memory_isolated_sessions(session_ids)
+            .await?;
 
         for session_id in session_ids {
             if !self
+                .history
                 .session_since_last_episode_is_owner_only(&session_id)
                 .await?
             {
@@ -2053,7 +1164,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
+        let suppressed_tasks = self
+            .history
+            .memory_suppressed_tasks_for_session(session_id)
+            .await?;
         let last_episode = sqlx::query(
             "SELECT end_event_id, end_time FROM episodes
              WHERE session_id = ?
@@ -2196,7 +1310,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let suppressed_tasks = self.memory_suppressed_tasks_for_session(session_id).await?;
+        let suppressed_tasks = self
+            .history
+            .memory_suppressed_tasks_for_session(session_id)
+            .await?;
         let rows = sqlx::query(
             "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
@@ -2259,7 +1376,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         since: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let suppressed_tasks = self.all_memory_suppressed_tasks().await?;
+        let suppressed_tasks = self.history.all_memory_suppressed_tasks().await?;
         let rows = sqlx::query(
             "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
@@ -2287,7 +1404,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             let memory_isolated = match isolation_by_session.get(&session_id) {
                 Some(isolated) => *isolated,
                 None => {
-                    let isolated = self.session_is_memory_isolated(&session_id).await?;
+                    let isolated = self.history.session_is_memory_isolated(&session_id).await?;
                     isolation_by_session.insert(session_id.clone(), isolated);
                     isolated
                 }
@@ -2333,7 +1450,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         since: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let suppressed_tasks = self.all_memory_suppressed_tasks().await?;
+        let suppressed_tasks = self.history.all_memory_suppressed_tasks().await?;
         let rows = sqlx::query(
             "SELECT id, session_id, event_type, data, created_at, task_id
              FROM events
@@ -2361,7 +1478,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             let memory_isolated = match isolation_by_session.get(&session_id) {
                 Some(isolated) => *isolated,
                 None => {
-                    let isolated = self.session_is_memory_isolated(&session_id).await?;
+                    let isolated = self.history.session_is_memory_isolated(&session_id).await?;
                     isolation_by_session.insert(session_id.clone(), isolated);
                     isolated
                 }
@@ -2380,7 +1497,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 Err(_) => continue,
             };
 
-            if !Self::parse_event_user_role(&data).is_some_and(UserRole::can_persist_owner_memory) {
+            if !EventHistory::parse_event_user_role(&data)
+                .is_some_and(UserRole::can_persist_owner_memory)
+            {
                 continue;
             }
 
@@ -2405,55 +1524,6 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         Ok(messages)
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct ExtractedFact {
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
-    category: String,
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
-    key: String,
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
-    value: String,
-    privacy: Option<String>,
-    /// For "people" category: the person's name
-    person_name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_lossy_graph")]
-    graph: crate::traits::ExtractedMemoryGraph,
-    #[serde(default, deserialize_with = "deserialize_lossy_personal_memory")]
-    personal_memory: Option<crate::traits::PersonalMemoryWrite>,
-    #[serde(default)]
-    lifetime: crate::memory::FactLifetime,
-}
-
-fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-fn deserialize_lossy_graph<'de, D>(
-    deserializer: D,
-) -> Result<crate::traits::ExtractedMemoryGraph, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
-}
-
-fn deserialize_lossy_personal_memory<'de, D>(
-    deserializer: D,
-) -> Result<Option<crate::traits::PersonalMemoryWrite>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    if value.is_null() {
-        return Ok(None);
-    }
-    Ok(serde_json::from_value(value).ok())
 }
 
 /// Derive a channel_id from a session_id string.
@@ -2567,57 +1637,6 @@ where
         .or_else(|| value.as_str().and_then(|value| value.parse::<f32>().ok()))
         .unwrap_or_else(default_emotional_intensity);
     Ok(intensity.clamp(0.0, 1.0))
-}
-
-fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>> {
-    // Try to find JSON array in the response (LLM may include markdown fences)
-    let trimmed = text.trim();
-    let json_str = if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            &trimmed[start..=end]
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-
-    let raw_facts: Vec<serde_json::Value> = serde_json::from_str(json_str)?;
-    let mut malformed = 0_usize;
-    let mut facts = Vec::with_capacity(raw_facts.len());
-    for (index, raw_fact) in raw_facts.into_iter().enumerate() {
-        match serde_json::from_value::<ExtractedFact>(raw_fact) {
-            Ok(fact) => facts.push(fact),
-            Err(error) => {
-                malformed += 1;
-                warn!(
-                    fact_index = index,
-                    %error,
-                    "Skipping one malformed memory fact from consolidation response"
-                );
-            }
-        }
-    }
-
-    if facts.is_empty() && malformed > 0 {
-        anyhow::bail!("all {malformed} memory facts were malformed");
-    }
-
-    // Filter out facts with empty/meaningless values to prevent hallucination
-    let facts = facts
-        .into_iter()
-        .filter(|f| {
-            [&f.category, &f.key, &f.value].into_iter().all(|field| {
-                let field = field.trim();
-                !field.is_empty()
-                    && !field.eq_ignore_ascii_case("none")
-                    && !field.eq_ignore_ascii_case("null")
-                    && !field.eq_ignore_ascii_case("n/a")
-                    && !field.eq_ignore_ascii_case("unknown")
-            })
-        })
-        .collect();
-    Ok(facts)
 }
 
 #[cfg(test)]
@@ -2883,41 +1902,6 @@ mod tests {
                 .expect("mandate episode count");
         assert_eq!(ordinary_count, 1);
         assert_eq!(mandate_count, 0);
-    }
-
-    #[test]
-    fn consolidation_parser_isolates_bad_items_and_nullable_fields() {
-        let response = r#"```json
-        [
-          {
-            "category": "preferences",
-            "key": "editor",
-            "value": "Neovim",
-            "privacy": null,
-            "graph": {
-              "entities": [{"local_id":"editor","name":null,"entity_type":"tool"}]
-            }
-          },
-          {"category": null, "key": "placeholder", "value": null},
-          42,
-          {"category": "profile", "key": "timezone", "value": "America/New_York"}
-        ]
-        ```"#;
-
-        let facts = parse_consolidation_response(response).unwrap();
-        assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].key, "editor");
-        assert!(facts[0].graph.entities.is_empty());
-        assert_eq!(facts[1].key, "timezone");
-    }
-
-    #[test]
-    fn consolidation_parser_retries_when_every_item_is_structurally_bad() {
-        let error = parse_consolidation_response(r#"[{"category": 7}, false]"#)
-            .expect_err("an entirely malformed batch must be retried");
-        assert!(error
-            .to_string()
-            .contains("all 2 memory facts were malformed"));
     }
 
     #[test]
