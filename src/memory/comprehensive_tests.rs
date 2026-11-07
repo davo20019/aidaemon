@@ -1879,7 +1879,7 @@ async fn test_fresh_db_migration() {
 
 // ==================== M. Context Window & Scoring ====================
 
-/// Verify the scoring module gives higher scores to messages with keywords.
+/// Verify message importance does not depend on matching keywords.
 #[tokio::test]
 async fn test_message_scoring_keywords() {
     use crate::memory::scoring::score_message;
@@ -1898,15 +1898,14 @@ async fn test_message_scoring_keywords() {
         ..Message::runtime_defaults()
     };
 
-    let score_high = score_message(&msg);
+    let with_keywords = score_message(&msg);
 
-    msg.content = Some("I just walked around the block for some exercise today".into());
-    let score_medium = score_message(&msg);
+    msg.content = Some("I just walked around the block for some exercise".into());
+    let casual = score_message(&msg);
 
-    assert!(
-        score_high > score_medium,
-        "Message with 'password' keyword should score higher than casual message"
-    );
+    // Importance reads structure, not wording: two user messages of the
+    // same length class score the same whatever words they use.
+    assert_eq!(with_keywords, casual);
 }
 
 /// Verify user profile defaults and update.
@@ -2073,17 +2072,17 @@ async fn test_error_solution_multiple_domains() {
 #[tokio::test]
 async fn test_procedure_extraction_helpers() {
     use crate::memory::procedures::{
-        extract_error_pattern, extract_trigger_pattern, generalize_procedure,
-        generate_procedure_name,
+        extract_error_pattern, extract_trigger_pattern, generalize_procedure, procedure_base_name,
     };
 
-    // Test procedure name generation
+    // Procedure names come from the tools used, not the request's wording.
     assert_eq!(
-        generate_procedure_name("Build the Rust project"),
-        "rust-build"
+        procedure_base_name(&[
+            "terminal(cargo build)".to_string(),
+            "write_file(x)".to_string()
+        ]),
+        "terminal-write_file"
     );
-    assert_eq!(generate_procedure_name("Run the test suite"), "run-tests");
-    assert_eq!(generate_procedure_name("Deploy to production"), "deploy");
 
     // Test trigger pattern extraction
     let trigger = extract_trigger_pattern(

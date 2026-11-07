@@ -285,6 +285,29 @@ pub fn term_overlap(query: &str, text: &str) -> f32 {
     query.intersection(&text).count() as f32 / query.len() as f32
 }
 
+/// A conversation turn's importance (0.1-1.0) from structure only: its role
+/// (system prompts are not memories; tool output counts less than what the
+/// user says) and its length. Nothing is inferred from the words used;
+/// deciding what is durable is the extraction model's job.
+pub fn turn_importance(role: &str, content: Option<&str>) -> f32 {
+    let base: f32 = match role {
+        "system" => return 0.0,
+        "tool" => 0.3,
+        "assistant" => 0.5,
+        "user" => 0.6,
+        _ => 0.5,
+    };
+    let length = content.map_or(0, str::len);
+    let adjust = if length > 200 {
+        0.2
+    } else if length < 20 {
+        -0.2
+    } else {
+        0.0
+    };
+    (base + adjust).clamp(0.1, 1.0)
+}
+
 /// Fraction of distinct query words that occur as words in `text`
 /// (0.0-1.0), counting every word, stopwords included. Unlike
 /// [`term_overlap`], a short query such as "who is she" keeps all its words:
@@ -308,6 +331,28 @@ pub fn word_overlap(query: &str, text: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_importance_reads_role_and_length_only() {
+        assert_eq!(turn_importance("system", Some("anything")), 0.0);
+        assert!(
+            turn_importance("user", Some(&"a".repeat(300)))
+                > turn_importance("user", Some("a medium length message"))
+        );
+        assert!(
+            turn_importance("user", Some("ok"))
+                < turn_importance("user", Some("a medium length message"))
+        );
+        assert!(
+            turn_importance("tool", Some("output of some length"))
+                < turn_importance("user", Some("output of some length"))
+        );
+        // Wording does not matter, only structure.
+        assert_eq!(
+            turn_importance("user", Some("please remember this one")),
+            turn_importance("user", Some("the weather is mild today"))
+        );
+    }
 
     #[test]
     fn word_overlap_counts_every_word() {

@@ -105,14 +105,15 @@ pub use extract::{
 };
 pub use learning::{
     detect_domains, error_pattern, expertise_level, extract_trigger_pattern, generalize_procedure,
-    new_error_solution, new_procedure, procedure_keyed_name, summarize_solution, BehaviorPattern,
-    ErrorSolution, Expertise, LearningStore, Procedure, UserProfile,
+    new_error_solution, new_procedure, procedure_base_name, procedure_keyed_name,
+    summarize_solution, BehaviorPattern, ErrorSolution, Expertise, LearningStore, Procedure,
+    UserProfile,
 };
 pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;
 pub use scoring::{
-    episode_importance, episode_recall_boost, term_overlap, tokens, word_overlap, HybridScorer,
-    HybridWeights, Scorer, ScoringConfig,
+    episode_importance, episode_recall_boost, term_overlap, tokens, turn_importance, word_overlap,
+    HybridScorer, HybridWeights, Scorer, ScoringConfig,
 };
 pub use store::{
     latest_version, InMemoryMemoryStore, MemoryStore, Migration, SqliteMemoryStore, MIGRATIONS,

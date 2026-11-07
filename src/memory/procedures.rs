@@ -11,7 +11,7 @@ use crate::traits::{Message, Procedure};
 /// The structural helpers live in the SDK memory crate.
 pub use aidaemon_memory::{
     extract_trigger_pattern, generalize_procedure, new_error_solution as create_error_solution,
-    new_procedure as create_procedure_with_outcome,
+    new_procedure as create_procedure_with_outcome, procedure_base_name,
     procedure_keyed_name as generate_procedure_keyed_name, summarize_solution,
 };
 
@@ -76,44 +76,6 @@ fn summarize_tool_args(tool_name: &str, args_json: &str) -> String {
     }
 }
 
-/// Generate a procedure name from the task context using keyword extraction.
-pub fn generate_procedure_name(task_context: &str) -> String {
-    let lower = task_context.to_lowercase();
-
-    // Common task patterns
-    if lower.contains("build") && lower.contains("rust") {
-        return "rust-build".to_string();
-    }
-    if lower.contains("test") {
-        return "run-tests".to_string();
-    }
-    if lower.contains("deploy") {
-        return "deploy".to_string();
-    }
-    if lower.contains("debug") || lower.contains("fix") {
-        return "debug-fix".to_string();
-    }
-    if lower.contains("search") || lower.contains("find") {
-        return "search".to_string();
-    }
-    if lower.contains("install") || lower.contains("setup") {
-        return "setup".to_string();
-    }
-    if lower.contains("git") {
-        if lower.contains("commit") {
-            return "git-commit".to_string();
-        }
-        if lower.contains("push") {
-            return "git-push".to_string();
-        }
-        return "git-workflow".to_string();
-    }
-
-    // Default: extract first verb-like word
-    let words: Vec<&str> = task_context.split_whitespace().take(3).collect();
-    words.join("-").to_lowercase()
-}
-
 /// Create a new Procedure from task context.
 #[allow(dead_code)] // Compatibility wrapper
 pub fn create_procedure(name: String, trigger_pattern: String, steps: Vec<String>) -> Procedure {
@@ -157,16 +119,6 @@ mod tests {
             "[UNTRUSTED EXTERNAL DATA from 'http_request' — x]\n[END UNTRUSTED EXTERNAL DATA]"
         )
         .is_empty());
-    }
-
-    #[test]
-    fn test_generate_procedure_name() {
-        assert_eq!(
-            generate_procedure_name("Build the Rust project"),
-            "rust-build"
-        );
-        assert_eq!(generate_procedure_name("Run the tests"), "run-tests");
-        assert_eq!(generate_procedure_name("Deploy to production"), "deploy");
     }
 
     #[test]

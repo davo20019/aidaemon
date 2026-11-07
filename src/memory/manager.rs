@@ -611,7 +611,7 @@ impl MemoryManager {
             return Ok(());
         }
 
-        // session_id -> selected high-importance messages (event_id, role, content)
+        // session_id -> selected candidate messages (event_id, role, content)
         let mut sessions: std::collections::HashMap<String, Vec<(i64, String, String)>> =
             std::collections::HashMap::new();
         // session_id -> max event id seen this cycle (for cursor advancement)
@@ -676,8 +676,9 @@ impl MemoryManager {
                 if content.trim().is_empty() {
                     continue;
                 }
-                let importance = crate::memory::scoring::score_turn(&turn);
-                if importance >= 0.7 && entry.len() < 30 {
+                // Every user message long enough to hold a fact is a
+                // candidate; the consolidation model decides what is durable.
+                if aidaemon_memory::progressive::worth_extracting(&content) && entry.len() < 30 {
                     entry.push((turn.event_id, turn.role.as_str().to_string(), content));
                 }
             }
@@ -690,7 +691,7 @@ impl MemoryManager {
             sessions.len()
         );
 
-        // If no high-importance candidates were found, advance cursors so we
+        // If no candidates were found, advance cursors so we
         // don't repeatedly rescan low-signal events.
         if sessions.is_empty() {
             for (session_id, max_seen) in &session_max_seen {

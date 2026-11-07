@@ -48,14 +48,16 @@ fn test_scoring_heuristic() {
         score_medium
     );
 
-    // Keyword boost
-    msg.content = Some("this is a very important secret password".into());
+    // Long messages carry more; wording adds nothing.
+    msg.content = Some("a".repeat(250));
     let score_high = score_message(&msg);
     assert!(
         score_high >= 0.8,
-        "Score should be high for keywords: {}",
+        "A long message should be high importance: {}",
         score_high
     );
+    msg.content = Some("this is a very important secret password".into());
+    assert_eq!(score_message(&msg), score_medium);
 
     // System role
     msg.role = "system".into();

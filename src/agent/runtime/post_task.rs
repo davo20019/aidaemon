@@ -78,7 +78,7 @@ pub(super) async fn process_learning(
     // This lets us accumulate failure_count for repeated bad paths.
     if ctx.tool_calls.len() >= 2 {
         let generalized = procedures::generalize_procedure(&ctx.tool_calls);
-        let base_name = procedures::generate_procedure_name(&ctx.user_text);
+        let base_name = procedures::procedure_base_name(&generalized);
         let keyed_name = procedures::generate_procedure_keyed_name(&base_name, &generalized);
         let procedure = procedures::create_procedure_with_outcome(
             keyed_name,

@@ -270,6 +270,36 @@ pub fn extract_trigger_pattern(task_context: &str) -> String {
     truncate_bytes(first_sentence, 100).to_string()
 }
 
+/// A readable procedure name from its steps: the distinct tools it used, in
+/// order (at most three), such as `terminal-edit_file`. Steps are recorded
+/// as `tool(arguments)` (or `tool: ...`); the name never depends on the
+/// wording of the request.
+pub fn procedure_base_name(steps: &[String]) -> String {
+    let mut tools: Vec<String> = Vec::new();
+    for step in steps {
+        let tool: String = step
+            .split(['(', ':'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !tool.is_empty() && !tools.contains(&tool) {
+            tools.push(tool);
+        }
+        if tools.len() == 3 {
+            break;
+        }
+    }
+    if tools.is_empty() {
+        "procedure".to_string()
+    } else {
+        tools.join("-")
+    }
+}
+
 /// A stable, collision-resistant procedure name: the readable `base_name`
 /// plus a short hash of the normalized steps, so different workflows under
 /// a generic name ("deploy") do not overwrite each other.
@@ -382,6 +412,21 @@ mod tests {
             pattern.contains("E0382") && pattern.contains("<path>") && pattern.contains("<line>")
         );
         assert!(error_pattern(&"é".repeat(300)).len() <= 200);
+    }
+
+    #[test]
+    fn procedure_names_come_from_the_tools_used() {
+        let steps = vec![
+            "terminal(cargo build)".to_string(),
+            "edit_file(src/main.rs)".to_string(),
+            "terminal(cargo test)".to_string(),
+        ];
+        assert_eq!(procedure_base_name(&steps), "terminal-edit_file");
+        assert_eq!(
+            procedure_base_name(&["terminal: cat <path>".to_string()]),
+            "terminal"
+        );
+        assert_eq!(procedure_base_name(&[]), "procedure");
     }
 
     #[test]
