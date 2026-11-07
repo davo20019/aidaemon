@@ -74,6 +74,7 @@ pub mod conformance;
 mod embed;
 mod error;
 mod extract;
+mod learning;
 mod memory;
 mod recall;
 mod scoring;
@@ -91,6 +92,10 @@ pub use embed::{
 pub use error::{MemoryError, Result};
 pub use extract::{
     parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
+};
+pub use learning::{
+    detect_domains, expertise_level, BehaviorPattern, ErrorSolution, Expertise, LearningStore,
+    Procedure, UserProfile,
 };
 pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;
