@@ -597,6 +597,20 @@ impl Agent {
             .or_else(|| scope.mcp_tools.iter().find(|tool| tool.name() == name))
     }
 
+    /// What a call of the tool this turn runs under `name` does: the
+    /// instance judged at turn start, never a fresh registry lookup (an MCP
+    /// server reloaded mid-run could answer differently).
+    pub(super) fn sdk_call_semantics(
+        &self,
+        scope: &TurnScope<'_>,
+        name: &str,
+        arguments: &str,
+    ) -> crate::traits::ToolCallSemantics {
+        self.turn_tool(scope, name)
+            .map(|tool| tool.call_semantics(arguments))
+            .unwrap_or_default()
+    }
+
     /// The dispatch facts of the tool this turn runs under `name` (nothing
     /// special for an unknown tool).
     pub(super) fn turn_tool_facts(
@@ -815,9 +829,7 @@ impl Agent {
         let grant = clearance.grant;
         ctx.mandate_authority = grant.as_ref();
         let started = Instant::now();
-        let call_semantics = self
-            .semantics_for_exact_tool_call(&request.name, arguments)
-            .await;
+        let call_semantics = self.sdk_call_semantics(scope, &request.name, arguments);
         // The same file and caption go out once per task.
         let send_file_key = facts
             .delivers_files
@@ -1461,7 +1473,7 @@ impl Agent {
                 scope_escalation.as_ref(),
                 turn_authority.as_ref(),
             );
-            self.sdk_mandate_gate(&ctx, request, arguments)
+            self.sdk_mandate_gate(scope, &ctx, request, arguments)
                 .await
                 .map_err(|refusal| (refusal, "mandate_authority"))
         };
@@ -1481,9 +1493,7 @@ impl Agent {
                     arguments: arguments.to_string(),
                     extra_content: None,
                 };
-                let semantics = self
-                    .semantics_for_exact_tool_call(&request.name, arguments)
-                    .await;
+                let semantics = self.sdk_call_semantics(scope, &request.name, arguments);
                 if let Err(error) = self
                     .persist_pre_dispatch_policy_denial(
                         scope.emitter,
@@ -1507,9 +1517,7 @@ impl Agent {
         let answer = |output: sdk::ToolOutput| {
             GateOutcome::Answer(output.with_trust(sdk::SourceTrust::Trusted))
         };
-        let call_semantics = self
-            .semantics_for_exact_tool_call(&request.name, arguments)
-            .await;
+        let call_semantics = self.sdk_call_semantics(scope, &request.name, arguments);
         // Before a call enters a deeper subtree, newly applicable nested
         // project instructions are loaded and the call is deliberately not
         // executed, so the model reviews them and retries (CLAUDE.md,
@@ -1882,6 +1890,7 @@ impl Agent {
     /// call, or the refusal text the model should see.
     pub(super) async fn sdk_mandate_gate(
         &self,
+        scope: &TurnScope<'_>,
         ctx: &ToolExecCtx<'_>,
         request: &KernelCall,
         arguments: &str,
@@ -1891,9 +1900,7 @@ impl Agent {
             Ok(None) => return Ok(None),
             Err(error) => return Err(format!("[MANDATE AUTHORITY BLOCKED] {error}")),
         };
-        let semantics = self
-            .semantics_for_exact_tool_call(&request.name, arguments)
-            .await;
+        let semantics = self.sdk_call_semantics(scope, &request.name, arguments);
         match crate::agent::tool_execution::mandate_gate_for_tool_call(
             self,
             &goal_id,

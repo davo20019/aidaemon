@@ -750,9 +750,7 @@ impl Agent {
             .reason
             .clone()
             .unwrap_or_else(|| format!("`{}` was refused before it ran", receipt.tool));
-        let semantics = self
-            .semantics_for_exact_tool_call(&call.name, &call.arguments)
-            .await;
+        let semantics = self.sdk_call_semantics(scope, &call.name, &call.arguments);
         let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
             // Deny hooks and resolutions on SDK turns: the authority hook,
             // whose refusals carry its fixed marker, the untrusted-content

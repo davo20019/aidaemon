@@ -391,7 +391,13 @@ impl Agent {
             goal_run.trigger_type == "mandate" && goal_run.status == "running",
             "Mandate action is outside a mandate run."
         );
-        let semantics = self.semantics_for_exact_tool_call(name, arguments).await;
+        // The MCP tool judged at turn start, when this is one.
+        let semantics = match ctx.mcp_tool.filter(|tool| tool.name() == name) {
+            Some(tool) if !self.tools.iter().any(|daemon| daemon.name() == name) => {
+                tool.call_semantics(arguments)
+            }
+            _ => self.semantics_for_exact_tool_call(name, arguments).await,
+        };
         let class = crate::mandates::classify_mandate_call(name, arguments, &semantics);
         let fence = self.mandate_execution.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Mandate dispatch is missing its immutable execution role fence.")
