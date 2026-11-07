@@ -810,7 +810,8 @@ mod tests {
         assert_eq!(typed.resets_at, Some(reset));
         let message = error.to_string();
         assert!(
-            message.contains("usage limit has been reached; it resets at"),
+            // "resets at 14:00" or, past midnight, "resets on Nov 8 at 00:00".
+            message.contains("usage limit has been reached; it resets "),
             "{message}"
         );
         assert!(
