@@ -54,6 +54,8 @@ pub struct TelegramChannel {
     backoff_initial: Duration,
     backoff_max: Duration,
     state: Arc<Shared>,
+    /// Longest message sent, at most [`TELEGRAM_MAX_MESSAGE_LEN`].
+    max_message_len: usize,
     #[cfg(feature = "webhook")]
     webhook: Option<crate::webhook::WebhookConfig>,
 }
@@ -80,9 +82,17 @@ impl TelegramChannel {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Shared::default()),
+            max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
             #[cfg(feature = "webhook")]
             webhook: None,
         }
+    }
+
+    /// Split messages at `len` UTF-16 units (1 to
+    /// [`TELEGRAM_MAX_MESSAGE_LEN`]).
+    pub fn with_max_message_len(mut self, len: usize) -> Self {
+        self.max_message_len = len.clamp(1, TELEGRAM_MAX_MESSAGE_LEN);
+        self
     }
 
     /// Receive updates on a webhook instead of long polling. If the
@@ -468,7 +478,7 @@ impl TelegramChannel {
         })?;
         let reply_to = reply_to.and_then(|r| r.parse::<i64>().ok());
         let html = markdown_to_html(text);
-        let mut chunks = split_html(&html, TELEGRAM_MAX_MESSAGE_LEN);
+        let mut chunks = split_html(&html, self.max_message_len);
         if chunks.is_empty() {
             // Telegram rejects empty messages; send something visible.
             chunks.push(if text.trim().is_empty() {
@@ -527,7 +537,7 @@ impl Channel for TelegramChannel {
             delete_messages: true,
             files: true,
             commands: true,
-            max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
+            max_message_len: self.max_message_len,
         }
     }
 
@@ -586,7 +596,7 @@ impl Channel for TelegramChannel {
             ))
         })?;
         // An edit replaces one message, so keep only what fits.
-        let html = split_html(&markdown_to_html(text), TELEGRAM_MAX_MESSAGE_LEN)
+        let html = split_html(&markdown_to_html(text), self.max_message_len)
             .into_iter()
             .next()
             .unwrap_or_else(|| "\u{2063}".to_string());
@@ -741,6 +751,36 @@ impl Channel for TelegramChannel {
             .download(path, FILE_TIMEOUT)
             .await
             .map_err(Into::into)
+    }
+
+    /// A private chat with the bot carries the person's name (`getChat` on
+    /// their user id); `None` when the bot has never talked to them.
+    async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let Ok(chat_id) = user_id.parse::<i64>() else {
+            return Ok(None);
+        };
+        match self
+            .call_with_retry::<Value>("getChat", &json!({ "chat_id": chat_id }))
+            .await
+        {
+            Ok(chat) => {
+                let field = |key: &str| {
+                    chat.get(key)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                };
+                let full = match (field("first_name"), field("last_name")) {
+                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                    (Some(first), None) => Some(first.to_string()),
+                    _ => None,
+                };
+                Ok(full.or_else(|| field("username").map(str::to_string)))
+            }
+            Err(e) if e.is_auth() => Err(e.into()),
+            // An unknown chat (the bot never talked to them): no name.
+            Err(e) if e.code() == Some(400) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The bot's `/` menu (`setMyCommands`).

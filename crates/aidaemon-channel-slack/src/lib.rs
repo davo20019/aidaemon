@@ -25,6 +25,7 @@
 mod events;
 pub mod format;
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -86,6 +87,13 @@ pub struct SlackChannel {
     reconnect_max: Duration,
     http: reqwest::Client,
     bot_user_id: Mutex<Option<String>>,
+    /// Longest chunk sent, at most [`SECTION_TEXT_LIMIT`].
+    max_message_len: usize,
+    /// The latest inbound message per conversation: (channel, ts). The
+    /// typing substitute reacts to it.
+    last_inbound: Mutex<HashMap<String, (String, String)>>,
+    /// Messages wearing the typing reaction, by conversation.
+    reacting: Mutex<HashMap<String, (String, String)>>,
 }
 
 impl std::fmt::Debug for SlackChannel {
@@ -122,6 +130,36 @@ impl SlackChannel {
                 .build()
                 .unwrap_or_default(),
             bot_user_id: Mutex::new(None),
+            max_message_len: SECTION_TEXT_LIMIT,
+            last_inbound: Mutex::new(HashMap::new()),
+            reacting: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Split messages at `len` characters (1 to [`SECTION_TEXT_LIMIT`], the
+    /// most one Block Kit section holds).
+    pub fn with_max_message_len(mut self, len: usize) -> Self {
+        self.max_message_len = len.clamp(1, SECTION_TEXT_LIMIT);
+        self
+    }
+
+    /// The reaction the typing substitute shows.
+    const TYPING_REACTION: &'static str = "hourglass_flowing_sand";
+
+    /// Take the typing reaction off the conversation's message, if it has
+    /// one. Best effort.
+    async fn clear_typing(&self, conversation_id: &str) {
+        let target = self
+            .reacting
+            .lock()
+            .ok()
+            .and_then(|mut reacting| reacting.remove(conversation_id));
+        if let Some((channel, ts)) = target {
+            let body =
+                json!({ "channel": channel, "timestamp": ts, "name": Self::TYPING_REACTION });
+            if let Err(e) = self.post_bot("reactions.remove", &body).await {
+                debug!(error = %e, "could not remove the typing reaction");
+            }
         }
     }
 
@@ -396,6 +434,15 @@ impl SlackChannel {
                 }
             };
 
+            if let Some(ChannelEvent::Message(message)) = &event {
+                let (channel, _) = split_conversation_id(&message.conversation.id);
+                if let Ok(mut last) = self.last_inbound.lock() {
+                    last.insert(
+                        message.conversation.id.clone(),
+                        (channel.to_string(), message.message_id.clone()),
+                    );
+                }
+            }
             if let Some(event) = event {
                 tokio::select! {
                     _ = shutdown.cancelled() => return SessionEnd::Stop,
@@ -436,12 +483,12 @@ impl Channel for SlackChannel {
         ChannelCapabilities {
             edit_messages: true,
             buttons: true,
-            typing_indicator: false,
+            typing_indicator: true,
             threads: true,
             delete_messages: true,
             files: true,
             commands: true,
-            max_message_len: MAX_MESSAGE_LEN,
+            max_message_len: self.max_message_len,
         }
     }
 
@@ -502,7 +549,8 @@ impl Channel for SlackChannel {
         }
 
         let mut last_ts = None;
-        for chunk in split_mrkdwn(&mrkdwn, SECTION_TEXT_LIMIT) {
+        self.clear_typing(&conversation.id).await;
+        for chunk in split_mrkdwn(&mrkdwn, self.max_message_len) {
             let mut body = json!({
                 "channel": channel,
                 "text": chunk,
@@ -539,6 +587,7 @@ impl Channel for SlackChannel {
             return Err(ChannelError::Other("approval prompt has no choices".into()));
         }
         let (channel, thread_ts) = split_conversation_id(&prompt.conversation.id);
+        self.clear_typing(&prompt.conversation.id).await;
         let mrkdwn = truncate_chars(&markdown_to_mrkdwn(&prompt.text), SECTION_TEXT_LIMIT);
 
         let mut buttons = Vec::new();
@@ -591,6 +640,57 @@ impl Channel for SlackChannel {
         })
     }
 
+    /// Slack has no typing indicator for bots: the person's latest message
+    /// gets an hourglass reaction until the next reply.
+    async fn typing(&self, conversation: &Conversation) -> Result<(), ChannelError> {
+        let target = {
+            let last = self
+                .last_inbound
+                .lock()
+                .ok()
+                .and_then(|last| last.get(&conversation.id).cloned());
+            let Some(target) = last else {
+                return Ok(());
+            };
+            let Ok(mut reacting) = self.reacting.lock() else {
+                return Ok(());
+            };
+            if reacting.get(&conversation.id) == Some(&target) {
+                return Ok(());
+            }
+            reacting.insert(conversation.id.clone(), target.clone());
+            target
+        };
+        let body =
+            json!({ "channel": target.0, "timestamp": target.1, "name": Self::TYPING_REACTION });
+        match self.post_bot("reactions.add", &body).await {
+            Ok(_) => Ok(()),
+            Err(ChannelError::Other(reason)) if reason.contains("already_reacted") => Ok(()),
+            Err(e) => {
+                if let Ok(mut reacting) = self.reacting.lock() {
+                    reacting.remove(&conversation.id);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let info = self
+            .call_form("users.info", &[("user", user_id.to_string())])
+            .await?;
+        let profile = info.get("user").and_then(|user| user.get("profile"));
+        Ok(["display_name", "real_name"]
+            .iter()
+            .find_map(|key| {
+                profile
+                    .and_then(|p| p.get(*key))
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .map(str::to_string))
+    }
+
     async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
         let (channel, _) = split_conversation_id(&message.conversation_id);
         let body = json!({ "channel": channel, "ts": message.message_id });
@@ -606,6 +706,7 @@ impl Channel for SlackChannel {
         file: &OutboundFile,
     ) -> Result<MessageRef, ChannelError> {
         let (channel, thread_ts) = split_conversation_id(&conversation.id);
+        self.clear_typing(&conversation.id).await;
         let ticket = self
             .call_form(
                 "files.getUploadURLExternal",

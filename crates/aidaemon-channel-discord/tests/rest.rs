@@ -323,3 +323,40 @@ async fn download_fetches_the_attachment() {
     assert_eq!(bytes, b"\"synthetic attachment bytes\"");
     assert_eq!(http.requests()[0].method, "GET");
 }
+
+#[tokio::test]
+async fn display_name_prefers_the_global_name() {
+    let http = MockHttp::start().await;
+    http.push(
+        200,
+        json!({"id": "100000000000000001", "username": "alice", "global_name": "Alice Rivera"}),
+    );
+    let name = channel(&http)
+        .display_name("100000000000000001")
+        .await
+        .unwrap();
+    assert_eq!(name.as_deref(), Some("Alice Rivera"));
+    assert_eq!(http.requests()[0].path, "/users/100000000000000001");
+}
+
+#[tokio::test]
+async fn a_shorter_message_length_splits_sooner() {
+    let http = MockHttp::start().await;
+    let ch = channel(&http).with_max_message_len(100);
+    assert_eq!(ch.capabilities().max_message_len, 100);
+    ch.send(&conv(), &OutboundMessage::text("word ".repeat(60)))
+        .await
+        .unwrap();
+    let reqs = http.requests();
+    assert!(reqs.len() >= 3);
+    for req in reqs {
+        assert!(req.body["content"].as_str().unwrap().chars().count() <= 100);
+    }
+    assert_eq!(
+        channel(&http)
+            .with_max_message_len(99_999)
+            .capabilities()
+            .max_message_len,
+        2000
+    );
+}

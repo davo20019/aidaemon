@@ -39,8 +39,15 @@ async fn capabilities_and_name() {
     assert_eq!(slack.name(), "slack");
     let caps = slack.capabilities();
     assert!(caps.edit_messages && caps.buttons && caps.threads);
-    assert!(!caps.typing_indicator);
-    assert_eq!(caps.max_message_len, 4000);
+    assert!(
+        caps.typing_indicator,
+        "the hourglass reaction stands in for typing"
+    );
+    assert_eq!(caps.max_message_len, 3000, "one Block Kit section");
+    let short = SlackChannel::new(BOT_TOKEN, APP_TOKEN).with_max_message_len(500);
+    assert_eq!(short.capabilities().max_message_len, 500);
+    let clamped = SlackChannel::new(BOT_TOKEN, APP_TOKEN).with_max_message_len(99_999);
+    assert_eq!(clamped.capabilities().max_message_len, 3000);
     assert_eq!(slack.with_name("slack-work").name(), "slack-work");
 }
 
@@ -396,4 +403,34 @@ async fn answer_command_posts_an_ephemeral_reply_to_the_response_url() {
     };
     assert!(slack.answer_command(&elsewhere, "hi").await.is_err());
     assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn display_name_reads_the_profile() {
+    let api = MockApi::start(|_, _| {
+        Response::json(json!({
+            "ok": true,
+            "user": { "id": "U000ALICE", "profile": { "display_name": "", "real_name": "Alice Rivera" } }
+        }))
+    })
+    .await;
+    let name = channel(&api).display_name("U000ALICE").await.unwrap();
+    assert_eq!(name.as_deref(), Some("Alice Rivera"));
+    assert!(api.calls("users.info")[0].body.contains("user=U000ALICE"));
+}
+
+#[tokio::test]
+async fn a_shorter_message_length_splits_sooner() {
+    let api = ok_api().await;
+    let slack = channel(&api).with_max_message_len(100);
+    let text = "word ".repeat(60);
+    slack
+        .send(&group(), &OutboundMessage::text(text))
+        .await
+        .unwrap();
+    let posts = api.calls("chat.postMessage");
+    assert!(posts.len() >= 3, "{} posts", posts.len());
+    for post in posts {
+        assert!(post.json()["text"].as_str().unwrap().chars().count() <= 100);
+    }
 }

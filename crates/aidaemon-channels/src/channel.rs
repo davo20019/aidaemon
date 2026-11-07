@@ -292,6 +292,12 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// The name a person shows on the platform, by their platform user id
+    /// (`None` when the platform has none to give).
+    async fn display_name(&self, _user_id: &str) -> Result<Option<String>, ChannelError> {
+        Ok(None)
+    }
+
     /// Answer a [`CommandInvocation`]. The default sends `text` to its
     /// conversation.
     async fn answer_command(

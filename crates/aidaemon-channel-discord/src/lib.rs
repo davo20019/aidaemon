@@ -67,6 +67,8 @@ pub struct DiscordChannel {
     backoff_initial: Duration,
     backoff_max: Duration,
     state: Arc<Mutex<gateway::GatewayState>>,
+    /// Longest message sent, at most [`MAX_MESSAGE_LEN`].
+    max_message_len: usize,
 }
 
 impl DiscordChannel {
@@ -84,7 +86,14 @@ impl DiscordChannel {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Mutex::new(gateway::GatewayState::default())),
+            max_message_len: MAX_MESSAGE_LEN,
         }
+    }
+
+    /// Split messages at `len` characters (1 to [`MAX_MESSAGE_LEN`]).
+    pub fn with_max_message_len(mut self, len: usize) -> Self {
+        self.max_message_len = len.clamp(1, MAX_MESSAGE_LEN);
+        self
     }
 
     /// Channel name (session-id prefix). Default `discord`.
@@ -169,7 +178,7 @@ impl DiscordChannel {
                 "discord: cannot send an empty message".into(),
             ));
         }
-        let mut chunks = split_message(text, MAX_MESSAGE_LEN);
+        let mut chunks = split_message(text, self.max_message_len);
         let last = chunks.pop().unwrap_or_default();
         let mut reply_to = reply_to.map(str::to_string);
         for chunk in chunks {
@@ -274,7 +283,7 @@ impl Channel for DiscordChannel {
             delete_messages: true,
             files: true,
             commands: true,
-            max_message_len: MAX_MESSAGE_LEN,
+            max_message_len: self.max_message_len,
         }
     }
 
@@ -303,7 +312,7 @@ impl Channel for DiscordChannel {
     /// is truncated.
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {
         let body = json!({
-            "content": format::truncate_chars(text, MAX_MESSAGE_LEN),
+            "content": format::truncate_chars(text, self.max_message_len),
             "allowed_mentions": {"parse": []},
             "components": [],
         });
@@ -371,7 +380,7 @@ impl Channel for DiscordChannel {
         let caption = file
             .caption
             .as_deref()
-            .map(|caption| format::truncate_chars(caption, MAX_MESSAGE_LEN))
+            .map(|caption| format::truncate_chars(caption, self.max_message_len))
             .unwrap_or_default();
         let payload = json!({
             "content": caption,
@@ -402,6 +411,18 @@ impl Channel for DiscordChannel {
         self.rest.download(&attachment.source).await
     }
 
+    async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let user = self
+            .rest
+            .request(Method::GET, &format!("/users/{user_id}"), None)
+            .await?;
+        Ok(["global_name", "username"]
+            .iter()
+            .find_map(|key| user.get(*key).and_then(Value::as_str))
+            .filter(|name| !name.is_empty())
+            .map(str::to_string))
+    }
+
     /// Registered now when the gateway is ready, else on its READY.
     async fn register_commands(&self, commands: &[CommandSpec]) -> Result<(), ChannelError> {
         let application_id = {
@@ -428,7 +449,7 @@ impl Channel for DiscordChannel {
             ));
         };
         let body = json!({
-            "content": format::truncate_chars(text, MAX_MESSAGE_LEN),
+            "content": format::truncate_chars(text, self.max_message_len),
             "allowed_mentions": {"parse": []},
         });
         self.rest

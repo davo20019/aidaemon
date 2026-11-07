@@ -358,3 +358,56 @@ async fn slash_commands_become_command_events() {
         .unwrap()
         .unwrap();
 }
+
+/// Slack has no bot typing indicator: the person's latest message gets an
+/// hourglass reaction, which the next reply takes off.
+#[tokio::test]
+async fn typing_reacts_to_the_latest_message_until_the_reply() {
+    let socket = MockSocket::start(vec![vec![
+        hello(),
+        events_api(
+            "env-typing",
+            json!({
+                "type": "message", "user": "U000ALICE", "channel": "D000SYNTH",
+                "channel_type": "im", "ts": "1700000000.000700", "text": "are you there"
+            }),
+        ),
+    ]])
+    .await;
+    let api = standard_api(socket.url.clone()).await;
+    let slack = std::sync::Arc::new(channel(&api));
+    let (tx, mut rx) = mpsc::channel(4);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let runner = slack.clone();
+    let run = tokio::spawn(async move { runner.run(tx, stop).await });
+
+    let ChannelEvent::Message(message) = next_event(&mut rx).await else {
+        panic!("expected a message")
+    };
+    slack.typing(&message.conversation).await.unwrap();
+    slack.typing(&message.conversation).await.unwrap();
+    let added = api.calls("reactions.add");
+    assert_eq!(added.len(), 1, "one reaction however often typing is shown");
+    assert_eq!(
+        added[0].json(),
+        json!({ "channel": "D000SYNTH", "timestamp": "1700000000.000700", "name": "hourglass_flowing_sand" })
+    );
+    slack
+        .send(
+            &message.conversation,
+            &aidaemon_channels::OutboundMessage::text("yes"),
+        )
+        .await
+        .unwrap();
+    let removed = api.calls("reactions.remove");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].json()["timestamp"], "1700000000.000700");
+
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

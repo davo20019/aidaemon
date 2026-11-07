@@ -1014,3 +1014,43 @@ async fn webhook_mode_falls_back_to_polling_when_the_listener_cannot_bind() {
     run.stop().await.unwrap();
     drop(taken);
 }
+
+#[tokio::test]
+async fn display_name_comes_from_the_private_chat() {
+    let (mock, base) = start_mock().await;
+    mock.script_ok(
+        "getChat",
+        json!({ "id": 100000001, "type": "private", "first_name": "Alice", "last_name": "Rivera" }),
+    );
+    let ch = channel(&base);
+    assert_eq!(
+        ch.display_name("100000001").await.unwrap().as_deref(),
+        Some("Alice Rivera")
+    );
+    mock.script(
+        "getChat",
+        400,
+        json!({ "ok": false, "error_code": 400, "description": "Bad Request: chat not found" }),
+    );
+    assert_eq!(ch.display_name("100000009").await.unwrap(), None);
+    assert_eq!(ch.display_name("not-a-number").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_shorter_message_length_splits_sooner() {
+    let (mock, base) = start_mock().await;
+    let ch = channel(&base).with_max_message_len(100);
+    assert_eq!(ch.capabilities().max_message_len, 100);
+    let conversation = Conversation {
+        id: DM_CHAT.to_string(),
+        kind: ConversationKind::Direct,
+    };
+    ch.send(&conversation, &OutboundMessage::text("word ".repeat(60)))
+        .await
+        .unwrap();
+    let sends = mock.calls("sendMessage");
+    assert!(sends.len() >= 3, "{} sends", sends.len());
+    for send in sends {
+        assert!(send.body["text"].as_str().unwrap().encode_utf16().count() <= 100);
+    }
+}
