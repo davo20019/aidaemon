@@ -3698,8 +3698,8 @@ mod tests {
 
     #[test]
     fn confirmation_access_summary_translates_scopes_without_leaking_adapter_json() {
-        let mut authority = MandateAuthority::default();
-        authority.operation_scopes = serde_json::from_value(json!([
+        let authority = MandateAuthority {
+            operation_scopes: serde_json::from_value(json!([
             {
                 "tool": "http_request",
                 "operation": "GET",
@@ -3736,8 +3736,10 @@ mod tests {
                 "allowed_query_params": [],
                 "mutation_effects": ["remote_mutation", "external_delivery"]
             }
-        ]))
-        .unwrap();
+            ]))
+            .unwrap(),
+            ..MandateAuthority::default()
+        };
 
         let summary = display_access_summary(&authority);
         assert!(summary.contains("read mentions of the connected X account"));

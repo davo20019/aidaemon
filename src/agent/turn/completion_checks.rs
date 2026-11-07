@@ -161,29 +161,6 @@ fn send_file_completion_reply() -> &'static str {
     "I've sent the requested file. If you want any changes or another file, tell me exactly what to send."
 }
 
-#[cfg(test)]
-pub(super) fn looks_like_recovery_message_with_trivial_content(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    let is_recovery_prefix = lower.starts_with("here is the latest tool output")
-        || lower.starts_with("here is the latest result")
-        || lower.starts_with("here's the command output")
-        || lower.starts_with("here's what i found")
-        || lower.starts_with("here's what i retrieved")
-        || lower.starts_with("here's the file content")
-        || lower.starts_with("here are the results")
-        || lower.starts_with("done. here's");
-    if !is_recovery_prefix {
-        return false;
-    }
-    // Extract content after the header line
-    if let Some(pos) = lower.find('\n') {
-        let content = lower[pos..].trim();
-        return content.is_empty() || is_trivial_tool_output(content);
-    }
-    // Header only, no substantive content
-    lower.len() < 60
-}
-
 /// Strip the `[UNTRUSTED EXTERNAL DATA ...]...[END UNTRUSTED EXTERNAL DATA]`
 /// wrapper that the tool execution framework adds to tool results. The raw content
 /// is needed for trivial-output detection, since the wrapper obscures the actual output.

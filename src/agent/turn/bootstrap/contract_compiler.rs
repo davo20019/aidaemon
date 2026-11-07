@@ -2441,7 +2441,7 @@ mod tests {
                 "terminal".to_string(),
                 crate::traits::ToolReceiptKind::Process,
             )],
-            structural_filesystem_resources: &[file.clone()],
+            structural_filesystem_resources: std::slice::from_ref(&file),
             structural_project_scopes: &[],
             project_alias_roots: &[],
             bound_workspace: None,

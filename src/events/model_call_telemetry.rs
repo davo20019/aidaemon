@@ -69,28 +69,6 @@ pub async fn record_model_call_telemetry(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::token_usage_evidence;
-    use crate::events::TokenUsageEvidence;
-
-    #[test]
-    fn token_usage_provenance_never_presents_an_estimate_as_provider_measurement() {
-        assert_eq!(
-            token_usage_evidence(true, Some(12_345)),
-            TokenUsageEvidence::ProviderMeasured
-        );
-        assert_eq!(
-            token_usage_evidence(false, Some(12_345)),
-            TokenUsageEvidence::EstimatedInputOnly
-        );
-        assert_eq!(
-            token_usage_evidence(false, None),
-            TokenUsageEvidence::Unavailable
-        );
-    }
-}
-
 /// Convenience wrapper for non-agent-loop LLM calls that do not have iteration
 /// or prompt-prefix metadata but still need correlated detailed and aggregate
 /// telemetry.
@@ -245,4 +223,26 @@ async fn record_background_call(
         },
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_usage_evidence;
+    use crate::events::TokenUsageEvidence;
+
+    #[test]
+    fn token_usage_provenance_never_presents_an_estimate_as_provider_measurement() {
+        assert_eq!(
+            token_usage_evidence(true, Some(12_345)),
+            TokenUsageEvidence::ProviderMeasured
+        );
+        assert_eq!(
+            token_usage_evidence(false, Some(12_345)),
+            TokenUsageEvidence::EstimatedInputOnly
+        );
+        assert_eq!(
+            token_usage_evidence(false, None),
+            TokenUsageEvidence::Unavailable
+        );
+    }
 }

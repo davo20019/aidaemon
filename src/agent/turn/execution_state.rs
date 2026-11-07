@@ -348,59 +348,6 @@ impl ExecutionState {
         self.persisted_at = Some(Utc::now());
     }
 
-    /// Charge one attempt only when the staged step reaches actual or
-    /// synthetic tool execution.
-    #[cfg(test)]
-    pub fn begin_staged_step(&mut self) -> bool {
-        let Some(step) = self.current_step.as_ref() else {
-            return false;
-        };
-        let operation_key = if step.operation_key.is_empty() {
-            step.step_id.clone()
-        } else {
-            step.operation_key.clone()
-        };
-        let attempts = self
-            .operation_attempts
-            .get(&operation_key)
-            .copied()
-            .unwrap_or_default();
-        if attempts >= step.retry_policy.max_attempts.max(1) {
-            return false;
-        }
-        let invocations = self
-            .operation_invocations
-            .get(&operation_key)
-            .copied()
-            .unwrap_or_default();
-        if invocations >= step.retry_policy.max_invocations.max(1) {
-            return false;
-        }
-        if let (Some(cardinality_key), Some(limit)) =
-            (step.cardinality_key.as_ref(), step.cardinality_limit)
-        {
-            let used = self
-                .obligation_invocations
-                .get(cardinality_key)
-                .copied()
-                .unwrap_or_default();
-            if used >= limit.max(1) {
-                return false;
-            }
-        }
-        *self.operation_invocations.entry(operation_key).or_default() =
-            invocations.saturating_add(1);
-        if let Some(cardinality_key) = step.cardinality_key.as_ref() {
-            let used = self
-                .obligation_invocations
-                .entry(cardinality_key.clone())
-                .or_default();
-            *used = used.saturating_add(1);
-        }
-        self.steps_used = self.steps_used.saturating_add(1);
-        true
-    }
-
     pub fn install_linear_intent_plan(&mut self, plan_version: u32, steps: Vec<LinearIntentStep>) {
         if steps.is_empty() {
             self.active_linear_intent_plan = None;

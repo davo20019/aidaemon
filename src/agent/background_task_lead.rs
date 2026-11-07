@@ -4085,7 +4085,11 @@ mod tests {
         for goal_status in ["active", "pending"] {
             pending.status = goal_status.to_string();
             assert_eq!(
-                goal_run_terminal_status(&pending.status, Some("completed"), &[task.clone()]),
+                goal_run_terminal_status(
+                    &pending.status,
+                    Some("completed"),
+                    std::slice::from_ref(&task)
+                ),
                 None
             );
         }

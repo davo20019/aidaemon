@@ -102,70 +102,6 @@ pub async fn health_response(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn health_fixture() -> (
-        SqlitePool,
-        Arc<crate::events::EventStore>,
-        tempfile::NamedTempFile,
-    ) {
-        let file = tempfile::NamedTempFile::new().expect("temporary health database");
-        let pool = SqlitePool::connect(&format!("sqlite:{}", file.path().display()))
-            .await
-            .expect("connect health database");
-        let event_store = Arc::new(
-            crate::events::EventStore::new(pool.clone())
-                .await
-                .expect("event store"),
-        );
-        (pool, event_store, file)
-    }
-
-    async fn append_provider_outcome(
-        event_store: &crate::events::EventStore,
-        failed: bool,
-        kind: Option<crate::providers::ProviderErrorKind>,
-    ) {
-        event_store
-            .append(crate::events::Event::new(
-                "synthetic-health-session",
-                crate::events::EventType::LlmCall,
-                json!({
-                    "task_id": "synthetic-health-task",
-                    "model": "synthetic-model",
-                    "latency_ms": 1,
-                    "failed": failed,
-                    "provider_error_kind": kind,
-                    "provider_status": if failed { Some(401) } else { None::<u16> }
-                }),
-            ))
-            .await
-            .expect("append provider outcome");
-    }
-
-    #[tokio::test]
-    async fn health_is_degraded_by_typed_auth_failure_and_closed_by_later_success() {
-        let (pool, event_store, _file) = health_fixture().await;
-        append_provider_outcome(
-            event_store.as_ref(),
-            true,
-            Some(crate::providers::ProviderErrorKind::Auth),
-        )
-        .await;
-
-        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.0["components"]["provider"]["status"], "unavailable");
-
-        append_provider_outcome(event_store.as_ref(), false, None).await;
-        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.0["components"]["provider"]["status"], "ready");
-    }
-}
-
 /// Generate and write a systemd service file (Linux).
 #[cfg(target_os = "linux")]
 pub fn install_service() -> anyhow::Result<()> {
@@ -358,5 +294,69 @@ pub fn spawn_macos_keep_awake() {
     {
         Ok(_) => info!("macOS keep-awake active (caffeinate -i -w {pid})"),
         Err(e) => tracing::warn!("Could not start caffeinate keep-awake: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn health_fixture() -> (
+        SqlitePool,
+        Arc<crate::events::EventStore>,
+        tempfile::NamedTempFile,
+    ) {
+        let file = tempfile::NamedTempFile::new().expect("temporary health database");
+        let pool = SqlitePool::connect(&format!("sqlite:{}", file.path().display()))
+            .await
+            .expect("connect health database");
+        let event_store = Arc::new(
+            crate::events::EventStore::new(pool.clone())
+                .await
+                .expect("event store"),
+        );
+        (pool, event_store, file)
+    }
+
+    async fn append_provider_outcome(
+        event_store: &crate::events::EventStore,
+        failed: bool,
+        kind: Option<crate::providers::ProviderErrorKind>,
+    ) {
+        event_store
+            .append(crate::events::Event::new(
+                "synthetic-health-session",
+                crate::events::EventType::LlmCall,
+                json!({
+                    "task_id": "synthetic-health-task",
+                    "model": "synthetic-model",
+                    "latency_ms": 1,
+                    "failed": failed,
+                    "provider_error_kind": kind,
+                    "provider_status": if failed { Some(401) } else { None::<u16> }
+                }),
+            ))
+            .await
+            .expect("append provider outcome");
+    }
+
+    #[tokio::test]
+    async fn health_is_degraded_by_typed_auth_failure_and_closed_by_later_success() {
+        let (pool, event_store, _file) = health_fixture().await;
+        append_provider_outcome(
+            event_store.as_ref(),
+            true,
+            Some(crate::providers::ProviderErrorKind::Auth),
+        )
+        .await;
+
+        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["components"]["provider"]["status"], "unavailable");
+
+        append_provider_outcome(event_store.as_ref(), false, None).await;
+        let (status, body) = health_response(&pool, Some(event_store.as_ref())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["components"]["provider"]["status"], "ready");
     }
 }

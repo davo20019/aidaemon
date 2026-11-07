@@ -1619,6 +1619,8 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 /// yolo terminal (auto-approved). Nothing here is mocked except the channel.
 pub struct LiveHarness {
     pub agent: Agent,
+    /// For inspecting a live run while debugging; no check reads it yet.
+    #[allow(dead_code)]
     pub state: Arc<SqliteStateStore>,
     pub event_store: Arc<EventStore>,
     _db_file: tempfile::NamedTempFile,

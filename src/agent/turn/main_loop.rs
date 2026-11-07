@@ -1515,7 +1515,7 @@ mod offered_tool_tests {
             write_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, &out).unwrap()],
             adapter_read_targets: Vec::new(),
         };
-        let scopes = owner_fallback_scopes(&[proj.clone()], None, Some(&assessed));
+        let scopes = owner_fallback_scopes(std::slice::from_ref(&proj), None, Some(&assessed));
         let call = ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: Vec::new(),

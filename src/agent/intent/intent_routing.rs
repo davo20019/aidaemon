@@ -80,7 +80,6 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     if is_observation_delivery_turn(user_text) {
         return IntentGateDecision {
             needs_tools: Some(false),
-            ..Default::default()
         };
     }
 
@@ -103,7 +102,6 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     {
         return IntentGateDecision {
             needs_tools: Some(true),
-            ..Default::default()
         };
     }
 

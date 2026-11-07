@@ -141,8 +141,10 @@ mod tests {
     #[tokio::test]
     async fn macos_say_produces_bounded_canonical_stereo_wav() {
         let directory = tempfile::tempdir().unwrap();
-        let mut config = NodeSpeechConfig::default();
-        config.enabled = true;
+        let config = NodeSpeechConfig {
+            enabled: true,
+            ..NodeSpeechConfig::default()
+        };
         let artifact = MacOsSaySpeech::new(config)
             .synthesize("Hi Bella.", directory.path(), 512 * 1024)
             .await

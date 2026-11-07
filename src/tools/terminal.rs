@@ -8886,7 +8886,11 @@ mod tests {
         );
         // A future exact write path covers descendant roots the same way.
         assert_eq!(
-            select_materialized_write_roots(&[file.clone()], &[dir.clone()], only_cwd_exists),
+            select_materialized_write_roots(
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&dir),
+                only_cwd_exists
+            ),
             Vec::<String>::new()
         );
         // A future output directory under an EXISTING grant is still prepared
@@ -8896,19 +8900,31 @@ mod tests {
             vec![cwd.clone(), dir.clone()]
         );
         assert_eq!(
-            select_materialized_write_roots(&[dir.clone()], &[cwd.clone()], only_cwd_exists),
+            select_materialized_write_roots(
+                std::slice::from_ref(&dir),
+                std::slice::from_ref(&cwd),
+                only_cwd_exists
+            ),
             vec![dir.clone()]
         );
         // The same FUTURE path declared as both an exact write path and a
         // root is a contradiction; the exact form wins and nothing is
         // materialized (the command owns that target).
         assert_eq!(
-            select_materialized_write_roots(&[file.clone()], &[file.clone()], only_cwd_exists),
+            select_materialized_write_roots(
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&file),
+                only_cwd_exists
+            ),
             Vec::<String>::new()
         );
         // An existing directory declared in both forms keeps its root grant.
         assert_eq!(
-            select_materialized_write_roots(&[cwd.clone()], &[cwd.clone()], only_cwd_exists),
+            select_materialized_write_roots(
+                std::slice::from_ref(&cwd),
+                std::slice::from_ref(&cwd),
+                only_cwd_exists
+            ),
             vec![cwd.clone()]
         );
         // Sibling prefixes are not ancestors.
@@ -8925,7 +8941,7 @@ mod tests {
         // role it was declared in.
         let file_exists = |path: &str| (path == file).then_some(false);
         assert_eq!(
-            select_materialized_write_roots(&[file.clone()], &[], file_exists),
+            select_materialized_write_roots(std::slice::from_ref(&file), &[], file_exists),
             Vec::<String>::new()
         );
     }
@@ -8959,7 +8975,7 @@ mod tests {
             &backend,
             &script,
             Some(&cwd),
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
             &[],
             &[
                 root.to_string_lossy().to_string(),
@@ -9003,7 +9019,7 @@ mod tests {
             &backend,
             script,
             Some(&cwd),
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
             &[],
             &[cwd.clone(), root.to_string_lossy().to_string()],
             ConfinedCapabilities::default(),
@@ -9149,7 +9165,7 @@ mod tests {
             &backend,
             "node --version",
             Some(&cwd),
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
             &[],
         )
         .await
@@ -9279,8 +9295,8 @@ mod tests {
             &backend,
             "cargo check --offline --quiet",
             Some(&cwd),
-            &[cwd.clone()],
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
+            std::slice::from_ref(&cwd),
         )
         .await
         .expect("confined request");
@@ -9347,8 +9363,8 @@ mod tests {
             &backend,
             "cargo new synthetic-created --quiet",
             Some(&cwd),
-            &[cwd.clone()],
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
+            std::slice::from_ref(&cwd),
         )
         .await
         .expect("confined request");
@@ -9395,7 +9411,7 @@ mod tests {
             &backend,
             "root=\"$PWD/synthetic-lifecycle\"; trap 'rm -rf -- \"$root\"' EXIT; cargo new --vcs none synthetic-lifecycle --quiet && cd synthetic-lifecycle && cargo build --quiet && cargo test --quiet && test \"$(cargo run --quiet)\" = 'Hello, world!'",
             Some(&cwd),
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
             &[created.to_string_lossy().to_string()],
         )
         .await
@@ -9480,7 +9496,7 @@ mod tests {
             &backend,
             "root=\"$PWD/synthetic-python-lifecycle\"; trap 'rm -rf -- \"$root\"' EXIT; mkdir \"$root\" && printf 'VALUE = 42\\n' > \"$root/module.py\" && python3 -m venv \"$root/.venv\" && \"$root/.venv/bin/python\" -c 'import sys; sys.path.insert(0, sys.argv[1]); import module; assert module.VALUE == 42' \"$root\"",
             Some(&cwd),
-            &[cwd.clone()],
+            std::slice::from_ref(&cwd),
             &[created.to_string_lossy().to_string()],
         )
         .await
@@ -9863,7 +9879,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        let host = TerminalTool::new(
+        let _host = TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(approval_tx),
