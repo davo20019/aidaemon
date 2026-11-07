@@ -106,6 +106,40 @@ impl std::fmt::Debug for SlackChannel {
     }
 }
 
+/// A Socket Mode envelope as Slack sent it, already acknowledged (see
+/// [`SlackChannel::run_envelopes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackEnvelope {
+    /// `events_api`, `interactive`, `slash_commands`, ...
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// Where a session delivers what it receives.
+#[derive(Clone, Copy)]
+enum Sink<'a> {
+    /// Mapped to [`ChannelEvent`]s.
+    Events(&'a mpsc::Sender<ChannelEvent>),
+    /// As sent.
+    Envelopes(&'a mpsc::Sender<SlackEnvelope>),
+}
+
+impl Sink<'_> {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Events(tx) => tx.is_closed(),
+            Self::Envelopes(tx) => tx.is_closed(),
+        }
+    }
+
+    async fn closed(&self) {
+        match self {
+            Self::Events(tx) => tx.closed().await,
+            Self::Envelopes(tx) => tx.closed().await,
+        }
+    }
+}
+
 enum SessionEnd {
     /// Shutdown requested or the event receiver went away.
     Stop,
@@ -340,7 +374,7 @@ impl SlackChannel {
         &self,
         ws: WsStream,
         bot_user_id: &str,
-        events: &mpsc::Sender<ChannelEvent>,
+        sink: Sink<'_>,
         shutdown: &CancellationToken,
         seen: &mut SeenMessages,
     ) -> SessionEnd {
@@ -357,7 +391,7 @@ impl SlackChannel {
                     let _ = tx.send(Message::Close(None)).await;
                     return SessionEnd::Stop;
                 }
-                _ = events.closed() => {
+                _ = sink.closed() => {
                     let _ = tx.send(Message::Close(None)).await;
                     return SessionEnd::Stop;
                 }
@@ -404,7 +438,37 @@ impl SlackChannel {
             }
 
             let payload = envelope.get("payload").unwrap_or(&Value::Null);
-            let event = match envelope.get("type").and_then(Value::as_str) {
+            let kind = envelope.get("type").and_then(Value::as_str);
+            if let (Sink::Envelopes(envelopes), Some(kind)) = (sink, kind) {
+                if !matches!(kind, "hello" | "disconnect") {
+                    let envelope = SlackEnvelope {
+                        kind: kind.to_string(),
+                        payload: payload.clone(),
+                    };
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return SessionEnd::Stop,
+                        sent = envelopes.send(envelope) => {
+                            if sent.is_err() {
+                                return SessionEnd::Stop;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            let Sink::Events(events) = sink else {
+                // hello and disconnect, handled below.
+                match kind {
+                    Some("hello") => saw_hello = true,
+                    Some("disconnect") => {
+                        let _ = tx.send(Message::Close(None)).await;
+                        return reconnect(true, saw_hello);
+                    }
+                    _ => {}
+                }
+                continue;
+            };
+            let event = match kind {
                 Some("hello") => {
                     debug!("Slack socket hello");
                     saw_hello = true;
@@ -458,14 +522,67 @@ impl SlackChannel {
 
     async fn connect_and_serve(
         &self,
-        events: &mpsc::Sender<ChannelEvent>,
+        sink: Sink<'_>,
         shutdown: &CancellationToken,
         seen: &mut SeenMessages,
     ) -> Result<SessionEnd, ChannelError> {
         let bot_user_id = self.ensure_bot_user_id().await?;
         let ws = self.open_socket().await?;
         info!(channel = %self.name, "Slack socket connected");
-        Ok(self.session(ws, &bot_user_id, events, shutdown, seen).await)
+        Ok(self.session(ws, &bot_user_id, sink, shutdown, seen).await)
+    }
+
+    /// Hold the Socket Mode connection (acknowledging every envelope,
+    /// answering pings, following `disconnect`, reconnecting with backoff)
+    /// and hand each envelope over as Slack sent it, for a host that reads
+    /// Slack's own event shapes. Like [`Channel::run`] otherwise.
+    pub async fn run_envelopes(
+        &self,
+        envelopes: mpsc::Sender<SlackEnvelope>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ChannelError> {
+        self.serve(Sink::Envelopes(&envelopes), shutdown).await
+    }
+
+    async fn serve(&self, sink: Sink<'_>, shutdown: CancellationToken) -> Result<(), ChannelError> {
+        let mut seen = SeenMessages::default();
+        let mut backoff = self.reconnect_initial;
+
+        loop {
+            if shutdown.is_cancelled() || sink.is_closed() {
+                return Ok(());
+            }
+            let outcome = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                outcome = self.connect_and_serve(sink, &shutdown, &mut seen) => outcome,
+            };
+            match outcome {
+                Ok(SessionEnd::Stop) => return Ok(()),
+                Ok(SessionEnd::Reconnect {
+                    immediate,
+                    saw_hello,
+                }) => {
+                    if saw_hello {
+                        backoff = self.reconnect_initial;
+                    }
+                    if immediate {
+                        continue;
+                    }
+                }
+                Err(ChannelError::Auth(reason)) => return Err(ChannelError::Auth(reason)),
+                Err(e) => warn!(error = %e, "Slack connection failed"),
+            }
+
+            debug!(
+                delay_ms = backoff.as_millis() as u64,
+                "Slack reconnect backoff"
+            );
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(self.reconnect_max);
+        }
     }
 
     fn section(text: &str) -> Value {
@@ -497,44 +614,7 @@ impl Channel for SlackChannel {
         events: mpsc::Sender<ChannelEvent>,
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError> {
-        let mut seen = SeenMessages::default();
-        let mut backoff = self.reconnect_initial;
-
-        loop {
-            if shutdown.is_cancelled() || events.is_closed() {
-                return Ok(());
-            }
-            let outcome = tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
-                outcome = self.connect_and_serve(&events, &shutdown, &mut seen) => outcome,
-            };
-            match outcome {
-                Ok(SessionEnd::Stop) => return Ok(()),
-                Ok(SessionEnd::Reconnect {
-                    immediate,
-                    saw_hello,
-                }) => {
-                    if saw_hello {
-                        backoff = self.reconnect_initial;
-                    }
-                    if immediate {
-                        continue;
-                    }
-                }
-                Err(ChannelError::Auth(reason)) => return Err(ChannelError::Auth(reason)),
-                Err(e) => warn!(error = %e, "Slack connection failed"),
-            }
-
-            debug!(
-                delay_ms = backoff.as_millis() as u64,
-                "Slack reconnect backoff"
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(self.reconnect_max);
-        }
+        self.serve(Sink::Events(&events), shutdown).await
     }
 
     async fn send(

@@ -411,3 +411,55 @@ async fn typing_reacts_to_the_latest_message_until_the_reply() {
         .unwrap()
         .unwrap();
 }
+
+/// The envelope mode hands every envelope over as Slack sent it (acked,
+/// unmapped, bot messages included) and still follows `disconnect`.
+#[tokio::test]
+async fn run_envelopes_hands_over_each_envelope_as_sent() {
+    let bot_message = json!({
+        "type": "message", "subtype": "bot_message", "bot_id": "B000SYNTH",
+        "channel": "C000SYNTH", "ts": "1700000000.000200", "text": "beep"
+    });
+    let socket = MockSocket::start(vec![
+        vec![
+            hello(),
+            events_api("env-1", bot_message.clone()),
+            json!({ "type": "disconnect", "reason": "refresh_requested" }),
+        ],
+        vec![
+            hello(),
+            json!({ "envelope_id": "env-2", "type": "slash_commands", "payload": { "command": "/status" } }),
+        ],
+    ])
+    .await;
+    let api = standard_api(socket.url.clone()).await;
+    let slack = channel(&api);
+    let (tx, mut rx) = mpsc::channel(4);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let run = tokio::spawn(async move { slack.run_envelopes(tx, stop).await });
+
+    let first = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.kind, "events_api");
+    assert_eq!(first.payload["event"], bot_message);
+    let second = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.kind, "slash_commands");
+    assert_eq!(second.payload["command"], "/status");
+    assert_eq!(
+        socket.wait_for_acks(2).await,
+        vec!["env-1".to_string(), "env-2".to_string()]
+    );
+
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
