@@ -72,16 +72,22 @@
 #[cfg(feature = "conformance")]
 pub mod conformance;
 mod embed;
+pub mod embedding_index;
 mod error;
 mod extract;
 mod learning;
 mod memory;
+pub mod neighborhood;
+pub mod people_intelligence;
+pub mod profile;
 mod recall;
 pub mod records;
+pub mod retrieval_eval;
 mod scoring;
 mod store;
 pub mod stores;
 mod system;
+mod text;
 mod tools;
 mod types;
 mod writer;

@@ -208,8 +208,12 @@ impl DaemonRecall {
                 .get(&turn.session_id)
                 .cloned();
             let (profile_str, new_ids, digest) = or_logged(
-                crate::memory::core_profile::build_core_profile(state, cached_ids, people_enabled)
-                    .await,
+                crate::memory::core_profile::build_core_profile(
+                    state.as_ref(),
+                    cached_ids,
+                    people_enabled,
+                )
+                .await,
                 "core_profile",
             );
             if let Some(ids) = new_ids {
