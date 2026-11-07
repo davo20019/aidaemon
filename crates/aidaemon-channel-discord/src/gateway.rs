@@ -32,6 +32,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 pub(crate) struct GatewayState {
     pub(crate) bot_user_id: Option<String>,
+    /// The bot's username, from READY.
+    pub(crate) bot_username: Option<String>,
+    /// Register commands in this guild instead of globally.
+    pub(crate) command_guild: Option<String>,
     /// The application id, from READY (needed to register commands).
     pub(crate) application_id: Option<String>,
     /// The command menu to (re-)register when the gateway becomes ready.
@@ -382,6 +386,11 @@ impl DiscordChannel {
                     .get("resume_gateway_url")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                st.bot_username = d
+                    .get("user")
+                    .and_then(|u| u.get("username"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 st.application_id = d
                     .get("application")
                     .and_then(|a| a.get("id"))
@@ -395,8 +404,11 @@ impl DiscordChannel {
                     (st.application_id.clone(), st.commands.clone())
                 {
                     let rest = self.rest.clone();
+                    let guild = st.command_guild.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = crate::put_commands(&rest, &app, &commands).await {
+                        if let Err(e) =
+                            crate::put_commands(&rest, &app, guild.as_deref(), &commands).await
+                        {
                             tracing::warn!(error = %e, "discord: command registration failed");
                         }
                     });

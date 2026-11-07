@@ -142,6 +142,39 @@ impl DiscordChannel {
         self.state.lock().unwrap().bot_user_id.clone()
     }
 
+    /// The bot's username, known after the gateway's READY event.
+    pub fn bot_username(&self) -> Option<String> {
+        self.state.lock().unwrap().bot_username.clone()
+    }
+
+    /// Register the command menu in this guild (it shows at once) instead
+    /// of globally (which can take an hour to appear).
+    pub fn with_command_guild(self, guild_id: impl Into<String>) -> Self {
+        self.state.lock().unwrap().command_guild = Some(guild_id.into());
+        self
+    }
+
+    /// The direct conversation with a user, opened if needed
+    /// (`POST /users/@me/channels`).
+    pub async fn open_direct(&self, user_id: &str) -> Result<Conversation, ChannelError> {
+        let channel = self
+            .rest
+            .request(
+                Method::POST,
+                "/users/@me/channels",
+                Some(&json!({ "recipient_id": user_id })),
+            )
+            .await?;
+        let id = channel
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ChannelError::Other("discord: DM channel without id".into()))?;
+        Ok(Conversation {
+            id: id.to_string(),
+            kind: aidaemon_channels::ConversationKind::Direct,
+        })
+    }
+
     async fn post_message(
         &self,
         channel_id: &str,
@@ -194,6 +227,7 @@ impl DiscordChannel {
 pub(crate) async fn put_commands(
     rest: &rest::Rest,
     application_id: &str,
+    guild_id: Option<&str>,
     commands: &[CommandSpec],
 ) -> Result<(), ChannelError> {
     let body: Vec<Value> = commands
@@ -212,13 +246,13 @@ pub(crate) async fn put_commands(
             })
         })
         .collect();
-    rest.request(
-        Method::PUT,
-        &format!("/applications/{application_id}/commands"),
-        Some(&Value::Array(body)),
-    )
-    .await
-    .map(|_| ())
+    let path = match guild_id {
+        Some(guild) => format!("/applications/{application_id}/guilds/{guild}/commands"),
+        None => format!("/applications/{application_id}/commands"),
+    };
+    rest.request(Method::PUT, &path, Some(&Value::Array(body)))
+        .await
+        .map(|_| ())
 }
 
 fn message_body(content: &str, reply_to: Option<&str>) -> Value {
@@ -425,13 +459,13 @@ impl Channel for DiscordChannel {
 
     /// Registered now when the gateway is ready, else on its READY.
     async fn register_commands(&self, commands: &[CommandSpec]) -> Result<(), ChannelError> {
-        let application_id = {
+        let (application_id, guild) = {
             let mut st = self.state.lock().unwrap();
             st.commands = Some(commands.to_vec());
-            st.application_id.clone()
+            (st.application_id.clone(), st.command_guild.clone())
         };
         match application_id {
-            Some(app) => put_commands(&self.rest, &app, commands).await,
+            Some(app) => put_commands(&self.rest, &app, guild.as_deref(), commands).await,
             None => Ok(()),
         }
     }

@@ -468,3 +468,32 @@ async fn commands_asked_for_before_ready_are_registered_on_ready() {
     assert_eq!(http.wait_for(2).await[1].method, "PUT");
     run.finish().await.unwrap();
 }
+
+#[tokio::test]
+async fn guild_commands_register_in_the_guild_and_ready_names_the_bot() {
+    let http = MockHttp::start().await;
+    let gw = MockGateway::start().await;
+    let run = start(
+        channel(&http)
+            .with_gateway_url(gw.url.clone())
+            .with_command_guild(GUILD_ID),
+    );
+    run.channel
+        .register_commands(&[aidaemon_channels::CommandSpec {
+            name: "help".to_string(),
+            description: "Show available commands".to_string(),
+        }])
+        .await
+        .unwrap();
+    let mut conn = gw.accept().await;
+    conn.hello(45_000).await;
+    conn.recv().await;
+    conn.ready("synthetic-session-1", &gw.url).await;
+    let reqs = http.wait_for(1).await;
+    assert_eq!(
+        reqs[0].path,
+        format!("/applications/{BOT_ID}/guilds/{GUILD_ID}/commands")
+    );
+    assert_eq!(run.channel.bot_username().as_deref(), Some("aidaemon"));
+    run.finish().await.unwrap();
+}

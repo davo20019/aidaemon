@@ -360,3 +360,18 @@ async fn a_shorter_message_length_splits_sooner() {
         2000
     );
 }
+
+#[tokio::test]
+async fn open_direct_creates_the_dm_channel() {
+    let http = MockHttp::start().await;
+    http.push(200, json!({"id": "100000000000000900", "type": 1}));
+    let conversation = channel(&http)
+        .open_direct("100000000000000001")
+        .await
+        .unwrap();
+    assert_eq!(conversation.id, "100000000000000900");
+    assert_eq!(conversation.kind, ConversationKind::Direct);
+    let reqs = http.requests();
+    assert_eq!(reqs[0].path, "/users/@me/channels");
+    assert_eq!(reqs[0].body, json!({"recipient_id": "100000000000000001"}));
+}
