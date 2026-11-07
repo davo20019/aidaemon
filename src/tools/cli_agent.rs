@@ -108,6 +108,19 @@ const MAX_PROMPT_SIZE: usize = 16384;
 /// Max git diff size to append to results (4 KB)
 const MAX_DIFF_SIZE: usize = 4096;
 
+tokio::task_local! {
+    /// Set by the call when it leaves its work running in the background
+    /// (started async, moved to background, or a check of a task still
+    /// running), so the outcome is typed from what the call did, never
+    /// guessed from its text (a finished agent's output can say anything).
+    static LEFT_IN_BACKGROUND: std::cell::Cell<bool>;
+}
+
+/// Record that this call left its work running in the background.
+fn mark_left_in_background() {
+    let _ = LEFT_IN_BACKGROUND.try_with(|flag| flag.set(true));
+}
+
 fn format_background_progress(
     tool_name: &str,
     task_context: &str,
@@ -3163,6 +3176,7 @@ impl CliAgentTool {
                 guard.disarm();
             }
 
+            mark_left_in_background();
             return Ok(format!(
                 "CLI agent '{}' started in background (task_id={}). \
                  Use action=\"check\" with task_id=\"{}\" to see output when done.",
@@ -3365,6 +3379,7 @@ impl CliAgentTool {
                     guard.disarm();
                 }
 
+                mark_left_in_background();
                 Ok(format!(
                     "CLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
                      Use action=\"check\" with task_id=\"{}\" to see output, or action=\"cancel\" to stop it.\n\n\
@@ -3501,6 +3516,7 @@ impl CliAgentTool {
                         "Requested task_id '{task_id}' was not found. Recovered the only recent CLI task for this session instead (task_id={recovered_id}, {status}).\n\n{result}"
                     ));
                 }
+                mark_left_in_background();
                 return Ok(format!(
                     "Requested task_id '{task_id}' was not found. Recovered the only active CLI task for this session (task_id={recovered_id}, {status}). Use action=\"check\" with task_id=\"{recovered_id}\"."
                 ));
@@ -3533,6 +3549,7 @@ impl CliAgentTool {
         if !is_running {
             Ok(Self::build_finished_result(&self.backend, agent).await)
         } else {
+            mark_left_in_background();
             Ok(format!(
                 "CLI agent '{}' still running ({}s elapsed, pid={}).\n\
                  Task: {}...\n\n\
@@ -4435,7 +4452,12 @@ impl crate::traits::ToolSemantics for CliAgentTool {
     }
 }
 
-fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolCallOutcome {
+fn cli_agent_outcome(
+    action: &str,
+    output: String,
+    read_only_run: bool,
+    left_in_background: bool,
+) -> ToolCallOutcome {
     let exit_code = cli_agent_exit_code(&output);
     let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
     let policy_block = output.trim_start().starts_with("Blocked:");
@@ -4452,11 +4474,7 @@ fn cli_agent_outcome(action: &str, output: String, read_only_run: bool) -> ToolC
             },
             ..ToolCallMetadata::default()
         }
-    } else if output.contains("started in background")
-        || output.contains("Moved to background")
-        || output.contains("still running")
-        || output.contains("only active CLI task for this session")
-    {
+    } else if left_in_background {
         ToolCallMetadata {
             outcome_status: Some(ToolOutcomeStatus::Backgrounded),
             background_started: true,
@@ -4517,16 +4535,26 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let output = self
-            .call_with_status_under_contract(
-                arguments,
-                status_tx,
-                read_only_run,
-                enforce_native_access,
-                facts,
-            )
+        let (output, left_in_background) = LEFT_IN_BACKGROUND
+            .scope(std::cell::Cell::new(false), async {
+                let output = self
+                    .call_with_status_under_contract(
+                        arguments,
+                        status_tx,
+                        read_only_run,
+                        enforce_native_access,
+                        facts,
+                    )
+                    .await?;
+                anyhow::Ok((output, LEFT_IN_BACKGROUND.with(std::cell::Cell::get)))
+            })
             .await?;
-        Ok(cli_agent_outcome(&action, output, read_only_run))
+        Ok(cli_agent_outcome(
+            &action,
+            output,
+            read_only_run,
+            left_in_background,
+        ))
     }
 
     async fn call_with_status_under_contract(
@@ -6988,6 +7016,50 @@ mod tests {
         assert!(recovered.contains("Recovered the only recent CLI task"));
         assert!(recovered.contains(&format!("task_id={real_task_id}")));
         assert!(recovered.contains("recovered-result"));
+    }
+
+    /// The outcome comes from what the call did: a finished agent whose own
+    /// output says "still running" or "moved to background" is not a
+    /// background handoff, and an async start is one.
+    #[tokio::test]
+    async fn background_outcome_is_typed_not_read_from_the_output() {
+        let (tool, _db) = setup_bash_tool().await;
+        let finished = tool
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"echo 'the server is still running. Moved to background earlier.'"}"#,
+                None,
+                false,
+                &crate::testing::call_facts("session-typed-finish"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            finished.output.contains("still running"),
+            "{}",
+            finished.output
+        );
+        assert_ne!(
+            finished.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded),
+            "{}",
+            finished.output
+        );
+        assert!(!finished.metadata.background_started);
+
+        let started = tool
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo later","async_mode":true}"#,
+                None,
+                false,
+                &crate::testing::call_facts("session-typed-async"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            started.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded)
+        );
+        assert!(started.metadata.background_started);
     }
 
     #[tokio::test]

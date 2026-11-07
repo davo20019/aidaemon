@@ -154,7 +154,7 @@ impl Tool for SendFileTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
+        Ok(self.run(arguments, &ToolCallContext::default()).await?.text)
     }
 
     async fn call_with_status_outcome(
@@ -172,14 +172,10 @@ impl Tool for SendFileTool {
         _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
         facts: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.run(arguments, &facts).await?;
-        let outcome_status = if output.starts_with("File sent:") {
-            ToolOutcomeStatus::Succeeded
-        } else if output.starts_with("File queued for delivery:") {
-            ToolOutcomeStatus::Backgrounded
-        } else {
-            ToolOutcomeStatus::FailedPermanent
-        };
+        let SendReply {
+            status: outcome_status,
+            text: output,
+        } = self.run(arguments, &facts).await?;
         let outcome = ToolCallOutcome {
             metadata: ToolCallMetadata {
                 outcome_status: Some(outcome_status),
@@ -205,7 +201,7 @@ impl SendFileTool {
         &self,
         arguments: &str,
         facts: &ToolCallContext,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<SendReply> {
         let args: Value = serde_json::from_str(arguments)?;
 
         let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
@@ -223,15 +219,15 @@ impl SendFileTool {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         if resource_id.is_some() && explicit_path.is_some() {
-            return Ok(
+            return Ok(SendReply::failed(
                 "Error: Provide exactly one of resource_id or file_path, not both.".to_string(),
-            );
+            ));
         }
 
         let registered_resource = if let Some(resource_id) = resource_id {
             match self.resolve_resource(session_id, resource_id).await {
                 Ok(resource) => Some(resource),
-                Err(reason) => return Ok(format!("Error: {reason}")),
+                Err(reason) => return Ok(SendReply::failed(format!("Error: {reason}"))),
             }
         } else {
             None
@@ -241,7 +237,9 @@ impl SendFileTool {
             .map(|resource| resource.locator.as_str())
             .or(explicit_path);
         let Some(file_path) = file_path else {
-            return Ok("Error: Missing resource_id or file_path.".to_string());
+            return Ok(SendReply::failed(
+                "Error: Missing resource_id or file_path.".to_string(),
+            ));
         };
 
         let backend = self.backend.clone();
@@ -250,14 +248,24 @@ impl SendFileTool {
         if registered_resource.is_none() && backend.kind() != BackendKind::Local {
             let backend_path = match backend.resolve_path(file_path).await {
                 Ok(path) => path,
-                Err(error) => return Ok(format!("Error: Invalid execution path: {error}")),
+                Err(error) => {
+                    return Ok(SendReply::failed(format!(
+                        "Error: Invalid execution path: {error}"
+                    )))
+                }
             };
             let metadata = match backend.metadata(&backend_path).await {
                 Ok(metadata) => metadata,
-                Err(_) => return Ok(format!("Error: File not found: {file_path}")),
+                Err(_) => {
+                    return Ok(SendReply::failed(format!(
+                        "Error: File not found: {file_path}"
+                    )))
+                }
             };
             if !metadata.is_file() {
-                return Ok(format!("Error: Not a regular file: {file_path}"));
+                return Ok(SendReply::failed(format!(
+                    "Error: Not a regular file: {file_path}"
+                )));
             }
             let canonical = backend
                 .canonicalize(&backend_path)
@@ -266,19 +274,19 @@ impl SendFileTool {
             if crate::tools::file_delivery::is_path_blocked(std::path::Path::new(
                 canonical.as_str(),
             )) {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: Sending this file is blocked for security reasons: {file_path}"
-                ));
+                )));
             }
             let filename = canonical.file_name().unwrap_or("file");
             let local_staging = self.inbox_dir.join(filename);
             if let Err(error) = backend.export_local_file(&canonical, &local_staging).await {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: Could not export {} from the {} execution backend for delivery: {}",
                     file_path,
                     backend.kind().as_str(),
                     error
-                ));
+                )));
             }
             requested_for_delivery = local_staging.to_string_lossy().into_owned();
             exported_from_backend = true;
@@ -286,10 +294,10 @@ impl SendFileTool {
 
         if let Some(resource) = &registered_resource {
             let Some(expected_sha256) = resource.sha256.as_deref() else {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: Resource {} has no integrity receipt and cannot be delivered safely.",
                     resource.resource_id
-                ));
+                )));
             };
             let actual_sha256 =
                 crate::channels::attachments::sha256_file(Path::new(&requested_for_delivery));
@@ -300,10 +308,10 @@ impl SendFileTool {
                     "file content changed after registration",
                 )
                 .await;
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: Resource {} changed after it was registered and was invalidated. Recreate or reattach the file before sending it.",
                     resource.resource_id
-                ));
+                )));
             }
         }
 
@@ -316,28 +324,34 @@ impl SendFileTool {
         ) {
             Ok(r) => r,
             Err(DeliveryError::FileNotFound(_)) => {
-                return Ok(format!("Error: File not found: {}", file_path));
+                return Ok(SendReply::failed(format!(
+                    "Error: File not found: {}",
+                    file_path
+                )));
             }
             Err(DeliveryError::NotRegularFile(_)) => {
-                return Ok(format!("Error: Not a regular file: {}", file_path));
+                return Ok(SendReply::failed(format!(
+                    "Error: Not a regular file: {}",
+                    file_path
+                )));
             }
             Err(DeliveryError::Blocked(_)) => {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: Sending this file is blocked for security reasons: {}",
                     file_path
-                ));
+                )));
             }
             Err(DeliveryError::OutsideAllowedDirs(_)) => {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: File is outside allowed directories: {}. Only files in the allowed \
                      output directories or a system temp dir can be sent. Move the file into {} \
                      and send that path instead.",
                     file_path,
                     self.inbox_dir.display(),
-                ));
+                )));
             }
             Err(DeliveryError::RecoveryFailed { path, error }) => {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "Error: File is outside allowed directories ({}). I tried to copy it into \
                      the allowed inbox directory {} but that failed: {}. Copy the file into {} \
                      (e.g. with the terminal tool: cp '{}' '{}/') and send that path instead.",
@@ -347,7 +361,7 @@ impl SendFileTool {
                     self.inbox_dir.display(),
                     path.display(),
                     self.inbox_dir.display(),
-                ));
+                )));
             }
         };
 
@@ -379,38 +393,71 @@ impl SendFileTool {
         match tokio::time::timeout(self.receipt_timeout, receipt_rx).await {
             Ok(Ok(Ok(()))) => {} // delivered — fall through to the success text
             Ok(Ok(Err(reason))) => {
-                return Ok(format!(
+                return Ok(SendReply::failed(format!(
                     "The file {} could not be delivered: {}. Do NOT tell the user it was sent; \
                      report the delivery failure instead.",
                     ready.filename, reason
-                ));
+                )));
             }
             // Receipt channel dropped or timed out: the message is still in the
             // delivery queue (e.g. waiting out a rate-limit retry) — report
             // pending honestly instead of claiming completion.
             Ok(Err(_)) | Err(_) => {
-                return Ok(format!(
+                return Ok(SendReply::queued(format!(
                     "File queued for delivery: {} ({}). The channel is congested; it should \
                      arrive shortly. Phrase your reply as \"sending\" (in progress), not \"sent\".",
                     ready.filename, size_display
-                ));
+                )));
             }
         }
 
         if exported_from_backend {
-            Ok(format!(
+            Ok(SendReply::sent(format!(
                 "File sent: {} ({}) [exported from the {} execution backend]",
                 ready.filename,
                 size_display,
                 backend.kind().as_str()
-            ))
+            )))
         } else if ready.recovered_into_inbox {
-            Ok(format!(
+            Ok(SendReply::sent(format!(
                 "File sent: {} ({}) [copied into the inbox for delivery]",
                 ready.filename, size_display
-            ))
+            )))
         } else {
-            Ok(format!("File sent: {} ({})", ready.filename, size_display))
+            Ok(SendReply::sent(format!(
+                "File sent: {} ({})",
+                ready.filename, size_display
+            )))
+        }
+    }
+}
+
+/// What a `send_file` call did, typed where the reply is produced.
+pub(crate) struct SendReply {
+    pub(crate) status: ToolOutcomeStatus,
+    pub(crate) text: String,
+}
+
+impl SendReply {
+    fn sent(text: String) -> Self {
+        Self {
+            status: ToolOutcomeStatus::Succeeded,
+            text,
+        }
+    }
+
+    /// Waiting in the delivery queue: handed to the background.
+    fn queued(text: String) -> Self {
+        Self {
+            status: ToolOutcomeStatus::Backgrounded,
+            text,
+        }
+    }
+
+    fn failed(text: impl Into<String>) -> Self {
+        Self {
+            status: ToolOutcomeStatus::FailedPermanent,
+            text: text.into(),
         }
     }
 }
