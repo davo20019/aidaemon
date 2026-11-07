@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_channels::testing::{direct, group, message, TestChannel};
+use aidaemon_channels::ChannelEvent;
 use aidaemon_channels::{
     AccessPolicy, ChannelError, ChannelRunner, EventRouter, MemorySessionIndex, RunnerConfig,
     SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
@@ -254,6 +255,41 @@ async fn direct_message_round_trip() {
     assert_eq!(
         run.channel.sent_texts("chat-1"),
         vec!["Hello, Alice Rivera."]
+    );
+    run.stop().await;
+}
+
+/// A command picked from the platform's menu is answered and then handled
+/// as if typed: `/new` resets the conversation instead of reaching the
+/// model.
+#[tokio::test]
+async fn menu_commands_are_answered_and_handled_like_typed_ones() {
+    let provider = scripted(vec![text("never")]);
+    let run = Setup::new(provider.clone()).start();
+    run.channel.inject(ChannelEvent::Command(
+        aidaemon_channels::CommandInvocation {
+            conversation: aidaemon_channels::testing::direct("chat-cmd"),
+            sender: aidaemon_channels::testing::sender(OWNER),
+            name: "new".to_string(),
+            args: String::new(),
+            handle: "synthetic-handle".to_string(),
+        },
+    ));
+    assert!(
+        run.channel
+            .wait_for(Duration::from_secs(2), |channel| channel
+                .sent_texts("chat-cmd")
+                .len()
+                >= 2)
+            .await,
+        "{:?}",
+        run.channel.sent_texts("chat-cmd")
+    );
+    let sent = run.channel.sent_texts("chat-cmd");
+    assert_eq!(sent[0], "Got it.", "the invocation is answered first");
+    assert!(
+        provider.requests().is_empty(),
+        "/new never reaches the model"
     );
     run.stop().await;
 }

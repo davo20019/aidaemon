@@ -236,6 +236,9 @@ impl Channel for DiscordChannel {
             buttons: true,
             typing_indicator: true,
             threads: true,
+            delete_messages: false,
+            files: false,
+            commands: false,
             max_message_len: MAX_MESSAGE_LEN,
         }
     }

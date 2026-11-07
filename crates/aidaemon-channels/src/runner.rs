@@ -482,6 +482,25 @@ impl Inner {
     async fn handle_event(self: &Arc<Self>, channel: usize, event: ChannelEvent) {
         match event {
             ChannelEvent::Message(message) => self.handle_message(channel, message).await,
+            // A command picked from the platform's menu is handled as if
+            // typed; the invocation itself is answered so the platform does
+            // not leave it pending.
+            ChannelEvent::Command(command) => {
+                if let Some(adapter) = self.channels.get(channel) {
+                    if let Err(error) = adapter.answer_command(&command, "Got it.").await {
+                        tracing::debug!(%error, "could not answer a command invocation");
+                    }
+                }
+                let message = InboundMessage {
+                    text: command.as_text(),
+                    conversation: command.conversation,
+                    sender: command.sender,
+                    message_id: String::new(),
+                    attachments: Vec::new(),
+                    addressed: true,
+                };
+                self.handle_message(channel, message).await;
+            }
             ChannelEvent::Approval(answer) => {
                 let approve = match answer.choice_id.as_str() {
                     APPROVE_CHOICE => true,

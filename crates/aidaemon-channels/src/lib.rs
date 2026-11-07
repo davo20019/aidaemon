@@ -29,8 +29,8 @@ pub mod testing;
 
 pub use channel::{
     ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, Channel, ChannelCapabilities,
-    ChannelError, ChannelEvent, Conversation, ConversationKind, InboundMessage, MessageRef,
-    OutboundMessage, Sender,
+    ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind,
+    InboundMessage, MessageRef, OutboundFile, OutboundMessage, Sender,
 };
 pub use policy::{AccessPolicy, Admission, SenderRole, DEFAULT_REFUSAL};
 pub use router::EventRouter;

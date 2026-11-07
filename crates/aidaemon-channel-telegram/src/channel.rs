@@ -379,6 +379,9 @@ impl Channel for TelegramChannel {
             buttons: true,
             typing_indicator: true,
             threads: true,
+            delete_messages: false,
+            files: false,
+            commands: false,
             max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
         }
     }

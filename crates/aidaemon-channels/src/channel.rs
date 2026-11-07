@@ -121,12 +121,60 @@ pub struct ApprovalAnswer {
     pub conversation: Conversation,
 }
 
+/// A command the app offers in the platform's own command menu (Discord and
+/// Slack slash commands, Telegram's `/` menu).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSpec {
+    /// Without the leading `/`; lowercase letters, digits and `_`.
+    pub name: String,
+    pub description: String,
+}
+
+/// A command invoked through the platform's command UI rather than typed
+/// as text (a typed `/command` arrives as an [`InboundMessage`]). Answer it
+/// with [`Channel::answer_command`]: some platforms show the invocation as
+/// pending until it is answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInvocation {
+    pub conversation: Conversation,
+    pub sender: Sender,
+    /// Without the leading `/`.
+    pub name: String,
+    /// Everything after the command name, trimmed.
+    pub args: String,
+    /// Adapter-defined token for answering this invocation.
+    pub handle: String,
+}
+
+impl CommandInvocation {
+    /// The invocation as the text a user would have typed.
+    pub fn as_text(&self) -> String {
+        if self.args.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} {}", self.name, self.args)
+        }
+    }
+}
+
 /// Everything a channel reports to the runner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ChannelEvent {
     Message(InboundMessage),
     Approval(ApprovalAnswer),
+    Command(CommandInvocation),
+}
+
+/// A file to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundFile {
+    /// File name shown to the recipient.
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub mime_type: Option<String>,
+    /// Markdown caption sent with the file.
+    pub caption: Option<String>,
 }
 
 /// What a channel supports; the runner adapts to it.
@@ -136,6 +184,12 @@ pub struct ChannelCapabilities {
     pub buttons: bool,
     pub typing_indicator: bool,
     pub threads: bool,
+    /// [`Channel::delete`] works.
+    pub delete_messages: bool,
+    /// [`Channel::send_file`] and [`Channel::download`] work.
+    pub files: bool,
+    /// The platform has a command menu ([`Channel::register_commands`]).
+    pub commands: bool,
     /// Longest message the platform accepts, in characters.
     pub max_message_len: usize,
 }
@@ -147,6 +201,9 @@ impl Default for ChannelCapabilities {
             buttons: false,
             typing_indicator: false,
             threads: false,
+            delete_messages: false,
+            files: false,
+            commands: false,
             max_message_len: 4000,
         }
     }
@@ -207,5 +264,43 @@ pub trait Channel: Send + Sync {
     /// Show a "typing" indicator. Best effort.
     async fn typing(&self, _conversation: &Conversation) -> Result<(), ChannelError> {
         Ok(())
+    }
+
+    /// Delete a message the bot sent.
+    async fn delete(&self, _message: &MessageRef) -> Result<(), ChannelError> {
+        Err(ChannelError::Unsupported("delete"))
+    }
+
+    /// Send a file, with an optional caption.
+    async fn send_file(
+        &self,
+        _conversation: &Conversation,
+        _file: &OutboundFile,
+    ) -> Result<MessageRef, ChannelError> {
+        Err(ChannelError::Unsupported("files"))
+    }
+
+    /// Fetch the bytes of an inbound attachment.
+    async fn download(&self, _attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+        Err(ChannelError::Unsupported("files"))
+    }
+
+    /// Offer `commands` in the platform's command menu, replacing what was
+    /// offered before. A platform whose commands are configured outside the
+    /// API (Slack's app manifest) accepts the call and does nothing.
+    async fn register_commands(&self, _commands: &[CommandSpec]) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    /// Answer a [`CommandInvocation`]. The default sends `text` to its
+    /// conversation.
+    async fn answer_command(
+        &self,
+        command: &CommandInvocation,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        self.send(&command.conversation, &OutboundMessage::text(text))
+            .await
+            .map(|_| ())
     }
 }

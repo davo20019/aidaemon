@@ -402,6 +402,9 @@ impl Channel for SlackChannel {
             buttons: true,
             typing_indicator: false,
             threads: true,
+            delete_messages: false,
+            files: false,
+            commands: false,
             max_message_len: MAX_MESSAGE_LEN,
         }
     }
