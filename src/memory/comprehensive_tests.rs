@@ -2414,24 +2414,3 @@ async fn test_context_window_token_estimation() {
     let long = "a".repeat(4000);
     assert_eq!(estimate_tokens(&long), 1000); // 4000/4 = 1000
 }
-
-/// Verify context window should_extract_facts filtering.
-#[tokio::test]
-async fn test_should_extract_facts_filtering() {
-    use crate::memory::context_window::should_extract_facts;
-
-    // Trivial messages should be filtered
-    assert!(!should_extract_facts("ok"));
-    assert!(!should_extract_facts("thanks"));
-    assert!(!should_extract_facts("yes"));
-    assert!(!should_extract_facts("lol"));
-    assert!(!should_extract_facts("short")); // <20 chars
-
-    // Meaningful messages should pass
-    assert!(should_extract_facts(
-        "My dog's name is Mia and she's a golden retriever"
-    ));
-    assert!(should_extract_facts(
-        "I work at Acme Corp in the engineering department"
-    ));
-}

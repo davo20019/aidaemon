@@ -240,10 +240,10 @@ async fn test_summary_crud() {
     );
 }
 
-/// Verify should_extract_facts filters trivial messages correctly.
+/// Verify the extraction gate filters trivial messages correctly.
 #[tokio::test]
 async fn test_should_extract_facts_filtering() {
-    use crate::memory::context_window::should_extract_facts;
+    use aidaemon_memory::progressive::worth_extracting as should_extract_facts;
 
     // Trivial messages should be filtered out
     assert!(!should_extract_facts("ok"));

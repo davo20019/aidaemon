@@ -878,7 +878,7 @@ impl MemoryManager {
                                     // Identity facts (user.name etc.) must appear in
                                     // the user's own messages — never adopt a name the
                                     // model lifted from elsewhere in the conversation.
-                                    if crate::memory::context_window::identity_fact_lacks_user_evidence(
+                                    if aidaemon_memory::progressive::identity_fact_lacks_user_evidence(
                                         &fact.category,
                                         &fact.key,
                                         &fact.value,

@@ -80,6 +80,7 @@ mod memory;
 pub mod neighborhood;
 pub mod people_intelligence;
 pub mod profile;
+pub mod progressive;
 mod recall;
 pub mod records;
 pub mod retrieval_eval;

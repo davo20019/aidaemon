@@ -70,7 +70,7 @@ impl sdk::Hook for DaemonMemoryWriter {
                 turn.memory_isolated(),
                 turn.memory_persistence_allowed,
                 self.settings.progressive_facts,
-                crate::memory::context_window::should_extract_facts(&turn.user_text),
+                aidaemon_memory::progressive::worth_extracting(&turn.user_text),
                 self.settings.summarization,
             );
             if extract {

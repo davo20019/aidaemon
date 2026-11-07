@@ -6,40 +6,20 @@
 //! - **System B**: Sliding-window summarization — preserves context when messages are trimmed.
 //! - **System C**: Progressive fact extraction — extracts durable facts immediately after interactions.
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::ContextWindowConfig;
 use crate::events::EventStore;
-use crate::providers::ChatJson;
 use crate::traits::StateStore;
 use crate::types::UserRole;
 
-/// Maximum concurrent background extraction LLM calls.
-static EXTRACTION_SEMAPHORE: std::sync::LazyLock<Semaphore> =
-    std::sync::LazyLock::new(|| Semaphore::new(2));
 /// Rolling provider/model correction for the portable chars/4 fallback.
 static TOKEN_ESTIMATE_CORRECTION: std::sync::LazyLock<
     std::sync::RwLock<HashMap<String, (f64, u32)>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
-
-/// A fact extracted from conversation by progressive extraction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InlineFact {
-    pub category: String,
-    pub key: String,
-    pub value: String,
-    #[serde(default)]
-    pub graph: crate::traits::ExtractedMemoryGraph,
-    #[serde(default)]
-    pub personal_memory: Option<crate::traits::PersonalMemoryWrite>,
-    #[serde(default)]
-    pub lifetime: crate::memory::FactLifetime,
-}
 
 /// Estimate token count from text using a simple heuristic (~4 chars per token).
 pub fn estimate_tokens(text: &str) -> usize {
@@ -567,315 +547,14 @@ pub(crate) fn compact_summary_input(content: &str, max_chars: usize) -> String {
     aidaemon_policies::elide_middle(content, max_chars)
 }
 
-/// Check if a user message is worth extracting facts from.
+/// Run progressive fact extraction in the background: the SDK memory
+/// crate's [`ProgressiveExtractor`] proposes and writes the facts, and the
+/// daemon records the write in its flight recorder.
 ///
-/// Returns `false` for trivial messages (very short, greetings, acknowledgments).
-/// This prevents wasting LLM calls on messages that will never contain durable facts.
-pub fn should_extract_facts(user_text: &str) -> bool {
-    let trimmed = user_text.trim();
-
-    // Too short to contain meaningful facts
-    if trimmed.len() < 20 {
-        return false;
-    }
-
-    // Single emoji or very short acknowledgments
-    let lower = trimmed.to_lowercase();
-    let trivial = [
-        "ok",
-        "okay",
-        "thanks",
-        "thank you",
-        "thx",
-        "yes",
-        "no",
-        "yep",
-        "nope",
-        "sure",
-        "got it",
-        "cool",
-        "nice",
-        "great",
-        "good",
-        "lol",
-        "haha",
-        "hmm",
-        "ah",
-        "oh",
-        "right",
-        "exactly",
-        "agreed",
-        "understood",
-        "roger",
-        "k",
-        "kk",
-        "ty",
-        "np",
-        "👍",
-        "👋",
-        "🙏",
-        "✅",
-        "done",
-        "perfect",
-        "awesome",
-    ];
-
-    if trivial.contains(&lower.as_str()) {
-        return false;
-    }
-
-    true
-}
-
-/// Extract durable facts from a user-assistant interaction using a fast LLM.
-///
-/// Returns facts worth remembering (user preferences, personal info, project details).
-/// Returns `[]` when nothing worth remembering (most interactions).
-/// Rate-limited by a static semaphore (max 2 concurrent calls).
-pub async fn extract_inline_facts(
-    provider: &crate::llm_runtime::ModelBackend,
-    model: &str,
-    user_message: &str,
-    assistant_response: &str,
-    state: Option<&Arc<dyn StateStore>>,
-    event_store: Option<Arc<EventStore>>,
-) -> anyhow::Result<Vec<InlineFact>> {
-    // Acquire semaphore permit to limit concurrent extraction calls
-    let _permit = EXTRACTION_SEMAPHORE.acquire().await?;
-
-    let llm_messages = vec![
-        json!({
-            "role": "system",
-            "content": (["You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
-                        Return a JSON array of objects with 'category', 'key', 'value', and optional 'graph' or 'personal_memory' fields.\n\n\
-                        Categories: user (personal info), preference (likes/dislikes), project (project details), technical (technical facts).\n\
-                        Use snake_case keys for non-personal facts. For personal/profile facts involving names, aliases, handles, birth dates, residence, accounts, or family relationships, include a 'personal_memory' write plan and do not encode identity in a dynamic key. The plan has entities [{local_id,entity_type,canonical_name,is_reference,canonical_name_confirmed}], aliases [{entity_local_id,value,alias_type}], facts [{subject_local_id,predicate,value,display_value,valid_from,valid_to}], relationships [{source_local_id,relationship_type,target_local_id,valid_from,valid_to}], direct_user_statement, and correction. Use local_id 'owner' for the user. A later alias mention uses is_reference=true; a newly declared person uses false. Relationship types are PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT.\n\n\
-                        CORRECTIONS: If the user is correcting or updating previously stated information (e.g., \"actually\", \"not X, it's Y\", \
-                        \"I changed\", \"I meant\"), extract the CORRECTED fact using the same key format as the original would have used. \
-                        The corrected value will automatically supersede the old one.\n\n\
-                        IDENTITY: The 'user' category is ONLY for facts the user states about THEMSELVES in first person. \
-                        Never store another person's name (friend, family member, client, applicant, public figure) under a user \
-                        identity key like 'name'. When the user talks about someone else, do not extract a 'user' fact from it.\n\n\
-                        GRAPH: When the fact contains named entities and a useful relationship, include: \
-                        \"graph\":{\"entities\":[{\"local_id\":\"e1\",\"name\":\"...\",\"entity_type\":\"person|project|technology|organization|place|concept\",\"aliases\":[],\"confidence\":0.0}], \
-                        \"relationships\":[{\"source_id\":\"e1\",\"target_id\":\"e2\",\"relation\":\"snake_case_relation\",\"confidence\":0.0}]}. \
-                        Use \"owner\" as the name for the user when needed. Only include entities and relationships directly supported by the user's words. \
-                        Do not infer entity types from fact category/key names, invent entities, or add a relationship unless both endpoints are present.\n\n\
-                        If nothing is worth remembering, return an empty array: []\n\n\
-                        Examples:\n\
-                        - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\"}]\n\
-                        - \"Actually my dog's name is Max, not Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\"}]\n\
-                        - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"dark mode\"}]\n\
-                        - \"My sister Alice lives in Tokyo, not Paris\" → emit personal_memory entities for Alice and Tokyo plus a LIVES_IN relationship; do not create sister_location\n\
-                        - \"How's the weather?\" → []\n\n\
-                        IMPORTANT: Return ONLY the JSON array, no other text.\n\n", crate::memory::FACT_LIFETIME_INSTRUCTION].concat())
-        }),
-        json!({
-            "role": "user",
-            "content": format!(
-                "User said: {}\n\nAssistant replied: {}",
-                truncate_for_extraction(user_message, 500),
-                truncate_for_extraction(assistant_response, 500)
-            )
-        }),
-    ];
-
-    let call_start = std::time::Instant::now();
-    let response = provider.chat(model, &llm_messages, &[]).await?;
-
-    if let (Some(state), Some(event_store)) = (state, event_store) {
-        crate::events::record_background_model_call_telemetry(
-            event_store,
-            state.as_ref(),
-            "background:progressive_extraction",
-            "progressive_extraction",
-            model,
-            &response,
-            call_start.elapsed(),
-        )
-        .await;
-    }
-
-    let text = match response.content {
-        Some(t) => t,
-        None => return Ok(vec![]),
-    };
-
-    // Parse JSON response — be lenient with formatting
-    let trimmed = text.trim();
-    // Try to find JSON array in the response
-    let json_str = if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            &trimmed[start..=end]
-        } else {
-            return Ok(vec![]);
-        }
-    } else {
-        return Ok(vec![]);
-    };
-
-    match serde_json::from_str::<Vec<InlineFact>>(json_str) {
-        Ok(facts) => {
-            if !facts.is_empty() {
-                info!(count = facts.len(), "Progressive extraction found facts");
-            }
-            Ok(facts)
-        }
-        Err(e) => {
-            debug!(error = %e, response = trimmed, "Failed to parse extraction response");
-            Ok(vec![])
-        }
-    }
-}
-
-/// Truncate text for extraction prompts to avoid excessive token usage.
-fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
-    if text.len() <= max_len {
-        text
-    } else {
-        let mut end = max_len;
-        while !text.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        &text[..end]
-    }
-}
-
-/// Identity-class `user` fact keys that require first-person evidence in the
-/// user's own message before they may be persisted.
-const USER_IDENTITY_KEYS: &[&str] = &["name", "full_name", "first_name", "last_name", "nickname"];
-
-/// Returns true when an extracted `user` identity fact (e.g. `name`) has no
-/// supporting evidence in the user's own words.
-///
-/// Guards against the extraction model misattributing a third-party name
-/// (someone merely mentioned in conversation) — or a hallucinated one — as
-/// the user's identity, which then poisons every future prompt that injects
-/// the user profile.
-pub(crate) fn identity_fact_lacks_user_evidence(
-    category: &str,
-    key: &str,
-    value: &str,
-    user_text: &str,
-) -> bool {
-    if !category.trim().eq_ignore_ascii_case("user") {
-        return false;
-    }
-    let key_norm = key.trim().to_ascii_lowercase();
-    if !USER_IDENTITY_KEYS.contains(&key_norm.as_str()) {
-        return false;
-    }
-    let value_norm = value.trim().to_lowercase();
-    if value_norm.len() <= 1 {
-        return true;
-    }
-    !user_text.to_lowercase().contains(&value_norm)
-}
-
-/// Normalize a fact key for cross-category comparison: lowercase, every run of
-/// non-alphanumeric characters collapses to a single `_`, trimmed. So `db_port`,
-/// `DB Port` and `db-port` all compare equal.
-fn normalize_fact_key_for_match(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    let mut last_sep = false;
-    for ch in key.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_sep = false;
-        } else if !last_sep {
-            out.push('_');
-            last_sep = true;
-        }
-    }
-    out.trim_matches('_').to_string()
-}
-
-/// True when an extracted fact is merely the assistant recalling/restating a
-/// fact we already store — not new information the user provided this turn.
-///
-/// Progressive extraction is fed the assistant's reply as well as the user's
-/// message, so on a recall turn ("what's my DB port?" → "You prefer port 54329")
-/// it would otherwise re-extract `54329` and persist it AGAIN — often under a
-/// different category than the original — duplicating the fact and letting
-/// "forgotten" facts resurface every time they're recalled.
-///
-/// Fires when the value is absent from the user's message (so it came from the
-/// assistant, not the user) AND an active fact already holds that exact value,
-/// under EITHER the same canonical key OR — for a distinctive multi-word value —
-/// any key. The second case catches recall duplication where the extractor
-/// invents a fresh key for a value it just recalled (e.g. "yerba mate" recalled
-/// as `late_night_coding_beverage` / `beverage` when it's already stored as
-/// `programming_beverage`).
-///
-/// The distinctive-value gate (≥2 word tokens) keeps this safe: a common
-/// single-word value like "blue" or "daily" re-appearing under a new key is left
-/// alone, since it may legitimately describe a different attribute. Corrections
-/// (the value differs) and user-stated values are never dropped.
-fn is_redundant_recall_fact(
-    fact_key: &str,
-    fact_value: &str,
-    user_message: &str,
-    existing: &[crate::traits::Fact],
-) -> bool {
-    let value_norm = fact_value.trim().to_lowercase();
-    if value_norm.is_empty() {
-        return false;
-    }
-    // If the user actually stated the value this turn, treat it as new/affirmed.
-    if user_message.to_lowercase().contains(&value_norm) {
-        return false;
-    }
-    let key_norm = normalize_fact_key_for_match(fact_key);
-    let value_is_distinctive = value_norm
-        .split_whitespace()
-        .filter(|w| w.len() >= 2)
-        .count()
-        >= 2;
-    existing.iter().any(|f| {
-        if f.superseded_at.is_some() {
-            return false;
-        }
-        if f.value.trim().to_lowercase() != value_norm {
-            return false;
-        }
-        normalize_fact_key_for_match(&f.key) == key_norm || value_is_distinctive
-    })
-}
-
-/// True when an active fact already holds this exact canonical key and value
-/// under a DIFFERENT category, so upserting would create a second row rather
-/// than refresh the existing one.
-///
-/// This is the turn-level idempotency check: when the agent stored a fact via
-/// `remember_fact` this turn, progressive extraction re-reads the same exchange
-/// and re-files it under its own category guess (`test` → `technical`). Unlike
-/// [`is_redundant_recall_fact`] this does not care who stated the value — an
-/// identical active fact is already stored, so the write adds nothing.
-/// Same-category writes are left to the upsert, which refreshes in place.
-fn duplicates_active_fact_in_other_category(
-    category: &str,
-    fact_key: &str,
-    fact_value: &str,
-    existing: &[crate::traits::Fact],
-) -> bool {
-    let value_norm = fact_value.trim().to_lowercase();
-    if value_norm.is_empty() {
-        return false;
-    }
-    let key_norm = normalize_fact_key_for_match(fact_key);
-    existing.iter().any(|f| {
-        f.superseded_at.is_none()
-            && !f.category.trim().eq_ignore_ascii_case(category.trim())
-            && f.value.trim().to_lowercase() == value_norm
-            && normalize_fact_key_for_match(&f.key) == key_norm
-    })
-}
-
-/// Run progressive fact extraction in the background.
-/// Spawns a tokio task that extracts facts and stores them immediately.
+/// [`ProgressiveExtractor`]: aidaemon_memory::progressive::ProgressiveExtractor
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_progressive_extraction(
-    provider: crate::llm_runtime::ModelBackend,
+    llm_runtime: crate::llm_runtime::SharedLlmRuntime,
     fast_model: String,
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
@@ -886,193 +565,97 @@ pub fn spawn_progressive_extraction(
     visibility: crate::types::ChannelVisibility,
     user_role: UserRole,
 ) {
+    use aidaemon_memory::progressive::{may_extract, Exchange};
     tokio::spawn(async move {
-        // Never extract or persist owner memory from non-owners or untrusted public platforms.
-        if !user_role.can_persist_owner_memory()
-            || matches!(visibility, crate::types::ChannelVisibility::PublicExternal)
-        {
+        if !may_extract(user_role, visibility) {
             return;
         }
-        match extract_inline_facts(
-            &provider,
-            &fast_model,
-            &user_text,
-            &assistant_response,
-            Some(&state),
-            Some(event_store.clone()),
-        )
-        .await
-        {
-            Ok(facts) if !facts.is_empty() => {
-                let source_excerpt = crate::utils::truncate_str(&user_text, 200);
-                let first_seen_at = chrono::Utc::now();
-                // Snapshot active facts once so we can suppress recall-restatement
-                // re-writes (the assistant recalling a fact we already store).
-                let existing_facts = state.get_facts(None).await.unwrap_or_default();
-                let mut written: Vec<serde_json::Value> = Vec::new();
-                for fact in facts {
-                    if fact.lifetime.is_transient() && fact.personal_memory.is_none() {
-                        continue;
-                    }
-                    if let Some(mut personal) = fact.personal_memory.clone() {
-                        personal.direct_user_statement = true;
-                        match state
-                            .reconcile_personal_memory(
-                                &personal,
-                                "progressive",
-                                Some(source_excerpt.as_str()),
-                                channel_id.as_deref(),
-                                crate::types::FactPrivacy::Private,
-                            )
-                            .await
-                        {
-                            Ok(result) => {
-                                written.push(json!({
-                                    "structured_personal_memory": result.concise_summary(),
-                                    "unresolved": result.unresolved,
-                                }));
-                            }
-                            Err(error) => {
-                                warn!(%error, "Failed to reconcile progressive personal memory");
-                            }
-                        }
-                        continue;
-                    }
-                    // Identity facts (user.name etc.) must be evidenced by the
-                    // user's own words — third-party names mentioned in
-                    // conversation are not the user's identity.
-                    if identity_fact_lacks_user_evidence(
-                        &fact.category,
-                        &fact.key,
-                        &fact.value,
-                        &user_text,
-                    ) {
-                        warn!(
-                            key = fact.key,
-                            value = fact.value,
-                            "Skipping user identity fact without evidence in the user's message"
-                        );
-                        continue;
-                    }
-                    // Don't re-persist a fact the assistant is merely recalling —
-                    // it duplicates the fact (often under a new category) and lets
-                    // "forgotten" facts resurface on every recall.
-                    if is_redundant_recall_fact(&fact.key, &fact.value, &user_text, &existing_facts)
-                    {
-                        debug!(
-                            key = fact.key,
-                            value = fact.value,
-                            "Skipping recall-restatement of a fact already in memory"
-                        );
-                        continue;
-                    }
-                    if duplicates_active_fact_in_other_category(
-                        &fact.category,
-                        &fact.key,
-                        &fact.value,
-                        &existing_facts,
-                    ) {
-                        debug!(
-                            key = fact.key,
-                            category = fact.category,
-                            "Skipping progressive fact already stored under another category"
-                        );
-                        continue;
-                    }
-                    // Progressive extraction can capture personal info; default to
-                    // conservative privacy unless explicitly promoted later.
-                    let privacy = if fact.category.trim().eq_ignore_ascii_case("user") {
-                        crate::types::FactPrivacy::Private
-                    } else {
-                        crate::types::FactPrivacy::Channel
-                    };
-                    if let Err(e) = state
-                        .upsert_fact_with_provenance(
-                            &fact.category,
-                            &fact.key,
-                            &fact.value,
-                            "progressive",
-                            channel_id.as_deref(),
-                            privacy,
-                            Some(first_seen_at),
-                            Some(source_excerpt.as_str()),
-                        )
-                        .await
-                    {
-                        warn!(error = %e, key = fact.key, "Failed to store progressive fact");
-                    } else {
-                        if let Err(e) = state
-                            .project_extracted_fact_graph(
-                                &fact.category,
-                                &fact.key,
-                                source_excerpt.as_str(),
-                                &fact.graph,
-                            )
-                            .await
-                        {
-                            debug!(error = %e, key = fact.key, "Failed to project extracted graph");
-                        }
-                        written.push(json!({
-                            "category": fact.category,
-                            "key": fact.key,
-                            "value": fact.value,
-                        }));
-                    }
-                }
-                // Flight-recorder entry so every background memory write is
-                // auditable: which facts, from which excerpt, into which channel.
-                if !written.is_empty() {
-                    let selected_source_event_id = match event_store
-                        .project_selected_user_message_memory_span_for_task(&source_task_id)
-                        .await
-                    {
-                        Ok(Some(event_id)) => {
-                            if let Err(error) = state.repair_memory_projections().await {
-                                debug!(%error, %source_task_id, "Failed to bind selected message provenance to extracted memory");
-                            }
-                            Some(event_id)
-                        }
-                        Ok(None) => {
-                            debug!(%source_task_id, "Selected memory write had no policy-eligible canonical user event");
-                            None
-                        }
-                        Err(error) => {
-                            debug!(%error, %source_task_id, "Failed to project selected message provenance");
-                            None
-                        }
-                    };
-                    let event = crate::events::Event::new(
-                        "background:progressive_extraction",
-                        crate::events::EventType::DecisionPoint,
-                        json!({
-                            "code": "memory_write",
-                            "decision_type": "memory_write",
-                            "severity": "info",
-                            "summary": format!(
-                                "Progressive extraction stored {} fact(s)",
-                                written.len()
-                            ),
-                            "metadata": {
-                                "source": "progressive",
-                                "source_task_id": source_task_id,
-                                "source_event_id": selected_source_event_id,
-                                "channel_id": channel_id,
-                                "facts": written,
-                                "source_excerpt": source_excerpt,
-                            },
-                        }),
-                    );
-                    if let Err(e) = event_store.append(event).await {
-                        debug!(error = %e, "Failed to record memory_write event");
-                    }
-                }
-            }
-            Ok(_) => {} // No facts found — expected for most interactions
+        let provider = crate::agent::RuntimeProvider::with_accounting(
+            llm_runtime,
+            state.clone(),
+            event_store.clone(),
+            "progressive_extraction",
+        );
+        let extractor = extractor(Arc::new(provider), &fast_model);
+        let exchange = Exchange {
+            user_text: &user_text,
+            assistant_reply: &assistant_response,
+            channel_id: channel_id.as_deref(),
+        };
+        let facts = match extractor.propose(&exchange).await {
+            Ok(facts) => facts,
             Err(e) => {
                 debug!(error = %e, "Progressive fact extraction failed");
+                return;
             }
+        };
+        if facts.is_empty() {
+            return; // Expected for most interactions.
+        }
+        let written = extractor.write(state.as_ref(), &exchange, facts).await;
+        if written.is_empty() {
+            return;
+        }
+        // Flight-recorder entry so every background memory write is
+        // auditable: which facts, from which excerpt, into which channel.
+        let source_excerpt = crate::utils::truncate_str(&user_text, 200);
+        let selected_source_event_id = match event_store
+            .project_selected_user_message_memory_span_for_task(&source_task_id)
+            .await
+        {
+            Ok(Some(event_id)) => {
+                if let Err(error) = state.repair_memory_projections().await {
+                    debug!(%error, %source_task_id, "Failed to bind selected message provenance to extracted memory");
+                }
+                Some(event_id)
+            }
+            Ok(None) => {
+                debug!(%source_task_id, "Selected memory write had no policy-eligible canonical user event");
+                None
+            }
+            Err(error) => {
+                debug!(%error, %source_task_id, "Failed to project selected message provenance");
+                None
+            }
+        };
+        let event = crate::events::Event::new(
+            "background:progressive_extraction",
+            crate::events::EventType::DecisionPoint,
+            json!({
+                "code": "memory_write",
+                "decision_type": "memory_write",
+                "severity": "info",
+                "summary": format!("Progressive extraction stored {} fact(s)", written.len()),
+                "metadata": {
+                    "source": "progressive",
+                    "source_task_id": source_task_id,
+                    "source_event_id": selected_source_event_id,
+                    "channel_id": channel_id,
+                    "facts": written,
+                    "source_excerpt": source_excerpt,
+                },
+            }),
+        );
+        if let Err(e) = event_store.append(event).await {
+            debug!(error = %e, "Failed to record memory_write event");
         }
     });
+}
+
+/// One extractor per process, so its two-call concurrency limit holds
+/// across every turn. The provider is rebuilt per call (the runtime may
+/// switch models), the limit is not.
+fn extractor(
+    provider: Arc<dyn aidaemon_core::Provider>,
+    model: &str,
+) -> aidaemon_memory::progressive::ProgressiveExtractor {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    aidaemon_memory::progressive::ProgressiveExtractor::with_permits(
+        provider,
+        model,
+        PERMITS.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -1087,233 +670,6 @@ mod tests {
         assert!((token_estimate_correction(model) - 1.5).abs() < f64::EPSILON);
         record_token_estimate_calibration(model, 1_000, 1_000);
         assert!((token_estimate_correction(model) - 1.4).abs() < 0.001);
-    }
-
-    fn active_fact(category: &str, key: &str, value: &str) -> crate::traits::Fact {
-        let now = chrono::Utc::now();
-        crate::traits::Fact {
-            id: 1,
-            category: category.to_string(),
-            key: key.to_string(),
-            value: value.to_string(),
-            source: "test".to_string(),
-            created_at: now,
-            updated_at: now,
-            superseded_at: None,
-            recall_count: 0,
-            last_recalled_at: None,
-            channel_id: None,
-            privacy: crate::types::FactPrivacy::Global,
-            first_seen_at: None,
-            source_excerpt: None,
-        }
-    }
-
-    #[test]
-    fn normalize_fact_key_matches_across_separators() {
-        assert_eq!(
-            normalize_fact_key_for_match("local_dev_db_port"),
-            "local_dev_db_port"
-        );
-        assert_eq!(normalize_fact_key_for_match("DB Port"), "db_port");
-        assert_eq!(normalize_fact_key_for_match("db-port"), "db_port");
-    }
-
-    #[test]
-    fn redundant_recall_fact_blocks_restatement_of_known_fact() {
-        // The live bug: recalling the port ("You prefer port 54329") must NOT
-        // re-store it, especially under a different category.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "what database port did I tell you I prefer?",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_user_stated_value() {
-        // User states the value this turn → legitimately new/affirmed, keep it.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "my local dev db port is 54329",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_correction_to_new_value() {
-        // Different value (a correction) is never suppressed, even if the user
-        // didn't restate it verbatim.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "9090",
-            "actually change my dev db port",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_blocks_distinctive_value_under_new_key() {
-        // The yerba-mate case: recalled value re-extracted under a fresh key.
-        // "yerba mate" is distinctive (2 words) → suppress the duplicate.
-        let existing = vec![active_fact(
-            "preference",
-            "programming_beverage",
-            "yerba mate",
-        )];
-        assert!(is_redundant_recall_fact(
-            "late_night_coding_beverage",
-            "yerba mate",
-            "what do I sip on during late-night coding sessions?",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_common_value_under_new_key() {
-        // A common single-word value ("blue") under a different key may describe a
-        // genuinely different attribute → must NOT be suppressed.
-        let existing = vec![active_fact("user", "car_color", "blue")];
-        assert!(!is_redundant_recall_fact(
-            "laptop_color",
-            "blue",
-            "my laptop matches my car",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_genuinely_new_fact() {
-        // No existing fact with this key → it's new information.
-        let existing = vec![active_fact("preference", "ui_theme", "dark")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "the assistant mentioned a port",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_ignores_superseded_existing() {
-        // A superseded duplicate must not anchor the guard.
-        let mut superseded = active_fact("preference", "local_dev_db_port", "54329");
-        superseded.superseded_at = Some(chrono::Utc::now());
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "what is my port?",
-            &[superseded],
-        ));
-    }
-
-    #[test]
-    fn progressive_skips_fact_the_agent_already_stored_this_turn() {
-        // The agent saved it via remember_fact; extraction re-files the same
-        // user-stated key/value under its own category guess. Must not duplicate,
-        // even though the user stated the value (the recall guard allows that).
-        let existing = vec![active_fact("test", "qa_color", "teal")];
-        let user_text = "remember qa_color=teal";
-        assert!(!is_redundant_recall_fact(
-            "qa_color", "teal", user_text, &existing
-        ));
-        assert!(duplicates_active_fact_in_other_category(
-            "technical",
-            "qa-color",
-            "Teal",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn progressive_duplicate_check_keeps_corrections_and_same_category_refresh() {
-        let existing = vec![active_fact("test", "qa_color", "teal")];
-        // A correction (new value) is new information.
-        assert!(!duplicates_active_fact_in_other_category(
-            "technical",
-            "qa_color",
-            "navy",
-            &existing,
-        ));
-        // Same category → the upsert refreshes in place; no duplicate row.
-        assert!(!duplicates_active_fact_in_other_category(
-            "test", "qa_color", "teal", &existing,
-        ));
-        // A different key with the same value is a different attribute.
-        assert!(!duplicates_active_fact_in_other_category(
-            "technical",
-            "qa_shade",
-            "teal",
-            &existing,
-        ));
-        // Superseded rows don't anchor the check.
-        let mut gone = active_fact("test", "qa_color", "teal");
-        gone.superseded_at = Some(chrono::Utc::now());
-        assert!(!duplicates_active_fact_in_other_category(
-            "technical",
-            "qa_color",
-            "teal",
-            &[gone],
-        ));
-    }
-
-    #[test]
-    fn identity_guard_blocks_unevidenced_user_name() {
-        // Third-party or hallucinated name not present in the user's words.
-        assert!(identity_fact_lacks_user_evidence(
-            "user",
-            "name",
-            "Edison Mendez",
-            "Tell me about the beca applicant and their nationality"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_allows_first_person_name() {
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "name",
-            "Jordan Lee",
-            "Hi, my name is Jordan Lee and I live in Lisbon"
-        ));
-        // Case-insensitive match.
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "Name",
-            "jordan lee",
-            "I'm Jordan Lee"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_ignores_non_identity_facts() {
-        // Other user facts are not gated (dog_name is not the user's identity).
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "dog_name",
-            "Mia",
-            "what's the weather?"
-        ));
-        // Non-user categories are never gated.
-        assert!(!identity_fact_lacks_user_evidence(
-            "project",
-            "name",
-            "aidaemon",
-            "unrelated text"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_blocks_trivial_values() {
-        assert!(identity_fact_lacks_user_evidence("user", "name", "x", "x"));
-        assert!(identity_fact_lacks_user_evidence(
-            "user", "name", " ", "anything"
-        ));
     }
 
     #[test]
@@ -1628,46 +984,5 @@ mod tests {
                 false
             );
         }
-    }
-
-    #[test]
-    fn test_should_extract_facts_trivial() {
-        assert!(!should_extract_facts("ok"));
-        assert!(!should_extract_facts("thanks"));
-        assert!(!should_extract_facts("yes"));
-        assert!(!should_extract_facts("lol"));
-        assert!(!should_extract_facts("👍"));
-        assert!(!should_extract_facts("short")); // <20 chars
-        assert!(!should_extract_facts("Got it")); // <20 chars
-    }
-
-    #[test]
-    fn test_should_extract_facts_meaningful() {
-        assert!(should_extract_facts(
-            "My dog's name is Mia and she's a golden retriever"
-        ));
-        assert!(should_extract_facts(
-            "I work at Acme Corp in the engineering department"
-        ));
-        assert!(should_extract_facts(
-            "Please set up a new React project with TypeScript"
-        ));
-    }
-
-    #[test]
-    fn test_inline_fact_deserialization() {
-        let json = r#"[{"category":"user","key":"dog_name","value":"Mia"}]"#;
-        let facts: Vec<InlineFact> = serde_json::from_str(json).unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].category, "user");
-        assert_eq!(facts[0].key, "dog_name");
-        assert_eq!(facts[0].value, "Mia");
-    }
-
-    #[test]
-    fn test_inline_fact_empty_array() {
-        let json = "[]";
-        let facts: Vec<InlineFact> = serde_json::from_str(json).unwrap();
-        assert!(facts.is_empty());
     }
 }
