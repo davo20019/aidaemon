@@ -372,10 +372,13 @@ mod learner_tests {
     use super::*;
     use crate::records::Fact;
 
+    /// A stored fact: key, value, channel and privacy.
+    type StoredFact = (String, String, Option<String>, FactPrivacy);
+
     /// Records what the learner stores.
     #[derive(Default)]
     struct Recorder {
-        facts: Mutex<Vec<(String, String, Option<String>, FactPrivacy)>>,
+        facts: Mutex<Vec<StoredFact>>,
         procedures: Mutex<Vec<Procedure>>,
         solutions: Mutex<Vec<ErrorSolution>>,
     }
