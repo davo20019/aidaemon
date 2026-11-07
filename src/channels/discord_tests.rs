@@ -15,6 +15,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::runtime_ports::ChannelAgentRuntime;
+use crate::tasks::TaskRegistry;
 use crate::testing::{setup_test_agent, MockProvider};
 
 const OWNER: u64 = 100_000_000_000_001_001;
@@ -178,7 +180,7 @@ async fn channel(
             transports: Default::default(),
         },
     ));
-    channel.use_sdk_transport(mock.transport());
+    channel.use_transport(mock.transport());
     (channel, harness)
 }
 
@@ -206,10 +208,8 @@ async fn an_owner_dm_runs_the_agent_and_the_reply_goes_back_over_the_sdk() {
     let provider =
         MockProvider::with_responses(vec![MockProvider::text_response("Hello from the agent.")]);
     let (channel, _harness) = channel(&mock, provider, vec![OWNER], vec![OWNER]).await;
-    let transport = mock.transport();
-
     channel
-        .handle_sdk_event(transport, direct_message(OWNER, "hi there"))
+        .handle_event(direct_message(OWNER, "hi there"))
         .await;
 
     let reply = mock
@@ -233,7 +233,7 @@ async fn a_dm_from_someone_else_is_refused_before_the_agent_runs() {
     let mock = MockDiscord::start().await;
     let (channel, harness) = channel(&mock, MockProvider::new(), vec![OWNER], vec![OWNER]).await;
     channel
-        .handle_sdk_event(mock.transport(), direct_message(STRANGER, "let me in"))
+        .handle_event(direct_message(STRANGER, "let me in"))
         .await;
     let refusal = mock
         .wait_for(|r| r.path == "/channels/100000000000000700/messages")
@@ -248,7 +248,7 @@ async fn a_dynamic_bot_is_claimed_by_its_first_dm() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response("Claimed.")]);
     let (channel, _harness) = channel(&mock, provider, vec![], vec![]).await;
     channel
-        .handle_sdk_event(mock.transport(), direct_message(STRANGER, "hello"))
+        .handle_event(direct_message(STRANGER, "hello"))
         .await;
     mock.wait_for(|r| r.body["content"] == "Claimed.").await;
     assert!(channel.is_authorized(STRANGER));
@@ -259,23 +259,20 @@ async fn a_slash_command_fills_in_its_deferred_reply() {
     let mock = MockDiscord::start().await;
     let (channel, _harness) = channel(&mock, MockProvider::new(), vec![OWNER], vec![OWNER]).await;
     channel
-        .handle_sdk_event(
-            mock.transport(),
-            ChannelEvent::Command(CommandInvocation {
-                conversation: Conversation {
-                    id: "100000000000000700".to_string(),
-                    kind: ConversationKind::Direct,
-                },
-                sender: Sender {
-                    id: OWNER.to_string(),
-                    display_name: None,
-                    is_bot: false,
-                },
-                name: "help".to_string(),
-                args: String::new(),
-                handle: "100000000000000009/synthetic-command-token".to_string(),
-            }),
-        )
+        .handle_event(ChannelEvent::Command(CommandInvocation {
+            conversation: Conversation {
+                id: "100000000000000700".to_string(),
+                kind: ConversationKind::Direct,
+            },
+            sender: Sender {
+                id: OWNER.to_string(),
+                display_name: None,
+                is_bot: false,
+            },
+            name: "help".to_string(),
+            args: String::new(),
+            handle: "100000000000000009/synthetic-command-token".to_string(),
+        }))
         .await;
     let answer = mock.wait_for(|r| r.method == "PATCH").await;
     assert_eq!(
@@ -323,13 +320,13 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
     let (prompt_id, choice) =
         aidaemon_channel_discord::decode_custom_id(buttons[0]["custom_id"].as_str().unwrap())
             .unwrap();
-    assert_eq!(choice, "approve:once");
+    assert_eq!(choice, "once");
 
     // Someone who is not authorized cannot answer it.
     let press = |from: u64| {
         ChannelEvent::Approval(ApprovalAnswer {
             prompt_id: prompt_id.clone(),
-            choice_id: "approve:once".to_string(),
+            choice_id: "once".to_string(),
             sender: Sender {
                 id: from.to_string(),
                 display_name: None,
@@ -341,14 +338,10 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
             },
         })
     };
-    channel
-        .handle_sdk_event(mock.transport(), press(STRANGER))
-        .await;
+    channel.handle_event(press(STRANGER)).await;
     assert!(!asked.is_finished());
 
-    channel
-        .handle_sdk_event(mock.transport(), press(OWNER))
-        .await;
+    channel.handle_event(press(OWNER)).await;
     let answer = tokio::time::timeout(Duration::from_secs(5), asked)
         .await
         .unwrap()

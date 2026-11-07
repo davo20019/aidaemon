@@ -88,7 +88,6 @@ once_cell = "1"
 # vs. a truly-stalled process. Default features disabled — we only need the
 # `system` component (processes), not disks/networks/components.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
-serenity = { version = "0.12", features = ["client", "gateway", "model", "cache", "rustls_backend"], default-features = false, optional = true }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
 self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"], default-features = false }
 semver = "1"
@@ -143,7 +142,7 @@ keyring = { version = "3", features = ["windows-native"] }
 [features]
 default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
 browser = ["dep:chromiumoxide"]
-discord = ["dep:serenity", "dep:aidaemon-channel-discord"]
+discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:tokio-tungstenite", "dep:aidaemon-channel-slack"]
 execution-docker = []
 terminal-bridge = [
