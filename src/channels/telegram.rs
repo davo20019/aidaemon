@@ -24,7 +24,7 @@ use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, html_escape, markdown_to_telegram_html, markdown_to_telegram_plain_fallback,
-    sanitize_filename, split_message,
+    sanitize_filename, split_telegram_html, split_telegram_text,
 };
 use super::telegram_bootstrap_signing::{
     random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
@@ -1042,7 +1042,7 @@ impl TelegramChannel {
         let user_id = msg.from.as_ref().map(|user| user.id.0).unwrap_or(0);
         let user_role = determine_role(&self.owner_user_ids, user_id);
         if let Some(reply) = ctx.dispatch(cmd, arg, &session_id, user_role).await {
-            for chunk in split_message(&reply, 4096) {
+            for chunk in split_telegram_text(&reply, 4096) {
                 let _ = bot.send_message(msg.chat.id, chunk).await;
             }
             return;
@@ -1077,7 +1077,7 @@ impl TelegramChannel {
             ),
         };
 
-        for chunk in split_message(&reply, 4096) {
+        for chunk in split_telegram_text(&reply, 4096) {
             let _ = bot.send_message(msg.chat.id, chunk).await;
         }
     }
@@ -4419,7 +4419,7 @@ impl TelegramChannel {
             .handle_terminal_lite_input(msg.chat.id.0, user_id, user_role, &text)
             .await
         {
-            for chunk in split_message(&lite_reply, 4096) {
+            for chunk in split_telegram_text(&lite_reply, 4096) {
                 let _ = bot.send_message(msg.chat.id, chunk).await;
             }
             return;
@@ -5572,8 +5572,8 @@ async fn send_markdown_chunks_or_fallback_result(
     markdown: &str,
 ) -> anyhow::Result<Vec<String>> {
     let html = markdown_to_telegram_html(markdown);
-    let html_chunks = split_message(&html, 4096);
-    let plain_chunks = split_message(&markdown_to_telegram_plain_fallback(markdown), 4096);
+    let html_chunks = split_telegram_html(&html, 4096);
+    let plain_chunks = split_telegram_text(&markdown_to_telegram_plain_fallback(markdown), 4096);
     let mut first_err: Option<anyhow::Error> = None;
     let mut message_ids = Vec::new();
 
@@ -5626,8 +5626,8 @@ async fn send_expandable_blockquote_reply(
     let html_body = markdown_to_telegram_html(markdown);
     let plain = markdown_to_telegram_plain_fallback(markdown);
     let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
-    let html_chunks = split_message(&html_body, max_chunk);
-    let plain_chunks = split_message(&plain, max_chunk);
+    let html_chunks = split_telegram_html(&html_body, max_chunk);
+    let plain_chunks = split_telegram_text(&plain, max_chunk);
     let mut first_err: Option<anyhow::Error> = None;
     let mut message_ids = Vec::new();
     for (i, html_chunk) in html_chunks.iter().enumerate() {

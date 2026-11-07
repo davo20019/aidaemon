@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
-    build_help_text, markdown_to_slack_mrkdwn, sanitize_filename, split_message,
+    build_help_text, markdown_to_slack_mrkdwn, sanitize_filename, split_mrkdwn,
 };
 use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
 use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
@@ -1841,7 +1841,7 @@ impl SlackChannel {
                     .await
             };
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
-            let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
+            let chunks = split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN);
             let last_idx = chunks.len().saturating_sub(1);
             for (i, chunk) in chunks.into_iter().enumerate() {
                 // Attach buttons to the last chunk only
@@ -2400,7 +2400,7 @@ impl SlackChannel {
                         let mrkdwn = markdown_to_slack_mrkdwn(&reply);
                         // Restore @DisplayName → <@USERID> for proper Slack mentions
                         let mrkdwn = restore_mentions_from_cache(&mrkdwn, &user_cache_snapshot);
-                        let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
+                        let chunks = split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN);
                         let mut platform_message_ids = Vec::new();
                         let mut failed = false;
                         for chunk in &chunks {
@@ -3309,7 +3309,7 @@ impl Channel for SlackChannel {
         let mrkdwn = markdown_to_slack_mrkdwn(text);
         // Convert @DisplayName back to <@USERID> so Slack renders proper mentions
         let mrkdwn = self.restore_user_mentions(&mrkdwn).await;
-        for chunk in split_message(&mrkdwn, MAX_MESSAGE_LEN) {
+        for chunk in split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN) {
             self.post_message(&channel_id, &chunk, thread_ts.as_deref())
                 .await?;
         }

@@ -3,11 +3,16 @@
 //! splitting and command help.
 
 #[cfg(feature = "slack")]
-pub(crate) use aidaemon_channel_slack::format::markdown_to_mrkdwn as markdown_to_slack_mrkdwn;
+pub(crate) use aidaemon_channel_slack::format::{
+    markdown_to_mrkdwn as markdown_to_slack_mrkdwn, split_mrkdwn,
+};
+use aidaemon_channel_telegram::format::tg_len;
 pub(crate) use aidaemon_channel_telegram::format::{
-    html_escape, markdown_to_html as markdown_to_telegram_html,
+    html_escape, markdown_to_html as markdown_to_telegram_html, split_html as split_telegram_html,
 };
 use aidaemon_channels::latex::strip_latex;
+/// Fence-aware Markdown splitting by characters (Discord, approval pages).
+pub(crate) use aidaemon_channels::split_message;
 
 /// Convert common LLM markdown to readable plain text for Telegram fallbacks.
 pub(crate) fn markdown_to_telegram_plain_fallback(md: &str) -> String {
@@ -145,83 +150,46 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     Some((text, url, close_paren + 1))
 }
 
-/// Split a message into chunks respecting Telegram's max length.
-/// Prefers splitting at paragraph boundaries, then line boundaries.
-/// Never splits inside HTML tags or code blocks.
-pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks: Vec<String> = Vec::new();
-    let mut remaining = text;
-
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.to_string());
-            break;
+/// Split plain text for Telegram into parts of at most `max_units` UTF-16
+/// code units, the unit the Bot API counts. The generic splitter picks the
+/// cut points by characters, and a character outside the Basic Multilingual
+/// Plane (most emoji) is two units, so a part still too long is cut again by
+/// units, at the last whitespace that fits when there is one.
+pub(crate) fn split_telegram_text(text: &str, max_units: usize) -> Vec<String> {
+    let max_units = max_units.max(2);
+    let mut parts = Vec::new();
+    for part in split_message(text, max_units) {
+        if tg_len(&part) <= max_units {
+            parts.push(part);
+            continue;
         }
-
-        // Find the largest char boundary at or before max_len to avoid
-        // slicing in the middle of a multi-byte UTF-8 character.
-        let mut boundary = max_len;
-        while boundary > 0 && !remaining.is_char_boundary(boundary) {
-            boundary -= 1;
+        let mut rest = part.as_str();
+        while tg_len(rest) > max_units {
+            let mut units = 0;
+            let mut end = 0;
+            let mut last_space = None;
+            for (index, c) in rest.char_indices() {
+                if units + c.len_utf16() > max_units {
+                    break;
+                }
+                units += c.len_utf16();
+                end = index + c.len_utf8();
+                if c.is_whitespace() {
+                    last_space = Some(end);
+                }
+            }
+            let cut = last_space.filter(|&cut| cut > 0).unwrap_or(end);
+            let piece = rest[..cut].trim_end();
+            if !piece.is_empty() {
+                parts.push(piece.to_string());
+            }
+            rest = rest[cut..].trim_start();
         }
-
-        let search_region = &remaining[..boundary];
-
-        // Try paragraph boundary first
-        let split_at = search_region
-            .rfind("\n\n")
-            .map(|p| p + 1) // include first \n, second starts next chunk
-            // Then try line boundary
-            .or_else(|| search_region.rfind('\n'))
-            // Last resort: split at char boundary
-            .unwrap_or(boundary);
-
-        // Ensure we don't split inside an HTML tag
-        let split_at = adjust_for_html_tags(search_region, split_at);
-
-        // Safety: if split_at is 0 (e.g. max_len=0), force progress by
-        // advancing one character to avoid an infinite loop.
-        let split_at = if split_at == 0 {
-            remaining
-                .char_indices()
-                .nth(1)
-                .map_or(remaining.len(), |(i, _)| i)
-        } else {
-            split_at
-        };
-
-        let (chunk, rest) = remaining.split_at(split_at);
-        let chunk = chunk.trim_end();
-        if !chunk.is_empty() {
-            chunks.push(chunk.to_string());
-        }
-        remaining = rest.trim_start_matches('\n');
-    }
-
-    chunks
-}
-
-/// If the split point is inside an HTML tag, move it before the tag start.
-fn adjust_for_html_tags(text: &str, split_at: usize) -> usize {
-    let bytes = text.as_bytes();
-    // Walk backward from split_at to check if we're inside a tag
-    let mut j = split_at;
-    while j > 0 {
-        j -= 1;
-        if bytes[j] == b'>' {
-            // We're outside a tag, safe to split at original point
-            return split_at;
-        }
-        if bytes[j] == b'<' {
-            // We're inside a tag — split before it
-            return j;
+        if !rest.is_empty() {
+            parts.push(rest.to_string());
         }
     }
-    split_at
+    parts
 }
 
 /// Format a number with comma separators (e.g. 12450 → "12,450").
@@ -475,7 +443,14 @@ mod tests {
             #[test]
             fn split_message_never_panics(text in "\\PC{0,2000}", max_len in 100usize..5000) {
                 let parts = split_message(&text, max_len);
-                assert!(!parts.is_empty());
+                assert_eq!(parts.is_empty(), text.trim().is_empty());
+            }
+
+            #[test]
+            fn telegram_text_parts_fit_the_utf16_limit(text in "\\PC{0,3000}", max_len in 100usize..1000) {
+                for part in split_telegram_text(&text, max_len) {
+                    assert!(tg_len(&part) <= max_len, "{} > {max_len}", tg_len(&part));
+                }
             }
         }
     }
