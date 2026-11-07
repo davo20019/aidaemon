@@ -1291,11 +1291,6 @@ impl MemoryManager {
     }
 }
 
-/// Derive a channel_id from a session_id string.
-/// Session IDs follow patterns like:
-///   - "slack:CHANNEL_ID:thread_ts" or "slack:CHANNEL_ID"
-///   - "bot:telegram:CHAT_ID" or "telegram:CHAT_ID" or just "CHAT_ID"
-///   - "discord:ch:ID" or "discord:dm:ID"
 /// A session's messages as episode transcript entries. Internal
 /// continuations are the daemon talking to itself, never owner speech.
 fn transcript_entries(messages: &[Message]) -> Vec<aidaemon_memory::episodes::TranscriptEntry> {
