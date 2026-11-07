@@ -71,6 +71,7 @@ name = "aidaemon"
 version = "0.12.9"
 dependencies = [
  "aes-gcm",
+ "aidaemon-channel-discord",
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
  "aidaemon-channels",

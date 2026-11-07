@@ -156,12 +156,12 @@ async fn ask_renders_buttons_with_custom_ids() {
                 label: "Allow once".into(),
             },
             ApprovalChoice {
-                id: "no".into(),
-                label: "Not now".into(),
-            },
-            ApprovalChoice {
                 id: "always".into(),
                 label: "Always".into(),
+            },
+            ApprovalChoice {
+                id: "no".into(),
+                label: "Not now".into(),
             },
         ],
     };
@@ -180,8 +180,8 @@ async fn ask_renders_buttons_with_custom_ids() {
         .iter()
         .map(|b| b["style"].as_u64().unwrap())
         .collect();
-    // By position, not label text: "Not now" is still danger.
-    assert_eq!(styles, vec![3, 4, 2]);
+    // By position, not label text: the last ("Not now") is danger.
+    assert_eq!(styles, vec![3, 1, 4], "green first, red last, blue between");
     for (b, choice) in buttons.iter().zip(&prompt.choices) {
         assert_eq!(b["type"], 2);
         assert_eq!(b["label"], choice.label.as_str());

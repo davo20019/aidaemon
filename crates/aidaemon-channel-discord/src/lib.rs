@@ -282,11 +282,13 @@ fn approval_components(prompt: &ApprovalPrompt) -> Result<Value, ChannelError> {
                 "approval ids too long for a discord custom_id ({CUSTOM_ID_MAX} chars max)"
             ))
         })?;
-        // By position: first = success (green), second = danger (red).
+        // By position: first = success (green), last = danger (red, the
+        // refusal), any in between = primary (blue).
+        let last = prompt.choices.len() - 1;
         let style = match i {
             0 => 3,
-            1 => 4,
-            _ => 2,
+            i if i == last => 4,
+            _ => 1,
         };
         buttons.push(json!({
             "type": 2,
