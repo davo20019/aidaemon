@@ -612,11 +612,10 @@ impl Agent {
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let name = name.trim();
         let session_id = ctx.session_id;
-        // `cli_agent` can legitimately run longer than the generic watchdog
-        // because it manages its own timeout/backgrounding behavior.
-        // Wrapping it here causes premature cancellation (and can orphan the
-        // underlying child process).
-        if name == "cli_agent" {
+        // A tool that manages its own timeout and backgrounding (`cli_agent`)
+        // is never wrapped: the watchdog would cancel it early and could
+        // orphan the process it started.
+        if self.exec_dispatch_facts(name, ctx).manages_own_timeout {
             return self.execute_tool_outcome(name, arguments, ctx).await;
         }
         if let Some(timeout_dur) = self.limits.llm_call_timeout {
@@ -688,6 +687,21 @@ impl Agent {
     /// the turn (`ctx`), this agent, and the store, never from the call's
     /// arguments. `mandate_preapproved` is left false: the caller sets it
     /// after revalidating the exact grant.
+    /// The dispatch facts of the tool a call runs: the daemon tool, else
+    /// the MCP tool judged at turn start.
+    pub(super) fn exec_dispatch_facts(
+        &self,
+        name: &str,
+        ctx: &ToolExecCtx<'_>,
+    ) -> crate::traits::ToolDispatchFacts {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .or_else(|| ctx.mcp_tool.filter(|tool| tool.name() == name))
+            .map(|tool| tool.dispatch_facts())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn tool_call_context(
         &self,
         name: &str,
@@ -723,30 +737,29 @@ impl Agent {
             workspace_collaboration_root: workspace_grant.map(|grant| grant.project_root.clone()),
             ..Default::default()
         };
-        // Only the terminal records the trust its launch was judged with.
-        if name == "terminal" {
+        let dispatch = self.exec_dispatch_facts(name, ctx);
+        // Only a tool that records it gets the trust its launch was judged
+        // with (the terminal).
+        if dispatch.records_launch_trust {
             if let Some((roots, cwd)) = ctx.trust_roots {
                 facts.trust_roots = Some(roots.to_vec());
                 facts.trust_cwd = Some(cwd.to_string());
             }
         }
         // A child inherits this turn's authority, not a re-resolution.
-        if name == "spawn_agent" {
+        if dispatch.spawns_child_agents {
             if let Some(turn_authority) = ctx.turn_authority {
                 facts.extensions.insert(turn_authority.clone());
             }
         }
-        // Goal context for the tools that need it. `cli_agent` and
-        // `terminal` route async/timeout notifications to the *origin*
-        // session (goal.session_id), since internal child-agent sessions
-        // are not routable.
-        if matches!(
-            name,
-            "spawn_agent" | "cli_agent" | "terminal" | "manage_mandates" | "manage_goal_tasks"
-        ) {
+        // Goal context for the tools that need it. Background delivery
+        // routes async/timeout notifications to the *origin* session
+        // (goal.session_id), since internal child-agent sessions are not
+        // routable.
+        if dispatch.goal_context != crate::traits::GoalContext::None {
             if let Some(ref gid) = self.goal_id {
                 facts.goal_id = Some(gid.clone());
-            } else if matches!(name, "cli_agent" | "terminal") {
+            } else if dispatch.goal_context == crate::traits::GoalContext::BackgroundDelivery {
                 // Executors typically don't carry goal_id, but do carry
                 // task_id: resolve it via the task so background
                 // notifications stay deliverable.
@@ -756,7 +769,7 @@ impl Agent {
                     }
                 }
             }
-            if matches!(name, "manage_mandates" | "manage_goal_tasks") {
+            if dispatch.goal_context == crate::traits::GoalContext::MandateRun {
                 if let Some(fence) = self.mandate_execution.as_ref() {
                     facts.goal_run_id = Some(fence.goal_run_id.clone());
                     facts.task_attempt_id = Some(fence.attempt_id.clone());
@@ -766,7 +779,7 @@ impl Agent {
             }
         }
         #[cfg(feature = "computer_use")]
-        if name == "computer_use" {
+        if dispatch.needs_live_model {
             let runtime = self.llm_runtime.snapshot();
             let current_model =
                 match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
@@ -844,8 +857,11 @@ impl Agent {
             _ => arguments.to_string(),
         };
 
+        let checkpoints_writes = !under_mandate
+            && !ctx.mutation_forbidden
+            && self.exec_dispatch_facts(name, ctx).checkpoints_writes;
         if let Some(grant) = active_workspace_grant {
-            if !under_mandate && matches!(name, "write_file" | "edit_file") {
+            if checkpoints_writes {
                 if let Some(manager) = crate::checkpoints::active_manager() {
                     manager
                         .begin_for_tool(name, &enriched_args, &call_facts)
@@ -883,14 +899,7 @@ impl Agent {
                     Err(rejection) => return Ok(*rejection),
                 };
                 let prepared_args = &prepared.canonical_arguments;
-                if !under_mandate
-                    && name != "terminal"
-                    && matches!(
-                        name,
-                        "write_file" | "edit_file" | "run_command" | "cli_agent"
-                    )
-                    && !(name == "cli_agent" && ctx.mutation_forbidden)
-                {
+                if checkpoints_writes {
                     if let Some(manager) = crate::checkpoints::active_manager() {
                         manager
                             .begin_for_access_manifest(name, &prepared.access_manifest, &call_facts)
@@ -1226,5 +1235,53 @@ mod scoped_workspace_tests {
         let result =
             scoped_workspace_arguments("read_file", r#"{"path":"link.txt"}"#, &grant).await;
         assert!(result.is_err());
+    }
+
+    /// The dispatcher's per-tool treatment comes from facts the tools
+    /// declare, never their names: each fact is pinned to the tools that
+    /// hold it.
+    #[tokio::test]
+    async fn dispatch_treatment_is_declared_by_the_tools() {
+        use crate::traits::{GoalContext, Tool};
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state: std::sync::Arc<dyn crate::traits::StateStore> = harness.state.clone();
+        let backend = crate::execution::active_execution_backend;
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::WriteFileTool::new(backend())),
+            Box::new(crate::tools::EditFileTool::new(backend())),
+            Box::new(crate::tools::RunCommandTool::new(backend())),
+            Box::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60)),
+            Box::new(crate::tools::ManagePeopleTool::new(state.clone())),
+            Box::new(crate::tools::ManageMemoriesTool::new(state.clone())),
+            Box::new(crate::tools::ManageGoalTasksTool::new(
+                "goal-synthetic-1".to_string(),
+                state.clone(),
+            )),
+        ];
+        for tool in &tools {
+            let facts = tool.dispatch_facts();
+            let name = tool.name();
+            assert_eq!(
+                facts.checkpoints_writes,
+                matches!(name, "write_file" | "edit_file" | "run_command"),
+                "{name}"
+            );
+            assert_eq!(
+                facts.status_from_arguments,
+                matches!(name, "manage_people" | "manage_memories"),
+                "{name}"
+            );
+            let goal = match name {
+                "spawn_agent" => GoalContext::Goal,
+                "manage_goal_tasks" => GoalContext::MandateRun,
+                _ => GoalContext::None,
+            };
+            assert_eq!(facts.goal_context, goal, "{name}");
+            assert!(!facts.manages_own_timeout, "{name}");
+            assert!(!facts.records_launch_trust, "{name}");
+            assert!(!facts.needs_live_model, "{name}");
+        }
     }
 }

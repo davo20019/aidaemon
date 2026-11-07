@@ -148,6 +148,7 @@ impl crate::traits::ToolSemantics for ManagePeopleTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
+            status_from_arguments: true,
             ..Default::default()
         }
     }

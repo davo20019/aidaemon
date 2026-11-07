@@ -850,6 +850,7 @@ impl crate::traits::ToolSemantics for SpawnAgentTool {
         crate::traits::ToolDispatchFacts {
             task_lead_delegation: true,
             spawns_child_agents: true,
+            goal_context: crate::traits::GoalContext::Goal,
             ..Default::default()
         }
     }

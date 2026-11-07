@@ -56,7 +56,32 @@ impl Tool for RecordingTool {
     }
 }
 
+/// The dispatch facts the real tool of `name` declares (the dispatcher's
+/// treatment follows them, never the name).
+fn stand_in_facts(name: &str) -> crate::traits::ToolDispatchFacts {
+    use crate::traits::GoalContext;
+    let mut facts = crate::traits::ToolDispatchFacts::default();
+    match name {
+        "terminal" => {
+            facts.records_launch_trust = true;
+            facts.goal_context = GoalContext::BackgroundDelivery;
+        }
+        "spawn_agent" => {
+            facts.spawns_child_agents = true;
+            facts.goal_context = GoalContext::Goal;
+        }
+        "manage_goal_tasks" | "manage_mandates" => facts.goal_context = GoalContext::MandateRun,
+        "computer_use" => facts.needs_live_model = true,
+        _ => {}
+    }
+    facts
+}
+
 impl crate::traits::ToolSemantics for RecordingTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        stand_in_facts(self.name)
+    }
+
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::observation()
     }
@@ -425,6 +450,12 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         "attempt-real",
         &attempt,
     );
+    for tool in ["manage_goal_tasks", "manage_mandates"] {
+        harness.agent.tools.push(Arc::new(RecordingTool {
+            name: tool,
+            seen: Arc::default(),
+        }));
+    }
     for tool in ["manage_goal_tasks", "manage_mandates"] {
         let facts = harness
             .agent

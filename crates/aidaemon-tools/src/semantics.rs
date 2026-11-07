@@ -98,6 +98,42 @@ pub struct ToolDispatchFacts {
     /// server), so its downstream effects escape per-action scoping and
     /// accounting. A mandate never delegates such a tool.
     pub opaque_execution: bool,
+    /// The tool manages its own timeout and backgrounding, so the generic
+    /// watchdog never wraps it (it would cancel the call early and could
+    /// orphan the process it started).
+    pub manages_own_timeout: bool,
+    /// The tool records the trusted roots its launch was judged with (the
+    /// terminal), so a background result keeps the trust it ran under.
+    pub records_launch_trust: bool,
+    /// Which goal facts the call receives.
+    pub goal_context: GoalContext,
+    /// The dispatcher takes a file checkpoint before the call runs, so its
+    /// writes can be rolled back.
+    pub checkpoints_writes: bool,
+    /// The call receives the live model, provider and model chain (a tool
+    /// that runs its own model loop).
+    pub needs_live_model: bool,
+    /// The status line summarizes a finished call from its arguments, not
+    /// its result (memory and people edits, whose result text is terse).
+    pub status_from_arguments: bool,
+}
+
+/// Which goal facts a call receives (see
+/// [`ToolDispatchFacts::goal_context`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoalContext {
+    /// None.
+    #[default]
+    None,
+    /// The goal the run works for.
+    Goal,
+    /// The goal, found through the executor's task when the run carries
+    /// only a task: the call's background notifications go to the goal's
+    /// own session, since a child agent's session is not routable.
+    BackgroundDelivery,
+    /// The goal and, in a mandate run, the run's mandate fence (goal run,
+    /// attempt, mandate and version).
+    MandateRun,
 }
 
 /// The consecutive-call allowance of a tool (see

@@ -4253,6 +4253,9 @@ impl crate::traits::ToolSemantics for CliAgentTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             task_lead_delegation: true,
+            manages_own_timeout: true,
+            goal_context: crate::traits::GoalContext::BackgroundDelivery,
+            checkpoints_writes: true,
             ..Default::default()
         }
     }

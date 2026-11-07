@@ -233,6 +233,13 @@ impl crate::traits::ToolSemantics for RunCommandTool {
         ToolRole::Action
     }
 
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            checkpoints_writes: true,
+            ..Default::default()
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

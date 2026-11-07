@@ -63,7 +63,14 @@ impl Tool for SlowCliAgentTool {
     }
 }
 
-impl crate::traits::ToolSemantics for SlowCliAgentTool {}
+impl crate::traits::ToolSemantics for SlowCliAgentTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            manages_own_timeout: true,
+            ..Default::default()
+        }
+    }
+}
 
 struct EchoSpawnAgentTool;
 

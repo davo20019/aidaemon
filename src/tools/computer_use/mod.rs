@@ -1370,6 +1370,7 @@ impl crate::traits::ToolSemantics for ComputerUseTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             same_tool_streak: crate::traits::SameToolStreak::Stepwise,
+            needs_live_model: true,
             ..Default::default()
         }
     }

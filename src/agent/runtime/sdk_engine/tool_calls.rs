@@ -1148,8 +1148,7 @@ impl Agent {
                 crate::agent::tool_execution::parse_checklist_from_result(&output)
                     .map(|text| StatusUpdate::Checklist { text })
             } else {
-                let source = if matches!(request.name.as_str(), "manage_memories" | "manage_people")
-                {
+                let source = if facts.status_from_arguments {
                     crate::agent::agent_helpers::summarize_tool_args(&request.name, arguments)
                 } else {
                     crate::agent::tool_execution::summarize_completed_tool_result(&output)

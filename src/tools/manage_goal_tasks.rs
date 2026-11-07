@@ -472,6 +472,7 @@ impl crate::traits::ToolSemantics for ManageGoalTasksTool {
         crate::traits::ToolDispatchFacts {
             task_lead_delegation: true,
             same_tool_streak: crate::traits::SameToolStreak::Versatile,
+            goal_context: crate::traits::GoalContext::MandateRun,
             ..Default::default()
         }
     }

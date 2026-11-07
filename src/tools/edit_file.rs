@@ -177,6 +177,7 @@ impl crate::traits::ToolSemantics for EditFileTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
+            checkpoints_writes: true,
             ..Default::default()
         }
     }
