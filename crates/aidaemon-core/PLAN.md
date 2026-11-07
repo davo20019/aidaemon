@@ -289,6 +289,10 @@ Order:
          mode.
       10. Share one quote-aware `contains_shell_operator`.
       The terminal, `http_request` and `web_search` stay in the daemon.
+      Done 2026-11-07: step 1 (`KernelTool`, `db34f0c`), step 2
+      (`file_output_trust` in `semantics.rs`, `18ab5e8`) and step 3
+      (`PathClassifier`, `7c623cf`; the daemon still holds one instance in
+      a static, and passing it to each tool is the follow-up).
       Steps 4-7 depend on 8.3's name checks staying valid; the tool names
       do not change.
 - [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
@@ -315,6 +319,18 @@ Order:
         and retention. Delete the old module only after parity tests and
         live N-of-M runs match the current daemon. Existing data must be
         migrated from the daemon database to the crate's store.
+        Done 2026-11-07: embedding encoding and cosine (`c8bad7e`), scoring
+        and fusion (`966582c`), the learning contract and expertise
+        (`d0f011c`), procedure and error-solution helpers (`a7db714`).
+        Blocked on a decision: the SDK has two fact/episode contracts,
+        `aidaemon_tools::services::{FactStore, EpisodeStore, PeopleStore}`
+        (daemon-shaped: privacy, channels, provenance, graph, health) and
+        `aidaemon_memory::MemoryStore` (scope-based). Extraction, task
+        learning, retention, consolidation and the graph store all read
+        and write through the first, so they port once one contract wins
+        and its crate home is chosen. Not ported on purpose:
+        `score_message`/`score_turn` and `generate_procedure_name` decide
+        from phrase lists and need typed replacements.
 - [ ] 8.7b Services: an SDK extension point for background work. It
       covers start and stop, scheduled ticks, and every agent run built
       through `AgentBuilder`, so background runs carry the same safeguards.
@@ -357,6 +373,9 @@ Order:
           configurable max message length.
         Order: formatter golden tests, then a daemon bridge with
         session-id mapping, then Discord, then Slack, then Telegram.
+        Done 2026-11-07: Telegram and Slack formatting (`df687af`, with
+        `aidaemon_channels::latex`) and message splitting (`e6b154f`) come
+        from the crates.
         Daemon Discord has no tests today. Live behavior needs a manual
         smoke test per bot.
 - [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
