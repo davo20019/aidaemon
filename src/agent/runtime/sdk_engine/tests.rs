@@ -3723,6 +3723,14 @@ impl sdk::Tool for NoopTool {
 fn hook_order_is_pinned() {
     let (calls, _rx) = mpsc::channel(1);
     let hooks = TurnHooks {
+        canonical: super::tool_calls::CanonicalCallHook {
+            tools: Arc::new(Default::default()),
+            known_project_dir: Arc::new(std::sync::Mutex::new(None)),
+            workspace_grant: false,
+            task_access: None,
+            authorized_scopes: Vec::new(),
+            records: Default::default(),
+        },
         authority: sdk::AuthorityHook::new(sdk::Authority::full()),
         same_tool: aidaemon_policies::SameToolStreakGuard {
             read_only_tools: HashSet::new(),
@@ -3743,6 +3751,7 @@ fn hook_order_is_pinned() {
     assert_eq!(
         slots,
         [
+            HookSlot::Canonical,
             HookSlot::Authority,
             HookSlot::SameToolLimit,
             HookSlot::LedgerStop,
@@ -3819,6 +3828,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
                         task_access: None,
                         authorized_scopes: scopes.clone(),
                         workspace_grant: false,
+                        records: Default::default(),
                     }),
                     judged.clone(),
                 )
@@ -3966,6 +3976,7 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
                         task_access: None,
                         authorized_scopes: vec![project_dir.clone()],
                         workspace_grant: false,
+                        records: Default::default(),
                     }),
                     judged.clone(),
                 )
@@ -4060,6 +4071,7 @@ async fn judged_terminal_rules(
                         task_access: None,
                         authorized_scopes: scopes,
                         workspace_grant: false,
+                        records: Default::default(),
                     }),
                     judged,
                 )
@@ -4406,4 +4418,108 @@ async fn a_turn_settles_the_run_a_restart_left_in_flight() {
         .expect("the session has runs");
     assert!(latest.in_flight.is_none(), "no run stays in flight");
     assert_ne!(latest.run_id, stranded.run_id);
+}
+
+/// The canonical form is applied by a kernel hook before any other hook
+/// judges the call: a terminal call without a directory is rewritten to run
+/// in the turn's project directory, the injected directory never becomes
+/// the turn's known directory, and the restarted chain leaves the rewritten
+/// call alone.
+#[tokio::test]
+async fn canonical_hook_anchors_a_call_before_it_is_judged() {
+    use sdk::Hook;
+    let base = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    let project = base.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_dir = project.to_string_lossy().to_string();
+    let pool_file = tempfile::NamedTempFile::new().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
+        .await
+        .unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["cat".to_string()],
+            crate::tools::ApprovalBroker::new(tx),
+            1,
+            1000,
+            crate::types::PermissionMode::Default,
+            pool,
+        )
+        .await,
+    );
+    let known = Arc::new(std::sync::Mutex::new(Some(project_dir.clone())));
+    let records = super::tool_calls::CanonicalCalls::default();
+    let hook = super::tool_calls::CanonicalCallHook {
+        tools: Arc::new(
+            [(tool.name().to_string(), tool.clone())]
+                .into_iter()
+                .collect(),
+        ),
+        known_project_dir: known.clone(),
+        workspace_grant: false,
+        task_access: None,
+        authorized_scopes: Vec::new(),
+        records: records.clone(),
+    };
+    let run = sdk::RunId::new();
+    let ctx = judged_hook_ctx(run);
+    let raw = sdk::ToolCall {
+        id: "call-anchor".to_string(),
+        name: tool.name().to_string(),
+        arguments: serde_json::json!({"action": "run", "command": "cat notes.txt"}),
+        provider_data: Default::default(),
+    };
+
+    let decision = hook.before_tool(&ctx, &raw, &unknown_effects_info()).await;
+    let sdk::ToolDecision::Rewrite { arguments } = decision else {
+        panic!("a call without a directory is anchored, got {decision:?}");
+    };
+    assert_eq!(arguments["working_dir"], serde_json::json!(project_dir));
+    let record = records
+        .get(run, "call-anchor")
+        .expect("the call is recorded");
+    assert_eq!(record.injected_dir.as_deref(), Some(project_dir.as_str()));
+    assert_eq!(
+        record.explicit_dir, None,
+        "an injected directory is not explicit"
+    );
+    assert_eq!(
+        record.known_project_dir.as_deref(),
+        Some(project_dir.as_str())
+    );
+
+    // The kernel restarts the chain with the rewritten call: it is left as is
+    // and the known directory is not touched again.
+    *known.lock().unwrap() = Some("/somewhere/else".to_string());
+    let rewritten = sdk::ToolCall {
+        arguments,
+        ..raw.clone()
+    };
+    assert_eq!(
+        hook.before_tool(&ctx, &rewritten, &unknown_effects_info())
+            .await,
+        sdk::ToolDecision::Allow
+    );
+    assert_eq!(known.lock().unwrap().as_deref(), Some("/somewhere/else"));
+
+    // The model's own directory refines the turn's known directory.
+    let explicit = sdk::ToolCall {
+        id: "call-explicit".to_string(),
+        arguments: serde_json::json!({
+            "action": "run",
+            "command": "cat notes.txt",
+            "working_dir": project_dir,
+        }),
+        ..raw
+    };
+    assert_eq!(
+        hook.before_tool(&ctx, &explicit, &unknown_effects_info())
+            .await,
+        sdk::ToolDecision::Allow
+    );
+    assert_eq!(known.lock().unwrap().as_deref(), Some(project_dir.as_str()));
+    let _ = std::fs::remove_dir_all(&base);
 }

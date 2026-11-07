@@ -2,6 +2,8 @@
 //! checks, durable replay, project anchoring, dispatch through
 //! `execute_tool_outcome`, receipts and the persisted tool exchange.
 
+use std::collections::HashMap;
+
 use super::*;
 
 /// Let a call read the session's own spilled tool results. An oversized
@@ -142,6 +144,128 @@ pub(super) fn canonicalize_call(
     call
 }
 
+/// How one call was put in canonical form before the kernel judged it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(in crate::agent) struct CanonRecord {
+    /// The model's own explicit directory (it refined the known directory).
+    pub explicit_dir: Option<String>,
+    /// The project directory injected into the call, if any.
+    pub injected_dir: Option<String>,
+    /// The known project directory the call's scope is checked against:
+    /// its explicit directory, else the turn's as of the call. An injected
+    /// directory never counts (it may be a parent picked because the
+    /// target does not exist yet).
+    pub known_project_dir: Option<String>,
+}
+
+/// The canonical form of each call, keyed by run and call id: written by
+/// [`CanonicalCallHook`] before any other hook judges the call, read by the
+/// approval rules and the dispatcher, so nobody canonicalizes again.
+#[derive(Debug, Clone, Default)]
+pub(in crate::agent) struct CanonicalCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>);
+
+impl CanonicalCalls {
+    pub(super) fn get(&self, run: sdk::RunId, call_id: &str) -> Option<CanonRecord> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(run, call_id.to_string()))
+            .cloned()
+    }
+
+    pub(super) fn take(&self, run: sdk::RunId, call_id: &str) -> Option<CanonRecord> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
+
+    fn insert(&self, run: sdk::RunId, call_id: &str, record: CanonRecord) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), record);
+    }
+}
+
+/// Puts every call in its canonical form ([`canonicalize_call`]) as the
+/// first `before_tool` hook, so the kernel computes effects, scope and
+/// approvals for the call that runs: a terminal call without a directory
+/// is judged with the directory it will run in, not as relative paths of
+/// unknown location. The kernel restarts the chain after the rewrite; a
+/// call already recorded is only re-checked, never re-anchored.
+pub(super) struct CanonicalCallHook {
+    /// The turn's tools by name (a daemon tool wins over an MCP tool).
+    pub(super) tools: Arc<HashMap<String, Arc<dyn crate::traits::Tool>>>,
+    pub(super) known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) workspace_grant: bool,
+    pub(super) task_access: Option<crate::traits::ToolCallAccessManifest>,
+    pub(super) authorized_scopes: Vec<String>,
+    pub(super) records: CanonicalCalls,
+}
+
+#[async_trait]
+impl sdk::Hook for CanonicalCallHook {
+    async fn before_tool(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        call: &sdk::ToolCall,
+        _tool: &sdk::ToolInfo,
+    ) -> sdk::ToolDecision {
+        let tool = self.tools.get(&call.name).map(|tool| tool.as_ref());
+        let recorded = self.records.get(ctx.run_id, &call.id);
+        let known = match &recorded {
+            Some(record) => record.known_project_dir.clone(),
+            None => self
+                .known_project_dir
+                .lock()
+                .ok()
+                .and_then(|known| known.clone()),
+        };
+        let canonical = canonicalize_call(
+            tool,
+            &call.name,
+            &call.arguments,
+            &CanonFacts {
+                workspace_grant: self.workspace_grant,
+                known_project_dir: known.as_deref(),
+                task_access: self.task_access.as_ref(),
+                authorized_scopes: &self.authorized_scopes,
+            },
+        );
+        if recorded.is_none() {
+            if let Some(explicit) = &canonical.explicit_dir {
+                if let Ok(mut known) = self.known_project_dir.lock() {
+                    *known = Some(explicit.clone());
+                }
+            }
+            if !canonical.stripped_read_roots.is_empty() {
+                info!(
+                    tool = %call.name,
+                    stripped_read_roots = ?canonical.stripped_read_roots,
+                    "SDK engine: attenuated unauthorized declared read roots"
+                );
+            }
+            self.records.insert(
+                ctx.run_id,
+                &call.id,
+                CanonRecord {
+                    known_project_dir: canonical.explicit_dir.clone().or(known),
+                    explicit_dir: canonical.explicit_dir,
+                    injected_dir: canonical.injected_dir,
+                },
+            );
+        }
+        if canonical.arguments == call.arguments {
+            sdk::ToolDecision::Allow
+        } else {
+            sdk::ToolDecision::Rewrite {
+                arguments: canonical.arguments,
+            }
+        }
+    }
+}
+
 /// How the kernel judged a dispatched call's filesystem scope.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum DispatchJudgment {
@@ -212,6 +336,12 @@ pub(super) fn canonicalize_dispatched_call(
         Some(None) => (None, DispatchJudgment::Unjudged),
         None => (None, DispatchJudgment::CheckNow),
     };
+    // The kernel already holds the canonical form (`CanonicalCallHook`):
+    // the arguments are run as sent, with the directories recorded then.
+    if let Some(record) = scope.canonical_calls.take(request.run_id, &request.call_id) {
+        return (record.injected_dir, judgment);
+    }
+    // Only a call that bypassed the hook chain gets here (tests).
     let canonical = match judged {
         Some(canonical) => canonical,
         None => {

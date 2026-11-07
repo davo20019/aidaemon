@@ -83,6 +83,7 @@ pub(super) fn read_only_tool_names<'a>(
 /// Where a hook sits in the turn's `before_tool` chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HookSlot {
+    Canonical,
     Authority,
     SameToolLimit,
     LedgerStop,
@@ -92,7 +93,8 @@ pub(super) enum HookSlot {
     Approval,
 }
 
-/// The turn's hooks, registered in the pinned order: authority first; the
+/// The turn's hooks, registered in the pinned order: the canonical form of
+/// the call first, so every later hook judges the call that runs; authority; the
 /// daemon's loop guard and ledger stop; memory; the outbound secret scan,
 /// so no secret reaches the untrusted-content verifier or an approval card;
 /// the untrusted-content rule; and owner approval last, so the owner is
@@ -100,6 +102,7 @@ pub(super) enum HookSlot {
 /// `UntrustedHook` may rewrite a call. The kernel's decline check runs
 /// before all of them.
 pub(super) struct TurnHooks {
+    pub(super) canonical: super::tool_calls::CanonicalCallHook,
     pub(super) authority: sdk::AuthorityHook,
     pub(super) same_tool: aidaemon_policies::SameToolStreakGuard,
     pub(super) ledger: LedgerStop,
@@ -112,6 +115,7 @@ pub(super) struct TurnHooks {
 impl TurnHooks {
     pub(super) fn chain(self) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
         let mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)> = vec![
+            (HookSlot::Canonical, Arc::new(self.canonical)),
             (HookSlot::Authority, Arc::new(self.authority)),
             (HookSlot::SameToolLimit, Arc::new(self.same_tool)),
             (HookSlot::LedgerStop, Arc::new(self.ledger)),

@@ -397,6 +397,8 @@ pub(super) struct TerminalCanonTurn {
     pub task_access: Option<crate::traits::ToolCallAccessManifest>,
     pub authorized_scopes: Vec<String>,
     pub workspace_grant: bool,
+    /// How `CanonicalCallHook` canonicalized each call.
+    pub(super) records: tool_calls::CanonicalCalls,
 }
 
 /// How the kernel's terminal rules see a call: in the canonical form the
@@ -404,27 +406,43 @@ pub(super) struct TerminalCanonTurn {
 /// exactly as the dispatcher will check it.
 pub(super) fn terminal_canonicalizer(
     turn: TerminalCanonTurn,
-) -> impl Fn(&Value) -> super::approvals::JudgedTerminal + Send + Sync + 'static {
-    move |raw| {
-        let known = turn
-            .known_project_dir
-            .lock()
-            .ok()
-            .and_then(|known| known.clone());
-        let call = tool_calls::canonicalize_call(
-            Some(turn.tool.as_ref()),
-            "terminal",
-            raw,
-            &tool_calls::CanonFacts {
-                workspace_grant: turn.workspace_grant,
-                known_project_dir: known.as_deref(),
-                task_access: turn.task_access.as_ref(),
-                authorized_scopes: &turn.authorized_scopes,
-            },
-        );
-        // `known` as the dispatcher's scope check reads it, after this
-        // call's explicit directory refined it.
-        let known = call.explicit_dir.clone().or(known);
+) -> impl Fn(sdk::RunId, &str, &Value) -> super::approvals::JudgedTerminal + Send + Sync + 'static {
+    move |run, call_id, raw| {
+        let (call, known) = match turn.records.get(run, call_id) {
+            // Already canonical: judged as sent, against the directory the
+            // hook recorded for it.
+            Some(record) => (
+                crate::agent::approvals::CanonicalCall {
+                    arguments: raw.clone(),
+                    explicit_dir: record.explicit_dir,
+                    injected_dir: record.injected_dir,
+                    stripped_read_roots: Vec::new(),
+                },
+                record.known_project_dir,
+            ),
+            None => {
+                let known = turn
+                    .known_project_dir
+                    .lock()
+                    .ok()
+                    .and_then(|known| known.clone());
+                let call = tool_calls::canonicalize_call(
+                    Some(turn.tool.as_ref()),
+                    "terminal",
+                    raw,
+                    &tool_calls::CanonFacts {
+                        workspace_grant: turn.workspace_grant,
+                        known_project_dir: known.as_deref(),
+                        task_access: turn.task_access.as_ref(),
+                        authorized_scopes: &turn.authorized_scopes,
+                    },
+                );
+                // `known` as the dispatcher's scope check reads it, after
+                // this call's explicit directory refined it.
+                let known = call.explicit_dir.clone().or(known);
+                (call, known)
+            }
+        };
         let facts = tool_calls::CallScopeFacts {
             session_id: &turn.session_id,
             task_access: turn.task_access.as_ref(),
@@ -581,6 +599,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// judged, by run and call id: the dispatcher executes exactly these,
     /// with the scope they were judged with.
     judged_terminal_calls: super::approvals::JudgedCalls,
+    /// How `CanonicalCallHook` canonicalized each call, by run and call id.
+    canonical_calls: tool_calls::CanonicalCalls,
     /// The run's declines as the kernel last showed them to the approval
     /// rules: a child spawned from this turn starts with them.
     run_declines: super::approvals::RunDeclines,
@@ -1035,6 +1055,7 @@ impl Agent {
         // project directory as it is refined during the run).
         let known_project_dir = Arc::new(std::sync::Mutex::new(known_project_dir));
         let judged_terminal_calls = super::approvals::JudgedCalls::default();
+        let canonical_calls = tool_calls::CanonicalCalls::default();
         let run_declines = super::approvals::RunDeclines::default();
         let workspace_grant = channel_ctx.active_workspace_grant(user_role).is_some();
         let terminal_approvals =
@@ -1052,6 +1073,7 @@ impl Agent {
                         task_access,
                         authorized_scopes: scopes,
                         workspace_grant,
+                        records: canonical_calls.clone(),
                     }),
                     judged_terminal_calls.clone(),
                 )
@@ -1086,7 +1108,25 @@ impl Agent {
             .fold(aidaemon_policies::Redactor::new(), |redactor, secret| {
                 redactor.secret(secret.clone())
             });
+        // The turn's tools by name, as the dispatcher resolves them: a
+        // daemon tool wins over an MCP tool of the same name.
+        let mut turn_tools: std::collections::HashMap<String, Arc<dyn crate::traits::Tool>> =
+            mcp_tools
+                .iter()
+                .map(|tool| (tool.name().to_string(), tool.clone()))
+                .collect();
+        for tool in self.tools.iter() {
+            turn_tools.insert(tool.name().to_string(), tool.clone());
+        }
         let hooks = TurnHooks {
+            canonical: tool_calls::CanonicalCallHook {
+                tools: Arc::new(turn_tools),
+                known_project_dir: known_project_dir.clone(),
+                workspace_grant,
+                task_access: authority.task_access.clone(),
+                authorized_scopes: authorized_scopes.clone(),
+                records: canonical_calls.clone(),
+            },
             authority: authority_hook,
             same_tool: aidaemon_policies::SameToolStreakGuard {
                 read_only_tools: read_only_tool_names(self.tools.iter()),
@@ -1260,6 +1300,7 @@ impl Agent {
             continue_inline_after_background,
             known_project_dir: known_project_dir.clone(),
             judged_terminal_calls,
+            canonical_calls,
             run_declines,
             project_scope,
             authority: &authority,

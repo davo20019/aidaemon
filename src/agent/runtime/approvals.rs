@@ -197,7 +197,8 @@ pub(crate) struct JudgedTerminal {
     pub scope: TerminalScope,
 }
 
-type Canonicalize = dyn Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync;
+/// Canonicalize and scope-check one call, by run and call id.
+type Canonicalize = dyn Fn(sdk::RunId, &str, &serde_json::Value) -> JudgedTerminal + Send + Sync;
 
 /// Test seams on the judgment path, by session: drop a judgment before the
 /// dispatcher takes it, or make the kernel judge a call with a given scope.
@@ -295,7 +296,10 @@ impl TerminalApprovals {
     /// recording each judged call in `judged` for the dispatcher.
     pub(crate) fn with_canonicalizer(
         mut self,
-        canonicalize: impl Fn(&serde_json::Value) -> JudgedTerminal + Send + Sync + 'static,
+        canonicalize: impl Fn(sdk::RunId, &str, &serde_json::Value) -> JudgedTerminal
+            + Send
+            + Sync
+            + 'static,
         judged: JudgedCalls,
     ) -> Self {
         self.canonicalize = Some(Arc::new(canonicalize));
@@ -304,9 +308,14 @@ impl TerminalApprovals {
     }
 
     /// The call in the form the dispatcher will execute, with its scope.
-    pub(crate) fn judge(&self, raw: &serde_json::Value) -> JudgedTerminal {
+    pub(crate) fn judge(
+        &self,
+        run: sdk::RunId,
+        call_id: &str,
+        raw: &serde_json::Value,
+    ) -> JudgedTerminal {
         match &self.canonicalize {
-            Some(canonicalize) => canonicalize(raw),
+            Some(canonicalize) => canonicalize(run, call_id, raw),
             None => JudgedTerminal {
                 call: CanonicalCall::stripped(Some(self.tool.as_ref()), raw),
                 scope: TerminalScope::InScope,
@@ -387,7 +396,7 @@ impl AppApprovalRules {
         run: sdk::RunId,
         call: &sdk::ToolCall,
     ) -> RuleDecision {
-        let judged = approvals.judge(&call.arguments);
+        let judged = approvals.judge(run, &call.id, &call.arguments);
         approvals.remember(run, &call.id, judged.clone());
         let (refused, escalation) = match judged.scope {
             // The dispatcher refuses it before the tool runs.
@@ -420,7 +429,7 @@ impl AppApprovalRules {
         if let Some(approvals) = self.judged_tool(&call.name) {
             let judged = approvals
                 .judged(run, &call.id)
-                .unwrap_or_else(|| approvals.judge(&call.arguments));
+                .unwrap_or_else(|| approvals.judge(run, &call.id, &call.arguments));
             let (refused, escalation) = match judged.scope {
                 TerminalScope::Refused(_) => (true, None),
                 TerminalScope::Escalate(escalation) => (false, Some(escalation)),
@@ -1309,7 +1318,7 @@ mod tests {
     /// The terminal with every call judged to have `scope`.
     fn with_scope(terminal: TerminalApprovals, scope: TerminalScope) -> TerminalApprovals {
         terminal.with_canonicalizer(
-            move |raw| JudgedTerminal {
+            move |_, _, raw| JudgedTerminal {
                 call: CanonicalCall::stripped(None, raw),
                 scope: scope.clone(),
             },
