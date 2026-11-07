@@ -71,6 +71,9 @@ name = "aidaemon"
 version = "0.12.9"
 dependencies = [
  "aes-gcm",
+ "aidaemon-channel-slack",
+ "aidaemon-channel-telegram",
+ "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-mcp",
  "aidaemon-memory",
@@ -207,6 +210,7 @@ dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
  "async-trait",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

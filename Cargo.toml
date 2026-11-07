@@ -114,6 +114,10 @@ aidaemon-tools = { path = "crates/aidaemon-tools" }
 aidaemon-providers = { path = "crates/aidaemon-providers" }
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { path = "crates/aidaemon-mcp" }
+# Channel contract and platform adapters (formatting today; transport next).
+aidaemon-channels = { path = "crates/aidaemon-channels" }
+aidaemon-channel-telegram = { path = "crates/aidaemon-channel-telegram" }
+aidaemon-channel-slack = { path = "crates/aidaemon-channel-slack", optional = true }
 # Optional SDK memory backend (`[memory] backend = "sdk"`).
 aidaemon-memory = { path = "crates/aidaemon-memory", optional = true }
 
@@ -139,7 +143,7 @@ keyring = { version = "3", features = ["windows-native"] }
 default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
-slack = ["dep:tokio-tungstenite"]
+slack = ["dep:tokio-tungstenite", "dep:aidaemon-channel-slack"]
 execution-docker = []
 terminal-bridge = [
     "dep:tokio-tungstenite",

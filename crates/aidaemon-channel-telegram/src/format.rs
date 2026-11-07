@@ -24,8 +24,11 @@ pub fn html_escape(s: &str) -> String {
 /// Supports fenced code blocks (with language), headings (rendered bold),
 /// `-`/`*` bullets, tables (rendered as `header: value` cards), and inline
 /// `**bold**`, `*italic*`/`_italic_`, `~~strike~~`, `` `code` `` and
-/// `[text](url)` links.
+/// `[text](url)` links. LaTeX math, which Telegram cannot render, is
+/// rewritten as plain text first ([`aidaemon_channels::latex::strip_latex`]).
 pub fn markdown_to_html(md: &str) -> String {
+    let md = aidaemon_channels::latex::strip_latex(md);
+    let md = md.as_str();
     let mut out = String::with_capacity(md.len() + md.len() / 4);
     let lines: Vec<&str> = md.lines().collect();
     let mut i = 0;

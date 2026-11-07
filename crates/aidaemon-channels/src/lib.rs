@@ -16,6 +16,7 @@
 pub mod channel;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod latex;
 pub mod policy;
 mod render;
 pub mod router;
