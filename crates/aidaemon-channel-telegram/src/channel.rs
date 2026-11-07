@@ -60,6 +60,24 @@ pub struct TelegramChannel {
     webhook: Option<crate::webhook::WebhookConfig>,
 }
 
+/// Where received updates go.
+#[derive(Clone, Copy)]
+enum Sink<'a> {
+    /// Mapped to [`ChannelEvent`]s.
+    Events(&'a mpsc::Sender<ChannelEvent>),
+    /// As the Bot API sent them.
+    Raw(&'a mpsc::Sender<Value>),
+}
+
+impl Sink<'_> {
+    async fn closed(&self) {
+        match self {
+            Self::Events(tx) => tx.closed().await,
+            Self::Raw(tx) => tx.closed().await,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     identity: RwLock<Option<BotIdentity>>,
@@ -251,7 +269,7 @@ impl TelegramChannel {
     /// Long polling with `getUpdates`.
     async fn run_polling(
         &self,
-        events: mpsc::Sender<ChannelEvent>,
+        sink: Sink<'_>,
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError> {
         let api = self.api();
@@ -270,15 +288,17 @@ impl TelegramChannel {
             }
             let result = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                _ = events.closed() => return Ok(()),
-                r = api.call::<Vec<Update>>("getUpdates", &body, http_timeout) => r,
+                _ = sink.closed() => return Ok(()),
+                r = api.call::<Vec<Value>>("getUpdates", &body, http_timeout) => r,
             };
             match result {
                 Ok(updates) => {
                     delay = self.backoff_initial;
                     for update in updates {
-                        offset = Some(offset.unwrap_or(i64::MIN).max(update.update_id + 1));
-                        if !self.handle_update(update, &events).await {
+                        if let Some(id) = update.get("update_id").and_then(Value::as_i64) {
+                            offset = Some(offset.unwrap_or(i64::MIN).max(id + 1));
+                        }
+                        if !self.deliver(sink, update).await {
                             return Ok(()); // receiver dropped
                         }
                         if shutdown.is_cancelled() {
@@ -306,7 +326,7 @@ impl TelegramChannel {
     async fn run_webhook(
         &self,
         webhook: &crate::webhook::WebhookConfig,
-        events: &mpsc::Sender<ChannelEvent>,
+        sink: Sink<'_>,
         shutdown: &CancellationToken,
     ) -> Result<bool, ChannelError> {
         let listener = match crate::webhook::bind(webhook).await {
@@ -358,10 +378,10 @@ impl TelegramChannel {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = events.closed() => break,
+                _ = sink.closed() => break,
                 update = updates.recv() => match update {
                     Some(update) => {
-                        if !self.handle_update(update, events).await {
+                        if !self.deliver(sink, update).await {
                             break;
                         }
                     }
@@ -372,6 +392,55 @@ impl TelegramChannel {
         server_shutdown.cancel();
         let _ = server.await;
         Ok(true)
+    }
+
+    /// Hand one update (as the Bot API sent it) to `sink`. `false`: the
+    /// receiver is gone.
+    async fn deliver(&self, sink: Sink<'_>, update: Value) -> bool {
+        match sink {
+            Sink::Raw(updates) => updates.send(update).await.is_ok(),
+            Sink::Events(events) => match serde_json::from_value::<Update>(update) {
+                Ok(update) => self.handle_update(update, events).await,
+                // A kind this adapter does not read.
+                Err(_) => true,
+            },
+        }
+    }
+
+    /// Receive and deliver until `shutdown`: webhook mode when configured
+    /// (falling back to polling), long polling otherwise.
+    async fn serve(&self, sink: Sink<'_>, shutdown: CancellationToken) -> Result<(), ChannelError> {
+        if !self.resolve_identity(&shutdown).await? {
+            return Ok(());
+        }
+        #[cfg(feature = "webhook")]
+        if let Some(webhook) = self.webhook.clone() {
+            match self.run_webhook(&webhook, sink, &shutdown).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    // A webhook left registered would make getUpdates fail.
+                    if let Err(e) = self.call::<Value>("deleteWebhook", &json!({})).await {
+                        if e.is_auth() {
+                            return Err(e.into());
+                        }
+                        warn!(channel = %self.name, error = %e, "deleteWebhook failed");
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.run_polling(sink, shutdown).await
+    }
+
+    /// Receive updates exactly as [`Channel::run`] does (polling or
+    /// webhook, offsets, backoff) but hand each one over as the Bot API sent
+    /// it, for a host that reads the Bot API's own types.
+    pub async fn run_updates(
+        &self,
+        updates: mpsc::Sender<Value>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ChannelError> {
+        self.serve(Sink::Raw(&updates), shutdown).await
     }
 
     async fn handle_update(&self, update: Update, events: &mpsc::Sender<ChannelEvent>) -> bool {
@@ -546,26 +615,7 @@ impl Channel for TelegramChannel {
         events: mpsc::Sender<ChannelEvent>,
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError> {
-        if !self.resolve_identity(&shutdown).await? {
-            return Ok(());
-        }
-        #[cfg(feature = "webhook")]
-        if let Some(webhook) = self.webhook.clone() {
-            match self.run_webhook(&webhook, &events, &shutdown).await {
-                Ok(true) => return Ok(()),
-                Ok(false) => {
-                    // A webhook left registered would make getUpdates fail.
-                    if let Err(e) = self.call::<Value>("deleteWebhook", &json!({})).await {
-                        if e.is_auth() {
-                            return Err(e.into());
-                        }
-                        warn!(channel = %self.name, error = %e, "deleteWebhook failed");
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        self.run_polling(events, shutdown).await
+        self.serve(Sink::Events(&events), shutdown).await
     }
 
     async fn send(

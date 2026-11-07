@@ -9,7 +9,7 @@ use axum::routing::post;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::Update;
+use serde_json::Value;
 
 /// The header Telegram sends the webhook's secret token in.
 const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
@@ -71,7 +71,7 @@ pub(crate) fn generate_secret() -> String {
 #[derive(Clone)]
 struct Listener {
     secret: String,
-    updates: mpsc::Sender<Update>,
+    updates: mpsc::Sender<Value>,
 }
 
 async fn deliver(
@@ -85,7 +85,7 @@ async fn deliver(
     if presented != Some(listener.secret.as_str()) {
         return StatusCode::UNAUTHORIZED;
     }
-    let Ok(update) = serde_json::from_slice::<Update>(&body) else {
+    let Ok(update) = serde_json::from_slice::<Value>(&body) else {
         // Telegram retries non-2xx deliveries; a body this adapter cannot
         // read would be retried forever, so it is accepted and dropped.
         tracing::debug!("telegram webhook: unreadable update dropped");
@@ -109,7 +109,7 @@ pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     path: String,
     secret: String,
-    updates: mpsc::Sender<Update>,
+    updates: mpsc::Sender<Value>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     let app = axum::Router::new()

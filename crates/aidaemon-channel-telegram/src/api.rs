@@ -332,7 +332,6 @@ pub(crate) struct CallbackQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Update {
-    pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
     #[serde(default)]

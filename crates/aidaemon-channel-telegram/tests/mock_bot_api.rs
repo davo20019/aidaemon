@@ -1054,3 +1054,39 @@ async fn a_shorter_message_length_splits_sooner() {
         assert!(send.body["text"].as_str().unwrap().encode_utf16().count() <= 100);
     }
 }
+
+/// The raw mode hands every update over as the Bot API sent it, kinds the
+/// adapter does not map included, and still advances the offset.
+#[tokio::test]
+async fn run_updates_hands_over_each_update_as_sent() {
+    let (mock, base) = start_mock().await;
+    let edited =
+        json!({ "update_id": 41, "edited_message": message(9, dm_chat(), alice(), "fixed") });
+    let plain = json!({ "update_id": 42, "message": message(10, dm_chat(), alice(), "hello") });
+    mock.script_ok("getUpdates", json!([edited.clone(), plain.clone()]));
+    let ch = Arc::new(channel(&base));
+    let (tx, mut rx) = mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let run = tokio::spawn(async move { ch.run_updates(tx, stop).await });
+
+    let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, edited);
+    let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second, plain);
+    let polls = mock.wait_for_calls("getUpdates", 2).await;
+    assert_eq!(polls[1].body["offset"], 43);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
