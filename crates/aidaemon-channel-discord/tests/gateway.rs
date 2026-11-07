@@ -385,3 +385,86 @@ async fn dropped_receiver_stops_run() {
         .unwrap();
     assert!(res.is_ok());
 }
+
+#[tokio::test]
+async fn slash_command_becomes_a_command_acked_at_once_and_answered_later() {
+    let http = MockHttp::start().await;
+    let gw = MockGateway::start().await;
+    let mut run = start(channel(&http).with_gateway_url(gw.url.clone()));
+
+    let mut conn = gw.accept().await;
+    conn.hello(45_000).await;
+    conn.recv().await;
+    conn.ready("synthetic-session-1", &gw.url).await;
+    conn.dispatch(
+        2,
+        "INTERACTION_CREATE",
+        json!({
+            "id": "100000000000000501",
+            "type": 2,
+            "token": "synthetic-command-token",
+            "application_id": "100000000000000009",
+            "guild_id": GUILD_ID,
+            "channel_id": CHANNEL_ID,
+            "member": {"user": alice()},
+            "data": {"name": "model", "options": [{"name": "args", "type": 3, "value": " list "}]}
+        }),
+    )
+    .await;
+    let command = match run.next_event().await {
+        ChannelEvent::Command(command) => command,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(command.name, "model");
+    assert_eq!(command.args, "list");
+    assert_eq!(command.as_text(), "/model list");
+    assert_eq!(command.sender.id, "100000000000000001");
+    assert_eq!(command.conversation.id, CHANNEL_ID);
+    let reqs = http.wait_for(1).await;
+    assert_eq!(
+        reqs[0].path,
+        "/interactions/100000000000000501/synthetic-command-token/callback"
+    );
+    assert_eq!(reqs[0].body, json!({"type": 5}), "a deferred reply");
+
+    run.channel
+        .answer_command(&command, "Models: synthetic-a, synthetic-b")
+        .await
+        .unwrap();
+    let reqs = http.wait_for(2).await;
+    assert_eq!(reqs[1].method, "PATCH");
+    assert_eq!(
+        reqs[1].path,
+        "/webhooks/100000000000000009/synthetic-command-token/messages/@original"
+    );
+    assert_eq!(reqs[1].body["content"], "Models: synthetic-a, synthetic-b");
+    run.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn commands_asked_for_before_ready_are_registered_on_ready() {
+    let http = MockHttp::start().await;
+    let gw = MockGateway::start().await;
+    let run = start(channel(&http).with_gateway_url(gw.url.clone()));
+    let commands = vec![aidaemon_channels::CommandSpec {
+        name: "status".to_string(),
+        description: "Show what the agent is doing".to_string(),
+    }];
+    run.channel.register_commands(&commands).await.unwrap();
+    assert!(http.requests().is_empty(), "nothing is sent before READY");
+
+    let mut conn = gw.accept().await;
+    conn.hello(45_000).await;
+    conn.recv().await;
+    conn.ready("synthetic-session-1", &gw.url).await;
+    let reqs = http.wait_for(1).await;
+    assert_eq!(reqs[0].method, "PUT");
+    assert_eq!(reqs[0].path, format!("/applications/{BOT_ID}/commands"));
+    assert_eq!(reqs[0].body[0]["name"], "status");
+    assert_eq!(reqs[0].body[0]["options"][0]["name"], "args");
+
+    // Once ready, a new menu is registered right away.
+    run.channel.register_commands(&commands).await.unwrap();
+    assert_eq!(http.wait_for(2).await[1].method, "PUT");
+    run.finish().await.unwrap();
+}

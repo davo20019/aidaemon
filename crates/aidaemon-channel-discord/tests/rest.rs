@@ -238,3 +238,88 @@ async fn typing_posts_to_typing_endpoint() {
     assert_eq!(reqs[0].method, "POST");
     assert_eq!(reqs[0].path, format!("/channels/{CHANNEL_ID}/typing"));
 }
+
+#[tokio::test]
+async fn delete_removes_the_message() {
+    let http = MockHttp::start().await;
+    http.push(204, json!(null));
+    let ch = channel(&http);
+    ch.delete(&MessageRef {
+        conversation_id: CHANNEL_ID.to_string(),
+        message_id: "100000000000000777".to_string(),
+    })
+    .await
+    .unwrap();
+    let reqs = http.requests();
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(
+        reqs[0].path,
+        format!("/channels/{CHANNEL_ID}/messages/100000000000000777")
+    );
+}
+
+#[tokio::test]
+async fn send_file_uploads_the_file_with_its_caption() {
+    let http = MockHttp::start().await;
+    let ch = channel(&http);
+    let sent = ch
+        .send_file(
+            &conv(),
+            &aidaemon_channels::OutboundFile {
+                name: "report.txt".to_string(),
+                bytes: b"synthetic report for Acme Corp".to_vec(),
+                mime_type: Some("text/plain".to_string()),
+                caption: Some("The weekly report".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.conversation_id, CHANNEL_ID);
+    let reqs = http.requests();
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, format!("/channels/{CHANNEL_ID}/messages"));
+    assert!(reqs[0].headers["content-type"].starts_with("multipart/form-data"));
+    let raw = String::from_utf8_lossy(&reqs[0].raw);
+    assert!(raw.contains("filename=\"report.txt\""), "{raw}");
+    assert!(raw.contains("synthetic report for Acme Corp"));
+    assert!(raw.contains("name=\"payload_json\""));
+    assert!(raw.contains("The weekly report"));
+}
+
+#[tokio::test]
+async fn send_file_refuses_a_file_over_the_limit() {
+    let http = MockHttp::start().await;
+    let ch = channel(&http);
+    let err = ch
+        .send_file(
+            &conv(),
+            &aidaemon_channels::OutboundFile {
+                name: "big.bin".to_string(),
+                bytes: vec![0; aidaemon_channel_discord::MAX_FILE_BYTES + 1],
+                mime_type: None,
+                caption: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)));
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn download_fetches_the_attachment() {
+    let http = MockHttp::start().await;
+    http.push(200, json!("synthetic attachment bytes"));
+    let ch = channel(&http);
+    let bytes = ch
+        .download(&aidaemon_channels::Attachment {
+            name: "notes.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            size_bytes: None,
+            source: format!("{}/attachments/1/2/notes.txt", http.base),
+        })
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"\"synthetic attachment bytes\"");
+    assert_eq!(http.requests()[0].method, "GET");
+}

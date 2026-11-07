@@ -44,17 +44,75 @@ impl Rest {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, ChannelError> {
+        self.send_with(method, path, |req| match body {
+            Some(b) => req.json(b),
+            None => req.body(Vec::<u8>::new()),
+        })
+        .await
+    }
+
+    /// POST a message with one file (`multipart/form-data`): the JSON
+    /// payload as `payload_json` and the file as `files[0]`.
+    pub(crate) async fn upload(
+        &self,
+        path: &str,
+        payload: &Value,
+        file_name: &str,
+        bytes: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<Value, ChannelError> {
+        self.send_with(Method::POST, path, |req| {
+            let mut part =
+                reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string());
+            if let Some(mime) = mime_type {
+                part = part.mime_str(mime).unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string())
+                });
+            }
+            let form = reqwest::multipart::Form::new()
+                .text("payload_json", payload.to_string())
+                .part("files[0]", part);
+            req.multipart(form)
+        })
+        .await
+    }
+
+    /// Fetch a file from Discord's CDN (attachment URLs need no token).
+    pub(crate) async fn download(&self, url: &str) -> Result<Vec<u8>, ChannelError> {
+        let resp = self
+            .http
+            .get(url)
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| ChannelError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ChannelError::Other(format!(
+                "discord: attachment download failed: {status}"
+            )));
+        }
+        resp.bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| ChannelError::Transport(e.to_string()))
+    }
+
+    /// Send a request built by `body` (called again on the one retry).
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        body: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<Value, ChannelError> {
         let mut retried = false;
         loop {
-            let mut req = self
+            let req = self
                 .http
                 .request(method.clone(), self.url(path))
                 .header("Authorization", format!("Bot {}", self.token))
                 .header("User-Agent", USER_AGENT);
-            req = match body {
-                Some(b) => req.json(b),
-                None => req.body(Vec::<u8>::new()),
-            };
+            let req = body(req);
             let resp = req
                 .send()
                 .await

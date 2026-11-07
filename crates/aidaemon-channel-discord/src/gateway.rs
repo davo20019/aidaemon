@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::mapping::{map_interaction, map_message, THREAD_CHANNEL_TYPES};
+use crate::mapping::{map_command, map_interaction, map_message, THREAD_CHANNEL_TYPES};
 use crate::DiscordChannel;
 
 const OP_DISPATCH: u64 = 0;
@@ -32,6 +32,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 pub(crate) struct GatewayState {
     pub(crate) bot_user_id: Option<String>,
+    /// The application id, from READY (needed to register commands).
+    pub(crate) application_id: Option<String>,
+    /// The command menu to (re-)register when the gateway becomes ready.
+    pub(crate) commands: Option<Vec<aidaemon_channels::CommandSpec>>,
     pub(crate) session_id: Option<String>,
     pub(crate) resume_url: Option<String>,
     pub(crate) seq: Option<u64>,
@@ -378,8 +382,25 @@ impl DiscordChannel {
                     .get("resume_gateway_url")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                st.application_id = d
+                    .get("application")
+                    .and_then(|a| a.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| st.bot_user_id.clone());
                 *backoff = self.backoff_initial;
                 tracing::info!(bot = ?st.bot_user_id, "discord: gateway ready");
+                // A command menu asked for before the gateway was ready.
+                if let (Some(app), Some(commands)) =
+                    (st.application_id.clone(), st.commands.clone())
+                {
+                    let rest = self.rest.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::put_commands(&rest, &app, &commands).await {
+                            tracing::warn!(error = %e, "discord: command registration failed");
+                        }
+                    });
+                }
                 None
             }
             "RESUMED" => {
@@ -389,6 +410,31 @@ impl DiscordChannel {
             "MESSAGE_CREATE" => {
                 let st = self.state.lock().unwrap();
                 map_message(d, st.bot_user_id.as_deref(), &st.threads).map(ChannelEvent::Message)
+            }
+            "INTERACTION_CREATE" if d.get("type").and_then(Value::as_u64) == Some(2) => {
+                let command = {
+                    let st = self.state.lock().unwrap();
+                    map_command(d, &st.threads)
+                }?;
+                if let (Some(id), Some(token)) = (
+                    d.get("id").and_then(Value::as_str),
+                    d.get("token").and_then(Value::as_str),
+                ) {
+                    // Acknowledge at once with a deferred reply (type 5):
+                    // Discord fails an invocation not answered within 3 s;
+                    // `answer_command` later fills in the reply.
+                    let rest = self.rest.clone();
+                    let path = format!("/interactions/{id}/{token}/callback");
+                    tokio::spawn(async move {
+                        if let Err(e) = rest
+                            .request(Method::POST, &path, Some(&json!({"type": 5})))
+                            .await
+                        {
+                            tracing::warn!(error = %e, "discord: command ack failed");
+                        }
+                    });
+                }
+                Some(ChannelEvent::Command(command))
             }
             "INTERACTION_CREATE" => {
                 let answer = {

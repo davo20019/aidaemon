@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use aidaemon_channels::{
-    ApprovalAnswer, Attachment, Conversation, ConversationKind, InboundMessage, Sender,
+    ApprovalAnswer, Attachment, CommandInvocation, Conversation, ConversationKind, InboundMessage,
+    Sender,
 };
 use serde_json::Value;
 
@@ -163,6 +164,64 @@ pub fn map_message(
     })
 }
 
+/// The conversation an interaction happened in.
+fn interaction_conversation(d: &Value, threads: &HashSet<String>) -> Option<Conversation> {
+    let channel_id =
+        str_field(d, "channel_id").or_else(|| d.get("channel").and_then(|c| str_field(c, "id")))?;
+    let mut kind = conversation_kind(d, channel_id, threads);
+    if kind == ConversationKind::Group
+        && d.get("channel")
+            .and_then(|c| c.get("type"))
+            .and_then(Value::as_u64)
+            .is_some_and(|t| THREAD_CHANNEL_TYPES.contains(&t))
+    {
+        kind = ConversationKind::Thread;
+    }
+    Some(Conversation {
+        id: channel_id.to_string(),
+        kind,
+    })
+}
+
+/// Map an INTERACTION_CREATE payload of type 2 (application command). The
+/// handle is `<application id>/<interaction token>`, which answers it.
+pub fn map_command(d: &Value, threads: &HashSet<String>) -> Option<CommandInvocation> {
+    if d.get("type").and_then(Value::as_u64) != Some(2) {
+        return None;
+    }
+    let data = d.get("data")?;
+    let name = str_field(data, "name")?.to_string();
+    // Every string option, in order, as the command's arguments.
+    let args = data
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| option.get("value").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let member = d.get("member");
+    let user = member
+        .and_then(|m| m.get("user"))
+        .or_else(|| d.get("user"))?;
+    let sender = sender_from(user, member)?;
+    let handle = format!(
+        "{}/{}",
+        str_field(d, "application_id")?,
+        str_field(d, "token")?
+    );
+    Some(CommandInvocation {
+        conversation: interaction_conversation(d, threads)?,
+        sender,
+        name,
+        args: args.trim().to_string(),
+        handle,
+    })
+}
+
 /// Map an INTERACTION_CREATE payload of type 3 (message component) whose
 /// `custom_id` this adapter produced.
 pub fn map_interaction(d: &Value, threads: &HashSet<String>) -> Option<ApprovalAnswer> {
@@ -178,25 +237,11 @@ pub fn map_interaction(d: &Value, threads: &HashSet<String>) -> Option<ApprovalA
         .and_then(|m| m.get("user"))
         .or_else(|| d.get("user"))?;
     let sender = sender_from(user, member)?;
-    let channel_id =
-        str_field(d, "channel_id").or_else(|| d.get("channel").and_then(|c| str_field(c, "id")))?;
-    let mut kind = conversation_kind(d, channel_id, threads);
-    if kind == ConversationKind::Group
-        && d.get("channel")
-            .and_then(|c| c.get("type"))
-            .and_then(Value::as_u64)
-            .is_some_and(|t| THREAD_CHANNEL_TYPES.contains(&t))
-    {
-        kind = ConversationKind::Thread;
-    }
     Some(ApprovalAnswer {
         prompt_id,
         choice_id,
         sender,
-        conversation: Conversation {
-            id: channel_id.to_string(),
-            kind,
-        },
+        conversation: interaction_conversation(d, threads)?,
     })
 }
 

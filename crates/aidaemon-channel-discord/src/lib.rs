@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_channels::{
-    ApprovalPrompt, Channel, ChannelCapabilities, ChannelError, ChannelEvent, Conversation,
-    MessageRef, OutboundMessage,
+    ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
+    CommandInvocation, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -38,6 +38,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use format::split_message;
 pub use mapping::{decode_custom_id, encode_custom_id, CUSTOM_ID_MAX};
+
+/// Discord's limit for a file sent by a bot without boosts, in bytes.
+pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Longest message Discord accepts, in characters.
 pub const MAX_MESSAGE_LEN: usize = 2000;
@@ -177,6 +180,38 @@ impl DiscordChannel {
     }
 }
 
+/// Replace the application's global command menu with `commands`. Each
+/// command takes one optional free-text `args` option.
+pub(crate) async fn put_commands(
+    rest: &rest::Rest,
+    application_id: &str,
+    commands: &[CommandSpec],
+) -> Result<(), ChannelError> {
+    let body: Vec<Value> = commands
+        .iter()
+        .map(|command| {
+            json!({
+                "type": 1,
+                "name": command.name,
+                "description": format::truncate_chars(&command.description, 100),
+                "options": [{
+                    "type": 3,
+                    "name": "args",
+                    "description": "Arguments",
+                    "required": false,
+                }],
+            })
+        })
+        .collect();
+    rest.request(
+        Method::PUT,
+        &format!("/applications/{application_id}/commands"),
+        Some(&Value::Array(body)),
+    )
+    .await
+    .map(|_| ())
+}
+
 fn message_body(content: &str, reply_to: Option<&str>) -> Value {
     let mut body = json!({
         "content": content,
@@ -236,9 +271,9 @@ impl Channel for DiscordChannel {
             buttons: true,
             typing_indicator: true,
             threads: true,
-            delete_messages: false,
-            files: false,
-            commands: false,
+            delete_messages: true,
+            files: true,
+            commands: true,
             max_message_len: MAX_MESSAGE_LEN,
         }
     }
@@ -302,6 +337,105 @@ impl Channel for DiscordChannel {
                 Method::POST,
                 &format!("/channels/{}/typing", conversation.id),
                 None,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        self.rest
+            .request(
+                Method::DELETE,
+                &format!(
+                    "/channels/{}/messages/{}",
+                    message.conversation_id, message.message_id
+                ),
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_file(
+        &self,
+        conversation: &Conversation,
+        file: &OutboundFile,
+    ) -> Result<MessageRef, ChannelError> {
+        if file.bytes.len() > MAX_FILE_BYTES {
+            return Err(ChannelError::Other(format!(
+                "discord: {} is {} bytes; bots may send at most {MAX_FILE_BYTES}",
+                file.name,
+                file.bytes.len()
+            )));
+        }
+        let caption = file
+            .caption
+            .as_deref()
+            .map(|caption| format::truncate_chars(caption, MAX_MESSAGE_LEN))
+            .unwrap_or_default();
+        let payload = json!({
+            "content": caption,
+            "allowed_mentions": {"parse": []},
+        });
+        let channel_id = &conversation.id;
+        let resp = self
+            .rest
+            .upload(
+                &format!("/channels/{channel_id}/messages"),
+                &payload,
+                &file.name,
+                &file.bytes,
+                file.mime_type.as_deref(),
+            )
+            .await?;
+        let message_id = resp
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ChannelError::Other("discord: message response without id".into()))?;
+        Ok(MessageRef {
+            conversation_id: channel_id.to_string(),
+            message_id: message_id.to_string(),
+        })
+    }
+
+    async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+        self.rest.download(&attachment.source).await
+    }
+
+    /// Registered now when the gateway is ready, else on its READY.
+    async fn register_commands(&self, commands: &[CommandSpec]) -> Result<(), ChannelError> {
+        let application_id = {
+            let mut st = self.state.lock().unwrap();
+            st.commands = Some(commands.to_vec());
+            st.application_id.clone()
+        };
+        match application_id {
+            Some(app) => put_commands(&self.rest, &app, commands).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Fills in the deferred reply the adapter acknowledged the invocation
+    /// with.
+    async fn answer_command(
+        &self,
+        command: &CommandInvocation,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        let Some((application_id, token)) = command.handle.split_once('/') else {
+            return Err(ChannelError::Other(
+                "discord: not a command handle from this adapter".into(),
+            ));
+        };
+        let body = json!({
+            "content": format::truncate_chars(text, MAX_MESSAGE_LEN),
+            "allowed_mentions": {"parse": []},
+        });
+        self.rest
+            .request(
+                Method::PATCH,
+                &format!("/webhooks/{application_id}/{token}/messages/@original"),
+                Some(&body),
             )
             .await
             .map(|_| ())

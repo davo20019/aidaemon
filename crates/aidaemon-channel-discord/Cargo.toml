@@ -12,7 +12,7 @@ publish = false
 aidaemon-channels = { path = "../aidaemon-channels" }
 async-trait = "0.1"
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "macros", "rt", "time", "net"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }

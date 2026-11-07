@@ -26,6 +26,8 @@ pub struct Recorded {
     pub path: String,
     pub headers: HashMap<String, String>,
     pub body: Value,
+    /// The body as sent (multipart uploads are not JSON).
+    pub raw: Vec<u8>,
 }
 
 type Scripted = (u16, String);
@@ -121,12 +123,14 @@ async fn serve_conn(
         if reader.read_exact(&mut body).await.is_err() {
             return;
         }
-        let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let raw = body;
+        let body = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         requests.lock().unwrap().push(Recorded {
             method,
             path,
             headers,
             body,
+            raw,
         });
         let (status, resp) = script.lock().unwrap().pop_front().unwrap_or_else(|| {
             let mut c = counter.lock().unwrap();
