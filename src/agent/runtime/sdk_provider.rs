@@ -67,9 +67,29 @@ pub(crate) struct RuntimeProvider {
     pub(crate) accounting: Option<ModelCallAccounting>,
 }
 
+impl RuntimeProvider {
+    /// A provider for a background `purpose` (memory extraction, task
+    /// learning): each call's tokens and `llm_call` event are filed under the
+    /// session `background:<purpose>`.
+    pub(crate) fn with_accounting(
+        runtime: crate::llm_runtime::SharedLlmRuntime,
+        state: std::sync::Arc<dyn crate::traits::StateStore>,
+        event_store: std::sync::Arc<crate::events::EventStore>,
+        purpose: &'static str,
+    ) -> Self {
+        Self {
+            runtime,
+            accounting: Some(ModelCallAccounting {
+                state,
+                event_store,
+                purpose,
+            }),
+        }
+    }
+}
+
 /// Where a [`RuntimeProvider`] records each call's tokens and `llm_call`
 /// event, and the purpose they are filed under.
-#[cfg_attr(not(feature = "sdk-memory"), allow(dead_code))]
 pub(crate) struct ModelCallAccounting {
     pub(crate) state: std::sync::Arc<dyn crate::traits::StateStore>,
     pub(crate) event_store: std::sync::Arc<crate::events::EventStore>,

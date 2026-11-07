@@ -6,13 +6,9 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
-use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use crate::providers::ChatJson;
 use crate::traits::{StateStore, Task};
-use crate::types::FactPrivacy;
 
 /// Maximum size of activity log text sent to the extraction prompt.
 const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
@@ -24,7 +20,7 @@ const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     event_store: Arc<crate::events::EventStore>,
-    provider: crate::llm_runtime::ModelBackend,
+    llm_runtime: crate::llm_runtime::SharedLlmRuntime,
     model: String,
     task: Task,
 ) -> anyhow::Result<()> {
@@ -97,293 +93,23 @@ pub async fn extract_task_knowledge(
         activity_log.push_str(&line);
     }
 
-    let result_text = task.result.as_deref().unwrap_or("(no result)");
-
-    let system_prompt = "You are a knowledge extraction system. Given a completed task and its activity log, \
-        extract durable knowledge worth remembering. Output ONLY a JSON object:\n\
-        {\n  \"facts\": [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"graph\": {\"entities\": [], \"relationships\": []}}],\n  \
-        \"procedures\": [{\"name\": \"...\", \"trigger_pattern\": \"...\", \"steps\": [\"...\"]}],\n  \
-        \"error_solutions\": [{\"error_pattern\": \"...\", \"solution_summary\": \"...\", \"domain\": \"...\"}]\n}\n\
-        Categories for facts: project, technical, preference, behavior. Graph entities use local_id, name, entity_type, aliases, confidence; relationships use source_id, target_id, relation, confidence. Only include graph data directly supported by the task evidence. Never infer entity types from category or key names.\n\
-        Only extract knowledge that would be useful for FUTURE tasks. If nothing worth remembering, return empty arrays.";
-    let system_prompt = format!(
-        "{system_prompt}\nFacts may carry a \"lifetime\" field. {}",
-        crate::memory::FACT_LIFETIME_INSTRUCTION
-    );
-
-    let user_prompt = format!(
-        "## Task\n{}\n\n## Result\n{}\n\n## Activity Log\n{}",
-        task.description, result_text, activity_log
-    );
-
-    let messages = vec![
-        json!({"role": "system", "content": system_prompt}),
-        json!({"role": "user", "content": user_prompt}),
-    ];
-
-    let call_start = std::time::Instant::now();
-    let response = provider.chat(&model, &messages, &[]).await?;
-
-    crate::events::record_background_model_call_telemetry(
+    let provider = crate::agent::RuntimeProvider::with_accounting(
+        llm_runtime,
+        state.clone(),
         event_store,
-        state.as_ref(),
-        "background:task_learning",
         "task_learning",
-        &model,
-        &response,
-        call_start.elapsed(),
-    )
-    .await;
-
-    let response_text = response
-        .content
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Empty extraction response"))?;
-
-    // Parse response
-    let extraction = parse_extraction_response(response_text)?;
-
-    // Store extracted knowledge
-    let mut stored = 0usize;
-
-    for fact in extraction.facts.iter().filter(|_| learn_facts) {
-        if fact.category.is_empty() || fact.key.is_empty() || fact.value.is_empty() {
-            continue;
-        }
-        if fact.lifetime.is_transient() {
-            continue;
-        }
-        if let Err(e) = state
-            .upsert_fact(
-                &fact.category,
-                &fact.key,
-                &fact.value,
-                "task_learning",
-                derived_channel_id.as_deref(),
-                FactPrivacy::Channel,
-            )
-            .await
-        {
-            warn!(error = %e, "Failed to store extracted fact");
-        } else {
-            let excerpt = crate::utils::truncate_str(&user_prompt, 1000);
-            if let Err(e) = state
-                .project_extracted_fact_graph(
-                    &fact.category,
-                    &fact.key,
-                    excerpt.as_str(),
-                    &fact.graph,
-                )
-                .await
-            {
-                debug!(error = %e, key = fact.key, "Failed to project task-learning graph");
-            }
-            stored += 1;
-        }
-    }
-
-    for proc in &extraction.procedures {
-        if proc.name.is_empty() || proc.steps.is_empty() {
-            continue;
-        }
-        let keyed_name =
-            crate::memory::procedures::generate_procedure_keyed_name(&proc.name, &proc.steps);
-        let procedure = crate::traits::Procedure {
-            id: 0,
-            name: keyed_name,
-            trigger_pattern: proc.trigger_pattern.clone(),
-            steps: proc.steps.clone(),
-            success_count: 1,
-            failure_count: 0,
-            avg_duration_secs: None,
-            last_used_at: Some(chrono::Utc::now()),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        if let Err(e) = state.upsert_procedure(&procedure).await {
-            warn!(error = %e, "Failed to store extracted procedure");
-        } else {
-            stored += 1;
-        }
-    }
-
-    for es in &extraction.error_solutions {
-        if es.error_pattern.is_empty() || es.solution_summary.is_empty() {
-            continue;
-        }
-        let solution = crate::traits::ErrorSolution {
-            id: 0,
-            error_pattern: es.error_pattern.clone(),
-            domain: if es.domain.is_empty() {
-                None
-            } else {
-                Some(es.domain.clone())
-            },
-            solution_summary: es.solution_summary.clone(),
-            solution_steps: None,
-            // Extracted, not observed: it earns credit only when reused.
-            success_count: 0,
-            failure_count: 0,
-            last_used_at: Some(chrono::Utc::now()),
-            created_at: chrono::Utc::now(),
-        };
-        if let Err(e) = state.insert_error_solution(&solution).await {
-            warn!(error = %e, "Failed to store extracted error solution");
-        } else {
-            stored += 1;
-        }
-    }
-
-    info!(
-        task_id = %task.id,
-        facts = extraction.facts.len(),
-        procedures = extraction.procedures.len(),
-        error_solutions = extraction.error_solutions.len(),
-        stored,
-        "Task knowledge extraction complete"
     );
-
-    Ok(())
-}
-
-/// Parsed extraction response from the LLM.
-#[derive(Debug, Deserialize)]
-struct ExtractionResponse {
-    #[serde(default)]
-    facts: Vec<ExtractedFact>,
-    #[serde(default)]
-    procedures: Vec<ExtractedProcedure>,
-    #[serde(default)]
-    error_solutions: Vec<ExtractedErrorSolution>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExtractedFact {
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    value: String,
-    #[serde(default)]
-    graph: crate::traits::ExtractedMemoryGraph,
-    #[serde(default)]
-    lifetime: crate::memory::FactLifetime,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExtractedProcedure {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    trigger_pattern: String,
-    #[serde(default)]
-    steps: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExtractedErrorSolution {
-    #[serde(default)]
-    error_pattern: String,
-    #[serde(default)]
-    solution_summary: String,
-    #[serde(default)]
-    domain: String,
-}
-
-/// Parse the LLM extraction response, handling markdown fences and partial JSON.
-fn parse_extraction_response(text: &str) -> anyhow::Result<ExtractionResponse> {
-    // Try to extract JSON from markdown code fences first
-    let json_str = if let Some(start) = text.find("```json") {
-        let after = &text[start + 7..];
-        if let Some(end) = after.find("```") {
-            after[..end].trim()
-        } else {
-            text.trim()
-        }
-    } else if let Some(start) = text.find("```") {
-        let after = &text[start + 3..];
-        if let Some(end) = after.find("```") {
-            after[..end].trim()
-        } else {
-            text.trim()
-        }
-    } else {
-        text.trim()
-    };
-
-    // Try to find a JSON object in the text
-    let json_str = if let Some(start) = json_str.find('{') {
-        if let Some(end) = json_str.rfind('}') {
-            &json_str[start..=end]
-        } else {
-            json_str
-        }
-    } else {
-        json_str
-    };
-
-    serde_json::from_str(json_str).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse extraction response: {} (text: {})",
-            e,
-            &text[..text.len().min(200)]
+    aidaemon_memory::task_learning::TaskLearner::new(Arc::new(provider), model)
+        .learn(
+            state.as_ref(),
+            &aidaemon_memory::task_learning::FinishedTask {
+                description: &task.description,
+                result: task.result.as_deref(),
+                activity_log: &activity_log,
+                channel_id: derived_channel_id.as_deref(),
+                learn_facts,
+            },
         )
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_extraction_response_full() {
-        let response = r#"{"facts": [{"category": "technical", "key": "database", "value": "Uses PostgreSQL 15"}], "procedures": [{"name": "deploy", "trigger_pattern": "deploy to prod", "steps": ["build", "test", "deploy"]}], "error_solutions": [{"error_pattern": "connection refused", "solution_summary": "Check if DB is running", "domain": "database"}]}"#;
-
-        let result = parse_extraction_response(response).unwrap();
-        assert_eq!(result.facts.len(), 1);
-        assert_eq!(result.facts[0].category, "technical");
-        assert_eq!(result.facts[0].key, "database");
-        assert_eq!(result.procedures.len(), 1);
-        assert_eq!(result.procedures[0].name, "deploy");
-        assert_eq!(result.procedures[0].steps.len(), 3);
-        assert_eq!(result.error_solutions.len(), 1);
-        assert_eq!(
-            result.error_solutions[0].error_pattern,
-            "connection refused"
-        );
-    }
-
-    #[test]
-    fn test_parse_extraction_response_empty_arrays() {
-        let response = r#"{"facts": [], "procedures": [], "error_solutions": []}"#;
-        let result = parse_extraction_response(response).unwrap();
-        assert!(result.facts.is_empty());
-        assert!(result.procedures.is_empty());
-        assert!(result.error_solutions.is_empty());
-    }
-
-    #[test]
-    fn test_parse_extraction_response_with_markdown_fences() {
-        let response = "Here is the extraction:\n```json\n{\"facts\": [{\"category\": \"project\", \"key\": \"lang\", \"value\": \"Rust\"}], \"procedures\": [], \"error_solutions\": []}\n```";
-        let result = parse_extraction_response(response).unwrap();
-        assert_eq!(result.facts.len(), 1);
-        assert_eq!(result.facts[0].value, "Rust");
-    }
-
-    #[test]
-    fn test_parse_extraction_response_partial_fields() {
-        // Missing some fields — defaults should apply
-        let response = r#"{"facts": [{"category": "technical"}], "procedures": []}"#;
-        let result = parse_extraction_response(response).unwrap();
-        assert_eq!(result.facts.len(), 1);
-        assert_eq!(result.facts[0].key, ""); // default empty
-        assert!(result.error_solutions.is_empty()); // missing → default empty
-    }
-
-    #[test]
-    fn test_parse_extraction_response_invalid_json() {
-        let response = "This is not JSON at all";
-        assert!(parse_extraction_response(response).is_err());
-    }
+        .await
+        .map(|_| ())
 }

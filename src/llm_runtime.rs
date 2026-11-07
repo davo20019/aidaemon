@@ -277,10 +277,6 @@ impl SharedLlmRuntime {
         }
     }
 
-    pub fn provider(&self) -> ModelBackend {
-        self.snapshot().provider()
-    }
-
     pub fn router(&self) -> Option<Router> {
         self.snapshot().router()
     }

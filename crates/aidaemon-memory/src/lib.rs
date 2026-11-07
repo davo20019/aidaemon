@@ -87,6 +87,7 @@ mod scoring;
 mod store;
 pub mod stores;
 mod system;
+pub mod task_learning;
 mod text;
 mod tools;
 mod types;

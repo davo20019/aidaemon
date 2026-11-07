@@ -155,6 +155,7 @@ mod project_scope;
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
 mod sdk_provider;
+pub(crate) use sdk_provider::RuntimeProvider;
 #[path = "turn/services.rs"]
 mod services;
 pub(crate) mod specialists;
