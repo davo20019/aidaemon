@@ -1595,6 +1595,125 @@ mod tests {
         }
     }
 
+    /// Disconnecting a service and registering or removing a custom provider
+    /// ask the owner in every session, with the card the tool used to send
+    /// itself and never a client secret; reads, actions that never asked and
+    /// calls that stop before changing anything need no card, and neither
+    /// does a call the dispatcher refuses.
+    #[tokio::test]
+    async fn oauth_changes_always_ask_before_dispatch() {
+        use crate::traits::ToolSemantics;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[provider]\napi_key = \"synthetic-key\"\n\n[oauth.providers.synthetic-custom]\n\
+             auth_type = \"oauth2_pkce\"\nauthorize_url = \"https://auth.example.invalid/authorize\"\n\
+             token_url = \"https://auth.example.invalid/token\"\nscopes = []\n\
+             allowed_domains = [\"api.example.invalid\"]\n",
+        )
+        .unwrap();
+        let store = Arc::new(SyntheticOAuthStore(Some(crate::traits::OAuthConnection {
+            id: 1,
+            service: "synthetic".to_string(),
+            auth_type: "oauth2_pkce".to_string(),
+            username: None,
+            account_id: None,
+            scopes: "[]".to_string(),
+            token_expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        })));
+        let gateway = crate::oauth::OAuthGateway::new(
+            store.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            "http://localhost:8080".to_string(),
+        );
+        let concrete = Arc::new(crate::tools::ManageOAuthTool::new(
+            gateway,
+            store as Arc<dyn crate::traits::OAuthStore>,
+            config,
+        ));
+        let tool: Arc<dyn crate::traits::Tool> = concrete.clone();
+        for trusted in [false, true] {
+            let rules = rules_over(vec![tool.clone()], trusted);
+            let RuleDecision::Ask(remove) = judge_call(
+                &rules,
+                "manage_oauth",
+                json!({"action":"remove","service":"synthetic","confirm_disconnect":true}),
+            )
+            .await
+            else {
+                panic!("a disconnect must ask (trusted={trusted})");
+            };
+            assert_eq!(remove.summary, "Disconnect OAuth service 'synthetic'");
+            assert_eq!(remove.risk, sdk::ApprovalRisk::High);
+            let register = json!({
+                "action": "register_provider",
+                "service": "synthetic-other",
+                "authorize_url": "https://auth.example.invalid/authorize",
+                "token_url": "https://auth.example.invalid/token",
+                "allowed_domains": ["api.example.invalid"],
+                "client_secret": "synthetic-client-secret",
+            });
+            let RuleDecision::Ask(registered) =
+                judge_call(&rules, "manage_oauth", register.clone()).await
+            else {
+                panic!("a registration must ask (trusted={trusted})");
+            };
+            assert!(registered
+                .summary
+                .starts_with("Register custom OAuth provider 'synthetic-other' (authorize="));
+            for text in [&registered.summary, &registered.subject] {
+                assert!(!text.contains("synthetic-client-secret"), "{text}");
+            }
+            let RuleDecision::Ask(removed) = judge_call(
+                &rules,
+                "manage_oauth",
+                json!({"action":"remove_provider","service":"synthetic-custom"}),
+            )
+            .await
+            else {
+                panic!("a provider removal must ask (trusted={trusted})");
+            };
+            assert_eq!(
+                removed.summary,
+                "Remove custom OAuth provider 'synthetic-custom' and delete its client credentials"
+            );
+            for args in [
+                json!({"action":"list"}),
+                json!({"action":"providers"}),
+                json!({"action":"connect","service":"synthetic"}),
+                json!({"action":"refresh","service":"synthetic"}),
+                json!({"action":"set_credentials","service":"synthetic","client_id":"synthetic-id","client_secret":"synthetic-client-secret"}),
+                // No confirmation; nothing connected; still connected; unknown.
+                json!({"action":"remove","service":"synthetic"}),
+                json!({"action":"remove","service":"absent","confirm_disconnect":true}),
+                json!({"action":"remove_provider","service":"synthetic"}),
+                json!({"action":"remove_provider","service":"absent"}),
+                // Missing endpoints.
+                json!({"action":"register_provider","service":"synthetic-other"}),
+            ] {
+                assert_eq!(
+                    judge_call(&rules, "manage_oauth", args.clone()).await,
+                    RuleDecision::Allow,
+                    "{args}"
+                );
+            }
+            let refused = crate::traits::ApprovalCall {
+                arguments: &register,
+                as_sent: &register,
+                refused: true,
+            };
+            assert_eq!(
+                concrete
+                    .owner_approval_request(&refused, &crate::traits::ToolCallContext::default())
+                    .await,
+                crate::traits::OwnerApprovalNeed::NotNeeded
+            );
+        }
+    }
+
     /// Rules over a real terminal with `allowed` prefixes and no semantic
     /// assessor (an unknown command then fails closed to a Critical ask).
     async fn terminal_rules(allowed: &[&str]) -> AppApprovalRules {

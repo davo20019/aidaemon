@@ -1065,7 +1065,6 @@ async fn register_runtime_tool_by_id(
                 gateway.clone(),
                 state.clone() as Arc<dyn crate::traits::StateStore>,
                 config_path.to_path_buf(),
-                approval_tx,
             )));
             *oauth_gateway = Some(gateway);
         }

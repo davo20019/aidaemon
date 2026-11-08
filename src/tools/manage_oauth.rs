@@ -11,16 +11,14 @@ use tracing::{info, warn};
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, StableObservationSubject, Tool, ToolCallContext,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
-    ToolTargetHint, ToolTargetHintKind,
+    semantics_for_exact_read_actions, ApprovalScope, OAuthStore, OwnerApprovalNeed,
+    StableObservationSubject, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolCollectionObservation, ToolMutationEffects,
+    ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint, ToolTargetHintKind,
 };
-use crate::types::{ApprovalResponse, StatusUpdate};
+use crate::types::StatusUpdate;
 
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::{ApprovalBroker, HttpRequestTool};
+use crate::tools::HttpRequestTool;
 
 #[derive(Deserialize, Default)]
 struct ManageOAuthArgs {
@@ -43,11 +41,29 @@ struct ManageOAuthArgs {
     call_session: String,
 }
 
+/// What a `bind_account` proves and binds, once its arguments and the
+/// connection are read.
+struct BindPlan {
+    identity_url: String,
+    expected_account_id: String,
+    account_id_pointer: String,
+    prior_binding: String,
+}
+
+/// The custom provider a `register_provider` writes, once its arguments are
+/// read.
+struct RegisterPlan {
+    auth_type: String,
+    authorize_url: String,
+    token_url: String,
+    allowed_domains: Vec<String>,
+    scopes: Vec<String>,
+}
+
 pub struct ManageOAuthTool {
     gateway: OAuthGateway,
     state_store: Arc<dyn OAuthStore>,
     config_path: PathBuf,
-    approval_tx: ApprovalBroker,
 }
 
 impl ManageOAuthTool {
@@ -62,13 +78,11 @@ impl ManageOAuthTool {
         gateway: OAuthGateway,
         state_store: Arc<dyn OAuthStore>,
         config_path: PathBuf,
-        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             gateway,
             state_store,
             config_path,
-            approval_tx,
         }
     }
 
@@ -321,31 +335,300 @@ impl ManageOAuthTool {
             .and_then(toml::Value::as_table)
     }
 
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-        warnings: Vec<String>,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings,
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
-            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
+    /// Refuse a call that changes a connection or provider unless it came
+    /// through the agent kernel, whose approval rules asked the owner
+    /// ([`ManageOAuthTool::owner_approval`]).
+    fn require_kernel_approval(
+        kernel_approved: Option<&ApprovalScope>,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        if kernel_approved != Some(&ApprovalScope::Call) {
+            anyhow::bail!(
+                "manage_oauth `{action}` requires approval through the agent kernel; it was \
+                 called outside an approved agent call"
+            );
         }
+        Ok(())
+    }
+
+    /// The owner approval one call needs: `bind_account`, `remove`,
+    /// `register_provider` and `remove_provider` ask once they reach their
+    /// change, judged against the stored connections and providers exactly
+    /// as the call reads them. A call that stops before changing anything
+    /// (missing or invalid fields, an unknown connection, a built-in
+    /// provider, a disconnect without `confirm_disconnect`) needs no card;
+    /// the other actions never asked.
+    pub(crate) async fn owner_approval(&self, arguments: &Value) -> OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ManageOAuthArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let Some(service) = args
+            .service
+            .as_deref()
+            .and_then(|service| Self::validate_service_name(service).ok())
+        else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let request = match args.action.as_str() {
+            "bind_account" => {
+                let (Some(account_id), Some(identity_url), Some(pointer)) = (
+                    args.account_id.as_deref(),
+                    args.identity_url.as_deref(),
+                    args.account_id_pointer.as_deref(),
+                ) else {
+                    return OwnerApprovalNeed::NotNeeded;
+                };
+                match self
+                    .bind_plan(&service, account_id, identity_url, pointer)
+                    .await
+                {
+                    Ok(plan) => Self::bind_request(&service, &plan),
+                    Err(_) => return OwnerApprovalNeed::NotNeeded,
+                }
+            }
+            "remove" => {
+                let connected = matches!(
+                    self.state_store.get_oauth_connection(&service).await,
+                    Ok(Some(_))
+                );
+                if !connected || !args.confirm_disconnect.unwrap_or(false) {
+                    return OwnerApprovalNeed::NotNeeded;
+                }
+                Self::remove_request(&service)
+            }
+            "register_provider" => match Self::register_plan(&service, &args) {
+                Ok(Ok(plan)) => Self::register_request(&service, &args, &plan),
+                _ => return OwnerApprovalNeed::NotNeeded,
+            },
+            "remove_provider" => match self.custom_provider_removable(&service).await {
+                Ok(true) => Self::remove_provider_request(&service),
+                _ => return OwnerApprovalNeed::NotNeeded,
+            },
+            _ => return OwnerApprovalNeed::NotNeeded,
+        };
+        OwnerApprovalNeed::Ask(request)
+    }
+
+    fn bind_request(service: &str, plan: &BindPlan) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Verify and bind OAuth service '{}' from account '{}' to '{}'",
+                service, plan.prior_binding, plan.expected_account_id
+            ),
+            // The exact arguments the owner approves; a changed argument is a new card.
+            subject: json!({
+                "action": "bind_account",
+                "service": service,
+                "account_id": plan.expected_account_id,
+                "identity_url": plan.identity_url,
+                "account_id_pointer": plan.account_id_pointer,
+            })
+            .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                format!(
+                    "Performs one authenticated read-only GET to {}",
+                    plan.identity_url
+                ),
+                "Persists the proven remote account ID for future mandate authorization"
+                    .to_string(),
+                "A later OAuth reconnect clears this binding and requires verification again"
+                    .to_string(),
+            ],
+        }
+    }
+
+    fn remove_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("Disconnect OAuth service '{}'", service),
+            subject: json!({"action": "remove", "service": service, "confirm_disconnect": true})
+                .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "Deletes the stored OAuth connection and tokens".to_string(),
+                "Leaves the service unavailable until it is connected again".to_string(),
+            ],
+        }
+    }
+
+    /// The card names the provider's endpoints, never its client
+    /// credentials (`register_provider` takes none).
+    fn register_request(
+        service: &str,
+        args: &ManageOAuthArgs,
+        plan: &RegisterPlan,
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Register custom OAuth provider '{}' (authorize={}, token={})",
+                service, plan.authorize_url, plan.token_url
+            ),
+            subject: json!({
+                "action": "register_provider",
+                "service": service,
+                "display_name": args.display_name,
+                "auth_type": plan.auth_type,
+                "authorize_url": plan.authorize_url,
+                "token_url": plan.token_url,
+                "scopes": plan.scopes,
+                "allowed_domains": plan.allowed_domains,
+            })
+            .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "Modifies OAuth configuration".to_string(),
+                "Can route credentialed API traffic to the configured domains".to_string(),
+            ],
+        }
+    }
+
+    fn remove_provider_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Remove custom OAuth provider '{}' and delete its client credentials",
+                service
+            ),
+            subject: json!({"action": "remove_provider", "service": service}).to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "Deletes OAuth provider configuration".to_string(),
+                "Deletes stored client credentials for this provider".to_string(),
+            ],
+        }
+    }
+
+    /// The typed effects of one call: every action but the reads acts on
+    /// the service's credential (connection tokens, client credentials or
+    /// provider definition); `bind_account` also reaches its identity host.
+    /// Token endpoints and the config file are not named, so the list is not
+    /// exhaustive.
+    pub(crate) fn effects_for(arguments: &str) -> aidaemon_core::CallEffects {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        let Ok(args) = serde_json::from_str::<ManageOAuthArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        match args.action.as_str() {
+            "list" | "providers" | "describe_provider" => CallEffects::none(),
+            "connect" | "bind_account" | "remove" | "set_credentials" | "refresh"
+            | "register_provider" | "remove_provider" => {
+                let mut effects = CallEffects::unknown();
+                if let Some(service) = args
+                    .service
+                    .as_deref()
+                    .and_then(|service| Self::validate_service_name(service).ok())
+                {
+                    effects
+                        .keys
+                        .push(EffectKey::named(EffectClass::Credential, &service));
+                }
+                if args.action == "bind_account" {
+                    if let Some(host) = args
+                        .identity_url
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(crate::tools::command_effects::url_effect)
+                    {
+                        effects.keys.push(host);
+                    }
+                }
+                effects
+            }
+            _ => CallEffects::unknown(),
+        }
+    }
+
+    /// What a `bind_account` proves and binds, or why it cannot.
+    async fn bind_plan(
+        &self,
+        service: &str,
+        expected_account_id: &str,
+        identity_url: &str,
+        account_id_pointer: &str,
+    ) -> anyhow::Result<BindPlan> {
+        let connection = self
+            .state_store
+            .get_oauth_connection(service)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No OAuth connection found for '{}'", service))?;
+        let provider = self
+            .gateway
+            .get_provider(service)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
+        let identity_url = Self::validate_identity_url(identity_url, &provider)?;
+        let expected_account_id = Self::validate_account_id(expected_account_id)?;
+        let account_id_pointer = Self::validate_account_id_pointer(account_id_pointer)?;
+        Ok(BindPlan {
+            identity_url,
+            expected_account_id,
+            account_id_pointer,
+            prior_binding: connection
+                .account_id
+                .unwrap_or_else(|| "unbound".to_string()),
+        })
+    }
+
+    /// What a `register_provider` writes, read from its arguments, or
+    /// (`Err`) the message it returns without writing.
+    fn register_plan(
+        service: &str,
+        args: &ManageOAuthArgs,
+    ) -> anyhow::Result<Result<RegisterPlan, String>> {
+        if crate::oauth::providers::get_builtin_provider(service).is_some() {
+            return Ok(Err(format!(
+                "'{}' is a built-in OAuth provider. Use it directly instead of re-registering it.",
+                service
+            )));
+        }
+
+        let auth_type = Self::validate_auth_type(args.auth_type.as_deref())?;
+        let authorize_url = match auth_type.as_str() {
+            "oauth2_client_credentials" => String::new(),
+            _ => Self::validate_https_url(
+                args.authorize_url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'register_provider' requires 'authorize_url'")
+                })?,
+                "authorize_url",
+            )?,
+        };
+        let token_url = Self::validate_https_url(
+            args.token_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("'register_provider' requires 'token_url'"))?,
+            "token_url",
+        )?;
+        let allowed_domains =
+            Self::normalize_domains(args.allowed_domains.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("'register_provider' requires 'allowed_domains'")
+            })?)?;
+        let scopes = Self::normalize_scopes(args.scopes.as_deref().unwrap_or(&[]));
+        Ok(Ok(RegisterPlan {
+            auth_type,
+            authorize_url,
+            token_url,
+            allowed_domains,
+            scopes,
+        }))
+    }
+
+    /// Whether `remove_provider` would remove a custom provider: not a
+    /// built-in one, no active connection, and defined in the config.
+    async fn custom_provider_removable(&self, service: &str) -> anyhow::Result<bool> {
+        if crate::oauth::providers::get_builtin_provider(service).is_some()
+            || self
+                .state_store
+                .get_oauth_connection(service)
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let doc = self.load_config_doc().await?;
+        Ok(Self::providers_table(&doc).is_some_and(|table| table.contains_key(service)))
     }
 
     fn credential_commands(service: &str) -> (String, String) {
@@ -611,58 +894,30 @@ impl ManageOAuthTool {
         }
     }
 
+    /// Proves and binds the remote account. The owner was asked by the
+    /// kernel before this runs.
     async fn handle_bind_account(
         &self,
         service: &str,
         expected_account_id: &str,
         identity_url: &str,
         account_id_pointer: &str,
-        session_id: &str,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
-        let connection = self
-            .state_store
-            .get_oauth_connection(service)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("No OAuth connection found for '{}'", service))?;
-        let provider = self
-            .gateway
-            .get_provider(service)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
-        let identity_url = Self::validate_identity_url(identity_url, &provider)?;
-        let expected_account_id = Self::validate_account_id(expected_account_id)?;
-        let account_id_pointer = Self::validate_account_id_pointer(account_id_pointer)?;
-        let prior_binding = connection.account_id.as_deref().unwrap_or("unbound");
-        let approval_description = format!(
-            "Verify and bind OAuth service '{}' from account '{}' to '{}'",
-            service, prior_binding, expected_account_id
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                vec![
-                    format!(
-                        "Performs one authenticated read-only GET to {}",
-                        identity_url
-                    ),
-                    "Persists the proven remote account ID for future mandate authorization"
-                        .to_string(),
-                    "A later OAuth reconnect clears this binding and requires verification again"
-                        .to_string(),
-                ],
+        let BindPlan {
+            identity_url,
+            expected_account_id,
+            account_id_pointer,
+            ..
+        } = self
+            .bind_plan(
+                service,
+                expected_account_id,
+                identity_url,
+                account_id_pointer,
             )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok(
-                    "OAuth account binding denied by user; no changes were made.".to_string(),
-                );
-            }
-        }
+            .await?;
+        Self::require_kernel_approval(kernel_approved, "bind_account")?;
 
         let (status, body, truncated) = self.identity_response(service, &identity_url).await?;
         anyhow::ensure!(
@@ -822,11 +1077,13 @@ impl ManageOAuthTool {
         }
     }
 
+    /// Disconnects a service. The owner was asked by the kernel before this
+    /// runs.
     async fn handle_remove(
         &self,
         service: &str,
         confirm_disconnect: bool,
-        session_id: &str,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
         let conn = self.state_store.get_oauth_connection(service).await?;
         if conn.is_none() {
@@ -835,88 +1092,29 @@ impl ManageOAuthTool {
         if !confirm_disconnect {
             return Ok(Self::disconnect_confirmation_message(service));
         }
-        let approval_description = format!("Disconnect OAuth service '{}'", service);
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                vec![
-                    "Deletes the stored OAuth connection and tokens".to_string(),
-                    "Leaves the service unavailable until it is connected again".to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("OAuth disconnection denied by user.".to_string());
-            }
-        }
+        Self::require_kernel_approval(kernel_approved, "remove")?;
         self.gateway.remove_connection(service).await
     }
 
+    /// Registers a custom provider. The owner was asked by the kernel before
+    /// this runs.
     async fn handle_register_provider(
         &self,
         service: &str,
         args: &ManageOAuthArgs,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
-        if crate::oauth::providers::get_builtin_provider(service).is_some() {
-            return Ok(format!(
-                "'{}' is a built-in OAuth provider. Use it directly instead of re-registering it.",
-                service
-            ));
-        }
-
-        let auth_type = Self::validate_auth_type(args.auth_type.as_deref())?;
-        let authorize_url = match auth_type.as_str() {
-            "oauth2_client_credentials" => String::new(),
-            _ => Self::validate_https_url(
-                args.authorize_url.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("'register_provider' requires 'authorize_url'")
-                })?,
-                "authorize_url",
-            )?,
+        let RegisterPlan {
+            auth_type,
+            authorize_url,
+            token_url,
+            allowed_domains,
+            scopes,
+        } = match Self::register_plan(service, args)? {
+            Ok(plan) => plan,
+            Err(message) => return Ok(message),
         };
-        let token_url = Self::validate_https_url(
-            args.token_url
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("'register_provider' requires 'token_url'"))?,
-            "token_url",
-        )?;
-        let allowed_domains =
-            Self::normalize_domains(args.allowed_domains.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("'register_provider' requires 'allowed_domains'")
-            })?)?;
-        let scopes = Self::normalize_scopes(args.scopes.as_deref().unwrap_or(&[]));
-        let session_id = if args.call_session.is_empty() {
-            "unknown"
-        } else {
-            args.call_session.as_str()
-        };
-        let approval_description = format!(
-            "Register custom OAuth provider '{}' (authorize={}, token={})",
-            service, authorize_url, token_url
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                vec![
-                    "Modifies OAuth configuration".to_string(),
-                    "Can route credentialed API traffic to the configured domains".to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("OAuth provider registration denied by user.".to_string());
-            }
-        }
+        Self::require_kernel_approval(kernel_approved, "register_provider")?;
 
         let display_name = args
             .display_name
@@ -999,10 +1197,12 @@ impl ManageOAuthTool {
         ))
     }
 
+    /// Removes a custom provider and its client credentials. The owner was
+    /// asked by the kernel before this runs.
     async fn handle_remove_provider(
         &self,
         service: &str,
-        session_id: &str,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
         if crate::oauth::providers::get_builtin_provider(service).is_some() {
             return Ok(format!(
@@ -1036,28 +1236,7 @@ impl ManageOAuthTool {
             ));
         }
 
-        let approval_description = format!(
-            "Remove custom OAuth provider '{}' and delete its client credentials",
-            service
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                vec![
-                    "Deletes OAuth provider configuration".to_string(),
-                    "Deletes stored client credentials for this provider".to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("OAuth provider removal denied by user.".to_string());
-            }
-        }
+        Self::require_kernel_approval(kernel_approved, "remove_provider")?;
 
         providers_table.remove(service);
         if providers_table.is_empty() {
@@ -1230,7 +1409,8 @@ impl Tool for ManageOAuthTool {
 }
 
 impl ManageOAuthTool {
-    /// Run one call with the dispatcher's `facts`.
+    /// Run one call with the dispatcher's `facts`. Approval is judged by the
+    /// kernel before this runs; a change without it is refused.
     pub(crate) async fn run(
         &self,
         arguments: &str,
@@ -1239,6 +1419,7 @@ impl ManageOAuthTool {
     ) -> anyhow::Result<String> {
         let mut args: ManageOAuthArgs = serde_json::from_str(arguments)?;
         args.call_session = facts.session_id.clone();
+        let kernel_approved = facts.kernel_approved.as_ref();
         match args.action.as_str() {
             "providers" => self.handle_providers().await,
             "describe_provider" => {
@@ -1256,11 +1437,6 @@ impl ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
                 )?;
-                let session_id = if args.call_session.is_empty() {
-                    "unknown"
-                } else {
-                    args.call_session.as_str()
-                };
                 self.handle_bind_account(
                     &service,
                     args.account_id
@@ -1272,7 +1448,7 @@ impl ManageOAuthTool {
                     args.account_id_pointer.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'bind_account' requires 'account_id_pointer'")
                     })?,
-                    session_id,
+                    kernel_approved,
                 )
                 .await
             }
@@ -1295,15 +1471,10 @@ impl ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
                 )?;
-                let session_id = if args.call_session.is_empty() {
-                    "unknown"
-                } else {
-                    args.call_session.as_str()
-                };
                 self.handle_remove(
                     &service,
                     args.confirm_disconnect.unwrap_or(false),
-                    session_id,
+                    kernel_approved,
                 )
                 .await
             }
@@ -1313,7 +1484,8 @@ impl ManageOAuthTool {
                         anyhow::anyhow!("'register_provider' requires 'service' parameter")
                     })?,
                 )?;
-                self.handle_register_provider(&service, &args).await
+                self.handle_register_provider(&service, &args, kernel_approved)
+                    .await
             }
             "remove_provider" => {
                 let service = Self::validate_service_name(
@@ -1321,12 +1493,7 @@ impl ManageOAuthTool {
                         anyhow::anyhow!("'remove_provider' requires 'service' parameter")
                     })?,
                 )?;
-                let session_id = if args.call_session.is_empty() {
-                    "unknown"
-                } else {
-                    args.call_session.as_str()
-                };
-                self.handle_remove_provider(&service, session_id).await
+                self.handle_remove_provider(&service, kernel_approved).await
             }
             "set_credentials" => {
                 let service = Self::validate_service_name(
@@ -1360,7 +1527,27 @@ impl ManageOAuthTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageOAuthTool {
+    /// Binding an account, disconnecting a service and registering or
+    /// removing a custom provider ask the owner, whatever the session. The
+    /// dispatcher runs the call only with that answer; a decline is recorded
+    /// by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> OwnerApprovalNeed {
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        self.owner_approval(call.arguments).await
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        Self::effects_for(arguments)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let mut semantics = semantics_for_exact_read_actions(
             arguments,
@@ -1473,23 +1660,102 @@ mod tests {
             profiles,
             "http://localhost:8080".to_string(),
         );
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(4);
-        let approval_tx = ApprovalBroker::new(approval_tx);
-        tokio::spawn(async move {
-            while let Some(request) = approval_rx.recv().await {
-                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
-            }
-        });
         Ok((
-            ManageOAuthTool::new(
-                gateway.clone(),
-                state as Arc<dyn OAuthStore>,
-                config_path,
-                approval_tx,
-            ),
+            ManageOAuthTool::new(gateway.clone(), state as Arc<dyn OAuthStore>, config_path),
             gateway,
             db_file,
         ))
+    }
+
+    /// Call `tool` as the dispatcher does for a call the kernel judged (and
+    /// asked the owner about where its rules required it).
+    async fn call_approved(tool: &ManageOAuthTool, arguments: &str) -> anyhow::Result<String> {
+        crate::testing::call_with_facts(
+            tool,
+            arguments,
+            ToolCallContext {
+                kernel_approved: Some(ApprovalScope::Call),
+                ..crate::testing::call_facts("test")
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn changes_declare_the_service_credential_and_reads_declare_none() {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        for args in [
+            r#"{"action":"remove","service":"Synthetic","confirm_disconnect":true}"#,
+            r#"{"action":"register_provider","service":"synthetic"}"#,
+            r#"{"action":"remove_provider","service":"synthetic"}"#,
+            r#"{"action":"set_credentials","service":"synthetic"}"#,
+            r#"{"action":"connect","service":"synthetic"}"#,
+        ] {
+            let effects = ManageOAuthTool::effects_for(args);
+            assert_eq!(
+                effects.keys,
+                vec![EffectKey::named(EffectClass::Credential, "synthetic")],
+                "{args}"
+            );
+            assert!(!effects.complete);
+        }
+        let bind = ManageOAuthTool::effects_for(
+            r#"{"action":"bind_account","service":"synthetic","identity_url":"https://api.example.invalid/me"}"#,
+        );
+        assert_eq!(
+            bind.keys,
+            vec![
+                EffectKey::named(EffectClass::Credential, "synthetic"),
+                EffectKey::egress("https", "api.example.invalid", None),
+            ]
+        );
+        for args in [
+            r#"{"action":"list"}"#,
+            r#"{"action":"providers"}"#,
+            r#"{"action":"describe_provider","service":"synthetic"}"#,
+        ] {
+            assert_eq!(ManageOAuthTool::effects_for(args), CallEffects::none());
+        }
+    }
+
+    /// Without the kernel's approval, a change is refused before it touches
+    /// the config or the connection (and never asks the owner itself).
+    #[tokio::test]
+    async fn changes_refuse_without_kernel_approval() {
+        let config_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            config_file.path(),
+            "[provider]\napi_key = \"test-key\"\n\n[oauth.providers.synthetic]\n\
+             auth_type = \"oauth2_pkce\"\nauthorize_url = \"https://auth.example.invalid/authorize\"\n\
+             token_url = \"https://auth.example.invalid/token\"\nscopes = []\n\
+             allowed_domains = [\"api.example.invalid\"]\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(config_file.path()).unwrap();
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        for args in [
+            r#"{"action":"register_provider","service":"other","authorize_url":"https://auth.example.invalid/authorize","token_url":"https://auth.example.invalid/token","allowed_domains":["api.example.invalid"]}"#,
+            r#"{"action":"remove_provider","service":"synthetic"}"#,
+        ] {
+            let error =
+                crate::testing::call_with_facts(&tool, args, crate::testing::call_facts("test"))
+                    .await
+                    .expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires approval through the agent kernel"),
+                "{error}"
+            );
+            assert!(tool.call(args).await.is_err(), "{args}");
+        }
+        assert_eq!(std::fs::read_to_string(config_file.path()).unwrap(), before);
+        // A call that stops before changing anything needs no approval.
+        let none = tool
+            .call(r#"{"action":"remove","service":"synthetic","confirm_disconnect":true}"#)
+            .await
+            .unwrap();
+        assert!(none.contains("No OAuth connection found"), "{none}");
     }
 
     fn write_minimal_config(path: &Path) {
@@ -1659,9 +1925,9 @@ mod tests {
         write_minimal_config(config_file.path());
         let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
-        let result = tool
-            .call(
-                r#"{
+        let result = call_approved(
+            &tool,
+            r#"{
                     "action": "register_provider",
                     "service": "linear",
                     "display_name": "Linear",
@@ -1670,9 +1936,9 @@ mod tests {
                     "scopes": ["read", "write"],
                     "allowed_domains": ["api.linear.app"]
                 }"#,
-            )
-            .await
-            .unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(result.contains("Registered custom OAuth provider `Linear`."));
         assert!(result.contains("oauth_linear_client_id"));
@@ -1694,9 +1960,9 @@ mod tests {
         write_minimal_config(config_file.path());
         let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
-        let result = tool
-            .call(
-                r#"{
+        let result = call_approved(
+            &tool,
+            r#"{
                     "action": "register_provider",
                     "service": "corpapi",
                     "display_name": "Corp API",
@@ -1705,9 +1971,9 @@ mod tests {
                     "scopes": ["read"],
                     "allowed_domains": ["api.example.com"]
                 }"#,
-            )
-            .await
-            .unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(result.contains("Registered custom OAuth provider `Corp API`."));
         assert!(result.contains("callback_url: (not used)"));
@@ -1764,8 +2030,7 @@ allowed_domains = ["api.linear.app"]
             .register_config_provider("linear", &config_provider)
             .await;
 
-        let result = tool
-            .call(r#"{"action":"remove_provider","service":"linear"}"#)
+        let result = call_approved(&tool, r#"{"action":"remove_provider","service":"linear"}"#)
             .await
             .unwrap();
 
@@ -1993,7 +2258,9 @@ allowed_domains = ["api.linear.app"]
         gateway.restore_connections().await;
 
         let identity_url = format!("http://{addr}/2/users/me");
-        let result = tool
+        // Outside an approved agent call the binding is refused before any
+        // request.
+        let unapproved = tool
             .call(
                 &json!({
                     "action": "bind_account",
@@ -2005,7 +2272,26 @@ allowed_domains = ["api.linear.app"]
                 .to_string(),
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            unapproved
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{unapproved}"
+        );
+        let result = call_approved(
+            &tool,
+            &json!({
+                "action": "bind_account",
+                "service": "twitter",
+                "account_id": "2018008573557551105",
+                "identity_url": identity_url,
+                "account_id_pointer": "/data/id",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
         assert!(result.contains("OAuth account identity verified and bound"));
         assert!(result.contains("\"http_status\": 200"));
         let bound = tool
@@ -2018,19 +2304,19 @@ allowed_domains = ["api.linear.app"]
         let listed = tool.call(r#"{"action":"list"}"#).await.unwrap();
         assert!(listed.contains("account_id: 2018008573557551105"));
 
-        let mismatch = tool
-            .call(
-                &json!({
-                    "action": "bind_account",
-                    "service": "twitter",
-                    "account_id": "different-account",
-                    "identity_url": identity_url,
-                    "account_id_pointer": "/data/id",
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap_err();
+        let mismatch = call_approved(
+            &tool,
+            &json!({
+                "action": "bind_account",
+                "service": "twitter",
+                "account_id": "different-account",
+                "identity_url": identity_url,
+                "account_id_pointer": "/data/id",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
         assert!(mismatch
             .to_string()
             .contains("Authenticated identity mismatch"));
@@ -2101,10 +2387,29 @@ allowed_domains = ["api.linear.app"]
             .await
             .unwrap();
 
-        let result = tool
+        let unapproved = tool
             .call(r#"{"action":"remove","service":"twitter","confirm_disconnect":true}"#)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            unapproved
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{unapproved}"
+        );
+        assert!(tool
+            .state_store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .is_some());
+
+        let result = call_approved(
+            &tool,
+            r#"{"action":"remove","service":"twitter","confirm_disconnect":true}"#,
+        )
+        .await
+        .unwrap();
 
         assert!(result.contains("Disconnected from twitter"));
         assert!(tool

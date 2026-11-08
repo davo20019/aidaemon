@@ -97,12 +97,7 @@ impl ManageApiTool {
                 profiles.clone(),
                 state_store.clone(),
             ),
-            manage_oauth: ManageOAuthTool::new(
-                oauth_gateway.clone(),
-                state_store,
-                config_path,
-                approval_tx.clone(),
-            ),
+            manage_oauth: ManageOAuthTool::new(oauth_gateway.clone(), state_store, config_path),
             manage_skills,
             http_request: HttpRequestTool::new(profiles).with_oauth_gateway(oauth_gateway),
             search_backend,
@@ -200,6 +195,32 @@ impl ManageApiTool {
                 .then_some(ApprovalScope::Call),
             ..Self::inner_facts(args)
         }
+    }
+
+    /// The `manage_oauth` provider registration an OAuth onboarding runs,
+    /// when it names any provider field.
+    fn oauth_register_args(
+        service: &str,
+        auth_mode: ApiAuthMode,
+        args: &ManageApiArgs,
+    ) -> Option<Value> {
+        let should_register_custom = args.authorize_url.is_some()
+            || args.token_url.is_some()
+            || args.allowed_domains.is_some()
+            || args.display_name.is_some()
+            || args.scopes.is_some();
+        should_register_custom.then(|| {
+            json!({
+                "action": "register_provider",
+                "service": service,
+                "display_name": args.display_name.clone(),
+                "auth_type": Self::auth_mode_label(auth_mode),
+                "authorize_url": args.authorize_url.clone(),
+                "token_url": args.token_url.clone(),
+                "scopes": args.scopes.clone(),
+                "allowed_domains": args.allowed_domains.clone(),
+            })
+        })
     }
 
     /// The `manage_http_auth` upsert a manual-auth onboarding runs.
@@ -466,31 +487,25 @@ impl ManageApiTool {
         auth_mode: ApiAuthMode,
         args: &ManageApiArgs,
         status_tx: Option<&mpsc::Sender<StatusUpdate>>,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
         let mut sections = Vec::new();
 
-        let should_register_custom = args.authorize_url.is_some()
-            || args.token_url.is_some()
-            || args.allowed_domains.is_some()
-            || args.display_name.is_some()
-            || args.scopes.is_some();
-        if should_register_custom {
+        if let Some(register_args) = Self::oauth_register_args(service, auth_mode, args) {
             Self::send_stage(
                 status_tx,
                 format!("Registering or updating OAuth provider `{}`.", service),
             )
             .await;
-            let register_args = json!({
-                "action": "register_provider",
-                "service": service,
-                "display_name": args.display_name.clone(),
-                "auth_type": Self::auth_mode_label(auth_mode),
-                "authorize_url": args.authorize_url.clone(),
-                "token_url": args.token_url.clone(),
-                "scopes": args.scopes.clone(),
-                "allowed_domains": args.allowed_domains.clone(),
-            });
-            sections.push(self.manage_oauth.call(&register_args.to_string()).await?);
+            sections.push(
+                self.manage_oauth
+                    .run(
+                        &register_args.to_string(),
+                        None,
+                        &Self::inner_change_facts(args, kernel_approved),
+                    )
+                    .await?,
+            );
         }
 
         match (&args.client_id, &args.client_secret) {
@@ -780,10 +795,14 @@ impl ManageApiTool {
         let service = Self::validate_service_name(args.service.as_deref()?).ok()?;
         let auth_mode = Self::parse_auth_mode(args.auth_mode.as_deref()).ok()?;
         let need = match auth_mode {
-            ApiAuthMode::Existing
-            | ApiAuthMode::Oauth2Pkce
+            ApiAuthMode::Existing => return None,
+            ApiAuthMode::Oauth2Pkce
             | ApiAuthMode::Oauth2AuthorizationCode
-            | ApiAuthMode::Oauth2ClientCredentials => return None,
+            | ApiAuthMode::Oauth2ClientCredentials => {
+                // Storing client credentials and connecting never asked.
+                let register = Self::oauth_register_args(&service, auth_mode, &args)?;
+                self.manage_oauth.owner_approval(&register).await
+            }
             ApiAuthMode::Bearer
             | ApiAuthMode::Header
             | ApiAuthMode::Basic
@@ -874,7 +893,13 @@ impl ManageApiTool {
             | ApiAuthMode::Oauth2AuthorizationCode
             | ApiAuthMode::Oauth2ClientCredentials => {
                 let auth_result = self
-                    .run_oauth_stage(&service, auth_mode, &args, status_tx.as_ref())
+                    .run_oauth_stage(
+                        &service,
+                        auth_mode,
+                        &args,
+                        status_tx.as_ref(),
+                        kernel_approved,
+                    )
                     .await?;
                 sections.push(format!("Auth:\n{}", auth_result));
             }
@@ -1275,20 +1300,13 @@ mod tests {
             profiles.clone(),
             "http://localhost:8080".to_string(),
         );
-        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
-        drop(approval_rx);
         ManageApiTool {
             manage_http_auth: ManageHttpAuthTool::new(
                 config_path.clone(),
                 profiles.clone(),
                 store.clone(),
             ),
-            manage_oauth: ManageOAuthTool::new(
-                gateway.clone(),
-                store,
-                config_path,
-                ApprovalBroker::new(approval_tx),
-            ),
+            manage_oauth: ManageOAuthTool::new(gateway.clone(), store, config_path),
             manage_skills: None,
             http_request: HttpRequestTool::new(profiles).with_oauth_gateway(gateway),
             search_backend: Box::new(crate::tools::web_search::DuckDuckGoBackend::new()),
@@ -1359,6 +1377,53 @@ mod tests {
         assert!(request
             .subject
             .ends_with("manage_api probe POST https://docs.example.invalid/graphql"));
+    }
+
+    /// An OAuth onboarding that registers a provider carries the
+    /// registration's card, in every session; connecting and storing client
+    /// credentials never asked.
+    #[tokio::test]
+    async fn oauth_onboarding_asks_for_its_provider_registration() {
+        use crate::traits::OwnerApprovalNeed;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = synthetic_tool(&dir);
+        for trusted in [false, true] {
+            let register = json!({
+                "action": "onboard",
+                "service": "synthetic-oauth",
+                "auth_mode": "oauth2_pkce",
+                "authorize_url": "https://auth.example.invalid/authorize",
+                "token_url": "https://auth.example.invalid/token",
+                "allowed_domains": ["api.example.invalid"],
+                "client_id": "synthetic-client-id",
+                "client_secret": "synthetic-client-secret",
+            });
+            let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, register, trusted).await
+            else {
+                panic!("a provider registration must ask (trusted={trusted})");
+            };
+            assert!(
+                request
+                    .summary
+                    .starts_with("Register custom OAuth provider 'synthetic-oauth'"),
+                "{}",
+                request.summary
+            );
+            for text in [&request.summary, &request.subject] {
+                assert!(!text.contains("synthetic-client-secret"), "{text}");
+            }
+            let connect_only = json!({
+                "action": "onboard",
+                "service": "synthetic-oauth",
+                "auth_mode": "oauth2_pkce",
+                "client_id": "synthetic-client-id",
+                "client_secret": "synthetic-client-secret",
+            });
+            assert_eq!(
+                judge_onboard(&tool, connect_only, trusted).await,
+                OwnerApprovalNeed::Unjudged
+            );
+        }
     }
 
     /// The inner profile change runs only with the kernel's approval of the
