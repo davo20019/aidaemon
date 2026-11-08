@@ -13,19 +13,22 @@ use tokio::sync::mpsc;
 
 use crate::config::BrowserConfig;
 use crate::testing::CallWithFacts;
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::{ApprovalBroker, BrowserTool};
+use crate::tools::BrowserTool;
 use crate::traits::Tool;
 use crate::types::ApprovalResponse;
 
-fn auto_approve_broker() -> ApprovalBroker {
-    let (tx, mut rx) = mpsc::channel::<ApprovalRequest>(8);
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            let _ = req.response_tx.send(ApprovalResponse::AllowSession);
-        }
-    });
-    ApprovalBroker::new(tx)
+/// Run `arguments` as the kernel does, the owner approving any card for the
+/// session.
+async fn call_approved(tool: &BrowserTool, arguments: &str, session: &str) -> String {
+    crate::testing::call_through_kernel(
+        tool,
+        arguments,
+        crate::testing::call_facts(session),
+        Some(ApprovalResponse::AllowSession),
+    )
+    .await
+    .expect("browser call")
+    .output
 }
 
 fn smoke_browser_config(user_data_dir: &str) -> BrowserConfig {
@@ -71,7 +74,6 @@ async fn browser_smoke_real_chrome() {
     let tool = BrowserTool::new(
         smoke_browser_config(profile.path().to_str().unwrap()),
         media_tx,
-        auto_approve_broker(),
         profile.path().join("inbox"),
         crate::execution::active_execution_backend(),
     )
@@ -92,31 +94,29 @@ async fn browser_smoke_real_chrome() {
         .expect("navigate");
     assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
 
-    let fill = tool
-        .call_with(
-            &json!({
-                "action": "fill",
-                "selector": "#name",
-                "value": "replaced",
-            })
-            .to_string(),
-            crate::testing::call_facts(session),
-        )
-        .await
-        .expect("fill");
+    let fill = call_approved(
+        &tool,
+        &json!({
+            "action": "fill",
+            "selector": "#name",
+            "value": "replaced",
+        })
+        .to_string(),
+        session,
+    )
+    .await;
     assert_eq!(fill, "Filled '#name'");
 
-    let click = tool
-        .call_with(
-            &json!({
-                "action": "click",
-                "selector": "#go",
-            })
-            .to_string(),
-            crate::testing::call_facts(session),
-        )
-        .await
-        .expect("click");
+    let click = call_approved(
+        &tool,
+        &json!({
+            "action": "click",
+            "selector": "#go",
+        })
+        .to_string(),
+        session,
+    )
+    .await;
     assert!(click.contains("Clicked element '#go'"), "{click}");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -210,7 +210,6 @@ html, body { margin: 0; background: #08352d; color: white }
     let tool = BrowserTool::new(
         config,
         media_tx,
-        auto_approve_broker(),
         fixture.path().join("inbox"),
         crate::execution::active_execution_backend(),
     )

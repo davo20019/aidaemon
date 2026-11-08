@@ -768,7 +768,6 @@ pub async fn register_optional_tools(
                 let browser_tool = BrowserTool::new(
                     config.browser.clone(),
                     media_tx.clone(),
-                    approval_tx.clone(),
                     inbox_dir.clone(),
                     execution_backend.clone(),
                 )

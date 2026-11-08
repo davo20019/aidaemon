@@ -9,14 +9,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     MessageAttachment, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use crate::types::{MediaKind, MediaMessage};
 
 use policy::BrowserRiskClass;
 
@@ -35,10 +32,11 @@ use session::{BrowserSessionRegistry, TabView};
 
 use tokio::sync::OwnedMutexGuard;
 
-/// Default time the user has to respond to a browser approval prompt before the
-/// action fails closed as unavailable. Matches the terminal/config approval
-/// window. Overridable in tests so the timeout path runs in milliseconds.
-const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// The warning on a card for a sensitive (`execute_js`) action.
+const POINT_OF_ACTION_SENSITIVE: &str = "This can read or access private data on the page.";
+/// The warning on a card for a consequential click or fill.
+const POINT_OF_ACTION_CONSEQUENTIAL: &str =
+    "This may submit forms, make purchases, delete data, or send messages.";
 
 /// Maximum allowed size of a `script` argument for `execute_js`. Generous for
 /// legitimate automation (64 KiB covers virtually any real workflow) while
@@ -201,16 +199,30 @@ enum GateDecision {
     Deny(String),
 }
 
+/// What a browser call needs from the owner before it runs.
+enum BrowserApproval {
+    /// The call runs without asking the owner.
+    NotNeeded,
+    /// The owner must approve `request` first. A point-of-action approval
+    /// covers only this call; an ordinary mutation's session approval marks
+    /// the session approved.
+    Ask {
+        request: aidaemon_core::OwnerApprovalRequest,
+        point_of_action: bool,
+    },
+}
+
 /// The parsed, approval-relevant fields of a single browser tool call. Bundled
 /// so the gate and prompt builder take one borrow instead of many positional
-/// args. The `value` (fill text) is deliberately NOT carried here — it must
-/// never reach the prompt.
+/// args. The `value` (fill text) is only hashed into the approval subject; it
+/// must never reach the prompt.
 struct ActionArgs<'a> {
     action: &'a str,
     url: Option<&'a str>,
     selector: Option<&'a str>,
     script: Option<&'a str>,
     tab_id: Option<&'a str>,
+    value: Option<&'a str>,
     session_id: &'a str,
     /// Runtime-injected proof that this call belongs to owner-confirmed
     /// scheduled automation. The dispatcher strips model-supplied underscore
@@ -439,14 +451,10 @@ pub struct BrowserTool {
     /// Per-session page state, keyed by the call's typed
     /// `ToolCallContext::session_id`.
     sessions: BrowserSessionRegistry,
-    /// Transport used to prompt the user Allow/Deny at action time.
-    ///
-    /// `None` means no approval channel is wired (only possible in tests via
-    /// `with_backend`); in that case every action that would require approval
-    /// fails safe to Deny without touching the backend.
-    approval_tx: Option<ApprovalBroker>,
-    /// How long to wait for an approval response before failing closed.
-    approval_timeout: Duration,
+    /// The owner's approvals of exact calls, delivered by the agent kernel
+    /// (`record_owner_answer`) after the card `owner_approval_request` asked
+    /// for, and consumed by the call. The tool never asks the owner itself.
+    owner_answers: crate::tools::owner_answers::OwnerAnsweredCalls,
     /// Bounded navigation/DOM-ready timeout (resolved + clamped from config).
     /// Used by `action_navigate` after `goto` and by the `action_click`
     /// nav-race when a click triggers a navigation.
@@ -550,7 +558,6 @@ impl BrowserTool {
     pub fn new(
         config: BrowserConfig,
         media_tx: mpsc::Sender<MediaMessage>,
-        approval_tx: ApprovalBroker,
         inbox_dir: impl Into<PathBuf>,
         execution_backend: crate::execution::SharedExecutionBackend,
     ) -> Result<Self, String> {
@@ -576,8 +583,7 @@ impl BrowserTool {
             media_tx,
             inbox_dir: inbox_dir.into(),
             sessions: BrowserSessionRegistry::new(),
-            approval_tx: Some(approval_tx),
-            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+            owner_answers: Default::default(),
             nav_timeout,
             element_timeout,
             action_timeout,
@@ -585,9 +591,9 @@ impl BrowserTool {
         })
     }
 
-    /// Test-only constructor that injects an arbitrary backend (e.g. the mock)
-    /// with NO approval channel — exercises the missing-channel (fail-safe Deny)
-    /// path for actions that require approval.
+    /// Test-only constructor that injects an arbitrary backend (e.g. the mock).
+    /// Actions that need the owner run only after the kernel delivered an
+    /// approval (see `crate::testing::call_through_kernel`).
     #[cfg(test)]
     pub fn with_backend(
         backend: Arc<dyn BrowserBackend>,
@@ -599,33 +605,7 @@ impl BrowserTool {
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
             execution_backend: crate::execution::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
-            approval_tx: None,
-            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
-            nav_timeout: Duration::from_secs(30),
-            element_timeout: Duration::from_secs(10),
-            action_timeout: Duration::from_secs(30),
-            diagnostics: BrowserDiagnosticsStore::new(),
-        }
-    }
-
-    /// Test-only constructor that injects a backend AND an approval broker plus a
-    /// (short) approval timeout, so approval allow/deny/timeout paths are
-    /// exercisable in milliseconds.
-    #[cfg(test)]
-    pub fn with_backend_and_approval(
-        backend: Arc<dyn BrowserBackend>,
-        media_tx: mpsc::Sender<MediaMessage>,
-        approval_tx: ApprovalBroker,
-        approval_timeout: Duration,
-    ) -> Self {
-        Self {
-            backend,
-            media_tx,
-            inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
-            execution_backend: crate::execution::active_execution_backend(),
-            sessions: BrowserSessionRegistry::new(),
-            approval_tx: Some(approval_tx),
-            approval_timeout,
+            owner_answers: Default::default(),
             nav_timeout: Duration::from_secs(30),
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
@@ -702,80 +682,30 @@ impl BrowserTool {
         )
     }
 
-    /// Send an approval request and await the user's decision, failing safe to
-    /// closed on any routing failure or timeout. `None` means approval was
-    /// unavailable; the caller still fails closed without claiming the user
-    /// explicitly denied the action.
-    async fn request_approval(
-        &self,
-        command: String,
-        risk_level: RiskLevel,
-        warnings: Vec<String>,
-        session_id: &str,
-        one_time_only: bool,
-        permission_mode: PermissionMode,
-    ) -> Option<ApprovalResponse> {
-        let broker = self.approval_tx.as_ref()?;
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if broker
-            .send(ApprovalRequest {
-                command,
-                session_id: session_id.to_string(),
-                risk_level,
-                warnings,
-                permission_mode,
-                response_tx,
-                kind: if one_time_only {
-                    crate::types::ApprovalKind::CommandOnce
-                } else {
-                    crate::types::ApprovalKind::Command
-                },
-            })
-            .await
-            .is_err()
-        {
-            warn!("browser approval channel closed; action remains blocked");
-            return None;
-        }
-        match tokio::time::timeout(self.approval_timeout, response_rx).await {
-            Ok(Ok(resp)) => Some(resp),
-            Ok(Err(_)) => {
-                warn!("browser approval response channel closed; action remains blocked");
-                None
-            }
-            Err(_) => {
-                warn!("browser approval request timed out; action remains blocked");
-                None
-            }
-        }
-    }
-
-    /// The approval gate. Runs BEFORE any backend/page method is touched, so a
-    /// denied action can never reach the browser. Returns [`GateDecision::Allow`]
-    /// only when the action is permitted.
+    /// What `args` needs from the owner. Runs BEFORE any backend/page method
+    /// is touched, both when the kernel judges the call
+    /// (`owner_approval_request`) and when the call runs (`approval_gate`),
+    /// from the same session state, so the card the owner saw and the call
+    /// that runs agree.
     ///
     /// Per-class rules:
-    /// - `Observation` (get_text/inspect_page/screenshot/wait/list_tabs): never prompt.
-    /// - `Administrative` (close/close_tab/set_mode): never prompt — local
+    /// - `Observation` (get_text/inspect_page/screenshot/wait/list_tabs): never ask.
+    /// - `Administrative` (close/close_tab/set_mode): never ask — local
     ///   lifecycle / mode switch, not a consequential web side effect.
-    /// - `sensitive` (`execute_js`): point-of-action — ALWAYS prompt, every call,
+    /// - `sensitive` (`execute_js`): point-of-action — ALWAYS ask, every call,
     ///   regardless of scheduled or session authority.
     /// - Consequential click/fill is point-of-action for interactive sessions,
     ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
     ///   issued call without waking the owner.
-    /// - `Navigation` (`navigate`/`new_tab`/`switch_tab`): never prompt. Public
+    /// - `Navigation` (`navigate`/`new_tab`/`switch_tab`): never ask. Public
     ///   HTTP(S) targets are validated against network/private-host policy before
     ///   this gate, while tab-only operations have no external side effect.
-    /// - Ordinary mutation: session-level only. Allowed without a prompt once
-    ///   the session is approved; otherwise prompt.
-    /// - Missing approval channel + an action that needs approval → fail safe to
-    ///   Deny (observations/navigation/administrative still run).
-    async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
-        let action = args.action;
-        let session_id = args.session_id;
-        let risk = policy::classify(action, args.selector, args.script);
+    /// - Ordinary mutation: session-level only. Allowed without asking once
+    ///   the session is approved; otherwise ask.
+    async fn approval_need(&self, args: &ActionArgs<'_>) -> BrowserApproval {
+        let risk = policy::classify(args.action, args.selector, args.script);
 
-        // Free actions: never prompt. Navigation reaches this point only after
+        // Free actions: never ask. Navigation reaches this point only after
         // its requested URL has passed the shared public-network preflight in
         // `run_action`; switching/opening an empty tab is local browser state.
         if matches!(
@@ -784,89 +714,125 @@ impl BrowserTool {
                 | BrowserRiskClass::Navigation
                 | BrowserRiskClass::Administrative
         ) {
-            return GateDecision::Allow;
+            return BrowserApproval::NotNeeded;
         }
 
         let point_of_action = risk.sensitive || risk.consequential;
 
         // The scheduler already carries durable owner confirmation, and the
-        // common dispatcher injects this bit only for the exact call after
-        // stripping model-supplied internal fields. Apply that authority
-        // consistently to navigation and click/fill mutations. Arbitrary JS
-        // remains sensitive and always requires a live owner decision.
+        // common dispatcher sets this fact only for the exact call. Arbitrary
+        // JS remains sensitive and always requires a live owner decision.
         if args.trusted_session && !risk.sensitive {
-            return GateDecision::Allow;
+            return BrowserApproval::NotNeeded;
         }
 
-        // Session-level fast path: an already-approved session skips the prompt
+        // Session-level fast path: an already-approved session skips the card
         // for ordinary mutation — but NEVER for point-of-action.
-        if !point_of_action && self.sessions.is_session_approved(session_id).await {
-            return GateDecision::Allow;
+        if !point_of_action && self.sessions.is_session_approved(args.session_id).await {
+            return BrowserApproval::NotNeeded;
         }
 
-        // From here we need to prompt. If no channel is wired, fail safe.
-        if self.approval_tx.is_none() {
-            warn!(
-                action,
-                "browser action requires approval but no approval channel is wired; denying"
-            );
-            return GateDecision::Deny(
-                "Approval required, but no approval channel is available. Action denied."
-                    .to_string(),
-            );
-        }
-
-        // Even the reusable ordinary-mutation prompt grants control over a
-        // logged-in browser session, so it is a real authority boundary rather
-        // than a medium-risk informational interruption.
-        let risk_level = RiskLevel::High;
         let mut warnings = Vec::new();
         if risk.sensitive {
-            warnings.push("This can read or access private data on the page.".to_string());
+            warnings.push(POINT_OF_ACTION_SENSITIVE.to_string());
         }
         if risk.consequential {
-            warnings.push(
-                "This may submit forms, make purchases, delete data, or send messages.".to_string(),
-            );
+            warnings.push(POINT_OF_ACTION_CONSEQUENTIAL.to_string());
         }
-        let command = self.build_prompt(args, &risk).await;
-
-        let resp = self
-            .request_approval(
-                command,
-                risk_level,
+        let summary = self.build_prompt(args, &risk).await;
+        // The subject binds the exact call (the hidden fill value and script
+        // included, by digest only) to what the owner saw.
+        let exact = json!([
+            args.action,
+            args.url,
+            args.selector,
+            args.script,
+            args.tab_id,
+            args.value,
+        ])
+        .to_string();
+        let digest = format!("{:x}", Sha256::digest(exact.as_bytes()));
+        let subject = format!("{summary} [call {}]", &digest[..16]);
+        BrowserApproval::Ask {
+            request: aidaemon_core::OwnerApprovalRequest {
+                effects: Vec::new(),
+                summary,
+                subject,
+                // Even the reusable ordinary-mutation card grants control over
+                // a logged-in browser session, so it is a real authority
+                // boundary rather than a medium-risk interruption.
+                risk: aidaemon_core::ApprovalRisk::High,
                 warnings,
-                session_id,
-                point_of_action,
-                // Browser mutations have no safe durable scope; reusable
-                // approval is honestly limited to the current session.
-                PermissionMode::Cautious,
-            )
-            .await;
+            },
+            point_of_action,
+        }
+    }
 
-        match resp {
-            // No channel: already handled above, but keep the fail-safe.
-            None => GateDecision::Deny(
-                "Approval required, but no approval channel is available. Action denied."
-                    .to_string(),
-            ),
-            Some(ApprovalResponse::Deny) => GateDecision::Deny("Denied by user.".to_string()),
-            Some(ApprovalResponse::AllowOnce) => GateDecision::Allow,
-            Some(ApprovalResponse::AllowSession) => {
-                // Point-of-action approvals NEVER persist: each consequential
-                // action / execute_js must be approved on its own. Only ordinary
-                // mutation marks the session approved.
-                if !point_of_action {
-                    self.sessions.mark_session_approved(session_id).await;
+    /// The approval gate at execution. Returns [`GateDecision::Allow`] only
+    /// when the action needs no owner approval or the kernel delivered the
+    /// owner's approval of this exact call; it never asks the owner itself.
+    async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
+        match self.approval_need(args).await {
+            BrowserApproval::NotNeeded => GateDecision::Allow,
+            BrowserApproval::Ask { request, .. } => {
+                if self.owner_answers.take(args.session_id, &request.subject) {
+                    GateDecision::Allow
+                } else {
+                    warn!(
+                        action = args.action,
+                        "browser action requires the owner's approval and the kernel delivered none for it; denying"
+                    );
+                    GateDecision::Deny(
+                        "Approval required: the owner has not approved this exact browser action through the agent kernel (or the page changed since the approval card). Action denied."
+                            .to_string(),
+                    )
                 }
-                GateDecision::Allow
             }
-            Some(ApprovalResponse::AllowAlways) => {
-                if !point_of_action {
-                    self.sessions.mark_session_approved(session_id).await;
-                }
-                GateDecision::Allow
-            }
+        }
+    }
+
+    /// The approval-relevant fields of a call's arguments, in `session_id`.
+    fn action_args<'a>(
+        args: &'a Value,
+        session_id: &'a str,
+        trusted_session: bool,
+    ) -> Option<ActionArgs<'a>> {
+        Some(ActionArgs {
+            action: args.get("action").and_then(|v| v.as_str())?,
+            url: args.get("url").and_then(|v| v.as_str()),
+            selector: args.get("selector").and_then(|v| v.as_str()),
+            script: args.get("script").and_then(|v| v.as_str()),
+            tab_id: args.get("tab_id").and_then(|v| v.as_str()),
+            value: args.get("value").and_then(|v| v.as_str()),
+            session_id,
+            trusted_session,
+        })
+    }
+
+    /// The card the kernel sends for a call, judged from the session state
+    /// the call will run in. A call `run_action` refuses before its gate (no
+    /// session, a rejected script, a blocked navigation target) asks nothing.
+    async fn kernel_approval_need(
+        &self,
+        arguments: &Value,
+        facts: &ToolCallContext,
+    ) -> Option<(aidaemon_core::OwnerApprovalRequest, bool)> {
+        let session_id = facts.session_id.as_str();
+        if session_id.is_empty() {
+            return None;
+        }
+        let args = Self::action_args(arguments, session_id, facts.trusted_session)?;
+        if args.action == "execute_js"
+            && validate_script_constraints(args.script.unwrap_or("")).is_err()
+        {
+            return None;
+        }
+        match self.approval_need(&args).await {
+            BrowserApproval::NotNeeded => None,
+            BrowserApproval::Ask {
+                request,
+                point_of_action,
+            } => Some((request, point_of_action)),
         }
     }
 
@@ -2157,6 +2123,7 @@ impl BrowserTool {
             selector: args.get("selector").and_then(|v| v.as_str()),
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
+            value: args.get("value").and_then(|v| v.as_str()),
             session_id,
             trusted_session: facts.trusted_session,
         };
@@ -2179,6 +2146,53 @@ impl BrowserTool {
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
+    }
+
+    /// Browser mutations have no safe durable scope: an ordinary mutation's
+    /// card offers at most session approval, and a point-of-action card
+    /// (`execute_js`, a consequential click or fill) only this call.
+    fn approval_card_kind(
+        &self,
+        request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        let point_of_action = request.warnings.iter().any(|warning| {
+            warning == POINT_OF_ACTION_SENSITIVE || warning == POINT_OF_ACTION_CONSEQUENTIAL
+        });
+        if point_of_action {
+            crate::types::ApprovalKind::CommandOnce
+        } else {
+            crate::types::ApprovalKind::Command
+        }
+    }
+
+    /// Keep the owner's approval for the call it was asked for: a
+    /// point-of-action or Allow Once approval covers this exact call alone;
+    /// a session approval of an ordinary mutation marks the session approved.
+    async fn record_owner_answer(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+        response: Option<crate::types::ApprovalResponse>,
+    ) {
+        use crate::types::ApprovalResponse;
+        let Some(response) = response else {
+            return;
+        };
+        if matches!(response, ApprovalResponse::Deny) {
+            return;
+        }
+        let Some((request, point_of_action)) =
+            self.kernel_approval_need(call.arguments, facts).await
+        else {
+            return;
+        };
+        let session_id = facts.session_id.as_str();
+        match response {
+            ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways if !point_of_action => {
+                self.sessions.mark_session_approved(session_id).await;
+            }
+            _ => self.owner_answers.approve(session_id, &request.subject),
+        }
     }
 
     fn description(&self) -> &str {
@@ -2295,7 +2309,34 @@ impl Tool for BrowserTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for BrowserTool {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            // The owner's answers are kept per call and per session by the
+            // tool (`record_owner_answer`), never as kernel session grants.
+            keeps_own_grants: true,
+            ..Default::default()
+        }
+    }
+
+    /// A page mutation or `execute_js` asks the owner, judged from the
+    /// session's current page (the card shows its origin); the call that
+    /// runs must match the card the owner approved.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        match self.kernel_approval_need(call.arguments, facts).await {
+            Some((request, _)) => crate::traits::OwnerApprovalNeed::Ask(request),
+            None => crate::traits::OwnerApprovalNeed::Unjudged,
+        }
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,

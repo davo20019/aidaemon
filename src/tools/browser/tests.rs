@@ -14,44 +14,120 @@ use tokio::sync::Mutex;
 
 use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
-use crate::tools::ApprovalBroker;
 use crate::traits::{AttachmentProvenance, Tool};
 use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 
+/// A browser tool called the way the agent kernel calls it: each call's
+/// card (`owner_approval_request`) is recorded and answered with `reply`
+/// (`None`: no answer) through `record_owner_answer`, and the call runs only
+/// when the owner approved. Everything else reaches the tool through `Deref`.
+struct KernelSim {
+    tool: BrowserTool,
+    reply: Option<ApprovalResponse>,
+    recorder: ApprovalRecorder,
+}
+
+impl std::ops::Deref for KernelSim {
+    type Target = BrowserTool;
+
+    fn deref(&self) -> &BrowserTool {
+        &self.tool
+    }
+}
+
+impl KernelSim {
+    fn new(tool: BrowserTool, reply: Option<ApprovalResponse>) -> (Self, ApprovalRecorder) {
+        let recorder = ApprovalRecorder {
+            commands: Arc::new(Mutex::new(Vec::new())),
+            kinds: Arc::new(Mutex::new(Vec::new())),
+            permission_modes: Arc::new(Mutex::new(Vec::new())),
+        };
+        (
+            Self {
+                tool,
+                reply,
+                recorder: recorder.clone(),
+            },
+            recorder,
+        )
+    }
+
+    fn with_inbox_dir(self, inbox_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            tool: self.tool.with_inbox_dir(inbox_dir),
+            reply: self.reply,
+            recorder: self.recorder,
+        }
+    }
+
+    fn with_timeouts(self, nav: Duration, element: Duration, action: Duration) -> Self {
+        Self {
+            tool: self.tool.with_timeouts(nav, element, action),
+            reply: self.reply,
+            recorder: self.recorder,
+        }
+    }
+
+    async fn call_with(
+        &self,
+        arguments: &str,
+        facts: crate::traits::ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let result =
+            crate::testing::call_through_kernel(&self.tool, arguments, facts, self.reply.clone())
+                .await?;
+        if let Some(request) = &result.asked {
+            self.recorder
+                .commands
+                .lock()
+                .await
+                .push(request.summary.clone());
+            self.recorder
+                .kinds
+                .lock()
+                .await
+                .push(self.tool.approval_card_kind(request));
+            self.recorder.permission_modes.lock().await.push(
+                self.tool
+                    .approval_card_mode()
+                    .unwrap_or(crate::tools::command_risk::PermissionMode::Cautious),
+            );
+        }
+        Ok(result.output)
+    }
+}
+
 fn mock_tool() -> (
-    BrowserTool,
+    KernelSim,
     Arc<MockBackend>,
     mpsc::Receiver<crate::types::MediaMessage>,
 ) {
     mock_tool_with(MockBackend::new())
 }
 
-/// Dispatch-smoke helper: wires an AUTO-APPROVING approval broker so these
-/// pre-Task-7 tests exercise the action dispatch paths (navigate/click/fill/
-/// execute_js) without each one being blocked by the approval gate. The
-/// missing-channel (fail-safe Deny) path is exercised explicitly by
-/// `no_channel_tool()` / the Task-7 missing-channel test.
+/// Dispatch-smoke helper: the owner approves every card for the session, so
+/// these tests exercise the action dispatch paths (navigate/click/fill/
+/// execute_js) without each one being blocked by the approval gate. A call
+/// that reaches the tool without the kernel's approval is exercised by
+/// `no_channel_tool()`.
 fn mock_tool_with(
     backend: MockBackend,
 ) -> (
-    BrowserTool,
+    KernelSim,
     Arc<MockBackend>,
     mpsc::Receiver<crate::types::MediaMessage>,
 ) {
     let backend = Arc::new(backend);
     let (media_tx, media_rx) = mpsc::channel(8);
-    let (broker, _recorder) = spawn_responder(ApprovalResponse::AllowSession);
-    let tool = BrowserTool::with_backend_and_approval(
-        backend.clone(),
-        media_tx,
-        broker,
-        Duration::from_secs(5),
+    let (tool, _recorder) = KernelSim::new(
+        BrowserTool::with_backend(backend.clone(), media_tx),
+        Some(ApprovalResponse::AllowSession),
     );
     (tool, backend, media_rx)
 }
 
-/// Build a tool with NO approval channel (every approval-requiring action fails
-/// safe to Deny).
+/// Build a tool called directly, never through the kernel: every
+/// approval-requiring action fails safe to Deny.
 fn no_channel_tool(
     backend: MockBackend,
 ) -> (
@@ -1810,9 +1886,9 @@ async fn single_page_actions_use_active_tab() {
 // Task 7: request approval at execution time
 // =============================================================================
 
-/// Captures every `ApprovalRequest.command` the gate sends, so tests can count
-/// prompts and assert prompt content (secret-exclusion). Backed by a spawned
-/// task that drains the broker channel and replies with a scripted response.
+/// Captures every card the kernel sent for the tool (its summary, kind and
+/// mode), so tests can count prompts and assert prompt content
+/// (secret-exclusion).
 #[derive(Clone)]
 struct ApprovalRecorder {
     commands: Arc<Mutex<Vec<String>>>,
@@ -1836,56 +1912,6 @@ impl ApprovalRecorder {
     async fn permission_modes(&self) -> Vec<crate::tools::command_risk::PermissionMode> {
         self.permission_modes.lock().await.clone()
     }
-}
-
-/// Spawn a responder that replies to every approval request with `reply`,
-/// recording the prompt `command` of each. Returns the broker (to inject into
-/// the tool) and the recorder (to assert on).
-fn spawn_responder(reply: ApprovalResponse) -> (ApprovalBroker, ApprovalRecorder) {
-    let (tx, mut rx) = mpsc::channel(8);
-    let broker = ApprovalBroker::new(tx);
-    let recorder = ApprovalRecorder {
-        commands: Arc::new(Mutex::new(Vec::new())),
-        kinds: Arc::new(Mutex::new(Vec::new())),
-        permission_modes: Arc::new(Mutex::new(Vec::new())),
-    };
-    let commands = recorder.commands.clone();
-    let kinds = recorder.kinds.clone();
-    let permission_modes = recorder.permission_modes.clone();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            commands.lock().await.push(req.command.clone());
-            kinds.lock().await.push(req.kind);
-            permission_modes.lock().await.push(req.permission_mode);
-            let _ = req.response_tx.send(reply.clone());
-        }
-    });
-    (broker, recorder)
-}
-
-/// Spawn a responder that NEVER replies (drops the oneshot sender), but still
-/// records each request — used for the timeout path.
-fn spawn_silent_responder() -> (ApprovalBroker, ApprovalRecorder) {
-    let (tx, mut rx) = mpsc::channel(8);
-    let broker = ApprovalBroker::new(tx);
-    let recorder = ApprovalRecorder {
-        commands: Arc::new(Mutex::new(Vec::new())),
-        kinds: Arc::new(Mutex::new(Vec::new())),
-        permission_modes: Arc::new(Mutex::new(Vec::new())),
-    };
-    let commands = recorder.commands.clone();
-    let kinds = recorder.kinds.clone();
-    let permission_modes = recorder.permission_modes.clone();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            commands.lock().await.push(req.command.clone());
-            kinds.lock().await.push(req.kind);
-            permission_modes.lock().await.push(req.permission_mode);
-            // Drop req (and its response_tx) without replying → the gate times out.
-            drop(req);
-        }
-    });
-    (broker, recorder)
 }
 
 /// Captures the `MediaMessage`s a media responder drained, so a test can assert
@@ -1935,15 +1961,12 @@ fn spawn_media_responder(
 fn approving_tool(
     backend: MockBackend,
     reply: ApprovalResponse,
-) -> (BrowserTool, Arc<MockBackend>, ApprovalRecorder) {
+) -> (KernelSim, Arc<MockBackend>, ApprovalRecorder) {
     let backend = Arc::new(backend);
     let (media_tx, _media_rx) = mpsc::channel(8);
-    let (broker, recorder) = spawn_responder(reply);
-    let tool = BrowserTool::with_backend_and_approval(
-        backend.clone(),
-        media_tx,
-        broker,
-        Duration::from_secs(5),
+    let (tool, recorder) = KernelSim::new(
+        BrowserTool::with_backend(backend.clone(), media_tx),
+        Some(reply),
     );
     (tool, backend, recorder)
 }
@@ -2139,22 +2162,15 @@ async fn approval_deny_blocks_consequential_click_before_backend() {
     );
 }
 
-/// TIMEOUT: a responder that never replies → the gate auto-denies fast, with no
-/// backend call.
+/// TIMEOUT: the owner never answers the card → the call never runs, and the
+/// tool keeps no approval for it.
 #[tokio::test]
 async fn approval_timeout_denies_without_backend() {
     let backend = Arc::new(MockBackend::new());
     let (media_tx, _media_rx) = mpsc::channel(8);
-    let (broker, recorder) = spawn_silent_responder();
-    // ~50ms timeout so the test runs fast.
-    let tool = BrowserTool::with_backend_and_approval(
-        backend.clone(),
-        media_tx,
-        broker,
-        Duration::from_millis(50),
-    );
+    let (tool, recorder) =
+        KernelSim::new(BrowserTool::with_backend(backend.clone(), media_tx), None);
 
-    let start = std::time::Instant::now();
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#menu"}).to_string(),
@@ -2162,7 +2178,6 @@ async fn approval_timeout_denies_without_backend() {
         )
         .await
         .unwrap();
-    let elapsed = start.elapsed();
 
     assert!(
         out.to_lowercase().contains("denied"),
@@ -2172,21 +2187,108 @@ async fn approval_timeout_denies_without_backend() {
         !out.contains("Denied by user"),
         "an unavailable approval path must not be attributed to the user: {out}"
     );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "timeout path must resolve quickly, took {elapsed:?}"
-    );
     assert_eq!(
         recorder.count().await,
         1,
         "the request was sent (and recorded) before timing out"
     );
+    // A later direct call (not through the kernel) finds no approval either.
+    let direct = crate::testing::call_with_facts(
+        &tool.tool,
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        crate::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
+    assert!(direct.contains("Approval required"), "{direct}");
     let calls = backend.calls();
     let calls = calls.lock().await;
     assert!(
         !calls.iter().any(|c| matches!(c, MockCall::Click(_))),
         "a timed-out mutation must never reach the backend: {calls:?}"
     );
+}
+
+/// The kernel's approval covers only the exact call the owner saw: the same
+/// fill with another (hidden) value finds none, and the approved call runs
+/// once. A point-of-action card is once-only; an ordinary mutation's is not.
+#[tokio::test]
+async fn kernel_approval_covers_only_the_exact_call() {
+    use crate::traits::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
+    let backend = Arc::new(MockBackend::new());
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx);
+    let facts = crate::testing::call_facts("sess-exact");
+    assert!(tool.dispatch_facts().keeps_own_grants);
+
+    let approved = json!({ "action": "fill", "selector": "#submit", "value": "one" });
+    let OwnerApprovalNeed::Ask(request) = tool
+        .owner_approval_request(&ApprovalCall::as_sent(&approved), &facts)
+        .await
+    else {
+        panic!("a consequential fill must ask");
+    };
+    assert!(matches!(
+        tool.approval_card_kind(&request),
+        ApprovalKind::CommandOnce
+    ));
+    assert!(!request.summary.contains("one"), "{}", request.summary);
+    assert!(!request.subject.contains("one"), "{}", request.subject);
+    tool.record_owner_answer(
+        &ApprovalCall::as_sent(&approved),
+        &facts,
+        Some(ApprovalResponse::AllowSession),
+    )
+    .await;
+
+    let other = json!({ "action": "fill", "selector": "#submit", "value": "two" });
+    let out = crate::testing::call_with_facts(&tool, &other.to_string(), facts.clone())
+        .await
+        .unwrap();
+    assert!(out.contains("Approval required"), "{out}");
+    assert!(
+        !calls_contains(
+            &backend,
+            &MockCall::ReplaceText("#submit".to_string(), "two".to_string())
+        )
+        .await
+    );
+
+    let out = crate::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
+        .await
+        .unwrap();
+    assert!(!out.contains("Approval required"), "{out}");
+    let out = crate::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
+        .await
+        .unwrap();
+    assert!(
+        out.contains("Approval required"),
+        "a point-of-action approval covers one call: {out}"
+    );
+
+    let ordinary = json!({ "action": "click", "selector": "#menu" });
+    let OwnerApprovalNeed::Ask(request) = tool
+        .owner_approval_request(&ApprovalCall::as_sent(&ordinary), &facts)
+        .await
+    else {
+        panic!("an ordinary mutation in an unapproved session must ask");
+    };
+    assert!(matches!(
+        tool.approval_card_kind(&request),
+        ApprovalKind::Command
+    ));
+
+    // Observations and navigation have no card.
+    for free in [
+        json!({ "action": "get_text" }),
+        json!({ "action": "navigate", "url": "https://example.com/" }),
+    ] {
+        assert!(matches!(
+            tool.owner_approval_request(&ApprovalCall::as_sent(&free), &facts)
+                .await,
+            OwnerApprovalNeed::Unjudged
+        ));
+    }
 }
 
 /// MISSING CHANNEL: with no broker, a mutation is denied with no backend call,
@@ -4162,14 +4264,8 @@ use super::backend::MockElementState;
 fn wait_tool(backend: MockBackend) -> (BrowserTool, Arc<MockBackend>) {
     let backend = Arc::new(backend);
     let (media_tx, _rx) = mpsc::channel(8);
-    let (broker, _rec) = spawn_responder(ApprovalResponse::AllowSession);
-    let tool = BrowserTool::with_backend_and_approval(
-        backend.clone(),
-        media_tx,
-        broker,
-        Duration::from_secs(5),
-    )
-    .with_timeouts(
+    // `wait` is an observation: no card, so no kernel is needed.
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx).with_timeouts(
         Duration::from_secs(4),
         Duration::from_secs(4),
         Duration::from_secs(4),

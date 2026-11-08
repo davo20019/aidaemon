@@ -738,6 +738,56 @@ pub async fn call_with_facts<T: Tool + ?Sized>(
         .map(|outcome| outcome.output)
 }
 
+/// What [`call_through_kernel`] did with a call.
+pub struct KernelCall {
+    /// The tool's output, or the kernel's refusal when the owner did not
+    /// approve (the tool did not run).
+    pub output: String,
+    /// The card the owner was asked with, if the tool asked.
+    pub asked: Option<aidaemon_core::OwnerApprovalRequest>,
+}
+
+/// Call `tool` as the agent kernel does for a tool that judges its own owner
+/// approvals: ask `owner_approval_request` with `facts`; when it asks, hand
+/// `answer` (`None`: no answer) back through `record_owner_answer` and run
+/// the call only when the owner approved. A decline or no answer never runs
+/// it, as with the kernel.
+pub async fn call_through_kernel<T: Tool + ?Sized>(
+    tool: &T,
+    arguments: &str,
+    facts: crate::traits::ToolCallContext,
+    answer: Option<ApprovalResponse>,
+) -> anyhow::Result<KernelCall> {
+    use crate::traits::ToolSemantics as _;
+    let parsed: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let call = crate::traits::ApprovalCall::as_sent(&parsed);
+    let asked = match tool.owner_approval_request(&call, &facts).await {
+        crate::traits::OwnerApprovalNeed::Ask(request) => Some(request),
+        _ => None,
+    };
+    if asked.is_some() {
+        tool.record_owner_answer(&call, &facts, answer.clone())
+            .await;
+        match answer {
+            Some(ApprovalResponse::Deny) => {
+                return Ok(KernelCall {
+                    output: "Error: Denied by user.".to_string(),
+                    asked,
+                });
+            }
+            None => {
+                return Ok(KernelCall {
+                    output: "Error: no answer from the owner. Action denied.".to_string(),
+                    asked,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    let output = call_with_facts(tool, arguments, facts).await?;
+    Ok(KernelCall { output, asked })
+}
+
 /// `tool.call_with(arguments, facts)`: [`call_with_facts`] as a method.
 #[async_trait]
 pub trait CallWithFacts {
