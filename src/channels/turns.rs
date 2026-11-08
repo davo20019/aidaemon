@@ -126,11 +126,16 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
 #[derive(Clone)]
 pub(crate) struct TurnRunner {
     deps: ChannelRuntimeDeps,
+    /// Longest one turn may run ([`TURN_WALL_CLOCK`]).
+    wall_clock: Duration,
 }
 
 impl TurnRunner {
     pub(crate) fn new(deps: ChannelRuntimeDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            wall_clock: TURN_WALL_CLOCK,
+        }
     }
 
     /// Remember that `session_id` belongs to `channel_name`, so outbound
@@ -249,9 +254,11 @@ impl TurnRunner {
         // Stops the working indicator even if this task panics.
         let indicator = Arc::new(std::sync::Mutex::new(CancellationToken::new()));
         let _indicator_guard = CancelOnDrop(indicator.clone());
-        let wall_clock_deadline = tokio::time::Instant::now() + TURN_WALL_CLOCK;
 
         loop {
+            // Each turn gets the whole limit; a message queued behind a long
+            // turn does not inherit what that turn used.
+            let wall_clock_deadline = tokio::time::Instant::now() + self.wall_clock;
             let description: String = text.chars().take(80).collect();
             let (task_id, cancel) = registry.register(&session_id, &description).await;
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
@@ -290,8 +297,9 @@ impl TurnRunner {
                     ))
                 },
                 _ = tokio::time::sleep_until(wall_clock_deadline) => {
-                    tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
-                    Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
+                    let minutes = self.wall_clock.as_secs() / 60;
+                    tracing::error!(session_id = %session_id, minutes, "Task hit its hard wall-clock limit");
+                    Err(anyhow::anyhow!("Task exceeded maximum wall-clock time ({minutes} minutes). This may indicate a hang."))
                 },
             };
             working.cancel();
@@ -637,6 +645,89 @@ pub(crate) fn repeat_while_working<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+
+    /// Records what the runner says.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TurnSurface for Recording {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(Vec::new())
+        }
+        fn show_working(&self, _: CancellationToken, _: Arc<AtomicU64>, _: u64) {}
+    }
+
+    fn turn(text: &str, key: &str) -> Turn {
+        Turn {
+            session_id: "test:wall-clock".to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("test"),
+            dedup_key: Some(key.to_string()),
+            ingress_timing: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_turn_gets_its_own_wall_clock() {
+        // Each turn takes most of the limit; together they exceed it.
+        let provider = MockProvider::with_delayed_responses(
+            vec![
+                MockProvider::text_response("first done"),
+                MockProvider::text_response("second done"),
+            ],
+            vec![Duration::from_millis(600), Duration::from_millis(600)],
+        );
+        let mut harness = setup_test_agent(provider).await.unwrap();
+        let agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> =
+            Arc::new(std::mem::replace(
+                &mut harness.agent,
+                setup_test_agent(MockProvider::new()).await.unwrap().agent,
+            ));
+        let inbox = tempfile::tempdir().unwrap().keep();
+        let registry = Arc::new(crate::tasks::TaskRegistry::new(50));
+        let mut runner = TurnRunner::new(ChannelRuntimeDeps {
+            agent,
+            config_path: inbox.join("config.toml"),
+            session_map: Arc::default(),
+            task_registry: registry.clone(),
+            files_enabled: false,
+            inbox_dir: inbox,
+            max_file_size_mb: 10,
+            state: harness.state.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        runner.wall_clock = Duration::from_millis(1000);
+        let surface = Arc::new(Recording::default());
+
+        runner.submit(surface.clone(), turn("first", "m1")).await;
+        while !registry.has_running_task("test:wall-clock").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        runner.submit(surface.clone(), turn("second", "m2")).await;
+
+        let said = || surface.0.lock().unwrap().clone();
+        for _ in 0..500 {
+            if said()
+                .iter()
+                .any(|s| s.contains("second done") || s.starts_with("Error"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let said = said();
+        assert!(said.iter().any(|s| s.contains("first done")), "{said:?}");
+        assert!(said.iter().any(|s| s.contains("second done")), "{said:?}");
+        assert!(!said.iter().any(|s| s.contains("wall-clock")), "{said:?}");
+    }
 
     #[test]
     fn cancel_words_are_whole_messages() {
