@@ -402,15 +402,18 @@ impl Tool for TrackRequirementsTool {
 
     fn description(&self) -> &str {
         "Declare the typed checklist of what the current request requires, BEFORE your first \
-         operation whenever the request names two or more distinct operations, deliverables, or \
-         targets (an ordered sequence like create/write/read/remove/verify is one item per step). \
+         operation whenever the request changes anything (a file, a remote system, a deployment, \
+         a schedule, a setting) or sends or publishes anything, even if it is one operation, and \
+         whenever it names two or more distinct operations, deliverables, or targets (an ordered \
+         sequence like create/write/read/remove/verify is one item per step). \
          Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation \
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
          Mark items 'completed' as you finish them, or 'deferred' if you will not do one: the run \
          may then end, but a deferred or removed item is reported as not done, never as done. \
-         Skip this only for a single direct operation or when the user forbids it."
+         Skip this only for a single read-only lookup, a plain answer or conversation, or when \
+         the user forbids it."
     }
 
     fn schema(&self) -> Value {
