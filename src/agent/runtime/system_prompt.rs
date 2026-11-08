@@ -8,7 +8,11 @@ const NEW_REQUEST_DIALOGUE_NOTE: &str = "[Conversation Continuity]\n\
      (tool activity omitted). Use them to understand references such as \"they\", \
      \"that\", or \"the second one\"; do not ask the user to repeat something they just said. \
      Those earlier requests are already handled: do not redo them, and re-check any \
-     current state instead of repeating earlier outputs.";
+     current state instead of repeating earlier outputs. Tool activity is left out of these \
+     messages only to save space, so its absence says nothing about whether your earlier \
+     replies were right. Do not question, qualify or retract an earlier reply unless the user \
+     asks about it or a tool result from this turn contradicts it; if the user asks, check \
+     the record first.";
 
 pub(in crate::agent) fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
     for line in prompt.lines() {
