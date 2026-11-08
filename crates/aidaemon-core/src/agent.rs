@@ -53,7 +53,7 @@ pub(crate) struct AgentInner {
     pub limits: Limits,
     pub stuck: StuckConfig,
     pub stop_conditions: Vec<Arc<dyn StopCondition>>,
-    pub sink: Option<Arc<dyn EventSink>>,
+    pub sinks: Vec<Arc<dyn EventSink>>,
     pub store: Option<Arc<dyn RunStore>>,
     pub max_output_tokens: Option<u32>,
     /// Carried by every call's [`crate::ToolContext`].
@@ -233,7 +233,7 @@ pub struct AgentBuilder {
     limits: Limits,
     stuck: StuckConfig,
     stop_conditions: Vec<Arc<dyn StopCondition>>,
-    sink: Option<Arc<dyn EventSink>>,
+    sinks: Vec<Arc<dyn EventSink>>,
     store: Option<Arc<dyn RunStore>>,
     max_output_tokens: Option<u32>,
     extensions: Extensions,
@@ -253,7 +253,7 @@ impl AgentBuilder {
             limits: Limits::default(),
             stuck: StuckConfig::default(),
             stop_conditions: Vec::new(),
-            sink: None,
+            sinks: Vec::new(),
             store: None,
             max_output_tokens: None,
             extensions: Extensions::default(),
@@ -330,7 +330,7 @@ impl AgentBuilder {
     }
 
     pub fn event_sink(mut self, sink: impl EventSink + 'static) -> Self {
-        self.sink = Some(Arc::new(sink));
+        self.sinks.push(Arc::new(sink));
         self
     }
 
@@ -395,7 +395,7 @@ impl AgentBuilder {
                 limits: self.limits,
                 stuck: self.stuck,
                 stop_conditions: self.stop_conditions,
-                sink: self.sink,
+                sinks: self.sinks,
                 store: self.store,
                 max_output_tokens: self.max_output_tokens,
                 extensions: self.extensions,

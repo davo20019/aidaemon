@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::hook::{HookFailure, HookPoint};
 use crate::limits::LimitKind;
 use crate::outcome::RunStatus;
-use crate::provider::Usage;
+use crate::provider::{ModelRequest, Usage};
 use crate::receipt::Receipt;
 use crate::state::{Interruption, RunId};
 use crate::stuck::StuckSignal;
@@ -18,6 +18,10 @@ pub enum Event {
         session_id: String,
     },
     RunResumed,
+    /// This run was started by a tool call of `parent_run`.
+    RunLinked {
+        parent_run: RunId,
+    },
     TurnStarted {
         turn: u32,
     },
@@ -37,11 +41,23 @@ pub enum Event {
         turn: u32,
         switch: crate::ProviderSwitch,
     },
+    /// The model is about to be called; pairs with `ModelResponded`, or
+    /// with `ModelRetried` or `Finished` if the call fails. Content is not
+    /// journaled: see [`EventSink::observe_request`].
+    ModelRequested {
+        turn: u32,
+        model: String,
+        messages: usize,
+        tools: usize,
+    },
     ModelResponded {
         turn: u32,
         usage: Usage,
         text: String,
         tool_calls: usize,
+        /// Why the reply may be incomplete, in the provider's words.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     ToolStarted {
         call_id: String,
@@ -55,6 +71,15 @@ pub enum Event {
     },
     StopRejected {
         message: String,
+    },
+    /// A hook made a decision other than letting things proceed. Together
+    /// with `HookFailed` this says which hook did what, and why.
+    HookDecided {
+        point: HookPoint,
+        hook: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A hook panicked, timed out or was cancelled, and gave no answer.
     /// See [`crate::Hook`] for what the run does instead.
@@ -110,6 +135,11 @@ pub enum Event {
 /// channel if the consumer is slow.
 pub trait EventSink: Send + Sync {
     fn emit(&self, run_id: RunId, event: &Event);
+
+    /// The exact request about to go to the model, after every hook has
+    /// shaped it. Prompts are not events, so they are never journaled; a
+    /// sink that exports them takes on deciding what may leave.
+    fn observe_request(&self, _run_id: RunId, _request: &ModelRequest) {}
 }
 
 impl<F> EventSink for F

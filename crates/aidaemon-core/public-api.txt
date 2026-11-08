@@ -122,6 +122,11 @@ pub aidaemon_core::Event::Finished
 pub aidaemon_core::Event::Finished::status: aidaemon_core::RunStatus
 pub aidaemon_core::Event::Finished::turns: u32
 pub aidaemon_core::Event::Finished::usage: aidaemon_core::Usage
+pub aidaemon_core::Event::HookDecided
+pub aidaemon_core::Event::HookDecided::decision: alloc::string::String
+pub aidaemon_core::Event::HookDecided::hook: alloc::string::String
+pub aidaemon_core::Event::HookDecided::point: aidaemon_core::HookPoint
+pub aidaemon_core::Event::HookDecided::reason: core::option::Option<alloc::string::String>
 pub aidaemon_core::Event::HookFailed
 pub aidaemon_core::Event::HookFailed::failure: aidaemon_core::HookFailure
 pub aidaemon_core::Event::HookFailed::hook: alloc::string::String
@@ -137,7 +142,13 @@ pub aidaemon_core::Event::ModelAnswered::turn: u32
 pub aidaemon_core::Event::ModelRejected
 pub aidaemon_core::Event::ModelRejected::message: alloc::string::String
 pub aidaemon_core::Event::ModelRejected::turn: u32
+pub aidaemon_core::Event::ModelRequested
+pub aidaemon_core::Event::ModelRequested::messages: usize
+pub aidaemon_core::Event::ModelRequested::model: alloc::string::String
+pub aidaemon_core::Event::ModelRequested::tools: usize
+pub aidaemon_core::Event::ModelRequested::turn: u32
 pub aidaemon_core::Event::ModelResponded
+pub aidaemon_core::Event::ModelResponded::note: core::option::Option<alloc::string::String>
 pub aidaemon_core::Event::ModelResponded::text: alloc::string::String
 pub aidaemon_core::Event::ModelResponded::tool_calls: usize
 pub aidaemon_core::Event::ModelResponded::turn: u32
@@ -152,6 +163,8 @@ pub aidaemon_core::Event::ProviderSwitched::turn: u32
 pub aidaemon_core::Event::Recovered
 pub aidaemon_core::Event::Recovered::indeterminate: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::Event::Recovered::reran: alloc::vec::Vec<alloc::string::String>
+pub aidaemon_core::Event::RunLinked
+pub aidaemon_core::Event::RunLinked::parent_run: aidaemon_core::RunId
 pub aidaemon_core::Event::RunResumed
 pub aidaemon_core::Event::RunStarted
 pub aidaemon_core::Event::RunStarted::session_id: alloc::string::String
@@ -721,6 +734,7 @@ pub aidaemon_core::RunState::in_flight: core::option::Option<aidaemon_core::InFl
 pub aidaemon_core::RunState::limit_grants: aidaemon_core::LimitGrants
 pub aidaemon_core::RunState::messages: alloc::vec::Vec<aidaemon_core::Message>
 pub aidaemon_core::RunState::nudges: u32
+pub aidaemon_core::RunState::parent_run: core::option::Option<aidaemon_core::RunId>
 pub aidaemon_core::RunState::pending: core::option::Option<aidaemon_core::Pending>
 pub aidaemon_core::RunState::receipts: alloc::vec::Vec<aidaemon_core::Receipt>
 pub aidaemon_core::RunState::run_id: aidaemon_core::RunId
@@ -737,6 +751,7 @@ pub fn aidaemon_core::RunState::run_receipts(&self) -> impl core::iter::traits::
 pub fn aidaemon_core::RunState::schema(&self) -> u32
 pub fn aidaemon_core::RunState::share_declines(self, aidaemon_core::SharedDeclines) -> Self
 pub fn aidaemon_core::RunState::shared_declines(&self) -> core::option::Option<&aidaemon_core::SharedDeclines>
+pub fn aidaemon_core::RunState::with_parent(self, aidaemon_core::RunId) -> Self
 pub fn aidaemon_core::RunState::with_untrusted_context(self) -> Self
 pub fn aidaemon_core::RunState::with_user_message(self, impl core::convert::Into<aidaemon_core::Message>) -> Self
 pub struct aidaemon_core::SharedDeclines(_)
@@ -857,8 +872,10 @@ pub trait aidaemon_core::AuthorityCeiling: core::marker::Send + core::marker::Sy
 pub fn aidaemon_core::AuthorityCeiling::ceiling<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::Authority>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub trait aidaemon_core::EventSink: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::EventSink::emit(&self, aidaemon_core::RunId, &aidaemon_core::Event)
+pub fn aidaemon_core::EventSink::observe_request(&self, aidaemon_core::RunId, &aidaemon_core::ModelRequest)
 impl<F> aidaemon_core::EventSink for F where F: core::ops::function::Fn(aidaemon_core::RunId, &aidaemon_core::Event) + core::marker::Send + core::marker::Sync
 pub fn F::emit(&self, aidaemon_core::RunId, &aidaemon_core::Event)
+pub fn F::observe_request(&self, aidaemon_core::RunId, &aidaemon_core::ModelRequest)
 pub trait aidaemon_core::FailoverPolicy: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::FailoverPolicy::after_error(&self, &aidaemon_core::ModelRequest, &aidaemon_core::ProviderError, u32, u32) -> aidaemon_core::FailoverAction
 pub fn aidaemon_core::FailoverPolicy::before_attempt(&self, &aidaemon_core::ModelRequest) -> core::result::Result<(), aidaemon_core::ProviderError>

@@ -897,3 +897,102 @@ async fn a_hook_can_supply_the_response_of_a_failed_call() {
 
     assert_eq!(out.final_text.as_deref(), Some("from the fallback"));
 }
+
+// ---------- what an exporter can see ----------
+
+#[derive(Default)]
+struct Observer {
+    events: Mutex<Vec<Event>>,
+    requests: Mutex<Vec<aidaemon_core::ModelRequest>>,
+}
+struct ArcObserver(Arc<Observer>);
+impl aidaemon_core::EventSink for ArcObserver {
+    fn emit(&self, _run: aidaemon_core::RunId, event: &Event) {
+        self.0.events.lock().unwrap().push(event.clone());
+    }
+    fn observe_request(&self, _run: aidaemon_core::RunId, request: &aidaemon_core::ModelRequest) {
+        self.0.requests.lock().unwrap().push(request.clone());
+    }
+}
+
+struct AddsNote;
+#[async_trait]
+impl Hook for AddsNote {
+    async fn before_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        request: &mut aidaemon_core::ModelRequest,
+    ) {
+        request.messages.push(Message::hook_note("added by a hook"));
+    }
+}
+
+#[tokio::test]
+async fn a_sink_sees_the_final_request_and_each_hook_decision() {
+    let observer = Arc::new(Observer::default());
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "write", json!({}))]),
+        text("done"),
+    ]));
+    let agent = agent(provider)
+        .tool(write_tool(Arc::default()))
+        .hook(AddsNote)
+        .hook(DenyWrite)
+        .event_sink(ArcObserver(observer.clone()))
+        .build()
+        .unwrap();
+
+    agent.run("s", "go").await.unwrap();
+
+    let requests = observer.requests.lock().unwrap();
+    assert!(requests[0]
+        .messages
+        .iter()
+        .any(|m| m.content == "added by a hook"));
+    let events = observer.events.lock().unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ModelRequested { model, .. } if model == "m")));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::HookDecided { hook, decision, reason, .. }
+            if hook.contains("DenyWrite") && decision == "deny" && reason.as_deref() == Some("policy")
+    )));
+}
+
+#[tokio::test]
+async fn several_sinks_all_receive_the_events() {
+    let (first, sink_one) = recording();
+    let (second, sink_two) = recording();
+    let provider = Arc::new(ScriptedProvider::new([text("done")]));
+    let agent = agent(provider)
+        .event_sink(sink_one)
+        .event_sink(sink_two)
+        .build()
+        .unwrap();
+
+    agent.run("s", "go").await.unwrap();
+
+    assert!(!first.lock().unwrap().is_empty());
+    assert_eq!(first.lock().unwrap().len(), second.lock().unwrap().len());
+}
+
+#[tokio::test]
+async fn a_child_run_names_its_parent() {
+    let (events, sink) = recording();
+    let provider = Arc::new(ScriptedProvider::new([text("done")]));
+    let agent = agent(provider).event_sink(sink).build().unwrap();
+    let parent = aidaemon_core::RunId::new();
+    let state = RunState::new("a", "s", "go").with_parent(parent);
+
+    agent
+        .run_from(state, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, Event::RunLinked { parent_run } if *parent_run == parent)));
+}

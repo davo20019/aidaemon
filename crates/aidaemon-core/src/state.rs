@@ -163,6 +163,9 @@ pub struct RunState {
     /// ([`RunState::with_user_message`]) starts with none.
     #[serde(default)]
     pub limit_grants: LimitGrants,
+    /// The run whose tool call started this one, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run: Option<RunId>,
     /// `on_stop` continuations since the last new successful call.
     #[serde(default)]
     pub(crate) idle_continuations: u32,
@@ -198,9 +201,16 @@ impl RunState {
             unmet: Vec::new(),
             finishing: None,
             limit_grants: LimitGrants::default(),
+            parent_run: None,
             idle_continuations: 0,
             continued_at_successes: 0,
         }
+    }
+
+    /// Record the run whose tool call started this one.
+    pub fn with_parent(mut self, parent: RunId) -> Self {
+        self.parent_run = Some(parent);
+        self
     }
 
     /// Start the run as if it had already read untrusted content (the

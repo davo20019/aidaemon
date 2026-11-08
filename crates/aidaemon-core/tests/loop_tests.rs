@@ -1225,15 +1225,17 @@ async fn events_are_emitted_and_state_is_checkpointed() {
         vec![
             "run_started",
             "turn_started",
+            "model_requested",
             "model_responded",
             "tool_started",
             "tool_finished",
             "turn_started",
+            "model_requested",
             "model_responded",
             "finished",
         ]
     );
-    assert_eq!(store.events(out.state.run_id).len(), 8);
+    assert_eq!(store.events(out.state.run_id).len(), 10);
     let saved = store
         .load_state(out.state.run_id)
         .await

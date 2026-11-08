@@ -106,6 +106,12 @@ impl EventSink for EventRouter {
             next.emit(run_id, event);
         }
     }
+
+    fn observe_request(&self, run_id: RunId, request: &aidaemon_core::ModelRequest) {
+        if let Some(next) = &self.next {
+            next.observe_request(run_id, request);
+        }
+    }
 }
 
 #[cfg(test)]

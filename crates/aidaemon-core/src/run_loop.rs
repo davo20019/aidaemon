@@ -180,6 +180,9 @@ impl<'a> Driver<'a> {
         } else {
             let session_id = self.state.session_id.clone();
             self.emit(Event::RunStarted { session_id }).await?;
+            if let Some(parent_run) = self.state.parent_run {
+                self.emit(Event::RunLinked { parent_run }).await?;
+            }
             // A process restart between turns also lands here; it is not a
             // new run.
             if self.state.turn == 0 {
@@ -240,7 +243,19 @@ impl<'a> Driver<'a> {
                     self.emit(Event::ModelAnswered { turn, hook }).await?;
                     Some(Ok(ModelCall::Response(response)))
                 }
-                None => within(self.remaining(), self.call_model(&request, turn)).await,
+                None => {
+                    self.emit(Event::ModelRequested {
+                        turn,
+                        model: request.model.clone(),
+                        messages: request.messages.len(),
+                        tools: request.tools.len(),
+                    })
+                    .await?;
+                    for sink in &self.agent.sinks {
+                        sink.observe_request(self.state.run_id, &request);
+                    }
+                    within(self.remaining(), self.call_model(&request, turn)).await
+                }
             };
             let response = match call {
                 None => {
@@ -305,6 +320,7 @@ impl<'a> Driver<'a> {
                 usage,
                 text: response.text.clone(),
                 tool_calls: calls.len(),
+                note: response.note.clone(),
             })
             .await?;
             if let Some(message) = rejection {
@@ -354,15 +370,20 @@ impl<'a> Driver<'a> {
                         match answer {
                             StopDecision::Accept => {}
                             StopDecision::Continue { message } => {
+                                guard.decided(hook.name(), "continue", Some(&message)).await;
                                 rejection.get_or_insert(message);
                             }
                             StopDecision::Halt { reason } => {
+                                guard.decided(hook.name(), "halt", Some(&reason)).await;
                                 halted = true;
                                 if !unmet.contains(&reason) {
                                     unmet.push(reason);
                                 }
                             }
                             StopDecision::AcceptUnmet { unmet: lines } => {
+                                guard
+                                    .decided(hook.name(), "accept_unmet", Some(&lines.join("; ")))
+                                    .await;
                                 for line in lines {
                                     let line = line.trim().to_string();
                                     if !line.is_empty() && !unmet.contains(&line) {
@@ -761,6 +782,20 @@ impl<'a> Driver<'a> {
                 .unwrap_or_else(|| ToolDecision::Deny {
                     reason: format!("the safety check `{}` gave no answer", hook.name()),
                 });
+            let name = hook.name();
+            match &answer {
+                ToolDecision::Deny { reason } => {
+                    guard.decided(name, "deny", Some(reason)).await;
+                }
+                ToolDecision::Interrupt { reason, .. } => {
+                    guard.decided(name, "interrupt", Some(reason)).await;
+                }
+                ToolDecision::Answer { .. } => guard.decided(name, "answer", None).await,
+                ToolDecision::Rewrite { arguments } if *arguments != call.arguments => {
+                    guard.decided(name, "rewrite", None).await;
+                }
+                _ => {}
+            }
             match answer {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
@@ -1257,8 +1292,12 @@ impl<'a> Driver<'a> {
             for hook in &self.agent.hooks {
                 let answer = guard.run(hook.as_ref(), hook.on_limit(&ctx, limit)).await;
                 match answer {
-                    Some(LimitDecision::Forbid) => return Ok(false),
+                    Some(LimitDecision::Forbid) => {
+                        guard.decided(hook.name(), "forbid", None).await;
+                        return Ok(false);
+                    }
                     Some(LimitDecision::Extend { amount }) if amount > 0 => {
+                        guard.decided(hook.name(), "extend", None).await;
                         granted.get_or_insert(amount);
                     }
                     _ => {}
@@ -1287,7 +1326,10 @@ impl<'a> Driver<'a> {
                 .await
             {
                 Some(ModelDecision::Accept) => {}
-                Some(ModelDecision::Reject { message }) => return Ok(Some(message)),
+                Some(ModelDecision::Reject { message }) => {
+                    guard.decided(hook.name(), "reject", Some(&message)).await;
+                    return Ok(Some(message));
+                }
                 None => return Err(hook.name()),
             }
         }
@@ -1338,9 +1380,15 @@ impl<'a> Driver<'a> {
             match answer {
                 None | Some(ModelErrorDecision::Fail) => {}
                 Some(ModelErrorDecision::Abort) => {
-                    return (hook.name().to_string(), ModelErrorDecision::Abort)
+                    guard.decided(hook.name(), "abort", None).await;
+                    return (hook.name().to_string(), ModelErrorDecision::Abort);
                 }
                 Some(decision) => {
+                    let kind = match decision {
+                        ModelErrorDecision::Recover { .. } => "recover",
+                        _ => "retry",
+                    };
+                    guard.decided(hook.name(), kind, None).await;
                     chosen.get_or_insert((hook.name().to_string(), decision));
                 }
             }
@@ -1416,7 +1464,7 @@ impl<'a> Driver<'a> {
     }
 
     async fn emit(&self, event: Event) -> Result<(), CoreError> {
-        if let Some(sink) = &self.agent.sink {
+        for sink in &self.agent.sinks {
             sink.emit(self.state.run_id, &event);
         }
         if let Some(store) = &self.agent.store {
@@ -1558,12 +1606,27 @@ impl HookGuard<'_> {
     /// Record the failure. A store error here must not change what the run
     /// does about the hook; the next checkpoint reports it.
     async fn report(&self, hook: &str, failure: HookFailure) {
-        let event = Event::HookFailed {
+        self.record(Event::HookFailed {
             point: self.point,
             hook: hook.to_string(),
             failure,
-        };
-        if let Some(sink) = &self.agent.sink {
+        })
+        .await;
+    }
+
+    /// Record a decision other than letting things proceed.
+    async fn decided(&self, hook: &str, decision: &str, reason: Option<&str>) {
+        self.record(Event::HookDecided {
+            point: self.point,
+            hook: hook.to_string(),
+            decision: decision.to_string(),
+            reason: reason.map(str::to_string),
+        })
+        .await;
+    }
+
+    async fn record(&self, event: Event) {
+        for sink in &self.agent.sinks {
             sink.emit(self.run_id, &event);
         }
         if let Some(store) = &self.agent.store {

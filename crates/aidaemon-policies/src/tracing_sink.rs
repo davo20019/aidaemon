@@ -96,6 +96,74 @@ impl EventSink for TracingSink {
                     "run recovered after restart"
                 );
             }
+            Event::ModelRequested {
+                turn,
+                model,
+                messages,
+                tools,
+            } => {
+                tracing::info!(
+                    target: "aidaemon::run",
+                    run_id = %run_id,
+                    turn = *turn,
+                    model = %model,
+                    messages = *messages as u64,
+                    tools = *tools as u64,
+                    "model requested"
+                );
+            }
+            Event::RunLinked { parent_run } => {
+                tracing::info!(target: "aidaemon::run", run_id = %run_id, parent_run = %parent_run, "run linked");
+            }
+            Event::HookDecided {
+                point,
+                hook,
+                decision,
+                reason,
+            } => {
+                tracing::info!(
+                    target: "aidaemon::run",
+                    run_id = %run_id,
+                    point = ?point,
+                    hook = %hook,
+                    decision = %decision,
+                    reason = reason.as_deref().unwrap_or(""),
+                    "hook decided"
+                );
+            }
+            Event::HookFailed {
+                point,
+                hook,
+                failure,
+            } => {
+                tracing::warn!(target: "aidaemon::run", run_id = %run_id, point = ?point, hook = %hook, failure = ?failure, "hook failed");
+            }
+            Event::ModelRejected { turn, message } => {
+                tracing::info!(target: "aidaemon::run", run_id = %run_id, turn = *turn, message = %message, "model response rejected");
+            }
+            Event::ModelRetried {
+                turn,
+                error,
+                after_ms,
+            } => {
+                tracing::warn!(target: "aidaemon::run", run_id = %run_id, turn = *turn, error = %error, after_ms = *after_ms, "model call retried");
+            }
+            Event::ModelAnswered { turn, hook } => {
+                tracing::info!(target: "aidaemon::run", run_id = %run_id, turn = *turn, hook = %hook, "hook answered for the model");
+            }
+            Event::LimitExtended { limit, amount } => {
+                tracing::info!(target: "aidaemon::run", run_id = %run_id, limit = ?limit, amount = *amount, "limit extended");
+            }
+            Event::TranscriptEdited {
+                turn,
+                before,
+                after,
+            } => {
+                tracing::info!(target: "aidaemon::run", run_id = %run_id, turn = *turn, before = *before as u64, after = *after as u64, "transcript edited");
+            }
+            Event::TranscriptEditRefused { turn, reason } => {
+                tracing::warn!(target: "aidaemon::run", run_id = %run_id, turn = *turn, reason = %reason, "transcript edit refused");
+            }
             Event::ModelResponded {
                 turn,
                 usage,
