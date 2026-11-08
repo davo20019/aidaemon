@@ -463,7 +463,7 @@ pub(crate) async fn generate_task_relationship_candidates(
                     .is_some_and(crate::providers::ProviderError::prevents_model_fallback);
                 record_auxiliary_model_failure(
                     telemetry,
-                    "task_relationship_fallback",
+                    "task_relationship",
                     model,
                     call_start.elapsed().as_millis() as u64,
                     (candidate_index + 1) as u32,
@@ -483,7 +483,7 @@ pub(crate) async fn generate_task_relationship_candidates(
             Err(_) => {
                 record_auxiliary_model_failure(
                     telemetry,
-                    "task_relationship_fallback",
+                    "task_relationship",
                     model,
                     call_start.elapsed().as_millis() as u64,
                     (candidate_index + 1) as u32,
@@ -508,7 +508,7 @@ pub(crate) async fn generate_task_relationship_candidates(
         else {
             record_auxiliary_model_call(
                 telemetry,
-                "task_relationship_fallback",
+                "task_relationship",
                 model,
                 &response,
                 latency_ms,
@@ -526,7 +526,7 @@ pub(crate) async fn generate_task_relationship_candidates(
             Err(error) => {
                 record_auxiliary_model_call(
                     telemetry,
-                    "task_relationship_fallback",
+                    "task_relationship",
                     model,
                     &response,
                     latency_ms,
@@ -568,7 +568,7 @@ pub(crate) async fn generate_task_relationship_candidates(
             valid && (parsed.request_relationship == "continuation" || antecedent.is_none());
         record_auxiliary_model_call(
             telemetry,
-            "task_relationship_fallback",
+            "task_relationship",
             model,
             &response,
             latency_ms,
