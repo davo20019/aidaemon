@@ -633,6 +633,10 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// The run's declines as the kernel last showed them to the approval
     /// rules: a child spawned from this turn starts with them.
     run_declines: super::approvals::RunDeclines,
+    /// The live decline set this turn's run shares with its parent (when it
+    /// is a child) and with the children it spawns: the kernel refuses any
+    /// of them an effect the owner declined in another.
+    shared_declines: sdk::SharedDeclines,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
@@ -1266,6 +1270,15 @@ impl Agent {
             state.declined =
                 crate::agent::authority::union_declines(&state.declined, &parent.declined);
         }
+        // From then on the run shares its declines live with its parent and
+        // its children (the kernel exchanges them before every call); a root
+        // turn starts a family of its own.
+        let shared_declines = self
+            .inherited_authority
+            .as_ref()
+            .and_then(|parent| parent.shared_declines.clone())
+            .unwrap_or_default();
+        let state = state.share_declines(shared_declines.clone());
         let prefix_len = state.messages.len();
 
         // Drive the run and the tool dispatcher together on this task.
@@ -1341,6 +1354,7 @@ impl Agent {
             canonical_calls,
             gate_outcomes: Default::default(),
             run_declines,
+            shared_declines,
             project_scope,
             authority: &authority,
             ceiling: ceiling.clone(),

@@ -34,6 +34,12 @@ pub(super) async fn stranded_run(
 
 /// Run `state` to its end. `None` means the owner gave no answer, so the run
 /// stays unfinished for a later turn.
+///
+/// The recovered run shares no decline set (`sdk::SharedDeclines` is a
+/// runtime handle, never stored): the parent and children it shared one
+/// with ended with the process, and the turn about to start is a new run
+/// whose declines start empty. Its own `declined` record still binds it
+/// while it settles, and still keeps it from ending `Succeeded`.
 pub(super) async fn settle(
     agent: &sdk::Agent,
     state: sdk::RunState,

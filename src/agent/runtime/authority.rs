@@ -188,6 +188,14 @@ pub(crate) struct InheritedAuthority {
     /// child for the same effect and target. Required: a child never starts
     /// with fewer declines than its parent had.
     pub declined: Vec<aidaemon_core::EffectKey>,
+    /// The parent run's live decline set: the child's run shares it, so a
+    /// decline in the child binds the parent (and its other children)
+    /// before their next call, and one the parent records after the child
+    /// started binds the child. `None` (a spawn outside any running turn,
+    /// such as a root goal dispatch) gives the child a set of its own. A
+    /// runtime handle, never serialized.
+    #[serde(skip)]
+    pub shared_declines: Option<aidaemon_core::SharedDeclines>,
 }
 
 /// The parent turn's authority the dispatcher handed `spawn_agent`: an
@@ -648,6 +656,7 @@ mod tests {
             origin_trusted: true,
             trusted_roots: Vec::new(),
             declined: Vec::new(),
+            shared_declines: None,
         }
     }
 
@@ -755,6 +764,7 @@ mod tests {
             origin_trusted: false,
             trusted_roots: Vec::new(),
             declined: Vec::new(),
+            shared_declines: None,
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,

@@ -1129,6 +1129,7 @@ mod tests {
                 "h.example.invalid",
                 None,
             )],
+            shared_declines: None,
         };
         let mut facts = ToolCallContext::default();
         assert!(crate::agent::authority::parent_authority(&facts).is_none());

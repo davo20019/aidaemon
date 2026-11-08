@@ -772,12 +772,18 @@ impl Agent {
             // What the owner declined in this run so far (the run's
             // declines already hold what this turn itself inherited).
             declined: crate::agent::authority::union_declines(
-                self.inherited_authority
-                    .as_ref()
-                    .map(|parent| parent.declined.as_slice())
-                    .unwrap_or_default(),
-                &scope.run_declines.snapshot(),
+                &crate::agent::authority::union_declines(
+                    self.inherited_authority
+                        .as_ref()
+                        .map(|parent| parent.declined.as_slice())
+                        .unwrap_or_default(),
+                    &scope.run_declines.snapshot(),
+                ),
+                &scope.shared_declines.snapshot(),
             ),
+            // The child shares this run's live declines: each is refused
+            // what the owner declined in the other, even after the spawn.
+            shared_declines: Some(scope.shared_declines.clone()),
         }
     }
 
