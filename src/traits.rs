@@ -47,8 +47,8 @@ pub use goals::{
     DEFAULT_PROJECT_ID,
 };
 pub use history::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, ProjectionStats,
-    TaskBookends,
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
+    ProjectionStats, RecentToolTurn, TaskBookends,
 };
 #[allow(unused_imports)]
 pub use mandates::{

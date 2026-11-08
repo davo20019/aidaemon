@@ -10,9 +10,9 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::traits::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, TaskBookends, Tool,
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus, ToolVerificationMode,
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
+    TaskBookends, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolOutcomeStatus, ToolVerificationMode,
 };
 use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
 
@@ -249,6 +249,7 @@ impl SearchHistoryTool {
             },
             matches: Vec::new(),
             messages: Vec::new(),
+            tool_activity: Vec::new(),
             older_cursor: None,
             newer_cursor: None,
         };
@@ -299,6 +300,12 @@ impl SearchHistoryTool {
                 );
                 if let Some(turn_id) = args.turn_id.as_deref() {
                     response.messages = self.state.history_turn(turn_id, &scope).await?;
+                    response.tool_activity = prepare_tool_activity(
+                        self.state
+                            .history_turn_tool_activity(turn_id, &scope)
+                            .await?,
+                        scope.visibility,
+                    );
                 } else {
                     let event_id = match (anchor, args.message_id.as_deref()) {
                         (Some(event_id), None) => event_id,
@@ -438,10 +445,54 @@ struct SearchResponse {
     matches: Vec<SearchHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     messages: Vec<HistoryMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_activity: Vec<HistoryToolActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     older_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     newer_cursor: Option<String>,
+}
+
+/// How far back the per-turn note looks, matching the dialogue a new request
+/// keeps.
+const RECENT_TOOL_TURNS: usize = 6;
+const TOOL_OUTPUT_CHARS: usize = 6_000;
+const TOOL_ARGUMENT_CHARS: usize = 1_000;
+
+/// Bound each call's output and argument strings, and redact outside a private
+/// chat, where a transcript of a shared session is redacted the same way.
+fn prepare_tool_activity(
+    activity: Vec<HistoryToolActivity>,
+    visibility: ChannelVisibility,
+) -> Vec<HistoryToolActivity> {
+    let private = visibility == ChannelVisibility::Private;
+    activity
+        .into_iter()
+        .map(|mut call| {
+            if !private {
+                call.output = crate::tools::sanitize::redact_secrets(&call.output);
+            }
+            let total = call.output.chars().count();
+            if total > TOOL_OUTPUT_CHARS {
+                call.output = call.output.chars().take(TOOL_OUTPUT_CHARS).collect();
+                call.output_omitted_chars = Some(total - TOOL_OUTPUT_CHARS);
+            }
+            call.arguments = call.arguments.map(|arguments| {
+                let text = arguments.to_string();
+                let text = if private {
+                    text
+                } else {
+                    crate::tools::sanitize::redact_secrets(&text)
+                };
+                if text.chars().count() > TOOL_ARGUMENT_CHARS {
+                    Value::from(crate::utils::truncate_str(&text, TOOL_ARGUMENT_CHARS))
+                } else {
+                    serde_json::from_str(&text).unwrap_or(Value::from(text))
+                }
+            });
+            call
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -457,7 +508,7 @@ impl Tool for SearchHistoryTool {
     fn schema(&self) -> Value {
         json!({
             "name": "search_history",
-            "description": "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors.",
+            "description": "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors. Opening a turn_id also returns the tool calls that turn ran and their output, which search does not cover.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -468,7 +519,7 @@ impl Tool for SearchHistoryTool {
                     "query": { "type": "string", "description": "Words to find; FTS syntax is treated as literal terms" },
                     "event_id": { "type": "integer", "description": "Authorized anchor event for open" },
                     "message_id": { "type": "string", "maxLength": 256, "description": "Stable canonical message ID for open" },
-                    "turn_id": { "type": "string", "maxLength": 256, "description": "Stable canonical turn ID; open returns the whole authorized turn" },
+                    "turn_id": { "type": "string", "maxLength": 256, "description": "Stable canonical turn ID; open returns the whole authorized turn, including its tool calls and their output" },
                     "cursor": { "type": "string", "description": "Opaque signed cursor returned by a prior call" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
                     "context": { "type": "integer", "minimum": 0, "maximum": 4 },
@@ -507,7 +558,45 @@ impl Tool for SearchHistoryTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for SearchHistoryTool {
+    /// Transcripts of new requests drop earlier tool calls, so a turn whose
+    /// reply was brief can read as if nothing ran. This states which turns did
+    /// from the event log, and carries no message or tool content.
+    async fn session_context_note(&self, session_id: &str) -> Option<String> {
+        let turns = self
+            .state
+            .history_recent_tool_turns(session_id, RECENT_TOOL_TURNS)
+            .await
+            .ok()?;
+        if turns.is_empty() {
+            return None;
+        }
+        let lines = turns
+            .iter()
+            .map(|turn| {
+                let tools = turn
+                    .tools
+                    .iter()
+                    .map(|(tool, count)| format!("{tool} x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ago = match turn.turns_ago {
+                    1 => "previous turn".to_string(),
+                    n => format!("{n} turns ago"),
+                };
+                format!("- {ago} (turn_id={}): {tools}", turn.turn_id)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "Tools ran in these earlier turns of this conversation:\n{lines}\nThe event log records \
+             those calls, so they did run even when the reply was brief. If their output is not in \
+             your transcript and you need it, call search_history with action=open and that \
+             turn_id to read the exact calls and output."
+        ))
+    }
+
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
@@ -563,6 +652,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
+    use crate::traits::ToolSemantics;
 
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
@@ -575,6 +665,119 @@ mod tests {
         );
         let events = Arc::new(EventStore::new(state.pool()).await.unwrap());
         (SearchHistoryTool::new(state, 90), events, db)
+    }
+
+    async fn append_tool_turn(
+        events: &EventStore,
+        session: &str,
+        turn: &str,
+        message: &str,
+        output: Option<&str>,
+    ) {
+        let turn_id = |mut event: Event| {
+            event.turn_id = Some(turn.to_string());
+            event
+        };
+        events
+            .append(turn_id(Event::new(
+                session,
+                EventType::UserMessage,
+                json!({
+                    "content": format!("request {turn}"),
+                    "message_id": message,
+                    "channel_visibility": "private",
+                    "user_role": "owner",
+                }),
+            )))
+            .await
+            .unwrap();
+        if let Some(output) = output {
+            events
+                .append(turn_id(Event::new(
+                    session,
+                    EventType::ToolCall,
+                    json!({"tool_call_id": format!("call-{turn}"), "name": "terminal",
+                           "arguments": {"command": "echo synthetic"}}),
+                )))
+                .await
+                .unwrap();
+            events
+                .append(turn_id(Event::new(
+                    session,
+                    EventType::ToolResult,
+                    json!({"tool_call_id": format!("call-{turn}"), "name": "terminal",
+                           "result": output, "success": true, "duration_ms": 1}),
+                )))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_a_turn_returns_its_tool_calls_and_output() {
+        let (tool, events, _db) = tool().await;
+        append_tool_turn(
+            &events,
+            "root-session",
+            "t1",
+            "m1",
+            Some("synthetic-output-417"),
+        )
+        .await;
+        let context = |session: &str, role: UserRole| crate::traits::ToolCallContext {
+            session_id: session.into(),
+            user_role: Some(role),
+            channel_visibility: Some(ChannelVisibility::Private),
+            ..Default::default()
+        };
+        let open = json!({"action": "open", "turn_id": "t1"}).to_string();
+        let opened = tool
+            .call_with_execution_context(&open, None, context("root-session", UserRole::Owner))
+            .await
+            .unwrap();
+        assert!(
+            opened.output.contains("synthetic-output-417"),
+            "{}",
+            opened.output
+        );
+        assert!(
+            opened.output.contains("echo synthetic"),
+            "{}",
+            opened.output
+        );
+
+        let guest = tool
+            .call_with_execution_context(&open, None, context("root-session", UserRole::Guest))
+            .await;
+        assert!(guest.is_err() || !guest.unwrap().output.contains("synthetic-output-417"));
+    }
+
+    #[tokio::test]
+    async fn the_note_names_prior_turns_that_ran_tools_and_nothing_they_said() {
+        let (tool, events, _db) = tool().await;
+        assert!(tool.session_context_note("root-session").await.is_none());
+        append_tool_turn(
+            &events,
+            "root-session",
+            "t1",
+            "m1",
+            Some("synthetic-output-417"),
+        )
+        .await;
+        append_tool_turn(&events, "root-session", "t2", "m2", None).await;
+        append_tool_turn(&events, "other-session", "t9", "m9", Some("other")).await;
+        append_tool_turn(&events, "root-session", "t3", "m3", None).await;
+
+        let note = tool
+            .session_context_note("root-session")
+            .await
+            .expect("t1 ran a tool");
+        assert!(
+            note.contains("2 turns ago (turn_id=t1): terminal x1"),
+            "{note}"
+        );
+        assert!(!note.contains("synthetic-output-417"), "{note}");
+        assert!(!note.contains("t9"), "{note}");
     }
 
     #[tokio::test]

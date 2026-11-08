@@ -10,8 +10,8 @@ use serde_json::Value;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::traits::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, ProjectionStats,
-    TaskBookends,
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
+    ProjectionStats, RecentToolTurn, TaskBookends,
 };
 use crate::types::{ChannelVisibility, UserRole};
 
@@ -67,6 +67,22 @@ impl HistorySearchStore for crate::state::SqliteStateStore {
         scope: &HistoryScope,
     ) -> anyhow::Result<Vec<HistoryMessage>> {
         turn(&self.pool(), turn_id, scope).await
+    }
+
+    async fn history_turn_tool_activity(
+        &self,
+        turn_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryToolActivity>> {
+        turn_tool_activity(&self.pool(), turn_id, scope).await
+    }
+
+    async fn history_recent_tool_turns(
+        &self,
+        session_id: &str,
+        turns: usize,
+    ) -> anyhow::Result<Vec<RecentToolTurn>> {
+        recent_tool_turns(&self.pool(), session_id, turns).await
     }
 
     async fn history_page(
@@ -798,6 +814,116 @@ pub(crate) async fn event_for_message_id(
     push_scope(&mut qb, scope, "h");
     qb.push(" ORDER BY h.event_id DESC LIMIT 1");
     Ok(qb.build_query_scalar().fetch_optional(pool).await?)
+}
+
+const TURN_TOOL_ACTIVITY_LIMIT: i64 = 40;
+
+/// Tool calls follow the turn's own authorization: a turn whose messages the
+/// scope cannot read yields none.
+async fn turn_tool_activity(
+    pool: &SqlitePool,
+    turn_id: &str,
+    scope: &HistoryScope,
+) -> anyhow::Result<Vec<HistoryToolActivity>> {
+    if turn(pool, turn_id, scope).await?.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT r.data AS result,
+                (SELECT c.data FROM events c
+                  WHERE c.event_type = 'tool_call'
+                    AND c.session_id = r.session_id
+                    AND c.id < r.id
+                    AND json_extract(c.data, '$.tool_call_id')
+                        = json_extract(r.data, '$.tool_call_id')
+                  ORDER BY c.id DESC LIMIT 1) AS call
+         FROM events r
+         WHERE r.event_type = 'tool_result' AND r.turn_id = ? AND r.id <= ?
+         ORDER BY r.id ASC LIMIT ?",
+    )
+    .bind(turn_id)
+    .bind(scope.snapshot_max_event_id)
+    .bind(TURN_TOOL_ACTIVITY_LIMIT)
+    .fetch_all(pool)
+    .await?;
+    let mut activity = Vec::with_capacity(rows.len());
+    for row in rows {
+        let result: String = row.get("result");
+        let Ok(result) = serde_json::from_str::<Value>(&result) else {
+            continue;
+        };
+        let call = row
+            .get::<Option<String>, _>("call")
+            .and_then(|call| serde_json::from_str::<Value>(&call).ok());
+        activity.push(HistoryToolActivity {
+            tool: result
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            success: result
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            arguments: call.and_then(|call| call.get("arguments").cloned()),
+            output: result
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            output_omitted_chars: None,
+        });
+    }
+    Ok(activity)
+}
+
+async fn recent_tool_turns(
+    pool: &SqlitePool,
+    session_id: &str,
+    turns: usize,
+) -> anyhow::Result<Vec<RecentToolTurn>> {
+    // The newest row is the turn being answered, which has no tools yet.
+    let rows = sqlx::query(
+        "SELECT turn_id FROM events
+         WHERE session_id = ? AND event_type = 'user_message' AND turn_id IS NOT NULL
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(i64::try_from(turns.saturating_add(1)).unwrap_or(i64::MAX))
+    .fetch_all(pool)
+    .await?;
+    let mut recent = Vec::new();
+    for (turns_ago, row) in rows.iter().enumerate().skip(1) {
+        let turn_id: String = row.get("turn_id");
+        let names = sqlx::query(
+            "SELECT json_extract(data, '$.name') AS name FROM events
+             WHERE session_id = ? AND turn_id = ? AND event_type = 'tool_result'
+             ORDER BY id ASC",
+        )
+        .bind(session_id)
+        .bind(&turn_id)
+        .fetch_all(pool)
+        .await?;
+        let mut tools: Vec<(String, usize)> = Vec::new();
+        for name in names {
+            let Some(name) = name.get::<Option<String>, _>("name") else {
+                continue;
+            };
+            match tools.iter_mut().find(|(known, _)| *known == name) {
+                Some((_, count)) => *count += 1,
+                None => tools.push((name, 1)),
+            }
+        }
+        if !tools.is_empty() {
+            recent.push(RecentToolTurn {
+                turn_id,
+                turns_ago,
+                tools,
+            });
+        }
+    }
+    recent.reverse();
+    Ok(recent)
 }
 
 pub(crate) async fn turn(

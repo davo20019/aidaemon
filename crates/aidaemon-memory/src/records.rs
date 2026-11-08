@@ -323,6 +323,30 @@ pub struct HistoryMessage {
     pub lexical_rank: Option<f64>,
 }
 
+/// One completed tool call of a retained turn. Fresh tasks do not see these in
+/// their transcript, so this is how they read what an earlier turn observed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryToolActivity {
+    pub tool: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
+    pub output: String,
+    /// Characters of `output` left out to fit the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_omitted_chars: Option<usize>,
+}
+
+/// A recent turn of a session that ran tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentToolTurn {
+    pub turn_id: String,
+    /// How many user turns back this one is; the newest prior turn is 1.
+    pub turns_ago: usize,
+    /// Tool name and how many calls of it completed, in first-use order.
+    pub tools: Vec<(String, usize)>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskBookends {
     #[serde(skip_serializing_if = "Option::is_none")]

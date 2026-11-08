@@ -42,6 +42,19 @@ pub trait HistorySearchStore: EpisodeStore {
         turn_id: &str,
         scope: &HistoryScope,
     ) -> anyhow::Result<Vec<HistoryMessage>>;
+    /// The tool calls of a turn the scope may read; empty when it may not.
+    async fn history_turn_tool_activity(
+        &self,
+        turn_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryToolActivity>>;
+    /// Which of the session's last `turns` prior user turns ran tools, oldest
+    /// first. Carries no message or tool content.
+    async fn history_recent_tool_turns(
+        &self,
+        session_id: &str,
+        turns: usize,
+    ) -> anyhow::Result<Vec<RecentToolTurn>>;
     async fn history_page(
         &self,
         anchor: i64,
