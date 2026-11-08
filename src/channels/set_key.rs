@@ -314,6 +314,9 @@ pub(crate) async fn save_key(
 ) -> anyhow::Result<String> {
     let current = tokio::fs::read_to_string(config_path).await?;
     let (stored, note) = match crate::config::store_in_keychain(&slot.keychain_field(), key) {
+        Ok(()) if crate::config::keychain_disabled() => {
+            ("keychain", "Stored in the daemon's .env file.")
+        }
         Ok(()) => ("keychain", "Stored in the OS keychain."),
         Err(error) => {
             tracing::warn!(%error, "Keychain unavailable; saving the API key in the config");

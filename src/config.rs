@@ -51,7 +51,7 @@ pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
 }
 
 /// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
-fn keychain_disabled() -> bool {
+pub(crate) fn keychain_disabled() -> bool {
     std::env::var("AIDAEMON_NO_KEYCHAIN").is_ok_and(|v| v == "1" || v == "true")
 }
 
