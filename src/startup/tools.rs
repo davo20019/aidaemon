@@ -1025,7 +1025,6 @@ async fn register_runtime_tool_by_id(
             tools.push(Arc::new(ManageHttpAuthTool::new(
                 config_path.to_path_buf(),
                 http_profiles,
-                approval_tx,
                 state as Arc<dyn crate::traits::StateStore>,
             )));
         }

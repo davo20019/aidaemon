@@ -10,17 +10,13 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, HttpAuthProfile, HttpAuthType};
 use crate::oauth::SharedHttpProfiles;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::http_request::HttpRequestTool;
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallContext, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolCollectionObservation,
-    ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet, ToolTargetHint,
-    ToolTargetHintKind,
+    semantics_for_exact_read_actions, ApprovalScope, OAuthStore, OwnerApprovalNeed, Tool,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolCollectionObservation, ToolMutationEffects, ToolObservationEvidence, ToolSemanticFacet,
+    ToolTargetHint, ToolTargetHintKind,
 };
-use crate::types::ApprovalResponse;
 
 const MAX_VERIFY_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 20;
@@ -37,9 +33,14 @@ struct ManageHttpAuthArgs {
     url: Option<String>,
     method: Option<String>,
     timeout_secs: Option<u64>,
-    /// The calling session, from the dispatcher's facts (never an argument).
-    #[serde(skip)]
-    call_session: String,
+}
+
+/// What an `upsert` writes once its arguments and the stored profile are
+/// read.
+struct UpsertPlan {
+    doc: toml::Table,
+    auth_type: HttpAuthType,
+    allowed_domains: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -68,7 +69,6 @@ impl ManualProfileResolution {
 pub struct ManageHttpAuthTool {
     config_path: PathBuf,
     profiles: SharedHttpProfiles,
-    approval_tx: ApprovalBroker,
     state_store: Arc<dyn OAuthStore>,
 }
 
@@ -78,13 +78,11 @@ impl ManageHttpAuthTool {
     pub fn new(
         config_path: PathBuf,
         profiles: SharedHttpProfiles,
-        approval_tx: ApprovalBroker,
         state_store: Arc<dyn OAuthStore>,
     ) -> Self {
         Self {
             config_path,
             profiles,
-            approval_tx,
             state_store,
         }
     }
@@ -432,32 +430,187 @@ impl ManageHttpAuthTool {
         Ok(resolution)
     }
 
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-        risk_level: RiskLevel,
-        warnings: Vec<String>,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level,
-                warnings,
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
-            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
+    /// Refuse a call that changes a profile unless it came through the agent
+    /// kernel, whose approval rules asked the owner
+    /// ([`ManageHttpAuthTool::owner_approval`]).
+    fn require_kernel_approval(
+        kernel_approved: Option<&ApprovalScope>,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        if kernel_approved != Some(&ApprovalScope::Call) {
+            anyhow::bail!(
+                "manage_http_auth `{action}` requires approval through the agent kernel; it was \
+                 called outside an approved agent call"
+            );
         }
+        Ok(())
+    }
+
+    /// The owner approval one call needs: an `upsert` or `remove` that
+    /// reaches its write asks, judged against the stored profiles exactly as
+    /// the call reads them. A call that stops before writing (an
+    /// OAuth-managed or unknown profile, missing fields) needs no card.
+    pub(crate) async fn owner_approval(&self, arguments: &Value) -> OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ManageHttpAuthArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let Some(profile) = args
+            .profile
+            .as_deref()
+            .and_then(|profile| Self::validate_profile_name(profile).ok())
+        else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        match args.action.as_str() {
+            "upsert" => match self.upsert_plan(&profile, &args).await {
+                Ok(Ok(plan)) => {
+                    OwnerApprovalNeed::Ask(Self::upsert_request(&profile, &args, &plan))
+                }
+                _ => OwnerApprovalNeed::NotNeeded,
+            },
+            "remove" => match self.manual_profile_exists(&profile).await {
+                Ok(true) => OwnerApprovalNeed::Ask(Self::remove_request(&profile)),
+                _ => OwnerApprovalNeed::NotNeeded,
+            },
+            _ => OwnerApprovalNeed::NotNeeded,
+        }
+    }
+
+    fn upsert_request(
+        profile_name: &str,
+        args: &ManageHttpAuthArgs,
+        plan: &UpsertPlan,
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Update manual API auth profile '{}' (type={}, domains={}, user_id={})",
+                profile_name,
+                Self::auth_type_name(&plan.auth_type),
+                plan.allowed_domains.join(", "),
+                args.user_id.as_deref().unwrap_or("unchanged")
+            ),
+            // The exact arguments the owner approves; a changed argument is a new card.
+            subject: json!({
+                "action": "upsert",
+                "profile": profile_name,
+                "auth_type": args.auth_type,
+                "allowed_domains": args.allowed_domains,
+                "header_name": args.header_name,
+                "username": args.username,
+                "user_id": args.user_id,
+            })
+            .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "Modifies API auth configuration".to_string(),
+                "Can change which domains receive credentials".to_string(),
+                "Changing user_id or rebinding credentials can change the remote account behind this profile. Pause or revoke affected autonomous mandates before the change, then reconfirm their account scope."
+                    .to_string(),
+            ],
+        }
+    }
+
+    fn remove_request(profile_name: &str) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Remove manual API auth profile '{}' and delete its stored credentials",
+                profile_name
+            ),
+            subject: json!({"action": "remove", "profile": profile_name}).to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "Deletes API auth configuration".to_string(),
+                "Deletes stored credentials for this profile".to_string(),
+            ],
+        }
+    }
+
+    /// The typed effects of one call: changing, removing or verifying a
+    /// profile acts on that credential (a verify with a url also reaches its
+    /// host). They also write the config file, so the list is not exhaustive.
+    /// Listing and describing read only.
+    pub(crate) fn effects_for(arguments: &str) -> aidaemon_core::CallEffects {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        let Ok(args) = serde_json::from_str::<ManageHttpAuthArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        match args.action.as_str() {
+            "list" | "describe" => CallEffects::none(),
+            "upsert" | "remove" | "verify" => {
+                let mut effects = CallEffects::unknown();
+                if let Some(profile) = args
+                    .profile
+                    .as_deref()
+                    .and_then(|profile| Self::validate_profile_name(profile).ok())
+                {
+                    effects
+                        .keys
+                        .push(EffectKey::named(EffectClass::Credential, &profile));
+                }
+                if args.action == "verify" {
+                    if let Some(host) = args
+                        .url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .and_then(crate::tools::command_effects::url_effect)
+                    {
+                        effects.keys.push(host);
+                    }
+                }
+                effects
+            }
+            _ => CallEffects::unknown(),
+        }
+    }
+
+    /// Whether a manual profile named `profile_name` is configured.
+    async fn manual_profile_exists(&self, profile_name: &str) -> anyhow::Result<bool> {
+        let doc = self.load_config_doc().await?;
+        Ok(Self::http_auth_table(&doc).is_some_and(|table| table.contains_key(profile_name)))
+    }
+
+    /// What an `upsert` writes, read from its arguments and the stored
+    /// profile, or (`Err`) the message it returns without writing.
+    async fn upsert_plan(
+        &self,
+        profile_name: &str,
+        args: &ManageHttpAuthArgs,
+    ) -> anyhow::Result<Result<UpsertPlan, String>> {
+        if self.is_oauth_managed_profile(profile_name).await? {
+            return Ok(Err(format!(
+                "Profile '{}' is already managed by OAuth. Use the OAuth flow for that service name, or choose a different manual profile name.",
+                profile_name
+            )));
+        }
+
+        let doc = self.load_config_doc().await?;
+        let existing_auth_type = Self::profile_table(&doc, profile_name)
+            .and_then(|table| Self::read_string_field(table, "auth_type"));
+        let auth_type = if let Some(ref raw) = args.auth_type {
+            Self::parse_auth_type(raw)?
+        } else if let Some(raw) = existing_auth_type {
+            Self::parse_auth_type(&raw)?
+        } else {
+            anyhow::bail!("action='upsert' requires auth_type when creating a new profile.");
+        };
+        let existing_allowed_domains = Self::profile_table(&doc, profile_name)
+            .map(Self::read_allowed_domains)
+            .unwrap_or_default();
+        let allowed_domains = if let Some(ref domains) = args.allowed_domains {
+            Self::normalize_domains(domains)?
+        } else if !existing_allowed_domains.is_empty() {
+            existing_allowed_domains
+        } else {
+            anyhow::bail!("action='upsert' requires allowed_domains when creating a new profile.");
+        };
+        Ok(Ok(UpsertPlan {
+            doc,
+            auth_type,
+            allowed_domains,
+        }))
     }
 
     async fn is_oauth_managed_profile(&self, profile_name: &str) -> anyhow::Result<bool> {
@@ -640,72 +793,23 @@ impl ManageHttpAuthTool {
         Ok(lines.join("\n"))
     }
 
+    /// Creates or updates a profile. The owner was asked by the kernel
+    /// before this runs.
     async fn handle_upsert(
         &self,
         profile_name: &str,
         args: &ManageHttpAuthArgs,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
-        if self.is_oauth_managed_profile(profile_name).await? {
-            return Ok(format!(
-                "Profile '{}' is already managed by OAuth. Use the OAuth flow for that service name, or choose a different manual profile name.",
-                profile_name
-            ));
-        }
-
-        let session_id = if args.call_session.is_empty() {
-            "unknown"
-        } else {
-            args.call_session.as_str()
+        let UpsertPlan {
+            mut doc,
+            auth_type,
+            allowed_domains,
+        } = match self.upsert_plan(profile_name, args).await? {
+            Ok(plan) => plan,
+            Err(message) => return Ok(message),
         };
-        let mut doc = self.load_config_doc().await?;
-        let existing_auth_type = Self::profile_table(&doc, profile_name)
-            .and_then(|table| Self::read_string_field(table, "auth_type"));
-        let auth_type = if let Some(ref raw) = args.auth_type {
-            Self::parse_auth_type(raw)?
-        } else if let Some(raw) = existing_auth_type {
-            Self::parse_auth_type(&raw)?
-        } else {
-            anyhow::bail!("action='upsert' requires auth_type when creating a new profile.");
-        };
-        let existing_allowed_domains = Self::profile_table(&doc, profile_name)
-            .map(Self::read_allowed_domains)
-            .unwrap_or_default();
-        let allowed_domains = if let Some(ref domains) = args.allowed_domains {
-            Self::normalize_domains(domains)?
-        } else if !existing_allowed_domains.is_empty() {
-            existing_allowed_domains
-        } else {
-            anyhow::bail!("action='upsert' requires allowed_domains when creating a new profile.");
-        };
-
-        let approval_description = format!(
-            "Update manual API auth profile '{}' (type={}, domains={}, user_id={})",
-            profile_name,
-            Self::auth_type_name(&auth_type),
-            allowed_domains.join(", "),
-            args.user_id.as_deref().unwrap_or("unchanged")
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                RiskLevel::High,
-                vec![
-                    "Modifies API auth configuration".to_string(),
-                    "Can change which domains receive credentials".to_string(),
-                    "Changing user_id or rebinding credentials can change the remote account behind this profile. Pause or revoke affected autonomous mandates before the change, then reconfirm their account scope."
-                        .to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("Manual API auth profile update denied by user.".to_string());
-            }
-        }
+        Self::require_kernel_approval(kernel_approved, "upsert")?;
 
         {
             let profile_table = Self::profile_table_mut(&mut doc, profile_name)?;
@@ -818,7 +922,13 @@ impl ManageHttpAuthTool {
         Ok(lines.join("\n"))
     }
 
-    async fn handle_remove(&self, profile_name: &str, session_id: &str) -> anyhow::Result<String> {
+    /// Removes a profile and its stored credentials. The owner was asked by
+    /// the kernel before this runs.
+    async fn handle_remove(
+        &self,
+        profile_name: &str,
+        kernel_approved: Option<&ApprovalScope>,
+    ) -> anyhow::Result<String> {
         let mut doc = self.load_config_doc().await?;
         let Some(http_auth_table) = Self::http_auth_table_mut(&mut doc).ok() else {
             return Ok(format!(
@@ -840,29 +950,7 @@ impl ManageHttpAuthTool {
             ));
         }
 
-        let approval_description = format!(
-            "Remove manual API auth profile '{}' and delete its stored credentials",
-            profile_name
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                RiskLevel::High,
-                vec![
-                    "Deletes API auth configuration".to_string(),
-                    "Deletes stored credentials for this profile".to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("Manual API auth profile removal denied by user.".to_string());
-            }
-        }
+        Self::require_kernel_approval(kernel_approved, "remove")?;
 
         http_auth_table.remove(profile_name);
         if http_auth_table.is_empty() {
@@ -1166,14 +1254,15 @@ impl Tool for ManageHttpAuthTool {
 }
 
 impl ManageHttpAuthTool {
-    /// Run one call with the dispatcher's `facts`.
+    /// Run one call with the dispatcher's `facts`. Approval is judged by the
+    /// kernel before this runs; a change without it is refused.
     pub(crate) async fn run(
         &self,
         arguments: &str,
         facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
-        let mut args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
-        args.call_session = facts.session_id.clone();
+        let args: ManageHttpAuthArgs = serde_json::from_str(arguments)?;
+        let kernel_approved = facts.kernel_approved.as_ref();
         match args.action.as_str() {
             "list" => self.handle_list().await,
             "describe" => {
@@ -1190,7 +1279,7 @@ impl ManageHttpAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
                 )?;
-                self.handle_upsert(&profile, &args).await
+                self.handle_upsert(&profile, &args, kernel_approved).await
             }
             "remove" => {
                 let profile = Self::validate_profile_name(
@@ -1198,12 +1287,7 @@ impl ManageHttpAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
                 )?;
-                let session_id = if args.call_session.is_empty() {
-                    "unknown"
-                } else {
-                    args.call_session.as_str()
-                };
-                self.handle_remove(&profile, session_id).await
+                self.handle_remove(&profile, kernel_approved).await
             }
             "verify" => {
                 let profile = Self::validate_profile_name(
@@ -1227,7 +1311,26 @@ impl ManageHttpAuthTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageHttpAuthTool {
+    /// Changing or removing a profile asks the owner, whatever the session.
+    /// The dispatcher runs the call only with that answer; a decline is
+    /// recorded by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> OwnerApprovalNeed {
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        self.owner_approval(call.arguments).await
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        Self::effects_for(arguments)
+    }
+
     fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
         vec![crate::traits::StableObservationSubject::collection(
             Self::AUTH_PROFILE_COLLECTION_ID,
@@ -1326,22 +1429,93 @@ mod tests {
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new()?);
         let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(4);
-        let approval_tx = ApprovalBroker::new(approval_tx);
-        tokio::spawn(async move {
-            while let Some(request) = approval_rx.recv().await {
-                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
-            }
-        });
         Ok((
-            ManageHttpAuthTool::new(
-                config_path,
-                profiles,
-                approval_tx,
-                state as Arc<dyn OAuthStore>,
-            ),
+            ManageHttpAuthTool::new(config_path, profiles, state as Arc<dyn OAuthStore>),
             db_file,
         ))
+    }
+
+    /// Dispatcher facts for a call the kernel judged (and asked the owner
+    /// about where its rules required it).
+    fn kernel_facts() -> ToolCallContext {
+        ToolCallContext {
+            kernel_approved: Some(ApprovalScope::Call),
+            ..crate::testing::call_facts("test")
+        }
+    }
+
+    /// Without the kernel's approval, a change is refused before it writes
+    /// anything (and never asks the owner itself); reads still run.
+    #[tokio::test]
+    async fn changes_refuse_without_kernel_approval() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(
+            config_file.path(),
+            "[http_auth.synthetic]\nauth_type = \"bearer\"\nallowed_domains = [\"api.example.invalid\"]",
+        );
+        let before = std::fs::read_to_string(config_file.path()).unwrap();
+        let profiles = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tool = test_tool(config_file.path().to_path_buf(), profiles)
+            .await
+            .unwrap();
+        for args in [
+            r#"{"action":"upsert","profile":"synthetic","auth_type":"header","header_name":"X-Key"}"#,
+            r#"{"action":"upsert","profile":"other","auth_type":"bearer","allowed_domains":["api.example.invalid"]}"#,
+            r#"{"action":"remove","profile":"synthetic"}"#,
+        ] {
+            let error =
+                crate::testing::call_with_facts(&tool, args, crate::testing::call_facts("test"))
+                    .await
+                    .expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires approval through the agent kernel"),
+                "{error}"
+            );
+            assert!(tool.call(args).await.is_err(), "{args}");
+        }
+        assert_eq!(std::fs::read_to_string(config_file.path()).unwrap(), before);
+        // A call that stops before writing needs no approval.
+        let missing = tool
+            .call(r#"{"action":"remove","profile":"absent"}"#)
+            .await
+            .unwrap();
+        assert!(missing.contains("was not found"), "{missing}");
+        let listed = tool.call(r#"{"action":"list"}"#).await.unwrap();
+        assert!(listed.contains("synthetic"), "{listed}");
+    }
+
+    #[test]
+    fn changes_declare_the_credential_and_reads_declare_none() {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        for args in [
+            r#"{"action":"upsert","profile":"synthetic","auth_type":"bearer"}"#,
+            r#"{"action":"remove","profile":"synthetic"}"#,
+        ] {
+            let effects = ManageHttpAuthTool::effects_for(args);
+            assert_eq!(
+                effects.keys,
+                vec![EffectKey::named(EffectClass::Credential, "synthetic")]
+            );
+            assert!(!effects.complete);
+        }
+        let verify = ManageHttpAuthTool::effects_for(
+            r#"{"action":"verify","profile":"synthetic","url":"https://api.example.invalid/me"}"#,
+        );
+        assert_eq!(
+            verify.keys,
+            vec![
+                EffectKey::named(EffectClass::Credential, "synthetic"),
+                EffectKey::egress("https", "api.example.invalid", None),
+            ]
+        );
+        for args in [
+            r#"{"action":"list"}"#,
+            r#"{"action":"describe","profile":"synthetic"}"#,
+        ] {
+            assert_eq!(ManageHttpAuthTool::effects_for(args), CallEffects::none());
+        }
     }
 
     fn write_minimal_config(path: &Path, extra: &str) {
@@ -1409,7 +1583,7 @@ mod tests {
                     "auth_type": "bearer",
                     "allowed_domains": ["api.stripe.com"]
                 }"#,
-            crate::testing::call_facts("test"),
+            kernel_facts(),
         )
         .await
         .unwrap();

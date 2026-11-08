@@ -1461,6 +1461,140 @@ mod tests {
         );
     }
 
+    /// An OAuth store holding at most one connection, for the judgments of
+    /// the auth tools (which read it before asking).
+    #[derive(Default)]
+    struct SyntheticOAuthStore(Option<crate::traits::OAuthConnection>);
+
+    #[async_trait]
+    impl crate::traits::OAuthStore for SyntheticOAuthStore {
+        async fn get_oauth_connection(
+            &self,
+            service: &str,
+        ) -> anyhow::Result<Option<crate::traits::OAuthConnection>> {
+            Ok(self.0.clone().filter(|conn| conn.service == service))
+        }
+
+        async fn list_oauth_connections(
+            &self,
+        ) -> anyhow::Result<Vec<crate::traits::OAuthConnection>> {
+            Ok(self.0.clone().into_iter().collect())
+        }
+    }
+
+    /// A config file with one synthetic manual auth profile.
+    fn synthetic_auth_config(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider]\napi_key = \"synthetic-key\"\n\n[http_auth.synthetic]\n\
+             auth_type = \"bearer\"\nallowed_domains = [\"api.example.invalid\"]\n",
+        )
+        .unwrap();
+        path
+    }
+
+    /// Rules over exactly `tools`, in a trusted (scheduled, mandate) session
+    /// or not.
+    fn rules_over(tools: Vec<Arc<dyn crate::traits::Tool>>, trusted: bool) -> AppApprovalRules {
+        AppApprovalRules {
+            tools: ApprovalTools::new(tools),
+            trusted_session: trusted,
+            mandate_preapproved: trusted,
+            ..AppApprovalRules::default()
+        }
+    }
+
+    async fn judge_call(
+        rules: &AppApprovalRules,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> RuleDecision {
+        let call = sdk::ToolCall::new("c1", tool, args);
+        rules.judge(&hook_ctx(), &call, &tool_info()).await
+    }
+
+    /// A profile change asks the owner in every session, with the card the
+    /// tool used to send itself; reads and calls that stop before writing
+    /// need no card, and neither does a call the dispatcher refuses.
+    #[tokio::test]
+    async fn http_auth_changes_always_ask_before_dispatch() {
+        use crate::traits::ToolSemantics;
+        let dir = tempfile::TempDir::new().unwrap();
+        let concrete = Arc::new(crate::tools::ManageHttpAuthTool::new(
+            synthetic_auth_config(&dir),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            Arc::new(SyntheticOAuthStore::default()),
+        ));
+        let tool: Arc<dyn crate::traits::Tool> = concrete.clone();
+        for trusted in [false, true] {
+            let rules = rules_over(vec![tool.clone()], trusted);
+            let upsert =
+                json!({"action":"upsert","profile":"synthetic","user_id":"synthetic-account-2"});
+            let RuleDecision::Ask(update) =
+                judge_call(&rules, "manage_http_auth", upsert.clone()).await
+            else {
+                panic!("an upsert must ask (trusted={trusted})");
+            };
+            assert_eq!(
+                update.summary,
+                "Update manual API auth profile 'synthetic' (type=bearer, \
+                 domains=api.example.invalid, user_id=synthetic-account-2)"
+            );
+            assert_eq!(update.risk, sdk::ApprovalRisk::High);
+            assert_eq!(update.warnings.len(), 3);
+            // A changed argument is a new card.
+            let RuleDecision::Ask(other) = judge_call(
+                &rules,
+                "manage_http_auth",
+                json!({"action":"upsert","profile":"synthetic","user_id":"synthetic-account-3"}),
+            )
+            .await
+            else {
+                panic!("an upsert must ask");
+            };
+            assert_ne!(update.subject, other.subject);
+            let RuleDecision::Ask(remove) = judge_call(
+                &rules,
+                "manage_http_auth",
+                json!({"action":"remove","profile":"synthetic"}),
+            )
+            .await
+            else {
+                panic!("a remove must ask (trusted={trusted})");
+            };
+            assert_eq!(
+                remove.summary,
+                "Remove manual API auth profile 'synthetic' and delete its stored credentials"
+            );
+            for args in [
+                json!({"action":"list"}),
+                json!({"action":"describe","profile":"synthetic"}),
+                json!({"action":"verify","profile":"synthetic"}),
+                // Nothing to remove; a new profile without its type.
+                json!({"action":"remove","profile":"absent"}),
+                json!({"action":"upsert","profile":"absent"}),
+            ] {
+                assert_eq!(
+                    judge_call(&rules, "manage_http_auth", args.clone()).await,
+                    RuleDecision::Allow,
+                    "{args}"
+                );
+            }
+            let refused = crate::traits::ApprovalCall {
+                arguments: &upsert,
+                as_sent: &upsert,
+                refused: true,
+            };
+            assert_eq!(
+                concrete
+                    .owner_approval_request(&refused, &crate::traits::ToolCallContext::default())
+                    .await,
+                crate::traits::OwnerApprovalNeed::NotNeeded
+            );
+        }
+    }
+
     /// Rules over a real terminal with `allowed` prefixes and no semantic
     /// assessor (an unknown command then fails closed to a Critical ask).
     async fn terminal_rules(allowed: &[&str]) -> AppApprovalRules {

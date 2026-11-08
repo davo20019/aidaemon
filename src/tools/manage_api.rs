@@ -95,7 +95,6 @@ impl ManageApiTool {
             manage_http_auth: ManageHttpAuthTool::new(
                 config_path.clone(),
                 profiles.clone(),
-                approval_tx.clone(),
                 state_store.clone(),
             ),
             manage_oauth: ManageOAuthTool::new(
@@ -185,6 +184,35 @@ impl ManageApiTool {
             session_id: Self::session_id(args).to_string(),
             ..Default::default()
         }
+    }
+
+    /// The facts an inner auth change receives: this call's session and,
+    /// when the kernel approved this outer call, the kernel's approval. The
+    /// kernel judged the change with this call
+    /// ([`ManageApiTool::auth_stage_approval`]), so a change the owner
+    /// must approve was asked about on this call's card.
+    fn inner_change_facts(
+        args: &ManageApiArgs,
+        kernel_approved: Option<&ApprovalScope>,
+    ) -> ToolCallContext {
+        ToolCallContext {
+            kernel_approved: (kernel_approved == Some(&ApprovalScope::Call))
+                .then_some(ApprovalScope::Call),
+            ..Self::inner_facts(args)
+        }
+    }
+
+    /// The `manage_http_auth` upsert a manual-auth onboarding runs.
+    fn manual_upsert_args(service: &str, auth_mode: ApiAuthMode, args: &ManageApiArgs) -> Value {
+        json!({
+            "action": "upsert",
+            "profile": service,
+            "auth_type": Self::auth_mode_label(auth_mode),
+            "allowed_domains": args.allowed_domains.clone(),
+            "header_name": args.header_name.clone(),
+            "username": args.username.clone(),
+            "user_id": args.user_id.clone(),
+        })
     }
 
     async fn send_stage(status_tx: Option<&mpsc::Sender<StatusUpdate>>, chunk: String) {
@@ -519,6 +547,7 @@ impl ManageApiTool {
         auth_mode: ApiAuthMode,
         args: &ManageApiArgs,
         status_tx: Option<&mpsc::Sender<StatusUpdate>>,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<(String, bool)> {
         Self::send_stage(
             status_tx,
@@ -530,18 +559,13 @@ impl ManageApiTool {
         )
         .await;
 
-        let upsert_args = json!({
-            "action": "upsert",
-            "profile": service,
-            "auth_type": Self::auth_mode_label(auth_mode),
-            "allowed_domains": args.allowed_domains.clone(),
-            "header_name": args.header_name.clone(),
-            "username": args.username.clone(),
-            "user_id": args.user_id.clone(),
-        });
+        let upsert_args = Self::manual_upsert_args(service, auth_mode, args);
         let upsert_result = self
             .manage_http_auth
-            .run(&upsert_args.to_string(), &Self::inner_facts(args))
+            .run(
+                &upsert_args.to_string(),
+                &Self::inner_change_facts(args, kernel_approved),
+            )
             .await?;
 
         let sync_args = json!({
@@ -741,6 +765,56 @@ impl ManageApiTool {
         }
     }
 
+    /// The owner approval the auth stage of an onboarding call needs: the
+    /// card its inner auth change asks for, judged by that tool against its
+    /// own stores exactly as the stage runs it. Asked in every session, as
+    /// the inner tool asks on its own.
+    async fn auth_stage_approval(
+        &self,
+        arguments: &Value,
+    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
+        let args: ManageApiArgs = serde_json::from_value(arguments.clone()).ok()?;
+        if args.action != "onboard" {
+            return None;
+        }
+        let service = Self::validate_service_name(args.service.as_deref()?).ok()?;
+        let auth_mode = Self::parse_auth_mode(args.auth_mode.as_deref()).ok()?;
+        let need = match auth_mode {
+            ApiAuthMode::Existing
+            | ApiAuthMode::Oauth2Pkce
+            | ApiAuthMode::Oauth2AuthorizationCode
+            | ApiAuthMode::Oauth2ClientCredentials => return None,
+            ApiAuthMode::Bearer
+            | ApiAuthMode::Header
+            | ApiAuthMode::Basic
+            | ApiAuthMode::Oauth1a => {
+                self.manage_http_auth
+                    .owner_approval(&Self::manual_upsert_args(&service, auth_mode, &args))
+                    .await
+            }
+        };
+        match need {
+            crate::traits::OwnerApprovalNeed::Ask(request) => Some(request),
+            _ => None,
+        }
+    }
+
+    /// One card for the auth change and the live probe of one call.
+    fn combined_request(
+        auth: aidaemon_core::OwnerApprovalRequest,
+        probe: aidaemon_core::OwnerApprovalRequest,
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        let mut warnings = auth.warnings;
+        warnings.extend(probe.warnings);
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!("{}\n{}", auth.summary, probe.summary),
+            subject: format!("{}\n{}", auth.subject, probe.subject),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings,
+        }
+    }
+
     fn probe_approval_for(args: &ManageApiArgs) -> Option<aidaemon_core::OwnerApprovalRequest> {
         if args.action != "onboard"
             || args
@@ -809,7 +883,13 @@ impl ManageApiTool {
             | ApiAuthMode::Basic
             | ApiAuthMode::Oauth1a => {
                 let (auth_result, manual_ready) = self
-                    .run_manual_auth_stage(&service, auth_mode, &args, status_tx.as_ref())
+                    .run_manual_auth_stage(
+                        &service,
+                        auth_mode,
+                        &args,
+                        status_tx.as_ref(),
+                        kernel_approved,
+                    )
                     .await?;
                 ready_for_live_probe = manual_ready;
                 sections.push(format!("Auth:\n{}", auth_result));
@@ -923,14 +1003,24 @@ impl Tool for ManageApiTool {
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for ManageApiTool {
     /// The live probe's inner request is approved here, at the outer call,
-    /// and runs with a scope for exactly that request. Anything else, or a
-    /// trusted scheduled session or a mandate run, is left to the policy.
+    /// and runs with a scope for exactly that request; so is the auth change
+    /// the onboarding makes (asked in every session, as the auth tools ask).
+    /// Anything else, or the probe in a trusted scheduled session or a
+    /// mandate run, is left to the policy.
     async fn owner_approval_request(
         &self,
         call: &crate::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> crate::traits::OwnerApprovalNeed {
-        Self::owner_approval(call.arguments, facts)
+        use crate::traits::OwnerApprovalNeed;
+        let probe = Self::owner_approval(call.arguments, facts);
+        match (self.auth_stage_approval(call.arguments).await, probe) {
+            (None, probe) => probe,
+            (Some(auth), OwnerApprovalNeed::Ask(probe)) => {
+                OwnerApprovalNeed::Ask(Self::combined_request(auth, probe))
+            }
+            (Some(auth), _) => OwnerApprovalNeed::Ask(auth),
+        }
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1159,6 +1249,131 @@ mod tests {
             );
         }
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An OAuth store with no connections.
+    struct NoOAuthConnections;
+
+    #[async_trait]
+    impl crate::traits::OAuthStore for NoOAuthConnections {}
+
+    /// A `manage_api` over a synthetic config with one manual profile, an
+    /// empty OAuth store and no skills (no database).
+    fn synthetic_tool(dir: &tempfile::TempDir) -> ManageApiTool {
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[provider]\napi_key = \"synthetic-key\"\n\n[http_auth.synthetic]\n\
+             auth_type = \"bearer\"\nallowed_domains = [\"api.example.invalid\"]\n",
+        )
+        .unwrap();
+        let profiles: SharedHttpProfiles =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let store: Arc<dyn crate::traits::OAuthStore> = Arc::new(NoOAuthConnections);
+        let gateway = OAuthGateway::new(
+            Arc::new(NoOAuthConnections) as Arc<dyn crate::traits::OAuthGatewayStore>,
+            profiles.clone(),
+            "http://localhost:8080".to_string(),
+        );
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
+        drop(approval_rx);
+        ManageApiTool {
+            manage_http_auth: ManageHttpAuthTool::new(
+                config_path.clone(),
+                profiles.clone(),
+                store.clone(),
+            ),
+            manage_oauth: ManageOAuthTool::new(
+                gateway.clone(),
+                store,
+                config_path,
+                ApprovalBroker::new(approval_tx),
+            ),
+            manage_skills: None,
+            http_request: HttpRequestTool::new(profiles).with_oauth_gateway(gateway),
+            search_backend: Box::new(crate::tools::web_search::DuckDuckGoBackend::new()),
+        }
+    }
+
+    async fn judge_onboard(
+        tool: &ManageApiTool,
+        args: Value,
+        trusted: bool,
+    ) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::ToolSemantics;
+        let facts = ToolCallContext {
+            trusted_session: trusted,
+            mandate_preapproved: trusted,
+            ..ToolCallContext::default()
+        };
+        tool.owner_approval_request(&crate::traits::ApprovalCall::as_sent(&args), &facts)
+            .await
+    }
+
+    /// A manual-auth onboarding carries the profile change it makes on its
+    /// own card, in every session (with the probe's, when it has one).
+    #[tokio::test]
+    async fn manual_auth_onboarding_asks_for_its_profile_change() {
+        use crate::traits::OwnerApprovalNeed;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = synthetic_tool(&dir);
+        for trusted in [false, true] {
+            let header = json!({
+                "action": "onboard",
+                "service": "synthetic",
+                "auth_mode": "header",
+                "header_name": "X-Synthetic-Key",
+            });
+            let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, header, trusted).await
+            else {
+                panic!("a manual-auth onboarding must ask (trusted={trusted})");
+            };
+            assert!(
+                request
+                    .summary
+                    .starts_with("Update manual API auth profile 'synthetic' (type=header"),
+                "{}",
+                request.summary
+            );
+            // Existing auth changes nothing; the probe alone is left to the
+            // policy in a trusted session.
+            let existing = json!({"action":"onboard","service":"synthetic","auth_mode":"existing"});
+            assert_eq!(
+                judge_onboard(&tool, existing, trusted).await,
+                OwnerApprovalNeed::Unjudged
+            );
+        }
+        // An untrusted onboarding that also derives a probe asks once for both.
+        let both = json!({
+            "action": "onboard",
+            "service": "synthetic",
+            "auth_mode": "bearer",
+            "learn_url": "https://docs.example.invalid/graphql",
+        });
+        let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, both, false).await else {
+            panic!("must ask");
+        };
+        assert!(request
+            .summary
+            .starts_with("Update manual API auth profile"));
+        assert!(request
+            .subject
+            .ends_with("manage_api probe POST https://docs.example.invalid/graphql"));
+    }
+
+    /// The inner profile change runs only with the kernel's approval of the
+    /// outer call.
+    #[test]
+    fn inner_changes_carry_only_the_kernels_approval() {
+        let args = onboard_args(json!({}));
+        assert_eq!(
+            ManageApiTool::inner_change_facts(&args, Some(&ApprovalScope::Call)).kernel_approved,
+            Some(ApprovalScope::Call)
+        );
+        assert_eq!(
+            ManageApiTool::inner_change_facts(&args, None).kernel_approved,
+            None
+        );
     }
 
     /// Approval lookalikes in the model's arguments are ignored: only the
