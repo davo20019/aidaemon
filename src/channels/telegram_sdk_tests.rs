@@ -274,3 +274,137 @@ async fn an_update_received_by_the_sdk_adapter_reaches_the_daemons_handler() {
     );
     assert!(calls.iter().any(|(method, _)| method == "getupdates"));
 }
+
+fn button_update(id: u64, data: &str) -> Value {
+    json!({
+        "update_id": id,
+        "callback_query": {
+            "id": format!("cb-{id}"),
+            "from": { "id": OWNER, "is_bot": false, "first_name": "Alice" },
+            "chat_instance": "synthetic",
+            "data": data,
+            "message": {
+                "message_id": 5001, "date": 1700000000,
+                "chat": { "id": OWNER, "type": "private", "first_name": "Alice" },
+                "text": "Which provider?"
+            }
+        }
+    })
+}
+
+/// A provider that accepts only `synthetic-good-key`.
+async fn key_checking_provider() -> String {
+    async fn models(headers: axum::http::HeaderMap) -> axum::http::StatusCode {
+        let good = headers
+            .get("x-api-key")
+            .is_some_and(|key| key == "synthetic-good-key");
+        if good {
+            axum::http::StatusCode::OK
+        } else {
+            axum::http::StatusCode::UNAUTHORIZED
+        }
+    }
+    let app = axum::Router::new().route("/v1/models", axum::routing::get(models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn setkey_channel(
+    base: &str,
+    provider_base: &str,
+) -> (Arc<TelegramChannel>, crate::testing::TestHarness) {
+    let (channel, harness) = channel(base, MockProvider::new()).await;
+    std::fs::write(
+        &channel.config_path,
+        format!(
+            "[provider]\nkind = \"openai_chatgpt\"\napi_key = \"\"\n\n\
+             # Claude\n[[provider.fallbacks]]\nkind = \"anthropic\"\n\
+             base_url = \"{provider_base}\"\napi_key = \"old\"\n"
+        ),
+    )
+    .unwrap();
+    (channel, harness)
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_good_key_is_saved_and_never_reaches_the_agent() {
+    let _keychain = crate::testing::KeychainIsolation::acquire();
+    let (mock, base) = start_mock().await;
+    let provider_base = key_checking_provider().await;
+    let (channel, harness) = setkey_channel(&base, &provider_base).await;
+    mock.updates.lock().unwrap().extend([
+        text_update(1, 10, "/setkey"),
+        button_update(2, "setkey:f0"),
+        text_update(3, 11, "synthetic-good-key"),
+    ]);
+    let running = tokio::spawn(channel.clone().start());
+
+    let menu = mock
+        .wait_for("sendmessage", |body| {
+            body["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("Which provider"))
+        })
+        .await;
+    assert!(menu.to_string().contains("Fallback 1: Anthropic"), "{menu}");
+    assert!(!menu.to_string().contains("openai_chatgpt"), "{menu}");
+    mock.wait_for("deletemessage", |body| body["message_id"] == json!(11))
+        .await;
+    let done = mock
+        .wait_for("sendmessage", |body| {
+            body["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("is saved"))
+        })
+        .await;
+    assert!(!done.to_string().contains("synthetic-good-key"), "{done}");
+    running.abort();
+
+    let saved = std::fs::read_to_string(&channel.config_path).unwrap();
+    assert!(saved.contains("api_key = \"keychain\""), "{saved}");
+    assert!(saved.contains("# Claude"), "{saved}");
+    assert_eq!(
+        crate::config::resolve_from_keychain("provider_fallback_0_api_key").unwrap(),
+        "synthetic-good-key"
+    );
+    assert!(harness.provider.call_log.lock().await.is_empty());
+    let calls = mock.calls.lock().unwrap();
+    assert!(!calls
+        .iter()
+        .any(|(method, body)| method == "sendmessage"
+            && body.to_string().contains("synthetic-good-key")));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_key_changes_nothing() {
+    let _keychain = crate::testing::KeychainIsolation::acquire();
+    let (mock, base) = start_mock().await;
+    let provider_base = key_checking_provider().await;
+    let (channel, _harness) = setkey_channel(&base, &provider_base).await;
+    let before = std::fs::read_to_string(&channel.config_path).unwrap();
+    mock.updates.lock().unwrap().extend([
+        button_update(1, "setkey:f0"),
+        text_update(2, 11, "synthetic-bad-key"),
+    ]);
+    let running = tokio::spawn(channel.clone().start());
+    mock.wait_for("deletemessage", |body| body["message_id"] == json!(11))
+        .await;
+    mock.wait_for("sendmessage", |body| {
+        body["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("rejected"))
+    })
+    .await;
+    running.abort();
+    assert_eq!(
+        std::fs::read_to_string(&channel.config_path).unwrap(),
+        before
+    );
+    assert!(crate::config::resolve_from_keychain("provider_fallback_0_api_key").is_err());
+}

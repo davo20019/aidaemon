@@ -70,6 +70,17 @@ impl ChannelBundle {
         }
     }
 
+    /// The first Telegram bot and its allowed users, who get the startup
+    /// notification and any other startup warning.
+    pub fn startup_recipients(
+        &self,
+        config: &AppConfig,
+    ) -> Option<(Arc<crate::channels::TelegramChannel>, Vec<u64>)> {
+        let bot = self.telegram_bots.first()?.clone();
+        let users = config.all_telegram_bots().first()?.allowed_user_ids.clone();
+        Some((bot, users))
+    }
+
     pub fn spawn_all(self) {
         #[cfg(feature = "discord")]
         {

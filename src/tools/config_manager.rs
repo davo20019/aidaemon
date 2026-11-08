@@ -270,7 +270,7 @@ pub struct ConfigManagerTool {
 /// Set file permissions to owner-only read/write (0600) on Unix.
 /// This is a best-effort operation — failures are logged but not fatal.
 #[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) {
+pub(crate) fn set_owner_only_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
         warn!(path = %path.display(), "Failed to set 0600 permissions: {}", e);
@@ -278,8 +278,33 @@ fn set_owner_only_permissions(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) {
+pub(crate) fn set_owner_only_permissions(_path: &Path) {
     // No-op on non-Unix platforms
+}
+
+/// Rotate backups (3-deep ring) and create a new .bak from current config.
+/// Rotation: .bak.2 is deleted, .bak.1 → .bak.2, .bak → .bak.1, current → .bak
+pub(crate) async fn rotate_config_backups(config_path: &Path) -> anyhow::Result<()> {
+    let bak = config_path.with_extension("toml.bak");
+    let bak1 = config_path.with_extension("toml.bak.1");
+    let bak2 = config_path.with_extension("toml.bak.2");
+
+    // Rotate: .bak.1 → .bak.2
+    if bak1.exists() {
+        let _ = tokio::fs::rename(&bak1, &bak2).await;
+    }
+    // Rotate: .bak → .bak.1
+    if bak.exists() {
+        let _ = tokio::fs::rename(&bak, &bak1).await;
+    }
+    // Current → .bak
+    tokio::fs::copy(&config_path, &bak).await?;
+    // Restrict permissions on all backup files (contain secrets)
+    set_owner_only_permissions(&bak);
+    set_owner_only_permissions(&bak1);
+    set_owner_only_permissions(&bak2);
+    info!(backup = %bak.display(), "Config backup created (3-deep rotation)");
+    Ok(())
 }
 
 impl ConfigManagerTool {
@@ -514,29 +539,8 @@ impl ConfigManagerTool {
         effects
     }
 
-    /// Rotate backups (3-deep ring) and create a new .bak from current config.
-    /// Rotation: .bak.2 is deleted, .bak.1 → .bak.2, .bak → .bak.1, current → .bak
     async fn create_backup(&self) -> anyhow::Result<()> {
-        let bak = self.config_path.with_extension("toml.bak");
-        let bak1 = self.config_path.with_extension("toml.bak.1");
-        let bak2 = self.config_path.with_extension("toml.bak.2");
-
-        // Rotate: .bak.1 → .bak.2
-        if bak1.exists() {
-            let _ = tokio::fs::rename(&bak1, &bak2).await;
-        }
-        // Rotate: .bak → .bak.1
-        if bak.exists() {
-            let _ = tokio::fs::rename(&bak, &bak1).await;
-        }
-        // Current → .bak
-        tokio::fs::copy(&self.config_path, &bak).await?;
-        // Restrict permissions on all backup files (contain secrets)
-        set_owner_only_permissions(&bak);
-        set_owner_only_permissions(&bak1);
-        set_owner_only_permissions(&bak2);
-        info!(backup = %bak.display(), "Config backup created (3-deep rotation)");
-        Ok(())
+        rotate_config_backups(&self.config_path).await
     }
 
     /// Restore from the first available backup in the chain.
@@ -564,7 +568,7 @@ impl ConfigManagerTool {
     /// Validate that a config string parses correctly as AppConfig.
     /// Expands `${ENV_VAR}` references before structural validation but does
     /// NOT resolve `"keychain"` sentinels (the value may not be stored yet).
-    fn validate_config(content: &str) -> Result<(), String> {
+    pub(crate) fn validate_config(content: &str) -> Result<(), String> {
         // First check it's valid TOML
         let _doc: toml::Table = content
             .parse()

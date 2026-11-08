@@ -12,6 +12,7 @@ pub(crate) mod mock_api;
 mod presentation;
 pub(crate) mod prompts;
 mod rate_limit;
+pub(crate) mod set_key;
 #[cfg(feature = "slack")]
 mod slack;
 pub(crate) mod telegram;

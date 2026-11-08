@@ -8,7 +8,7 @@ pub(crate) mod cli_agent;
 #[cfg(feature = "computer_use")]
 #[allow(dead_code)]
 pub mod computer_use;
-mod config_manager;
+pub(crate) mod config_manager;
 mod diagnose;
 pub mod file_delivery;
 mod goal_trace;

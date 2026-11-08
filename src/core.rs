@@ -413,7 +413,31 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 16. Start channels
     info!("Starting aidaemon v{}", env!("CARGO_PKG_VERSION"));
+    let startup_recipients = channel_bundle.startup_recipients(&config);
     channel_bundle.spawn_all();
+    {
+        // Failover into a dead key is only discovered during an outage.
+        let provider = config.provider.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let rejected = crate::channels::set_key::rejected_keys(&provider).await;
+            if !rejected.is_empty() {
+                tracing::warn!(?rejected, "Configured provider keys were rejected");
+                let message = format!(
+                    "A configured model provider won't work:\n{}\nOn Telegram, /setkey replaces a key.",
+                    rejected.join("\n")
+                );
+                if let Some((bot, users)) = startup_recipients {
+                    use crate::traits::HubChannel;
+                    for user in users {
+                        if let Err(error) = bot.send_text(&user.to_string(), &message).await {
+                            tracing::warn!(%error, "Failed to send the rejected-key warning");
+                        }
+                    }
+                }
+            }
+        });
+    }
     #[cfg(feature = "terminal-bridge")]
     crate::terminal_bridge::spawn_if_configured(&config, state.clone());
 
