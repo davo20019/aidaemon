@@ -8,17 +8,15 @@
 //! closed so they can never silently authorize execution.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::time::timeout;
 use tracing::warn;
 
 use crate::events::EventStore;
 use crate::execution::SharedExecutionBackend;
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::providers::ChatJson;
 use crate::traits::{ChatOptions, StateStore};
 use crate::types::RiskLevel;
 
@@ -341,8 +339,6 @@ pub(crate) async fn assess_command(
         &referenced_files,
     );
     let snapshot = runtime.snapshot();
-    let provider: crate::llm_runtime::ModelBackend = snapshot.provider();
-    let model = snapshot.primary_model();
     let options = ChatOptions {
         response_mode: crate::traits::ResponseMode::JsonSchema {
             name: "terminal_command_risk".to_string(),
@@ -354,26 +350,43 @@ pub(crate) async fn assess_command(
         single_attempt_fail_closed: true,
         ..ChatOptions::default()
     };
-    let started = Instant::now();
-    let response = timeout(
-        timeout_after,
-        provider.chat_with_options(&model, &messages, &[], &options),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("semantic command-risk assessment timed out"))??;
-
-    if let (Some(state), Some(event_store)) = (state, event_store) {
-        crate::events::record_background_model_call_telemetry(
-            event_store,
-            state.as_ref(),
-            session_id,
-            "terminal_command_risk",
-            &model,
-            &response,
-            started.elapsed(),
-        )
+    let outcome = snapshot
+        .ask_for_judgment(&messages, &options, timeout_after)
         .await;
+    if let (Some(state), Some(event_store)) = (state, event_store) {
+        for failure in &outcome.failures {
+            crate::events::record_background_model_call_failure(
+                event_store.clone(),
+                state.as_ref(),
+                session_id,
+                "terminal_command_risk",
+                &failure.model,
+                &failure.error,
+                failure.elapsed,
+            )
+            .await;
+        }
+        if let Some(answer) = &outcome.answer {
+            crate::events::record_background_model_call_telemetry(
+                event_store,
+                state.as_ref(),
+                session_id,
+                "terminal_command_risk",
+                &answer.model,
+                &answer.response,
+                answer.elapsed,
+            )
+            .await;
+        }
     }
+    let Some(answer) = outcome.answer else {
+        let reason = outcome
+            .failures
+            .last()
+            .map_or("no model available", |failure| failure.error.as_str());
+        anyhow::bail!("semantic command-risk assessment failed: {reason}");
+    };
+    let response = answer.response;
 
     let raw = response
         .content
@@ -389,6 +402,71 @@ pub(crate) async fn assess_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quota_exhausted() -> crate::providers::ProviderError {
+        let mut error = crate::providers::ProviderError::from_status(429, "plan limit");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error
+    }
+
+    async fn assess_with_primary_error(
+        primary_error: crate::providers::ProviderError,
+    ) -> (anyhow::Result<SemanticCommandAssessment>, usize) {
+        use crate::llm_runtime::{ModelBackend, ProviderRuntimeTarget};
+        use crate::testing::MockProvider;
+        let primary: ModelBackend =
+            Arc::new(MockProvider::new().with_leading_provider_errors(vec![primary_error]));
+        let failover = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":[]}"#,
+            ),
+        ]));
+        let runtime = SharedLlmRuntime::new_with_failovers(
+            primary,
+            None,
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                failover.clone() as ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "failover-model".to_string(),
+            )],
+        );
+        let outcome = assess_command(
+            &runtime,
+            "df -h /",
+            &crate::execution::active_execution_backend(),
+            "risk-session",
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+        let asked = failover.call_log.lock().await.len();
+        (outcome, asked)
+    }
+
+    /// A used-up plan must not turn every command into an approval card
+    /// while another provider can judge it.
+    #[tokio::test]
+    async fn assessment_moves_to_a_failover_provider_when_the_plan_is_out() {
+        let (outcome, asked) = assess_with_primary_error(quota_exhausted()).await;
+        assert!(outcome.expect("judged by failover").observation_only);
+        assert_eq!(asked, 1);
+    }
+
+    /// A failure tied to this request stays on the primary: the command being
+    /// judged cannot steer the assessment onto another model.
+    #[tokio::test]
+    async fn a_request_failure_does_not_change_the_assessor() {
+        let (outcome, asked) = assess_with_primary_error(
+            crate::providers::ProviderError::from_status(400, "rejected"),
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(asked, 0);
+    }
 
     #[test]
     fn safe_workspace_assessment_does_not_require_approval() {

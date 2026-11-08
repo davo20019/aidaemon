@@ -8,7 +8,7 @@
 //! and the proposed call, never the content that tainted the run.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
@@ -20,7 +20,6 @@ use super::Agent;
 use crate::config::OwnerLevel;
 use crate::events::EventStore;
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::providers::ChatJson;
 use crate::traits::{ChatOptions, ResponseMode, TokenUsageStore};
 use crate::types::{ChannelVisibility, UserRole};
 
@@ -333,38 +332,6 @@ pub(in crate::agent) async fn verify_untrusted_call(
 ) -> VerifierVerdict {
     let messages = verifier_messages(origin_request, origin_trusted, tool, description, arguments);
     let snapshot = runtime.snapshot();
-    let models = snapshot.with_failover_models(vec![snapshot.primary_model()]);
-    let backend = snapshot.model_routed_backend();
-    let answer = tokio::select! {
-        answer = ask_verifier(&backend, &models, &messages, tool, telemetry) => answer,
-        _ = cancel.cancelled() => {
-            return VerifierVerdict {
-                consistent: false,
-                reason: "cancelled".to_string(),
-            };
-        }
-    };
-    let Some(response) = answer else {
-        return could_not_verify();
-    };
-    let raw = response
-        .content
-        .as_deref()
-        .or(response.thinking.as_deref())
-        .unwrap_or_default();
-    parse_verdict(raw)
-}
-
-/// The first answer from `models`, within one shared time budget. Only an
-/// infrastructure failure moves to the next model: a failure tied to this
-/// request must not let the content being judged pick a different judge.
-async fn ask_verifier(
-    backend: &crate::llm_runtime::ModelBackend,
-    models: &[String],
-    messages: &[Value],
-    tool: &str,
-    telemetry: Option<VerifierTelemetry<'_>>,
-) -> Option<crate::traits::ProviderResponse> {
     let options = ChatOptions {
         response_mode: ResponseMode::JsonSchema {
             name: VERIFIER_PURPOSE.to_string(),
@@ -376,63 +343,52 @@ async fn ask_verifier(
         single_attempt_fail_closed: true,
         ..ChatOptions::default()
     };
-    let deadline = Instant::now() + VERIFIER_TIMEOUT;
-    for model in models {
-        let started = Instant::now();
-        let remaining = deadline.saturating_duration_since(started);
-        let answer = tokio::time::timeout(
-            remaining,
-            backend.chat_with_options(model, messages, &[], &options),
-        )
-        .await;
-        let (failure, try_next) = match answer {
-            Ok(Ok(response)) => {
-                if let Some(telemetry) = &telemetry {
-                    crate::events::record_background_model_call_telemetry(
-                        telemetry.event_store.clone(),
-                        telemetry.state,
-                        telemetry.session_id,
-                        VERIFIER_PURPOSE,
-                        model,
-                        &response,
-                        started.elapsed(),
-                    )
-                    .await;
-                }
-                return Some(response);
-            }
-            Ok(Err(error)) => {
-                warn!(tool, %model, %error, "Untrusted call verifier failed");
-                let infrastructure = error
-                    .downcast_ref::<crate::providers::ProviderError>()
-                    .is_some_and(|error| error.kind.is_infrastructure_failure());
-                (error.to_string(), infrastructure)
-            }
-            Err(_) => {
-                warn!(tool, %model, "Untrusted call verifier timed out");
-                (
-                    format!("timed out after {}s", VERIFIER_TIMEOUT.as_secs()),
-                    false,
-                )
-            }
-        };
-        if let Some(telemetry) = &telemetry {
+    let outcome = tokio::select! {
+        outcome = snapshot.ask_for_judgment(&messages, &options, VERIFIER_TIMEOUT) => outcome,
+        _ = cancel.cancelled() => {
+            return VerifierVerdict {
+                consistent: false,
+                reason: "cancelled".to_string(),
+            };
+        }
+    };
+    if let Some(telemetry) = &telemetry {
+        for failure in &outcome.failures {
             crate::events::record_background_model_call_failure(
                 telemetry.event_store.clone(),
                 telemetry.state,
                 telemetry.session_id,
                 VERIFIER_PURPOSE,
-                model,
-                &failure,
-                started.elapsed(),
+                &failure.model,
+                &failure.error,
+                failure.elapsed,
             )
             .await;
         }
-        if !try_next {
-            return None;
+        if let Some(answer) = &outcome.answer {
+            crate::events::record_background_model_call_telemetry(
+                telemetry.event_store.clone(),
+                telemetry.state,
+                telemetry.session_id,
+                VERIFIER_PURPOSE,
+                &answer.model,
+                &answer.response,
+                answer.elapsed,
+            )
+            .await;
         }
     }
-    None
+    let Some(answer) = outcome.answer else {
+        warn!(tool, "Untrusted call verifier got no answer");
+        return could_not_verify();
+    };
+    let raw = answer
+        .response
+        .content
+        .as_deref()
+        .or(answer.response.thinking.as_deref())
+        .unwrap_or_default();
+    parse_verdict(raw)
 }
 
 /// Settles the kernel's untrusted-egress interruptions with the verifier:
@@ -645,7 +601,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             trigger.cancel();
         });
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let verdict = verify_untrusted_call(
             &harness.agent.llm_runtime,
             None,

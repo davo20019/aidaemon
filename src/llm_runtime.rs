@@ -85,6 +85,26 @@ fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> 
     models
 }
 
+/// The model that answered a safety judgment.
+pub(crate) struct JudgmentAnswer {
+    pub model: String,
+    pub response: crate::traits::ProviderResponse,
+    pub elapsed: std::time::Duration,
+}
+
+/// A model that could not answer a safety judgment.
+pub(crate) struct JudgmentFailure {
+    pub model: String,
+    pub error: String,
+    pub elapsed: std::time::Duration,
+}
+
+/// What came of asking for a safety judgment.
+pub(crate) struct JudgmentOutcome {
+    pub answer: Option<JudgmentAnswer>,
+    pub failures: Vec<JudgmentFailure>,
+}
+
 #[derive(Clone)]
 pub struct LlmRuntimeSnapshot {
     provider: ModelBackend,
@@ -175,6 +195,66 @@ impl LlmRuntimeSnapshot {
             }
         }
         primary_models
+    }
+
+    /// Ask for a safety judgment within one time budget, starting on the
+    /// primary model and moving to the failover providers only on an
+    /// infrastructure failure. A failure tied to this request stops, so the
+    /// content being judged cannot pick a different judge. One attempt per
+    /// model; the caller fails closed when no answer comes back.
+    pub(crate) async fn ask_for_judgment(
+        &self,
+        messages: &[serde_json::Value],
+        options: &crate::traits::ChatOptions,
+        budget: std::time::Duration,
+    ) -> JudgmentOutcome {
+        use crate::providers::ChatJson;
+        let backend = self.model_routed_backend();
+        let models = self.with_failover_models(vec![self.primary_model()]);
+        let deadline = std::time::Instant::now() + budget;
+        let mut failures = Vec::new();
+        for model in models {
+            let started = std::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(started);
+            let attempt = tokio::time::timeout(
+                remaining,
+                backend.chat_with_options(&model, messages, &[], options),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let (error, try_next) = match attempt {
+                Ok(Ok(response)) => {
+                    return JudgmentOutcome {
+                        answer: Some(JudgmentAnswer {
+                            model,
+                            response,
+                            elapsed,
+                        }),
+                        failures,
+                    };
+                }
+                Ok(Err(error)) => {
+                    let infrastructure = error
+                        .downcast_ref::<crate::providers::ProviderError>()
+                        .is_some_and(|error| error.kind.is_infrastructure_failure());
+                    (error.to_string(), infrastructure)
+                }
+                Err(_) => (format!("timed out after {}s", budget.as_secs()), false),
+            };
+            tracing::warn!(%model, %error, "Safety judgment attempt failed");
+            failures.push(JudgmentFailure {
+                model,
+                error,
+                elapsed,
+            });
+            if !try_next {
+                break;
+            }
+        }
+        JudgmentOutcome {
+            answer: None,
+            failures,
+        }
     }
 
     /// One backend that sends each request to the provider that owns its
