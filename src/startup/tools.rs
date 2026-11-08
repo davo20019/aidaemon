@@ -846,8 +846,7 @@ pub async fn register_optional_tools(
                     }
                 }
                 if register_manage_cli {
-                    let manage_cli =
-                        ManageCliAgentsTool::new(arc, state.clone(), approval_tx.clone());
+                    let manage_cli = ManageCliAgentsTool::new(arc, state.clone());
                     tools.push(Arc::new(manage_cli));
                 }
             }

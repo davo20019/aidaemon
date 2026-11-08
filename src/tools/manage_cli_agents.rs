@@ -6,63 +6,84 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::tools::cli_agent::CliAgentTool;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, DynamicCliAgentStore, Tool, ToolCallContext,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, DynamicCliAgentStore, OwnerApprovalNeed, Tool,
+    ToolCallContext, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
-use crate::types::ApprovalResponse;
 
 pub struct ManageCliAgentsTool {
     cli_tool: Arc<CliAgentTool>,
     state: Arc<dyn DynamicCliAgentStore>,
-    approval_tx: ApprovalBroker,
 }
 
 impl ManageCliAgentsTool {
-    pub fn new(
-        cli_tool: Arc<CliAgentTool>,
-        state: Arc<dyn DynamicCliAgentStore>,
-        approval_tx: ApprovalBroker,
-    ) -> Self {
-        Self {
-            cli_tool,
-            state,
-            approval_tx,
-        }
+    pub fn new(cli_tool: Arc<CliAgentTool>, state: Arc<dyn DynamicCliAgentStore>) -> Self {
+        Self { cli_tool, state }
     }
 
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec!["This will register a new CLI agent process".to_string()],
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
-            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
+    /// The owner approval for one call. Registering a CLI agent always asks,
+    /// even in a trusted session; a call the add path refuses (no name or
+    /// command, unreadable arguments) never runs and needs no card.
+    pub(crate) fn owner_approval(arguments: &Value) -> OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ManageCliAgentsArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if args.action != "add" {
+            return OwnerApprovalNeed::NotNeeded;
         }
+        let (Some(name), Some(command)) = (args.name.as_deref(), args.command.as_deref()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Add CLI agent '{}' ({} {})\n\
+                 This will register a new CLI-based AI agent that can execute commands.",
+                name,
+                command,
+                args.args.join(" ")
+            ),
+            // The exact arguments the owner approves; a changed argument is a new card.
+            subject: json!({
+                "action": "add",
+                "name": name,
+                "command": command,
+                "args": args.args,
+                "description": args.description.as_deref().unwrap_or(""),
+                "timeout_secs": args.timeout_secs,
+                "max_output_chars": args.max_output_chars,
+            })
+            .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec!["This will register a new CLI agent process".to_string()],
+        })
+    }
+
+    /// The typed effects of one call: registering an agent names the program
+    /// it will run. That program may also write files or contact hosts, so
+    /// the effects are declared incomplete. Listing and history are reads.
+    pub(crate) fn effects_for(arguments: &str) -> aidaemon_core::CallEffects {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        let Ok(args) = serde_json::from_str::<ManageCliAgentsArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        if matches!(args.action.as_str(), "list" | "history") {
+            return CallEffects::none();
+        }
+        let mut effects = CallEffects::unknown();
+        if args.action == "add" {
+            if let Some(command) = args.command.filter(|command| !command.is_empty()) {
+                effects
+                    .keys
+                    .push(EffectKey::named(EffectClass::Process, &command));
+            }
+        }
+        effects
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_add(
         &self,
-        session_id: &str,
         name: &str,
         command: &str,
         args: Vec<String>,
@@ -70,23 +91,6 @@ impl ManageCliAgentsTool {
         timeout_secs: Option<u64>,
         max_output_chars: Option<usize>,
     ) -> anyhow::Result<String> {
-        // Request user approval
-        let args_display = args.join(" ");
-        let approval_desc = format!(
-            "Add CLI agent '{}' ({} {})\n\
-             This will register a new CLI-based AI agent that can execute commands.",
-            name, command, args_display
-        );
-        let response = self.request_approval(session_id, &approval_desc).await?;
-        match response {
-            ApprovalResponse::Deny => {
-                return Ok("CLI agent addition denied by user.".to_string());
-            }
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-        }
-
         let result = self
             .cli_tool
             .add_agent(
@@ -266,8 +270,6 @@ impl ManageCliAgentsTool {
         let args: ManageCliAgentsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
 
-        let session_id = facts.session_id.as_str();
-
         match args.action.as_str() {
             "add" => {
                 let name = args
@@ -279,8 +281,13 @@ impl ManageCliAgentsTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'command' is required for add action"))?;
                 let description = args.description.as_deref().unwrap_or("");
+                if facts.kernel_approved.is_none() {
+                    anyhow::bail!(
+                        "manage_cli_agents add requires approval through the agent kernel; it \
+                         was called outside an approved agent call"
+                    );
+                }
                 self.handle_add(
-                    session_id,
                     name,
                     command,
                     args.args,
@@ -324,7 +331,26 @@ impl ManageCliAgentsTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageCliAgentsTool {
+    /// Registering an agent asks the owner, whatever the session. The
+    /// dispatcher runs the call only with that answer; a decline is recorded
+    /// by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> OwnerApprovalNeed {
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        Self::owner_approval(call.arguments)
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        Self::effects_for(arguments)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,
@@ -347,6 +373,54 @@ impl crate::traits::ToolSemantics for ManageCliAgentsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addition_asks_with_exact_arguments_and_declares_its_process() {
+        let args =
+            json!({"action":"add","name":"synthetic","command":"synthetic-cli","args":["--quiet"]});
+        let OwnerApprovalNeed::Ask(first) = ManageCliAgentsTool::owner_approval(&args) else {
+            panic!("an add must ask");
+        };
+        assert!(first
+            .summary
+            .starts_with("Add CLI agent 'synthetic' (synthetic-cli --quiet)"));
+        assert_eq!(first.risk, aidaemon_core::ApprovalRisk::High);
+        let mut changed = args.clone();
+        changed["args"] = json!(["--loud"]);
+        let OwnerApprovalNeed::Ask(other) = ManageCliAgentsTool::owner_approval(&changed) else {
+            panic!("an add must ask");
+        };
+        assert_ne!(first.subject, other.subject);
+        for no_card in [
+            json!({"action":"add","name":"synthetic"}),
+            json!({"action":"list"}),
+            json!({"action":"history"}),
+            json!({"action":"remove","name":"synthetic"}),
+        ] {
+            assert!(
+                matches!(
+                    ManageCliAgentsTool::owner_approval(&no_card),
+                    OwnerApprovalNeed::NotNeeded
+                ),
+                "{no_card}"
+            );
+        }
+
+        let effects = ManageCliAgentsTool::effects_for(&args.to_string());
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::named(
+                aidaemon_core::EffectClass::Process,
+                "synthetic-cli"
+            )]
+        );
+        assert!(!effects.complete);
+        assert_eq!(
+            ManageCliAgentsTool::effects_for(r#"{"action":"history"}"#),
+            aidaemon_core::CallEffects::none()
+        );
+        assert!(!ManageCliAgentsTool::effects_for(r#"{"action":"remove","name":"x"}"#).complete);
+    }
 
     #[test]
     fn schema_fits_payload_budget() {

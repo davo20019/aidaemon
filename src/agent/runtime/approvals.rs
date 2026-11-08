@@ -1216,6 +1216,79 @@ mod tests {
         ));
     }
 
+    /// `manage_cli_agents`'s approval judgment without its CLI registry: the
+    /// same `ManageCliAgentsTool::owner_approval` the tool runs.
+    struct ManageCliAgentsApprovals;
+
+    #[async_trait]
+    impl crate::traits::ToolSemantics for ManageCliAgentsApprovals {
+        async fn owner_approval_request(
+            &self,
+            call: &crate::traits::ApprovalCall<'_>,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> crate::traits::OwnerApprovalNeed {
+            if call.refused {
+                return crate::traits::OwnerApprovalNeed::NotNeeded;
+            }
+            crate::tools::ManageCliAgentsTool::owner_approval(call.arguments)
+        }
+    }
+
+    #[async_trait]
+    impl crate::traits::Tool for ManageCliAgentsApprovals {
+        fn name(&self) -> &str {
+            "manage_cli_agents"
+        }
+        fn description(&self) -> &str {
+            "manage_cli_agents approvals"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"name": "manage_cli_agents", "description": "", "parameters": {"type": "object"}})
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            anyhow::bail!("not run in these tests")
+        }
+    }
+
+    /// Registering a CLI agent asks the owner in every session; listing,
+    /// history and a call the add path refuses need no card.
+    #[tokio::test]
+    async fn cli_agent_add_always_asks_before_dispatch() {
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                tools: ApprovalTools::new([
+                    Arc::new(ManageCliAgentsApprovals) as Arc<dyn crate::traits::Tool>
+                ]),
+                trusted_session: trusted,
+                mandate_preapproved: trusted,
+                ..AppApprovalRules::default()
+            };
+            let add = sdk::ToolCall::new(
+                "c1",
+                "manage_cli_agents",
+                json!({"action":"add","name":"synthetic","command":"synthetic-cli"}),
+            );
+            assert!(
+                matches!(
+                    rules.judge(&hook_ctx(), &add, &tool_info()).await,
+                    RuleDecision::Ask(_)
+                ),
+                "trusted={trusted}"
+            );
+            for no_card in [
+                json!({"action":"add","name":"synthetic"}),
+                json!({"action":"list"}),
+                json!({"action":"history","limit":5}),
+            ] {
+                let call = sdk::ToolCall::new("c2", "manage_cli_agents", no_card);
+                assert_eq!(
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                    RuleDecision::Allow
+                );
+            }
+        }
+    }
+
     #[test]
     fn risks_map_to_card_levels() {
         use crate::tools::command_risk::RiskLevel;
