@@ -237,27 +237,131 @@ async fn model_pin_is_set_on_first_gui_action() {
     assert_eq!(pinned, "gpt-4o");
 }
 
-#[tokio::test]
-async fn consequential_allow_always_proceeds_as_one_time_allow() {
-    use super::approvals::ApprovalState;
-    use crate::tools::ApprovalBroker;
-    use crate::types::ApprovalResponse;
-    use tokio::sync::mpsc;
+#[test]
+fn consequential_subject_binds_the_exact_action() {
+    let one = super::consequential_subject(
+        "com.example.App",
+        "Type text into Example",
+        &json!({"action": "type_text", "text": "one"}),
+    );
+    let two = super::consequential_subject(
+        "com.example.App",
+        "Type text into Example",
+        &json!({"action": "type_text", "text": "two"}),
+    );
+    assert_ne!(one, two);
+    assert!(!one.contains("one"), "{one}");
+    // Key order in the arguments does not matter.
+    assert_eq!(
+        one,
+        super::consequential_subject(
+            "com.example.App",
+            "Type text into Example",
+            &json!({"text": "one", "action": "type_text"}),
+        )
+    );
+}
 
-    let (tx, mut rx) = mpsc::channel(1);
-    let broker = ApprovalBroker::new(tx);
-    let state = ApprovalState::new();
-    let responder = tokio::spawn(async move {
-        let req = rx.recv().await.expect("approval request");
-        let _ = req.response_tx.send(ApprovalResponse::AllowAlways);
-    });
-    let result = state
-        .ensure_consequential(&broker, "telegram:1", "task-1", "Click 'Delete'")
-        .await;
-    responder.await.unwrap();
+#[tokio::test]
+async fn app_control_is_asked_through_the_kernel() {
+    use crate::traits::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
+    use crate::types::{ApprovalKind, ApprovalResponse};
+
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    assert!(tool.dispatch_facts().keeps_own_grants);
+    // `test_tool` approves Calculator for telegram:1 only.
+    let facts = crate::traits::ToolCallContext {
+        session_id: "telegram:2".into(),
+        ..cu_facts("task-kernel")
+    };
+    let args = json!({"action": "get_app_state", "app": "Calculator"});
+    let raw = args.to_string();
+
+    // Never approved: refused, not asked about inside the tool.
+    let out = crate::testing::call_with_facts(&tool, &raw, facts.clone())
+        .await
+        .unwrap();
+    assert!(out.contains("through the agent kernel"), "{out}");
+
+    let OwnerApprovalNeed::Ask(request) = tool
+        .owner_approval_request(&ApprovalCall::as_sent(&args), &facts)
+        .await
+    else {
+        panic!("an app not approved in the session must ask");
+    };
     assert!(
-        result.is_ok(),
-        "AllowAlways on a consequential action should proceed as a one-time allow: {result:?}"
+        request.summary.contains("com.apple.calculator"),
+        "{}",
+        request.summary
+    );
+    assert!(matches!(
+        tool.approval_card_kind(&request),
+        ApprovalKind::Command
+    ));
+
+    // Allow Once covers one call.
+    let run = crate::testing::call_through_kernel(
+        &tool,
+        &raw,
+        facts.clone(),
+        Some(ApprovalResponse::AllowOnce),
+    )
+    .await
+    .unwrap();
+    assert!(run.asked.is_some());
+    assert!(
+        !run.output.contains("through the agent kernel"),
+        "{}",
+        run.output
+    );
+    let out = crate::testing::call_with_facts(&tool, &raw, facts.clone())
+        .await
+        .unwrap();
+    assert!(out.contains("through the agent kernel"), "{out}");
+
+    // A decline keeps nothing.
+    let run = crate::testing::call_through_kernel(
+        &tool,
+        &raw,
+        facts.clone(),
+        Some(ApprovalResponse::Deny),
+    )
+    .await
+    .unwrap();
+    assert!(run.asked.is_some());
+    assert!(run.output.contains("Denied"), "{}", run.output);
+
+    // Allow Session covers the session's later calls without a card.
+    let run = crate::testing::call_through_kernel(
+        &tool,
+        &raw,
+        facts.clone(),
+        Some(ApprovalResponse::AllowSession),
+    )
+    .await
+    .unwrap();
+    assert!(run.asked.is_some());
+    let run = crate::testing::call_through_kernel(
+        &tool,
+        &raw,
+        facts.clone(),
+        Some(ApprovalResponse::Deny),
+    )
+    .await
+    .unwrap();
+    assert!(run.asked.is_none(), "an approved session needs no card");
+    assert!(
+        !run.output.contains("through the agent kernel"),
+        "{}",
+        run.output
     );
 }
 

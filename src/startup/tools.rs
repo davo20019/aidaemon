@@ -785,7 +785,6 @@ pub async fn register_optional_tools(
                     config.computer_use.clone(),
                     vision,
                     std::path::PathBuf::from(&inbox_dir),
-                    approval_tx.clone(),
                     media_tx.clone(),
                     Some(event_store.clone()),
                 )));

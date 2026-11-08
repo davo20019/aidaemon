@@ -1,18 +1,43 @@
-//! Channel approval flows for computer-use sessions and actions.
+//! The owner's approvals for computer-use sessions and actions.
+//!
+//! The tool never asks the owner itself: the agent kernel asks with the card
+//! `ComputerUseTool::owner_approval_request` returns and hands the answer back
+//! through `record_owner_answer`, which keeps it here. At execution the tool
+//! checks for an approval and refuses a call that has none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::warn;
 
 use crate::config::ComputerUseConfig;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
-use crate::types::ApprovalResponse;
+use crate::tools::owner_answers::OwnerAnsweredCalls;
 
 use super::telemetry::MutationBudget;
+
+/// The warnings on a per-app card.
+pub const APP_WARNINGS: [&str; 2] = [
+    "Captures screenshots (may expose private content) and can click/type in this app.",
+    "Send/delete/purchase-style actions will still ask for confirmation each time.",
+];
+
+/// The warning that marks a consequential action's card (once-only).
+pub const CONSEQUENTIAL_WARNING: &str = "This action may send, delete, purchase, or publish.";
+
+/// Said on a consequential action's card.
+pub const ONE_TIME_WARNING: &str =
+    "Persistent allow is not available here — any approval applies to this action only.";
+
+/// The one-call subject of an approval to control the running app `bundle_id`.
+pub fn app_subject(bundle_id: &str) -> String {
+    format!("computer_use app {bundle_id}")
+}
+
+/// The one-call subject of an approval to launch and control the app the
+/// call names, asked before it runs (its bundle id is not known yet).
+pub fn requested_app_subject(app: &str) -> String {
+    format!("computer_use app named {}", app.trim().to_ascii_lowercase())
+}
 
 #[derive(Clone, Default)]
 pub struct ApprovalState {
@@ -21,6 +46,9 @@ pub struct ApprovalState {
     /// is asked once per app, not once per scope. Consequential actions still
     /// require a separate point-of-action confirmation (see `ensure_consequential`).
     app_approved: Arc<Mutex<HashSet<(String, String)>>>,
+    /// Approvals good for one call: Allow Once on an app, and every
+    /// consequential action.
+    answers: Arc<OwnerAnsweredCalls>,
     mutating_actions: Arc<Mutex<HashMap<String, u32>>>,
 }
 
@@ -35,10 +63,7 @@ impl ApprovalState {
 
     #[cfg(test)]
     pub async fn approve_all_for_test(&self, session_id: &str, bundle_id: &str) {
-        self.app_approved
-            .lock()
-            .await
-            .insert((session_id.to_string(), bundle_id.to_string()));
+        self.approve_app_for_session(session_id, bundle_id).await;
     }
 
     pub async fn mutations_used(&self, task_id: &str) -> u32 {
@@ -75,142 +100,90 @@ impl ApprovalState {
         Ok(budget)
     }
 
-    /// Ensure the user has approved aidaemon to operate `app` in this session.
-    ///
-    /// One combined prompt per app grants both inspection (screenshots) and
-    /// control (click/type). Persists for the session on Allow Session. This does
-    /// NOT authorize consequential actions (send/delete/purchase/publish) — those
-    /// are gated separately at point of action.
-    pub async fn ensure_app(
+    /// Whether operating the app needs the owner's approval in this session.
+    /// `None`: the app is not running yet, so nothing covers it.
+    pub async fn app_needs_approval(
         &self,
-        approval_tx: &ApprovalBroker,
         config: &ComputerUseConfig,
         session_id: &str,
-        task_id: &str,
-        bundle_id: &str,
-        app_name: &str,
-    ) -> Result<(), String> {
+        bundle_id: Option<&str>,
+    ) -> bool {
+        let Some(bundle_id) = bundle_id else {
+            return true;
+        };
         if config
             .always_allowed_apps
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(bundle_id))
         {
-            return Ok(());
+            return false;
         }
-        let key = (session_id.to_string(), bundle_id.to_string());
-        if self.app_approved.lock().await.contains(&key) {
-            return Ok(());
-        }
-        let summary = format!("Allow aidaemon to inspect and control '{app_name}' ({bundle_id})?");
-        let response = request_approval(
-            approval_tx,
-            session_id,
-            &summary,
-            RiskLevel::High,
-            vec![
-                "Captures screenshots (may expose private content) and can click/type in this app."
-                    .to_string(),
-                "Send/delete/purchase-style actions will still ask for confirmation each time."
-                    .to_string(),
-            ],
-            Some(task_id),
-            crate::types::ApprovalKind::Command,
-        )
-        .await?;
-        match response {
-            ApprovalResponse::AllowOnce => Ok(()),
-            ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways => {
-                self.app_approved.lock().await.insert(key);
-                Ok(())
-            }
-            ApprovalResponse::Deny => Err(format!("computer_use denied for {app_name}")),
-        }
+        !self
+            .app_approved
+            .lock()
+            .await
+            .contains(&(session_id.to_string(), bundle_id.to_string()))
     }
 
-    pub async fn ensure_consequential(
+    /// The owner allowed operating `bundle_id` for the session.
+    pub async fn approve_app_for_session(&self, session_id: &str, bundle_id: &str) {
+        self.app_approved
+            .lock()
+            .await
+            .insert((session_id.to_string(), bundle_id.to_string()));
+    }
+
+    /// The owner approved `subject` for one call in the session.
+    pub fn approve_once(&self, session_id: &str, subject: &str) {
+        self.answers.approve(session_id, subject);
+    }
+
+    /// Ensure the owner approved operating `app` in this call.
+    ///
+    /// One combined approval per app grants both inspection (screenshots) and
+    /// control (click/type): for the session after Allow Session, or for one
+    /// call. A one-call approval asked before the app was running is keyed by
+    /// the name the call gave (`requested_app`). This does NOT authorize
+    /// consequential actions (send/delete/purchase/publish) — those are gated
+    /// separately at point of action.
+    pub async fn ensure_app(
         &self,
-        approval_tx: &ApprovalBroker,
+        config: &ComputerUseConfig,
         session_id: &str,
-        task_id: &str,
-        summary: &str,
+        bundle_id: &str,
+        app_name: &str,
+        requested_app: &str,
     ) -> Result<(), String> {
-        let response = request_approval(
-            approval_tx,
-            session_id,
-            summary,
-            RiskLevel::Critical,
-            vec![
-                "This action may send, delete, purchase, or publish.".to_string(),
-                "Persistent allow is not available here — any approval applies to this action \
-                 only."
+        if !self
+            .app_needs_approval(config, session_id, Some(bundle_id))
+            .await
+        {
+            return Ok(());
+        }
+        if self.answers.take(session_id, &app_subject(bundle_id))
+            || self
+                .answers
+                .take(session_id, &requested_app_subject(requested_app))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "computer_use control of '{app_name}' ({bundle_id}) needs the owner's approval \
+             through the agent kernel, and none was given for this call"
+        ))
+    }
+
+    /// Ensure the owner approved this exact consequential action (`subject`).
+    /// Each approval covers one action; none persists.
+    pub fn ensure_consequential(&self, session_id: &str, subject: &str) -> Result<(), String> {
+        if self.answers.take(session_id, subject) {
+            Ok(())
+        } else {
+            Err(
+                "consequential computer_use action needs the owner's approval of this exact \
+                 action through the agent kernel, and none was given"
                     .to_string(),
-            ],
-            Some(task_id),
-            crate::types::ApprovalKind::CommandOnce,
-        )
-        .await?;
-        match response {
-            // The user said yes — a session/always response is still consent for
-            // this action. Persistent grants are intentionally never stored for
-            // consequential actions, so all allows degrade to one-time.
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => Ok(()),
-            ApprovalResponse::Deny => {
-                Err("consequential computer_use action denied by user".to_string())
-            }
-        }
-    }
-}
-
-async fn request_approval(
-    approval_tx: &ApprovalBroker,
-    session_id: &str,
-    command: &str,
-    risk_level: RiskLevel,
-    warnings: Vec<String>,
-    _task_id: Option<&str>,
-    kind: crate::types::ApprovalKind,
-) -> Result<ApprovalResponse, String> {
-    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    if let Err(send_err) = approval_tx
-        .send(ApprovalRequest {
-            command: command.to_string(),
-            session_id: session_id.to_string(),
-            risk_level,
-            warnings,
-            permission_mode: if matches!(kind, crate::types::ApprovalKind::CommandOnce) {
-                PermissionMode::Default
-            } else {
-                PermissionMode::Cautious
-            },
-            response_tx,
-            kind,
-        })
-        .await
-    {
-        return Err(format!("Approval channel closed: {send_err}"));
-    }
-
-    // Keep the per-approval wait comfortably below the agent's tool-call
-    // watchdog (300s): if the approval wait reached the watchdog, the tool call
-    // is killed mid-await, the turn ends abnormally, and the running-task entry
-    // can leak (the queue then stalls behind a phantom task). 120s gives the
-    // user time to respond while still resolving cleanly before the watchdog
-    // fires. Child sessions are routed to the parent channel and get the same
-    // response window.
-    let timeout_secs = 120;
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => {
-            warn!(command, "computer_use approval response channel closed");
-            Err("computer_use approval response channel closed".to_string())
-        }
-        Err(_) => {
-            warn!(command, "computer_use approval timed out");
-            Err(format!(
-                "computer_use approval timed out after {timeout_secs}s"
-            ))
+            )
         }
     }
 }
@@ -218,62 +191,78 @@ async fn request_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn approval_broker(response: ApprovalResponse) -> (ApprovalBroker, Arc<AtomicUsize>) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(4);
-        let count = Arc::new(AtomicUsize::new(0));
-        let observed = count.clone();
-        tokio::spawn(async move {
-            while let Some(request) = rx.recv().await {
-                observed.fetch_add(1, Ordering::SeqCst);
-                let _ = request.response_tx.send(response.clone());
-            }
-        });
-        (ApprovalBroker::new(tx), count)
-    }
 
     #[tokio::test]
     async fn app_allow_once_does_not_become_session_approval() {
         let state = ApprovalState::new();
-        let (broker, count) = approval_broker(ApprovalResponse::AllowOnce);
         let config = ComputerUseConfig::default();
+        state.approve_once("session", &app_subject("com.example.App"));
 
-        for task in ["task-1", "task-2"] {
-            state
-                .ensure_app(
-                    &broker,
-                    &config,
-                    "session",
-                    task,
-                    "com.example.App",
-                    "Example",
-                )
-                .await
-                .unwrap();
+        for expect_ok in [true, false] {
+            let result = state
+                .ensure_app(&config, "session", "com.example.App", "Example", "Example")
+                .await;
+            assert_eq!(result.is_ok(), expect_ok, "{result:?}");
         }
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(
+            state
+                .app_needs_approval(&config, "session", Some("com.example.App"))
+                .await
+        );
     }
 
     #[tokio::test]
     async fn app_allow_session_is_reused() {
         let state = ApprovalState::new();
-        let (broker, count) = approval_broker(ApprovalResponse::AllowSession);
         let config = ComputerUseConfig::default();
+        state
+            .approve_app_for_session("session", "com.example.App")
+            .await;
 
-        for task in ["task-1", "task-2"] {
+        for _ in 0..2 {
             state
-                .ensure_app(
-                    &broker,
-                    &config,
-                    "session",
-                    task,
-                    "com.example.App",
-                    "Example",
-                )
+                .ensure_app(&config, "session", "com.example.App", "Example", "Example")
                 .await
                 .unwrap();
         }
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .app_needs_approval(&config, "other-session", Some("com.example.App"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_asked_before_launch_covers_the_named_app_once() {
+        let state = ApprovalState::new();
+        let config = ComputerUseConfig::default();
+        state.approve_once("session", &requested_app_subject(" Example "));
+
+        assert!(state
+            .ensure_app(&config, "session", "com.example.App", "Example", "example")
+            .await
+            .is_ok());
+        assert!(state
+            .ensure_app(&config, "session", "com.example.App", "Example", "example")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn consequential_approval_covers_one_exact_action() {
+        let state = ApprovalState::new();
+        state.approve_once("session", "delete-subject");
+        assert!(state
+            .ensure_consequential("session", "other-subject")
+            .is_err());
+        assert!(state
+            .ensure_consequential("other-session", "delete-subject")
+            .is_err());
+        assert!(state
+            .ensure_consequential("session", "delete-subject")
+            .is_ok());
+        assert!(state
+            .ensure_consequential("session", "delete-subject")
+            .is_err());
     }
 }

@@ -10,12 +10,11 @@ use tokio::sync::{mpsc, Mutex};
 use crate::channels::attachments::save_tool_observation_image;
 use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
 use crate::events::{Event, EventStore, EventType};
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolRole,
 };
-use crate::types::{MediaKind, MediaMessage, StatusUpdate};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 
 mod approvals;
 pub mod cache;
@@ -46,6 +45,74 @@ use types::{
 
 const TOOL_NAME: &str = "computer_use";
 
+/// A computer_use call's card, and what the owner's approval of it covers.
+struct CuApprovalNeed {
+    request: aidaemon_core::OwnerApprovalRequest,
+    /// The per-app approval asked for: its one-call subject and, when the
+    /// app is already running, its bundle id (which a session approval
+    /// covers).
+    app: Option<(String, Option<String>)>,
+    /// The one-call subject of the consequential action asked for.
+    consequential: Option<String>,
+}
+
+/// What a call's target means for the owner's card.
+enum TargetClass {
+    /// The call fails before any approval (a missing argument, a stale or
+    /// prohibited target), so nothing is asked.
+    NoAsk,
+    /// A consequential action, with the label the owner sees.
+    Consequential(String),
+    /// Anything else: at most the per-app approval.
+    Other,
+}
+
+/// The running app `app` names: an exact name or bundle id, else the first
+/// name containing it.
+fn match_app<'a>(apps: &'a [types::AppInfo], app: &str) -> Option<&'a types::AppInfo> {
+    let needle = app.trim();
+    apps.iter()
+        .find(|a| a.bundle_id.eq_ignore_ascii_case(needle) || a.name.eq_ignore_ascii_case(needle))
+        .or_else(|| {
+            apps.iter().find(|a| {
+                a.name
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+        })
+}
+
+/// The one-call subject of a consequential action: the app, the label the
+/// owner saw, and a digest of the exact call (its target, text and value).
+fn consequential_subject(bundle_id: &str, label: &str, args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let exact: Vec<Value> = [
+        "action",
+        "app",
+        "snapshot_generation",
+        "element_index",
+        "element_title",
+        "element_role",
+        "occurrence",
+        "x",
+        "y",
+        "text",
+        "key",
+        "value",
+    ]
+    .iter()
+    .map(|field| args.get(*field).cloned().unwrap_or(Value::Null))
+    .collect();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(Value::Array(exact).to_string().as_bytes())
+    );
+    format!(
+        "computer_use consequential {bundle_id}: {label} [call {}]",
+        &digest[..16]
+    )
+}
+
 #[derive(Default)]
 struct PendingActionMeta {
     mutation_budget: Option<MutationBudget>,
@@ -59,7 +126,7 @@ pub struct ComputerUseTool {
     inbox_dir: PathBuf,
     harness: Arc<dyn ComputerHarness>,
     cache: Arc<Mutex<SnapshotCache>>,
-    approval: ApprovalBroker,
+    /// The owner's approvals the agent kernel delivered (`record_owner_answer`).
     approval_state: ApprovalState,
     pins: ComputerUsePinRegistry,
     media_tx: mpsc::Sender<MediaMessage>,
@@ -131,7 +198,6 @@ impl ComputerUseTool {
         config: ComputerUseConfig,
         vision: VisionConfig,
         inbox_dir: PathBuf,
-        approval: ApprovalBroker,
         media_tx: mpsc::Sender<MediaMessage>,
         events: Option<Arc<EventStore>>,
     ) -> Self {
@@ -146,7 +212,6 @@ impl ComputerUseTool {
             inbox_dir,
             harness,
             cache: Arc::new(Mutex::new(SnapshotCache::default())),
-            approval,
             approval_state: ApprovalState::new(),
             pins: ComputerUsePinRegistry::shared(),
             media_tx,
@@ -316,9 +381,12 @@ impl ComputerUseTool {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_action_approvals(
         &self,
         ctx: &HarnessRequestContext,
+        args: &Value,
+        requested_app: &str,
         action: ComputerActionKind,
         bundle_id: Option<&str>,
         app_name: Option<&str>,
@@ -341,21 +409,20 @@ impl ComputerUseTool {
             }
             self.approval_state
                 .ensure_app(
-                    &self.approval,
                     &self.config,
                     &ctx.session_id,
-                    &ctx.task_id,
                     bundle_id,
                     app_name,
+                    requested_app,
                 )
                 .await?;
         }
 
         if action_class == ActionClass::Consequential {
             let label = summary.unwrap_or("consequential desktop action");
+            let subject = consequential_subject(bundle_id.unwrap_or(""), label, args);
             self.approval_state
-                .ensure_consequential(&self.approval, &ctx.session_id, &ctx.task_id, label)
-                .await?;
+                .ensure_consequential(&ctx.session_id, &subject)?;
         }
 
         if !observation {
@@ -496,6 +563,8 @@ impl ComputerUseTool {
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -526,6 +595,8 @@ impl ComputerUseTool {
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -590,6 +661,8 @@ impl ComputerUseTool {
                 };
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -651,6 +724,8 @@ impl ComputerUseTool {
                 }
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&bundle_id),
                     Some(&resolved.name),
@@ -741,6 +816,8 @@ impl ComputerUseTool {
                 }
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -766,6 +843,8 @@ impl ComputerUseTool {
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -807,6 +886,8 @@ impl ComputerUseTool {
                 }
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -854,6 +935,8 @@ impl ComputerUseTool {
                 }
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&bundle_id),
                     Some(&resolved.name),
@@ -877,6 +960,8 @@ impl ComputerUseTool {
                 let resolved = self.harness.launch_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
+                    args,
+                    &app,
                     action,
                     Some(&resolved.bundle_id),
                     Some(&resolved.name),
@@ -909,20 +994,7 @@ impl ComputerUseTool {
 
     async fn resolve_app(&self, app: &str) -> Result<types::AppInfo, String> {
         let apps = self.harness.list_apps().await?;
-        let needle = app.trim();
-        let found = apps
-            .iter()
-            .find(|a| {
-                a.bundle_id.eq_ignore_ascii_case(needle) || a.name.eq_ignore_ascii_case(needle)
-            })
-            .or_else(|| {
-                apps.iter().find(|a| {
-                    a.name
-                        .to_ascii_lowercase()
-                        .contains(&needle.to_ascii_lowercase())
-                })
-            });
-        match found {
+        match match_app(&apps, app) {
             Some(a) => {
                 // Remember the app so a later action that omits `app` resumes here.
                 *self.last_app.lock().await = Some(a.name.clone());
@@ -934,6 +1006,218 @@ impl ComputerUseTool {
 
     async fn resolve_bundle_id(&self, app: &str) -> Result<String, String> {
         Ok(self.resolve_app(app).await?.bundle_id)
+    }
+
+    /// What a call's target means for the owner's card, read from the same
+    /// snapshot cache `dispatch` reads, without changing anything.
+    async fn target_class(
+        &self,
+        action: ComputerActionKind,
+        args: &Value,
+        ctx: &HarnessRequestContext,
+        app: &types::AppInfo,
+    ) -> TargetClass {
+        let key = self.snapshot_key(&app.bundle_id, ctx);
+        match action {
+            ComputerActionKind::Click => {
+                let is_coordinate_click = optional_f64(args, "x").is_some()
+                    && optional_f64(args, "y").is_some()
+                    && optional_u32(args, "element_index").is_none()
+                    && args.get("element_title").and_then(|v| v.as_str()).is_none()
+                    && args.get("element_role").and_then(|v| v.as_str()).is_none();
+                let generation = if is_coordinate_click {
+                    args.get("snapshot_generation")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                } else {
+                    match required_generation(args) {
+                        Ok(generation) => generation,
+                        Err(_) => return TargetClass::NoAsk,
+                    }
+                };
+                let cache = self.cache.lock().await;
+                let index = match resolve_target_index(args, &cache, &key, generation) {
+                    Ok(Some(index)) => index,
+                    Ok(None) => return TargetClass::Other,
+                    Err(_) => return TargetClass::NoAsk,
+                };
+                let Ok(element) = cache.element_by_index(&key, generation, index) else {
+                    return TargetClass::NoAsk;
+                };
+                match classify_target(action, Some(element), None) {
+                    ActionClass::Prohibited => TargetClass::NoAsk,
+                    ActionClass::Consequential => {
+                        TargetClass::Consequential(format!("Click '{}'", element.title))
+                    }
+                    _ => TargetClass::Other,
+                }
+            }
+            ComputerActionKind::TypeText => {
+                if required_generation(args).is_err() {
+                    return TargetClass::NoAsk;
+                }
+                let Ok(text) = required_str(args, "text") else {
+                    return TargetClass::NoAsk;
+                };
+                match classify_target(action, None, Some(&text)) {
+                    ActionClass::Prohibited => TargetClass::NoAsk,
+                    ActionClass::Consequential => {
+                        TargetClass::Consequential(format!("Type text into {}", app.name))
+                    }
+                    _ => TargetClass::Other,
+                }
+            }
+            ComputerActionKind::SetValue => {
+                let Ok(generation) = required_generation(args) else {
+                    return TargetClass::NoAsk;
+                };
+                let Ok(value) = required_str(args, "value") else {
+                    return TargetClass::NoAsk;
+                };
+                let cache = self.cache.lock().await;
+                let Ok(Some(index)) = resolve_target_index(args, &cache, &key, generation) else {
+                    return TargetClass::NoAsk;
+                };
+                let Ok(element) = cache.element_by_index(&key, generation, index) else {
+                    return TargetClass::NoAsk;
+                };
+                match classify_target(action, Some(element), Some(&value)) {
+                    ActionClass::Prohibited => TargetClass::NoAsk,
+                    ActionClass::Consequential => {
+                        TargetClass::Consequential(format!("Set value on '{}'", element.title))
+                    }
+                    _ => TargetClass::Other,
+                }
+            }
+            ComputerActionKind::PressKey => {
+                if required_generation(args).is_err() || required_str(args, "key").is_err() {
+                    TargetClass::NoAsk
+                } else {
+                    TargetClass::Other
+                }
+            }
+            ComputerActionKind::Scroll => {
+                if required_generation(args).is_err() || required_str(args, "direction").is_err() {
+                    TargetClass::NoAsk
+                } else {
+                    TargetClass::Other
+                }
+            }
+            _ => TargetClass::Other,
+        }
+    }
+
+    /// The owner's card a call needs, judged without side effects from the
+    /// state `dispatch` will read (the running apps, the snapshot cache, the
+    /// session's app approvals): a per-app approval for an app not yet
+    /// approved in the session, a point-of-action approval for a
+    /// consequential action, or one card for both. `None`: no card (nothing
+    /// to approve, or the call fails before any approval).
+    async fn owner_approval_need(
+        &self,
+        args: &Value,
+        facts: &ToolCallContext,
+    ) -> Option<CuApprovalNeed> {
+        let action = ComputerActionKind::parse(args.get("action")?.as_str()?).ok()?;
+        if action == ComputerActionKind::ListApps {
+            return None;
+        }
+        let ctx = Self::parse_context(facts).ok()?;
+        if !self.vision.enabled || self.harness.check_permissions().is_err() {
+            return None;
+        }
+        let last = self.last_app.lock().await.clone();
+        let app = resolve_sticky_app(args, last.as_deref()).ok()?;
+        let apps = self.harness.list_apps().await.unwrap_or_default();
+        let running = match_app(&apps, &app).cloned();
+        if running.is_none()
+            && !matches!(
+                action,
+                ComputerActionKind::LaunchApp | ComputerActionKind::ActivateApp
+            )
+        {
+            // `dispatch` fails to resolve the app before any approval.
+            return None;
+        }
+        if running
+            .as_ref()
+            .is_some_and(|found| is_prohibited_bundle(&found.bundle_id))
+        {
+            return None;
+        }
+        let consequential_label = match &running {
+            Some(found) => match self.target_class(action, args, &ctx, found).await {
+                TargetClass::NoAsk => return None,
+                TargetClass::Consequential(label) => Some(label),
+                TargetClass::Other => None,
+            },
+            None => None,
+        };
+        let app_needs = self
+            .approval_state
+            .app_needs_approval(
+                &self.config,
+                &ctx.session_id,
+                running.as_ref().map(|found| found.bundle_id.as_str()),
+            )
+            .await;
+        let app_label = match &running {
+            Some(found) => format!("'{}' ({})", found.name, found.bundle_id),
+            None => format!("'{}'", app.trim()),
+        };
+        let app_ask = app_needs.then(|| match &running {
+            Some(found) => (
+                approvals::app_subject(&found.bundle_id),
+                Some(found.bundle_id.clone()),
+            ),
+            None => (approvals::requested_app_subject(&app), None),
+        });
+        let mut warnings: Vec<String> = Vec::new();
+        if app_ask.is_some() {
+            warnings.extend(approvals::APP_WARNINGS.iter().map(|w| w.to_string()));
+        }
+        let request = match &consequential_label {
+            Some(label) => {
+                warnings.push(approvals::CONSEQUENTIAL_WARNING.to_string());
+                warnings.push(approvals::ONE_TIME_WARNING.to_string());
+                let bundle_id = running
+                    .as_ref()
+                    .map(|found| found.bundle_id.as_str())
+                    .unwrap_or("");
+                let summary = if app_ask.is_some() {
+                    format!(
+                        "{label} (this also lets aidaemon inspect and control {app_label} for                          this action)"
+                    )
+                } else {
+                    label.clone()
+                };
+                aidaemon_core::OwnerApprovalRequest {
+                    effects: Vec::new(),
+                    summary,
+                    subject: consequential_subject(bundle_id, label, args),
+                    risk: aidaemon_core::ApprovalRisk::Critical,
+                    warnings,
+                }
+            }
+            None => {
+                let (subject, _) = app_ask.as_ref()?;
+                aidaemon_core::OwnerApprovalRequest {
+                    effects: Vec::new(),
+                    summary: format!("Allow aidaemon to inspect and control {app_label}?"),
+                    subject: subject.clone(),
+                    risk: aidaemon_core::ApprovalRisk::High,
+                    warnings,
+                }
+            }
+        };
+        let consequential = consequential_label
+            .is_some()
+            .then(|| request.subject.clone());
+        Some(CuApprovalNeed {
+            request,
+            app: app_ask,
+            consequential,
+        })
     }
 
     fn snapshot_key(&self, bundle_id: &str, ctx: &HarnessRequestContext) -> cache::SnapshotKey {
@@ -1105,6 +1389,65 @@ fn optional_f64(args: &Value, key: &str) -> Option<f64> {
 impl Tool for ComputerUseTool {
     fn name(&self) -> &str {
         TOOL_NAME
+    }
+
+    /// A consequential action's card covers only that action; a per-app
+    /// card may be allowed for the session.
+    fn approval_card_kind(
+        &self,
+        request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        if request
+            .warnings
+            .iter()
+            .any(|warning| warning == approvals::CONSEQUENTIAL_WARNING)
+        {
+            crate::types::ApprovalKind::CommandOnce
+        } else {
+            crate::types::ApprovalKind::Command
+        }
+    }
+
+    /// Keep the owner's approval for the call it was asked for: a session
+    /// approval of a running app covers the session; every other approval
+    /// (Allow Once, an app not yet running, a consequential action) covers
+    /// this call alone.
+    async fn record_owner_answer(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+        response: Option<ApprovalResponse>,
+    ) {
+        let Some(response) = response else {
+            return;
+        };
+        if matches!(response, ApprovalResponse::Deny) {
+            return;
+        }
+        let Some(need) = self.owner_approval_need(call.arguments, facts).await else {
+            return;
+        };
+        let session_id = facts.session_id.as_str();
+        if let Some(subject) = &need.consequential {
+            self.approval_state.approve_once(session_id, subject);
+            if let Some((app_subject, _)) = &need.app {
+                self.approval_state.approve_once(session_id, app_subject);
+            }
+            return;
+        }
+        if let Some((app_subject, bundle_id)) = &need.app {
+            match (response, bundle_id) {
+                (
+                    ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways,
+                    Some(bundle_id),
+                ) => {
+                    self.approval_state
+                        .approve_app_for_session(session_id, bundle_id)
+                        .await;
+                }
+                _ => self.approval_state.approve_once(session_id, app_subject),
+            }
+        }
     }
 
     fn description(&self) -> &str {
@@ -1371,7 +1714,26 @@ impl crate::traits::ToolSemantics for ComputerUseTool {
         crate::traits::ToolDispatchFacts {
             same_tool_streak: crate::traits::SameToolStreak::Stepwise,
             needs_live_model: true,
+            // App approvals are kept per session and per bundle, and
+            // consequential ones per call, by the tool (`record_owner_answer`).
+            keeps_own_grants: true,
             ..Default::default()
+        }
+    }
+
+    /// Operating an app not yet approved in the session, or a consequential
+    /// action, asks the owner; the call that runs must match the card.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        match self.owner_approval_need(call.arguments, facts).await {
+            Some(need) => crate::traits::OwnerApprovalNeed::Ask(need.request),
+            None => crate::traits::OwnerApprovalNeed::Unjudged,
         }
     }
 
@@ -1436,19 +1798,16 @@ impl crate::traits::ToolSemantics for ComputerUseTool {
 #[cfg(test)]
 pub async fn test_tool(config: ComputerUseConfig, inbox: PathBuf) -> ComputerUseTool {
     use crate::config::FilesConfig;
-    use crate::tools::ApprovalBroker;
 
     let files = FilesConfig {
         vision_enabled: true,
         ..Default::default()
     };
     let (media_tx, _media_rx) = mpsc::channel(1);
-    let (approval_tx, _approval_rx) = mpsc::channel(1);
     let tool = ComputerUseTool::new(
         config,
         VisionConfig::from_files(&files),
         inbox,
-        ApprovalBroker::new(approval_tx),
         media_tx,
         None,
     );

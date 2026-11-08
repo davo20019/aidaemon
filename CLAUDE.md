@@ -351,10 +351,15 @@ kernel hook judging typed effects. A tool must not prompt the owner or refuse
 on policy inside `call()`; a decline binds the run for that effect and target
 across tools. Do not add a new in-tool prompt or policy refusal.
 
-Not yet everywhere: `cli_agent`, `browser`, `computer_use`, `config_manager`,
-`share_memory` and the `manage_*` tools still prompt inside `call()` until
-Phase 3c moves them onto the kernel. `manage_mcp` already asks only through
-the kernel (`owner_approval_request`), for `add`, `restart` and `enable`.
+Not yet everywhere: `config_manager`, `share_memory` and the `manage_*` tools
+still prompt inside `call()` until Phase 3c moves them onto the kernel.
+`manage_mcp` already asks only through the kernel (`owner_approval_request`),
+for `add`, `restart` and `enable`. `cli_agent`, `browser` and `computer_use`
+judge state they read before the call: they return the card from
+`owner_approval_request`, pick its buttons with `Tool::approval_card_kind`,
+keep the kernel's answer (`keeps_own_grants`, `record_owner_answer`) for the
+exact call or session it covers, and refuse a call at execution that needs
+the owner and has no matching approval.
 
 A call whose only effect is the agent's own internal state (its memory,
 people store, checklist or goal bookkeeping) declares `CallEffects::none()`,
