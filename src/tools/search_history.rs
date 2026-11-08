@@ -166,7 +166,7 @@ impl SearchHistoryTool {
         arguments: &str,
         facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let args: SearchHistoryArgs = serde_json::from_str(arguments)?;
+        let args = serde_json::from_str::<SearchHistoryArgs>(arguments)?.without_blank_fields();
         let action = args.action.as_str();
         let authorization_scope = Self::runtime_scope(
             &args,
@@ -406,6 +406,26 @@ struct SearchHistoryArgs {
     #[serde(rename = "session_id")]
     filter_session_id: Option<String>,
     task_id: Option<String>,
+}
+
+impl SearchHistoryArgs {
+    /// Strict function schemas make models send every optional field, so an
+    /// unused one arrives as `""` or `0`. Those mean absent.
+    fn without_blank_fields(mut self) -> Self {
+        for field in [
+            &mut self.query,
+            &mut self.message_id,
+            &mut self.turn_id,
+            &mut self.cursor,
+            &mut self.filter_session_id,
+            &mut self.task_id,
+        ] {
+            *field = field.take().filter(|value| !value.trim().is_empty());
+        }
+        self.event_id = self.event_id.filter(|id| *id > 0);
+        self.limit = self.limit.filter(|limit| *limit > 0);
+        self
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -730,7 +750,13 @@ mod tests {
             channel_visibility: Some(ChannelVisibility::Private),
             ..Default::default()
         };
-        let open = json!({"action": "open", "turn_id": "t1"}).to_string();
+        // As a strict-schema model sends it: every unused field blank.
+        let open = json!({
+            "action": "open", "turn_id": "t1", "event_id": 0, "message_id": "",
+            "query": "", "cursor": "", "session_id": "", "task_id": "",
+            "limit": 10, "context": 0, "include_subagents": false
+        })
+        .to_string();
         let opened = tool
             .call_with_execution_context(&open, None, context("root-session", UserRole::Owner))
             .await
