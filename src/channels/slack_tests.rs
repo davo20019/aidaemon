@@ -49,7 +49,6 @@ async fn channel(
             max_file_size_mb: 10,
             state: harness.state.clone(),
             watchdog_stale_threshold_secs: 0,
-            transports: Default::default(),
         },
     )
     .with_api(&api.base, BOT);

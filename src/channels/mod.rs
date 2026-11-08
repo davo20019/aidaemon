@@ -47,8 +47,6 @@ pub(crate) struct ChannelRuntimeDeps {
     pub max_file_size_mb: u64,
     pub state: Arc<dyn crate::traits::StateStore>,
     pub watchdog_stale_threshold_secs: u64,
-    /// The transport each platform runs on.
-    pub transports: crate::config::ChannelsConfig,
 }
 
 /// Wait until the heartbeat becomes stale and return stale minutes.
