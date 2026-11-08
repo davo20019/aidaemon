@@ -3,7 +3,6 @@
 //! These functions are channel-agnostic: they validate tokens and manage the
 //! `dynamic_bots` table without touching channel-specific spawning logic.
 
-use teloxide::prelude::*;
 use tracing::warn;
 
 use crate::traits::{DynamicBot, StateStore};
@@ -15,7 +14,9 @@ use crate::traits::{DynamicBot, StateStore};
 /// Validate a Telegram bot token by calling `getMe`.
 /// Returns the bot username on success.
 pub(crate) async fn validate_telegram_token(token: &str) -> Result<String, String> {
-    let test_bot = Bot::new(token);
+    let test_bot = super::telegram_api::Bot::new(std::sync::Arc::new(
+        aidaemon_channel_telegram::TelegramChannel::new(token.to_string()),
+    ));
     let me = test_bot.get_me().await.map_err(|e| {
         format!(
             "Invalid token: {}\n\nMake sure you copied the full token from @BotFather.",

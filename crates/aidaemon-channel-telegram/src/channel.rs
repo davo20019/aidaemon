@@ -34,6 +34,8 @@ const CAPTION_MAX_LEN: usize = 1024;
 pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Longest `retry_after` that `send` waits out by itself before surfacing
 /// [`ChannelError::RateLimited`].
+/// The largest picture `sendPhoto` takes.
+const PHOTO_MAX_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SEND_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// A Telegram bot, driven by long polling over the Bot HTTP API.
@@ -108,6 +110,16 @@ impl TelegramChannel {
 
     /// Split messages at `len` UTF-16 units (1 to
     /// [`TELEGRAM_MAX_MESSAGE_LEN`]).
+    /// Call Bot API `method` with a JSON body and return its `result`, for
+    /// host features the channel contract does not cover (reply keyboards,
+    /// callback answers, web-app buttons). One short rate limit is waited
+    /// out.
+    pub async fn call_bot_api(&self, method: &str, body: &Value) -> Result<Value, ChannelError> {
+        self.call_with_retry::<Value>(method, body)
+            .await
+            .map_err(Into::into)
+    }
+
     /// The `(prompt_id, choice_id)` a button made by `ask` carries in its
     /// `callback_data`, for a host that reads raw updates
     /// ([`TelegramChannel::run_updates`]). `None` for any other data.
@@ -764,9 +776,21 @@ impl Channel for TelegramChannel {
                 .mime_str(mime)
                 .map_err(|e| ChannelError::Other(format!("invalid mime type {mime}: {e}")))?;
         }
+        // A picture is shown inline; anything else (or a picture too large
+        // for sendPhoto) is sent as a file.
+        let as_photo = file
+            .mime_type
+            .as_deref()
+            .is_some_and(|mime| matches!(mime, "image/png" | "image/jpeg" | "image/webp"))
+            && file.bytes.len() <= PHOTO_MAX_BYTES;
+        let (method, field) = if as_photo {
+            ("sendPhoto", "photo")
+        } else {
+            ("sendDocument", "document")
+        };
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
-            .part("document", part);
+            .part(field, part);
         if let Some(thread) = thread_id {
             form = form.text("message_thread_id", thread.to_string());
         }
@@ -778,7 +802,7 @@ impl Channel for TelegramChannel {
         }
         let sent: SentMessage = self
             .api()
-            .call_multipart("sendDocument", form, FILE_TIMEOUT)
+            .call_multipart(method, form, FILE_TIMEOUT)
             .await?;
         Ok(MessageRef {
             conversation_id: conversation.id.clone(),

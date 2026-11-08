@@ -15,6 +15,7 @@ mod rate_limit;
 #[cfg(feature = "slack")]
 mod slack;
 pub(crate) mod telegram;
+pub(crate) mod telegram_api;
 mod telegram_bootstrap_signing;
 pub(crate) mod turns;
 

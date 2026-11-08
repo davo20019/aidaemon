@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use teloxide::prelude::*;
-use teloxide::types::{
-    BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    KeyboardButton, KeyboardMarkup, LinkPreviewOptions, ParseMode, WebAppInfo,
+use super::telegram_api::{
+    Bot, BotCommand, ButtonRequest, CallbackQuery, ChatAction, ChatId, InlineKeyboardButton,
+    InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, LinkPreviewOptions, MessageId, ParseMode,
+    RequestError, WebAppInfo,
 };
-use teloxide::RequestError;
+use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -44,13 +43,7 @@ use crate::types::{
 use aidaemon_channels::Channel as _;
 
 fn disabled_link_preview() -> LinkPreviewOptions {
-    LinkPreviewOptions {
-        is_disabled: true,
-        url: None,
-        prefer_small_media: false,
-        prefer_large_media: false,
-        show_above_text: false,
-    }
+    LinkPreviewOptions { is_disabled: true }
 }
 
 pub struct TelegramChannel {
@@ -233,7 +226,10 @@ impl TelegramChannel {
         terminal_web_app_url: String,
         terminal_allowed_prefixes: Vec<String>,
     ) -> Self {
-        let bot = Bot::new(bot_token);
+        let adapter = Arc::new(aidaemon_channel_telegram::TelegramChannel::new(
+            bot_token.to_string(),
+        ));
+        let bot = Bot::new(adapter.clone());
         let terminal_allowed_prefixes = terminal_allowed_prefixes
             .into_iter()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -261,9 +257,7 @@ impl TelegramChannel {
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
             api_url: None,
-            transport: StdRwLock::new(Arc::new(aidaemon_channel_telegram::TelegramChannel::new(
-                bot_token.to_string(),
-            ))),
+            transport: StdRwLock::new(adapter),
             prompts: super::prompts::Prompts::default(),
             terminal_web_app_url,
             terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
@@ -634,9 +628,9 @@ impl TelegramChannel {
 
     /// The SDK adapter receives updates (webhook or long polling, offsets,
     /// backoff, the webhook fallback) and hands each one over as the Bot API
-    /// sent it; the handlers below read teloxide's types, so they are
+    /// sent it, read here as `telegram_api` types so the handlers below are
     /// unchanged. Each chat's updates are handled in order, one at a time, as
-    /// teloxide's dispatcher does; different chats run concurrently.
+    /// a dispatcher would; different chats run concurrently.
     async fn start_sdk(self: Arc<Self>, bot_username: &str) {
         let mut transport = aidaemon_channel_telegram::TelegramChannel::new(self.bot_token.clone())
             .bot_username(bot_username)
@@ -649,7 +643,7 @@ impl TelegramChannel {
         } else {
             // A webhook left from an earlier setup would starve long polling.
             info!(name = %bot_username, "Clearing any existing webhook before starting long polling");
-            if let Err(err) = self.bot.delete_webhook().send().await {
+            if let Err(err) = self.bot.delete_webhook().await {
                 warn!(
                     name = %bot_username,
                     error = %err,
@@ -669,17 +663,17 @@ impl TelegramChannel {
         };
         info!(name = %bot_username, "Telegram updates received by the SDK adapter");
         // One worker per chat keeps that chat's updates in order.
-        let mut chats: HashMap<i64, mpsc::UnboundedSender<teloxide::types::Update>> =
+        let mut chats: HashMap<i64, mpsc::UnboundedSender<super::telegram_api::Update>> =
             HashMap::new();
         while let Some(raw) = updates.recv().await {
-            let update = match parse_update(raw) {
+            let update = match serde_json::from_value::<super::telegram_api::Update>(raw) {
                 Ok(update) => update,
                 Err(error) => {
                     warn!(name = %bot_username, %error, "Unreadable Telegram update dropped");
                     continue;
                 }
             };
-            let chat = update.chat().map(|chat| chat.id.0).unwrap_or_default();
+            let chat = update.chat_id().map(|chat| chat.0).unwrap_or_default();
             let mut update = Some(update);
             if let Some(worker) = chats.get(&chat) {
                 match worker.send(update.take().expect("set above")) {
@@ -709,26 +703,22 @@ impl TelegramChannel {
     /// Talk to this Bot API server instead of Telegram's (tests).
     #[cfg(test)]
     fn with_api_url(mut self, api_url: &str) -> Self {
-        self.bot = Bot::new(&self.bot_token)
-            .set_api_url(reqwest::Url::parse(api_url).expect("a valid URL"));
-        self.api_url = Some(api_url.to_string());
-        self.transport = StdRwLock::new(Arc::new(
+        let adapter = Arc::new(
             aidaemon_channel_telegram::TelegramChannel::new(self.bot_token.clone())
                 .api_base(api_url.to_string()),
-        ));
+        );
+        self.bot = Bot::new(adapter.clone());
+        self.api_url = Some(api_url.to_string());
+        self.transport = StdRwLock::new(adapter);
         self
     }
 
     /// Run the handler for one update.
-    async fn dispatch_update(self: &Arc<Self>, update: teloxide::types::Update) {
-        match update.kind {
-            teloxide::types::UpdateKind::Message(msg) => {
-                self.handle_message(msg, self.bot.clone()).await;
-            }
-            teloxide::types::UpdateKind::CallbackQuery(query) => {
-                self.handle_callback(query, self.bot.clone()).await;
-            }
-            _ => {}
+    async fn dispatch_update(self: &Arc<Self>, update: super::telegram_api::Update) {
+        if let Some(msg) = update.message {
+            self.handle_message(msg, self.bot.clone()).await;
+        } else if let Some(query) = update.callback_query {
+            self.handle_callback(query, self.bot.clone()).await;
         }
     }
 
@@ -889,7 +879,7 @@ impl TelegramChannel {
                 .answer_callback_query(q.id.clone())
                 .text("Generating share code...")
                 .await;
-            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
+            if let Some(m) = q.message {
                 self.send_agent_share_code(&bot, m.chat.id, user_id, explicit_relay_session_id)
                     .await;
             } else {
@@ -922,7 +912,7 @@ impl TelegramChannel {
                 .text("Approval expired. Please run the command again.")
                 .show_alert(true)
                 .await;
-            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
+            if let Some(m) = q.message {
                 let original = m.text().unwrap_or("");
                 if !original.contains("Approval expired") {
                     let _ = bot
@@ -958,7 +948,7 @@ impl TelegramChannel {
         }
     }
 
-    async fn handle_command(&self, text: &str, msg: &teloxide::types::Message, bot: &Bot) {
+    async fn handle_command(&self, text: &str, msg: &super::telegram_api::Message, bot: &Bot) {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
         let cmd_raw = parts[0];
         let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw);
@@ -1084,7 +1074,7 @@ impl TelegramChannel {
     async fn handle_agent_flags_command(
         &self,
         args: Vec<String>,
-        msg: &teloxide::types::Message,
+        msg: &super::telegram_api::Message,
         bot: &Bot,
         user_id: u64,
     ) {
@@ -1172,7 +1162,7 @@ impl TelegramChannel {
     async fn handle_agent_defaults_command(
         &self,
         mut args: Vec<String>,
-        msg: &teloxide::types::Message,
+        msg: &super::telegram_api::Message,
         bot: &Bot,
         user_id: u64,
     ) {
@@ -1369,7 +1359,7 @@ impl TelegramChannel {
     async fn handle_terminal_lite_command(
         &self,
         args: Vec<String>,
-        msg: &teloxide::types::Message,
+        msg: &super::telegram_api::Message,
         bot: &Bot,
         user_id: u64,
     ) {
@@ -1395,7 +1385,7 @@ impl TelegramChannel {
     async fn handle_terminal_command(
         &self,
         arg: &str,
-        msg: &teloxide::types::Message,
+        msg: &super::telegram_api::Message,
         bot: &Bot,
         invoked_cmd: &str,
     ) {
@@ -1942,78 +1932,46 @@ impl TelegramChannel {
     /// Downloads the file, saves to inbox, and returns attachment metadata.
     async fn handle_file_message(
         &self,
-        msg: &teloxide::types::Message,
-        bot: &Bot,
+        msg: &super::telegram_api::Message,
     ) -> anyhow::Result<crate::traits::MessageAttachment> {
-        // Extract file_id, file_size, filename, and mime_type from the message
-        let (file_id, file_size, filename, mime_type) = if let Some(doc) = msg.document() {
+        // The file, its size, and the name and type it is saved under.
+        let (file, filename, mime_type) = if let Some(doc) = msg.document() {
             (
-                doc.file.id.clone(),
-                doc.file.size as u64,
-                doc.file_name
-                    .clone()
-                    .unwrap_or_else(|| "document".to_string()),
+                doc,
+                doc.file_name.as_deref().unwrap_or("document"),
                 doc.mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
             )
-        } else if let Some(photos) = msg.photo() {
-            // Last photo in the array is the largest
-            let photo = photos
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
-            (
-                photo.file.id.clone(),
-                photo.file.size as u64,
-                "photo.jpg".to_string(),
-                "image/jpeg".to_string(),
-            )
+        } else if let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) {
+            // The last size is the largest.
+            (photo, "photo.jpg", "image/jpeg")
         } else if let Some(audio) = msg.audio() {
             (
-                audio.file.id.clone(),
-                audio.file.size as u64,
-                audio
-                    .file_name
-                    .clone()
-                    .unwrap_or_else(|| "audio.mp3".to_string()),
-                audio
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "audio/mpeg".to_string()),
+                audio,
+                audio.file_name.as_deref().unwrap_or("audio.mp3"),
+                audio.mime_type.as_deref().unwrap_or("audio/mpeg"),
             )
         } else if let Some(video) = msg.video() {
             (
-                video.file.id.clone(),
-                video.file.size as u64,
-                video
-                    .file_name
-                    .clone()
-                    .unwrap_or_else(|| "video.mp4".to_string()),
-                video
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "video/mp4".to_string()),
+                video,
+                video.file_name.as_deref().unwrap_or("video.mp4"),
+                video.mime_type.as_deref().unwrap_or("video/mp4"),
             )
         } else if let Some(voice) = msg.voice() {
             (
-                voice.file.id.clone(),
-                voice.file.size as u64,
-                "voice.ogg".to_string(),
-                voice
-                    .mime_type
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "audio/ogg".to_string()),
+                voice,
+                "voice.ogg",
+                voice.mime_type.as_deref().unwrap_or("audio/ogg"),
             )
         } else {
             anyhow::bail!("Unsupported message type. I can process text, files, photos, audio, video, and voice messages.");
         };
+        let (filename, mime_type) = (filename.to_string(), mime_type.to_string());
 
         // Check file size before downloading
         let max_bytes = self.max_file_size_mb * 1_048_576;
+        let file_size = file.file_size.unwrap_or(0);
         if file_size > max_bytes {
             anyhow::bail!(
                 "File too large ({:.1} MB). Maximum is {} MB.",
@@ -2022,27 +1980,23 @@ impl TelegramChannel {
             );
         }
 
-        // Get file info from Telegram
-        let file = bot.get_file(file_id).await?;
-        let file_path_on_server = file.path;
-
-        // Download via HTTP (simpler than teloxide's Download trait)
-        let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path_on_server
-        );
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap_or_default();
-        let response = client.get(&download_url).send().await?;
-        if !response.status().is_success() {
+        let bytes = self
+            .sdk_transport()
+            .download(&aidaemon_channels::Attachment {
+                name: filename.clone(),
+                mime_type: Some(mime_type.clone()),
+                size_bytes: file.file_size,
+                source: file.file_id.clone(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download file from Telegram: {e}"))?;
+        if bytes.len() as u64 > max_bytes {
             anyhow::bail!(
-                "Failed to download file from Telegram: HTTP {}",
-                response.status()
+                "File too large ({:.1} MB). Maximum is {} MB.",
+                bytes.len() as f64 / 1_048_576.0,
+                self.max_file_size_mb
             );
         }
-        let bytes = response.bytes().await?;
 
         let (filename, mime_type) = if msg.photo().is_some() {
             super::attachments::telegram_photo_filename_and_mime(&bytes)
@@ -3645,13 +3599,8 @@ impl TelegramChannel {
                     let bot_info = match bot.channel_type.as_str() {
                         "telegram" => {
                             // Try to get username for display
-                            let test_bot = Bot::new(&bot.bot_token);
-                            match test_bot.get_me().await {
-                                Ok(me) => {
-                                    let username = me
-                                        .username
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
+                            match super::connect::validate_telegram_token(&bot.bot_token).await {
+                                Ok(username) => {
                                     format!("• telegram:@{} (id: {})", username, bot.id)
                                 }
                                 Err(_) => format!("• telegram:<invalid token> (id: {})", bot.id),
@@ -3873,7 +3822,7 @@ impl TelegramChannel {
     async fn handle_continue_on_computer_action(
         &self,
         bot: &Bot,
-        msg: &teloxide::types::Message,
+        msg: &super::telegram_api::Message,
         user_id: u64,
         relay_session_id: Option<String>,
     ) {
@@ -4114,7 +4063,7 @@ impl TelegramChannel {
             .await;
     }
 
-    async fn handle_message(self: &Arc<Self>, msg: teloxide::types::Message, bot: Bot) {
+    async fn handle_message(self: &Arc<Self>, msg: super::telegram_api::Message, bot: Bot) {
         let transport_received_at = chrono::Utc::now();
         let ingress_timing =
             crate::runtime_ports::InboundMessageTiming::new(Some(msg.date), transport_received_at);
@@ -4125,7 +4074,7 @@ impl TelegramChannel {
         // message becomes the owner. Group messages are rejected until an
         // owner is established, preventing someone from claiming ownership
         // by adding the bot to a group.
-        let is_private = matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_));
+        let is_private = msg.chat.is_private();
         let auth_result = {
             let allowed = self
                 .allowed_user_ids
@@ -4280,7 +4229,7 @@ impl TelegramChannel {
                 || msg.video().is_some()
                 || msg.voice().is_some())
         {
-            match self.handle_file_message(&msg, &bot).await {
+            match self.handle_file_message(&msg).await {
                 Ok(attachment) => inbound_attachments.push(attachment),
                 Err(e) => {
                     let _ = bot
@@ -4369,20 +4318,12 @@ impl TelegramChannel {
 
         // Build channel context from Telegram chat type
         let channel_ctx = {
-            use teloxide::types::{ChatKind, PublicChatKind};
-            let visibility = match &msg.chat.kind {
-                ChatKind::Private(_) => ChannelVisibility::Private,
-                ChatKind::Public(public) => match &public.kind {
-                    PublicChatKind::Group => ChannelVisibility::PrivateGroup,
-                    PublicChatKind::Supergroup(sg) => {
-                        if sg.username.is_some() {
-                            ChannelVisibility::Public
-                        } else {
-                            ChannelVisibility::PrivateGroup
-                        }
-                    }
-                    PublicChatKind::Channel(_) => ChannelVisibility::Public,
-                },
+            // A supergroup with a public username is public; a channel always.
+            let visibility = match msg.chat.kind.as_str() {
+                "private" => ChannelVisibility::Private,
+                "supergroup" if msg.chat.username.is_some() => ChannelVisibility::Public,
+                "channel" => ChannelVisibility::Public,
+                _ => ChannelVisibility::PrivateGroup,
             };
             ChannelContext {
                 visibility,
@@ -4605,31 +4546,6 @@ impl TurnSurface for TelegramSurface {
     }
 }
 
-/// A Bot API update as teloxide's type. teloxide reads `update_id` before
-/// the update's kind and a `serde_json::Value` keeps its keys sorted
-/// (`message` before `update_id`), so the text is rebuilt with `update_id`
-/// first.
-fn parse_update(raw: serde_json::Value) -> serde_json::Result<teloxide::types::Update> {
-    let serde_json::Value::Object(mut fields) = raw else {
-        return serde_json::from_value(raw);
-    };
-    let mut text = String::from("{");
-    if let Some(id) = fields.remove("update_id") {
-        text.push_str("\"update_id\":");
-        text.push_str(&id.to_string());
-    }
-    for (key, value) in fields {
-        if text.len() > 1 {
-            text.push(',');
-        }
-        text.push_str(&serde_json::Value::String(key).to_string());
-        text.push(':');
-        text.push_str(&value.to_string());
-    }
-    text.push('}');
-    serde_json::from_str(&text)
-}
-
 fn fallback_session_namespace_from_token(bot_token: &str) -> String {
     let raw_id = bot_token
         .split_once(':')
@@ -4698,22 +4614,19 @@ impl HubChannel for TelegramChannel {
         // carries markdown). Fall back to a plain send if Telegram rejects the
         // HTML. The returned message id is captured for later in-place editing.
         let html = markdown_to_telegram_html(text);
-        let msg = match retry_telegram_rate_limit(|| {
-            self.bot
-                .send_message(ChatId(chat_id), &html)
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(disabled_link_preview())
-        })
-        .await
+        let msg = match self
+            .bot
+            .send_message(ChatId(chat_id), &html)
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
+            .await
         {
             Ok(m) => m,
             Err(_) => {
-                retry_telegram_rate_limit(|| {
-                    self.bot
-                        .send_message(ChatId(chat_id), text)
-                        .link_preview_options(disabled_link_preview())
-                })
-                .await?
+                self.bot
+                    .send_message(ChatId(chat_id), text)
+                    .link_preview_options(disabled_link_preview())
+                    .await?
             }
         };
         Ok(Some(msg.id.0.to_string()))
@@ -4745,7 +4658,7 @@ impl HubChannel for TelegramChannel {
         let html = markdown_to_telegram_html(text);
         match self
             .bot
-            .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), &html)
+            .edit_message_text(ChatId(chat_id), MessageId(mid), &html)
             .parse_mode(ParseMode::Html)
             .link_preview_options(disabled_link_preview())
             .await
@@ -4756,7 +4669,7 @@ impl HubChannel for TelegramChannel {
             Err(e) if e.to_string().contains("message is not modified") => Ok(true),
             Err(_) => match self
                 .bot
-                .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
+                .edit_message_text(ChatId(chat_id), MessageId(mid), text)
                 .link_preview_options(disabled_link_preview())
                 .await
             {
@@ -4781,13 +4694,11 @@ impl HubChannel for TelegramChannel {
             Ok(v) => v,
             Err(_) => return Ok(false),
         };
-        retry_telegram_rate_limit(|| {
-            self.bot
-                .delete_message(ChatId(chat_id), teloxide::types::MessageId(mid))
-        })
-        .await
-        .map(|_| true)
-        .map_err(Into::into)
+        self.bot
+            .delete_message(ChatId(chat_id), MessageId(mid))
+            .await
+            .map(|_| true)
+            .map_err(Into::into)
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
@@ -4800,31 +4711,37 @@ impl HubChannel for TelegramChannel {
                     .copied()
                     .unwrap_or(0) as i64
             });
-        match &media.kind {
-            MediaKind::Photo { data } => {
-                let photo = InputFile::memory(data.clone()).file_name("screenshot.png");
-                retry_telegram_rate_limit(|| {
-                    self.bot
-                        .send_photo(ChatId(chat_id), photo.clone())
-                        .caption(&media.caption)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
-            }
+        let (name, bytes, mime_type) = match &media.kind {
+            MediaKind::Photo { data } => (
+                "screenshot.png".to_string(),
+                data.clone(),
+                Some("image/png".to_string()),
+            ),
             MediaKind::Document {
                 file_path,
                 filename,
-            } => {
-                let doc = InputFile::file(file_path).file_name(filename.clone());
-                let mut req = self.bot.send_document(ChatId(chat_id), doc);
-                if !media.caption.is_empty() {
-                    req = req.caption(&media.caption);
-                }
-                retry_telegram_rate_limit(|| req.clone())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send document: {}", e))?;
-            }
-        }
+            } => (filename.clone(), tokio::fs::read(file_path).await?, None),
+        };
+        let conversation = aidaemon_channels::Conversation {
+            id: chat_id.to_string(),
+            kind: if chat_id > 0 {
+                aidaemon_channels::ConversationKind::Direct
+            } else {
+                aidaemon_channels::ConversationKind::Group
+            },
+        };
+        self.sdk_transport()
+            .send_file(
+                &conversation,
+                &aidaemon_channels::OutboundFile {
+                    name,
+                    bytes,
+                    mime_type,
+                    caption: (!media.caption.is_empty()).then(|| media.caption.clone()),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;
         Ok(())
     }
 
@@ -4900,43 +4817,22 @@ async fn send_html_or_fallback(
     chat_id: ChatId,
     html: &str,
     plain: &str,
-) -> Result<teloxide::types::Message, teloxide::RequestError> {
-    match retry_telegram_rate_limit(|| {
-        bot.send_message(chat_id, html)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(disabled_link_preview())
-    })
-    .await
+) -> Result<super::telegram_api::Message, RequestError> {
+    match bot
+        .send_message(chat_id, html)
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(disabled_link_preview())
+        .await
     {
         Ok(message) => Ok(message),
         Err(e) => {
             warn!("HTML send failed, falling back to plain text: {}", e);
-            let message = retry_telegram_rate_limit(|| {
-                bot.send_message(chat_id, plain)
-                    .link_preview_options(disabled_link_preview())
-            })
-            .await?;
+            let message = bot
+                .send_message(chat_id, plain)
+                .link_preview_options(disabled_link_preview())
+                .await?;
             Ok(message)
         }
-    }
-}
-
-async fn retry_telegram_rate_limit<Op, Req, T>(mut op: Op) -> Result<T, RequestError>
-where
-    Op: FnMut() -> Req,
-    Req: std::future::IntoFuture<Output = Result<T, RequestError>>,
-{
-    match op().into_future().await {
-        Ok(value) => Ok(value),
-        Err(RequestError::RetryAfter(after)) => {
-            let delay = crate::channels::rate_limit::bounded_retry_after(
-                after.duration(),
-                crate::channels::rate_limit::default_retry_after_cap(),
-            );
-            crate::channels::rate_limit::sleep_after_rate_limit("telegram", delay).await;
-            op().into_future().await
-        }
-        Err(err) => Err(err),
     }
 }
 

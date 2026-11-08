@@ -443,9 +443,7 @@ Order:
         - Slack (`fda3475`): on both, the hand-written Socket Mode client
           deleted; the message path is tested against a mock Web API;
         - Telegram (`0fa59fe`): on both; the teloxide dispatcher, its
-          poll-health watchdog and the HTML approval builders deleted.
-          Only inbound moved: teloxide stays as its HTTP client and its
-          types (see below);
+          poll-health watchdog and the HTML approval builders deleted;
         - the `[channels]` switch is gone (`3a9a7ff`) and the daemon's
           `Channel` trait is `HubChannel` (`95f552c`), the hub's outbound
           surface over an SDK transport.
@@ -455,15 +453,16 @@ Order:
         platform behavior: Slack workspace grants, mention resolution and
         `file_shared` hydration (it still reads raw envelopes), Telegram's
         web app, terminal and setup commands.
-        Telegram is not off teloxide. Inbound updates come from the
-        adapter, but they are parsed into teloxide's `Update`/`Message`
-        types, every handler reads those types, and every outbound call
-        (replies, typing, the live status message, files, callback answers,
-        `/setup`, `/connect`, web-app buttons) goes through teloxide's
-        `Bot`. `src/wizard.rs` and `src/channels/connect.rs` use it too.
-        Removing teloxide means moving those calls onto the adapter (or its
-        Bot API client) and the handlers onto the adapter's own message
-        type: a project of its own, not a cleanup.
+        Telegram off teloxide (2026-11-08): the dependency is gone. The
+        bot reads updates and messages as `channels::telegram_api` types
+        (serde over the Bot API's own JSON, so key order no longer matters
+        and `parse_update` is gone), and every call it makes goes through
+        the adapter: replies, typing, the live status message, callback
+        answers, reply keyboards and web-app buttons with `call_bot_api`;
+        files with the adapter's `send_file` (pictures now go as
+        `sendPhoto`) and `download` (which uses the configured API base
+        instead of a hardcoded host); `/connect` and `/bots` token checks
+        with `getMe`.
 - [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
       scenario format and the trajectory assertions are duplicated.
       `src/harness_eval/report.rs` formats live telemetry and is not a

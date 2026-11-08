@@ -24,8 +24,7 @@ struct MockApi {
 }
 
 async fn handler(State(mock): State<Arc<MockApi>>, uri: Uri, body: Bytes) -> Json<Value> {
-    // teloxide names methods in PascalCase (`SendMessage`), the adapter in
-    // camelCase (`getUpdates`).
+    // Bot API method names are matched case-insensitively.
     let method = uri
         .path()
         .rsplit('/')
@@ -274,32 +273,4 @@ async fn an_update_received_by_the_sdk_adapter_reaches_the_daemons_handler() {
         "polling clears a stale webhook first"
     );
     assert!(calls.iter().any(|(method, _)| method == "getupdates"));
-}
-
-/// Updates arrive as `serde_json::Value`, whose keys are sorted; teloxide
-/// needs `update_id` first. Without the rebuild every update parses as an
-/// unknown kind and is never handled.
-#[test]
-fn updates_handed_over_as_values_parse_as_teloxide_updates() {
-    let raw = json!({
-        "update_id": 1,
-        "message": {
-            "message_id": 10,
-            "date": 1700000000,
-            "chat": { "id": OWNER, "type": "private", "first_name": "Alice" },
-            "from": { "id": OWNER, "is_bot": false, "first_name": "Alice", "last_name": "Rivera" },
-            "text": "/help"
-        }
-    });
-    let naive = serde_json::from_value::<teloxide::types::Update>(raw.clone()).unwrap();
-    assert!(
-        matches!(naive.kind, teloxide::types::UpdateKind::Error(_)),
-        "if teloxide stops needing the order, parse_update can go"
-    );
-    let update = parse_update(raw).unwrap();
-    assert_eq!(update.id.0, 1);
-    assert!(matches!(
-        update.kind,
-        teloxide::types::UpdateKind::Message(_)
-    ));
 }

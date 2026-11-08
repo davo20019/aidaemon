@@ -130,7 +130,7 @@ async fn json_handler(mock: Arc<Mock>, path: &str, body: Bytes) -> impl IntoResp
             tokio::time::sleep(Duration::from_millis(50)).await;
             json!([])
         }
-        "sendMessage" | "sendDocument" => {
+        "sendMessage" | "sendDocument" | "sendPhoto" => {
             json!({ "message_id": 5000 + mock.next_message_id.fetch_add(1, Ordering::SeqCst) })
         }
         "getFile" => json!({ "file_id": "synthetic-file", "file_path": "documents/notes.txt" }),
@@ -887,6 +887,31 @@ async fn send_file_uploads_a_document_with_a_plain_caption() {
         "the caption is plain text: {raw}"
     );
     assert!(raw.contains(&DM_CHAT.to_string()));
+}
+
+#[tokio::test]
+async fn a_picture_is_sent_as_a_photo() {
+    let (mock, base) = start_mock().await;
+    let conversation = Conversation {
+        id: DM_CHAT.to_string(),
+        kind: ConversationKind::Direct,
+    };
+    channel(&base)
+        .send_file(
+            &conversation,
+            &aidaemon_channels::OutboundFile {
+                name: "screenshot.png".to_string(),
+                bytes: b"synthetic png".to_vec(),
+                mime_type: Some("image/png".to_string()),
+                caption: None,
+            },
+        )
+        .await
+        .unwrap();
+    let calls = mock.calls("sendPhoto");
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].raw.contains("name=\"photo\""), "{}", calls[0].raw);
+    assert!(mock.calls("sendDocument").is_empty());
 }
 
 #[tokio::test]

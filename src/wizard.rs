@@ -660,9 +660,9 @@ fn build_low_latency_plans_for_all_bots(
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|| format!("/telegram/{}", bot.slug));
         let base_url = format!("https://{}.{}", label, normalized_domain);
-        // The public_url must include the path because teloxide sends it
-        // verbatim to Telegram's setWebhook. Without the path, Telegram
-        // delivers updates to "/" while our axum listener expects "/telegram/<slug>".
+        // The public_url must include the path: it goes verbatim to
+        // Telegram's setWebhook and the listener serves that path. Without
+        // it, Telegram delivers updates to "/" instead of "/telegram/<slug>".
         let public_url = format!("{}{}", base_url, path);
         plans.push(TelegramWebhookPlan {
             target: bot.target,
