@@ -187,8 +187,8 @@ adapters, tested against local mock servers.
 
 Status: 8.1, 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-3 of 10; 8.8
 providers done and MCP transport moved, channels on the SDK adapters; 8.5-8.7,
-8.7b and 8.9 open. Next: 8.5 (in-tool approvals) and 8.6 (declines between
-parent and child runs), which close safety gaps. 8.4, 8.8 (MCP and store) and
+8.7b and 8.9 open (8.6's declines between parent and child runs are done).
+Next: 8.5 (in-tool approvals), which closes safety gaps. 8.4, 8.8 (MCP and store) and
 8.9 move working code between crates and wait for a second user of the SDK.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
@@ -324,11 +324,18 @@ Order:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
-      `AgentBuilder`. Includes child→parent decline propagation (a child's
-      Deny does not reach its parent today) and kernel-level decline
-      inheritance (the kernel passes a run's declines to its children
-      directly, including children already running when the parent
-      declines; today the daemon seeds them only at spawn).
+      `AgentBuilder`. Done 2026-11-07: declines move both ways between
+      parent and child runs. `c98314c`: kernel `SharedDeclines`, attached
+      with `RunState::share_declines` and exchanged with the run's own
+      `declined` at turn start, before each call is judged, on a decline
+      and at run end (a child's decline refuses the parent's overlapping
+      calls with `[OWNER DECLINED]`; a parent's later decline reaches a
+      running child; a parent whose child was declined never ends
+      `Succeeded`). `fd163cd`: each daemon turn attaches one, a child turn
+      takes its parent's through `InheritedAuthority::shared_declines`, a
+      root turn or root goal dispatch starts its own; a run recovered after
+      a restart shares none. Remaining: children assembled through
+      `AgentBuilder`.
 - [ ] 8.7 Authority Phase 4 (end check, typed final outcome, budgets) and
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
