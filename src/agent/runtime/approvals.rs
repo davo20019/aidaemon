@@ -2159,6 +2159,66 @@ mod tests {
         }
     }
 
+    /// A scheduled goal that runs the agent is confirmed by the owner on a
+    /// goal card before anything is created, in every session; a reminder,
+    /// a guest's call and an internal run need no card (the call answers
+    /// them without creating a goal).
+    #[tokio::test]
+    async fn scheduled_goal_asks_before_dispatch_on_a_goal_card() {
+        let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ManageMemoriesTool::new(
+            approval_test_store().await as Arc<dyn crate::traits::StateStore>,
+        ));
+        let goal = json!({
+            "action": "create_scheduled_goal",
+            "goal": "Check API health",
+            "schedule": "every 6h"
+        });
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                trusted_session: trusted,
+                ..rules_over(tool.clone())
+            };
+            let call = sdk::ToolCall::new("c1", "manage_memories", goal.clone());
+            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &call, &tool_info()).await
+            else {
+                panic!("a scheduled goal must ask (trusted={trusted})");
+            };
+            assert_eq!(request.summary, "Check API health");
+            assert!(matches!(
+                rules.card_kind("manage_memories", &request),
+                crate::types::ApprovalKind::GoalConfirmation
+            ));
+            let mut reminder = goal.clone();
+            reminder["reminder"] = json!("Check the API.");
+            let call = sdk::ToolCall::new("c2", "manage_memories", reminder);
+            assert_eq!(
+                rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                RuleDecision::Allow
+            );
+            let call = sdk::ToolCall::new("c3", "manage_memories", json!({"action": "list"}));
+            assert_eq!(
+                rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                RuleDecision::Allow
+            );
+        }
+        for rules in [
+            AppApprovalRules {
+                user_role: Some(crate::types::UserRole::Guest),
+                ..rules_over(tool.clone())
+            },
+            AppApprovalRules {
+                channel_visibility: Some(crate::types::ChannelVisibility::Internal),
+                ..rules_over(tool.clone())
+            },
+        ] {
+            let call = sdk::ToolCall::new("c4", "manage_memories", goal.clone());
+            assert_eq!(
+                rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                RuleDecision::Allow
+            );
+        }
+    }
+
     #[test]
     fn configured_secrets_never_print() {
         let secrets = ConfiguredSecrets::new(vec!["synthetic-token-123456".to_string()]);

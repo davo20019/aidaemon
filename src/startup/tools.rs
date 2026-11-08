@@ -1166,7 +1166,7 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
-            tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            tool: Arc::new(ManageMemoriesTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::SetReminder => BuiltBaseTool {

@@ -5,14 +5,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     semantics_for_exact_read_actions, StateStore, Tool, ToolArgumentContractViolation,
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus,
 };
-use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy, UserRole};
+use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
 /// boundary. Structured fact keys carry their words behind `_`, `-`, `:` and
@@ -126,20 +124,276 @@ fn merge_search_results(
 
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
-    approval_tx: Option<ApprovalBroker>,
+}
+
+/// One parsed schedule of a `create_scheduled_goal` call.
+struct ParsedSchedule {
+    original: String,
+    cron: String,
+    is_one_shot: bool,
+    next_local: chrono::DateTime<chrono::Local>,
+}
+
+/// A validated `create_scheduled_goal` call, before anything is stored.
+struct ScheduledGoalPlan {
+    desc: String,
+    session_id: String,
+    parsed: Vec<ParsedSchedule>,
+    fire_policy: String,
+    reminder: Option<String>,
+    next_run: String,
+    tz_label: String,
+    /// The exact arguments the owner approves (the approval subject).
+    subject: String,
+}
+
+/// What `create_scheduled_goal` does before storing anything: store the
+/// plan, or answer without storing anything.
+enum ScheduledGoalPrep {
+    Plan(ScheduledGoalPlan),
+    Answer(String),
+}
+
+impl ScheduledGoalPlan {
+    /// The owner confirms a scheduled goal that runs the agent; a typed
+    /// reminder runs no agent and only messages the owner, so it needs none.
+    fn needs_owner_approval(&self) -> bool {
+        self.reminder.is_none()
+    }
+
+    /// The card the owner confirms the goal with, as the tool asked before.
+    fn approval_request(&self) -> aidaemon_core::OwnerApprovalRequest {
+        aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: self.desc.clone(),
+            subject: self.subject.clone(),
+            risk: aidaemon_core::ApprovalRisk::Medium,
+            warnings: vec![
+                format!("{} schedule(s)", self.parsed.len()),
+                format!("Next: {}", self.next_run),
+                format!("System timezone: {}", self.tz_label),
+            ],
+        }
+    }
 }
 
 impl ManageMemoriesTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self {
-            state,
-            approval_tx: None,
-        }
+        Self { state }
     }
 
-    pub fn with_approval_tx(mut self, tx: ApprovalBroker) -> Self {
-        self.approval_tx = Some(tx);
-        self
+    /// Validate a `create_scheduled_goal` call with the dispatcher's facts
+    /// and the stored goals, exactly as the call does before it stores
+    /// anything. Shared by the call and its approval judgment, so the owner
+    /// is asked only about a goal the call would create.
+    async fn prepare_scheduled_goal(
+        &self,
+        args: &ManageArgs,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<ScheduledGoalPrep> {
+        use self::ScheduledGoalPrep::Answer;
+        let is_owner = facts.user_role == Some(UserRole::Owner);
+        if !is_owner {
+            return Ok(Answer(
+                "Only owners can create scheduled goals.".to_string(),
+            ));
+        }
+
+        let session_id = facts.session().unwrap_or("");
+        if session_id.trim().is_empty() {
+            return Ok(Answer("Internal error: create_scheduled_goal: the session fact is missing from the call context.".to_string()));
+        }
+        let is_internal_visibility = facts.channel_visibility == Some(ChannelVisibility::Internal);
+        // `sub-` is the legacy child-session prefix (replaced by
+        // `specialist:`); accept both so an in-flight legacy session
+        // can't bypass this guard.
+        if is_internal_visibility
+            || session_id.starts_with("sub-")
+            || session_id.starts_with("specialist:")
+        {
+            return Ok(Answer("Cannot create scheduled goals from within internal scheduled-task execution. Execute the task directly instead.".to_string()));
+        }
+
+        let raw_desc = args
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("'goal' is required for create_scheduled_goal action")
+            })?;
+
+        // Strict-schema providers send every field, so an unused
+        // `schedules` arrives as `[]` beside the real `schedule`.
+        let mut schedule_inputs: Vec<String> = args
+            .schedules
+            .iter()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if schedule_inputs.is_empty() {
+            if let Some(schedule) = args.schedule.as_deref().map(str::trim) {
+                if !schedule.is_empty() {
+                    schedule_inputs.push(schedule.to_string());
+                }
+            }
+        }
+        if schedule_inputs.is_empty() {
+            anyhow::bail!(
+                "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
+            );
+        }
+
+        // Keep tool-path descriptions aligned with fast-path scheduling:
+        // remove explicit schedule phrases and leading filler prompts.
+        let mut desc = raw_desc.to_string();
+        for schedule_raw in &schedule_inputs {
+            desc = crate::cron_utils::clean_task_description(&desc, schedule_raw);
+        }
+        desc = crate::cron_utils::clean_task_description(&desc, "");
+        if desc.trim().is_empty() {
+            desc = raw_desc.to_string();
+        }
+
+        // Parse schedules first so we don't create partial goals on failure.
+        let mut parsed = Vec::new();
+        for schedule_raw in &schedule_inputs {
+            let cron_expr = match crate::cron_utils::parse_schedule(schedule_raw) {
+                Ok(expr) => expr,
+                Err(e) => {
+                    return Ok(Answer(format!(
+                        "Couldn't parse schedule '{}': {}",
+                        schedule_raw, e
+                    )))
+                }
+            };
+            let next_local = match crate::cron_utils::compute_next_run_local(&cron_expr) {
+                Ok(dt) => dt,
+                Err(e) => {
+                    return Ok(Answer(format!(
+                        "Couldn't compute next run for '{}': {}",
+                        cron_expr, e
+                    )))
+                }
+            };
+            let is_one_shot = args
+                .is_one_shot
+                .unwrap_or_else(|| crate::cron_utils::is_one_shot_schedule(&cron_expr));
+            parsed.push(ParsedSchedule {
+                original: schedule_raw.to_string(),
+                cron: cron_expr,
+                is_one_shot,
+                next_local,
+            });
+        }
+
+        // Prevent duplicate schedules when the model repeats the same create request.
+        let target_desc = Self::canonicalize_schedule_goal_description(&desc);
+        let target_crons: BTreeSet<String> = parsed
+            .iter()
+            .map(|p| p.cron.trim().to_ascii_lowercase())
+            .collect();
+        let existing_goals = self.state.get_scheduled_goals().await.unwrap_or_default();
+        for existing in existing_goals {
+            if existing.session_id != session_id {
+                continue;
+            }
+            if !matches!(
+                existing.status.as_str(),
+                "active" | "pending_confirmation" | "paused"
+            ) {
+                continue;
+            }
+            if Self::canonicalize_schedule_goal_description(&existing.description) != target_desc {
+                continue;
+            }
+            let existing_schedules = self
+                .state
+                .get_schedules_for_goal(&existing.id)
+                .await
+                .unwrap_or_default();
+            let existing_crons: BTreeSet<String> = existing_schedules
+                .iter()
+                .map(|s| s.cron_expr.trim().to_ascii_lowercase())
+                .collect();
+            if !existing_crons.is_empty() && existing_crons == target_crons {
+                return Ok(Answer(format!(
+                    "A similar scheduled goal already exists ({}). Use list_scheduled to inspect existing goals.",
+                    existing.id
+                )));
+            }
+        }
+
+        // Checked before anything is stored, so an invalid policy leaves no
+        // half-created goal behind.
+        let fire_policy = match args.fire_policy.as_deref() {
+            Some("always_fire") => "always_fire".to_string(),
+            Some("coalesce") | None => "coalesce".to_string(),
+            Some(other) => {
+                return Ok(Answer(format!(
+                    "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
+                    other
+                )))
+            }
+        };
+        let reminder = args
+            .reminder
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_string);
+
+        let tz_label = crate::cron_utils::system_timezone_display();
+        let next_run = parsed
+            .iter()
+            .map(|p| p.next_local)
+            .min_by_key(|dt| dt.timestamp())
+            .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let subject = json!({
+            "action": "create_scheduled_goal",
+            "goal": desc,
+            "schedules": parsed.iter().map(|p| p.cron.clone()).collect::<Vec<_>>(),
+            "one_shot": parsed.iter().map(|p| p.is_one_shot).collect::<Vec<_>>(),
+            "fire_policy": fire_policy,
+            "is_paused": args.is_paused.unwrap_or(false),
+        })
+        .to_string();
+        Ok(ScheduledGoalPrep::Plan(ScheduledGoalPlan {
+            desc,
+            session_id: session_id.to_string(),
+            parsed,
+            fire_policy,
+            reminder,
+            next_run,
+            tz_label,
+            subject,
+        }))
+    }
+
+    /// The owner approval one call needs: a scheduled goal that runs the
+    /// agent is confirmed by the owner before it is created, whatever the
+    /// session; a reminder and every call the tool answers without creating
+    /// a goal need none.
+    pub(crate) async fn owner_approval(
+        &self,
+        arguments: &Value,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        let Ok(args) = serde_json::from_value::<ManageArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if args.action != "create_scheduled_goal" {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        match self.prepare_scheduled_goal(&args, facts).await {
+            Ok(ScheduledGoalPrep::Plan(plan)) if plan.needs_owner_approval() => {
+                OwnerApprovalNeed::Ask(plan.approval_request())
+            }
+            _ => OwnerApprovalNeed::NotNeeded,
+        }
     }
 
     /// Resolve a goal identifier provided by the model/user.
@@ -430,6 +684,15 @@ impl Tool for ManageMemoriesTool {
         manage_memories_schema()
     }
 
+    /// A scheduled goal is confirmed on a goal card (Approve & activate /
+    /// Cancel), which offers no session or persistent grant.
+    fn approval_card_kind(
+        &self,
+        _request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        crate::types::ApprovalKind::GoalConfirmation
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.run(arguments, &ToolCallContext::default()).await
     }
@@ -452,7 +715,22 @@ impl Tool for ManageMemoriesTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageMemoriesTool {
+    /// A scheduled goal that runs the agent is confirmed by the owner
+    /// before it is created. The dispatcher runs the call only with that
+    /// answer; a decline is recorded by the kernel and creates nothing.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        self.owner_approval(call.arguments, facts).await
+    }
+
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
@@ -522,7 +800,10 @@ impl crate::traits::ToolSemantics for ManageMemoriesTool {
 
     /// Reads, `repair` and `forget` touch only the agent's own memory store.
     /// `set_privacy` widens who may see a fact, and the goal and schedule
-    /// actions start or schedule work, so those stay undeclared.
+    /// actions start or schedule work, so those stay undeclared. A declined
+    /// `create_scheduled_goal` (no typed target to name: the work it
+    /// schedules is open-ended) is recorded by its approval subject, so the
+    /// identical goal is not put to the owner again.
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
         match action_of(arguments).as_deref() {
             Some(
@@ -1141,176 +1422,45 @@ impl ManageMemoriesTool {
                 Ok(format!("Goal {} marked as abandoned. It will not be re-created by automatic analysis.", resolved_goal_id))
             }
             "create_scheduled_goal" => {
-                let is_owner = facts.user_role == Some(UserRole::Owner);
-                if !is_owner {
-                    return Ok("Only owners can create scheduled goals.".to_string());
-                }
-
-                let session_id = facts.session().unwrap_or("");
-                if session_id.trim().is_empty() {
-                    return Ok("Internal error: create_scheduled_goal: the session fact is missing from the call context.".to_string());
-                }
-                let is_internal_visibility = facts.channel_visibility == Some(ChannelVisibility::Internal);
-                // `sub-` is the legacy child-session prefix (replaced by
-                // `specialist:`); accept both so an in-flight legacy session
-                // can't bypass this guard.
-                if is_internal_visibility
-                    || session_id.starts_with("sub-")
-                    || session_id.starts_with("specialist:")
+                let plan = match self.prepare_scheduled_goal(&args, facts).await? {
+                    ScheduledGoalPrep::Answer(answer) => return Ok(answer),
+                    ScheduledGoalPrep::Plan(plan) => plan,
+                };
+                // The owner confirmed this goal through the agent kernel
+                // (`owner_approval_request`) before the call ran. Outside
+                // the kernel nothing is created.
+                if plan.needs_owner_approval()
+                    && facts.kernel_approved != Some(crate::traits::ApprovalScope::Call)
                 {
-                    return Ok("Cannot create scheduled goals from within internal scheduled-task execution. Execute the task directly instead.".to_string());
-                }
-
-                let raw_desc = args
-                    .goal
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_scheduled_goal action"))?;
-
-                // Strict-schema providers send every field, so an unused
-                // `schedules` arrives as `[]` beside the real `schedule`.
-                let mut schedule_inputs: Vec<String> = args
-                    .schedules
-                    .iter()
-                    .flatten()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if schedule_inputs.is_empty() {
-                    if let Some(schedule) = args.schedule.as_deref().map(str::trim) {
-                        if !schedule.is_empty() {
-                            schedule_inputs.push(schedule.to_string());
-                        }
-                    }
-                }
-                if schedule_inputs.is_empty() {
                     anyhow::bail!(
-                        "'schedule' (or a non-empty 'schedules' list) is required for create_scheduled_goal"
+                        "manage_memories create_scheduled_goal requires approval through the \
+                         agent kernel; it was called outside an approved agent call"
                     );
                 }
-
-                // Keep tool-path descriptions aligned with fast-path scheduling:
-                // remove explicit schedule phrases and leading filler prompts.
-                let mut desc = raw_desc.to_string();
-                for schedule_raw in &schedule_inputs {
-                    desc = crate::cron_utils::clean_task_description(&desc, schedule_raw);
-                }
-                desc = crate::cron_utils::clean_task_description(&desc, "");
-                if desc.trim().is_empty() {
-                    desc = raw_desc.to_string();
-                }
-
-                // Parse schedules first so we don't create partial goals on failure.
-                struct ParsedSchedule {
-                    original: String,
-                    cron: String,
-                    is_one_shot: bool,
-                    next_local: chrono::DateTime<chrono::Local>,
-                }
-                let mut parsed = Vec::new();
-                for schedule_raw in &schedule_inputs {
-                    let cron_expr = match crate::cron_utils::parse_schedule(schedule_raw) {
-                        Ok(expr) => expr,
-                        Err(e) => {
-                            return Ok(format!(
-                                "Couldn't parse schedule '{}': {}",
-                                schedule_raw, e
-                            ))
-                        }
-                    };
-                    let next_local = match crate::cron_utils::compute_next_run_local(&cron_expr) {
-                        Ok(dt) => dt,
-                        Err(e) => {
-                            return Ok(format!(
-                                "Couldn't compute next run for '{}': {}",
-                                cron_expr, e
-                            ))
-                        }
-                    };
-                    let is_one_shot = args
-                        .is_one_shot
-                        .unwrap_or_else(|| crate::cron_utils::is_one_shot_schedule(&cron_expr));
-                    parsed.push(ParsedSchedule {
-                        original: schedule_raw.to_string(),
-                        cron: cron_expr,
-                        is_one_shot,
-                        next_local,
-                    });
-                }
-
-                // Prevent duplicate schedules when the model repeats the same create request.
-                let target_desc = Self::canonicalize_schedule_goal_description(&desc);
-                let target_crons: BTreeSet<String> = parsed
-                    .iter()
-                    .map(|p| p.cron.trim().to_ascii_lowercase())
-                    .collect();
-                let existing_goals = self.state.get_scheduled_goals().await.unwrap_or_default();
-                let mut duplicate_goal_id: Option<String> = None;
-                for existing in existing_goals {
-                    if existing.session_id != session_id {
-                        continue;
-                    }
-                    if !matches!(
-                        existing.status.as_str(),
-                        "active" | "pending_confirmation" | "paused"
-                    ) {
-                        continue;
-                    }
-                    if Self::canonicalize_schedule_goal_description(&existing.description)
-                        != target_desc
-                    {
-                        continue;
-                    }
-                    let existing_schedules = self
-                        .state
-                        .get_schedules_for_goal(&existing.id)
-                        .await
-                        .unwrap_or_default();
-                    let existing_crons: BTreeSet<String> = existing_schedules
-                        .iter()
-                        .map(|s| s.cron_expr.trim().to_ascii_lowercase())
-                        .collect();
-                    if !existing_crons.is_empty() && existing_crons == target_crons {
-                        duplicate_goal_id = Some(existing.id.clone());
-                        break;
-                    }
-                }
-                if let Some(existing_id) = duplicate_goal_id {
-                    return Ok(format!(
-                        "A similar scheduled goal already exists ({}). Use list_scheduled to inspect existing goals.",
-                        existing_id
-                    ));
-                }
+                let ScheduledGoalPlan {
+                    desc,
+                    session_id,
+                    parsed,
+                    fire_policy,
+                    reminder,
+                    next_run,
+                    tz_label,
+                    subject: _,
+                } = plan;
 
                 let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
                 let mut goal = if has_recurring {
-                    crate::traits::Goal::new_continuous_pending(&desc, session_id, None, None)
+                    crate::traits::Goal::new_continuous_pending(&desc, &session_id, None, None)
                 } else {
-                    crate::traits::Goal::new_deferred_finite(&desc, session_id)
+                    crate::traits::Goal::new_deferred_finite(&desc, &session_id)
                 };
                 goal.domain = "orchestration".to_string();
-                let reminder_message = args
-                    .reminder
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|message| !message.is_empty());
-                if let Some(message) = reminder_message {
+                if let Some(message) = reminder.as_deref() {
                     goal.context = Some(crate::reminders::context_for_message(message));
                 }
 
                 self.state.create_goal(&goal).await?;
 
-                let fire_policy = match args.fire_policy.as_deref() {
-                    Some("always_fire") => "always_fire".to_string(),
-                    Some("coalesce") | None => "coalesce".to_string(),
-                    Some(other) => {
-                        return Ok(format!(
-                            "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
-                            other
-                        ))
-                    }
-                };
                 let paused = args.is_paused.unwrap_or(false);
                 let now = chrono::Utc::now().to_rfc3339();
 
@@ -1334,18 +1484,10 @@ impl ManageMemoriesTool {
                     self.state.create_goal_schedule(&schedule).await?;
                 }
 
-                let tz_label = crate::cron_utils::system_timezone_display();
-                let next_run = parsed
-                    .iter()
-                    .map(|p| p.next_local)
-                    .min_by_key(|dt| dt.timestamp())
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
-                    .unwrap_or_else(|| "n/a".to_string());
-
+                self.state.activate_goal(&goal.id).await?;
                 // A reminder runs no agent and only messages the owner: no
                 // confirmation step.
-                if let Some(message) = reminder_message {
-                    self.state.activate_goal(&goal.id).await?;
+                if let Some(message) = reminder {
                     return Ok(format!(
                         "Reminder set: \"{}\". {} schedule(s). Next: {}. System timezone: {}.",
                         message,
@@ -1354,91 +1496,13 @@ impl ManageMemoriesTool {
                         tz_label
                     ));
                 }
-
-                // Button-based confirmation via approval channel
-                if let Some(ref tx) = self.approval_tx {
-                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                    let details = vec![
-                        format!("{} schedule(s)", parsed.len()),
-                        format!("Next: {}", next_run),
-                        format!("System timezone: {}", tz_label),
-                    ];
-                    if let Err(error) = tx
-                        .send(ApprovalRequest {
-                            command: desc.to_string(),
-                            session_id: session_id.to_string(),
-                            risk_level: crate::tools::command_risk::RiskLevel::Medium,
-                            warnings: details,
-                            permission_mode:
-                                crate::tools::command_risk::PermissionMode::Default,
-                            response_tx,
-                            kind: ApprovalKind::GoalConfirmation,
-                        })
-                        .await
-                    {
-                        return Ok(format!(
-                            "Created scheduled goal {} (pending confirmation) with {} schedule(s), but its confirmation could not be delivered: {}. Next: {}. System timezone: {}. It was not cancelled or activated.",
-                            goal.id,
-                            parsed.len(),
-                            error,
-                            next_run,
-                            tz_label
-                        ));
-                    }
-
-                    match response_rx.await {
-                        Ok(
-                            ApprovalResponse::AllowOnce
-                            | ApprovalResponse::AllowSession
-                            | ApprovalResponse::AllowAlways,
-                        ) => {
-                            self.state.activate_goal(&goal.id).await?;
-                            Ok(format!(
-                                "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
-                                goal.id,
-                                parsed.len(),
-                                next_run,
-                                tz_label
-                            ))
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            // Only an explicit owner response cancels the goal.
-                            let mut cancelled_goal = goal.clone();
-                            cancelled_goal.status = "cancelled".to_string();
-                            cancelled_goal.completed_at =
-                                Some(chrono::Utc::now().to_rfc3339());
-                            cancelled_goal.updated_at = chrono::Utc::now().to_rfc3339();
-                            self.state.update_goal(&cancelled_goal).await?;
-                            let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
-                            for schedule in &schedules {
-                                self.state.delete_goal_schedule(&schedule.id).await?;
-                            }
-                            Ok(format!(
-                                "Cancelled scheduled goal {}. The user declined confirmation.",
-                                goal.id
-                            ))
-                        }
-                        Err(_) => Ok(format!(
-                            "Created scheduled goal {} (pending confirmation) with {} schedule(s), but the confirmation response became unavailable. Next: {}. System timezone: {}. It was not cancelled or activated.",
-                            goal.id,
-                            parsed.len(),
-                            next_run,
-                            tz_label
-                        )),
-                    }
-                } else {
-                    // The next owner turn is interpreted normally by the model.
-                    // It must resolve that natural-language intent to the typed,
-                    // session-scoped `activate_scheduled` or `cancel_scheduled`
-                    // action for this exact goal; no phrase router mutates state.
-                    Ok(format!(
-                        "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. The owner may approve or decline it in natural language; resolve that decision using this exact goal ID.",
-                        goal.id,
-                        parsed.len(),
-                        next_run,
-                        tz_label
-                    ))
-                }
+                Ok(format!(
+                    "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
+                    goal.id,
+                    parsed.len(),
+                    next_run,
+                    tz_label
+                ))
             }
             "activate_scheduled" => {
                 let is_owner = facts.user_role == Some(UserRole::Owner);
@@ -3840,23 +3904,22 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Created scheduled goal"));
-        assert!(result.contains("pending confirmation"));
+        assert!(result.contains("Confirmed and activated scheduled goal"));
         assert!(result.contains("1 schedule(s)"));
-        assert!(result.contains("confirm"));
 
         let goals = state.get_scheduled_goals().await.unwrap();
         let goal = goals
             .iter()
             .find(|g| g.description == "Check API health")
             .unwrap();
-        assert_eq!(goal.status, "pending_confirmation");
+        assert_eq!(goal.status, "active");
         assert_eq!(goal.domain, "orchestration");
         assert_eq!(goal.goal_type, "continuous");
         assert_eq!(goal.budget_per_check, Some(400_000));
@@ -3872,28 +3935,12 @@ mod tests {
     async fn activate_scheduled_is_typed_owner_and_session_scoped() {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
-        tool.call_with(
-            &json!({
-                "action": "create_scheduled_goal",
-                "goal": "Review operational health",
-                "schedule": "every 6h"
-            })
-            .to_string(),
-            crate::traits::ToolCallContext {
-                user_role: Some(crate::types::UserRole::Owner),
-                session_id: "owner-session".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let goal = state
-            .get_scheduled_goals()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|goal| goal.description == "Review operational health")
-            .unwrap();
+        // A goal still pending confirmation (one created before the kernel
+        // confirmed goals up front).
+        let mut goal =
+            Goal::new_continuous_pending("Review operational health", "owner-session", None, None);
+        goal.status = "pending_confirmation".to_string();
+        state.create_goal(&goal).await.unwrap();
 
         let wrong_session = tool
             .call_with(
@@ -3960,18 +4007,13 @@ mod tests {
         assert!(result.contains("Only the owner"));
     }
 
+    /// Outside the kernel (no `kernel_approved`) a scheduled goal that runs
+    /// the agent is refused and nothing is stored; a reminder still works.
     #[tokio::test]
-    async fn unavailable_schedule_confirmation_does_not_cancel_created_goal() {
+    async fn create_scheduled_goal_refuses_without_kernel_approval() {
         let state = setup_state().await;
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMemoriesTool::new(state.clone())
-            .with_approval_tx(crate::tools::ApprovalBroker::new(approval_tx));
-        let responder = tokio::spawn(async move {
-            let request = approval_rx.recv().await.expect("approval request");
-            drop(request.response_tx);
-        });
-
-        let result = tool
+        let tool = ManageMemoriesTool::new(state.clone());
+        let error = tool
             .call_with(
                 &json!({
                     "action": "create_scheduled_goal",
@@ -3986,22 +4028,132 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-        responder.await.unwrap();
-
-        assert!(result.contains("confirmation response became unavailable"));
-        assert!(result.contains("not cancelled or activated"));
-        let goal = state
+            .expect_err("refused outside the kernel");
+        assert!(
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
+        );
+        assert!(state
             .get_scheduled_goals()
             .await
             .unwrap()
-            .into_iter()
-            .find(|goal| goal.description == "Check confirmation transport")
-            .unwrap();
-        assert_eq!(goal.status, "pending_confirmation");
+            .iter()
+            .all(|goal| goal.description != "Check confirmation transport"));
+    }
+
+    /// The owner is asked exactly where the call would create a goal that
+    /// runs the agent: not for a reminder, a non-owner, an internal run, a
+    /// bad schedule or a duplicate. The card binds the exact goal.
+    #[tokio::test]
+    async fn create_scheduled_goal_judges_its_own_approval() {
+        use crate::traits::OwnerApprovalNeed;
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        let owner = crate::traits::ToolCallContext {
+            user_role: Some(crate::types::UserRole::Owner),
+            session_id: "test-session".into(),
+            channel_visibility: Some(ChannelVisibility::Private),
+            ..Default::default()
+        };
+        let args = json!({
+            "action": "create_scheduled_goal",
+            "goal": "Check API health",
+            "schedule": "every 6h"
+        });
+        let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&args, &owner).await else {
+            panic!("a scheduled goal asks");
+        };
+        assert_eq!(request.summary, "Check API health");
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::Medium);
+        assert!(request.warnings.iter().any(|w| w == "1 schedule(s)"));
+        assert!(request.warnings.iter().any(|w| w.starts_with("Next: ")));
+        let mut injected = args.clone();
+        injected["_session_id"] = json!("synthetic-session");
+        let OwnerApprovalNeed::Ask(same) = tool.owner_approval(&injected, &owner).await else {
+            panic!("a scheduled goal asks");
+        };
+        assert_eq!(request.subject, same.subject);
+        let OwnerApprovalNeed::Ask(other) = tool
+            .owner_approval(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check API health",
+                    "schedule": "every 2h"
+                }),
+                &owner,
+            )
+            .await
+        else {
+            panic!("a scheduled goal asks");
+        };
+        assert_ne!(request.subject, other.subject);
+
+        async fn judged(
+            tool: &ManageMemoriesTool,
+            args: Value,
+            facts: crate::traits::ToolCallContext,
+        ) -> OwnerApprovalNeed {
+            tool.owner_approval(&args, &facts).await
+        }
+        let mut reminder = args.clone();
+        reminder["reminder"] = json!("Check the oven.");
         assert_eq!(
-            state.get_schedules_for_goal(&goal.id).await.unwrap().len(),
-            1
+            judged(&tool, reminder, owner.clone()).await,
+            OwnerApprovalNeed::NotNeeded
+        );
+        assert_eq!(
+            judged(
+                &tool,
+                args.clone(),
+                crate::traits::ToolCallContext {
+                    user_role: Some(crate::types::UserRole::Guest),
+                    ..owner.clone()
+                }
+            )
+            .await,
+            OwnerApprovalNeed::NotNeeded
+        );
+        assert_eq!(
+            judged(
+                &tool,
+                args.clone(),
+                crate::traits::ToolCallContext {
+                    channel_visibility: Some(ChannelVisibility::Internal),
+                    ..owner.clone()
+                }
+            )
+            .await,
+            OwnerApprovalNeed::NotNeeded
+        );
+        let mut bad = args.clone();
+        bad["schedule"] = json!("whenever the moon is full");
+        assert_eq!(
+            judged(&tool, bad, owner.clone()).await,
+            OwnerApprovalNeed::NotNeeded
+        );
+        assert_eq!(
+            judged(&tool, json!({"action": "list"}), owner.clone()).await,
+            OwnerApprovalNeed::NotNeeded
+        );
+
+        // Once the approved goal exists, the identical request is a duplicate
+        // the call answers without creating anything: no card.
+        let created = tool
+            .call_with(
+                &args.to_string(),
+                crate::traits::ToolCallContext {
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
+                    ..owner.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(created.contains("Confirmed and activated"), "{created}");
+        assert_eq!(
+            judged(&tool, args, owner).await,
+            OwnerApprovalNeed::NotNeeded
         );
     }
 
@@ -4021,13 +4173,14 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("activated scheduled goal"));
 
         let goals = state.get_scheduled_goals().await.unwrap();
         let goal = goals
@@ -4060,12 +4213,13 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        assert!(result.contains("Created scheduled goal"), "{result}");
+        assert!(result.contains("activated scheduled goal"), "{result}");
 
         let missing = tool
             .call_with(
@@ -4079,6 +4233,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4091,9 +4246,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_with_reminder_message_is_active_at_once() {
         let state = setup_state().await;
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMemoriesTool::new(state.clone())
-            .with_approval_tx(crate::tools::ApprovalBroker::new(approval_tx));
+        let tool = ManageMemoriesTool::new(state.clone());
 
         let result = tool
             .call_with(
@@ -4107,13 +4260,13 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert!(result.contains("Reminder set"), "{result}");
-        assert!(approval_rx.try_recv().is_err(), "no confirmation prompt");
 
         let goals = state.get_scheduled_goals().await.unwrap();
         let goal = goals
@@ -4144,6 +4297,7 @@ mod tests {
             crate::traits::ToolCallContext {
                 user_role: Some(crate::types::UserRole::Owner),
                 session_id: "test-session".into(),
+                kernel_approved: Some(crate::traits::ApprovalScope::Call),
                 ..Default::default()
             },
         )
@@ -4169,6 +4323,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4200,6 +4355,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4217,6 +4373,7 @@ mod tests {
             crate::traits::ToolCallContext {
                 user_role: Some(crate::types::UserRole::Owner),
                 session_id: "test-session".into(),
+                kernel_approved: Some(crate::traits::ApprovalScope::Call),
                 ..Default::default()
             },
         )
@@ -4232,6 +4389,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4256,13 +4414,14 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("activated scheduled goal"));
 
         let goals = state.get_scheduled_goals().await.unwrap();
         let goal = goals
@@ -4288,6 +4447,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Guest),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4342,6 +4502,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4368,6 +4529,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4392,13 +4554,14 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("activated scheduled goal"));
         assert!(result.contains("3 schedule(s)"));
 
         let goals = state.get_scheduled_goals().await.unwrap();
@@ -4433,13 +4596,14 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("activated scheduled goal"));
 
         let goals = state.get_scheduled_goals().await.unwrap();
         let goal = goals
@@ -4496,12 +4660,13 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        assert!(first.contains("Created scheduled goal"));
+        assert!(first.contains("activated scheduled goal"));
 
         let second = tool
             .call_with(
@@ -4514,6 +4679,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4545,6 +4711,7 @@ mod tests {
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
                     session_id: "test-session".into(),
+                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
