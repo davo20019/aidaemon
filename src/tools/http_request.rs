@@ -381,6 +381,14 @@ impl HttpRequestTool {
         }
     }
 
+    fn is_refused_write(method: &str, status: u16) -> bool {
+        matches!(status, 429 | 503)
+            && !matches!(
+                method.to_ascii_uppercase().as_str(),
+                "GET" | "HEAD" | "OPTIONS"
+            )
+    }
+
     fn is_write_request(arguments: &str) -> bool {
         let method = serde_json::from_str::<Value>(arguments)
             .ok()
@@ -854,12 +862,16 @@ impl HttpRequestTool {
     /// (a 5xx may have been applied server-side, so retrying risks
     /// double-execution) and never 4xx/429 (a 429 needs a long rate-limit wait
     /// that a short retry can't satisfy).
-    fn should_retry_idempotent_5xx(method: &str, status: reqwest::StatusCode) -> bool {
-        let idempotent = matches!(
+    fn should_retry_transient(method: &str, status: reqwest::StatusCode) -> bool {
+        let read = matches!(
             method.to_ascii_uppercase().as_str(),
             "GET" | "HEAD" | "OPTIONS"
         );
-        idempotent && status.is_server_error()
+        if read {
+            status.is_server_error()
+        } else {
+            status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        }
     }
 
     /// Auto-detect content type from body.
@@ -1206,11 +1218,12 @@ impl HttpRequestTool {
                 )
             })?;
 
-            // Transparently retry idempotent requests on transient upstream 5xx
-            // (e.g. an X API hiccup) instead of surfacing a one-off 500 that the
-            // agent then treats as a hard blocker. Writes are never retried.
+            // Transparently retry on a transient upstream failure (e.g. an X
+            // API hiccup) instead of surfacing a one-off error the agent then
+            // treats as a hard blocker. A write is resent only on 503, where
+            // the server refused it; any other 5xx may have been applied.
             if retry_count < MAX_TRANSIENT_RETRIES
-                && Self::should_retry_idempotent_5xx(&current_method, resp.status())
+                && Self::should_retry_transient(&current_method, resp.status())
             {
                 retry_count += 1;
                 let backoff = crate::backoff::exponential_backoff(
@@ -1222,7 +1235,7 @@ impl HttpRequestTool {
                     method = %current_method,
                     status = resp.status().as_u16(),
                     attempt = retry_count,
-                    "Transient upstream 5xx; retrying after backoff"
+                    "Transient upstream failure; retrying after backoff"
                 );
                 tokio::time::sleep(backoff).await;
                 continue;
@@ -1905,7 +1918,14 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
 
             result.push_str("--- END ERROR ---\n");
             result.push_str("\nIMPORTANT: Report the FULL error details above to the user. ");
-            result.push_str("Do NOT retry the same request — diagnose the root cause first.\n");
+            if Self::is_refused_write(&method, status_code) {
+                result.push_str(
+                    "The server refused this write, so it did not take effect. It can be sent \
+                     again later.\n",
+                );
+            } else {
+                result.push_str("Do NOT retry the same request — diagnose the root cause first.\n");
+            }
         }
 
         result.push('\n');
@@ -2387,40 +2407,29 @@ mod tests {
     use crate::config::{HttpAuthProfile, HttpAuthType};
 
     #[test]
-    fn retries_only_idempotent_requests_on_transient_5xx() {
+    fn retries_reads_on_5xx_and_writes_only_on_503() {
         use reqwest::StatusCode;
-        // Idempotent + 5xx → retry (the transient case that hard-blocked the
-        // Twitter goal on a GET user lookup).
-        assert!(HttpRequestTool::should_retry_idempotent_5xx(
-            "GET",
-            StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(HttpRequestTool::should_retry_idempotent_5xx(
-            "GET",
-            StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert!(HttpRequestTool::should_retry_idempotent_5xx(
-            "head",
-            StatusCode::BAD_GATEWAY
-        ));
-        // Never retry writes — a 5xx may have been applied server-side.
-        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
-            "POST",
-            StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        // Never retry non-5xx, including rate limits (need a long wait).
-        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
-            "GET",
-            StatusCode::TOO_MANY_REQUESTS
-        ));
-        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
-            "GET",
-            StatusCode::NOT_FOUND
-        ));
-        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
-            "GET",
-            StatusCode::OK
-        ));
+        for (method, status, retried) in [
+            ("GET", StatusCode::INTERNAL_SERVER_ERROR, true),
+            ("GET", StatusCode::SERVICE_UNAVAILABLE, true),
+            ("head", StatusCode::BAD_GATEWAY, true),
+            ("POST", StatusCode::SERVICE_UNAVAILABLE, true),
+            ("delete", StatusCode::SERVICE_UNAVAILABLE, true),
+            // Any other 5xx on a write may have been applied server-side.
+            ("POST", StatusCode::INTERNAL_SERVER_ERROR, false),
+            ("POST", StatusCode::BAD_GATEWAY, false),
+            ("PATCH", StatusCode::GATEWAY_TIMEOUT, false),
+            // Rate limits need a longer wait than this backoff.
+            ("GET", StatusCode::TOO_MANY_REQUESTS, false),
+            ("POST", StatusCode::TOO_MANY_REQUESTS, false),
+            ("GET", StatusCode::NOT_FOUND, false),
+        ] {
+            assert_eq!(
+                HttpRequestTool::should_retry_transient(method, status),
+                retried,
+                "{method} {status}"
+            );
+        }
     }
 
     fn make_oauth_profile() -> HttpAuthProfile {
@@ -3239,6 +3248,100 @@ mod tests {
         assert!(HttpRequestTool::is_write_request(r#"{"method":"DELETE"}"#));
         assert!(!HttpRequestTool::is_write_request(r#"{"method":"GET"}"#));
         assert!(!HttpRequestTool::is_write_request(r#"{"url":"x"}"#));
+    }
+
+    /// Answers each request with the next status line, repeating the last.
+    async fn spawn_status_sequence_server(
+        status_lines: Vec<&'static str>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let url = format!("http://{}/notes", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = count.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let attempt = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let line = status_lines[attempt.min(status_lines.len() - 1)];
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await;
+                let response =
+                    format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, count, server)
+    }
+
+    async fn post_against(status_lines: Vec<&'static str>) -> (ToolCallOutcome, usize) {
+        let (url, count, server) = spawn_status_sequence_server(status_lines).await;
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())));
+        let outcome = tool
+            .call_with_execution_context(
+                &json!({"method": "POST", "url": url, "body": "{}"}).to_string(),
+                None,
+                ToolCallContext {
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an HTTP status is returned as a result");
+        server.abort();
+        let _ = server.await;
+        (outcome, count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_is_resent_within_the_call() {
+        let (outcome, requests) = post_against(vec!["503 Service Unavailable", "200 OK"]).await;
+        assert_eq!(requests, 2);
+        assert_eq!(outcome.metadata.http_status, Some(200));
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_still_refused_after_retries_may_be_sent_again_later() {
+        let (outcome, requests) = post_against(vec!["503 Service Unavailable"]).await;
+        assert_eq!(requests, 1 + MAX_TRANSIENT_RETRIES);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedRetryable)
+        );
+        assert!(outcome.output.contains("can be sent again later"));
+        assert!(!outcome.output.contains("Do NOT retry"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_write_is_not_resent_immediately() {
+        let (outcome, requests) = post_against(vec!["429 Too Many Requests", "200 OK"]).await;
+        assert_eq!(requests, 1);
+        assert!(!outcome.output.contains("Do NOT retry"));
+    }
+
+    #[tokio::test]
+    async fn a_write_with_an_unknown_effect_is_never_resent() {
+        for line in [
+            "500 Internal Server Error",
+            "502 Bad Gateway",
+            "504 Gateway Timeout",
+        ] {
+            let (outcome, requests) = post_against(vec![line, "200 OK"]).await;
+            assert_eq!(requests, 1, "{line}");
+            assert!(outcome.output.contains("Do NOT retry"), "{line}");
+        }
     }
 
     #[tokio::test]
