@@ -1211,10 +1211,7 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ConfigManager => BuiltBaseTool {
-            tool: Arc::new(ConfigManagerTool::new(
-                config_path.to_path_buf(),
-                approval_tx,
-            )),
+            tool: Arc::new(ConfigManagerTool::new(config_path.to_path_buf())),
             terminal_tool: None,
         },
         BaseToolId::WebFetch => BuiltBaseTool {

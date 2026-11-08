@@ -300,13 +300,8 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
     let config_dir = tempfile::tempdir().unwrap();
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[provider]\nmodel = \"synthetic-model\"\n").unwrap();
-    let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
-    std::mem::forget(_tool_rx);
     let config: Arc<dyn crate::traits::Tool> = Arc::new(OfferedConfigTool(
-        crate::tools::ConfigManagerTool::new(
-            config_path.clone(),
-            crate::tools::ApprovalBroker::new(tool_tx),
-        ),
+        crate::tools::ConfigManagerTool::new(config_path.clone()),
     ));
     let (harness, approver) = approvals_harness_with(
         vec![

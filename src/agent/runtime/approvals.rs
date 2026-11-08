@@ -1216,6 +1216,59 @@ mod tests {
         ));
     }
 
+    /// A security-sensitive config change asks the owner in every session;
+    /// a read and an ordinary setting need no card.
+    #[tokio::test]
+    async fn sensitive_config_change_asks_before_dispatch() {
+        use crate::traits::ToolSemantics;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[provider]\nkind = \"openai_compatible\"\n").unwrap();
+        let tool: Arc<dyn crate::traits::Tool> =
+            Arc::new(crate::tools::ConfigManagerTool::new(path));
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                tools: ApprovalTools::new([tool.clone()]),
+                trusted_session: trusted,
+                mandate_preapproved: trusted,
+                ..AppApprovalRules::default()
+            };
+            let set = sdk::ToolCall::new(
+                "c1",
+                "manage_config",
+                json!({"action": "set", "key": "provider.base_url", "value": "\"https://h.example.invalid/v1\""}),
+            );
+            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &set, &tool_info()).await
+            else {
+                panic!("a sensitive change must ask (trusted={trusted})");
+            };
+            assert_eq!(
+                request.summary,
+                "Config change: provider.base_url = \"https://h.example.invalid/v1\""
+            );
+            for no_card in [
+                json!({"action": "read"}),
+                json!({"action": "set", "key": "provider.kind", "value": "\"openai_compatible\""}),
+            ] {
+                let call = sdk::ToolCall::new("c2", "manage_config", no_card);
+                assert_eq!(
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                    RuleDecision::Allow
+                );
+            }
+        }
+        let args = json!({"action": "set", "key": "provider.base_url", "value": "\"x\""});
+        let refused = crate::traits::ApprovalCall {
+            refused: true,
+            ..crate::traits::ApprovalCall::as_sent(&args)
+        };
+        assert!(matches!(
+            tool.owner_approval_request(&refused, &Default::default())
+                .await,
+            crate::traits::OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
     /// `manage_cli_agents`'s approval judgment without its CLI registry: the
     /// same `ManageCliAgentsTool::owner_approval` the tool runs.
     struct ManageCliAgentsApprovals;

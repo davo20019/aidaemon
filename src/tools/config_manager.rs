@@ -6,14 +6,10 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallContext, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+    semantics_for_exact_read_actions, OwnerApprovalNeed, Tool, ToolCallContext, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects,
 };
-use crate::types::ApprovalResponse;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
 const SENSITIVE_KEYS: &[&str] = &[
@@ -269,7 +265,6 @@ impl ResolvedProviderSelection {
 
 pub struct ConfigManagerTool {
     config_path: PathBuf,
-    approval_tx: ApprovalBroker,
 }
 
 /// Set file permissions to owner-only read/write (0600) on Unix.
@@ -288,11 +283,8 @@ fn set_owner_only_permissions(_path: &Path) {
 }
 
 impl ConfigManagerTool {
-    pub fn new(config_path: PathBuf, approval_tx: ApprovalBroker) -> Self {
-        Self {
-            config_path,
-            approval_tx,
-        }
+    pub fn new(config_path: PathBuf) -> Self {
+        Self { config_path }
     }
 
     /// Check if a key path requires user approval to modify.
@@ -301,36 +293,225 @@ impl ConfigManagerTool {
         APPROVAL_REQUIRED_KEYS.contains(&last)
     }
 
-    /// Request user approval for a config change.
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec!["Modifying security-sensitive configuration".to_string()],
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                tracing::warn!(description, "Approval response channel closed");
-                Err(anyhow::anyhow!("Approval response channel closed"))
-            }
-            Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s)");
-                Err(anyhow::anyhow!("Approval request timed out after 300s"))
-            }
+    /// Refuse a change that needs the owner's approval when the call did not
+    /// come through the agent kernel (which asked the owner).
+    fn require_kernel_approval(args: &ConfigArgs) -> anyhow::Result<()> {
+        if args.kernel_approved {
+            return Ok(());
         }
+        anyhow::bail!(
+            "manage_config {} requires approval through the agent kernel; it was called outside \
+             an approved agent call",
+            args.action
+        )
+    }
+
+    /// The card summary for a `set` that needs approval: secrets are shown
+    /// redacted, other security-sensitive values as given.
+    fn set_summary(args: &ConfigArgs) -> String {
+        let display_value = if is_sensitive_key(&args.key) {
+            "[REDACTED]".to_string()
+        } else {
+            args.value.clone()
+        };
+        format!("Config change: {} = {}", args.key, display_value)
+    }
+
+    fn base_url_display(selection: &ResolvedProviderSelection) -> &str {
+        if selection.base_url.is_empty() {
+            "(not used)"
+        } else {
+            selection.base_url.as_str()
+        }
+    }
+
+    fn switch_provider_summary(selection: &ResolvedProviderSelection) -> String {
+        format!(
+            "Switch provider to {} (kind={}, base_url={}, models={}/{}/{})",
+            selection.preset.display_name,
+            selection.preset.kind,
+            Self::base_url_display(selection),
+            selection.primary_model,
+            selection.fast_model,
+            selection.smart_model
+        )
+    }
+
+    fn add_failover_summary(next_index: usize, selection: &ResolvedProviderSelection) -> String {
+        format!(
+            "Add failover provider #{}: {} (kind={}, base_url={}, models={}/{}/{})",
+            next_index,
+            selection.preset.display_name,
+            selection.preset.kind,
+            Self::base_url_display(selection),
+            selection.primary_model,
+            selection.fast_model,
+            selection.smart_model
+        )
+    }
+
+    /// The summary of failover entry `index` of `entries`.
+    fn failover_entry_summary(entries: &[toml::Value], index: usize) -> String {
+        entries[index]
+            .as_table()
+            .map(|table| Self::summarize_provider_table(index, table))
+            .unwrap_or_else(|| format!("[{}] (invalid provider entry)", index))
+    }
+
+    /// The card summary for a call that asks the owner, read from the
+    /// config as the call will find it; `None` for a call that needs no card
+    /// (a change that is not security-sensitive, or a call its action
+    /// refuses before changing anything).
+    async fn approval_summary(&self, args: &ConfigArgs) -> anyhow::Result<Option<String>> {
+        match args.action.as_str() {
+            "set" => {
+                if args.key.is_empty()
+                    || args.value.is_empty()
+                    || !Self::requires_approval(&args.key)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(Self::set_summary(args)))
+            }
+            "switch_provider" => Ok(Self::resolve_provider_selection(args, "switch_provider")
+                .ok()
+                .map(|selection| Self::switch_provider_summary(&selection))),
+            "add_failover_provider" => {
+                let Ok(selection) = Self::resolve_provider_selection(args, "add_failover_provider")
+                else {
+                    return Ok(None);
+                };
+                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let doc: toml::Table = content.parse()?;
+                let next_index = match doc.get("provider") {
+                    None => 0,
+                    Some(value) => {
+                        let provider_table = value
+                            .as_table()
+                            .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+                        Self::get_failover_array(provider_table)?
+                            .map(|entries| entries.len())
+                            .unwrap_or(0)
+                    }
+                };
+                Ok(Some(Self::add_failover_summary(next_index, &selection)))
+            }
+            "remove_failover_provider" => {
+                let Some(index) = args.failover_index else {
+                    return Ok(None);
+                };
+                let content = tokio::fs::read_to_string(&self.config_path).await?;
+                let doc: toml::Table = content.parse()?;
+                let provider_table = doc
+                    .get("provider")
+                    .and_then(toml::Value::as_table)
+                    .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+                let Some(entries) = Self::get_failover_array(provider_table)? else {
+                    return Ok(None);
+                };
+                if index >= entries.len() {
+                    return Ok(None);
+                }
+                Ok(Some(format!(
+                    "Remove failover provider {}",
+                    Self::failover_entry_summary(entries, index)
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The exact arguments the owner approves (a changed argument is a new
+    /// card), with secret values replaced by their SHA-256 digest so no
+    /// secret is kept in a grant or a decline.
+    fn approval_subject(args: &ConfigArgs) -> String {
+        use sha2::{Digest, Sha256};
+        let secret = |value: &str| -> String {
+            if value.is_empty() {
+                String::new()
+            } else {
+                format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+            }
+        };
+        let subject = match args.action.as_str() {
+            "set" => {
+                let value = if is_sensitive_key(&args.key) {
+                    secret(&args.value)
+                } else {
+                    args.value.clone()
+                };
+                json!({"action": "set", "key": args.key, "value": value})
+            }
+            "remove_failover_provider" => json!({
+                "action": args.action,
+                "failover_index": args.failover_index,
+            }),
+            _ => json!({
+                "action": args.action,
+                "provider": args.provider,
+                "api_key": secret(&args.api_key),
+                "base_url": args.base_url,
+                "gateway_token": secret(&args.gateway_token),
+                "primary_model": args.primary_model,
+                "fast_model": args.fast_model,
+                "smart_model": args.smart_model,
+                "save_secrets_to_keychain": args.save_secrets_to_keychain,
+            }),
+        };
+        subject.to_string()
+    }
+
+    /// The owner approval for one call: the same changes the tool asked
+    /// about before (security-sensitive `set`, provider switch, failover
+    /// add/remove), with the same wording. If the config cannot be read to
+    /// word the card, it still asks.
+    pub(crate) async fn owner_approval(&self, arguments: &Value) -> OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ConfigArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let summary = match self.approval_summary(&args).await {
+            Ok(Some(summary)) => summary,
+            Ok(None) => return OwnerApprovalNeed::NotNeeded,
+            Err(e) => format!(
+                "Config change: manage_config {} (the config could not be read: {e})",
+                args.action
+            ),
+        };
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary,
+            subject: Self::approval_subject(&args),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec!["Modifying security-sensitive configuration".to_string()],
+        })
+    }
+
+    /// The typed effects of one call: every change writes the config file,
+    /// a configuration effect on that path. A change may also store secrets
+    /// in the keychain or redirect provider traffic, so the effects are
+    /// declared incomplete. Reads have none.
+    pub(crate) fn effects_for(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        use aidaemon_core::{CallEffects, EffectClass, EffectKey};
+        let Ok(args) = serde_json::from_str::<ConfigArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        if matches!(
+            args.action.as_str(),
+            "read" | "get" | "list_provider_presets" | "list_failover_providers"
+        ) {
+            return CallEffects::none();
+        }
+        let mut effects = CallEffects::unknown();
+        let config_key = std::path::absolute(&self.config_path)
+            .ok()
+            .and_then(|path| {
+                path.to_str()
+                    .and_then(|path| EffectKey::path(EffectClass::Configuration, path))
+            });
+        if let Some(key) = config_key {
+            effects.keys.push(key);
+        }
+        effects
     }
 
     /// Rotate backups (3-deep ring) and create a new .bak from current config.
@@ -1042,34 +1223,7 @@ impl ConfigManagerTool {
             .map(|entries| entries.len())
             .unwrap_or(0);
 
-        let approval_description = format!(
-            "Add failover provider #{}: {} (kind={}, base_url={}, models={}/{}/{})",
-            next_index,
-            selection.preset.display_name,
-            selection.preset.kind,
-            if selection.base_url.is_empty() {
-                "(not used)"
-            } else {
-                selection.base_url.as_str()
-            },
-            selection.primary_model,
-            selection.fast_model,
-            selection.smart_model
-        );
-        match self
-            .request_approval(&args.call_session, &approval_description)
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => {}
-            Ok(ApprovalResponse::Deny) => {
-                return Ok("Failover provider addition denied by user.".to_string());
-            }
-            Err(e) => {
-                return Ok(format!("Could not get approval: {}", e));
-            }
-        }
+        Self::require_kernel_approval(args)?;
 
         let mut notes = Vec::new();
         let mut new_provider = toml::Table::new();
@@ -1162,10 +1316,7 @@ impl ConfigManagerTool {
                 ));
             }
 
-            let removed_summary = current_entries[index]
-                .as_table()
-                .map(|table| Self::summarize_provider_table(index, table))
-                .unwrap_or_else(|| format!("[{}] (invalid provider entry)", index));
+            let removed_summary = Self::failover_entry_summary(current_entries, index);
             let existing_tables: Vec<toml::Table> = current_entries
                 .iter()
                 .map(|value| {
@@ -1177,21 +1328,7 @@ impl ConfigManagerTool {
                 .collect::<anyhow::Result<_>>()?;
             (current_entries.len(), removed_summary, existing_tables)
         };
-        let approval_description = format!("Remove failover provider {}", removed_summary);
-        match self
-            .request_approval(&args.call_session, &approval_description)
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => {}
-            Ok(ApprovalResponse::Deny) => {
-                return Ok("Failover provider removal denied by user.".to_string());
-            }
-            Err(e) => {
-                return Ok(format!("Could not get approval: {}", e));
-            }
-        }
+        Self::require_kernel_approval(args)?;
 
         let mut notes = Vec::new();
         let mut cleanup_keys = Vec::new();
@@ -1269,33 +1406,7 @@ impl ConfigManagerTool {
             Err(message) => return Ok(message),
         };
 
-        let approval_description = format!(
-            "Switch provider to {} (kind={}, base_url={}, models={}/{}/{})",
-            selection.preset.display_name,
-            selection.preset.kind,
-            if selection.base_url.is_empty() {
-                "(not used)"
-            } else {
-                selection.base_url.as_str()
-            },
-            selection.primary_model,
-            selection.fast_model,
-            selection.smart_model
-        );
-        match self
-            .request_approval(&args.call_session, &approval_description)
-            .await
-        {
-            Ok(ApprovalResponse::AllowOnce)
-            | Ok(ApprovalResponse::AllowSession)
-            | Ok(ApprovalResponse::AllowAlways) => {}
-            Ok(ApprovalResponse::Deny) => {
-                return Ok("Provider switch denied by user.".to_string());
-            }
-            Err(e) => {
-                return Ok(format!("Could not get approval: {}", e));
-            }
-        }
+        Self::require_kernel_approval(args)?;
 
         let content = tokio::fs::read_to_string(&self.config_path).await?;
         let mut doc: toml::Table = content.parse()?;
@@ -1454,10 +1565,10 @@ struct ConfigArgs {
     stt_language: Option<String>,
     #[serde(default)]
     stt_ffmpeg_path: Option<String>,
-    /// The session approval requests are routed to, from the dispatcher's
-    /// facts (never an argument).
+    /// The kernel judged this call's owner approval (from the dispatcher's
+    /// facts, never an argument).
     #[serde(skip)]
-    call_session: String,
+    kernel_approved: bool,
 }
 
 fn default_true() -> bool {
@@ -1542,7 +1653,7 @@ impl ConfigManagerTool {
         facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
         let mut args: ConfigArgs = serde_json::from_str(arguments)?;
-        args.call_session = facts.session_id.clone();
+        args.kernel_approved = facts.kernel_approved.is_some();
 
         match args.action.as_str() {
             "list_provider_presets" => Ok(Self::list_provider_presets_message()),
@@ -1587,29 +1698,10 @@ impl ConfigManagerTool {
                     );
                 }
 
-                // Require user approval for security-sensitive keys
+                // Security-sensitive keys need the owner's approval, which
+                // the kernel asked for before this runs.
                 if Self::requires_approval(&args.key) {
-                    // Show redacted value for secrets, actual value for other sensitive keys
-                    let display_value = if is_sensitive_key(&args.key) {
-                        "[REDACTED]".to_string()
-                    } else {
-                        args.value.clone()
-                    };
-                    let description = format!("Config change: {} = {}", args.key, display_value);
-
-                    match self.request_approval(&args.call_session, &description).await {
-                        Ok(ApprovalResponse::AllowOnce)
-                        | Ok(ApprovalResponse::AllowSession)
-                        | Ok(ApprovalResponse::AllowAlways) => {
-                            info!(key = %args.key, "Config change approved by user");
-                        }
-                        Ok(ApprovalResponse::Deny) => {
-                            return Ok("Config change denied by user.".to_string());
-                        }
-                        Err(e) => {
-                            return Ok(format!("Could not get approval: {}", e));
-                        }
-                    }
+                    Self::require_kernel_approval(&args)?;
                 }
 
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
@@ -1661,7 +1753,26 @@ impl ConfigManagerTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ConfigManagerTool {
+    /// Security-sensitive changes ask the owner, whatever the session. The
+    /// dispatcher runs the call only with that answer; a decline is recorded
+    /// by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> OwnerApprovalNeed {
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        self.owner_approval(call.arguments).await
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        self.effects_for(arguments)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,
@@ -1771,7 +1882,6 @@ mod tests {
     use std::path::PathBuf;
 
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -1793,16 +1903,12 @@ mod tests {
             stt_model_path: None,
             stt_language: None,
             stt_ffmpeg_path: None,
-            call_session: "test-session".to_string(),
+            kernel_approved: true,
         }
     }
 
     fn test_tool() -> ConfigManagerTool {
-        let (tx, _rx) = mpsc::channel(1);
-        ConfigManagerTool::new(
-            PathBuf::from("/tmp/nonexistent-config.toml"),
-            ApprovalBroker::new(tx),
-        )
+        ConfigManagerTool::new(PathBuf::from("/tmp/nonexistent-config.toml"))
     }
 
     fn write_temp_config(contents: &str) -> (TempDir, PathBuf) {
@@ -1812,14 +1918,131 @@ mod tests {
         (dir, path)
     }
 
+    /// The tool as the kernel runs it: test calls carry the kernel's
+    /// approval (`test_args().kernel_approved`).
     fn approving_tool(config_path: PathBuf) -> ConfigManagerTool {
-        let (tx, mut rx) = mpsc::channel::<ApprovalRequest>(4);
-        tokio::spawn(async move {
-            while let Some(request) = rx.recv().await {
-                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
-            }
-        });
-        ConfigManagerTool::new(config_path, ApprovalBroker::new(tx))
+        ConfigManagerTool::new(config_path)
+    }
+
+    const FAILOVER_CONFIG: &str = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "first-key"
+
+[provider.fallbacks.models]
+default = "claude-sonnet-4-20250514"
+"#;
+
+    #[tokio::test]
+    async fn sensitive_changes_ask_with_the_old_wording_and_no_secret_in_the_subject() {
+        let (_dir, path) = write_temp_config(FAILOVER_CONFIG);
+        let tool = ConfigManagerTool::new(path);
+
+        let set = json!({"action": "set", "key": "provider.api_key", "value": "synthetic-secret"});
+        let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&set).await else {
+            panic!("a secret change must ask");
+        };
+        assert_eq!(
+            request.summary,
+            "Config change: provider.api_key = [REDACTED]"
+        );
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
+        assert_eq!(
+            request.warnings,
+            vec!["Modifying security-sensitive configuration".to_string()]
+        );
+        assert!(!request.subject.contains("synthetic-secret"));
+        let mut other = set.clone();
+        other["value"] = json!("synthetic-other-secret");
+        let OwnerApprovalNeed::Ask(changed) = tool.owner_approval(&other).await else {
+            panic!("a secret change must ask");
+        };
+        assert_ne!(request.subject, changed.subject);
+
+        let remove = json!({"action": "remove_failover_provider", "failover_index": 0});
+        let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&remove).await else {
+            panic!("a failover removal must ask");
+        };
+        assert!(
+            request.summary.starts_with("Remove failover provider [0]"),
+            "{}",
+            request.summary
+        );
+
+        let add = json!({"action": "add_failover_provider", "provider": "anthropic", "api_key": "synthetic-key"});
+        let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&add).await else {
+            panic!("a failover addition must ask");
+        };
+        assert!(
+            request.summary.starts_with("Add failover provider #1: "),
+            "{}",
+            request.summary
+        );
+        assert!(!request.subject.contains("synthetic-key"));
+
+        for no_card in [
+            json!({"action": "set", "key": "provider.models.default", "value": "\"other\""}),
+            json!({"action": "read"}),
+            json!({"action": "get", "key": "provider.kind"}),
+            json!({"action": "list_failover_providers"}),
+            json!({"action": "remove_failover_provider", "failover_index": 5}),
+            json!({"action": "switch_provider", "provider": "unknown-provider"}),
+            json!({"action": "restore"}),
+        ] {
+            assert!(
+                matches!(
+                    tool.owner_approval(&no_card).await,
+                    OwnerApprovalNeed::NotNeeded
+                ),
+                "{no_card}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_change_without_the_kernel_is_refused() {
+        let (_dir, path) = write_temp_config(FAILOVER_CONFIG);
+        let tool = ConfigManagerTool::new(path.clone());
+        let before = fs::read_to_string(&path).unwrap();
+        let args = json!({"action": "set", "key": "provider.base_url", "value": "\"https://h.example.invalid/v1\""})
+            .to_string();
+        let err = tool.call(&args).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires approval through the agent kernel"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        let remove = json!({"action": "remove_failover_provider", "failover_index": 0}).to_string();
+        assert!(tool.call(&remove).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn changes_declare_the_config_path_and_reads_declare_nothing() {
+        let tool = ConfigManagerTool::new(PathBuf::from("/tmp/aidaemon-synthetic/config.toml"));
+        let effects = tool.effects_for(r#"{"action":"set","key":"provider.kind","value":"x"}"#);
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::path(
+                aidaemon_core::EffectClass::Configuration,
+                "/tmp/aidaemon-synthetic/config.toml"
+            )
+            .unwrap()]
+        );
+        assert!(!effects.complete);
+        assert_eq!(
+            tool.effects_for(r#"{"action":"read"}"#),
+            aidaemon_core::CallEffects::none()
+        );
     }
 
     #[test]
