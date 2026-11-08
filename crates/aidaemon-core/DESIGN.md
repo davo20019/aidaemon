@@ -325,7 +325,7 @@ see images is the caller's decision; the kernel does not gate it. `Debug` on
 | Untrusted-output sanitization, secret redaction | `after_tool` |
 | Completion contract / ledger closeout / checklist | `on_stop` |
 | Approach pivot, self-correction ledger | `on_stuck` |
-| Budget auto-extension | `on_limit` → `Extend` |
+| Budget auto-extension | `on_limit` → `Extend` for this run's limits; `after_model` → `Stop` for a durable balance spanning runs |
 | Decision points, gate telemetry | `EventSink` |
 
 ## Choosing an extension point

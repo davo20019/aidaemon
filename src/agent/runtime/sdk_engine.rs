@@ -321,6 +321,7 @@ pub(super) enum DaemonCall {
     Gate(GateRequest),
     Model(ModelCall),
     Stop(StopCheck),
+    Budget(BudgetCheck),
 }
 
 /// What turn setup (`main_loop.rs`) settled before the SDK run starts:
@@ -381,6 +382,12 @@ pub(in crate::agent) struct SdkTurnSetup {
 }
 
 /// The model wants to stop; the dispatcher asks the run ledger.
+/// A model response to charge against the budgets before it is acted on.
+pub(super) struct BudgetCheck {
+    response: sdk::ModelResponse,
+    reply: oneshot::Sender<sdk::ModelDecision>,
+}
+
 pub(super) struct StopCheck {
     /// Operations of this run that completed.
     completed_results: usize,
@@ -583,7 +590,6 @@ pub(in crate::agent) struct TurnScope<'a> {
     prefix_len: usize,
     budget_goal: Option<BudgetGoal>,
     /// Set once the goal budget is used up; later model calls are refused.
-    budget_exhausted: AtomicBool,
     model_calls: AtomicU64,
     /// The verify-once and failure-recovery passes have been used.
     verification_demanded: AtomicBool,
@@ -609,7 +615,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// The one reply retry has been spent.
     reply_retry_used: AtomicBool,
     /// The next model call runs with tools disabled (empty-reply retry).
-    text_only_next_call: AtomicBool,
+    text_only_next_call: Arc<AtomicBool>,
+    /// The usage of the latest model call, until its budget check takes it.
+    pending_charge: std::sync::Mutex<Option<crate::traits::TokenUsage>>,
     /// Consecutive responses cut off at the token limit with no output (the
     /// whole budget went to thinking). The next call first gets more output
     /// room; only repeated cutoffs lower reasoning effort.
@@ -935,6 +943,7 @@ impl Agent {
         // hook denial) never reach the daemon dispatcher; the event sink hands
         // their receipts over so the run ledger records them too.
         let (refusals_tx, mut refusals_rx) = mpsc::unbounded_channel::<KernelNotice>();
+        let text_only_next_call = Arc::new(AtomicBool::new(false));
         // The turn's resolved authority is enforced by the kernel hook, the
         // outbound secret scan by `EgressGuard`, the untrusted-content rule
         // by `UntrustedHook` and owner approvals by `ApprovalPolicy` (all in
@@ -1184,6 +1193,15 @@ impl Agent {
                 aidaemon_policies::wrap_untrusted,
             ),
             approval,
+            text_only: TextOnlyNext {
+                flag: text_only_next_call.clone(),
+            },
+            budget: BudgetGate {
+                calls: calls_tx.clone(),
+            },
+            stuck: StuckNotice {
+                notices: refusals_tx.clone(),
+            },
             dispatch: DispatchGate {
                 calls: calls_tx.clone(),
             },
@@ -1217,9 +1235,6 @@ impl Agent {
                     ) =>
                 {
                     let _ = refusals_tx.send(KernelNotice::Refusal(receipt.clone()));
-                }
-                sdk::Event::Stuck { .. } => {
-                    let _ = refusals_tx.send(KernelNotice::Stuck);
                 }
                 _ => {}
             }
@@ -1356,7 +1371,8 @@ impl Agent {
             learning: learning.clone(),
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
-            text_only_next_call: AtomicBool::new(false),
+            text_only_next_call: text_only_next_call.clone(),
+            pending_charge: std::sync::Mutex::new(None),
             thinking_truncations: std::sync::atomic::AtomicU8::new(0),
             raised_output_tokens: std::sync::atomic::AtomicU32::new(0),
             continue_inline_after_background,
@@ -1421,7 +1437,6 @@ impl Agent {
             prefix,
             prefix_len,
             budget_goal,
-            budget_exhausted: AtomicBool::new(false),
             model_calls: AtomicU64::new(0),
             closeout_demands: std::sync::atomic::AtomicU32::new(0),
             verification_demanded: AtomicBool::new(false),
@@ -1500,6 +1515,9 @@ impl Agent {
                     }
                     DaemonCall::Stop(check) => {
                         in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
+                    }
+                    DaemonCall::Budget(check) => {
+                        in_flight.push(self.serve_sdk_budget(&scope, check).boxed());
                     }
                 },
                 Some(notice) = refusals_rx.recv() => {
@@ -1676,3 +1694,6 @@ mod tests;
 #[cfg(test)]
 #[path = "sdk_engine/finish_tests.rs"]
 mod finish_tests;
+#[cfg(test)]
+#[path = "sdk_engine/hook_port_tests.rs"]
+mod hook_port_tests;

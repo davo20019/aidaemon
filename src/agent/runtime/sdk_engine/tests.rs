@@ -3762,6 +3762,15 @@ fn hook_order_is_pinned() {
             aidaemon_policies::wrap_untrusted,
         ),
         approval: aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never),
+        text_only: TextOnlyNext {
+            flag: Arc::new(AtomicBool::new(false)),
+        },
+        budget: BudgetGate {
+            calls: calls.clone(),
+        },
+        stuck: StuckNotice {
+            notices: mpsc::unbounded_channel().0,
+        },
         dispatch: DispatchGate {
             calls: calls.clone(),
         },
@@ -3775,6 +3784,9 @@ fn hook_order_is_pinned() {
             HookSlot::Authority,
             HookSlot::SameToolLimit,
             HookSlot::LedgerStop,
+            HookSlot::TextOnly,
+            HookSlot::Budget,
+            HookSlot::Stuck,
             HookSlot::Memory,
             HookSlot::Egress,
             HookSlot::Untrusted,

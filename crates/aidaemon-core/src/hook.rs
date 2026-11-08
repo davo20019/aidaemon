@@ -132,6 +132,10 @@ pub enum ModelDecision {
     /// can see what it is correcting, followed by `message`, and another
     /// turn runs. To keep the text from the model, clear it first.
     Reject { message: String },
+    /// End the run now with [`crate::RunStatus::Stopped`]: none of the
+    /// response's tool calls run and it is not recorded. For a hook that
+    /// knows nothing more may happen, such as a spent budget.
+    Stop { reason: String },
 }
 
 /// What an `on_model_error` hook decides about a failed model call.
@@ -216,8 +220,8 @@ pub enum HookFailure {
 /// | `edit_transcript` | the transcript stays as it was |
 /// | `on_run_start`, `before_model`, `on_stuck`, `on_run_end` | the run goes on |
 ///
-/// `on_run_start`, `edit_transcript`, `answer_model`, `after_model`,
-/// `on_model_error`, `on_limit` and `on_stuck` are unstable: tests cover them
+/// `on_run_start`, `edit_transcript`, `answer_model`, `on_model_error` and
+/// `on_limit` are unstable: tests cover them
 /// but no shipped policy depends on them yet, so they may still change.
 ///
 /// Timeouts and cancels stop a hook at its next `.await`, so a hook that
@@ -287,7 +291,7 @@ pub trait Hook: Send + Sync {
     }
 
     /// The model replied. Check or rewrite the response before it is
-    /// recorded or acted on; the first `Reject` wins. Calls a hook adds or
+    /// recorded or acted on; the first `Reject` or `Stop` wins. Calls a hook adds or
     /// changes face the same validation and `before_tool` hooks as any
     /// other. Streamed text has already gone out as events, and the tokens
     /// are already counted.

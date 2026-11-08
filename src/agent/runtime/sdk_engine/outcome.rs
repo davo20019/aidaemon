@@ -272,10 +272,15 @@ impl TurnVerdict {
             .and_then(|ack| ack.clone());
         let budget_stop = self.budget_stop.lock().ok().and_then(|stop| stop.clone());
         let (reply, status, task_outcome) = match (&outcome.status, budget_stop) {
-            // A budget stop ends the run through the provider port.
+            // The budget hook stopped the run, or the mandate's balance
+            // could not cover the next call.
+            (sdk::RunStatus::Stopped { reason }, Some((reply, outcome)))
+                if reason == GOAL_BUDGET_EXHAUSTED =>
+            {
+                (reply, TaskStatus::Completed, outcome)
+            }
             (sdk::RunStatus::ProviderFailed { error }, Some((reply, outcome)))
-                if error.contains(GOAL_BUDGET_EXHAUSTED)
-                    || error.contains(MANDATE_BUDGET_EXHAUSTED) =>
+                if error.contains(MANDATE_BUDGET_EXHAUSTED) =>
             {
                 (reply, TaskStatus::Completed, outcome)
             }
@@ -285,7 +290,8 @@ impl TurnVerdict {
             (
                 sdk::RunStatus::ProviderFailed { .. } | sdk::RunStatus::LimitReached { .. },
                 Some(ack),
-            ) => (
+            )
+            | (sdk::RunStatus::Stopped { .. }, Some(ack)) => (
                 crate::agent::tool_execution::user_facing_external_action_ack(&ack),
                 TaskStatus::Completed,
                 TaskOutcome::Succeeded,

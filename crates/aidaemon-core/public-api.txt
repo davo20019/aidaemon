@@ -257,6 +257,8 @@ pub enum aidaemon_core::ModelDecision
 pub aidaemon_core::ModelDecision::Accept
 pub aidaemon_core::ModelDecision::Reject
 pub aidaemon_core::ModelDecision::Reject::message: alloc::string::String
+pub aidaemon_core::ModelDecision::Stop
+pub aidaemon_core::ModelDecision::Stop::reason: alloc::string::String
 pub enum aidaemon_core::ModelErrorDecision
 pub aidaemon_core::ModelErrorDecision::Abort
 pub aidaemon_core::ModelErrorDecision::Fail

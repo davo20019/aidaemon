@@ -312,10 +312,7 @@ impl<'a> Driver<'a> {
             let mut response = response;
             let rejection = match self.judge_response(&mut response).await {
                 Ok(rejection) => rejection,
-                Err(hook) => {
-                    let reason = format!("the response check `{hook}` gave no answer");
-                    return self.finish(RunStatus::Stopped { reason }, None).await;
-                }
+                Err(reason) => return self.finish(RunStatus::Stopped { reason }, None).await,
             };
             let calls: Vec<ToolCall> = response
                 .tool_calls
@@ -1337,11 +1334,8 @@ impl<'a> Driver<'a> {
     }
 
     /// Let `after_model` hooks check the response. Returns why it was
-    /// rejected, if it was, or the name of a hook that gave no answer.
-    async fn judge_response(
-        &self,
-        response: &mut ModelResponse,
-    ) -> Result<Option<String>, &'static str> {
+    /// rejected, if it was, or why the run must stop here.
+    async fn judge_response(&self, response: &mut ModelResponse) -> Result<Option<String>, String> {
         let ctx = self.ctx();
         let guard = self.guard(HookPoint::AfterModel);
         for hook in &self.agent.hooks {
@@ -1354,7 +1348,16 @@ impl<'a> Driver<'a> {
                     guard.decided(hook.name(), "reject", Some(&message)).await;
                     return Ok(Some(message));
                 }
-                None => return Err(hook.name()),
+                Some(ModelDecision::Stop { reason }) => {
+                    guard.decided(hook.name(), "stop", Some(&reason)).await;
+                    return Err(reason);
+                }
+                None => {
+                    return Err(format!(
+                        "the response check `{}` gave no answer",
+                        hook.name()
+                    ))
+                }
             }
         }
         Ok(None)

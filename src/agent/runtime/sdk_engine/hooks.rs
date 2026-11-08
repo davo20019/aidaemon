@@ -91,6 +91,9 @@ pub(super) enum HookSlot {
     Authority,
     SameToolLimit,
     LedgerStop,
+    TextOnly,
+    Budget,
+    Stuck,
     Memory,
     Egress,
     Untrusted,
@@ -111,6 +114,9 @@ pub(super) struct TurnHooks {
     pub(super) authority: sdk::AuthorityHook,
     pub(super) same_tool: aidaemon_policies::SameToolStreakGuard,
     pub(super) ledger: LedgerStop,
+    pub(super) text_only: TextOnlyNext,
+    pub(super) budget: BudgetGate,
+    pub(super) stuck: StuckNotice,
     pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
     pub(super) egress: aidaemon_policies::EgressGuard,
     pub(super) untrusted: sdk::UntrustedHook,
@@ -125,6 +131,9 @@ impl TurnHooks {
             (HookSlot::Authority, Arc::new(self.authority)),
             (HookSlot::SameToolLimit, Arc::new(self.same_tool)),
             (HookSlot::LedgerStop, Arc::new(self.ledger)),
+            (HookSlot::TextOnly, Arc::new(self.text_only)),
+            (HookSlot::Budget, Arc::new(self.budget)),
+            (HookSlot::Stuck, Arc::new(self.stuck)),
         ];
         chain.extend(self.memory.into_iter().map(|hook| (HookSlot::Memory, hook)));
         chain.push((HookSlot::Egress, Arc::new(self.egress)));
@@ -132,6 +141,74 @@ impl TurnHooks {
         chain.push((HookSlot::Approval, Arc::new(self.approval)));
         chain.push((HookSlot::Dispatch, Arc::new(self.dispatch)));
         chain
+    }
+}
+
+/// Withholds tools from the next request only, when a retry must answer in
+/// text from the receipts it already holds.
+pub(super) struct TextOnlyNext {
+    pub(super) flag: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl sdk::Hook for TextOnlyNext {
+    async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
+        if self.flag.swap(false, Ordering::Relaxed) {
+            request.tool_choice = sdk::ToolChoice::None;
+        }
+    }
+}
+
+/// Charges each response to the token budgets before anything acts on it.
+/// A budget is a durable balance spanning runs (and may ask the owner to
+/// extend it), so it is the daemon's to judge; the kernel's own limits only
+/// count this run. Served on the turn's task.
+pub(super) struct BudgetGate {
+    pub(super) calls: mpsc::Sender<DaemonCall>,
+}
+
+#[async_trait]
+impl sdk::Hook for BudgetGate {
+    /// Longer than an owner's budget card can stay open.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(60 * 60))
+    }
+
+    async fn after_model(
+        &self,
+        _ctx: &sdk::HookContext<'_>,
+        response: &mut sdk::ModelResponse,
+    ) -> sdk::ModelDecision {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .calls
+            .send(DaemonCall::Budget(BudgetCheck {
+                response: response.clone(),
+                reply,
+            }))
+            .await;
+        if sent.is_err() {
+            return sdk::ModelDecision::Accept;
+        }
+        answer.await.unwrap_or(sdk::ModelDecision::Accept)
+    }
+}
+
+/// Records that the run repeated itself. What to do about it stays the
+/// kernel's default: nudge, then stop.
+pub(super) struct StuckNotice {
+    pub(super) notices: mpsc::UnboundedSender<KernelNotice>,
+}
+
+#[async_trait]
+impl sdk::Hook for StuckNotice {
+    async fn on_stuck(
+        &self,
+        _ctx: &sdk::HookContext<'_>,
+        _signal: &sdk::StuckSignal,
+    ) -> Option<sdk::StuckDecision> {
+        let _ = self.notices.send(KernelNotice::Stuck);
+        None
     }
 }
 

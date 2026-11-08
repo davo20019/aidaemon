@@ -29,6 +29,39 @@ pub(super) fn task_token_budget(configured: Option<u64>, scheduled_per_check: Op
 }
 
 impl Agent {
+    /// Charge the latest response to the budgets, and record its tool calls
+    /// only if the run will act on them: a stopped response must leave no
+    /// call without a result in the history.
+    pub(super) async fn serve_sdk_budget(&self, scope: &TurnScope<'_>, check: BudgetCheck) {
+        let usage = scope
+            .pending_charge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
+        let mut decision = sdk::ModelDecision::Accept;
+        if let Some(usage) = usage {
+            if let Some(stop) = self.sdk_charge_budgets(scope, &usage, iteration).await {
+                // Closeout grace: a final answer on the first call, or after
+                // real progress, still ships; otherwise the budget reply
+                // replaces it and no further work runs.
+                let grace = check.response.tool_calls.is_empty()
+                    && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
+                if !grace {
+                    scope.verdict.record_budget_stop(stop, TaskOutcome::Failed);
+                    decision = sdk::ModelDecision::Stop {
+                        reason: GOAL_BUDGET_EXHAUSTED.to_string(),
+                    };
+                }
+            }
+        }
+        if decision == sdk::ModelDecision::Accept && !check.response.tool_calls.is_empty() {
+            self.persist_sdk_tool_call_message(scope, &check.response)
+                .await;
+        }
+        let _ = check.reply.send(decision);
+    }
+
     /// Charge a model call to the task, goal-daily and scheduled-run
     /// budgets. When one is used up, it extends once more if receipts show
     /// progress since the last extension (or the owner approves); otherwise

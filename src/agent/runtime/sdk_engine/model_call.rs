@@ -186,9 +186,6 @@ impl Agent {
         scope: &TurnScope<'_>,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
-        if scope.budget_exhausted.load(Ordering::Relaxed) {
-            return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
-        }
         // A computer_use GUI loop pins a vision-capable model for its task;
         // every later call of the task uses it.
         #[cfg(feature = "computer_use")]
@@ -270,9 +267,6 @@ impl Agent {
             .lock()
             .map(|learning| learning.tool_calls.is_empty())
             .unwrap_or(true);
-        if scope.text_only_next_call.swap(false, Ordering::Relaxed) {
-            options.tool_choice = crate::traits::ToolChoiceMode::None;
-        }
         let est_input_tokens = crate::context_budget::estimate_multimodal_message_tokens(&messages);
         let mut telemetry = crate::agent::llm::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
@@ -546,22 +540,10 @@ impl Agent {
                 "SDK engine: response truncated at the token limit with no output"
             );
         }
-        if let Some(usage) = usage.as_ref() {
-            if let Some(stop) = self
-                .sdk_charge_budgets(scope, usage, iteration as usize)
-                .await
-            {
-                // Closeout grace: a final answer on the first call,
-                // or after real progress, still ships; otherwise the budget
-                // reply replaces it and no further work runs.
-                let grace = response.tool_calls.is_empty()
-                    && (iteration == 1 || scope.succeeded_calls.load(Ordering::Relaxed) > 0);
-                if !grace {
-                    scope.verdict.record_budget_stop(stop, TaskOutcome::Failed);
-                    return Err(sdk::ProviderError::Other(GOAL_BUDGET_EXHAUSTED.into()));
-                }
-            }
-        }
+        *scope
+            .pending_charge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
         if let Some(note) = response.response_note.clone() {
             if let Ok(mut latest) = scope.verdict.response_note.lock() {
                 *latest = Some(note);
@@ -570,11 +552,7 @@ impl Agent {
         scope
             .last_batch_size
             .store(response.tool_calls.len(), Ordering::Relaxed);
-        let response = from_provider_response(response);
-        if !response.tool_calls.is_empty() {
-            self.persist_sdk_tool_call_message(scope, &response).await;
-        }
-        Ok(response)
+        Ok(from_provider_response(response))
     }
 
     /// Messages the same sender sent while this root turn runs, taken from

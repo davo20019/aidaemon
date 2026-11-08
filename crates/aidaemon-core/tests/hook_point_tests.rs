@@ -996,3 +996,45 @@ async fn a_child_run_names_its_parent() {
         .iter()
         .any(|e| matches!(e, Event::RunLinked { parent_run } if *parent_run == parent)));
 }
+
+// ---------- ending a run from a response ----------
+
+struct StopOnResponse;
+#[async_trait]
+impl Hook for StopOnResponse {
+    async fn after_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        _response: &mut ModelResponse,
+    ) -> ModelDecision {
+        ModelDecision::Stop {
+            reason: "the budget is spent".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_response_hook_can_end_the_run_before_anything_acts_on_it() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new([tool_calls([call(
+        "c1",
+        "write",
+        json!({}),
+    )])]));
+    let agent = agent(provider)
+        .tool(write_tool(calls.clone()))
+        .hook(StopOnResponse)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(
+        out.status,
+        RunStatus::Stopped {
+            reason: "the budget is spent".into()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(out.state.messages.iter().all(|m| m.tool_calls.is_empty()));
+}
