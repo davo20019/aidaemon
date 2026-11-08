@@ -127,6 +127,10 @@ impl ResolvedReviewCapacity {
 pub struct ManageMandatesTool {
     state: Arc<dyn MandateToolStore>,
     skills_dir: Option<PathBuf>,
+    /// The strategy skill content each card was judged with, by session and
+    /// approved arguments, so a commit pins exactly the content the owner
+    /// was asked about (a skill edited while the card was open is refused).
+    judged_strategies: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// The owner's confirmation card for a mandate change, as the tool asked
@@ -167,6 +171,7 @@ impl ManageMandatesTool {
         Self {
             state: state as Arc<dyn MandateToolStore>,
             skills_dir: None,
+            judged_strategies: Default::default(),
         }
     }
 
@@ -223,10 +228,16 @@ impl ManageMandatesTool {
                     .collect()
             })
             .unwrap_or_default();
+        let strategy_sha256 = self.judged_strategy_hash(&args);
         OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
             effects: Vec::new(),
             summary: card.summary,
-            subject: json!({"arguments": approved, "autopilot": card.autopilot}).to_string(),
+            subject: json!({
+                "arguments": approved,
+                "autopilot": card.autopilot,
+                "strategy_sha256": strategy_sha256,
+            })
+            .to_string(),
             risk: card.risk,
             warnings: card.warnings,
         })
@@ -421,6 +432,62 @@ impl ManageMandatesTool {
             per_cycle,
             daily,
         })
+    }
+
+    fn strategy_key(args: &ManageMandatesArgs) -> Option<String> {
+        let skill = args.strategy_skill.as_deref()?.trim();
+        if skill.is_empty() || !matches!(args.action.as_str(), "create" | "update") {
+            return None;
+        }
+        Some(format!(
+            "{}\n{}\n{}\n{}",
+            args.call_session.as_deref().unwrap_or_default(),
+            args.action,
+            args.mandate_id.as_deref().unwrap_or_default(),
+            skill
+        ))
+    }
+
+    /// Judging a card: remember the strategy content it shows (its hash).
+    fn judged_strategy_hash(&self, args: &ManageMandatesArgs) -> Option<String> {
+        let key = Self::strategy_key(args)?;
+        let hash = self
+            .strategy_snapshot(args.strategy_skill.as_deref())
+            .ok()
+            .flatten()?
+            .content_sha256;
+        self.judged_strategies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, hash.clone());
+        Some(hash)
+    }
+
+    /// The strategy snapshot a committing call pins: refused when the skill
+    /// changed since the owner's card was judged.
+    fn approved_strategy_snapshot(
+        &self,
+        args: &ManageMandatesArgs,
+    ) -> anyhow::Result<Option<MandateStrategySnapshot>> {
+        let snapshot = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        if !args.call_kernel_approved {
+            return Ok(snapshot);
+        }
+        let judged = Self::strategy_key(args).and_then(|key| {
+            self.judged_strategies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+        });
+        if let (Some(judged), Some(current)) = (judged, snapshot.as_ref()) {
+            anyhow::ensure!(
+                judged == current.content_sha256,
+                "strategy skill `{}` changed after the owner was asked; call again so the owner \
+                 confirms the current version",
+                current.skill_name
+            );
+        }
+        Ok(snapshot)
     }
 
     fn strategy_snapshot(
@@ -704,20 +771,6 @@ impl ManageMandatesTool {
         }
     }
 
-    async fn cancel_unconfirmed(&self, mandate: &Mandate) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.state
-                .transition_mandate_status(
-                    &mandate.id,
-                    MandateStatus::Paused,
-                    MandateStatus::Cancelled,
-                )
-                .await?,
-            "unconfirmed mandate could not be cancelled"
-        );
-        Ok(())
-    }
-
     /// Validate a `create` exactly as it commits, without storing anything.
     /// `Ok(Err(answer))`: the call answers without creating a mandate.
     async fn create_plan(
@@ -820,7 +873,7 @@ impl ManageMandatesTool {
         mandate.constraints = clean_strings(args.constraints.as_deref());
         mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
         mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
-        mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        mandate.strategy = self.approved_strategy_snapshot(args)?;
         mandate.objective_control = args.objective_control.clone();
         if let Some(control) = mandate.objective_control.as_ref() {
             control.validate().map_err(anyhow::Error::msg)?;
@@ -1787,7 +1840,7 @@ impl ManageMandatesTool {
         if args.clear_strategy.unwrap_or(false) {
             mandate.strategy = None;
         } else if args.strategy_skill.is_some() {
-            mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+            mandate.strategy = self.approved_strategy_snapshot(args)?;
         }
         if let Some(control) = args.objective_control.as_ref() {
             control.validate().map_err(anyhow::Error::msg)?;
@@ -4849,6 +4902,70 @@ mod tests {
         assert_eq!(mandate.review_effort, "thorough");
         assert_eq!(mandate.default_review_secs, AUTOPILOT_DEFAULT_REVIEW_SECS);
         assert_eq!(mandate.version, 2);
+    }
+
+    /// A strategy skill edited while the owner's card is open is never
+    /// pinned: the commit refuses and nothing is stored.
+    #[tokio::test]
+    async fn a_strategy_edited_after_the_card_is_refused() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        let mut skill = crate::skills::Skill {
+            name: "acme-stewardship".to_string(),
+            description: "Careful account strategy".to_string(),
+            triggers: vec![],
+            body: "Prefer useful replies.".to_string(),
+            origin: Some("custom".to_string()),
+            source: Some("filesystem".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        crate::skills::write_skill_to_file(skills_dir.path(), &skill).unwrap();
+        let tool = ManageMandatesTool::new(state.clone())
+            .with_skills_dir(Some(skills_dir.path().to_path_buf()));
+        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let args = format!(
+            r#"{{
+                    "action":"create",
+                    "objective":"Steward the Acme account",
+                    "allow_observations":false,
+                    "constraints":["No fabrication"],
+                    "success_criteria":["Owner ends stewardship"],
+                    "stop_conditions":["Credentials are revoked"],
+                    "strategy_skill":"acme-stewardship",
+                    "expires_at":"{expires_at}"
+                }}"#,
+        );
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&args).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        assert!(request.subject.contains("strategy_sha256"));
+
+        skill.body = "Post as often as possible.".to_string();
+        crate::skills::write_skill_to_file(skills_dir.path(), &skill).unwrap();
+
+        let error = tool
+            .call_with(&args, approved_owner_facts())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed after the owner was asked"),
+            "{error}"
+        );
+        assert!(state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
