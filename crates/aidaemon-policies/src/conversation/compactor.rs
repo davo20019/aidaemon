@@ -5,10 +5,79 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
+use aidaemon_core::{MessageOrigin, Role};
+
 use super::{
     compaction_threshold, turns_to_summarize, verbatim_tokens, ConversationSource,
-    ConversationSummary, Summarizer, SummaryStore,
+    ConversationSummary, ConversationTurn, Summarizer, SummaryStore,
 };
+
+/// Starts the part of a summary that holds what the user said, unsummarized.
+const PINNED_HEADING: &str = "\n\n## What the user said, word for word\n";
+/// Longest single message kept in the pinned list.
+const MAX_PINNED_MESSAGE_CHARS: usize = 600;
+/// Most text the pinned list may hold; the oldest entries go first.
+const MAX_PINNED_CHARS: usize = 6_000;
+
+/// A summary's own text, and the pinned entries stored after it.
+fn split_pinned(text: &str) -> (Option<&str>, Vec<String>) {
+    let Some((summary, list)) = text.split_once(PINNED_HEADING) else {
+        return (Some(text), Vec::new());
+    };
+    let pinned = list
+        .lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .map(str::to_string)
+        .collect();
+    (Some(summary), pinned)
+}
+
+/// Add what the user typed in `turns`. Selection is by who wrote a message,
+/// never by what it says, so no standing instruction depends on a classifier.
+fn pin_from_turns(pinned: &mut Vec<String>, turns: &[ConversationTurn]) {
+    for message in turns.iter().flat_map(|turn| &turn.messages) {
+        let typed = message.role == Role::User
+            && matches!(message.origin, None | Some(MessageOrigin::User));
+        if !typed {
+            continue;
+        }
+        let line: String = message
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_PINNED_MESSAGE_CHARS)
+            .collect();
+        if !line.is_empty() && !pinned.contains(&line) {
+            pinned.push(line);
+        }
+    }
+    trim_pinned(pinned);
+}
+
+fn trim_pinned(pinned: &mut Vec<String>) {
+    let mut total: usize = pinned.iter().map(String::len).sum();
+    let mut drop = 0;
+    while total > MAX_PINNED_CHARS && drop < pinned.len() {
+        total -= pinned[drop].len();
+        drop += 1;
+    }
+    pinned.drain(..drop);
+}
+
+fn with_pinned(mut summary: String, pinned: &[String]) -> String {
+    if pinned.is_empty() {
+        return summary;
+    }
+    summary.push_str(PINNED_HEADING);
+    for line in pinned {
+        summary.push_str("- ");
+        summary.push_str(line);
+        summary.push('\n');
+    }
+    summary
+}
 
 /// How big the history may grow before a pass compacts it, and how much of
 /// it stays verbatim.
@@ -119,6 +188,7 @@ pub struct Compactor {
     summarizer: Arc<dyn Summarizer>,
     store: Arc<dyn SummaryStore>,
     jobs: CompactionJobs,
+    pin_user_messages: bool,
 }
 
 impl Compactor {
@@ -131,7 +201,16 @@ impl Compactor {
             summarizer,
             store,
             jobs: CompactionJobs::default(),
+            pin_user_messages: false,
         }
+    }
+
+    /// Keep what the user typed, word for word, after each summary. A
+    /// summary loses standing instructions ("never delete those") more often
+    /// than it loses the task; the list is bounded, oldest out first.
+    pub fn pin_user_messages(mut self) -> Self {
+        self.pin_user_messages = true;
+        self
     }
 
     /// Coordinate with other compactors through shared [`CompactionJobs`].
@@ -172,10 +251,17 @@ impl Compactor {
             return Ok(None);
         }
         let folded = &pending.turns[..count];
-        let text = self
-            .summarizer
-            .summarize(previous.as_ref().map(|s| s.text.as_str()), folded)
-            .await?;
+        let (earlier_summary, mut pinned) = match previous.as_ref() {
+            Some(summary) => split_pinned(&summary.text),
+            None => (None, Vec::new()),
+        };
+        let text = self.summarizer.summarize(earlier_summary, folded).await?;
+        let text = if self.pin_user_messages {
+            pin_from_turns(&mut pinned, folded);
+            with_pinned(text, &pinned)
+        } else {
+            text
+        };
         let last = &folded[count - 1];
         let summary = ConversationSummary {
             text,
@@ -369,6 +455,70 @@ mod tests {
             .unwrap();
         assert_eq!(second.text, "+1,2,3,4+5,6,7,8,9,10");
         assert_eq!(second.message_count, 10);
+    }
+
+    /// Forgets everything it is given: the worst a summary can do.
+    #[derive(Clone, Default)]
+    struct Forgetful {
+        previous_seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Summarizer for Forgetful {
+        async fn summarize(
+            &self,
+            previous: Option<&str>,
+            _turns: &[ConversationTurn],
+        ) -> Result<String, String> {
+            self.previous_seen
+                .lock()
+                .unwrap()
+                .push(previous.unwrap_or_default().to_string());
+            Ok("a summary that lost the details".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn what_the_user_said_survives_every_pass_word_for_word() {
+        let summarizer = Forgetful::default();
+        let compactor =
+            Compactor::new(summarizer.clone(), InMemorySummaries::default()).pin_user_messages();
+        let source = Numbered {
+            turns: 6,
+            tokens: 100,
+            newest_finished: true,
+        };
+        let first = compactor
+            .compact("s", &source, limits(500, 200))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.text.contains("- turn 1\n"));
+        assert!(first.text.starts_with("a summary that lost the details"));
+
+        let grown = Numbered {
+            turns: 12,
+            ..source
+        };
+        let second = compactor
+            .compact("s", &grown, limits(500, 200))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.text.contains("- turn 1\n"), "{}", second.text);
+        assert!(second.text.contains("- turn 10"));
+        assert_eq!(second.text.matches("said, word for word").count(), 1);
+        // The summarizer works from the summary alone, not the pinned list.
+        assert!(!summarizer.previous_seen.lock().unwrap()[1].contains("word for word"));
+    }
+
+    #[test]
+    fn the_pinned_list_keeps_the_newest_when_it_is_full() {
+        let mut pinned: Vec<String> = (0..500).map(|i| format!("instruction {i}")).collect();
+        trim_pinned(&mut pinned);
+        assert!(pinned.iter().map(String::len).sum::<usize>() <= MAX_PINNED_CHARS);
+        assert_eq!(pinned.last().unwrap(), "instruction 499");
+        assert!(!pinned.contains(&"instruction 0".to_string()));
     }
 
     #[tokio::test]

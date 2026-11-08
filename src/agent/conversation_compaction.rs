@@ -193,7 +193,9 @@ fn compactor(
     };
     let summarizer = sdk_policies::ProviderSummarizer::new(Arc::new(provider), fast_model)
         .permits(SUMMARY_PERMITS.clone());
-    sdk_policies::Compactor::new(summarizer, DaemonSummaries { state }).with_jobs(JOBS.clone())
+    sdk_policies::Compactor::new(summarizer, DaemonSummaries { state })
+        .with_jobs(JOBS.clone())
+        .pin_user_messages()
 }
 
 /// Thresholds in the daemon's calibrated tokens, as the SDK's raw estimate
