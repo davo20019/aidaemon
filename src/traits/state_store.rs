@@ -90,6 +90,7 @@ pub trait DialogueStateStore: Send + Sync {
 #[async_trait]
 pub trait TokenUsageStore: Send + Sync {
     /// Record token usage from an LLM call.
+    #[allow(dead_code)]
     async fn record_token_usage(
         &self,
         _session_id: &str,

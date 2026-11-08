@@ -209,96 +209,22 @@ impl Agent {
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
         let skills_snapshot = self.skill_cache.get();
-        let skill_matches = skills::match_skills(
-            &skills_snapshot,
-            user_text,
-            user_role,
-            channel_ctx.visibility,
-        );
-        let skill_match_kind = skill_matches.kind;
-        let mut active_skills = skill_matches.skills;
-        let keyword_skill_names: Vec<String> =
-            active_skills.iter().map(|s| s.name.clone()).collect();
-        let mut llm_confirmed_skills = false;
+        let active_skills = skills::match_skills(&skills_snapshot, user_text);
         if !active_skills.is_empty() {
             let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
-            info!(session_id, skills = ?names, "Matched skills for message");
-
-            // Explicit skill references are typed user commands and need no
-            // classifier. Trigger matches are candidates only: they may alter
-            // the prompt and, for untrusted API guides, the tool roster, so a
-            // lexical hit must never activate one independently.
-            if skill_match_kind == skills::SkillMatchKind::Trigger {
-                if self.depth > 0 {
-                    active_skills.clear();
-                    info!(
-                        session_id,
-                        "Dropped trigger-only skills for delegated agent"
-                    );
-                } else {
-                    let runtime_snapshot = self.llm_runtime.snapshot();
-                    let confirmation_model = runtime_snapshot
-                        .router()
-                        .map(|router| router.select(router::Tier::Fast).to_string())
-                        .unwrap_or_else(|| runtime_snapshot.primary_model());
-                    let provider = runtime_snapshot.provider();
-                    match skills::confirm_skills(
-                        &*provider,
-                        &confirmation_model,
-                        active_skills.clone(),
-                        user_text,
-                        Some(&self.state),
-                        Some((Arc::clone(&self.event_store), session_id)),
-                    )
-                    .await
-                    {
-                        Ok(confirmed) => {
-                            let confirmed_names: Vec<&str> =
-                                confirmed.iter().map(|s| s.name.as_str()).collect();
-                            info!(session_id, confirmed = ?confirmed_names, "LLM-confirmed skills");
-                            llm_confirmed_skills = true;
-                            active_skills = confirmed;
-                        }
-                        Err(error) => {
-                            warn!(
-                                %error,
-                                "Skill confirmation failed for trigger candidates; dropping skills"
-                            );
-                            active_skills.clear();
-                        }
-                    }
-                }
-            }
+            info!(session_id, skills = ?names, "Explicitly requested skills for message");
         }
 
         if self.record_decision_points {
             let final_skill_names: Vec<String> =
                 active_skills.iter().map(|s| s.name.clone()).collect();
-            let final_set: HashSet<String> = final_skill_names.iter().cloned().collect();
-            let dropped: Vec<String> = keyword_skill_names
-                .iter()
-                .filter(|n| !final_set.contains(*n))
-                .cloned()
-                .collect();
             self.emit_decision_point(
                 emitter,
                 task_id,
                 0,
                 DecisionType::SkillMatch,
-                format!(
-                    "Skill match: kind={:?} keyword={} confirmed={} dropped={}",
-                    skill_match_kind,
-                    keyword_skill_names.len(),
-                    final_skill_names.len(),
-                    dropped.len()
-                ),
-                json!({
-                    "kind": format!("{:?}", skill_match_kind),
-                    "keyword_matches": keyword_skill_names,
-                    "llm_confirmed": llm_confirmed_skills,
-                    "final": final_skill_names,
-                    "dropped": dropped
-                }),
+                format!("Skill match: explicit={}", final_skill_names.len()),
+                json!({ "final": final_skill_names }),
             )
             .await;
         }

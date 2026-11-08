@@ -24,7 +24,7 @@ use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
-use crate::router::{self, Router};
+use crate::router::Router;
 use crate::runtime_ports::OutboundRouter;
 use crate::skills;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};

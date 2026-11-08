@@ -219,16 +219,12 @@ impl ManageSkillsTool {
         Ok(())
     }
 
-    fn no_trigger_note(skill: &Skill) -> Option<String> {
-        if skill.triggers.is_empty() {
-            let explicit_ref = skills::sanitize_skill_filename(&skill.name);
-            Some(format!(
-                " Note: '{}' has no triggers, so it will not auto-activate. Use `use skill {}` or `${}` in the same message.",
-                skill.name, explicit_ref, explicit_ref
-            ))
-        } else {
-            None
-        }
+    fn activation_note(skill: &Skill) -> String {
+        let explicit_ref = skills::sanitize_skill_filename(&skill.name);
+        format!(
+            " Note: '{}' is loaded when a task calls for it. To force it, use `use skill {}` or `${}` in the same message.",
+            skill.name, explicit_ref, explicit_ref
+        )
     }
 
     async fn fetch_registry_entry(
@@ -2184,7 +2180,7 @@ impl ManageSkillsTool {
         let name = skill.name.clone();
         let desc = skill.description.clone();
         let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
-        let activation_note = Self::no_trigger_note(&skill).unwrap_or_default();
+        let activation_note = Self::activation_note(&skill);
 
         info!(name = %name, path = %path.display(), "Skill added to filesystem");
         Ok(format!(
@@ -2706,7 +2702,7 @@ impl ManageSkillsTool {
         }
 
         let skill_name = skill.name.clone();
-        let activation_note = Self::no_trigger_note(&skill).unwrap_or_default();
+        let activation_note = Self::activation_note(&skill);
         let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
         let version_suffix = entry
             .version
@@ -2772,7 +2768,7 @@ impl ManageSkillsTool {
             skill.source = Some("registry".to_string());
             skill.source_url = Some(entry.url.clone());
             let skill_name = skill.name.clone();
-            let activation_note = Self::no_trigger_note(&skill).unwrap_or_default();
+            let activation_note = Self::activation_note(&skill);
             let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
             if !existing.enabled {
                 let _ = skills::set_skill_enabled(&self.skills_dir, &skill.name, false)?;
@@ -2838,7 +2834,7 @@ impl ManageSkillsTool {
         );
         skill.source = existing.skill.source.clone();
         skill.source_url = Some(source_url);
-        let activation_note = Self::no_trigger_note(&skill).unwrap_or_default();
+        let activation_note = Self::activation_note(&skill);
         let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
         if !existing.enabled {
             let _ = skills::set_skill_enabled(&self.skills_dir, &skill.name, false)?;
@@ -4120,7 +4116,7 @@ mutation CreateWidget {
     }
 
     #[test]
-    fn no_trigger_note_guides_explicit_activation() {
+    fn activation_note_guides_explicit_activation() {
         let skill = Skill {
             name: "manual-only".to_string(),
             description: "Needs explicit activation".to_string(),
@@ -4133,8 +4129,7 @@ mutation CreateWidget {
             resources: vec![],
         };
 
-        let note = ManageSkillsTool::no_trigger_note(&skill).expect("note");
-        assert!(note.contains("no triggers"));
+        let note = ManageSkillsTool::activation_note(&skill);
         assert!(note.contains("use skill manual-only"));
         assert!(note.contains("$manual-only"));
     }

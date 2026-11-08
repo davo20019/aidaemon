@@ -62,7 +62,7 @@ Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gem
 SQLite-backed persistent memory with vector embeddings (AllMiniLML6V2). Background consolidation extracts durable facts from conversations. Semantic episode recall is the coarse discovery layer; `search_history` adds authorized FTS5 search over exact retained user/assistant messages, anchored context, task bookends, and signed forward/backward paging. Exact recall follows `state.retention.messages_days` (90 by default; `0` opts into permanent active-database history), independently of short-lived diagnostic events. Database encrypted at rest by default.
 
 ### Skills
-Trigger-based instructions that teach it new workflows. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
+Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
 
 ### Automation
 Cron-style scheduled tasks with natural language time parsing. Email triggers via IMAP IDLE. Long-running goal tracking with task breakdown and multi-schedule support.

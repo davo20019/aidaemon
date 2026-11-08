@@ -1220,9 +1220,8 @@ pub(in crate::agent) async fn run_bootstrap(
         )
         .await?;
 
-    // An external-reference skill may narrow the roster only after it is the
-    // final activated skill. Raw trigger matches are merely semantic
-    // candidates and cannot independently remove tools.
+    // A skill the user explicitly asked for this turn narrows the roster when
+    // it is an external API reference.
     let skills_snapshot = agent.skill_cache.get();
     let active_untrusted_external_reference_skills: Vec<String> = skills_snapshot
         .iter()
