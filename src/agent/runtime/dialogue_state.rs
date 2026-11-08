@@ -187,6 +187,10 @@ pub(in crate::agent) fn owner_request_for_verifier(
                 && Some(request.user_message_id.as_str()) != current_message_id
                 && !request.text.trim().is_empty()
                 && !open_request_anchor_expired(request, now)
+                && state
+                    .last_user_turn
+                    .as_ref()
+                    .is_none_or(|turn| turn.message_id != request.user_message_id)
         })
         .collect();
     owed.sort_by_key(|request| request.opened_at);
@@ -249,6 +253,10 @@ pub(in crate::agent) fn owed_request_candidate_rows(
             request_is_owed(request)
                 && !request.text.trim().is_empty()
                 && !open_request_anchor_expired(request, now)
+                && state
+                    .last_user_turn
+                    .as_ref()
+                    .is_none_or(|turn| turn.message_id != request.user_message_id)
         })
         .collect();
     owed.sort_by_key(|request| request.opened_at);
@@ -2248,6 +2256,37 @@ mod owner_lineage_tests {
             1,
             "a new request leaves owed work alone"
         );
+    }
+
+    #[test]
+    fn the_current_message_is_never_its_own_continuation_candidate() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("session-1".to_string());
+        let request = |id: &str, text: &str| OpenRequest {
+            user_message_id: id.to_string(),
+            text: text.to_string(),
+            status: OpenRequestStatus::Open,
+            task_id: None,
+            project_scope: None,
+            semantic_scope: None,
+            completion_contract: None,
+            opened_at: now,
+            resolved_at: None,
+        };
+        state.open_request = Some(request("message-current", "the provisional request"));
+        state.last_user_turn = Some(crate::traits::UserTurnSummary {
+            message_id: "message-current".to_string(),
+            kind: UserTurnKind::NewRequest,
+            text: "the provisional request".to_string(),
+        });
+        assert!(owed_request_candidate_rows(&state, now).is_none());
+
+        state
+            .unfinished_requests
+            .push(request("message-earlier", "the earlier unfinished request"));
+        let rows = owed_request_candidate_rows(&state, now).expect("the earlier request is owed");
+        assert!(rows.contains("message-earlier"));
+        assert!(!rows.contains("message-current"));
     }
 
     #[test]
