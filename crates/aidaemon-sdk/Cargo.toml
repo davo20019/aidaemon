@@ -53,3 +53,7 @@ required-features = ["tools", "policies", "testing"]
 [[example]]
 name = "coding_agent"
 required-features = ["providers", "tools", "policies", "sqlite"]
+
+[[example]]
+name = "support_triage"
+required-features = ["providers", "policies"]

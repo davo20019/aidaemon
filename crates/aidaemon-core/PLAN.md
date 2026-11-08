@@ -33,7 +33,9 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
   untrusted output, project instructions, context window, memory, tracing),
   eval kit, swappable long-term memory ported from the daemon, chat
   channels (runner + Telegram, Slack, Discord adapters), and the
-  `aidaemon-sdk` bundle with a `coding_agent` example.
+  `aidaemon-sdk` bundle with a `coding_agent` example and a non-coding
+  `support_triage` example (custom tools, approvals on writes, no file or
+  shell tools; not yet run against a live model).
 
 ## Decisions already made
 
@@ -69,9 +71,11 @@ Each phase ends in something runnable and tested. Phases 1-3 can overlap.
 
 ### Phase 0: lock the primitives (done)
 ### Phase 1: a real model (done)
-OpenAI-compatible and Anthropic providers with streaming and prompt caching,
-tested against local mock servers. **Not yet run against a live model**:
-needs an API key (see Phase 4).
+Five backends, each with streaming and tests against local mock servers:
+Anthropic, OpenAI-compatible, Google Gemini, xAI, and the ChatGPT
+subscription backend (`aidaemon-providers`). The daemon runs every model
+call through them, so they have run live under the daemon. The SDK's own
+examples have not yet been run live: see Phase 4.
 
 ### Phase 2: tools worth having (done)
 Workspace-confined tools, sandbox backends (local, bubblewrap, seatbelt,
@@ -86,8 +90,11 @@ database.
 ### Phase 4: measurement
 - [x] `aidaemon-eval`: scenarios, trajectory assertions, N-of-M reports,
       baseline comparison, 5 scripted scenarios.
-- [ ] Live runs: run `crates/aidaemon-eval/scenarios` and the
-      `coding_agent` example against real models (needs API keys).
+- [ ] Live runs: run `crates/aidaemon-eval/scenarios`, the `coding_agent`
+      example and the `support_triage` example against real models (needs
+      API keys; `support_triage` is the non-coding check for "any kind of
+      agent"). Live tests that exist: `src/integration_tests/live_sdk_turns.rs`
+      (six `#[ignore]` tests against the ChatGPT backend).
 - [ ] Old-vs-new comparison: translate the daemon's 16 fixtures in
       `tests/harness_eval/fixtures/` into `aidaemon-eval` scenarios (or add a
       `core` engine to `src/harness_eval`) and report both loops side by side.
@@ -176,7 +183,11 @@ adapters, tested against local mock servers.
       (`sdk_engine/budgets.rs`, `task_token_budget`).
 - [ ] Whole-branch review, then live N-of-M runs on goals and mandates.
 
-### Phase 8: the daemon is built on the SDK  ← Next up
+### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
+
+Status: 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-3 of 10; 8.8 providers
+done and MCP transport moved, channels on the SDK adapters; 8.1, 8.5-8.7,
+8.7b and 8.9 not started or open. The first unchecked item below is next.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -185,12 +196,14 @@ in `aidaemon-policies`, extending what is there (`ApprovalPolicy`,
 only facts specific to it (its tools' effects, the owner's rules, the
 channel that asks the owner) and deletes the logic it duplicates.
 
-Where duplication comes from: the daemon uses `aidaemon-core` and
-`aidaemon-providers` (every model call, since 8.8's providers step), and
-uses `aidaemon-policies` and `aidaemon-memory` only in part. It does not use
-`aidaemon-tools`, the channel crates, `aidaemon-mcp`,
-`aidaemon-store-sqlite` or `aidaemon-agents`, because it has larger copies
-of each in `src/`.
+Where duplication comes from (checked 2026-11-07 by import count): the daemon
+imports `aidaemon-core` (62 files), `aidaemon-memory` (29),
+`aidaemon-policies` (13), `aidaemon-tools` (8), the channel crates (8),
+`aidaemon-store-sqlite` (6), `aidaemon-providers` (5) and `aidaemon-mcp`
+(1). It does not import `aidaemon-agents`. Most of these are partial uses:
+the daemon keeps larger copies of tools and policies in `src/`, and only
+some of each crate is used. Providers are the exception: every model call
+goes through them.
 
 Direction (owner): promote the daemon's implementations into the SDK
 crates, replacing the thinner SDK versions, one domain per plan.
@@ -395,8 +408,11 @@ Order:
         Separate fixes, done: `restart` and `enable` ask the owner before
         respawning a stored command; `is_non_delegable_tool` no longer
         relies on an `mcp__` prefix no real name has.
-      - Channels map (2026-11-07). The daemon uses teloxide, serenity and
-        hand-written Slack code, and does not depend on the channel crates.
+      - Channels map (2026-11-07). Update: the daemon's Telegram, Slack and
+        Discord bots now run on the SDK channel adapters, and on the daemon's
+        own turn runner (`src/channels/turns.rs`, `57788a2`, `fda3475`,
+        `0fa59fe`). Discord has dropped serenity. The rest of this item
+        records the plan as written before those commits.
         Use the crate adapters for transport only, not `ChannelRunner`: the
         daemon owns access, sessions, queueing, approvals and dynamic bots.
         Generic features the crates need first:
@@ -527,10 +543,12 @@ cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools \
   -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk --all-features
 cargo run -p aidaemon-core --example quickstart --features testing
 ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example coding_agent -- <dir> "<task>"
+ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example support_triage
 ```
 
 Prompt to start a new session:
 
 > Continue the aidaemon SDK work. Check out branch `ccr-695cf12a-023uky`,
 > read `crates/aidaemon-core/PLAN.md` and `DESIGN.md`, then work on the
-> step marked "Next up". Commit as David Loor M. with no Claude attribution.
+> first unchecked step in Phase 8. Commit as David Loor M. with no Claude
+> attribution.
