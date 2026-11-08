@@ -828,7 +828,6 @@ pub async fn register_optional_tools(
                     config.cli_agents.clone(),
                     state.clone(),
                     llm_runtime.clone(),
-                    approval_tx.clone(),
                 )
                 .await;
                 has_cli_agents = cli_tool.has_tools();

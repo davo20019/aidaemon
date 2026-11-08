@@ -22,6 +22,7 @@ mod manage_memories;
 mod manage_people;
 pub(crate) mod memory;
 pub(crate) mod objective_status;
+pub(crate) mod owner_answers;
 mod policy_metrics;
 pub mod result_spill;
 pub mod sanitize;

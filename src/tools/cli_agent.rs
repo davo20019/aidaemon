@@ -13,10 +13,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{
-    command_risk::{PermissionMode, RiskLevel},
-    daemon_guard::detect_daemonization_primitives,
-};
+use super::daemon_guard::detect_daemonization_primitives;
 use crate::agent::{
     derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
     ExecutorHandoff, TargetScope, TaskValidationOutcome,
@@ -27,8 +24,6 @@ use crate::execution::{
 };
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     DynamicCliAgent, Message, StateStore, Tool, ToolArgumentContractViolation,
     ToolCallAccessManifest, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
@@ -630,7 +625,9 @@ pub struct CliAgentTool {
     default_max_output: usize,
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
-    approval_tx: ApprovalBroker,
+    /// The owner's approvals of exact detached/background runs, delivered by
+    /// the agent kernel (`record_owner_answer`) and consumed by the run.
+    owner_answers: Arc<crate::tools::owner_answers::OwnerAnsweredCalls>,
     hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// Re-enter the root agent when background delegation completes so the
     /// delegated step advances the original user outcome instead of ending it.
@@ -1240,15 +1237,65 @@ impl CliAgentTool {
         }
     }
 
-    async fn request_daemonization_approval(
-        &self,
-        session_id: &str,
-        tool_name: &str,
+    /// The detached/background markers in a run's prompt and system
+    /// instruction, in the order found, without repeats.
+    fn daemonization_hits(prompt: &str, system_instruction: Option<&str>) -> Vec<&'static str> {
+        let mut hits = detect_daemonization_primitives(prompt);
+        if let Some(system_instruction) = system_instruction {
+            for hit in detect_daemonization_primitives(system_instruction) {
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
+            }
+        }
+        hits
+    }
+
+    /// A `run` call whose own prompt (not one recovered from stored task
+    /// context) or system instruction carries detached/background markers,
+    /// with that prompt.
+    fn daemonizing_run(arguments: &Value) -> Option<(CliAgentArgs, String)> {
+        let args: CliAgentArgs = serde_json::from_value(arguments.clone()).ok()?;
+        if args.action.as_deref().unwrap_or("run") != "run" {
+            return None;
+        }
+        let prompt = args.run_prompt()?;
+        if Self::daemonization_hits(&prompt, args.system_instruction.as_deref()).is_empty() {
+            return None;
+        }
+        Some((args, prompt))
+    }
+
+    /// The exact run an owner approval of a daemonizing run covers: the
+    /// requested agent, prompt and system instruction. The card and the run
+    /// derive it from the same arguments, so an approval never covers a
+    /// different run.
+    fn daemonization_subject(
+        requested_tool: Option<&str>,
         prompt: &str,
+        system_instruction: Option<&str>,
+    ) -> String {
+        json!({
+            "action": "run",
+            "tool": requested_tool,
+            "prompt": prompt,
+            "system_instruction": system_instruction,
+        })
+        .to_string()
+    }
+
+    /// The owner's card for a run whose prompt asks for detached/background
+    /// execution, for this exact run.
+    fn daemonization_request(
+        &self,
+        requested_tool: Option<&str>,
+        prompt: &str,
+        system_instruction: Option<&str>,
         hits: &[&str],
-    ) -> anyhow::Result<ApprovalResponse> {
+    ) -> aidaemon_core::OwnerApprovalRequest {
+        let tool_name = requested_tool.unwrap_or("default");
         let prompt_preview: String = prompt.chars().take(180).collect();
-        let command = format!(
+        let summary = format!(
             "cli_agent '{}' requested detached/background execution markers: {}. Prompt preview: {}",
             tool_name,
             hits.join(", "),
@@ -1265,25 +1312,15 @@ impl CliAgentTool {
             "Detached/background processes may survive cancellation and continue running."
                 .to_string(),
         ];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command,
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::Critical,
-                warnings,
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
-            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
+        aidaemon_core::OwnerApprovalRequest {
+            effects: vec![aidaemon_core::EffectKey::named(
+                aidaemon_core::EffectClass::Process,
+                &format!("cli_agent:{tool_name}"),
+            )],
+            summary,
+            subject: Self::daemonization_subject(requested_tool, prompt, system_instruction),
+            risk: aidaemon_core::ApprovalRisk::Critical,
+            warnings,
         }
     }
 
@@ -1292,7 +1329,6 @@ impl CliAgentTool {
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
         llm_runtime: SharedLlmRuntime,
-        approval_tx: ApprovalBroker,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
@@ -1386,7 +1422,7 @@ impl CliAgentTool {
             default_max_output,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -4154,6 +4190,46 @@ impl Tool for CliAgentTool {
         "cli_agent"
     }
 
+    /// A daemonizing run's card authorizes only that run.
+    fn approval_card_kind(
+        &self,
+        _request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        crate::types::ApprovalKind::CommandOnce
+    }
+
+    /// Keep the owner's approval of a daemonizing run for that exact run in
+    /// its session; the run consumes it.
+    async fn record_owner_answer(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+        response: Option<ApprovalResponse>,
+    ) {
+        if !matches!(
+            response,
+            Some(
+                ApprovalResponse::AllowOnce
+                    | ApprovalResponse::AllowSession
+                    | ApprovalResponse::AllowAlways
+            )
+        ) {
+            return;
+        }
+        let Some(session) = facts.session() else {
+            return;
+        };
+        let Some((args, prompt)) = Self::daemonizing_run(call.arguments) else {
+            return;
+        };
+        let subject = Self::daemonization_subject(
+            args.tool.as_deref(),
+            &prompt,
+            args.system_instruction.as_deref(),
+        );
+        self.owner_answers.approve(session, &subject);
+    }
+
     fn description(&self) -> &str {
         "Delegate a task to a CLI-based AI coding agent running on this machine"
     }
@@ -4266,6 +4342,7 @@ impl Tool for CliAgentTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for CliAgentTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
@@ -4273,8 +4350,38 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             manages_own_timeout: true,
             goal_context: crate::traits::GoalContext::BackgroundDelivery,
             checkpoints_writes: true,
+            // The owner's approval of a daemonizing run is kept for that
+            // run alone (`record_owner_answer`), never as a session grant.
+            keeps_own_grants: true,
             ..Default::default()
         }
+    }
+
+    /// A run whose prompt asks for detached/background execution asks the
+    /// owner, for that exact run. A caller who is not the owner, or a call
+    /// with no session, is refused by the run itself, so nothing is asked.
+    /// Every other call is left to the approval policy.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        let Some((args, prompt)) = Self::daemonizing_run(call.arguments) else {
+            return crate::traits::OwnerApprovalNeed::Unjudged;
+        };
+        if !Self::is_owner_role(facts.user_role) || facts.session().is_none() {
+            return crate::traits::OwnerApprovalNeed::Unjudged;
+        }
+        let hits = Self::daemonization_hits(&prompt, args.system_instruction.as_deref());
+        crate::traits::OwnerApprovalNeed::Ask(self.daemonization_request(
+            args.tool.as_deref(),
+            &prompt,
+            args.system_instruction.as_deref(),
+            &hits,
+        ))
     }
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
@@ -4662,14 +4769,8 @@ impl CliAgentTool {
                     }
                 }
 
-                let mut daemon_hits = detect_daemonization_primitives(&prompt);
-                if let Some(system_instruction) = args.system_instruction.as_deref() {
-                    for hit in detect_daemonization_primitives(system_instruction) {
-                        if !daemon_hits.contains(&hit) {
-                            daemon_hits.push(hit);
-                        }
-                    }
-                }
+                let daemon_hits =
+                    Self::daemonization_hits(&prompt, args.system_instruction.as_deref());
                 if !daemon_hits.is_empty() {
                     if !Self::is_owner_role(args.call_role) {
                         return Ok(format!(
@@ -4683,29 +4784,22 @@ impl CliAgentTool {
                                 .to_string(),
                         );
                     }
-                    match self
-                        .request_daemonization_approval(
-                            session_id.trim(),
-                            &tool,
-                            &prompt,
-                            &daemon_hits,
-                        )
-                        .await
-                    {
-                        Ok(ApprovalResponse::Deny) => {
-                            return Ok("Daemonizing cli_agent run denied by owner.".to_string());
-                        }
-                        Ok(
-                            ApprovalResponse::AllowOnce
-                            | ApprovalResponse::AllowSession
-                            | ApprovalResponse::AllowAlways,
-                        ) => {}
-                        Err(e) => {
-                            return Ok(format!(
-                                "Could not get owner approval for daemonizing cli_agent run: {}",
-                                e
-                            ));
-                        }
+                    // The kernel asked the owner about this exact run
+                    // (`owner_approval_request`) and delivered the approval
+                    // (`record_owner_answer`); a decline never reaches here.
+                    let subject = Self::daemonization_subject(
+                        args.tool.as_deref(),
+                        &prompt,
+                        args.system_instruction.as_deref(),
+                    );
+                    let approved = facts
+                        .session()
+                        .is_some_and(|session| self.owner_answers.take(session, &subject));
+                    if !approved {
+                        return Ok(format!(
+                            "Blocked: daemonization primitives detected in cli_agent prompt ({}); detached/background execution requires the owner's approval of this exact run through the agent kernel, and none was given.",
+                            daemon_hits.join(", ")
+                        ));
                     }
                 }
                 // Goal-scoped cli_agent runs should not detach immediately:
@@ -5076,8 +5170,6 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -5110,7 +5202,7 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -5134,8 +5226,6 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -5168,7 +5258,7 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -5389,6 +5479,112 @@ mod tests {
             "Expected daemonization guard block, got: {}",
             result
         );
+    }
+
+    fn owner_facts(session: &str) -> crate::traits::ToolCallContext {
+        crate::traits::ToolCallContext {
+            session_id: session.into(),
+            user_role: Some(crate::types::UserRole::Owner),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn daemonizing_run_asks_the_owner_through_the_kernel_once() {
+        use crate::traits::{ApprovalCall, OwnerApprovalNeed};
+        let (tool, _db) = setup_echo_tool().await;
+        let args = json!({"action":"run","tool":"echo","prompt":"nohup echo hi &"});
+        let call = ApprovalCall::as_sent(&args);
+
+        let OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval_request(&call, &owner_facts("sess1"))
+            .await
+        else {
+            panic!("a daemonizing owner run must ask");
+        };
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::Critical);
+        assert!(request.summary.contains("detached/background"));
+        assert!(matches!(
+            tool.approval_card_kind(&request),
+            crate::types::ApprovalKind::CommandOnce
+        ));
+        assert!(tool.dispatch_facts().keeps_own_grants);
+
+        // A plain run, a non-owner, or no session: the tool has no card.
+        let plain = json!({"action":"run","tool":"echo","prompt":"echo hi"});
+        assert!(matches!(
+            tool.owner_approval_request(&ApprovalCall::as_sent(&plain), &owner_facts("sess1"))
+                .await,
+            OwnerApprovalNeed::Unjudged
+        ));
+        let guest = crate::traits::ToolCallContext {
+            session_id: "sess1".into(),
+            user_role: Some(crate::types::UserRole::Guest),
+            ..Default::default()
+        };
+        assert!(matches!(
+            tool.owner_approval_request(&call, &guest).await,
+            OwnerApprovalNeed::Unjudged
+        ));
+        assert!(matches!(
+            tool.owner_approval_request(&call, &owner_facts("")).await,
+            OwnerApprovalNeed::Unjudged
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemonizing_run_runs_only_with_a_kernel_approval_of_that_run() {
+        use crate::traits::ApprovalCall;
+        let (tool, _db) = setup_echo_tool().await;
+        let raw = r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#;
+        let args: Value = serde_json::from_str(raw).unwrap();
+        let facts = owner_facts("sess1");
+        let run = || tool.call_with_status_under_contract(raw, None, false, false, &facts);
+
+        // Never approved: refused, and the tool asks nobody itself.
+        let result = run().await.unwrap();
+        assert!(result.contains("through the agent kernel"), "{result}");
+
+        // A decline or a timeout keeps nothing.
+        tool.record_owner_answer(
+            &ApprovalCall::as_sent(&args),
+            &facts,
+            Some(ApprovalResponse::Deny),
+        )
+        .await;
+        tool.record_owner_answer(&ApprovalCall::as_sent(&args), &facts, None)
+            .await;
+        let result = run().await.unwrap();
+        assert!(result.contains("through the agent kernel"), "{result}");
+
+        // An approval of a different run, or in another session, covers nothing.
+        let other = json!({"action":"run","tool":"echo","prompt":"nohup echo other &"});
+        tool.record_owner_answer(
+            &ApprovalCall::as_sent(&other),
+            &facts,
+            Some(ApprovalResponse::AllowOnce),
+        )
+        .await;
+        tool.record_owner_answer(
+            &ApprovalCall::as_sent(&args),
+            &owner_facts("sess2"),
+            Some(ApprovalResponse::AllowOnce),
+        )
+        .await;
+        let result = run().await.unwrap();
+        assert!(result.contains("through the agent kernel"), "{result}");
+
+        // The approved run runs once.
+        tool.record_owner_answer(
+            &ApprovalCall::as_sent(&args),
+            &facts,
+            Some(ApprovalResponse::AllowOnce),
+        )
+        .await;
+        let result = run().await.unwrap();
+        assert!(!result.contains("Blocked"), "{result}");
+        let result = run().await.unwrap();
+        assert!(result.contains("through the agent kernel"), "{result}");
     }
 
     #[tokio::test]
@@ -6559,8 +6755,6 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         // Config with echo as a custom tool
         let mut tools = HashMap::new();
@@ -6591,7 +6785,6 @@ mod tests {
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
             ),
-            approval_tx,
         )
         .await;
         assert!(tool.has_tools());
@@ -6615,8 +6808,6 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools = HashMap::new();
         tools.insert(
@@ -6646,7 +6837,6 @@ mod tests {
                 crate::config::ProviderKind::OpenaiCompatible,
                 "mock".to_string(),
             ),
-            approval_tx,
         )
         .await;
         assert!(!tool.has_tools());
@@ -6672,8 +6862,6 @@ mod tests {
         );
         let state_clone = state.clone();
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -6706,7 +6894,7 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -6751,8 +6939,6 @@ mod tests {
         );
         let state_clone = state.clone();
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -6785,7 +6971,7 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
@@ -6923,8 +7109,6 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -6957,7 +7141,7 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            approval_tx,
+            owner_answers: Default::default(),
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
