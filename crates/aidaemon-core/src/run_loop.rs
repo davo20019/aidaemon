@@ -15,8 +15,8 @@ use crate::approval::{EffectClass, EffectKey, InterruptKind, OWNER_DECLINED};
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{
-    HookContext, LimitDecision, ModelDecision, ModelErrorDecision, StopDecision, StuckDecision,
-    ToolDecision,
+    Hook, HookContext, HookFailure, HookPoint, LimitDecision, ModelDecision, ModelErrorDecision,
+    StopDecision, StuckDecision, ToolDecision,
 };
 use crate::limits::{LimitKind, Limits, RunSnapshot, HARD_TURN_CAP};
 use crate::message::{Message, MessageOrigin, Role, ToolCall};
@@ -158,8 +158,13 @@ impl<'a> Driver<'a> {
                 started: earlier.clone(),
                 done: earlier,
             });
+            // A position in a different chain is a different hook: judge
+            // the call from the start rather than skip one.
+            let resume_after = pending
+                .hook_index
+                .filter(|_| pending.hook_chain == self.hook_chain());
             match self
-                .execute_batch(&pending.calls, pending.next, resolution, pending.hook_index)
+                .execute_batch(&pending.calls, pending.next, resolution, resume_after)
                 .await?
             {
                 BatchEnd::Done => self.checkpoint().await?,
@@ -179,8 +184,9 @@ impl<'a> Driver<'a> {
             // new run.
             if self.state.turn == 0 {
                 let ctx = self.ctx();
+                let guard = self.guard(HookPoint::OnRunStart);
                 for hook in &self.agent.hooks {
-                    hook.on_run_start(&ctx).await;
+                    guard.run(hook.as_ref(), hook.on_run_start(&ctx)).await;
                 }
             }
         }
@@ -219,8 +225,11 @@ impl<'a> Driver<'a> {
             let mut request = self.build_request();
             {
                 let ctx = self.ctx();
+                let guard = self.guard(HookPoint::BeforeModel);
                 for hook in &self.agent.hooks {
-                    hook.before_model(&ctx, &mut request).await;
+                    guard
+                        .run(hook.as_ref(), hook.before_model(&ctx, &mut request))
+                        .await;
                 }
             }
 
@@ -260,7 +269,13 @@ impl<'a> Driver<'a> {
             self.state.usage.add(usage);
             self.state.run_usage.add(usage);
             let mut response = response;
-            let rejection = self.judge_response(&mut response).await;
+            let rejection = match self.judge_response(&mut response).await {
+                Ok(rejection) => rejection,
+                Err(hook) => {
+                    let reason = format!("the response check `{hook}` gave no answer");
+                    return self.finish(RunStatus::Stopped { reason }, None).await;
+                }
+            };
             let calls: Vec<ToolCall> = response
                 .tool_calls
                 .into_iter()
@@ -309,10 +324,20 @@ impl<'a> Driver<'a> {
                 // unmet: stopping is permitted, success is not implied.
                 let (rejection, unmet) = {
                     let ctx = self.ctx();
+                    let guard = self.guard(HookPoint::OnStop);
                     let mut rejection = None;
                     let mut unmet: Vec<String> = Vec::new();
                     for hook in &self.agent.hooks {
-                        match hook.on_stop(&ctx, &response.text).await {
+                        let answer = guard
+                            .run(hook.as_ref(), hook.on_stop(&ctx, &response.text))
+                            .await
+                            .unwrap_or_else(|| StopDecision::AcceptUnmet {
+                                unmet: vec![format!(
+                                    "the completion check `{}` gave no answer",
+                                    hook.name()
+                                )],
+                            });
+                        match answer {
                             StopDecision::Accept => {}
                             StopDecision::Continue { message } => {
                                 rejection = Some(message);
@@ -330,6 +355,9 @@ impl<'a> Driver<'a> {
                     }
                     (rejection, unmet)
                 };
+                if self.cancel.is_cancelled() {
+                    return self.finish(RunStatus::Cancelled, None).await;
+                }
                 match rejection {
                     Some(message) => {
                         self.emit(Event::StopRejected {
@@ -628,6 +656,7 @@ impl<'a> Driver<'a> {
                         next: index,
                         interruption: interruption.clone(),
                         hook_index: Some(hook_index),
+                        hook_chain: self.hook_chain(),
                     });
                     self.emit(Event::Interrupted {
                         interruption: interruption.clone(),
@@ -691,10 +720,17 @@ impl<'a> Driver<'a> {
             return Verdict::Deny(reason);
         }
         let ctx = self.ctx();
+        let guard = self.guard(HookPoint::BeforeTool);
         let mut hook_index = from;
         let mut rewrites = 0;
         while let Some(hook) = self.agent.hooks.get(hook_index) {
-            match hook.before_tool(&ctx, call, info).await {
+            let answer = guard
+                .run(hook.as_ref(), hook.before_tool(&ctx, call, info))
+                .await
+                .unwrap_or_else(|| ToolDecision::Deny {
+                    reason: format!("the safety check `{}` gave no answer", hook.name()),
+                });
+            match answer {
                 ToolDecision::Allow => {}
                 ToolDecision::Deny { reason } => return Verdict::Deny(reason),
                 ToolDecision::Interrupt { reason, kind } => {
@@ -916,8 +952,17 @@ impl<'a> Driver<'a> {
         output.content = truncate_middle(&output.content, self.agent.limits.max_tool_output_chars);
         {
             let ctx = self.ctx();
+            let guard = self.guard(HookPoint::AfterTool);
             for hook in &self.agent.hooks {
-                hook.after_tool(&ctx, &receipt, output).await;
+                let screened = guard
+                    .run(hook.as_ref(), hook.after_tool(&ctx, &receipt, output))
+                    .await;
+                if screened.is_none() {
+                    *output = ToolOutput::error(format!(
+                        "This result was withheld because the check `{}` gave no answer.",
+                        hook.name()
+                    ));
+                }
             }
         }
         self.state.messages.push(
@@ -974,7 +1019,12 @@ impl<'a> Driver<'a> {
             let ctx = self.ctx();
             let mut decision = None;
             for hook in &self.agent.hooks {
-                if let Some(d) = hook.on_stuck(&ctx, &signal).await {
+                let answer = self
+                    .guard(HookPoint::OnStuck)
+                    .run(hook.as_ref(), hook.on_stuck(&ctx, &signal))
+                    .await
+                    .flatten();
+                if let Some(d) = answer {
                     decision = Some(d);
                     break;
                 }
@@ -1127,6 +1177,31 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The names of the installed hooks, in order.
+    fn hook_chain(&self) -> Vec<String> {
+        self.agent
+            .hooks
+            .iter()
+            .map(|hook| hook.name().to_string())
+            .collect()
+    }
+
+    /// Containment for hooks called at `point` from here.
+    fn guard(&self, point: HookPoint) -> HookGuard<'_> {
+        // Being out of time is what `on_limit` is asked about, and at zero
+        // left any other hook would time out before it could answer.
+        let budget = self
+            .remaining()
+            .filter(|left| point != HookPoint::OnLimit && !left.is_zero());
+        HookGuard {
+            agent: self.agent,
+            run_id: self.state.run_id,
+            point,
+            cancel: Some(&self.cancel),
+            budget,
+        }
+    }
+
     /// The agent's limits, raised by what hooks granted this run.
     fn limits(&self) -> Limits {
         self.agent.limits.with_grants(&self.state.limit_grants)
@@ -1147,8 +1222,10 @@ impl<'a> Driver<'a> {
         let mut granted = None;
         {
             let ctx = self.ctx();
+            let guard = self.guard(HookPoint::OnLimit);
             for hook in &self.agent.hooks {
-                if let LimitDecision::Extend { amount } = hook.on_limit(&ctx, limit).await {
+                let answer = guard.run(hook.as_ref(), hook.on_limit(&ctx, limit)).await;
+                if let Some(LimitDecision::Extend { amount }) = answer {
                     if amount > 0 {
                         granted = Some(amount);
                         break;
@@ -1165,23 +1242,36 @@ impl<'a> Driver<'a> {
     }
 
     /// Let `after_model` hooks check the response. Returns why it was
-    /// rejected, if it was.
-    async fn judge_response(&self, response: &mut ModelResponse) -> Option<String> {
+    /// rejected, if it was, or the name of a hook that gave no answer.
+    async fn judge_response(
+        &self,
+        response: &mut ModelResponse,
+    ) -> Result<Option<String>, &'static str> {
         let ctx = self.ctx();
+        let guard = self.guard(HookPoint::AfterModel);
         for hook in &self.agent.hooks {
-            if let ModelDecision::Reject { message } = hook.after_model(&ctx, response).await {
-                return Some(message);
+            match guard
+                .run(hook.as_ref(), hook.after_model(&ctx, response))
+                .await
+            {
+                Some(ModelDecision::Accept) => {}
+                Some(ModelDecision::Reject { message }) => return Ok(Some(message)),
+                None => return Err(hook.name()),
             }
         }
-        None
+        Ok(None)
     }
 
     /// How long to wait before retrying a failed model call, if a hook
     /// wants a retry.
     async fn retry_after(&self, error: &ProviderError) -> Option<Duration> {
         let ctx = self.ctx();
+        let guard = self.guard(HookPoint::OnModelError);
         for hook in &self.agent.hooks {
-            if let ModelErrorDecision::Retry { after } = hook.on_model_error(&ctx, error).await {
+            let answer = guard
+                .run(hook.as_ref(), hook.on_model_error(&ctx, error))
+                .await;
+            if let Some(ModelErrorDecision::Retry { after }) = answer {
                 return Some(after);
             }
         }
@@ -1206,7 +1296,11 @@ impl<'a> Driver<'a> {
         for index in 0..self.agent.hooks.len() {
             let replacement = {
                 let ctx = self.ctx();
-                self.agent.hooks[index].edit_transcript(&ctx).await
+                let hook = &self.agent.hooks[index];
+                self.guard(HookPoint::EditTranscript)
+                    .run(hook.as_ref(), hook.edit_transcript(&ctx))
+                    .await
+                    .flatten()
             };
             let Some(replacement) = replacement else {
                 continue;
@@ -1304,6 +1398,9 @@ impl<'a> Driver<'a> {
         // inside its last call) is part of this run's record: it never
         // ends `Succeeded`.
         self.state.sync_declines();
+        // The run is over: whatever the batch was doing will not continue,
+        // and a recovery must not mistake it for a run a crash cut short.
+        self.state.in_flight = None;
         self.checkpoint().await?;
         self.emit(Event::Finished {
             status: status.clone(),
@@ -1337,8 +1434,71 @@ pub(crate) async fn report_run_end(agent: &AgentInner, outcome: &RunOutcome) {
         untrusted_seen: outcome.state.untrusted_seen,
         declined: &outcome.state.declined,
     };
+    // Not raced against the cancel: the run has ended, and what a hook
+    // does here (writing memory) is worth finishing.
+    let guard = HookGuard {
+        agent,
+        run_id: outcome.state.run_id,
+        point: HookPoint::OnRunEnd,
+        cancel: None,
+        budget: None,
+    };
     for hook in &agent.hooks {
-        hook.on_run_end(&ctx, outcome).await;
+        guard
+            .run(hook.as_ref(), hook.on_run_end(&ctx, outcome))
+            .await;
+    }
+}
+
+/// Runs a hook so that a panic, a hang or a cancel costs one answer rather
+/// than the run.
+struct HookGuard<'a> {
+    agent: &'a AgentInner,
+    run_id: RunId,
+    point: HookPoint,
+    cancel: Option<&'a CancellationToken>,
+    budget: Option<Duration>,
+}
+
+impl HookGuard<'_> {
+    /// The hook's answer, or `None` if it gave none.
+    async fn run<T>(&self, hook: &dyn Hook, call: impl Future<Output = T>) -> Option<T> {
+        let allowed = hook.timeout().unwrap_or(self.agent.limits.hook_timeout);
+        let allowed = self.budget.map_or(allowed, |left| allowed.min(left));
+        let contained = tokio::time::timeout(allowed, AssertUnwindSafe(call).catch_unwind());
+        let cancelled = async {
+            match self.cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let failure = tokio::select! {
+            biased;
+            _ = cancelled => HookFailure::Cancelled,
+            outcome = contained => match outcome {
+                Ok(Ok(answer)) => return Some(answer),
+                Ok(Err(panic)) => HookFailure::Panicked { message: panic_message(&*panic) },
+                Err(_) => HookFailure::TimedOut { after_ms: allowed.as_millis() as u64 },
+            },
+        };
+        self.report(hook.name(), failure).await;
+        None
+    }
+
+    /// Record the failure. A store error here must not change what the run
+    /// does about the hook; the next checkpoint reports it.
+    async fn report(&self, hook: &str, failure: HookFailure) {
+        let event = Event::HookFailed {
+            point: self.point,
+            hook: hook.to_string(),
+            failure,
+        };
+        if let Some(sink) = &self.agent.sink {
+            sink.emit(self.run_id, &event);
+        }
+        if let Some(store) = &self.agent.store {
+            let _ = store.append_event(self.run_id, &event).await;
+        }
     }
 }
 

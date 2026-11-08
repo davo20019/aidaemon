@@ -12,6 +12,10 @@ pub(super) struct LedgerStop {
 
 #[async_trait]
 impl sdk::Hook for LedgerStop {
+    fn timeout(&self) -> Option<std::time::Duration> {
+        Some(super::TOOL_TIMEOUT)
+    }
+
     async fn on_stop(&self, ctx: &sdk::HookContext<'_>, final_text: &str) -> sdk::StopDecision {
         let completed_results = ctx
             .run_receipts()
@@ -143,6 +147,10 @@ pub(super) struct DispatchGate {
 
 #[async_trait]
 impl sdk::Hook for DispatchGate {
+    fn timeout(&self) -> Option<std::time::Duration> {
+        Some(super::TOOL_TIMEOUT)
+    }
+
     async fn before_tool(
         &self,
         ctx: &sdk::HookContext<'_>,

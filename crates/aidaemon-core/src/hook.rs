@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval::{EffectKey, InterruptKind};
@@ -152,10 +153,60 @@ pub enum LimitDecision {
     Extend { amount: u64 },
 }
 
+/// A moment of the loop at which hooks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPoint {
+    OnRunStart,
+    EditTranscript,
+    BeforeModel,
+    AfterModel,
+    OnModelError,
+    OnLimit,
+    BeforeTool,
+    AfterTool,
+    OnStop,
+    OnStuck,
+    OnRunEnd,
+}
+
+/// How a hook failed to give an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum HookFailure {
+    Panicked {
+        message: String,
+    },
+    TimedOut {
+        after_ms: u64,
+    },
+    /// The run was cancelled while the hook was working.
+    Cancelled,
+}
+
 /// Extension point for every policy. All methods have no-op defaults, so a
 /// hook implements only what it needs. Hooks run in registration order and
 /// outside the model's context window: they cost no tokens and the model
 /// cannot argue its way past them.
+///
+/// The kernel contains every call: a hook that panics, outlasts its time or
+/// is overtaken by a cancel has given no answer, an
+/// [`crate::Event::HookFailed`] is recorded, and the run goes on as that
+/// moment requires. A check that guards something fails closed; anything
+/// else fails open, because the run can go on without it:
+///
+/// | Point | With no answer |
+/// |---|---|
+/// | `before_tool` | the call is refused |
+/// | `after_tool` | the model does not see the result |
+/// | `after_model` | the response is not acted on and the run stops |
+/// | `on_stop` | the run ends with an unmet requirement, never as a success |
+/// | `on_limit`, `on_model_error` | the limit stands, the failure stands |
+/// | `edit_transcript` | the transcript stays as it was |
+/// | `on_run_start`, `before_model`, `on_stuck`, `on_run_end` | the run goes on |
+///
+/// Timeouts and cancels stop a hook at its next `.await`, so a hook that
+/// blocks a thread is not interrupted: keep blocking work off the executor.
 #[async_trait]
 pub trait Hook: Send + Sync {
     /// The safeguards this hook enforces. [`crate::AgentBuilder::build`]
@@ -163,6 +214,19 @@ pub trait Hook: Send + Sync {
     /// or an attestation.
     fn safeguards(&self) -> &'static [Safeguard] {
         &[]
+    }
+
+    /// How this hook is named in events and in a saved interruption. Stable
+    /// across restarts of the same build; override it to keep a hook's
+    /// identity across a rename.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    /// How long one call of this hook may take, in place of
+    /// [`crate::Limits::hook_timeout`]. The wall-clock budget still applies.
+    fn timeout(&self) -> Option<Duration> {
+        None
     }
 
     /// A new run is about to take its first turn: load what the other hooks

@@ -23,7 +23,17 @@ pub(super) async fn stranded_run(
 ) -> Option<sdk::RunState> {
     let store = store?;
     match store.latest_state_for_session(session_id).await {
-        Ok(Some(state)) if state.pending.is_some() || state.in_flight.is_some() => Some(state),
+        Ok(Some(state)) if state.pending.is_some() => Some(state),
+        // The kernel now clears `in_flight` when a run ends; a row written
+        // before that still has it, and restarting it would undo a cancel.
+        Ok(Some(state)) if state.in_flight.is_some() => match store.run_ended(state.run_id).await {
+            Ok(false) => Some(state),
+            Ok(true) => None,
+            Err(error) => {
+                warn!(session_id, %error, "Could not read how the session's last run ended; leaving it alone");
+                None
+            }
+        },
         Ok(_) => None,
         Err(error) => {
             warn!(session_id, %error, "Could not read the session's last run; nothing is recovered");

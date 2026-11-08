@@ -25,6 +25,8 @@ pub struct Limits {
     pub tool_timeout: Duration,
     /// Tool output beyond this many characters is cut to head + tail.
     pub max_tool_output_chars: usize,
+    /// How long one hook call may take (see [`crate::Hook::timeout`]).
+    pub hook_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -36,6 +38,7 @@ impl Default for Limits {
             timeout: None,
             tool_timeout: Duration::from_secs(120),
             max_tool_output_chars: 30_000,
+            hook_timeout: Duration::from_secs(300),
         }
     }
 }

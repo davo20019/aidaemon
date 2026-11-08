@@ -66,6 +66,11 @@ pub struct Pending {
     /// only: hooks registered after it still judge the call on resume.
     #[serde(default)]
     pub hook_index: Option<usize>,
+    /// The hooks that were installed when the run paused. `hook_index` means
+    /// nothing under a different chain, so an approval is judged again from
+    /// the first hook when this does not match.
+    #[serde(default)]
+    pub hook_chain: Vec<String>,
 }
 
 /// A tool batch that was executing when the state was last saved. Present

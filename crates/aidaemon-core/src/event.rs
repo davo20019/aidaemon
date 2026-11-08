@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::hook::{HookFailure, HookPoint};
 use crate::limits::LimitKind;
 use crate::outcome::RunStatus;
 use crate::provider::Usage;
@@ -54,6 +55,13 @@ pub enum Event {
     },
     StopRejected {
         message: String,
+    },
+    /// A hook panicked, timed out or was cancelled, and gave no answer.
+    /// See [`crate::Hook`] for what the run does instead.
+    HookFailed {
+        point: HookPoint,
+        hook: String,
+        failure: HookFailure,
     },
     /// An `after_model` hook rejected this turn's response.
     ModelRejected {

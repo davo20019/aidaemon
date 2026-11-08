@@ -166,6 +166,18 @@ impl SqliteStore {
         Ok(seq)
     }
 
+    /// Whether the last thing the run journaled was its end. A run that was
+    /// resumed and then cut short journals something after its pause.
+    pub async fn run_ended(&self, run_id: RunId) -> Result<bool, Error> {
+        let last: Option<String> = sqlx::query_scalar(
+            "SELECT event_type FROM run_events WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(last.as_deref() == Some("finished"))
+    }
+
     /// The run's journal in order, decoded.
     pub async fn events(&self, run_id: RunId) -> Result<Vec<Event>, Error> {
         self.raw_events(run_id)

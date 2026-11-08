@@ -433,3 +433,22 @@ async fn erase_session_without_a_journal_is_a_no_op() {
         .unwrap();
     tx.commit().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_run_is_ended_only_while_its_last_event_is_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(db_path(&dir)).await.unwrap();
+    let run = RunId::new();
+    assert!(!store.run_ended(run).await.unwrap());
+
+    let finished = Event::Finished {
+        status: RunStatus::Cancelled,
+        usage: Default::default(),
+        turns: 1,
+    };
+    store.append(run, &finished).await.unwrap();
+    assert!(store.run_ended(run).await.unwrap());
+
+    store.append(run, &Event::RunResumed).await.unwrap();
+    assert!(!store.run_ended(run).await.unwrap());
+}
