@@ -79,6 +79,7 @@ pub use provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 #[allow(unused_imports)]
+pub(crate) use tools::NothingSentError;
 pub use tools::{
     default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
     ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,

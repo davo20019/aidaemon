@@ -1211,12 +1211,35 @@ impl HttpRequestTool {
                 }
             }
 
-            let resp = builder.send().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "{}",
-                    Self::strip_credentials_from_error_with(profiles_snapshot, &e.to_string())
-                )
-            })?;
+            let resp = match builder.send().await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    let text = Self::strip_credentials_from_error_with(
+                        profiles_snapshot,
+                        &error.to_string(),
+                    );
+                    if !error.is_connect() {
+                        return Err(anyhow::anyhow!("{text}"));
+                    }
+                    // The connection never opened, so nothing was sent.
+                    if retry_count >= MAX_TRANSIENT_RETRIES {
+                        return Err(crate::traits::NothingSentError(text).into());
+                    }
+                    retry_count += 1;
+                    let backoff = crate::backoff::exponential_backoff(
+                        Duration::from_millis(400),
+                        (retry_count - 1) as u32,
+                        Duration::MAX,
+                    );
+                    warn!(
+                        method = %current_method,
+                        attempt = retry_count,
+                        "Connection failed; retrying after backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+            };
 
             // Transparently retry on a transient upstream failure (e.g. an X
             // API hiccup) instead of surfacing a one-off error the agent then
@@ -3299,6 +3322,31 @@ mod tests {
         server.abort();
         let _ = server.await;
         (outcome, count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_opened_is_typed_as_nothing_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to close");
+        let url = format!("http://{}/notes", listener.local_addr().unwrap());
+        drop(listener);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())));
+        let error = tool
+            .call_with_execution_context(
+                &json!({"method": "POST", "url": url, "body": "{}"}).to_string(),
+                None,
+                ToolCallContext {
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a closed port cannot answer");
+        assert!(error
+            .downcast_ref::<crate::traits::NothingSentError>()
+            .is_some());
     }
 
     #[tokio::test]

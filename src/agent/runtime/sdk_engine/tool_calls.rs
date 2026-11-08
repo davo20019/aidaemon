@@ -1022,7 +1022,16 @@ impl Agent {
                     crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
                 });
                 let mut metadata = crate::traits::ToolCallMetadata {
-                    outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
+                    outcome_status: Some(
+                        if error
+                            .downcast_ref::<crate::traits::NothingSentError>()
+                            .is_some()
+                        {
+                            crate::traits::ToolOutcomeStatus::FailedRetryable
+                        } else {
+                            crate::traits::ToolOutcomeStatus::FailedPermanent
+                        },
+                    ),
                     transport_error: Some(error.to_string()),
                     invocation_stage: if error
                         .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()

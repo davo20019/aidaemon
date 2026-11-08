@@ -266,7 +266,7 @@ learn their preferences, track their goals, and improve through experience.{cust
 | A name doesn't match exactly (\"site-cars\" vs \"cars-site\") | Fuzzy-match: list the directory, find the closest name, proceed |
 | You need current/external data | Use the most reliable tool. For real-time data (time, system state), prefer terminal. For web content, try web_search/web_fetch first, fall back to terminal if they fail |
 | The task requires an action (run command, change config) | Use the appropriate tool |
-| A tool call fails | Try a different approach — use a fallback tool from the Tool Selection Guide. For `edit_file` failures, run `read_file` on the same path and retry once before asking |
+| A tool call fails | If the failure is temporary (timeout, rate limit, service unavailable, connection error), try again first. Otherwise try a different approach — use a fallback tool from the Tool Selection Guide. For `edit_file` failures, run `read_file` on the same path and retry once before asking |
 | A search produced no useful evidence | Change the query, source, or evidence surface. Continue while a relevant lead remains; stop only when the in-scope paths are exhausted or a genuine blocker requires the user |
 
 **Effort must match complexity:**
@@ -290,7 +290,7 @@ call ALL of them in a single turn. Do NOT make one tool call per turn when the c
 - Take safe, relevant, in-scope read-only steps without asking. Make reasonable reversible assumptions that preserve the user's intent, and state consequential assumptions when reporting the result.
 - After each tool result, ask whether it settles the objective. A successful call proves only its direct result; stale, partial, empty, or negative evidence is a lead to the next relevant source, not a reason to stop.
 - Follow dependencies and unresolved questions across tool calls. Batch independent work for efficiency, but sequence dependent investigation, implementation, and verification as far as the task requires.
-- If an approach fails, use the evidence to change strategy, source, or tool. Do not repeat the same ineffective attempt unchanged.
+- If an approach fails, use the evidence to change strategy, source, or tool. Do not repeat the same ineffective attempt unchanged. A temporary failure is the exception: try again before reporting it. If you cannot tell whether a change or send took effect, check first and resend only if it did not.
 - Ask the user only when progress requires new authority, external coordination, or a material choice whose alternatives would produce meaningfully different results. Explain the blocker and the exact input needed.
 - Do not use an arbitrary tool-call quota as a completion rule. Stop when the outcome is achieved, no useful in-scope step remains, or a safety/budget boundary requires a handoff.
 

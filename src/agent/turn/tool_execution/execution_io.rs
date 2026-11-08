@@ -4,15 +4,19 @@ fn should_replay_durable_result(
     result: &crate::events::ToolResultData,
     tool_is_idempotent: bool,
 ) -> bool {
-    // A retryable failure is the tool's own statement that the operation did
-    // not take effect, so it may run again. A timeout carries that status too
-    // but proves nothing about the effect: it runs again only when repeating
-    // is safe. Every other durable outcome, including backgrounded and
-    // blocked, is replayed to avoid duplicating an indeterminate or
-    // already-completed effect.
+    // A failure of a tool that is safe to repeat may always run again. On any
+    // other tool, a retryable failure is the tool's own statement that the
+    // operation did not take effect, except a timeout, which carries that
+    // status but proves nothing about the effect. Every other durable outcome,
+    // including backgrounded and blocked, is replayed to avoid duplicating an
+    // indeterminate or already-completed effect.
     let may_run_again = result.receipt.as_ref().is_some_and(|receipt| {
-        receipt.outcome_status == crate::traits::ToolOutcomeStatus::FailedRetryable
-            && (tool_is_idempotent || !receipt.timed_out)
+        use crate::traits::ToolOutcomeStatus::{FailedPermanent, FailedRetryable};
+        match receipt.outcome_status {
+            FailedPermanent => tool_is_idempotent,
+            FailedRetryable => tool_is_idempotent || !receipt.timed_out,
+            _ => false,
+        }
     });
     !may_run_again
 }
@@ -179,10 +183,19 @@ mod replay_tests {
         );
         assert!(!should_replay_durable_result(&timed_out, true));
 
+        let permanent = result_with_status(crate::traits::ToolOutcomeStatus::FailedPermanent);
+        assert!(
+            !should_replay_durable_result(&permanent, true),
+            "a tool that is safe to repeat may always try again"
+        );
+        assert!(
+            should_replay_durable_result(&permanent, false),
+            "a generic failure leaves a write's effect unknown"
+        );
+
         for status in [
             crate::traits::ToolOutcomeStatus::Succeeded,
             crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-            crate::traits::ToolOutcomeStatus::FailedPermanent,
             crate::traits::ToolOutcomeStatus::Blocked,
             crate::traits::ToolOutcomeStatus::Backgrounded,
         ] {

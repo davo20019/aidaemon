@@ -164,6 +164,19 @@ pub trait Tool: ToolSemantics {
     }
 }
 
+/// A tool could not reach its target at all, so nothing took effect and the
+/// call may run again.
+#[derive(Debug)]
+pub(crate) struct NothingSentError(pub(crate) String);
+
+impl std::fmt::Display for NothingSentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NothingSentError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
