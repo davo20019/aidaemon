@@ -37,6 +37,17 @@ struct DaemonRecovery {
     /// fails, it is the failure to report (with its reset), not the last
     /// fallback's error.
     quota: std::sync::Mutex<Option<aidaemon_core::ProviderError>>,
+    /// The latest failure of each model tried, in first-attempt order.
+    failures: std::sync::Mutex<Vec<crate::providers::ModelFailure>>,
+}
+
+impl DaemonRecovery {
+    fn failures(&self) -> Vec<crate::providers::ModelFailure> {
+        self.failures
+            .lock()
+            .map(|failures| failures.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// How long a billing failure is cached before the model is tried again
@@ -120,6 +131,17 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
             "LLM call failed: {}",
             daemon_error
         );
+        if let Ok(mut failures) = self.failures.lock() {
+            let failure = crate::providers::ModelFailure {
+                model: model.to_string(),
+                kind: daemon_error.kind,
+                status: daemon_error.status,
+            };
+            match failures.iter_mut().find(|known| known.model == model) {
+                Some(known) => *known = failure,
+                None => failures.push(failure),
+            }
+        }
         if matches!(error, aidaemon_core::ProviderError::QuotaExhausted { .. }) {
             if let Ok(mut quota) = self.quota.lock() {
                 quota.get_or_insert_with(|| error.clone());
@@ -356,6 +378,7 @@ impl Agent {
             provider_label: provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind()),
             attempted: std::sync::Mutex::new(Vec::new()),
             quota: std::sync::Mutex::new(None),
+            failures: std::sync::Mutex::new(Vec::new()),
         });
         let chain = Failover::new(steps).policy(RecoveryHandle(recovery.clone()));
 
@@ -385,10 +408,13 @@ impl Agent {
                 ))
             }
             Err(error) => match error.downcast::<ProviderError>() {
-                Ok(provider_err) => {
+                Ok(mut provider_err) => {
                     let quota = recovery.quota.lock().ok().and_then(|quota| quota.clone());
                     if let Some(quota) = quota {
-                        return Err(quota_failure(quota, provider_err));
+                        return Err(quota_failure(quota, provider_err, recovery.failures()));
+                    }
+                    if telemetry.fell_back {
+                        provider_err.fallback_failures = recovery.failures();
                     }
                     let terminal = provider_err.kind == ProviderErrorKind::Auth
                         || options.single_attempt_fail_closed
@@ -412,8 +438,16 @@ impl Agent {
 /// The error for a call that met a used-up quota and then failed on every
 /// other model: the quota (and its reset) is what the user can act on, so it
 /// is the typed error; what the fallbacks answered follows it.
-fn quota_failure(quota: aidaemon_core::ProviderError, last: ProviderError) -> anyhow::Error {
-    let quota = crate::providers::sdk_backed::to_daemon_error(quota);
+fn quota_failure(
+    quota: aidaemon_core::ProviderError,
+    last: ProviderError,
+    failures: Vec<crate::providers::ModelFailure>,
+) -> anyhow::Error {
+    let mut quota = crate::providers::sdk_backed::to_daemon_error(quota);
+    quota.fallback_failures = failures
+        .into_iter()
+        .filter(|failure| failure.kind != ProviderErrorKind::QuotaExhausted)
+        .collect();
     let mut message = quota.user_message();
     if last.kind != ProviderErrorKind::QuotaExhausted {
         message.push_str(&format!(

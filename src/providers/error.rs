@@ -15,6 +15,36 @@ pub struct ProviderError {
     pub affordable_tokens: Option<u32>,
     /// For a used-up quota: when the provider says it resets.
     pub resets_at: Option<std::time::SystemTime>,
+    /// What each other model answered when this error ended a failover chain.
+    pub fallback_failures: Vec<ModelFailure>,
+}
+
+/// One model's failure during a failover chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFailure {
+    pub model: String,
+    pub kind: ProviderErrorKind,
+    pub status: Option<u16>,
+}
+
+impl ModelFailure {
+    fn reason(&self) -> String {
+        let reason = match self.kind {
+            ProviderErrorKind::Auth => "API key rejected",
+            ProviderErrorKind::Billing => "out of credits",
+            ProviderErrorKind::QuotaExhausted => "usage limit reached",
+            ProviderErrorKind::RateLimit => "rate limited",
+            ProviderErrorKind::NotFound => "model not found",
+            ProviderErrorKind::Timeout => "timed out",
+            ProviderErrorKind::Network => "could not be reached",
+            ProviderErrorKind::ServerError => "provider error",
+            _ => "request failed",
+        };
+        match self.status {
+            Some(status) => format!("{reason} ({status})"),
+            None => reason.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +169,7 @@ impl ProviderError {
             retry_after_secs,
             affordable_tokens,
             resets_at: None,
+            fallback_failures: Vec::new(),
         }
     }
 
@@ -152,6 +183,7 @@ impl ProviderError {
             retry_after_secs: None,
             affordable_tokens: None,
             resets_at: None,
+            fallback_failures: Vec::new(),
         }
     }
 
@@ -164,7 +196,39 @@ impl ProviderError {
             retry_after_secs: None,
             affordable_tokens: None,
             resets_at: None,
+            fallback_failures: Vec::new(),
         }
+    }
+
+    /// Why each other model failed, grouped by reason, for a reply about the
+    /// whole chain failing. `None` when no other model was tried.
+    pub fn fallback_failures_note(&self) -> Option<String> {
+        if self.fallback_failures.is_empty() {
+            return None;
+        }
+        let mut grouped: Vec<(String, Vec<&str>)> = Vec::new();
+        for failure in &self.fallback_failures {
+            let reason = failure.reason();
+            match grouped.iter_mut().find(|(known, _)| *known == reason) {
+                Some((_, models)) => models.push(&failure.model),
+                None => grouped.push((reason, vec![&failure.model])),
+            }
+        }
+        let lines = grouped
+            .iter()
+            .map(|(reason, models)| format!("- {}: {reason}", models.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hint = if self
+            .fallback_failures
+            .iter()
+            .any(|failure| failure.kind == ProviderErrorKind::Auth)
+        {
+            "\nOn Telegram, /setkey replaces a rejected key."
+        } else {
+            ""
+        };
+        Some(format!("Other models also failed:\n{lines}{hint}"))
     }
 
     /// User-facing summary suitable for sending back via Telegram.

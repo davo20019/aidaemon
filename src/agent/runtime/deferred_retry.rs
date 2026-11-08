@@ -111,6 +111,17 @@ fn not_before(error: &anyhow::Error) -> Option<String> {
 /// What the user is told when their request was queued (`attempt` 0) or
 /// re-queued after another failure.
 pub(crate) fn deferral_notice(attempt: u16, error: &anyhow::Error) -> String {
+    let notice = queued_request_notice(attempt, error);
+    match error
+        .downcast_ref::<crate::providers::ProviderError>()
+        .and_then(crate::providers::ProviderError::fallback_failures_note)
+    {
+        Some(note) => format!("{notice}\n\n{note}"),
+        None => notice,
+    }
+}
+
+fn queued_request_notice(attempt: u16, error: &anyhow::Error) -> String {
     let quota = error
         .downcast_ref::<crate::providers::ProviderError>()
         .filter(|e| e.kind == crate::providers::ProviderErrorKind::QuotaExhausted);
@@ -275,6 +286,37 @@ mod tests {
         error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
         error.resets_at = resets_in.map(|left| std::time::SystemTime::now() + left);
         anyhow::Error::new(error)
+    }
+
+    #[test]
+    fn the_notice_names_why_each_other_model_failed() {
+        use crate::providers::{ModelFailure, ProviderError, ProviderErrorKind};
+        let failure = |model: &str, kind, status| ModelFailure {
+            model: model.to_string(),
+            kind,
+            status: Some(status),
+        };
+        let mut error = ProviderError::from_status(429, "plan cap");
+        error.kind = ProviderErrorKind::QuotaExhausted;
+        error.fallback_failures = vec![
+            failure("synthetic-haiku", ProviderErrorKind::Auth, 401),
+            failure("synthetic-sonnet", ProviderErrorKind::Auth, 401),
+            failure("synthetic-kimi", ProviderErrorKind::Billing, 402),
+        ];
+        // The chain's error reaches the notice wrapped in its reply context.
+        let notice = deferral_notice(0, &anyhow::Error::new(error).context("reply text"));
+        assert!(notice.contains("usage limit"), "{notice}");
+        assert!(
+            notice.contains("- synthetic-haiku, synthetic-sonnet: API key rejected (401)"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("- synthetic-kimi: out of credits (402)"),
+            "{notice}"
+        );
+        assert!(notice.contains("/setkey"), "{notice}");
+
+        assert!(!deferral_notice(0, &quota(None)).contains("Other models"));
     }
 
     #[test]
