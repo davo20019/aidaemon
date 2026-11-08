@@ -14,11 +14,14 @@ use crate::agent::{AgentInner, Resolution};
 use crate::approval::{EffectClass, EffectKey, InterruptKind, OWNER_DECLINED};
 use crate::error::CoreError;
 use crate::event::Event;
-use crate::hook::{HookContext, StopDecision, StuckDecision, ToolDecision};
-use crate::limits::{LimitKind, RunSnapshot};
-use crate::message::{Message, MessageOrigin, ToolCall};
+use crate::hook::{
+    HookContext, LimitDecision, ModelDecision, ModelErrorDecision, StopDecision, StuckDecision,
+    ToolDecision,
+};
+use crate::limits::{LimitKind, Limits, RunSnapshot, HARD_TURN_CAP};
+use crate::message::{Message, MessageOrigin, Role, ToolCall};
 use crate::outcome::{RunOutcome, RunStatus};
-use crate::provider::{ModelRequest, ModelResponse, StreamEvent, ToolChoice};
+use crate::provider::{ModelRequest, ModelResponse, ProviderError, StreamEvent, ToolChoice};
 use crate::receipt::{InvocationStage, Receipt, ReceiptStatus};
 use crate::state::{InFlight, Interruption, Pending, PendingFinish, RunId, RunState};
 use crate::stuck::StuckSignal;
@@ -60,7 +63,7 @@ enum StuckAction {
 enum ModelCall {
     Response(ModelResponse),
     Cancelled,
-    Failed(String),
+    Failed(ProviderError),
 }
 
 /// The settled policy decision for one call (rewrites already applied).
@@ -172,6 +175,14 @@ impl<'a> Driver<'a> {
         } else {
             let session_id = self.state.session_id.clone();
             self.emit(Event::RunStarted { session_id }).await?;
+            // A process restart between turns also lands here; it is not a
+            // new run.
+            if self.state.turn == 0 {
+                let ctx = self.ctx();
+                for hook in &self.agent.hooks {
+                    hook.on_run_start(&ctx).await;
+                }
+            }
         }
 
         loop {
@@ -179,10 +190,16 @@ impl<'a> Driver<'a> {
             if self.cancel.is_cancelled() {
                 return self.finish(RunStatus::Cancelled, None).await;
             }
-            let snapshot = self.snapshot();
-            if let Some(limit) = self.agent.limits.exceeded(&snapshot) {
-                return self.finish(RunStatus::LimitReached { limit }, None).await;
+            // A hook is asked once per limit per turn, so a grant too small
+            // to clear the limit ends the run instead of asking forever.
+            let mut raised: Vec<LimitKind> = Vec::new();
+            while let Some(limit) = self.limits().exceeded(&self.snapshot()) {
+                if raised.contains(&limit) || !self.extend_limit(limit).await? {
+                    return self.finish(RunStatus::LimitReached { limit }, None).await;
+                }
+                raised.push(limit);
             }
+            let snapshot = self.snapshot();
             if let Some(reason) = self
                 .agent
                 .stop_conditions
@@ -198,6 +215,7 @@ impl<'a> Driver<'a> {
             self.state.turn += 1;
             let turn = self.state.turn;
             self.emit(Event::TurnStarted { turn }).await?;
+            self.apply_transcript_edits().await?;
             let mut request = self.build_request();
             {
                 let ctx = self.ctx();
@@ -211,6 +229,9 @@ impl<'a> Driver<'a> {
             let response = match within(self.remaining(), self.call_model(&request, turn)).await {
                 None => {
                     let limit = LimitKind::WallClock;
+                    if self.extend_limit(limit).await? {
+                        continue;
+                    }
                     return self.finish(RunStatus::LimitReached { limit }, None).await;
                 }
                 Some(call) => call?,
@@ -219,11 +240,27 @@ impl<'a> Driver<'a> {
                 ModelCall::Response(response) => response,
                 ModelCall::Cancelled => return self.finish(RunStatus::Cancelled, None).await,
                 ModelCall::Failed(error) => {
-                    return self.finish(RunStatus::ProviderFailed { error }, None).await;
+                    let Some(after) = self.retry_after(&error).await else {
+                        let error = error.to_string();
+                        return self.finish(RunStatus::ProviderFailed { error }, None).await;
+                    };
+                    self.emit(Event::ModelRetried {
+                        turn,
+                        error: error.to_string(),
+                        after_ms: after.as_millis() as u64,
+                    })
+                    .await?;
+                    self.pause(after).await;
+                    continue;
                 }
             };
-            self.state.usage.add(response.usage);
-            self.state.run_usage.add(response.usage);
+            // Counted before any hook runs: a rejected response was still
+            // paid for, and no hook can hide what it cost.
+            let usage = response.usage;
+            self.state.usage.add(usage);
+            self.state.run_usage.add(usage);
+            let mut response = response;
+            let rejection = self.judge_response(&mut response).await;
             let calls: Vec<ToolCall> = response
                 .tool_calls
                 .into_iter()
@@ -237,11 +274,30 @@ impl<'a> Driver<'a> {
                 .collect();
             self.emit(Event::ModelResponded {
                 turn,
-                usage: response.usage,
+                usage,
                 text: response.text.clone(),
                 tool_calls: calls.len(),
             })
             .await?;
+            if let Some(message) = rejection {
+                self.emit(Event::ModelRejected {
+                    turn,
+                    message: message.clone(),
+                })
+                .await?;
+                // Without the calls: a call with no result is a request
+                // providers refuse, and these will never run.
+                if !response.text.is_empty() {
+                    self.state
+                        .messages
+                        .push(Message::assistant(response.text, Vec::new()));
+                }
+                self.state
+                    .messages
+                    .push(Message::from_origin(MessageOrigin::Harness, message));
+                self.checkpoint().await?;
+                continue;
+            }
             self.state
                 .messages
                 .push(Message::assistant(response.text.clone(), calls.clone()));
@@ -373,10 +429,20 @@ impl<'a> Driver<'a> {
             // Budgets hold inside a batch too, not only between turns.
             if let Some(limit) = self.call_limit(group.len()) {
                 self.flush(&mut group, &mut nudge, &mut stop).await?;
-                let reason = format!("the run reached its {} limit", limit_name(limit));
-                self.skip_rest(&calls[index..], ReceiptStatus::Skipped, &reason)
-                    .await?;
-                return Ok(BatchEnd::Limit(limit));
+                // Asked after the flush, so a hook sees every result so far.
+                let raised = stop.is_none()
+                    && !self.cancel.is_cancelled()
+                    && self.extend_limit(limit).await?;
+                if let Some(limit) = if raised {
+                    self.call_limit(0)
+                } else {
+                    Some(limit)
+                } {
+                    let reason = format!("the run reached its {} limit", limit_name(limit));
+                    self.skip_rest(&calls[index..], ReceiptStatus::Skipped, &reason)
+                        .await?;
+                    return Ok(BatchEnd::Limit(limit));
+                }
             }
 
             let mut call = calls[index].clone();
@@ -953,11 +1019,11 @@ impl<'a> Driver<'a> {
                     self.emit(Event::ProviderSwitched { turn, switch }).await?;
                 }
                 Some(Ok(StreamEvent::Done(response))) => return Ok(ModelCall::Response(response)),
-                Some(Err(err)) => return Ok(ModelCall::Failed(err.to_string())),
+                Some(Err(err)) => return Ok(ModelCall::Failed(err)),
                 None => {
-                    return Ok(ModelCall::Failed(
+                    return Ok(ModelCall::Failed(ProviderError::Other(
                         "provider stream ended without a final response".into(),
-                    ))
+                    )))
                 }
             }
         }
@@ -1061,18 +1127,119 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The agent's limits, raised by what hooks granted this run.
+    fn limits(&self) -> Limits {
+        self.agent.limits.with_grants(&self.state.limit_grants)
+    }
+
     /// Wall-clock budget left, if the run has one.
     fn remaining(&self) -> Option<Duration> {
-        self.agent
-            .limits
+        self.limits()
             .timeout
             .map(|timeout| timeout.saturating_sub(self.elapsed()))
+    }
+
+    /// Ask the hooks to raise `limit`. Returns whether one did.
+    async fn extend_limit(&mut self, limit: LimitKind) -> Result<bool, CoreError> {
+        if limit == LimitKind::Turns && self.limits().max_turns >= HARD_TURN_CAP {
+            return Ok(false);
+        }
+        let mut granted = None;
+        {
+            let ctx = self.ctx();
+            for hook in &self.agent.hooks {
+                if let LimitDecision::Extend { amount } = hook.on_limit(&ctx, limit).await {
+                    if amount > 0 {
+                        granted = Some(amount);
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(amount) = granted else {
+            return Ok(false);
+        };
+        self.state.limit_grants.add(limit, amount);
+        self.emit(Event::LimitExtended { limit, amount }).await?;
+        Ok(true)
+    }
+
+    /// Let `after_model` hooks check the response. Returns why it was
+    /// rejected, if it was.
+    async fn judge_response(&self, response: &mut ModelResponse) -> Option<String> {
+        let ctx = self.ctx();
+        for hook in &self.agent.hooks {
+            if let ModelDecision::Reject { message } = hook.after_model(&ctx, response).await {
+                return Some(message);
+            }
+        }
+        None
+    }
+
+    /// How long to wait before retrying a failed model call, if a hook
+    /// wants a retry.
+    async fn retry_after(&self, error: &ProviderError) -> Option<Duration> {
+        let ctx = self.ctx();
+        for hook in &self.agent.hooks {
+            if let ModelErrorDecision::Retry { after } = hook.on_model_error(&ctx, error).await {
+                return Some(after);
+            }
+        }
+        None
+    }
+
+    /// Wait, but no longer than the wall-clock budget and not past a
+    /// cancel. The guards at the top of the turn then see either.
+    async fn pause(&self, wait: Duration) {
+        let wait = self.remaining().map_or(wait, |left| wait.min(left));
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {}
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+
+    /// Let `edit_transcript` hooks replace the transcript, one after another.
+    async fn apply_transcript_edits(&mut self) -> Result<(), CoreError> {
+        let turn = self.state.turn;
+        let mut edited = false;
+        for index in 0..self.agent.hooks.len() {
+            let replacement = {
+                let ctx = self.ctx();
+                self.agent.hooks[index].edit_transcript(&ctx).await
+            };
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            if replacement == self.state.messages {
+                continue;
+            }
+            if let Some(reason) = transcript_defect(&replacement) {
+                self.emit(Event::TranscriptEditRefused { turn, reason })
+                    .await?;
+                continue;
+            }
+            let before = self.state.messages.len();
+            let after = replacement.len();
+            self.state.messages = replacement;
+            self.emit(Event::TranscriptEdited {
+                turn,
+                before,
+                after,
+            })
+            .await?;
+            edited = true;
+        }
+        if edited {
+            self.checkpoint().await?;
+        }
+        Ok(())
     }
 
     /// Limits that stop a batch before its next call. `queued` approved
     /// read-only calls are waiting to run and count toward `max_tool_calls`.
     fn call_limit(&self, queued: usize) -> Option<LimitKind> {
-        let limits = &self.agent.limits;
+        let limits = self.limits();
         if let Some(max) = limits.max_tool_calls {
             if u64::from(self.state.tool_calls) + queued as u64 >= u64::from(max) {
                 return Some(LimitKind::ToolCalls);
@@ -1173,6 +1340,36 @@ pub(crate) async fn report_run_end(agent: &AgentInner, outcome: &RunOutcome) {
     for hook in &agent.hooks {
         hook.on_run_end(&ctx, outcome).await;
     }
+}
+
+/// Why a hook's replacement transcript cannot be sent to a provider, if so.
+/// Every call must be answered before the next assistant message, and every
+/// result must answer a call.
+fn transcript_defect(messages: &[Message]) -> Option<String> {
+    if !messages.iter().any(|m| m.role == Role::User) {
+        return Some("the transcript has no user message".into());
+    }
+    let mut open: Vec<&str> = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::Assistant => {
+                if let Some(id) = open.first() {
+                    return Some(format!("tool call `{id}` has no result"));
+                }
+                open = message.tool_calls.iter().map(|c| c.id.as_str()).collect();
+            }
+            Role::Tool => {
+                let id = message.tool_call_id.as_deref().unwrap_or_default();
+                let Some(position) = open.iter().position(|open| *open == id) else {
+                    return Some(format!("tool result `{id}` answers no call"));
+                };
+                open.remove(position);
+            }
+            Role::System | Role::User => {}
+        }
+    }
+    open.first()
+        .map(|id| format!("tool call `{id}` has no result"))
 }
 
 fn track(action: Option<StuckAction>, nudge: &mut Option<String>, stop: &mut Option<StuckSignal>) {

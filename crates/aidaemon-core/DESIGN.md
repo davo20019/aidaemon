@@ -40,7 +40,7 @@ hooks or the tool batch.
 | `Provider` | `provider.rs` | `complete(&ModelRequest) -> ModelResponse`. Retries are a wrapper (`Retry`), not loop logic; so are failover (`Failover`, `failover.rs`) and remembering an account that cannot answer until its quota resets (`QuotaGuard`, `quota.rs`). |
 | `Tool` | `tool.rs` | `spec` + `call` required. `annotations` default to destructive; `validate` defaults to a `required`-keys check; `effects` declares what a call does (`CallEffects`). |
 | `ToolContext` | `tool.rs` | Trusted run/session/call ids, a cancel token, and the agent's typed `Extensions` (application values keyed by type, set with `AgentBuilder::tool_extensions`), passed *beside* the model's arguments. |
-| `Hook` | `hook.rs` | `before_model`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`. All default to no-ops. |
+| `Hook` | `hook.rs` | `on_run_start`, `edit_transcript`, `before_model`, `after_model`, `on_model_error`, `on_limit`, `before_tool`, `after_tool`, `on_stop`, `on_stuck`, `on_run_end`. All default to no-ops. |
 | `Receipt` | `receipt.rs` | One per tool call, refusals included: status, stage, duration, reason, structured details. |
 | `RunOutcome` / `RunStatus` | `outcome.rs` | Every exit maps to one variant. Usage, turns and receipts travel with it. A tool may end the run with `ToolOutput::finish`: once its whole batch has run, the run ends `Finished { outcome, tool }` with the finish's reply as final text (first finish in call order wins; `on_stop` is not consulted, `on_run_end` is). A recorded finish is kept in `RunState::finishing`, so it survives an approval interrupt, `resume` and crash recovery; once its tool has run it also wins over a mid-batch limit or stuck stop, while a cancel drops it (the owner's cancel wins). |
 | `RunState` | `state.rs` | Plain serializable data: transcript, receipts, usage, pending interruption. |
@@ -127,6 +127,31 @@ name-based rebuild problem.
 every request and kept out of `RunState.messages`, so any future compaction
 cannot drop it and the cacheable prefix stays byte-stable. Hook edits in
 `before_model` affect only the request, not the stored transcript.
+
+**Every moment of the loop has a hook, and the record stays the kernel's.**
+A hook can rewrite or reject a response (`after_model`), retry a failed model
+call (`on_model_error`), raise a limit (`on_limit`) and replace the stored
+transcript (`edit_transcript`). Four rules keep those from weakening the loop:
+
+- *Hooks change what happens next, not what happened.* Usage is counted before
+  `after_model` runs, and an `edit_transcript` leaves receipts and the run's
+  trust state alone, so evidence outlives a summarized history. This is the
+  split OpenHands makes between its event log and condensed views.
+- *A hook cannot widen authority by accident.* A call `after_model` adds goes
+  through the same validation, declines and `before_tool` hooks as a model's.
+- *Feedback reaches the model, retries stay bounded.* A rejected response stays
+  in the transcript with the reason after it, as output validators do in
+  Pydantic AI, minus its tool calls. A retry is a turn, so budgets bound it,
+  and the wait before one stops on cancel and at the wall-clock budget.
+- *A malformed edit is refused, not sent.* Summarizers that split a tool call
+  from its result produce requests providers reject, so the kernel checks the
+  pairing and keeps the old transcript if it fails.
+
+Every intervention is an `Event`. Grants live in `RunState::limit_grants`, so
+they survive a resume and can be audited. `HARD_TURN_CAP` is never put to a hook.
+
+What stays fixed: the order of a turn, tool concurrency, validation and the
+decline check before any hook, and output truncation before `after_tool`.
 
 **Stuck detection with configurable thresholds.** When the policy decides to
 stop, the rest of the batch is skipped, not run. OpenHands' detector
@@ -270,7 +295,8 @@ see images is the caller's decision; the kernel does not gate it. `Debug` on
 - **Async approval inside sub-agents.** A child that interrupts returns an
   error to the parent; resuming a child through its parent is not modelled.
 - **Context strategy as a trait.** Compaction is a view-only `before_model`
-  hook (`ContextWindow` in `aidaemon-policies`); no dedicated trait yet.
+  hook (`ContextWindow` in `aidaemon-policies`); `edit_transcript` is there for
+  a durable one. No dedicated trait yet.
 - **Native OpenTelemetry.** `TracingSink` emits `tracing` spans; use a
   `tracing-opentelemetry` layer to export.
 - **Reasoning content** in `Message`/`ModelResponse`. (Images are in: see
@@ -288,7 +314,7 @@ see images is the caller's decision; the kernel does not gate it. `Debug` on
 | Untrusted-output sanitization, secret redaction | `after_tool` |
 | Completion contract / ledger closeout / checklist | `on_stop` |
 | Approach pivot, self-correction ledger | `on_stuck` |
-| Budget auto-extension | custom `StopCondition` + config |
+| Budget auto-extension | `on_limit` → `Extend` |
 | Decision points, gate telemetry | `EventSink` |
 
 ## The SDK crates

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::approval::{EffectKey, InterruptKind, SharedDeclines};
+use crate::limits::LimitGrants;
 use crate::message::{Message, ToolCall};
 use crate::provider::Usage;
 use crate::receipt::Receipt;
@@ -153,6 +154,10 @@ pub struct RunState {
     /// ends with it once the batch ends (see [`crate::ToolOutput::finish`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finishing: Option<PendingFinish>,
+    /// How far `on_limit` hooks raised this run's limits. A new run
+    /// ([`RunState::with_user_message`]) starts with none.
+    #[serde(default)]
+    pub limit_grants: LimitGrants,
 }
 
 impl RunState {
@@ -181,6 +186,7 @@ impl RunState {
             shared_declines: None,
             unmet: Vec::new(),
             finishing: None,
+            limit_grants: LimitGrants::default(),
         }
     }
 
@@ -212,6 +218,7 @@ impl RunState {
         self.shared_declines = None;
         self.unmet.clear();
         self.finishing = None;
+        self.limit_grants = LimitGrants::default();
         self
     }
 

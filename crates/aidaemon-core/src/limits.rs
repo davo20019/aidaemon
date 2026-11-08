@@ -49,6 +49,28 @@ pub enum LimitKind {
     WallClock,
 }
 
+/// How far hooks have raised each limit for this run (see
+/// [`crate::Hook::on_limit`]), on top of the agent's [`Limits`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitGrants {
+    pub turns: u32,
+    pub tokens: u64,
+    pub tool_calls: u32,
+    pub wall_clock_ms: u64,
+}
+
+impl LimitGrants {
+    pub(crate) fn add(&mut self, limit: LimitKind, amount: u64) {
+        let small = u32::try_from(amount).unwrap_or(u32::MAX);
+        match limit {
+            LimitKind::Turns => self.turns = self.turns.saturating_add(small),
+            LimitKind::Tokens => self.tokens = self.tokens.saturating_add(amount),
+            LimitKind::ToolCalls => self.tool_calls = self.tool_calls.saturating_add(small),
+            LimitKind::WallClock => self.wall_clock_ms = self.wall_clock_ms.saturating_add(amount),
+        }
+    }
+}
+
 /// What a [`StopCondition`] can see.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunSnapshot {
@@ -75,6 +97,21 @@ where
 }
 
 impl Limits {
+    /// These limits, raised by a run's grants.
+    pub(crate) fn with_grants(&self, grants: &LimitGrants) -> Limits {
+        Limits {
+            max_turns: self.max_turns.saturating_add(grants.turns),
+            max_tokens: self.max_tokens.map(|m| m.saturating_add(grants.tokens)),
+            max_tool_calls: self
+                .max_tool_calls
+                .map(|m| m.saturating_add(grants.tool_calls)),
+            timeout: self
+                .timeout
+                .map(|t| t.saturating_add(Duration::from_millis(grants.wall_clock_ms))),
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn exceeded(&self, snapshot: &RunSnapshot) -> Option<LimitKind> {
         if snapshot.turn >= self.max_turns.min(HARD_TURN_CAP) {
             return Some(LimitKind::Turns);

@@ -54,8 +54,11 @@ pub use failover::{
     DefaultFailover, Failover, FailoverAction, FailoverPolicy, FailoverStep, ProviderSwitch,
     SwitchReason,
 };
-pub use hook::{Hook, HookContext, StopDecision, StuckDecision, ToolDecision};
-pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
+pub use hook::{
+    Hook, HookContext, LimitDecision, ModelDecision, ModelErrorDecision, StopDecision,
+    StuckDecision, ToolDecision,
+};
+pub use limits::{LimitGrants, LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{FinishOutcome, RunOutcome, RunStatus};
 pub use provider::{

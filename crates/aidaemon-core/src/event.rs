@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::limits::LimitKind;
 use crate::outcome::RunStatus;
 use crate::provider::Usage;
 use crate::receipt::Receipt;
@@ -53,6 +54,33 @@ pub enum Event {
     },
     StopRejected {
         message: String,
+    },
+    /// An `after_model` hook rejected this turn's response.
+    ModelRejected {
+        turn: u32,
+        message: String,
+    },
+    /// The model call failed and an `on_model_error` hook asked for a retry.
+    ModelRetried {
+        turn: u32,
+        error: String,
+        after_ms: u64,
+    },
+    /// An `on_limit` hook raised a limit; `amount` is in the limit's unit.
+    LimitExtended {
+        limit: LimitKind,
+        amount: u64,
+    },
+    /// An `edit_transcript` hook replaced the stored transcript.
+    TranscriptEdited {
+        turn: u32,
+        before: usize,
+        after: usize,
+    },
+    /// An `edit_transcript` hook's edit was malformed and was not applied.
+    TranscriptEditRefused {
+        turn: u32,
+        reason: String,
     },
     Interrupted {
         interruption: Interruption,

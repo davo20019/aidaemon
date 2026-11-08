@@ -1,10 +1,13 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::approval::{EffectKey, InterruptKind};
+use crate::limits::LimitKind;
 use crate::message::{Message, ToolCall};
 use crate::outcome::RunOutcome;
-use crate::provider::{ModelRequest, Usage};
+use crate::provider::{ModelRequest, ModelResponse, ProviderError, Usage};
 use crate::receipt::Receipt;
 use crate::safeguard::Safeguard;
 use crate::state::RunId;
@@ -114,6 +117,41 @@ pub enum StuckDecision {
     Ignore,
 }
 
+/// What an `after_model` hook decides about a response.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelDecision {
+    /// Carry on with the response as the hooks left it.
+    Accept,
+    /// Do not act on this response: none of its tool calls run and it is
+    /// not a final answer. Its text stays in the transcript, so the model
+    /// can see what it is correcting, followed by `message`, and another
+    /// turn runs. To keep the text from the model, clear it first.
+    Reject { message: String },
+}
+
+/// What an `on_model_error` hook decides about a failed model call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelErrorDecision {
+    /// End the run with [`crate::RunStatus::ProviderFailed`].
+    Fail,
+    /// Wait, then run another turn. The transcript is untouched and
+    /// `before_model` runs again, so a hook can shrink the request or change
+    /// the model first. The wait stops on cancel and at the wall-clock
+    /// budget, and the retry counts as a turn: budgets bound the retries.
+    Retry { after: Duration },
+}
+
+/// What an `on_limit` hook decides about a limit the run has reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitDecision {
+    /// End the run with [`crate::RunStatus::LimitReached`].
+    Stop,
+    /// Raise this limit for the rest of the run. `amount` is in the limit's
+    /// own unit: turns, billable tokens, tool calls, or milliseconds. An
+    /// amount of zero is a [`LimitDecision::Stop`].
+    Extend { amount: u64 },
+}
+
 /// Extension point for every policy. All methods have no-op defaults, so a
 /// hook implements only what it needs. Hooks run in registration order and
 /// outside the model's context window: they cost no tokens and the model
@@ -127,9 +165,61 @@ pub trait Hook: Send + Sync {
         &[]
     }
 
+    /// A new run is about to take its first turn: load what the other hooks
+    /// will need. Resuming a paused run is not a start. A process that dies
+    /// before the first turn starts the run again, so make this repeatable.
+    async fn on_run_start(&self, _ctx: &HookContext<'_>) {}
+
+    /// Replace the stored transcript at the start of a turn, for example
+    /// with a summary. Prefer a `before_model` edit, which changes one
+    /// request and loses nothing; use this when the shortened history should
+    /// be what later turns and resumes start from.
+    ///
+    /// Hooks run in order and each sees the last one's edit. The kernel
+    /// refuses an empty edit, one with no user message, and one that splits
+    /// a tool call from its result (providers reject those requests), and
+    /// keeps the transcript it had. Receipts and the run's trust state do
+    /// not change: they are the record of what happened, whatever the
+    /// transcript says now.
+    async fn edit_transcript(&self, _ctx: &HookContext<'_>) -> Option<Vec<Message>> {
+        None
+    }
+
     /// Edit the request before it is sent: trim context, inject memory,
     /// change the model or tool choice.
     async fn before_model(&self, _ctx: &HookContext<'_>, _request: &mut ModelRequest) {}
+
+    /// The model replied. Check or rewrite the response before it is
+    /// recorded or acted on; the first `Reject` wins. Calls a hook adds or
+    /// changes face the same validation and `before_tool` hooks as any
+    /// other. Streamed text has already gone out as events, and the tokens
+    /// are already counted.
+    async fn after_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        _response: &mut ModelResponse,
+    ) -> ModelDecision {
+        ModelDecision::Accept
+    }
+
+    /// A model call failed after whatever retries its provider does itself.
+    /// The first `Retry` wins; with none, the run ends.
+    async fn on_model_error(
+        &self,
+        _ctx: &HookContext<'_>,
+        _error: &ProviderError,
+    ) -> ModelErrorDecision {
+        ModelErrorDecision::Fail
+    }
+
+    /// The run reached a limit in [`crate::Limits`]. The first `Extend`
+    /// wins, is recorded in [`crate::RunState::limit_grants`], and lasts for
+    /// this run. [`crate::HARD_TURN_CAP`] cannot be extended and is never
+    /// put to a hook. A model call cut off by the wall clock is lost and
+    /// runs again if the limit is extended.
+    async fn on_limit(&self, _ctx: &HookContext<'_>, _limit: LimitKind) -> LimitDecision {
+        LimitDecision::Stop
+    }
 
     /// Decide whether a call may run. The first `Deny`, `Interrupt` or
     /// `Answer` wins;

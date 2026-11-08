@@ -19,7 +19,8 @@ pub enum Role {
 pub enum MessageOrigin {
     /// Typed by the user (or the calling application).
     User,
-    /// Injected by the kernel, such as a stuck-detection nudge.
+    /// Injected by the kernel, such as a stuck-detection nudge or an
+    /// `after_model` hook's reason for rejecting a response.
     Harness,
     /// Injected because an `on_stop` hook rejected a final answer.
     StopHook,
