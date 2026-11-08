@@ -38,6 +38,8 @@ pub(crate) const GOAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(1800)
 
 /// Reason recorded when the owner answers Deny.
 const DECLINED_BY_OWNER: &str = "declined by the owner";
+/// Reason recorded for a card that was lost when its run was cut off.
+const RUN_ABANDONED: &str = "the run was cut off before the owner answered";
 /// Reason recorded when the card could not be delivered.
 const COULD_NOT_REACH: &str = "could not reach the owner";
 
@@ -774,6 +776,32 @@ impl OwnerApprovalResolver<'_> {
             .await;
     }
 
+    /// Decline `request` without a card: its run outlived the conversation
+    /// it belonged to.
+    async fn decline_unasked(
+        &self,
+        run: sdk::RunId,
+        interruption: &sdk::Interruption,
+        request: &sdk::OwnerApprovalRequest,
+    ) -> sdk::Resolution {
+        let tool = interruption.call.name.as_str();
+        if self.rules.keeps_own_grants(tool) {
+            self.rules
+                .record_owner_answer(run, &interruption.call, None)
+                .await;
+        }
+        self.record(
+            "owner_approval_declined",
+            tool,
+            request,
+            Some(RUN_ABANDONED),
+        )
+        .await;
+        sdk::Resolution::Deny {
+            reason: RUN_ABANDONED.to_string(),
+        }
+    }
+
     async fn resolve(
         &self,
         run: sdk::RunId,
@@ -824,6 +852,38 @@ impl OwnerApprovalResolver<'_> {
                 sdk::Resolution::Deny { reason }
             }
         }
+    }
+}
+
+/// Settles a run the daemon left unfinished, ahead of the owner's new message.
+/// Nobody is asked: a card for the old request would answer the new message
+/// with an unrelated question. Its owner approvals are declined and listed,
+/// so the turn can say what was not done.
+pub(in crate::agent) struct AbandonedRunResolver<'a, 'r> {
+    pub turn: &'a DaemonInterruptResolver<'r>,
+    pub not_done: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl sdk::InterruptResolver for AbandonedRunResolver<'_, '_> {
+    async fn resolve(
+        &self,
+        state: &sdk::RunState,
+        interruption: &sdk::Interruption,
+    ) -> Option<sdk::Resolution> {
+        let sdk::InterruptKind::OwnerApproval(request) = &interruption.kind else {
+            return sdk::InterruptResolver::resolve(self.turn, state, interruption).await;
+        };
+        self.not_done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request.summary.clone());
+        Some(
+            self.turn
+                .owner
+                .decline_unasked(state.run_id, interruption, request)
+                .await,
+        )
     }
 }
 

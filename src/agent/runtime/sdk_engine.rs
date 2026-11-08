@@ -1460,10 +1460,14 @@ impl Agent {
         // A run the daemon stopped on (a crash, a restart) is settled first,
         // so its batch finishes under the kernel's rules before this turn.
         let stranded = recovery::stranded_run(self.run_store.as_deref(), session_id).await;
+        let abandoned = super::approvals::AbandonedRunResolver {
+            turn: &resolver,
+            not_done: std::sync::Mutex::new(Vec::new()),
+        };
         let run = async {
             if let Some(stranded) = stranded {
                 let settled =
-                    recovery::settle(&sdk_agent, stranded, cancel.clone(), &resolver).await;
+                    recovery::settle(&sdk_agent, stranded, cancel.clone(), &abandoned).await;
                 match settled {
                     Ok(Some(_)) => info!(session_id, "Settled the run a restart left unfinished"),
                     Ok(None) => warn!(
@@ -1569,6 +1573,14 @@ impl Agent {
                     {
                         reply = crate::agent::deferred_retry::deferral_notice(attempt, &failure);
                     }
+                }
+                let not_done = abandoned
+                    .not_done
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(note) = recovery::not_done_note(&not_done) {
+                    reply = format!("{note}\n\n{reply}");
                 }
                 let run_failure = scope.verdict.run_failure();
                 if status == TaskStatus::Completed {

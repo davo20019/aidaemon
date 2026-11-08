@@ -4441,6 +4441,78 @@ async fn a_turn_settles_the_run_a_restart_left_in_flight() {
     assert_ne!(latest.run_id, stranded.run_id);
 }
 
+/// A run cut off while waiting on the owner never answers the owner's next
+/// message with its old card: it is declined unasked, costs no model call,
+/// and the reply says what was not done, once.
+#[tokio::test]
+async fn a_new_message_never_gets_the_card_of_a_run_that_was_cut_off() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("It is Sunday."),
+        MockProvider::text_response("Noted."),
+    ]);
+    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+        .await
+        .unwrap();
+    let store = std::sync::Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(harness.state.pool())
+            .await
+            .unwrap(),
+    );
+    harness.agent.set_run_store(store.clone());
+    let session = "telegram:synthetic-user-1";
+
+    let call = aidaemon_core::ToolCall::new("c1", "manage_memories", serde_json::json!({}));
+    let mut stranded = aidaemon_core::RunState::new("aidaemon", session, "Earlier request.");
+    stranded.pending = Some(aidaemon_core::Pending {
+        calls: vec![call.clone()],
+        next: 0,
+        interruption: aidaemon_core::Interruption {
+            call,
+            reason: "needs the owner".to_string(),
+            kind: aidaemon_core::InterruptKind::OwnerApproval(
+                aidaemon_core::OwnerApprovalRequest {
+                    effects: Vec::new(),
+                    summary: "Summarize the forecast each Monday".to_string(),
+                    subject: "goal".to_string(),
+                    risk: aidaemon_core::ApprovalRisk::Medium,
+                    warnings: Vec::new(),
+                },
+            ),
+        },
+        hook_index: None,
+        hook_chain: Vec::new(),
+    });
+    store.upsert_state(&stranded).await.unwrap();
+
+    let first = harness
+        .agent
+        .handle_inbound_message(owner_request("What day is it?"))
+        .await
+        .unwrap();
+    assert!(first.text.contains("It is Sunday."), "{}", first.text);
+    assert!(
+        first.text.contains("was not done")
+            && first.text.contains("Summarize the forecast each Monday"),
+        "{}",
+        first.text
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        1,
+        "the cut-off run must not spend a model call"
+    );
+
+    let second = harness
+        .agent
+        .handle_inbound_message(owner_request("Thanks."))
+        .await
+        .unwrap();
+    assert!(!second.text.contains("was not done"), "{}", second.text);
+}
+
 /// The canonical form is applied by a kernel hook before any other hook
 /// judges the call: a terminal call without a directory is rewritten to run
 /// in the turn's project directory, the injected directory never becomes

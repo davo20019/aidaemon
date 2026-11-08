@@ -5,9 +5,10 @@
 //! last checkpoint is `in_flight` stopped mid tool batch: the kernel finishes
 //! that batch under its own rules (idempotent calls run again, others are
 //! marked indeterminate rather than repeated). A run that is `pending` was
-//! waiting for an owner decision that no longer exists in memory, so it is
-//! settled through the same resolver a live turn uses (a fresh card, or a
-//! denial). The recovered transcript is not reused: the next turn is built
+//! waiting for an owner decision that no longer exists in memory. It is
+//! declined without a card and ended there, because the owner has moved on
+//! and sent a new message: the turn says what was not done instead. The
+//! recovered transcript is not reused: the next turn is built
 //! from the daemon's own projection, as every turn is, so nothing is
 //! duplicated.
 
@@ -15,6 +16,18 @@ use aidaemon_core as sdk;
 use aidaemon_store_sqlite::SqliteStore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// What the owner is told about requests a cut-off run did not carry out.
+pub(super) fn not_done_note(not_done: &[String]) -> Option<String> {
+    const MAX_CHARS: usize = 300;
+    if not_done.is_empty() {
+        return None;
+    }
+    let listed: String = not_done.join("; ").chars().take(MAX_CHARS).collect();
+    Some(format!(
+        "⚠️ An earlier request was cut off before you answered, so it was not done: {listed}. Ask again if you still want it."
+    ))
+}
 
 /// The session's most recent run, when it is unfinished.
 pub(super) async fn stranded_run(
@@ -61,8 +74,20 @@ pub(super) async fn settle(
             let Some(resolution) = resolver.resolve(&state, &pending.interruption).await else {
                 return Ok(None);
             };
+            // A declined owner decision ends the old run here; going on would
+            // spend model calls on a request the owner has moved past.
+            let resume_cancel = if matches!(
+                pending.interruption.kind,
+                sdk::InterruptKind::OwnerApproval(_)
+            ) {
+                let ended = CancellationToken::new();
+                ended.cancel();
+                ended
+            } else {
+                cancel.clone()
+            };
             agent
-                .resume_with_cancel(state, resolution, cancel.clone())
+                .resume_with_cancel(state, resolution, resume_cancel)
                 .await?
         }
         None => agent.run_resolving(state, cancel.clone(), resolver).await?,
