@@ -54,8 +54,6 @@ pub(crate) struct PlannedTaskShape {
     /// Exact prior user-message ID selected from relationship-assessment
     /// context. Required for `continuation`; null for independent requests.
     pub antecedent_user_message_id: Option<String>,
-    /// Typed tool/resource domain for the request.
-    pub semantic_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +63,6 @@ struct TaskRelationshipResponse {
     request_relationship: String,
     #[serde(default)]
     antecedent_user_message_id: Option<String>,
-    semantic_scope: String,
 }
 
 const TASK_RELATIONSHIP_SCHEMA_VERSION: u16 = 1;
@@ -89,18 +86,6 @@ pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) ->
         .map(str::trim)
         .filter(|value| !value.is_empty());
     confidence_is_sufficient(shape.confidence.as_deref())
-        && shape.semantic_scope.as_deref().is_some_and(|scope| {
-            matches!(
-                scope.trim(),
-                "none"
-                    | "goal_state"
-                    | "user_memory"
-                    | "conversation_history"
-                    | "external_remote"
-                    | "local_workspace"
-                    | "host_local"
-            )
-        })
         && match relationship {
             // The semantic compiler owns the relationship class. Exact
             // identity belongs to the deterministic dialogue-state resolver,
@@ -414,8 +399,7 @@ pub(crate) async fn generate_task_relationship_candidates(
          Current user request:\n{user_text}\n\n\
          Return exactly: {{\"schema_version\":1,\"confidence\":\"low|medium|high\",\
          \"request_relationship\":\"new_request|continuation|clarification_answer|courtesy\",\
-         \"antecedent_user_message_id\":null|\"message-id\",\
-         \"semantic_scope\":\"none|goal_state|user_memory|conversation_history|external_remote|local_workspace|host_local\"}}.\n\
+         \"antecedent_user_message_id\":null|\"message-id\"}}.\n\
          Use continuation only when the current request advances, retries, or asks about one prior request shown above; copy that prior USER row's exact message_id. Otherwise use new_request and null. Courtesy and clarification_answer also require null. Judge the whole meaning, not isolated words.",
         conversation_context = truncate_str(conversation_context, 6000),
         user_text = truncate_str(user_text, 4000),
@@ -545,16 +529,6 @@ pub(crate) async fn generate_task_relationship_candidates(
             && matches!(
                 parsed.request_relationship.as_str(),
                 "new_request" | "continuation" | "clarification_answer" | "courtesy"
-            )
-            && matches!(
-                parsed.semantic_scope.as_str(),
-                "none"
-                    | "goal_state"
-                    | "user_memory"
-                    | "conversation_history"
-                    | "external_remote"
-                    | "local_workspace"
-                    | "host_local"
             );
         let antecedent = parsed
             .antecedent_user_message_id
@@ -586,7 +560,6 @@ pub(crate) async fn generate_task_relationship_candidates(
             confidence: Some(parsed.confidence),
             request_relationship: Some(parsed.request_relationship),
             antecedent_user_message_id: antecedent,
-            semantic_scope: Some(parsed.semantic_scope),
         });
     }
     None
@@ -830,8 +803,7 @@ mod tests {
                 "schema_version": 1,
                 "confidence": "high",
                 "request_relationship": "continuation",
-                "antecedent_user_message_id": "message-setup-1",
-                "semantic_scope": "conversation_history"
+                "antecedent_user_message_id": "message-setup-1"
             }"#,
         );
         let provider =
@@ -853,10 +825,6 @@ mod tests {
             shape.antecedent_user_message_id.as_deref(),
             Some("message-setup-1")
         );
-        assert_eq!(
-            shape.semantic_scope.as_deref(),
-            Some("conversation_history")
-        );
     }
 
     #[tokio::test]
@@ -866,8 +834,7 @@ mod tests {
                 "schema_version": 1,
                 "confidence": "high",
                 "request_relationship": "continuation",
-                "antecedent_user_message_id": null,
-                "semantic_scope": "conversation_history"
+                "antecedent_user_message_id": null
             }"#,
         );
         let provider =

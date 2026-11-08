@@ -461,7 +461,7 @@ async fn test_old_interaction_assistant_content_truncated() {
         MockProvider::text_response(&long_response_2),
         // Turn 3: direct text response
         MockProvider::text_response("Short answer."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -572,7 +572,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         MockProvider::text_response("It is 4."),
         // Turn 2: different topic
         MockProvider::text_response("Rust 1.82.0"),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -654,7 +654,7 @@ async fn test_compaction_fires_on_window_overflow() {
 
     // A session's first turn has no antecedent, so the router runs from turn 2.
     let relationships = (1..8)
-        .map(|_| MockProvider::relationship_assessment("continuation", "conversation_history"))
+        .map(|_| MockProvider::relationship_assessment("continuation"))
         .collect();
     let provider = MockProvider::with_responses(responses)
         .with_relationship_assessments(relationships);

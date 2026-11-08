@@ -5,7 +5,7 @@ async fn test_semantic_followup_uses_dialogue_state_projection() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I searched for AI news and found several results."),
         MockProvider::text_response("Here is the original answer you asked for."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "none")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
     let session_id = "dialogue_state_followup";
@@ -109,7 +109,7 @@ async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() 
         MockProvider::text_response(
             "I based that recap on the saved job-preparation notes returned in the prior turn.",
         ),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("new_request", "none"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("new_request"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session_id = "exact_source_question_adjacency";
 

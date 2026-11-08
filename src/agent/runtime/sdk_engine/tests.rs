@@ -2790,7 +2790,7 @@ async fn unrestricted_owner_sends_and_the_call_is_recorded() {
 /// Turn one reads the page; turn two runs a send. Returns how many clean
 /// checks ran. Each turn is scripted after the previous one finished
 /// (closeout passes take the default reply).
-async fn checks_after_a_tainted_turn(relationship: &str, scope: &str) -> usize {
+async fn checks_after_a_tainted_turn(relationship: &str) -> usize {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
     let (harness, sent) = untrusted_harness_with(
@@ -2798,10 +2798,7 @@ async fn checks_after_a_tainted_turn(relationship: &str, scope: &str) -> usize {
             MockProvider::tool_call_response("page_probe", PAGE_CALL),
             MockProvider::text_response("The page asks for files."),
         ])
-        .with_relationship_assessments(vec![MockProvider::relationship_assessment(
-            relationship,
-            scope,
-        )]),
+        .with_relationship_assessments(vec![MockProvider::relationship_assessment(relationship)]),
     )
     .await;
     harness
@@ -2839,16 +2836,13 @@ async fn checks_after_a_tainted_turn(relationship: &str, scope: &str) -> usize {
 /// A continuation still sees the turn that read the page: it starts tainted.
 #[tokio::test]
 async fn a_tainted_turn_taints_the_next_turn_that_still_sees_it() {
-    assert_eq!(
-        checks_after_a_tainted_turn("continuation", "conversation_history").await,
-        1
-    );
+    assert_eq!(checks_after_a_tainted_turn("continuation").await, 1);
 }
 
 /// A new request whose prefix no longer holds that turn starts clean.
 #[tokio::test]
 async fn a_new_request_without_the_tainted_turn_starts_clean() {
-    assert_eq!(checks_after_a_tainted_turn("new_request", "none").await, 0);
+    assert_eq!(checks_after_a_tainted_turn("new_request").await, 0);
 }
 
 /// A trigger's text is someone else's: the verifier is told there is no

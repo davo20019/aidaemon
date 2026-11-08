@@ -197,17 +197,13 @@ impl MockProvider {
 
     /// One typed dialogue edge from the relationship router, naming no exact
     /// antecedent (the dialogue-state resolver binds it when unambiguous).
-    pub fn relationship_assessment(
-        request_relationship: &str,
-        semantic_scope: &str,
-    ) -> ProviderResponse {
+    pub fn relationship_assessment(request_relationship: &str) -> ProviderResponse {
         Self::text_response(
             &json!({
                 "schema_version": 1,
                 "confidence": "high",
                 "request_relationship": request_relationship,
-                "antecedent_user_message_id": Value::Null,
-                "semantic_scope": semantic_scope
+                "antecedent_user_message_id": Value::Null
             })
             .to_string(),
         )

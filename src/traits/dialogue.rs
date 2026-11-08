@@ -486,8 +486,6 @@ pub struct OpenRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_scope: Option<ToolSemanticScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_contract: Option<RequestCompletionContract>,
     pub opened_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,7 +756,6 @@ mod tests {
             status: OpenRequestStatus::PartiallyAnswered,
             task_id: None,
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at: now,
             resolved_at: None,

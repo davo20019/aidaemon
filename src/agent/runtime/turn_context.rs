@@ -1634,7 +1634,6 @@ mod tests {
             status: OpenRequestStatus::PartiallyAnswered,
             task_id: Some("task-1".to_string()),
             project_scope: None,
-            semantic_scope: None,
             completion_contract: Some(crate::traits::RequestCompletionContract {
                 scope_task_id: Some("task-1".to_string()),
                 adopted_from_task_ids: Vec::new(),
@@ -1712,7 +1711,6 @@ mod tests {
             status: OpenRequestStatus::InProgress,
             task_id: Some("task-1".to_string()),
             project_scope: None,
-            semantic_scope: Some(crate::traits::ToolSemanticScope::ExternalRemote),
             completion_contract: Some(crate::traits::RequestCompletionContract {
                 scope_task_id: Some("task-1".to_string()),
                 adopted_from_task_ids: Vec::new(),

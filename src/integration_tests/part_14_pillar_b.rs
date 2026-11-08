@@ -64,7 +64,7 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_cross_turn_archived";
 
@@ -165,7 +165,7 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_fact_between_turns";
 
@@ -388,7 +388,7 @@ async fn pillar_b_identity_statement_in_archived_turn_survives_verbatim() {
         MockProvider::text_response("Understood, noted."),
         MockProvider::text_response("Okay."),
         MockProvider::text_response("Sure."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_identity_archived";
 

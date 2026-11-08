@@ -670,7 +670,7 @@ async fn test_memory_persistence() {
 
 #[tokio::test]
 async fn test_multi_turn_conversation() {
-    let provider = MockProvider::new().with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    let provider = MockProvider::new().with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     // First turn
@@ -730,9 +730,7 @@ async fn exact_history_follow_up_is_grounded_by_the_projected_antecedent() {
         MockProvider::text_response(marker),
     ])
     .with_relationship_assessments(vec![MockProvider::relationship_assessment(
-        "continuation",
-        "conversation_history",
-    )]);
+        "continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     harness

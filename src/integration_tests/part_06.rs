@@ -206,7 +206,7 @@ async fn test_identity_tool_result_survives_context_collapse() {
         ),
         MockProvider::text_response("Saved."),
         MockProvider::text_response("Continuing with your latest request."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let _ = harness

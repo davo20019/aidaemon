@@ -63,7 +63,7 @@ async fn misclassified_continuation_still_shows_the_verifier_the_owed_request() 
         MockProvider::tool_call_response("forget_probe", r#"{"key":"side_project"}"#),
         MockProvider::text_response(r#"{"consistent":true,"reason":"owner asked"}"#),
         MockProvider::text_response("Done for this pass."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("new_request", "none"), MockProvider::relationship_assessment("new_request", "none")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("new_request"), MockProvider::relationship_assessment("new_request")]);
     let tools: Vec<Arc<dyn crate::traits::Tool>> =
         vec![Arc::new(InjectedPage(String::new())), Arc::new(ForgetProbe)];
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)

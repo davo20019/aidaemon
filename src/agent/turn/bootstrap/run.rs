@@ -152,8 +152,8 @@ async fn finalize_turn_assessment(
             .flatten();
         let typed_clarification = initial_turn_context.followup_mode
             == Some(crate::agent::followup::FollowupMode::ClarificationAnswer);
-        let (relationship, semantic_scope, reason_code) = if structural_resume {
-            ("continuation", "none", "runtime_resume_edge")
+        let (relationship, reason_code) = if structural_resume {
+            ("continuation", "runtime_resume_edge")
         } else if let Some(shape) = relationship_shape {
             let requested = shape
                 .request_relationship
@@ -200,19 +200,15 @@ async fn finalize_turn_assessment(
             } else {
                 "assessment_committed"
             };
-            (
-                relationship,
-                shape.semantic_scope.as_deref().unwrap_or("none"),
-                reason,
-            )
+            (relationship, reason)
         } else if typed_clarification {
-            ("clarification_answer", "none", "typed_clarification_edge")
+            ("clarification_answer", "typed_clarification_edge")
         } else {
             // A failed/unavailable language assessment cannot authorize an
             // adoption edge. Ordinary ingress therefore fails closed to a
             // fresh request; only runtime continuations and typed pending
             // questions bypass this rule.
-            ("new_request", "none", "assessment_unavailable_fresh_task")
+            ("new_request", "assessment_unavailable_fresh_task")
         };
 
         if let Err(error) = crate::agent::dialogue_state::record_dialogue_semantic_user_turn(
@@ -220,7 +216,6 @@ async fn finalize_turn_assessment(
             session_id,
             user_text,
             relationship,
-            semantic_scope,
         )
         .await
         {
@@ -236,7 +231,6 @@ async fn finalize_turn_assessment(
                 json!({
                     "condition": "task_relationship_finalized",
                     "relationship": relationship,
-                    "semantic_scope": semantic_scope,
                     "reason_code": reason_code,
                     "requested_antecedent_user_message_id": requested_antecedent_user_message_id,
                     "antecedent_user_message_id": committed_antecedent_user_message_id,

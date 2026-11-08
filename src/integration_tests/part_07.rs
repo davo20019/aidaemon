@@ -269,7 +269,7 @@ async fn test_structural_continuation_projects_exact_prior_exchange() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("There are 3 R's in strawberry."),
         MockProvider::text_response("Yes — strawberry has 3 R's."),
-    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let first = harness

@@ -557,7 +557,6 @@ fn apply_user_message(
                 },
                 task_id: state.active_task.as_ref().map(|task| task.task_id.clone()),
                 project_scope: None,
-                semantic_scope: infer_open_request_scope(trimmed, alias_roots),
                 completion_contract: None,
                 opened_at: observed_at,
                 resolved_at: None,
@@ -588,19 +587,6 @@ fn apply_user_message(
     state.touch();
 }
 
-fn parse_semantic_scope(value: &str) -> Result<Option<ToolSemanticScope>, ()> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Ok(None),
-        "goal_state" => Ok(Some(ToolSemanticScope::GoalState)),
-        "user_memory" => Ok(Some(ToolSemanticScope::UserMemory)),
-        "conversation_history" => Ok(Some(ToolSemanticScope::ConversationHistory)),
-        "external_remote" => Ok(Some(ToolSemanticScope::ExternalRemote)),
-        "local_workspace" => Ok(Some(ToolSemanticScope::LocalWorkspace)),
-        "host_local" => Ok(Some(ToolSemanticScope::HostLocal)),
-        _ => Err(()),
-    }
-}
-
 fn parse_semantic_relationship(value: &str) -> Option<UserTurnKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "new_request" => Some(UserTurnKind::NewRequest),
@@ -617,7 +603,6 @@ fn apply_semantic_user_turn_assessment(
     state: &mut DialogueState,
     text: &str,
     kind: UserTurnKind,
-    semantic_scope: Option<ToolSemanticScope>,
     observed_at: chrono::DateTime<Utc>,
 ) {
     let Some(turn) = state
@@ -648,13 +633,10 @@ fn apply_semantic_user_turn_assessment(
                     },
                     task_id: state.active_task.as_ref().map(|task| task.task_id.clone()),
                     project_scope: None,
-                    semantic_scope,
                     completion_contract: None,
                     opened_at: observed_at,
                     resolved_at: None,
                 });
-            } else if let Some(request) = state.open_request.as_mut() {
-                request.semantic_scope = semantic_scope;
             }
             state.open_question = None;
             state.last_closed_question = None;
@@ -679,9 +661,6 @@ fn apply_semantic_user_turn_assessment(
                 }
             }
             if let Some(request) = state.open_request.as_mut() {
-                if semantic_scope.is_some() {
-                    request.semantic_scope = semantic_scope;
-                }
                 if state.active_task.is_some() {
                     request.status = OpenRequestStatus::InProgress;
                     request.resolved_at = None;
@@ -716,16 +695,12 @@ pub(in crate::agent) async fn record_dialogue_semantic_user_turn(
     session_id: &str,
     text: &str,
     relationship: &str,
-    semantic_scope: &str,
 ) -> anyhow::Result<Option<UserTurnKind>> {
     let Some(kind) = parse_semantic_relationship(relationship) else {
         return Ok(None);
     };
-    let Ok(scope) = parse_semantic_scope(semantic_scope) else {
-        return Ok(None);
-    };
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
-    apply_semantic_user_turn_assessment(&mut state, text, kind, scope, Utc::now());
+    apply_semantic_user_turn_assessment(&mut state, text, kind, Utc::now());
     agent.state.upsert_dialogue_state(&state).await?;
     Ok(Some(kind))
 }
@@ -1144,7 +1119,6 @@ mod tests {
             status: OpenRequestStatus::InProgress,
             task_id: Some("task-1".to_string()),
             project_scope: None,
-            semantic_scope: Some(ToolSemanticScope::ExternalRemote),
             completion_contract: None,
             opened_at: now,
             resolved_at: None,
@@ -1187,7 +1161,6 @@ mod tests {
             status: OpenRequestStatus::Open,
             task_id: None,
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at: Utc::now(),
             resolved_at: None,
@@ -1226,7 +1199,6 @@ mod tests {
             status: OpenRequestStatus::Open,
             task_id: None,
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at: Utc::now(),
             resolved_at: None,
@@ -1253,52 +1225,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_request_records_goal_state_scope() {
-        let mut state = DialogueState::new("s1");
-        apply_user_message(
-            &mut state,
-            "u1",
-            "What times does the tweet posting schedule trigger?",
-            &[],
-            Utc::now(),
-        );
-        apply_semantic_user_turn_assessment(
-            &mut state,
-            "What times does the tweet posting schedule trigger?",
-            UserTurnKind::NewRequest,
-            Some(ToolSemanticScope::GoalState),
-            Utc::now(),
-        );
-        assert_eq!(
-            state
-                .open_request
-                .as_ref()
-                .and_then(|request| request.semantic_scope),
-            Some(ToolSemanticScope::GoalState)
-        );
-    }
-
-    #[test]
-    fn scheduled_execution_instruction_does_not_use_goal_state_scope() {
-        let mut state = DialogueState::new("s1");
-        apply_user_message(
-            &mut state,
-            "u1",
-            "Scheduled check: Post daily optimized tweets for the aidaemon Twitter account \
-             [SYSTEM: already scheduled and firing now; do not reschedule.]",
-            &[],
-            Utc::now(),
-        );
-        assert_eq!(
-            state
-                .open_request
-                .as_ref()
-                .and_then(|request| request.semantic_scope),
-            None
-        );
-    }
-
-    #[test]
     fn short_self_contained_schedule_query_supersedes_previous_request() {
         let mut state = DialogueState::new("s1");
         apply_user_message(
@@ -1321,7 +1247,6 @@ mod tests {
             &mut state,
             "What are your scheduled tasks?",
             UserTurnKind::NewRequest,
-            Some(ToolSemanticScope::GoalState),
             observed_at,
         );
 
@@ -1335,13 +1260,6 @@ mod tests {
                 .as_ref()
                 .map(|request| request.user_message_id.as_str()),
             Some("u2")
-        );
-        assert_eq!(
-            state
-                .open_request
-                .as_ref()
-                .and_then(|request| request.semantic_scope),
-            Some(ToolSemanticScope::GoalState)
         );
     }
 
@@ -1364,7 +1282,6 @@ mod tests {
             status,
             task_id: None,
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at,
             resolved_at,
@@ -1417,7 +1334,6 @@ mod tests {
             &mut state,
             "Return the values from that setup.",
             UserTurnKind::Followup,
-            None,
             now,
         );
         assert_eq!(
@@ -1452,7 +1368,6 @@ mod tests {
             &mut state,
             "Are there any uncommitted files?",
             UserTurnKind::Followup,
-            Some(ToolSemanticScope::LocalWorkspace),
             now,
         );
         assert_eq!(
@@ -1483,7 +1398,6 @@ mod tests {
             &mut state,
             "How can that be possible?",
             UserTurnKind::Followup,
-            Some(ToolSemanticScope::LocalWorkspace),
             now + chrono::Duration::seconds(1),
         );
         assert_eq!(
@@ -1627,7 +1541,6 @@ mod tests {
             &mut state,
             "Send me my Microsoft resume",
             UserTurnKind::NewRequest,
-            None,
             now,
         );
         assert_eq!(
@@ -1720,7 +1633,6 @@ mod tests {
             &mut state,
             "Check disk space on this Mac.",
             UserTurnKind::NewRequest,
-            Some(ToolSemanticScope::HostLocal),
             now,
         );
 
@@ -1747,7 +1659,6 @@ mod tests {
             &mut state,
             "hmm the second folder maybe",
             UserTurnKind::Followup,
-            None,
             now,
         );
         assert_eq!(
@@ -1772,13 +1683,7 @@ mod tests {
         state.open_request = Some(request);
 
         apply_user_message(&mut state, "u2", "Fixed?", &[], now);
-        apply_semantic_user_turn_assessment(
-            &mut state,
-            "Fixed?",
-            UserTurnKind::Followup,
-            None,
-            now,
-        );
+        apply_semantic_user_turn_assessment(&mut state, "Fixed?", UserTurnKind::Followup, now);
 
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
@@ -1813,7 +1718,6 @@ mod tests {
             &mut state,
             "Take another pass from the receipt we already have.",
             UserTurnKind::Followup,
-            None,
             now,
         );
 
@@ -1990,7 +1894,6 @@ mod tests {
                 &mut followup_state,
                 followup,
                 UserTurnKind::Followup,
-                None,
                 now,
             );
             assert_eq!(
@@ -2019,7 +1922,6 @@ mod tests {
             &mut separate_state,
             "Check disk space on this Mac.",
             UserTurnKind::NewRequest,
-            Some(ToolSemanticScope::HostLocal),
             now,
         );
         assert_eq!(
@@ -2041,7 +1943,6 @@ mod owner_lineage_tests {
             status,
             task_id: Some("task-1".to_string()),
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at: Utc::now(),
             resolved_at: None,
@@ -2268,7 +2169,6 @@ mod owner_lineage_tests {
             status: OpenRequestStatus::Open,
             task_id: None,
             project_scope: None,
-            semantic_scope: None,
             completion_contract: None,
             opened_at: now,
             resolved_at: None,
