@@ -131,6 +131,9 @@ pub aidaemon_core::Event::Interrupted::interruption: aidaemon_core::Interruption
 pub aidaemon_core::Event::LimitExtended
 pub aidaemon_core::Event::LimitExtended::amount: u64
 pub aidaemon_core::Event::LimitExtended::limit: aidaemon_core::LimitKind
+pub aidaemon_core::Event::ModelAnswered
+pub aidaemon_core::Event::ModelAnswered::hook: alloc::string::String
+pub aidaemon_core::Event::ModelAnswered::turn: u32
 pub aidaemon_core::Event::ModelRejected
 pub aidaemon_core::Event::ModelRejected::message: alloc::string::String
 pub aidaemon_core::Event::ModelRejected::turn: u32
@@ -193,6 +196,7 @@ pub aidaemon_core::HookFailure::TimedOut::after_ms: u64
 pub enum aidaemon_core::HookPoint
 pub aidaemon_core::HookPoint::AfterModel
 pub aidaemon_core::HookPoint::AfterTool
+pub aidaemon_core::HookPoint::AnswerModel
 pub aidaemon_core::HookPoint::BeforeModel
 pub aidaemon_core::HookPoint::BeforeTool
 pub aidaemon_core::HookPoint::EditTranscript
@@ -224,6 +228,7 @@ pub aidaemon_core::InvocationStage::RejectedBeforeDispatch
 pub enum aidaemon_core::LimitDecision
 pub aidaemon_core::LimitDecision::Extend
 pub aidaemon_core::LimitDecision::Extend::amount: u64
+pub aidaemon_core::LimitDecision::Forbid
 pub aidaemon_core::LimitDecision::Stop
 pub enum aidaemon_core::LimitKind
 pub aidaemon_core::LimitKind::Tokens
@@ -240,7 +245,10 @@ pub aidaemon_core::ModelDecision::Accept
 pub aidaemon_core::ModelDecision::Reject
 pub aidaemon_core::ModelDecision::Reject::message: alloc::string::String
 pub enum aidaemon_core::ModelErrorDecision
+pub aidaemon_core::ModelErrorDecision::Abort
 pub aidaemon_core::ModelErrorDecision::Fail
+pub aidaemon_core::ModelErrorDecision::Recover
+pub aidaemon_core::ModelErrorDecision::Recover::response: aidaemon_core::ModelResponse
 pub aidaemon_core::ModelErrorDecision::Retry
 pub aidaemon_core::ModelErrorDecision::Retry::after: core::time::Duration
 pub enum aidaemon_core::ProviderError
@@ -332,6 +340,8 @@ pub aidaemon_core::StopDecision::AcceptUnmet
 pub aidaemon_core::StopDecision::AcceptUnmet::unmet: alloc::vec::Vec<alloc::string::String>
 pub aidaemon_core::StopDecision::Continue
 pub aidaemon_core::StopDecision::Continue::message: alloc::string::String
+pub aidaemon_core::StopDecision::Halt
+pub aidaemon_core::StopDecision::Halt::reason: alloc::string::String
 impl aidaemon_core::StopDecision
 pub fn aidaemon_core::StopDecision::permits_stop(&self) -> bool
 pub enum aidaemon_core::StreamEvent
@@ -450,6 +460,7 @@ pub fn aidaemon_core::AuthorityHook::with_ceiling(self, alloc::sync::Arc<dyn aid
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
+pub fn aidaemon_core::AuthorityHook::answer_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::ModelResponse>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::before_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ToolCall, &'life4 aidaemon_core::ToolInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::AuthorityHook::edit_transcript<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::vec::Vec<aidaemon_core::Message>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
@@ -562,6 +573,7 @@ pub aidaemon_core::LimitGrants::turns: u32
 pub aidaemon_core::LimitGrants::wall_clock_ms: u64
 pub struct aidaemon_core::Limits
 pub aidaemon_core::Limits::hook_timeout: core::time::Duration
+pub aidaemon_core::Limits::max_idle_continuations: u32
 pub aidaemon_core::Limits::max_tokens: core::option::Option<u64>
 pub aidaemon_core::Limits::max_tool_calls: core::option::Option<u32>
 pub aidaemon_core::Limits::max_tool_output_chars: usize
@@ -815,6 +827,7 @@ pub fn aidaemon_core::UntrustedHook::new(aidaemon_core::UntrustedMode, fn(&str, 
 impl aidaemon_core::Hook for aidaemon_core::UntrustedHook
 pub fn aidaemon_core::UntrustedHook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
+pub fn aidaemon_core::UntrustedHook::answer_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::ModelResponse>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::before_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ToolCall, &'life4 aidaemon_core::ToolInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::UntrustedHook::edit_transcript<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::vec::Vec<aidaemon_core::Message>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
@@ -855,6 +868,7 @@ pub fn aidaemon_core::DefaultFailover::before_attempt(&self, &aidaemon_core::Mod
 pub trait aidaemon_core::Hook: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::Hook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::Hook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
+pub fn aidaemon_core::Hook::answer_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::ModelResponse>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::Hook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::Hook::before_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ToolCall, &'life4 aidaemon_core::ToolInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::Hook::edit_transcript<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::vec::Vec<aidaemon_core::Message>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
@@ -870,6 +884,7 @@ pub fn aidaemon_core::Hook::timeout(&self) -> core::option::Option<core::time::D
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
 pub fn aidaemon_core::AuthorityHook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
+pub fn aidaemon_core::AuthorityHook::answer_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::ModelResponse>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::AuthorityHook::before_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ToolCall, &'life4 aidaemon_core::ToolInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::AuthorityHook::edit_transcript<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::vec::Vec<aidaemon_core::Message>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
@@ -885,6 +900,7 @@ pub fn aidaemon_core::AuthorityHook::timeout(&self) -> core::option::Option<core
 impl aidaemon_core::Hook for aidaemon_core::UntrustedHook
 pub fn aidaemon_core::UntrustedHook::after_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelResponse) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ModelDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::after_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::Receipt, &'life4 mut aidaemon_core::ToolOutput) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
+pub fn aidaemon_core::UntrustedHook::answer_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<aidaemon_core::ModelResponse>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::before_model<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 mut aidaemon_core::ModelRequest) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn aidaemon_core::UntrustedHook::before_tool<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>, &'life3 aidaemon_core::ToolCall, &'life4 aidaemon_core::ToolInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolDecision> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait
 pub fn aidaemon_core::UntrustedHook::edit_transcript<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 aidaemon_core::HookContext<'life2>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::vec::Vec<aidaemon_core::Message>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait

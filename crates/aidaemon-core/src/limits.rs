@@ -25,6 +25,11 @@ pub struct Limits {
     pub tool_timeout: Duration,
     /// Tool output beyond this many characters is cut to head + tail.
     pub max_tool_output_chars: usize,
+    /// How many times in a row `on_stop` hooks may send the model back with
+    /// no new successful tool call in between. Counting progress rather than
+    /// turns stops a hook and a refusing model from circling forever while
+    /// leaving long, productive runs alone.
+    pub max_idle_continuations: u32,
     /// How long one hook call may take (see [`crate::Hook::timeout`]).
     pub hook_timeout: Duration,
 }
@@ -38,6 +43,7 @@ impl Default for Limits {
             timeout: None,
             tool_timeout: Duration::from_secs(120),
             max_tool_output_chars: 30_000,
+            max_idle_continuations: 8,
             hook_timeout: Duration::from_secs(300),
         }
     }

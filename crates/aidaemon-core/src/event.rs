@@ -63,6 +63,12 @@ pub enum Event {
         hook: String,
         failure: HookFailure,
     },
+    /// A hook answered in the model's place, or supplied the response of a
+    /// failed call; the model's own reply was not used.
+    ModelAnswered {
+        turn: u32,
+        hook: String,
+    },
     /// An `after_model` hook rejected this turn's response.
     ModelRejected {
         turn: u32,

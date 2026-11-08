@@ -94,6 +94,9 @@ pub enum StopDecision {
     Accept,
     /// Do not finish yet; append this message and run another turn.
     Continue { message: String },
+    /// Stop now, whatever any other hook asked for, and record `reason` as
+    /// unmet: for a hook that knows more turns must not happen.
+    Halt { reason: String },
     /// Stop, but the objective is not met. Each line names one unmet
     /// requirement in words a person can read. The run ends `Completed`
     /// (the model may not keep going) and never counts as succeeded.
@@ -131,7 +134,7 @@ pub enum ModelDecision {
 }
 
 /// What an `on_model_error` hook decides about a failed model call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelErrorDecision {
     /// End the run with [`crate::RunStatus::ProviderFailed`].
     Fail,
@@ -140,6 +143,10 @@ pub enum ModelErrorDecision {
     /// the model first. The wait stops on cancel and at the wall-clock
     /// budget, and the retry counts as a turn: budgets bound the retries.
     Retry { after: Duration },
+    /// Carry on with this response as if the model had given it.
+    Recover { response: ModelResponse },
+    /// End the run, whatever any other hook asked for.
+    Abort,
 }
 
 /// What an `on_limit` hook decides about a limit the run has reached.
@@ -151,6 +158,8 @@ pub enum LimitDecision {
     /// own unit: turns, billable tokens, tool calls, or milliseconds. An
     /// amount of zero is a [`LimitDecision::Stop`].
     Extend { amount: u64 },
+    /// End the run, whatever any other hook granted.
+    Forbid,
 }
 
 /// A moment of the loop at which hooks run.
@@ -161,6 +170,7 @@ pub enum HookPoint {
     EditTranscript,
     BeforeModel,
     AfterModel,
+    AnswerModel,
     OnModelError,
     OnLimit,
     BeforeTool,
@@ -253,6 +263,18 @@ pub trait Hook: Send + Sync {
     /// change the model or tool choice.
     async fn before_model(&self, _ctx: &HookContext<'_>, _request: &mut ModelRequest) {}
 
+    /// Answer in the model's place, for example from a cache. It runs after
+    /// every `before_model` hook, so it sees the final request. The first
+    /// answer wins; the response is treated as the model's, `after_model`
+    /// included, and the turn counts.
+    async fn answer_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        _request: &ModelRequest,
+    ) -> Option<ModelResponse> {
+        None
+    }
+
     /// The model replied. Check or rewrite the response before it is
     /// recorded or acted on; the first `Reject` wins. Calls a hook adds or
     /// changes face the same validation and `before_tool` hooks as any
@@ -267,7 +289,8 @@ pub trait Hook: Send + Sync {
     }
 
     /// A model call failed after whatever retries its provider does itself.
-    /// The first `Retry` wins; with none, the run ends.
+    /// Every hook is asked: an `Abort` beats everything, then the first
+    /// `Recover` or `Retry` wins. With none, the run ends.
     async fn on_model_error(
         &self,
         _ctx: &HookContext<'_>,
@@ -276,8 +299,8 @@ pub trait Hook: Send + Sync {
         ModelErrorDecision::Fail
     }
 
-    /// The run reached a limit in [`crate::Limits`]. The first `Extend`
-    /// wins, is recorded in [`crate::RunState::limit_grants`], and lasts for
+    /// The run reached a limit in [`crate::Limits`]. Every hook is asked: a
+    /// `Forbid` beats any grant, then the first `Extend` wins, is recorded in [`crate::RunState::limit_grants`], and lasts for
     /// this run. [`crate::HARD_TURN_CAP`] cannot be extended and is never
     /// put to a hook. A model call cut off by the wall clock is lost and
     /// runs again if the limit is extended.
@@ -308,7 +331,10 @@ pub trait Hook: Send + Sync {
     }
 
     /// The model produced a final answer. Check it against receipts, a
-    /// checklist, tests, anything. The first `Continue` wins.
+    /// checklist, tests, anything. Every hook is asked: a `Halt` beats
+    /// everything, then the first `Continue` wins. More than
+    /// [`crate::Limits::max_idle_continuations`] in a row with no new
+    /// successful call ends the run unmet.
     async fn on_stop(&self, _ctx: &HookContext<'_>, _final_text: &str) -> StopDecision {
         StopDecision::Accept
     }

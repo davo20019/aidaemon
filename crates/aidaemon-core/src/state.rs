@@ -163,6 +163,12 @@ pub struct RunState {
     /// ([`RunState::with_user_message`]) starts with none.
     #[serde(default)]
     pub limit_grants: LimitGrants,
+    /// `on_stop` continuations since the last new successful call.
+    #[serde(default)]
+    pub(crate) idle_continuations: u32,
+    /// Successful calls of this run when `idle_continuations` last changed.
+    #[serde(default)]
+    pub(crate) continued_at_successes: usize,
 }
 
 impl RunState {
@@ -192,6 +198,8 @@ impl RunState {
             unmet: Vec::new(),
             finishing: None,
             limit_grants: LimitGrants::default(),
+            idle_continuations: 0,
+            continued_at_successes: 0,
         }
     }
 
@@ -224,6 +232,8 @@ impl RunState {
         self.unmet.clear();
         self.finishing = None;
         self.limit_grants = LimitGrants::default();
+        self.idle_continuations = 0;
+        self.continued_at_successes = 0;
         self
     }
 

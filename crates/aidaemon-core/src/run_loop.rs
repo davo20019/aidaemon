@@ -235,7 +235,14 @@ impl<'a> Driver<'a> {
 
             // 3. Call the model (streamed; non-streaming providers yield a
             //    single final event), bounded by the remaining wall-clock budget.
-            let response = match within(self.remaining(), self.call_model(&request, turn)).await {
+            let call = match self.answer_from_hooks(&request).await {
+                Some((hook, response)) => {
+                    self.emit(Event::ModelAnswered { turn, hook }).await?;
+                    Some(Ok(ModelCall::Response(response)))
+                }
+                None => within(self.remaining(), self.call_model(&request, turn)).await,
+            };
+            let response = match call {
                 None => {
                     let limit = LimitKind::WallClock;
                     if self.extend_limit(limit).await? {
@@ -248,20 +255,26 @@ impl<'a> Driver<'a> {
             let response = match response {
                 ModelCall::Response(response) => response,
                 ModelCall::Cancelled => return self.finish(RunStatus::Cancelled, None).await,
-                ModelCall::Failed(error) => {
-                    let Some(after) = self.retry_after(&error).await else {
+                ModelCall::Failed(error) => match self.judge_model_error(&error).await {
+                    (_, ModelErrorDecision::Fail | ModelErrorDecision::Abort) => {
                         let error = error.to_string();
                         return self.finish(RunStatus::ProviderFailed { error }, None).await;
-                    };
-                    self.emit(Event::ModelRetried {
-                        turn,
-                        error: error.to_string(),
-                        after_ms: after.as_millis() as u64,
-                    })
-                    .await?;
-                    self.pause(after).await;
-                    continue;
-                }
+                    }
+                    (_, ModelErrorDecision::Retry { after }) => {
+                        self.emit(Event::ModelRetried {
+                            turn,
+                            error: error.to_string(),
+                            after_ms: after.as_millis() as u64,
+                        })
+                        .await?;
+                        self.pause(after).await;
+                        continue;
+                    }
+                    (hook, ModelErrorDecision::Recover { response }) => {
+                        self.emit(Event::ModelAnswered { turn, hook }).await?;
+                        response
+                    }
+                },
             };
             // Counted before any hook runs: a rejected response was still
             // paid for, and no hook can hide what it cost.
@@ -326,6 +339,7 @@ impl<'a> Driver<'a> {
                     let ctx = self.ctx();
                     let guard = self.guard(HookPoint::OnStop);
                     let mut rejection = None;
+                    let mut halted = false;
                     let mut unmet: Vec<String> = Vec::new();
                     for hook in &self.agent.hooks {
                         let answer = guard
@@ -340,8 +354,13 @@ impl<'a> Driver<'a> {
                         match answer {
                             StopDecision::Accept => {}
                             StopDecision::Continue { message } => {
-                                rejection = Some(message);
-                                break;
+                                rejection.get_or_insert(message);
+                            }
+                            StopDecision::Halt { reason } => {
+                                halted = true;
+                                if !unmet.contains(&reason) {
+                                    unmet.push(reason);
+                                }
                             }
                             StopDecision::AcceptUnmet { unmet: lines } => {
                                 for line in lines {
@@ -353,11 +372,23 @@ impl<'a> Driver<'a> {
                             }
                         }
                     }
-                    (rejection, unmet)
+                    (if halted { None } else { rejection }, unmet)
                 };
+                let (rejection, mut unmet) = (rejection, unmet);
                 if self.cancel.is_cancelled() {
                     return self.finish(RunStatus::Cancelled, None).await;
                 }
+                let rejection = rejection.filter(|_| {
+                    let room = self.record_continuation();
+                    if !room {
+                        unmet.push(format!(
+                            "the work was sent back {} times in a row with no new successful \
+                             call, so the run stopped",
+                            self.limits().max_idle_continuations
+                        ));
+                    }
+                    room
+                });
                 match rejection {
                     Some(message) => {
                         self.emit(Event::StopRejected {
@@ -1225,11 +1256,12 @@ impl<'a> Driver<'a> {
             let guard = self.guard(HookPoint::OnLimit);
             for hook in &self.agent.hooks {
                 let answer = guard.run(hook.as_ref(), hook.on_limit(&ctx, limit)).await;
-                if let Some(LimitDecision::Extend { amount }) = answer {
-                    if amount > 0 {
-                        granted = Some(amount);
-                        break;
+                match answer {
+                    Some(LimitDecision::Forbid) => return Ok(false),
+                    Some(LimitDecision::Extend { amount }) if amount > 0 => {
+                        granted.get_or_insert(amount);
                     }
+                    _ => {}
                 }
             }
         }
@@ -1262,20 +1294,58 @@ impl<'a> Driver<'a> {
         Ok(None)
     }
 
-    /// How long to wait before retrying a failed model call, if a hook
-    /// wants a retry.
-    async fn retry_after(&self, error: &ProviderError) -> Option<Duration> {
+    /// The first answer a hook gives in the model's place, with its name.
+    async fn answer_from_hooks(&self, request: &ModelRequest) -> Option<(String, ModelResponse)> {
+        let ctx = self.ctx();
+        let guard = self.guard(HookPoint::AnswerModel);
+        for hook in &self.agent.hooks {
+            let answer = guard
+                .run(hook.as_ref(), hook.answer_model(&ctx, request))
+                .await
+                .flatten();
+            if let Some(response) = answer {
+                return Some((hook.name().to_string(), response));
+            }
+        }
+        None
+    }
+
+    /// Count a continuation. Returns whether the run has room for it.
+    fn record_continuation(&mut self) -> bool {
+        let successes = self
+            .state
+            .run_receipts()
+            .filter(|receipt| receipt.status == ReceiptStatus::Succeeded)
+            .count();
+        if successes > self.state.continued_at_successes {
+            self.state.continued_at_successes = successes;
+            self.state.idle_continuations = 0;
+        }
+        self.state.idle_continuations = self.state.idle_continuations.saturating_add(1);
+        self.state.idle_continuations <= self.limits().max_idle_continuations
+    }
+
+    /// What the hooks want done about a failed model call, and which hook
+    /// said so.
+    async fn judge_model_error(&self, error: &ProviderError) -> (String, ModelErrorDecision) {
         let ctx = self.ctx();
         let guard = self.guard(HookPoint::OnModelError);
+        let mut chosen = None;
         for hook in &self.agent.hooks {
             let answer = guard
                 .run(hook.as_ref(), hook.on_model_error(&ctx, error))
                 .await;
-            if let Some(ModelErrorDecision::Retry { after }) = answer {
-                return Some(after);
+            match answer {
+                None | Some(ModelErrorDecision::Fail) => {}
+                Some(ModelErrorDecision::Abort) => {
+                    return (hook.name().to_string(), ModelErrorDecision::Abort)
+                }
+                Some(decision) => {
+                    chosen.get_or_insert((hook.name().to_string(), decision));
+                }
             }
         }
-        None
+        chosen.unwrap_or_else(|| (String::new(), ModelErrorDecision::Fail))
     }
 
     /// Wait, but no longer than the wall-clock budget and not past a

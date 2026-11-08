@@ -556,7 +556,11 @@ async fn no_hook_can_pass_the_hard_turn_cap() {
     let hook = extend(1_000);
     let provider = Arc::new(ScriptedProvider::default().then_repeat(text("again")));
     let agent = agent(provider)
-        .limits(max_turns(HARD_TURN_CAP))
+        .limits(Limits {
+            max_turns: HARD_TURN_CAP,
+            max_idle_continuations: u32::MAX,
+            ..Limits::default()
+        })
         .hook(AlwaysContinue)
         .hook_arc(hook.clone())
         .build()
@@ -701,4 +705,195 @@ async fn an_edit_with_no_user_message_is_refused() {
 #[tokio::test]
 async fn an_empty_edit_is_refused() {
     assert_refused(Vec::new()).await;
+}
+
+// ---------- a restrictive answer beats a permissive one ----------
+
+struct Forbid;
+#[async_trait]
+impl Hook for Forbid {
+    async fn on_limit(&self, _ctx: &HookContext<'_>, _limit: LimitKind) -> LimitDecision {
+        LimitDecision::Forbid
+    }
+    async fn on_model_error(
+        &self,
+        _ctx: &HookContext<'_>,
+        _error: &ProviderError,
+    ) -> ModelErrorDecision {
+        ModelErrorDecision::Abort
+    }
+    async fn on_stop(&self, _ctx: &HookContext<'_>, _text: &str) -> StopDecision {
+        StopDecision::Halt {
+            reason: "the owner stopped this work".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_later_hook_can_forbid_an_extension() {
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "write", json!({}))]),
+        text("done"),
+    ]));
+    let agent = agent(provider)
+        .tool(write_tool(Arc::default()))
+        .limits(max_turns(1))
+        .hook_arc(extend(5))
+        .hook(Forbid)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert!(matches!(out.status, RunStatus::LimitReached { .. }));
+    assert_eq!(out.state.limit_grants, LimitGrants::default());
+}
+
+#[tokio::test]
+async fn a_later_hook_can_abort_a_retry() {
+    let provider = Arc::new(ScriptedProvider::with_results([
+        Err(ProviderError::Transient("503".into())),
+        Ok(text("never")),
+    ]));
+    let agent = agent(provider)
+        .hook_arc(Arc::new(RetryRetryable::default()))
+        .hook(Forbid)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert!(matches!(out.status, RunStatus::ProviderFailed { .. }));
+}
+
+#[tokio::test]
+async fn a_later_hook_can_halt_a_continuation() {
+    let provider = Arc::new(ScriptedProvider::new([text("done")]));
+    let agent = agent(provider.clone())
+        .hook(AlwaysContinue)
+        .hook(Forbid)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.status, RunStatus::Completed);
+    assert!(!out.is_succeeded());
+    assert_eq!(out.state.unmet, vec!["the owner stopped this work"]);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+// ---------- continuations need progress ----------
+
+fn idle_cap(cap: u32) -> Limits {
+    Limits {
+        max_idle_continuations: cap,
+        ..Limits::default()
+    }
+}
+
+#[tokio::test]
+async fn continuing_without_progress_ends_the_run_unmet() {
+    let provider = Arc::new(ScriptedProvider::default().then_repeat(text("still nothing")));
+    let agent = agent(provider.clone())
+        .limits(idle_cap(2))
+        .hook(AlwaysContinue)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.status, RunStatus::Completed);
+    assert!(!out.is_succeeded());
+    assert_eq!(provider.requests().len(), 3);
+}
+
+struct UntilThreeReceipts;
+#[async_trait]
+impl Hook for UntilThreeReceipts {
+    async fn on_stop(&self, ctx: &HookContext<'_>, _text: &str) -> StopDecision {
+        if ctx.run_receipts().count() < 3 {
+            StopDecision::Continue {
+                message: "keep going".into(),
+            }
+        } else {
+            StopDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn new_successful_work_resets_the_continuation_count() {
+    let write = |id: &str| tool_calls([call(id, "write", json!({}))]);
+    let provider = Arc::new(ScriptedProvider::new([
+        text("a"),
+        write("c1"),
+        text("b"),
+        write("c2"),
+        text("c"),
+        write("c3"),
+        text("finished"),
+    ]));
+    let agent = agent(provider)
+        .tool(write_tool(Arc::default()))
+        .limits(idle_cap(1))
+        .hook(UntilThreeReceipts)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.final_text.as_deref(), Some("finished"));
+    assert!(out.is_succeeded());
+}
+
+// ---------- answering in the model's place ----------
+
+struct Cached;
+#[async_trait]
+impl Hook for Cached {
+    async fn answer_model(
+        &self,
+        _ctx: &HookContext<'_>,
+        _request: &aidaemon_core::ModelRequest,
+    ) -> Option<ModelResponse> {
+        Some(text("from the cache"))
+    }
+}
+
+#[tokio::test]
+async fn a_hook_can_answer_in_the_models_place() {
+    let provider = Arc::new(ScriptedProvider::new([text("from the model")]));
+    let agent = agent(provider.clone()).hook(Cached).build().unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.final_text.as_deref(), Some("from the cache"));
+    assert!(provider.requests().is_empty());
+}
+
+struct RecoverWithFallback;
+#[async_trait]
+impl Hook for RecoverWithFallback {
+    async fn on_model_error(
+        &self,
+        _ctx: &HookContext<'_>,
+        _error: &ProviderError,
+    ) -> ModelErrorDecision {
+        ModelErrorDecision::Recover {
+            response: text("from the fallback"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hook_can_supply_the_response_of_a_failed_call() {
+    let provider = Arc::new(ScriptedProvider::with_results([Err(ProviderError::Auth(
+        "bad key".into(),
+    ))]));
+    let agent = agent(provider).hook(RecoverWithFallback).build().unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.final_text.as_deref(), Some("from the fallback"));
 }
