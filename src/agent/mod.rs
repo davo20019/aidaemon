@@ -1048,32 +1048,18 @@ impl Agent {
     /// This is used by channels to implement fast-path `cancel`/`stop` handling
     /// without needing an LLM call. It cancels the goal token (cascading to task
     /// leads/executors), updates goal/task DB state, and removes any schedules.
-    pub async fn cancel_active_goals_for_session(&self, session_id: &str) -> Vec<String> {
-        self.cancel_active_goals_for_session_scoped(session_id, SessionGoalCancellationScope::All)
-            .await
-    }
-
-    /// Cancel only finite orchestration work for a session.
-    ///
-    /// Mid-task pivots use this narrower scope so a conversational correction
-    /// cannot cancel durable recurring goals or tracked personal goals that
-    /// happen to share the same channel session.
+    /// Cancel the finite work a session started (task leads and their
+    /// executors). Recurring goals and tracked personal goals in the same
+    /// session are kept: a "stop" or a correction in chat must not end
+    /// them; that takes an explicit cancel of that goal.
     pub(crate) async fn cancel_active_finite_work_for_session(
         &self,
         session_id: &str,
     ) -> Vec<String> {
-        self.cancel_active_goals_for_session_scoped(
-            session_id,
-            SessionGoalCancellationScope::FiniteOrchestration,
-        )
-        .await
+        self.cancel_session_finite_goals(session_id).await
     }
 
-    async fn cancel_active_goals_for_session_scoped(
-        &self,
-        session_id: &str,
-        scope: SessionGoalCancellationScope,
-    ) -> Vec<String> {
+    async fn cancel_session_finite_goals(&self, session_id: &str) -> Vec<String> {
         let goals = self
             .state
             .get_goals_for_session(session_id)
@@ -1081,7 +1067,7 @@ impl Agent {
             .unwrap_or_default();
         let active: Vec<&crate::traits::Goal> = goals
             .iter()
-            .filter(|goal| session_goal_matches_cancellation_scope(goal, scope))
+            .filter(|goal| session_goal_is_finite_work(goal))
             .collect();
         if active.is_empty() {
             return Vec::new();
@@ -1131,30 +1117,14 @@ impl Agent {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SessionGoalCancellationScope {
-    All,
-    FiniteOrchestration,
-}
-
-fn session_goal_matches_cancellation_scope(
-    goal: &crate::traits::Goal,
-    scope: SessionGoalCancellationScope,
-) -> bool {
-    let is_active = matches!(
+/// An active goal that a session's stop or correction cancels: finite
+/// orchestration work, never a recurring or personal goal.
+fn session_goal_is_finite_work(goal: &crate::traits::Goal) -> bool {
+    matches!(
         goal.status.as_str(),
         "active" | "pending" | "pending_confirmation"
-    );
-    if !is_active {
-        return false;
-    }
-
-    match scope {
-        SessionGoalCancellationScope::All => true,
-        SessionGoalCancellationScope::FiniteOrchestration => {
-            goal.domain == "orchestration" && goal.goal_type == "finite"
-        }
-    }
+    ) && goal.domain == "orchestration"
+        && goal.goal_type == "finite"
 }
 
 fn agent_return_owns_scheduled_run_cleanup(
@@ -1169,36 +1139,17 @@ fn agent_return_owns_scheduled_run_cleanup(
 mod session_goal_cancellation_tests {
     use crate::traits::Goal;
 
-    use super::{session_goal_matches_cancellation_scope, SessionGoalCancellationScope};
+    use super::session_goal_is_finite_work;
 
     #[test]
-    fn pivot_scope_preserves_continuous_and_personal_goals() {
+    fn stop_cancels_finite_work_but_keeps_recurring_and_personal_goals() {
         let finite = Goal::new_finite("Answer the current question", "session-1");
         let recurring = Goal::new_continuous("Publish a daily blog post", "session-1", None, None);
         let personal = Goal::new_personal("Keep writing", "session-1");
 
-        assert!(session_goal_matches_cancellation_scope(
-            &finite,
-            SessionGoalCancellationScope::FiniteOrchestration
-        ));
-        assert!(!session_goal_matches_cancellation_scope(
-            &recurring,
-            SessionGoalCancellationScope::FiniteOrchestration
-        ));
-        assert!(!session_goal_matches_cancellation_scope(
-            &personal,
-            SessionGoalCancellationScope::FiniteOrchestration
-        ));
-    }
-
-    #[test]
-    fn explicit_stop_scope_still_includes_continuous_goals() {
-        let recurring = Goal::new_continuous("Publish a daily blog post", "session-1", None, None);
-
-        assert!(session_goal_matches_cancellation_scope(
-            &recurring,
-            SessionGoalCancellationScope::All
-        ));
+        assert!(session_goal_is_finite_work(&finite));
+        assert!(!session_goal_is_finite_work(&recurring));
+        assert!(!session_goal_is_finite_work(&personal));
     }
 }
 

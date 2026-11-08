@@ -235,7 +235,7 @@ impl TurnRunner {
         let cancelled_goals = self
             .deps
             .agent
-            .cancel_active_goals_for_session(session_id)
+            .cancel_active_finite_work_for_session(session_id)
             .await;
         cancel_reply(&cancelled, queued_work_preserved, &cancelled_goals)
     }
@@ -673,6 +673,47 @@ mod tests {
             dedup_key: Some(key.to_string()),
             ingress_timing: None,
         }
+    }
+
+    #[tokio::test]
+    async fn stop_ends_finite_work_but_keeps_a_recurring_goal() {
+        use crate::traits::store_prelude::*;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let session = "test:stop";
+        let recurring =
+            crate::traits::Goal::new_continuous("Publish a daily blog post", session, None, None);
+        let finite = crate::traits::Goal::new_finite("Answer the current question", session);
+        harness.state.create_goal(&recurring).await.unwrap();
+        harness.state.create_goal(&finite).await.unwrap();
+        let inbox = tempfile::tempdir().unwrap().keep();
+        let state = harness.state.clone();
+        let runner = TurnRunner::new(ChannelRuntimeDeps {
+            agent: Arc::new(harness.agent),
+            config_path: inbox.join("config.toml"),
+            session_map: Arc::default(),
+            task_registry: Arc::new(crate::tasks::TaskRegistry::new(50)),
+            files_enabled: false,
+            inbox_dir: inbox,
+            max_file_size_mb: 10,
+            state: state.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        let surface = Arc::new(Recording::default());
+        let mut stop = turn("stop", "m1");
+        stop.session_id = session.to_string();
+        runner.submit(surface.clone(), stop).await;
+
+        let said = surface.0.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("Answer the current question"), "{said:?}");
+        assert!(!said[0].contains("daily blog"), "{said:?}");
+        let status = |goal: &crate::traits::Goal| {
+            let state = state.clone();
+            let id = goal.id.clone();
+            async move { state.get_goal(&id).await.unwrap().unwrap().status }
+        };
+        assert_eq!(status(&finite).await, "cancelled");
+        assert_ne!(status(&recurring).await, "cancelled");
     }
 
     #[tokio::test]

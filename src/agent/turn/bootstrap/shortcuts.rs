@@ -61,8 +61,11 @@ pub(super) async fn maybe_handle_stop_command(
         .await;
     let cli_cancel_msg = cancel_result.ok();
 
-    // Cancel any active goals for this session as well (background task leads/executors).
-    let cancelled_goals = agent.cancel_active_goals_for_session(session_id).await;
+    // Also cancel the finite work this session started (background task
+    // leads and executors). Recurring and personal goals are kept.
+    let cancelled_goals = agent
+        .cancel_active_finite_work_for_session(session_id)
+        .await;
 
     let cli_cancelled_any = cli_cancel_msg
         .as_deref()

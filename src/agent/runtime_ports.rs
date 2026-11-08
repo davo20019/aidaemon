@@ -220,10 +220,6 @@ impl ChannelAgentRuntime for Agent {
             .await
     }
 
-    async fn cancel_active_goals_for_session(&self, session_id: &str) -> Vec<String> {
-        Agent::cancel_active_goals_for_session(self, session_id).await
-    }
-
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String> {
         Agent::cancel_active_finite_work_for_session(self, session_id).await
     }

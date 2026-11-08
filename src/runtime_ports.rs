@@ -224,7 +224,6 @@ pub(crate) trait ChannelAgentRuntime: AgentIngress {
         status: crate::events::TaskStatus,
         error: String,
     ) -> anyhow::Result<Option<String>>;
-    async fn cancel_active_goals_for_session(&self, session_id: &str) -> Vec<String>;
     async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
     async fn current_model(&self) -> String;
     async fn context_debug_settings(
