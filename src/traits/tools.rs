@@ -91,6 +91,16 @@ pub trait Tool: ToolSemantics {
     fn approval_card_mode(&self) -> Option<crate::tools::command_risk::PermissionMode> {
         None
     }
+    /// The kind of card the owner is asked `request` (from
+    /// [`ToolSemantics::owner_approval_request`]) with, which picks the
+    /// buttons offered: a one-time card or a goal confirmation offers no
+    /// session or persistent grant. The default is a standard command card.
+    fn approval_card_kind(
+        &self,
+        _request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        crate::types::ApprovalKind::Command
+    }
     /// Apply the owner's answer to a card asked for `call` (from
     /// [`ToolSemantics::owner_approval_request`]) to the tool's own grant
     /// stores. `None`: the card timed out or never reached the owner. The

@@ -147,7 +147,6 @@ pub async fn setup_tools(
         http_profiles.clone(),
         state.clone() as Arc<dyn crate::traits::SkillsStore>,
         &mut tools,
-        approval_tx.clone(),
     )
     .await?;
 

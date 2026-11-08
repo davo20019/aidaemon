@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::config::AppConfig;
-use crate::tools::ApprovalBroker;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 use crate::traits::{SkillsStore, Tool};
 
@@ -14,7 +13,6 @@ pub async fn register_skills_tools(
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<dyn SkillsStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
-    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !config.skills.enabled {
         info!("Skills system disabled");
@@ -107,7 +105,7 @@ pub async fn register_skills_tools(
     }
 
     if config.tools.is_enabled("manage_skills") {
-        let manage_skills = ManageSkillsTool::new(dir.clone(), state, approval_tx)
+        let manage_skills = ManageSkillsTool::new(dir.clone(), state)
             .with_http_profiles(http_profiles)
             .with_registries(config.skills.registries.clone());
         tools.push(Arc::new(manage_skills));

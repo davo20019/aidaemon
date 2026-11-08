@@ -12,22 +12,17 @@ use tracing::{info, warn};
 
 use crate::oauth::SharedHttpProfiles;
 use crate::skills::{self, Skill};
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::http_request::HttpRequestTool;
 use crate::tools::skill_registry::{self, RegistryEntry};
-use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     semantics_for_exact_read_actions, SkillsStore, Tool, ToolCallContext, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects,
 };
-use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
     state: Arc<dyn SkillsStore>,
-    approval_tx: ApprovalBroker,
     client: reqwest::Client,
     http_profiles: Option<SharedHttpProfiles>,
     /// Configured registry URLs for browse/install.
@@ -177,15 +172,10 @@ struct ExternalRefOccurrence {
 }
 
 impl ManageSkillsTool {
-    pub fn new(
-        skills_dir: PathBuf,
-        state: Arc<dyn SkillsStore>,
-        approval_tx: ApprovalBroker,
-    ) -> Self {
+    pub fn new(skills_dir: PathBuf, state: Arc<dyn SkillsStore>) -> Self {
         Self {
             skills_dir,
             state,
-            approval_tx,
             client: build_browser_client(),
             http_profiles: None,
             registry_urls: Vec::new(),
@@ -2180,39 +2170,6 @@ impl ManageSkillsTool {
         })
     }
 
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec![
-                    "This will add a new skill that can influence AI behavior".to_string()
-                ],
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                tracing::warn!(description, "Approval response channel closed");
-                Err(anyhow::anyhow!("Approval response channel closed"))
-            }
-            Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s)");
-                Err(anyhow::anyhow!("Approval request timed out after 300s"))
-            }
-        }
-    }
-
     /// Write a skill to the filesystem, checking for duplicate names.
     async fn persist_to_filesystem(&self, skill: Skill) -> anyhow::Result<String> {
         let existing = skills::load_skills_with_status(&self.skills_dir);
@@ -3057,15 +3014,21 @@ struct ManageSkillsArgs {
     draft_id: Option<i64>,
     approve: Option<bool>,
     dry_run: Option<bool>,
-    /// The calling session, from the dispatcher's facts (never an argument).
-    #[serde(skip)]
-    call_session: Option<String>,
 }
 
 #[async_trait]
 impl Tool for ManageSkillsTool {
     fn name(&self) -> &str {
         "manage_skills"
+    }
+
+    /// A skill fetch is approved for this call only: no session or
+    /// persistent grant is offered.
+    fn approval_card_kind(
+        &self,
+        _request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        crate::types::ApprovalKind::CommandOnce
     }
 
     fn description(&self) -> &str {
@@ -3143,36 +3106,30 @@ impl Tool for ManageSkillsTool {
 }
 
 impl ManageSkillsTool {
-    /// Run one call with the dispatcher's `facts`.
+    /// Run one call with the dispatcher's `facts`. The owner's approval
+    /// for the actions that fetch external skill content comes from the
+    /// agent kernel (`owner_approval_request`); outside it they are refused.
     pub(crate) async fn run(
         &self,
         arguments: &str,
         facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
-        let mut args: ManageSkillsArgs = serde_json::from_str(arguments)
+        let args: ManageSkillsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
-        args.call_session = facts.session().map(str::to_string);
+        if Self::approval_for(&args, !self.registry_urls.is_empty()).is_some()
+            && facts.kernel_approved != Some(crate::traits::ApprovalScope::Call)
+        {
+            anyhow::bail!(
+                "manage_skills {} requires approval through the agent kernel; it was called \
+                 outside an approved agent call",
+                args.action
+            );
+        }
 
         match args.action.as_str() {
             "add" => {
                 let url = args.url.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'add' action"))?;
-                let session_id = args.call_session.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Missing session context for approval on 'add' action")
-                })?;
-                let approval = self
-                    .request_approval(
-                        session_id,
-                        &format!(
-                            "Add skill from URL '{}'\n\
-                             WARNING: This will fetch external instructions that can influence AI behavior.",
-                            url
-                        ),
-                    )
-                    .await?;
-                if matches!(approval, ApprovalResponse::Deny) {
-                    return Ok("Skill add from URL denied by user.".to_string());
-                }
                 self.handle_add_url(url).await
             }
             "add_inline" => {
@@ -3183,22 +3140,6 @@ impl ManageSkillsTool {
             "learn_api" => {
                 let url = args.url.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'learn_api' action"))?;
-                let session_id = args.call_session.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Missing session context for approval on 'learn_api' action")
-                })?;
-                let approval = self
-                    .request_approval(
-                        session_id,
-                        &format!(
-                            "Learn API from URL '{}'\n\
-                             WARNING: This will fetch external documentation or an OpenAPI spec and save a new reusable API guide skill.",
-                            url
-                        ),
-                    )
-                    .await?;
-                if matches!(approval, ApprovalResponse::Deny) {
-                    return Ok("API learning denied by user.".to_string());
-                }
                 self.handle_learn_api(
                     args.name.as_deref(),
                     args.profile.as_deref(),
@@ -3236,45 +3177,11 @@ impl ManageSkillsTool {
             "install" => {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'install' action"))?;
-                if !self.registry_urls.is_empty() {
-                    let session_id = args.call_session.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("Missing session context for approval on 'install' action")
-                    })?;
-                    let approval = self
-                        .request_approval(
-                            session_id,
-                            &format!(
-                                "Install registry skill '{}'\n\
-                                 WARNING: This will fetch external instructions from a registry URL.",
-                                name
-                            ),
-                        )
-                        .await?;
-                    if matches!(approval, ApprovalResponse::Deny) {
-                        return Ok("Skill installation denied by user.".to_string());
-                    }
-                }
                 self.handle_install(name).await
             }
             "update" => {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'update' action"))?;
-                let session_id = args.call_session.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Missing session context for approval on 'update' action")
-                })?;
-                let approval = self
-                    .request_approval(
-                        session_id,
-                        &format!(
-                            "Update skill '{}'\n\
-                             WARNING: This will re-fetch external skill content from its source URL.",
-                            name
-                        ),
-                    )
-                    .await?;
-                if matches!(approval, ApprovalResponse::Deny) {
-                    return Ok("Skill update denied by user.".to_string());
-                }
                 self.handle_update(name).await
             }
             "review" => {
@@ -3285,7 +3192,144 @@ impl ManageSkillsTool {
     }
 }
 
+impl ManageSkillsTool {
+    /// The owner approval one call needs: adding a skill from a URL,
+    /// learning an API from a URL, installing from a configured registry,
+    /// and updating a skill from its source all fetch external content that
+    /// can influence the agent, so each asks, whatever the session. Every
+    /// other action needs none. `has_registries`: registries are configured.
+    fn approval_for(
+        args: &ManageSkillsArgs,
+        has_registries: bool,
+    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
+        let (summary, warning, subject) = match args.action.as_str() {
+            "add" => {
+                let url = args.url.as_deref()?;
+                (
+                    format!("Add skill from URL '{url}'"),
+                    "This will fetch external instructions that can influence AI behavior.",
+                    json!({"action": "add", "url": url}),
+                )
+            }
+            "learn_api" => {
+                let url = args.url.as_deref()?;
+                (
+                    format!("Learn API from URL '{url}'"),
+                    "This will fetch external documentation or an OpenAPI spec and save a new reusable API guide skill.",
+                    json!({
+                        "action": "learn_api",
+                        "url": url,
+                        "name": args.name,
+                        "profile": args.profile,
+                        "kind": args.kind,
+                    }),
+                )
+            }
+            "install" if has_registries => {
+                let name = args.name.as_deref()?;
+                (
+                    format!("Install registry skill '{name}'"),
+                    "This will fetch external instructions from a registry URL.",
+                    json!({"action": "install", "name": name}),
+                )
+            }
+            "update" => {
+                let name = args.name.as_deref()?;
+                (
+                    format!("Update skill '{name}'"),
+                    "This will re-fetch external skill content from its source URL.",
+                    json!({"action": "update", "name": name}),
+                )
+            }
+            _ => return None,
+        };
+        Some(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary,
+            // The exact arguments the owner approves; a changed argument is a new card.
+            subject: subject.to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                warning.to_string(),
+                "This will add a new skill that can influence AI behavior".to_string(),
+            ],
+        })
+    }
+
+    /// The owner approval for one call, judged from its arguments alone
+    /// (`_` keys are not arguments). A call that cannot be read never runs.
+    pub(crate) fn owner_approval(
+        arguments: &Value,
+        has_registries: bool,
+    ) -> crate::traits::OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ManageSkillsArgs>(arguments.clone()) else {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        };
+        match Self::approval_for(&args, has_registries) {
+            Some(request) => crate::traits::OwnerApprovalNeed::Ask(request),
+            None => crate::traits::OwnerApprovalNeed::NotNeeded,
+        }
+    }
+
+    /// The typed effects of one call. Listing and reviewing drafts without a
+    /// decision read only the skills store. A fetch from a URL (add,
+    /// learn_api) or from a configured registry (install) names its host, so
+    /// a declined fetch binds that host; the fetched content then becomes a
+    /// skill, so no fetching call claims its effects are exhaustive. Every
+    /// other change stays undeclared (`unknown`).
+    pub(crate) fn effects_for(
+        arguments: &str,
+        registries: &[String],
+    ) -> aidaemon_core::CallEffects {
+        use crate::tools::command_effects::url_effect;
+        use aidaemon_core::CallEffects;
+        let Ok(args) = serde_json::from_str::<ManageSkillsArgs>(arguments) else {
+            return CallEffects::unknown();
+        };
+        let mut effects = CallEffects::unknown();
+        match args.action.as_str() {
+            "list" => return CallEffects::none(),
+            "review" if args.approve.is_none() => return CallEffects::none(),
+            "add" | "learn_api" => {
+                effects
+                    .keys
+                    .extend(args.url.as_deref().and_then(url_effect));
+            }
+            "install" => {
+                for registry in registries {
+                    if let Some(key) = url_effect(registry) {
+                        if !effects.keys.contains(&key) {
+                            effects.keys.push(key);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        effects
+    }
+}
+
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageSkillsTool {
+    /// Fetching external skill content asks the owner, whatever the
+    /// session. The dispatcher runs the call only with that answer; a
+    /// decline is recorded by the kernel.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        Self::owner_approval(call.arguments, !self.registry_urls.is_empty())
+    }
+
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        Self::effects_for(arguments, &self.registry_urls)
+    }
+
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         let parsed = serde_json::from_str::<Value>(arguments).ok();
         let review_without_decision = parsed.as_ref().is_some_and(|args| {
@@ -3325,8 +3369,6 @@ mod tests {
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::tools::terminal::ApprovalRequest;
-    use crate::tools::ApprovalBroker;
     use crate::traits::store_prelude::*;
     use crate::traits::SkillDraft;
     use serde_json::json;
@@ -3343,62 +3385,12 @@ mod tests {
         );
         std::mem::forget(db_file);
 
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(4);
-        let approval_tx = ApprovalBroker::new(approval_tx);
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
             sqlite_state.clone() as Arc<dyn crate::traits::SkillsStore>,
-            approval_tx,
         );
 
         (tool, sqlite_state as Arc<dyn StateStore>, skills_dir)
-    }
-
-    async fn setup_tool_with_approval_channel() -> (
-        ManageSkillsTool,
-        Arc<dyn StateStore>,
-        tempfile::TempDir,
-        tokio::sync::mpsc::Receiver<ApprovalRequest>,
-    ) {
-        let skills_dir = tempfile::TempDir::new().unwrap();
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let sqlite_state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(db_file);
-
-        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
-        let approval_tx = ApprovalBroker::new(approval_tx);
-        let tool = ManageSkillsTool::new(
-            skills_dir.path().to_path_buf(),
-            sqlite_state.clone() as Arc<dyn crate::traits::SkillsStore>,
-            approval_tx,
-        );
-
-        (
-            tool,
-            sqlite_state as Arc<dyn StateStore>,
-            skills_dir,
-            approval_rx,
-        )
-    }
-
-    fn make_skill(name: &str) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: format!("{} skill", name),
-            triggers: vec!["deploy".to_string()],
-            body: "Do the thing.".to_string(),
-            origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
-            source: Some("inline".to_string()),
-            source_url: None,
-            dir_path: None,
-            resources: vec![],
-        }
     }
 
     #[test]
@@ -3746,93 +3738,133 @@ mutation CreateWidget {
         assert!(response.get("$ref").is_none());
     }
 
-    #[tokio::test]
-    async fn learn_api_requires_approval_and_respects_denial() {
-        let (tool, _state, _skills_dir, mut approval_rx) = setup_tool_with_approval_channel().await;
-
-        let approval_task = tokio::spawn(async move {
-            let req = approval_rx.recv().await.expect("approval request");
-            assert!(req.command.contains("Learn API from URL"));
-            let _ = req.response_tx.send(crate::types::ApprovalResponse::Deny);
-        });
-
-        let result = tool
-            .call_with(
-                r#"{
-                    "action":"learn_api",
-                    "url":"https://example.com/openapi.json",
-                    "profile":"demo"
-                }"#,
-                crate::testing::call_facts("test:owner"),
-            )
-            .await
-            .unwrap();
-        approval_task.await.unwrap();
-
-        assert!(result.contains("API learning denied by user"));
-    }
-
-    #[tokio::test]
-    async fn add_url_requires_approval_and_respects_denial() {
-        let (tool, _state, _skills_dir, mut approval_rx) = setup_tool_with_approval_channel().await;
-
-        let approval_task = tokio::spawn(async move {
-            let req = approval_rx.recv().await.expect("approval request");
-            assert!(req.command.contains("Add skill from URL"));
-            let _ = req.response_tx.send(crate::types::ApprovalResponse::Deny);
-        });
-
-        let result = tool
-            .call_with(
-                r#"{
-                    "action":"add",
-                    "url":"https://example.com/skill.md"
-                }"#,
-                crate::testing::call_facts("test:owner"),
-            )
-            .await
-            .unwrap();
-        approval_task.await.unwrap();
-
-        assert!(result.contains("denied by user"));
-    }
-
-    #[tokio::test]
-    async fn update_requires_approval_and_respects_denial() {
-        let (tool, _state, skills_dir, mut approval_rx) = setup_tool_with_approval_channel().await;
-
-        let skill = Skill {
-            name: "updatable".to_string(),
-            description: "Update me".to_string(),
-            triggers: vec!["update".to_string()],
-            body: "body".to_string(),
-            origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
-            source: Some("url".to_string()),
-            source_url: Some("https://example.com/updatable.md".to_string()),
-            dir_path: None,
-            resources: vec![],
+    /// Every action that fetches external skill content asks the owner; no
+    /// other action does. The card binds the exact arguments and ignores
+    /// injected `_` keys.
+    #[test]
+    fn fetching_actions_ask_the_owner_and_others_do_not() {
+        use crate::traits::OwnerApprovalNeed;
+        let ask = |args: Value, registries: bool| match ManageSkillsTool::owner_approval(
+            &args, registries,
+        ) {
+            OwnerApprovalNeed::Ask(request) => Some(request),
+            _ => None,
         };
-        skills::write_skill_to_file(skills_dir.path(), &skill).unwrap();
+        let add = ask(
+            json!({"action":"add","url":"https://example.com/skill.md"}),
+            false,
+        )
+        .expect("add asks");
+        assert_eq!(
+            add.summary,
+            "Add skill from URL 'https://example.com/skill.md'"
+        );
+        assert_eq!(add.risk, aidaemon_core::ApprovalRisk::High);
+        assert!(add
+            .warnings
+            .iter()
+            .any(|w| w.contains("can influence AI behavior")));
+        let injected = ask(
+            json!({"action":"add","url":"https://example.com/skill.md","_session_id":"synthetic"}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(add, injected);
+        let other = ask(
+            json!({"action":"add","url":"https://example.com/other.md"}),
+            false,
+        )
+        .unwrap();
+        assert_ne!(add.subject, other.subject);
 
-        let approval_task = tokio::spawn(async move {
-            let req = approval_rx.recv().await.expect("approval request");
-            assert!(req.command.contains("Update skill 'updatable'"));
-            let _ = req.response_tx.send(crate::types::ApprovalResponse::Deny);
-        });
+        let learn = ask(
+            json!({"action":"learn_api","url":"https://example.com/openapi.json","profile":"demo"}),
+            false,
+        )
+        .expect("learn_api asks");
+        assert!(learn.summary.contains("Learn API from URL"));
+        assert!(ask(json!({"action":"update","name":"updatable"}), false)
+            .expect("update asks")
+            .summary
+            .contains("Update skill 'updatable'"));
+        // Install fetches only from configured registries; without one it
+        // fails without fetching anything.
+        assert!(ask(json!({"action":"install","name":"synthetic"}), true).is_some());
+        assert!(ask(json!({"action":"install","name":"synthetic"}), false).is_none());
+        for quiet in [
+            json!({"action":"list"}),
+            json!({"action":"browse"}),
+            json!({"action":"add_inline","content":"---\nname: x\n---\nbody"}),
+            json!({"action":"remove","name":"synthetic"}),
+            json!({"action":"add"}),
+        ] {
+            assert!(ask(quiet.clone(), true).is_none(), "{quiet}");
+        }
+    }
 
-        let result = tool
+    /// Outside the kernel (no `kernel_approved`) a fetching action is
+    /// refused before any fetch; other actions run as before.
+    #[tokio::test]
+    async fn fetching_actions_refuse_without_kernel_approval() {
+        let (tool, _state, _skills_dir) = setup_tool().await;
+        for args in [
+            r#"{"action":"add","url":"https://example.com/skill.md"}"#,
+            r#"{"action":"learn_api","url":"https://example.com/openapi.json"}"#,
+            r#"{"action":"update","name":"updatable"}"#,
+        ] {
+            let error = tool
+                .call_with(args, crate::testing::call_facts("test:owner"))
+                .await
+                .expect_err(args);
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires approval through the agent kernel"),
+                "{error}"
+            );
+        }
+        let listed = tool
             .call_with(
-                r#"{
-                    "action":"update",
-                    "name":"updatable"
-                }"#,
+                r#"{"action":"list"}"#,
                 crate::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();
-        approval_task.await.unwrap();
+        assert!(!listed.contains("agent kernel"));
+    }
 
-        assert!(result.contains("denied by user"));
+    #[test]
+    fn fetching_actions_declare_the_fetched_host() {
+        let effects = ManageSkillsTool::effects_for(
+            r#"{"action":"add","url":"https://example.com/skill.md"}"#,
+            &[],
+        );
+        assert_eq!(
+            effects.keys,
+            vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "example.com",
+                Some(443)
+            )]
+        );
+        assert!(!effects.complete);
+        let install = ManageSkillsTool::effects_for(
+            r#"{"action":"install","name":"synthetic"}"#,
+            &["https://registry.example.com/index.json".to_string()],
+        );
+        assert_eq!(
+            install.keys,
+            vec![aidaemon_core::EffectKey::egress(
+                "https",
+                "registry.example.com",
+                Some(443)
+            )]
+        );
+        assert_eq!(
+            ManageSkillsTool::effects_for(r#"{"action":"list"}"#, &[]),
+            aidaemon_core::CallEffects::none()
+        );
+        assert!(!ManageSkillsTool::effects_for(r#"{"action":"remove","name":"x"}"#, &[]).complete);
     }
 
     #[tokio::test]

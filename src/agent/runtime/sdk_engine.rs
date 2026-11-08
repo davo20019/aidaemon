@@ -1125,6 +1125,7 @@ impl Agent {
             mandate_preapproved: mandate_run,
             session_id: session_id.to_string(),
             user_role: Some(user_role),
+            channel_visibility: Some(channel_ctx.visibility),
             untrusted_trigger_session: super::is_trigger_session(session_id),
             terminal: terminal_approvals,
             tools: super::approvals::ApprovalTools::new(self.tools.iter().cloned()),

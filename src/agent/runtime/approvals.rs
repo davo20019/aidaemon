@@ -63,6 +63,9 @@ pub(crate) struct AppApprovalRules {
     pub session_id: String,
     /// The role of the turn's user (`None` when unknown).
     pub user_role: Option<crate::types::UserRole>,
+    /// Visibility of the channel the turn came from (`None` when unknown),
+    /// so a tool's judgment needs no card for a call its run refuses there.
+    pub channel_visibility: Option<crate::types::ChannelVisibility>,
     /// The session was started by an automated trigger (an email, an
     /// event), not by the owner: its terminal calls always ask.
     pub untrusted_trigger_session: bool,
@@ -352,6 +355,7 @@ impl AppApprovalRules {
         crate::traits::ToolCallContext {
             session_id: self.session_id.clone(),
             user_role: self.user_role,
+            channel_visibility: self.channel_visibility,
             trusted_session: self.trusted_session,
             mandate_preapproved: self.mandate_preapproved,
             untrusted_source: self.untrusted_trigger_session,
@@ -379,6 +383,18 @@ impl AppApprovalRules {
         self.tool(tool)
             .and_then(|tool| tool.approval_card_mode())
             .unwrap_or(PermissionMode::Cautious)
+    }
+
+    /// The kind of card `request` for `tool` is sent as: the tool's own
+    /// (`approval_card_kind`), a standard command card otherwise.
+    pub(crate) fn card_kind(
+        &self,
+        tool: &str,
+        request: &sdk::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        self.tool(tool)
+            .map(|tool| tool.approval_card_kind(request))
+            .unwrap_or_default()
     }
 
     /// Whether `tool` keeps the owner's answers in its own grant stores
@@ -568,6 +584,7 @@ impl OwnerApprovals {
         card_session: &str,
         request: &sdk::OwnerApprovalRequest,
         permission_mode: PermissionMode,
+        kind: crate::types::ApprovalKind,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Answer {
         let broker = self
@@ -593,7 +610,7 @@ impl OwnerApprovals {
                 warnings: request.warnings.clone(),
                 permission_mode,
                 response_tx,
-                kind: Default::default(),
+                kind,
             })
             .await;
         let answer = if sent.is_err() {
@@ -752,6 +769,7 @@ impl OwnerApprovalResolver<'_> {
                 self.card_session,
                 request,
                 self.rules.card_permission_mode(tool),
+                self.rules.card_kind(tool, request),
                 &self.cancel,
             )
             .await
@@ -2063,6 +2081,82 @@ mod tests {
         // A later view keeps every earlier decline.
         rules.run_declines.observe(&[]);
         assert_eq!(rules.run_declines.snapshot(), declined.to_vec());
+    }
+
+    /// A temp SQLite store for the tools whose judgment reads state.
+    async fn approval_test_store() -> Arc<crate::state::SqliteStateStore> {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        std::mem::forget(db);
+        Arc::new(
+            crate::state::SqliteStateStore::new(
+                &path,
+                100,
+                None,
+                Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// Rules over one real tool.
+    fn rules_over(tool: Arc<dyn crate::traits::Tool>) -> AppApprovalRules {
+        AppApprovalRules {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            user_role: Some(crate::types::UserRole::Owner),
+            channel_visibility: Some(crate::types::ChannelVisibility::Private),
+            tools: ApprovalTools::new([tool]),
+            ..AppApprovalRules::default()
+        }
+    }
+
+    /// Fetching external skill content asks the owner in every session, on a
+    /// one-time card; reading and local edits need no card.
+    #[tokio::test]
+    async fn skill_fetches_ask_before_dispatch_on_a_one_time_card() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool: Arc<dyn crate::traits::Tool> = Arc::new(
+            crate::tools::ManageSkillsTool::new(
+                dir.path().to_path_buf(),
+                approval_test_store().await as Arc<dyn crate::traits::SkillsStore>,
+            )
+            .with_registries(vec!["https://registry.example.com/index.json".to_string()]),
+        );
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                trusted_session: trusted,
+                ..rules_over(tool.clone())
+            };
+            for args in [
+                json!({"action":"add","url":"https://example.com/skill.md"}),
+                json!({"action":"learn_api","url":"https://example.com/openapi.json"}),
+                json!({"action":"install","name":"synthetic"}),
+                json!({"action":"update","name":"synthetic"}),
+            ] {
+                let call = sdk::ToolCall::new("c1", "manage_skills", args.clone());
+                let RuleDecision::Ask(request) =
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await
+                else {
+                    panic!("{args} must ask (trusted={trusted})");
+                };
+                assert!(matches!(
+                    rules.card_kind("manage_skills", &request),
+                    crate::types::ApprovalKind::CommandOnce
+                ));
+            }
+            for args in [
+                json!({"action":"list"}),
+                json!({"action":"remove","name":"synthetic"}),
+            ] {
+                let call = sdk::ToolCall::new("c2", "manage_skills", args.clone());
+                assert_eq!(
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                    RuleDecision::Allow,
+                    "{args}"
+                );
+            }
+        }
     }
 
     #[test]
