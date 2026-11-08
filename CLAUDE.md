@@ -351,10 +351,11 @@ kernel hook judging typed effects. A tool must not prompt the owner or refuse
 on policy inside `call()`; a decline binds the run for that effect and target
 across tools. Do not add a new in-tool prompt or policy refusal.
 
-Not yet everywhere: `config_manager`, `share_memory` and the `manage_*` tools
-still prompt inside `call()` until Phase 3c moves them onto the kernel.
-`manage_mcp` already asks only through the kernel (`owner_approval_request`),
-for `add`, `restart` and `enable`. `cli_agent`, `browser` and `computer_use`
+Every tool now asks through the kernel: `config_manager`, `share_memory`,
+`cli_agent`, `browser`, `computer_use` and the `manage_*` tools that need the
+owner build their card in `owner_approval_request`, and startup passes tools
+no approval broker. The self-updater (`src/updater.rs`) is not a tool and
+still asks through its own `ApprovalBroker`. `cli_agent`, `browser` and `computer_use`
 judge state they read before the call: they return the card from
 `owner_approval_request`, pick its buttons with `Tool::approval_card_kind`,
 keep the kernel's answer (`keeps_own_grants`, `record_owner_answer`) for the
