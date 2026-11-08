@@ -199,8 +199,8 @@ pub(super) fn build_approval_message_text(
     text
 }
 
-/// Build the Markdown body for a Discord command-approval prompt.
-pub(super) fn build_approval_message_discord(
+/// Build the Markdown body for a command-approval prompt.
+pub(super) fn build_approval_message_markdown(
     command: &str,
     risk_level: RiskLevel,
     warnings: &[String],
@@ -224,37 +224,6 @@ pub(super) fn build_approval_message_discord(
 
     text.push_str(&format!(
         "\n\n*{}*",
-        allow_button_hint(use_session_button, one_time_only)
-    ));
-
-    text
-}
-
-/// Build the mrkdwn body for a Slack command-approval prompt.
-pub(super) fn build_approval_message_slack(
-    command: &str,
-    risk_level: RiskLevel,
-    warnings: &[String],
-    use_session_button: bool,
-    one_time_only: bool,
-) -> String {
-    let display_cmd = truncate_command(command);
-    let (risk_icon, risk_label, risk_subtitle) = risk_header(risk_level);
-
-    let mut text = format!(
-        "{} *{}*\n{}\n\n*Requested action*\n```{display_cmd}```",
-        risk_icon, risk_label, risk_subtitle
-    );
-
-    if !warnings.is_empty() {
-        text.push('\n');
-        for warning in warnings {
-            text.push_str(&format!("\n• {warning}"));
-        }
-    }
-
-    text.push_str(&format!(
-        "\n\n_{}_",
         allow_button_hint(use_session_button, one_time_only)
     ));
 

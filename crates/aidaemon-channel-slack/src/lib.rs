@@ -209,6 +209,23 @@ impl SlackChannel {
         self
     }
 
+    /// The HTTP client for Web API calls (for example one that bypasses a
+    /// proxy in tests).
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = client;
+        self
+    }
+
+    /// The approval answer in an `interactive` envelope payload, for a
+    /// host that reads envelopes itself ([`SlackChannel::run_envelopes`]).
+    /// `None` unless it is a press on a button made by `ask`.
+    pub fn approval_answer(payload: &Value) -> Option<aidaemon_channels::ApprovalAnswer> {
+        match events::map_interactive(payload)? {
+            ChannelEvent::Approval(answer) => Some(answer),
+            _ => None,
+        }
+    }
+
     /// Answer addressed top-level channel messages in a new thread
     /// (default true).
     pub fn with_reply_in_thread(mut self, reply_in_thread: bool) -> Self {

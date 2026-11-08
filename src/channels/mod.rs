@@ -7,6 +7,8 @@ mod discord;
 mod formatting;
 mod hub;
 pub(crate) mod live_status;
+#[cfg(test)]
+pub(crate) mod mock_api;
 mod presentation;
 pub(crate) mod prompts;
 mod rate_limit;

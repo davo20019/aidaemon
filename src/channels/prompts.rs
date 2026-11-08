@@ -70,7 +70,7 @@ impl Prompts {
             });
         }
         choices.push(choice("deny", "Deny"));
-        let text = approval_render::build_approval_message_discord(
+        let text = approval_render::build_approval_message_markdown(
             command,
             risk_level,
             warnings,

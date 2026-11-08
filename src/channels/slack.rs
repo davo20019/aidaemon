@@ -5,8 +5,6 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
-use futures::SinkExt;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -15,18 +13,22 @@ use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, markdown_to_slack_mrkdwn, sanitize_filename, split_mrkdwn,
 };
-use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
-use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
-use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
+use super::prompts::Prompts;
+use super::turns::{Turn, TurnRunner, TurnSurface};
+use crate::channels::{ChannelHub, ChannelRuntimeDeps};
+use crate::runtime_ports::ChannelAgentRuntime;
+use crate::tasks::{QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{
-    ChannelContext, ChannelVisibility, StatusUpdate, UserRole, WorkspaceAccessLevel, WorkspaceGrant,
+    ChannelContext, ChannelVisibility, UserRole, WorkspaceAccessLevel, WorkspaceGrant,
 };
+use aidaemon_channels::Channel as _;
 
 /// Maximum message length for Slack (actual limit is 40,000 but leave margin).
 const MAX_MESSAGE_LEN: usize = 39_000;
+const SLACK_API: &str = "https://slack.com/api";
 const DEFAULT_WORKSPACE_GRANT_HOURS: i64 = 24;
 const MAX_WORKSPACE_GRANT_HOURS: i64 = 168;
 
@@ -306,7 +308,6 @@ pub struct SlackChannel {
     /// Bot name fetched from Slack API (e.g., "my_bot").
     /// Populated on first connection.
     bot_name: std::sync::RwLock<String>,
-    app_token: String,
     bot_token: String,
     allowed_user_ids: std::sync::RwLock<Vec<String>>,
     /// Explicit owners from `users.owner_ids.slack`. When empty, allowed users
@@ -316,8 +317,6 @@ pub struct SlackChannel {
     use_threads: bool,
     agent: Arc<dyn ChannelAgentRuntime>,
     config_path: PathBuf,
-    pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
-    session_map: SessionMap,
     task_registry: Arc<TaskRegistry>,
     files_enabled: bool,
     inbox_dir: PathBuf,
@@ -331,17 +330,19 @@ pub struct SlackChannel {
     team_id: std::sync::RwLock<Option<String>>,
     /// Reference to the channel hub for dynamic bot registration.
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
-    /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
-    watchdog_stale_threshold_secs: u64,
     /// Cache of resolved Slack user IDs to display names.
     user_cache: RwLock<HashMap<String, String>>,
     /// Cache of channel ID → channel name (process-lifetime; channel names rarely change).
     channel_name_cache: RwLock<HashMap<String, String>>,
     /// Cache of channel ID → (member display names, fetched_at). TTL: 10 minutes.
     channel_members_cache: RwLock<HashMap<String, (Vec<String>, Instant)>>,
-    /// `sdk`: the Socket Mode connection is held by `aidaemon-channel-slack`;
-    /// `legacy`: by the hand-written client below.
-    transport: crate::config::ChannelTransport,
+    deps: ChannelRuntimeDeps,
+    runner: TurnRunner,
+    /// `https://slack.com/api` (a test points it at a mock).
+    api_base: String,
+    /// Holds the Socket Mode connection and asks prompts.
+    transport: Arc<aidaemon_channel_slack::SlackChannel>,
+    prompts: Prompts,
 }
 
 fn determine_slack_role(
@@ -381,9 +382,17 @@ impl SlackChannel {
         use_threads: bool,
         runtime: ChannelRuntimeDeps,
     ) -> Self {
+        let deps = runtime.clone();
         Self {
+            runner: TurnRunner::new(runtime.clone()),
+            deps,
+            api_base: SLACK_API.to_string(),
+            transport: Arc::new(aidaemon_channel_slack::SlackChannel::new(
+                bot_token.to_string(),
+                app_token.to_string(),
+            )),
+            prompts: Prompts::default(),
             bot_name: std::sync::RwLock::new("slack".to_string()),
-            app_token: app_token.to_string(),
             bot_token: bot_token.to_string(),
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids: std::sync::RwLock::new(owner_user_ids),
@@ -391,8 +400,6 @@ impl SlackChannel {
             use_threads,
             agent: runtime.agent,
             config_path: runtime.config_path,
-            pending_approvals: Mutex::new(HashMap::new()),
-            session_map: runtime.session_map,
             task_registry: runtime.task_registry,
             files_enabled: runtime.files_enabled,
             inbox_dir: runtime.inbox_dir,
@@ -402,8 +409,6 @@ impl SlackChannel {
             bot_user_id: Mutex::new(None),
             team_id: std::sync::RwLock::new(None),
             channel_hub: std::sync::RwLock::new(None),
-            watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
-            transport: runtime.transports.slack,
             user_cache: RwLock::new(HashMap::new()),
             channel_name_cache: RwLock::new(HashMap::new()),
             channel_members_cache: RwLock::new(HashMap::new()),
@@ -941,101 +946,18 @@ impl SlackChannel {
         }
     }
 
-    /// Open a Socket Mode connection and process events.
+    /// Resolve the bot's identity, then hold the connection.
     async fn start(self: Arc<Self>) -> anyhow::Result<()> {
-        // Resolve our own bot user ID (for filtering self-messages)
+        // Our own bot user ID filters out the bot's own messages.
         self.resolve_bot_info().await;
-        if self.transport == crate::config::ChannelTransport::Sdk {
-            return self.start_sdk().await;
-        }
-
-        // Request a WebSocket URL from Slack
-        let wss_url = self.open_connection().await?;
-        // The returned URL carries a short-lived ticket in its query string.
-        // Never persist it in logs.
-        info!("Slack Socket Mode connection URL obtained");
-
-        // Connect via WebSocket
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {}", e))?;
-
-        info!("Slack WebSocket connected");
-
-        let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-        // Process incoming WebSocket messages
-        while let Some(msg) = ws_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("WebSocket read error: {}", e);
-                    break;
-                }
-            };
-
-            match msg {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    // tokio-tungstenite 0.29+ wraps text payloads in `Utf8Bytes`;
-                    // borrow `&str` via Deref for downstream parsing.
-                    let envelope: Value = match serde_json::from_str(text.as_str()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("Failed to parse Slack envelope: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Acknowledge the envelope immediately
-                    if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str())
-                    {
-                        let ack = serde_json::json!({ "envelope_id": envelope_id });
-                        let ack_msg =
-                            tokio_tungstenite::tungstenite::Message::Text(ack.to_string());
-                        if let Err(e) = ws_tx.send(ack_msg).await {
-                            warn!("Failed to ack envelope: {}", e);
-                        }
-                    }
-
-                    // Handle disconnect events
-                    if envelope.get("type").and_then(|v| v.as_str()) == Some("disconnect") {
-                        let reason = envelope
-                            .get("reason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        info!(reason, "Slack requested disconnect");
-                        break;
-                    }
-
-                    // Dispatch by envelope type
-                    let channel = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        channel.handle_envelope(envelope).await;
-                    });
-                }
-                tokio_tungstenite::tungstenite::Message::Ping(data) => {
-                    let pong = tokio_tungstenite::tungstenite::Message::Pong(data);
-                    let _ = ws_tx.send(pong).await;
-                }
-                tokio_tungstenite::tungstenite::Message::Close(_) => {
-                    info!("Slack WebSocket closed by server");
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
+        self.start_sdk().await
     }
 
     /// The SDK adapter holds the connection (acks, pings, reconnects) and
     /// hands each envelope over as Slack sent it; the handling below reads
     /// Slack's own event shapes, so it is unchanged.
     async fn start_sdk(self: Arc<Self>) -> anyhow::Result<()> {
-        let transport = Arc::new(aidaemon_channel_slack::SlackChannel::new(
-            self.bot_token.clone(),
-            self.app_token.clone(),
-        ));
+        let transport = self.transport.clone();
         let (envelopes_tx, mut envelopes) = tokio::sync::mpsc::channel(64);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let runner = {
@@ -1060,31 +982,6 @@ impl SlackChannel {
             Ok(result) => result.map_err(|e| anyhow::anyhow!("Slack connection: {e}")),
             Err(e) => Err(anyhow::anyhow!("Slack connection task failed: {e}")),
         }
-    }
-
-    /// Call `apps.connections.open` to get a WebSocket URL.
-    async fn open_connection(&self) -> anyhow::Result<String> {
-        let resp = self
-            .http
-            .post("https://slack.com/api/apps.connections.open")
-            .header("Authorization", format!("Bearer {}", self.app_token))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send()
-            .await?;
-
-        let body: Value = resp.json().await?;
-        if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("apps.connections.open failed: {}", error);
-        }
-
-        body.get("url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("No URL in apps.connections.open response"))
     }
 
     /// Resolve the bot's own user ID and name via `auth.test`.
@@ -1123,7 +1020,7 @@ impl SlackChannel {
         // Call users.info API
         let resp = self
             .http
-            .get("https://slack.com/api/users.info")
+            .get(format!("{}/users.info", self.api_base))
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .query(&[("user", user_id)])
             .send()
@@ -1195,7 +1092,7 @@ impl SlackChannel {
         // Call conversations.info API
         let resp = self
             .http
-            .get("https://slack.com/api/conversations.info")
+            .get(format!("{}/conversations.info", self.api_base))
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .query(&[("channel", channel_id)])
             .send()
@@ -1241,7 +1138,7 @@ impl SlackChannel {
         // Call conversations.members API (limit 50)
         let resp = match self
             .http
-            .get("https://slack.com/api/conversations.members")
+            .get(format!("{}/conversations.members", self.api_base))
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .query(&[("channel", channel_id), ("limit", "50")])
             .send()
@@ -1313,7 +1210,7 @@ impl SlackChannel {
 
     /// Make a GET-style Slack API call (actually POST with empty body).
     async fn slack_api_get(&self, method: &str) -> anyhow::Result<Value> {
-        let url = format!("https://slack.com/api/{}", method);
+        let url = format!("{}/{}", self.api_base, method);
         let resp = self
             .http
             .post(&url)
@@ -1338,7 +1235,7 @@ impl SlackChannel {
         method: &str,
         params: &[(&str, String)],
     ) -> anyhow::Result<Value> {
-        let url = format!("https://slack.com/api/{}", method);
+        let url = format!("{}/{}", self.api_base, method);
         let mut resp = self
             .http
             .get(&url)
@@ -1536,7 +1433,7 @@ impl SlackChannel {
 
     /// Make a POST Slack API call with a JSON body.
     async fn slack_api_post(&self, method: &str, body: &Value) -> anyhow::Result<Value> {
-        let url = format!("https://slack.com/api/{}", method);
+        let url = format!("{}/{}", self.api_base, method);
         let body_bytes = serde_json::to_vec(body)?;
         let mut resp = self
             .http
@@ -1925,91 +1822,6 @@ impl SlackChannel {
 
         let session_id = self.build_session_id(&channel_id, reply_thread.as_deref());
 
-        // Handle cancel/stop commands - these bypass the queue
-        let text_lower = agent_text.to_lowercase();
-        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
-            if user_role != UserRole::Owner {
-                let _ = self
-                    .post_message(
-                        &channel_id,
-                        "Only the owner can cancel running work in this session.",
-                        reply_thread.as_deref(),
-                    )
-                    .await;
-                return;
-            }
-            let cancelled = self
-                .task_registry
-                .cancel_running_for_session(&session_id)
-                .await;
-            let queued_work_preserved = self.task_registry.queue_len(&session_id).await;
-            let cancelled_goals = self
-                .agent
-                .cancel_active_goals_for_session(&session_id)
-                .await;
-            if cancelled.is_empty() {
-                if cancelled_goals.is_empty() {
-                    let _ = self
-                        .post_message(
-                            &channel_id,
-                            "No running task to cancel.",
-                            reply_thread.as_deref(),
-                        )
-                        .await;
-                } else if cancelled_goals.len() == 1 {
-                    let response = format!("⏹️ Cancelled goal: {}", cancelled_goals[0]);
-                    let _ = self
-                        .post_message(&channel_id, &response, reply_thread.as_deref())
-                        .await;
-                } else {
-                    let response = format!(
-                        "⏹️ Cancelled {} goals:\n{}",
-                        cancelled_goals.len(),
-                        cancelled_goals
-                            .iter()
-                            .map(|d| format!("- {}", d))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    let _ = self
-                        .post_message(&channel_id, &response, reply_thread.as_deref())
-                        .await;
-                }
-            } else {
-                let desc = cancelled
-                    .first()
-                    .map(|(_, d)| d.as_str())
-                    .unwrap_or("unknown");
-                let mut response = format!("⏹️ Cancelled: {}", desc);
-                if queued_work_preserved > 0 {
-                    response.push_str(&format!(
-                        " ({} queued request(s) will continue in order)",
-                        queued_work_preserved
-                    ));
-                }
-                if !cancelled_goals.is_empty() {
-                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
-                }
-                let _ = self
-                    .post_message(&channel_id, &response, reply_thread.as_deref())
-                    .await;
-            }
-            return;
-        }
-
-        // Register this session with the channel hub (in-memory + persistent)
-        {
-            let channel_name = self.channel_name();
-            {
-                let mut map = self.session_map.write().await;
-                map.insert(session_id.clone(), channel_name.clone());
-            }
-            let _ = self
-                .state
-                .save_session_channel(&session_id, &channel_name)
-                .await;
-        }
-
         // Build channel context from Slack channel type
         let channel_ctx = {
             let visibility = match channel_type {
@@ -2047,628 +1859,37 @@ impl SlackChannel {
             }
         };
 
+        self.runner
+            .register_session(&session_id, &self.channel_name())
+            .await;
         info!(session_id, user_id = %user, "Received Slack message");
 
-        // Stable per-message identity for dedup. Slack's `ts` is unique per
-        // message and reused on Events API retries, but a user re-typing the
-        // same text gets a new `ts` — so this drops genuine duplicates while
-        // letting a deliberate re-ask through. Fall back to text-hash dedup when
-        // `ts` is absent (malformed event).
-        let dedup_key: Option<&str> = if ts.is_empty() {
-            None
-        } else {
-            Some(ts.as_str())
+        let surface = SlackSurface {
+            api: self.api_handle(),
+            channel: channel_id.clone(),
+            thread: reply_thread.clone(),
+            // The hourglass goes on the message that started the work.
+            reacting_to: std::sync::Mutex::new((!ts.is_empty()).then(|| ts.clone())),
+            // Restores @DisplayName to a Slack mention in replies.
+            user_cache: self.user_cache.read().await.clone(),
+            config_path: self.deps.config_path.clone(),
         };
-
-        // Check if a task is already running for this session - if so, queue this message
-        if self.task_registry.has_running_task(&session_id).await {
-            // Atomic check-and-queue: if the task finished between the
-            // has_running_task() check above and this call, fall through to
-            // direct processing instead of stranding the message.
-            match self
-                .task_registry
-                .queue_message_if_running(
-                    &session_id,
-                    QueuedMessage::new(
-                        &agent_text,
-                        user_role,
-                        channel_ctx.clone(),
-                        inbound_attachments.clone(),
-                    ),
-                    dedup_key,
-                )
-                .await
-            {
-                QueueOutcome::Queued(queue_pos) => {
-                    // Only notify for the first 3 queued messages to avoid spam.
-                    if queue_pos <= 3 {
-                        let current_task = self
-                            .task_registry
-                            .get_running_task_description(&session_id)
-                            .await
-                            .unwrap_or_else(|| "processing".to_string());
-                        let notice = crate::channels::presentation::queued_message_notice(
-                            &agent_text,
-                            &current_task,
-                            !inbound_attachments.is_empty(),
-                        );
-                        let _ = self
-                            .post_message(&channel_id, &notice, reply_thread.as_deref())
-                            .await;
-                    }
-                    return;
-                }
-                QueueOutcome::Duplicate => {
-                    debug!(session_id, "Dropped duplicate queued message");
-                    return;
-                }
-                QueueOutcome::NoRunningTask => {
-                    info!(
-                        session_id,
-                        "Task finished during queue attempt — processing message directly"
-                    );
-                }
-            }
-        }
-
-        // Dedup gate: atomically mark this message as "seen" so concurrent
-        // handlers for the same text don't ALL start direct processing.
-        if !self
-            .task_registry
-            .mark_seen(&session_id, &agent_text, dedup_key)
-            .await
-        {
-            debug!(
-                session_id,
-                "Dropped duplicate message (direct processing race)"
-            );
-            return;
-        }
-
-        // Create heartbeat for watchdog — agent bumps this on every activity point.
-        let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ));
-
-        // Typing indicator via reaction
-        let typing_channel = channel_id.clone();
-        let typing_ts = ts.clone();
-        let typing_self = self.clone_for_typing();
-        let typing_cancel = tokio_util::sync::CancellationToken::new();
-        let typing_token = typing_cancel.clone();
-        tokio::spawn(async move {
-            // Add hourglass reaction as typing indicator
-            let _ = typing_self
-                .add_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand")
-                .await;
-            typing_token.cancelled().await;
-            // Remove when done
-            let _ = typing_self
-                .remove_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand")
-                .await;
-        });
-
-        // Watchdog: periodically check heartbeat staleness
-        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
-        if stale_threshold_secs > 0 {
-            let watchdog_heartbeat = heartbeat.clone();
-            let watchdog_cancel = typing_cancel.clone();
-            let watchdog_channel = channel_id.clone();
-            let watchdog_ts = ts.clone();
-            let watchdog_typing_self = self.clone_for_typing();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                            let last_hb = watchdog_heartbeat.load(Ordering::Relaxed);
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
-                                .unwrap_or_default().as_secs();
-                            if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                // Swap hourglass for warning
-                                let _ = watchdog_typing_self.remove_reaction(
-                                    &watchdog_channel, &watchdog_ts, "hourglass_flowing_sand"
-                                ).await;
-                                let _ = watchdog_typing_self.add_reaction(
-                                    &watchdog_channel, &watchdog_ts, "warning"
-                                ).await;
-                                break;
-                            }
-                        }
-                        _ = watchdog_cancel.cancelled() => break,
-                    }
-                }
-            });
-        }
-
-        // Status updates
-        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
-        let status_channel = channel_id.clone();
-        let status_thread = reply_thread.clone();
-        let status_self = self.clone_for_status();
-        let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
-        let status_task = tokio::spawn(async move {
-            let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-            let min_interval = Duration::from_secs(3);
-            while let Some(update) = status_rx.recv().await {
-                // In non-DM channels: hourglass reaction is sufficient, skip status messages
-                // (except BudgetExtended which must always reach the user)
-                if !is_dm && !matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                    continue;
-                }
-                let now = tokio::time::Instant::now();
-                // Explicit user actions and BudgetExtended notifications bypass
-                // rate limiting. A URL inside ordinary progress is still just
-                // ordinary progress (task descriptions commonly contain URLs).
-                let is_immediate = update.requires_immediate_delivery();
-                if !is_immediate && now.duration_since(last_sent) < min_interval {
-                    continue;
-                }
-                let text = match &update {
-                    StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
-                    StatusUpdate::ToolStart { name, summary } => {
-                        let mut chars = name.chars();
-                        let cap_name = match chars.next() {
-                            None => String::new(),
-                            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-                        };
-                        if summary.is_empty() {
-                            format!("_{}..._", cap_name)
-                        } else {
-                            format!("_{}: {}..._", cap_name, summary)
-                        }
-                    }
-                    StatusUpdate::ToolProgress { name, chunk } => {
-                        let preview: String = chunk.chars().take(100).collect();
-                        if chunk.chars().count() > 100 {
-                            format!("_📤 {}: {}..._", name, preview)
-                        } else {
-                            format!("_📤 {}: {}_", name, preview)
-                        }
-                    }
-                    StatusUpdate::UserActionRequired { message } => message.clone(),
-                    StatusUpdate::ToolComplete { name, summary } => {
-                        format!("_✓ {}: {}_", name, summary)
-                    }
-                    StatusUpdate::ToolCancellable { name, task_id } => {
-                        format!("_⏳ {} started (task_id: {})_", name, task_id)
-                    }
-                    StatusUpdate::ProgressSummary {
-                        elapsed_mins,
-                        summary,
-                    } => {
-                        format!("_📊 Progress ({} min): {}_", elapsed_mins, summary)
-                    }
-                    StatusUpdate::IterationWarning { current, threshold } => {
-                        format!(
-                            "_⚠️ Approaching soft limit: {} of {} iterations_",
-                            current, threshold
-                        )
-                    }
-                    StatusUpdate::PlanCreated {
-                        description,
-                        total_steps,
-                        ..
-                    } => {
-                        format!("_📋 Plan created: {} ({} steps)_", description, total_steps)
-                    }
-                    StatusUpdate::PlanStepStart {
-                        step_index,
-                        total_steps,
-                        description,
-                        ..
-                    } => {
-                        format!(
-                            "_▶️ Step {}/{}: {}_",
-                            step_index + 1,
-                            total_steps,
-                            description
-                        )
-                    }
-                    StatusUpdate::PlanStepComplete {
-                        step_index,
-                        total_steps,
-                        description,
-                        summary,
-                        ..
-                    } => {
-                        let base = format!(
-                            "_✅ Step {}/{} done: {}",
-                            step_index + 1,
-                            total_steps,
-                            description
-                        );
-                        if let Some(s) = summary {
-                            format!("{} - {}_", base, s)
-                        } else {
-                            format!("{}_", base)
-                        }
-                    }
-                    StatusUpdate::PlanStepFailed {
-                        step_index,
-                        description,
-                        error,
-                        ..
-                    } => {
-                        format!(
-                            "_❌ Step {} failed: {} - {}_",
-                            step_index + 1,
-                            description,
-                            error
-                        )
-                    }
-                    StatusUpdate::PlanComplete {
-                        description,
-                        total_steps,
-                        duration_secs,
-                        ..
-                    } => {
-                        let mins = duration_secs / 60;
-                        let secs = duration_secs % 60;
-                        format!(
-                            "_🎉 Plan complete: {} ({} steps in {}m {}s)_",
-                            description, total_steps, mins, secs
-                        )
-                    }
-                    StatusUpdate::PlanAbandoned { description, .. } => {
-                        format!("_🚫 Plan abandoned: {}_", description)
-                    }
-                    StatusUpdate::PlanRevised {
-                        description,
-                        reason,
-                        new_total_steps,
-                        ..
-                    } => {
-                        format!(
-                            "_🔄 Plan revised: {} ({} steps) - {}_",
-                            description, new_total_steps, reason
-                        )
-                    }
-                    StatusUpdate::BudgetExtended {
-                        old_budget,
-                        new_budget,
-                        extension,
-                        max_extensions,
-                    } => {
-                        format!(
-                            "_💰 Auto-extended token budget {} → {} ({}/{}) — continuing._",
-                            old_budget, new_budget, extension, max_extensions
-                        )
-                    }
-                    StatusUpdate::Checklist { text } => text.clone(),
-                };
-                let _ = status_self
-                    .post_message(&status_channel, &text, status_thread.as_deref())
-                    .await;
-                last_sent = tokio::time::Instant::now();
-            }
-        });
-
-        // Register task for tracking
-        let description: String = agent_text.chars().take(80).collect();
-        let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
-        // Associate the typing indicator with this task so cancel_running_for_session
-        // also stops the typing/reaction indicator.
-        self.task_registry
-            .set_typing_cancel(task_id, typing_cancel.clone())
+        self.runner
+            .submit(
+                Arc::new(surface),
+                Turn {
+                    session_id,
+                    text: agent_text,
+                    attachments: inbound_attachments,
+                    user_role,
+                    channel_ctx,
+                    // `ts` is unique per message and reused on Events API
+                    // retries; without it, dedup falls back to the text.
+                    dedup_key: (!ts.is_empty()).then_some(ts),
+                    ingress_timing: None,
+                },
+            )
             .await;
-        let registry = Arc::clone(&self.task_registry);
-
-        let agent = Arc::clone(&self.agent);
-        let reply_channel = channel_id.clone();
-        let reply_thread_ts = reply_thread.clone();
-        let bot_token = self.bot_token.clone();
-        let http = self.http.clone();
-        let config_path = self.config_path.clone();
-        // Snapshot user_cache for restoring @mentions in the reply
-        let user_cache_snapshot = self.user_cache.read().await.clone();
-        tokio::spawn(async move {
-            // Drop guard: if this task panics, ensure the typing indicator stops.
-            let typing_guard_token = Arc::new(std::sync::Mutex::new(typing_cancel.clone()));
-            struct TypingGuard(Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>);
-            impl Drop for TypingGuard {
-                fn drop(&mut self) {
-                    if let Ok(token) = self.0.lock() {
-                        token.cancel();
-                    }
-                }
-            }
-            let _typing_guard = TypingGuard(typing_guard_token.clone());
-
-            let mut current_text = agent_text;
-            let mut current_attachments = inbound_attachments;
-            let mut current_user_role = user_role;
-            let mut current_channel_ctx = channel_ctx;
-            let mut current_task_id = task_id;
-            let mut current_cancel_token = cancel_token;
-            let mut current_status_tx = status_tx;
-            let mut current_typing_cancel = typing_cancel;
-            let mut current_status_task = status_task;
-            let mut current_heartbeat = heartbeat;
-            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
-
-            loop {
-                let result = tokio::select! {
-                    r = agent.handle_inbound_message(InboundMessageRequest {
-                        session_id: session_id.clone(),
-                        user_text: current_text.clone(),
-                        attachments: current_attachments.clone(),
-                        status_tx: Some(current_status_tx.clone()),
-                        user_role: current_user_role,
-                        channel_ctx: current_channel_ctx.clone(),
-                        heartbeat: Some(current_heartbeat.clone()),
-                        ingress_timing: None,
-                    }) => r,
-                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 10), if stale_threshold_secs > 0 => {
-                        Err(anyhow::anyhow!(
-                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
-                            stale_mins,
-                            if stale_mins == 1 { "" } else { "s" }
-                        ))
-                    },
-                    _ = tokio::time::sleep_until(task_wall_deadline) => {
-                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
-                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
-                    },
-                };
-                current_typing_cancel.cancel();
-                // Abort the status display task to prevent blocking if a background
-                // CLI agent monitoring task still holds a status_tx clone.
-                current_status_task.abort();
-
-                let mut task_error: Option<String> = None;
-
-                match result {
-                    Ok(envelope) => {
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "slack",
-                                    crate::events::ResponseDeliveryState::Queued,
-                                    Vec::new(),
-                                    None,
-                                ),
-                            )
-                            .await;
-                        let reply = crate::channels::prepare_chat_message(&envelope.text);
-                        // NOTE: Task intentionally stays "running" during response
-                        // sending to prevent a race where incoming messages skip the
-                        // queue. Finalized below before queue check.
-                        let mrkdwn = markdown_to_slack_mrkdwn(&reply);
-                        // Restore @DisplayName → <@USERID> for proper Slack mentions
-                        let mrkdwn = restore_mentions_from_cache(&mrkdwn, &user_cache_snapshot);
-                        let chunks = split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN);
-                        let mut platform_message_ids = Vec::new();
-                        let mut failed = false;
-                        for chunk in &chunks {
-                            match slack_post_message(
-                                &http,
-                                &bot_token,
-                                &reply_channel,
-                                chunk,
-                                reply_thread_ts.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(response) => {
-                                    if let Some(ts) = response.get("ts").and_then(Value::as_str) {
-                                        platform_message_ids.push(ts.to_string());
-                                    }
-                                }
-                                Err(error) => {
-                                    failed = true;
-                                    warn!(%error, "Failed to send Slack response");
-                                }
-                            }
-                        }
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "slack",
-                                    if failed {
-                                        crate::events::ResponseDeliveryState::Failed
-                                    } else {
-                                        crate::events::ResponseDeliveryState::PlatformAcknowledged
-                                    },
-                                    platform_message_ids,
-                                    failed.then(|| "slack_send_failed".to_string()),
-                                ),
-                            )
-                            .await;
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        if error_msg == "Task cancelled" {
-                            task_error = Some(error_msg);
-                            info!("Task #{} cancelled", current_task_id);
-                        } else {
-                            task_error = Some(error_msg.clone());
-                            if error_msg.starts_with("Task auto-cancelled due to inactivity") {
-                                info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
-                                let _ = slack_post_message(
-                                    &http,
-                                    &bot_token,
-                                    &reply_channel,
-                                    &format!("⚠️ {}", error_msg),
-                                    reply_thread_ts.as_deref(),
-                                )
-                                .await;
-                            } else {
-                                warn!("Agent error: {}", e);
-                                let _ = slack_post_message(
-                                    &http,
-                                    &bot_token,
-                                    &reply_channel,
-                                    &format!("Error: {}", e),
-                                    reply_thread_ts.as_deref(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(error) = task_error.as_ref() {
-                    let status = if error == "Task cancelled" {
-                        crate::events::TaskStatus::Cancelled
-                    } else {
-                        crate::events::TaskStatus::Failed
-                    };
-                    if let Err(terminalize_error) = agent
-                        .terminalize_supervised_task(&session_id, status, error.clone())
-                        .await
-                    {
-                        warn!(%terminalize_error, "Failed to persist supervised task termination");
-                    }
-                }
-
-                // Finalize the current task AFTER sending the response/error,
-                // draining the queue in the same critical section so no
-                // concurrent message can be stranded between the two steps.
-                if let Some(mut queued) = registry
-                    .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
-                    .await
-                {
-                    // Small delay to ensure previous message is fully committed to DB
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    if queued.user_role == UserRole::Guest {
-                        if let Some(original) = queued.channel_ctx.workspace_grant.clone() {
-                            queued.channel_ctx.workspace_grant =
-                                match revalidate_queued_workspace_grant(&config_path, &original)
-                                    .await
-                                {
-                                    Ok(grant) => grant,
-                                    Err(error) => {
-                                        warn!(%error, "Could not revalidate queued workspace grant; denying scoped access");
-                                        None
-                                    }
-                                };
-                        }
-                    }
-
-                    info!(
-                        session_id,
-                        "Processing queued message: {}",
-                        queued.text.chars().take(50).collect::<String>()
-                    );
-                    let _ = slack_post_message(
-                        &http,
-                        &bot_token,
-                        &reply_channel,
-                        &format!(
-                            "_▶️ Processing queued: \"{}\"_",
-                            queued.text.chars().take(50).collect::<String>()
-                        ),
-                        reply_thread_ts.as_deref(),
-                    )
-                    .await;
-
-                    // Set up for next iteration
-                    current_text = queued.text;
-                    current_user_role = queued.user_role;
-                    current_channel_ctx = queued.channel_ctx;
-                    current_attachments = queued.attachments;
-                    let desc: String = current_text.chars().take(80).collect();
-                    let (new_task_id, new_cancel_token) =
-                        registry.register(&session_id, &desc).await;
-                    current_task_id = new_task_id;
-                    current_cancel_token = new_cancel_token;
-
-                    // Create new status channel for queued message
-                    let (new_status_tx, mut new_status_rx) =
-                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
-                    current_status_tx = new_status_tx;
-
-                    let queued_status_channel = reply_channel.clone();
-                    let queued_status_thread = reply_thread_ts.clone();
-                    let queued_status_http = http.clone();
-                    let queued_status_token = bot_token.clone();
-                    current_status_task = tokio::spawn(async move {
-                        let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-                        let min_interval = Duration::from_secs(3);
-                        while let Some(update) = new_status_rx.recv().await {
-                            // For queued messages, only show Thinking, ToolStart, and BudgetExtended
-                            if !is_dm && !matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                                continue;
-                            }
-                            let now = tokio::time::Instant::now();
-                            let is_budget_ext =
-                                matches!(&update, StatusUpdate::BudgetExtended { .. });
-                            if !is_budget_ext && now.duration_since(last_sent) < min_interval {
-                                continue;
-                            }
-                            let text = match &update {
-                                StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
-                                StatusUpdate::ToolStart { name, summary } => {
-                                    let mut chars = name.chars();
-                                    let cap_name = match chars.next() {
-                                        None => String::new(),
-                                        Some(f) => {
-                                            f.to_uppercase().collect::<String>() + chars.as_str()
-                                        }
-                                    };
-                                    if summary.is_empty() {
-                                        format!("_{}..._", cap_name)
-                                    } else {
-                                        format!("_{}: {}..._", cap_name, summary)
-                                    }
-                                }
-                                StatusUpdate::BudgetExtended {
-                                    old_budget,
-                                    new_budget,
-                                    extension,
-                                    max_extensions,
-                                } => {
-                                    format!(
-                                        "_💰 Auto-extended token budget {} → {} ({}/{}) — continuing._",
-                                        old_budget, new_budget, extension, max_extensions
-                                    )
-                                }
-                                _ => continue,
-                            };
-                            let _ = slack_post_message(
-                                &queued_status_http,
-                                &queued_status_token,
-                                &queued_status_channel,
-                                &text,
-                                queued_status_thread.as_deref(),
-                            )
-                            .await;
-                            last_sent = tokio::time::Instant::now();
-                        }
-                    });
-
-                    // Fresh heartbeat for queued message
-                    let new_heartbeat = Arc::new(AtomicU64::new(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ));
-                    current_heartbeat = new_heartbeat;
-
-                    // New typing cancel for queued message (no reaction-based indicator)
-                    current_typing_cancel = tokio_util::sync::CancellationToken::new();
-                    // Associate typing token with the new queued task for cancel support
-                    registry
-                        .set_typing_cancel(current_task_id, current_typing_cancel.clone())
-                        .await;
-                    // Update the drop guard to track the new typing token
-                    if let Ok(mut guard_token) = typing_guard_token.lock() {
-                        *guard_token = current_typing_cancel.clone();
-                    }
-                } else {
-                    // No more queued messages, exit loop
-                    break;
-                }
-            }
-        });
     }
 
     /// Handle interactive payloads (button clicks for approvals and command buttons).
@@ -2727,98 +1948,35 @@ impl SlackChannel {
                 }
                 continue;
             }
+        }
 
-            let parts: Vec<&str> = action_id.splitn(3, ':').collect();
-            if parts.len() != 3 || !matches!(parts[0], "approve" | "goal" | "autopilot") {
-                continue;
+        let Some(answer) = aidaemon_channel_slack::SlackChannel::approval_answer(payload) else {
+            return;
+        };
+        if !self.prompts.is_open(&answer.prompt_id).await {
+            // Not a card this run asked, e.g. one left from before a restart.
+            warn!(prompt = %answer.prompt_id, "Stale Slack approval callback");
+            return;
+        }
+        let Some(answered) = self
+            .prompts
+            .answer(&answer.prompt_id, &answer.choice_id)
+            .await
+        else {
+            return;
+        };
+        if let Some((message, text)) = answered.update {
+            let transport = self.transport.clone();
+            if let Err(e) = transport.edit(&message, &text).await {
+                warn!("Failed to update a Slack approval message: {}", e);
             }
-
-            let prefix = parts[0];
-            let action_type = parts[1];
-            let approval_id = parts[2];
-
-            let response = if matches!(prefix, "goal" | "autopilot") {
-                match action_type {
-                    "confirm" => ApprovalResponse::AllowOnce,
-                    "cancel" | "edit" => ApprovalResponse::Deny,
-                    _ => continue,
-                }
-            } else {
-                match action_type {
-                    "once" => ApprovalResponse::AllowOnce,
-                    "session" => ApprovalResponse::AllowSession,
-                    "always" => ApprovalResponse::AllowAlways,
-                    "deny" => ApprovalResponse::Deny,
-                    _ => continue,
-                }
-            };
-
-            // Resolve only a currently pending approval. In particular, do not
-            // update or auto-dismiss a stale card after a daemon restart.
-            let response_tx = {
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(approval_id)
-            };
-            let Some(response_tx) = response_tx else {
-                warn!(approval_id, "Stale Slack approval callback");
-                continue;
-            };
-
-            // Update the original message via response_url
-            if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
-                let original_text = payload
-                    .pointer("/message/text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Command approval");
-                let updated = if matches!(prefix, "goal" | "autopilot") {
-                    let status = match (prefix, action_type, &response) {
-                        ("autopilot", "edit", _) => {
-                            "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
-                        }
-                        ("autopilot", _, ApprovalResponse::Deny) => {
-                            "❌ Autopilot cancelled\nNo new autonomy was activated."
-                        }
-                        ("autopilot", _, _) => {
-                            "✅ Autopilot enabled\nActivation is continuing now."
-                        }
-                        (_, _, ApprovalResponse::Deny) => {
-                            "❌ Goal cancelled\nNothing was activated."
-                        }
-                        _ => "✅ Goal approved\nActivation is continuing now.",
-                    };
-                    format!("{}\n\n{status}", original_text.trim_end())
-                } else {
-                    super::approval_render::finalize_approval_message(original_text, &response)
-                };
-                let updated_payload = serde_json::json!({
-                    "replace_original": true,
-                    "text": updated,
+            // Keep the outcome visible briefly, then remove the card.
+            if let Some(delay) = Self::resolved_approval_dismiss_delay() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = transport.delete(&message).await;
                 });
-                let _ = self
-                    .http
-                    .post(response_url)
-                    .json(&updated_payload)
-                    .send()
-                    .await;
-
-                // Keep the resolved state visible briefly, then delete the
-                // interactive source message via its short-lived response URL.
-                // Slack permits response URLs to delete source messages, and
-                // the default 10-second delay is well inside their validity.
-                if let Some(delay) = Self::resolved_approval_dismiss_delay() {
-                    let http = self.http.clone();
-                    let response_url = response_url.to_string();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let delete_payload = serde_json::json!({
-                            "delete_original": true,
-                        });
-                        let _ = http.post(response_url).json(&delete_payload).send().await;
-                    });
-                }
             }
-
-            let _ = response_tx.send(response);
         }
     }
 
@@ -3112,10 +2270,10 @@ impl SlackChannel {
         thread_ts: Option<&str>,
     ) -> anyhow::Result<()> {
         // Step 1: Get upload URL (uses form-encoded, not JSON)
-        let url = "https://slack.com/api/files.getUploadURLExternal";
+        let url = format!("{}/files.getUploadURLExternal", self.api_base);
         let form_resp = self
             .http
-            .post(url)
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .form(&[
                 ("filename", filename.to_string()),
@@ -3195,20 +2353,152 @@ impl SlackChannel {
         (channel_id, thread_ts)
     }
 
-    /// Create a lightweight clone for use in spawned tasks (typing indicator).
-    fn clone_for_typing(&self) -> SlackApiHandle {
-        SlackApiHandle {
-            http: self.http.clone(),
-            bot_token: self.bot_token.clone(),
+    /// The SDK conversation a session's messages go to.
+    fn conversation_for(&self, session_id: &str) -> aidaemon_channels::Conversation {
+        let (channel, thread) = self.parse_session_id(session_id);
+        let kind = if channel.starts_with('D') {
+            aidaemon_channels::ConversationKind::Direct
+        } else if thread.is_some() {
+            aidaemon_channels::ConversationKind::Thread
+        } else {
+            aidaemon_channels::ConversationKind::Group
+        };
+        aidaemon_channels::Conversation {
+            id: match thread {
+                Some(ts) => format!("{channel}:{ts}"),
+                None => channel,
+            },
+            kind,
         }
     }
 
-    /// Create a lightweight clone for use in spawned tasks (status updates).
-    fn clone_for_status(&self) -> SlackApiHandle {
+    /// A handle for Slack API calls from spawned tasks.
+    fn api_handle(&self) -> SlackApiHandle {
         SlackApiHandle {
             http: self.http.clone(),
             bot_token: self.bot_token.clone(),
+            api_base: self.api_base.clone(),
         }
+    }
+}
+
+/// One Slack conversation (a channel, or a thread in one), as the turn
+/// runner shows it.
+struct SlackSurface {
+    api: SlackApiHandle,
+    channel: String,
+    thread: Option<String>,
+    /// The message the working reaction goes on; taken by the first turn.
+    reacting_to: std::sync::Mutex<Option<String>>,
+    user_cache: HashMap<String, String>,
+    config_path: PathBuf,
+}
+
+#[async_trait]
+impl TurnSurface for SlackSurface {
+    fn platform(&self) -> &'static str {
+        "slack"
+    }
+
+    async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+        let mrkdwn = markdown_to_slack_mrkdwn(text);
+        let mrkdwn = restore_mentions_from_cache(&mrkdwn, &self.user_cache);
+        let mut ids = Vec::new();
+        let mut failure = None;
+        for chunk in split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN) {
+            match slack_post_message(
+                &self.api.http,
+                &self.api.api_base,
+                &self.api.bot_token,
+                &self.channel,
+                &chunk,
+                self.thread.as_deref(),
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Some(ts) = response.get("ts").and_then(Value::as_str) {
+                        ids.push(ts.to_string());
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "Failed to send Slack message");
+                    failure = Some(error);
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(ids),
+        }
+    }
+
+    /// Slack bots have no typing indicator: an hourglass reaction on the
+    /// message that started the work, swapped for a warning if the agent
+    /// goes quiet. Queued turns have no message of their own to react to.
+    fn show_working(
+        &self,
+        stop: tokio_util::sync::CancellationToken,
+        heartbeat: Arc<AtomicU64>,
+        stale_secs: u64,
+    ) {
+        let Some(ts) = self
+            .reacting_to
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let api = SlackApiHandle {
+            http: self.api.http.clone(),
+            bot_token: self.api.bot_token.clone(),
+            api_base: self.api.api_base.clone(),
+        };
+        let channel = self.channel.clone();
+        tokio::spawn(async move {
+            const WORKING: &str = "hourglass_flowing_sand";
+            let _ = api.add_reaction(&channel, &ts, WORKING).await;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)), if stale_secs > 0 => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if now.saturating_sub(heartbeat.load(Ordering::Relaxed)) > stale_secs {
+                            let _ = api.remove_reaction(&channel, &ts, WORKING).await;
+                            let _ = api.add_reaction(&channel, &ts, "warning").await;
+                            return;
+                        }
+                    }
+                    _ = stop.cancelled() => break,
+                }
+            }
+            let _ = api.remove_reaction(&channel, &ts, WORKING).await;
+        });
+    }
+
+    /// A queued guest message keeps a workspace grant only if the grant is
+    /// still in force.
+    async fn before_queued(&self, mut queued: QueuedMessage) -> QueuedMessage {
+        if queued.user_role == UserRole::Guest {
+            if let Some(original) = queued.channel_ctx.workspace_grant.clone() {
+                queued.channel_ctx.workspace_grant = match revalidate_queued_workspace_grant(
+                    &self.config_path,
+                    &original,
+                )
+                .await
+                {
+                    Ok(grant) => grant,
+                    Err(error) => {
+                        warn!(%error, "Could not revalidate queued workspace grant; denying scoped access");
+                        None
+                    }
+                };
+            }
+        }
+        queued
     }
 }
 
@@ -3216,29 +2506,20 @@ impl SlackChannel {
 struct SlackApiHandle {
     http: reqwest::Client,
     bot_token: String,
+    api_base: String,
 }
 
 impl SlackApiHandle {
-    async fn post_message(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> anyhow::Result<()> {
-        slack_post_message(&self.http, &self.bot_token, channel, text, thread_ts).await?;
-        Ok(())
-    }
-
     async fn add_reaction(&self, channel: &str, ts: &str, name: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "channel": channel,
             "timestamp": ts,
             "name": name,
         });
-        let url = "https://slack.com/api/reactions.add";
+        let url = format!("{}/reactions.add", self.api_base);
         let _ = self
             .http
-            .post(url)
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&body)
             .send()
@@ -3252,10 +2533,10 @@ impl SlackApiHandle {
             "timestamp": ts,
             "name": name,
         });
-        let url = "https://slack.com/api/reactions.remove";
+        let url = format!("{}/reactions.remove", self.api_base);
         let _ = self
             .http
-            .post(url)
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&body)
             .send()
@@ -3287,6 +2568,7 @@ fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> S
 /// Free function to post a message via Slack Web API.
 async fn slack_post_message(
     http: &reqwest::Client,
+    api_base: &str,
     bot_token: &str,
     channel: &str,
     text: &str,
@@ -3300,7 +2582,7 @@ async fn slack_post_message(
         body["thread_ts"] = Value::String(ts.to_string());
     }
     let mut resp = http
-        .post("https://slack.com/api/chat.postMessage")
+        .post(format!("{api_base}/chat.postMessage"))
         .header("Authorization", format!("Bearer {}", bot_token))
         .json(&body)
         .send()
@@ -3312,7 +2594,7 @@ async fn slack_post_message(
         ) {
             crate::channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
             resp = http
-                .post("https://slack.com/api/chat.postMessage")
+                .post(format!("{api_base}/chat.postMessage"))
                 .header("Authorization", format!("Bearer {}", bot_token))
                 .json(&body)
                 .send()
@@ -3389,147 +2671,18 @@ impl Channel for SlackChannel {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
-        let (channel_id, thread_ts) = self.parse_session_id(session_id);
-
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let short_id = &approval_id[..8];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.insert(approval_id.clone(), response_tx);
-            info!(
-                approval_id = %short_id,
-                pending_count = pending.len(),
-                risk = %risk_level,
-                mode = %permission_mode,
-                "Stored pending Slack approval"
-            );
-        }
-
-        let use_session_button =
-            super::approval_render::approval_use_session_button(permission_mode, risk_level);
-
-        let message_text = super::approval_render::build_approval_message_slack(
-            command,
-            risk_level,
-            warnings,
-            use_session_button,
-            one_time_only,
-        );
-
-        // Build Block Kit message with approval buttons
-        let action_buttons = if one_time_only {
-            serde_json::json!([
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Allow Once" },
-                    "action_id": format!("approve:once:{}", approval_id),
-                    "style": "primary"
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Deny" },
-                    "action_id": format!("approve:deny:{}", approval_id),
-                    "style": "danger"
-                }
-            ])
-        } else if use_session_button {
-            serde_json::json!([
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Allow Once" },
-                    "action_id": format!("approve:once:{}", approval_id),
-                    "style": "primary"
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Allow Session" },
-                    "action_id": format!("approve:session:{}", approval_id)
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Deny" },
-                    "action_id": format!("approve:deny:{}", approval_id),
-                    "style": "danger"
-                }
-            ])
-        } else {
-            serde_json::json!([
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Allow Once" },
-                    "action_id": format!("approve:once:{}", approval_id),
-                    "style": "primary"
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Allow Always" },
-                    "action_id": format!("approve:always:{}", approval_id)
-                },
-                {
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Deny" },
-                    "action_id": format!("approve:deny:{}", approval_id),
-                    "style": "danger"
-                }
-            ])
-        };
-
-        let blocks = serde_json::json!([
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": message_text
-                }
-            },
-            {
-                "type": "actions",
-                "elements": action_buttons
-            }
-        ]);
-
-        let mut body = serde_json::json!({
-            "channel": channel_id,
-            "text": message_text,
-            "blocks": blocks,
-        });
-        if let Some(ts) = &thread_ts {
-            body["thread_ts"] = Value::String(ts.to_string());
-        }
-
-        match self.slack_api_post("chat.postMessage", &body).await {
-            Ok(_) => {
-                info!(approval_id = %short_id, "Approval message sent to Slack");
-            }
-            Err(e) => {
-                warn!("Failed to send Slack approval request: {}", e);
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Slack approval request could not be delivered: {e}"
-                ));
-            }
-        }
-
-        // Wait for response with 5-minute timeout
-        info!(approval_id = %short_id, "Waiting for user approval response...");
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                warn!(approval_id = %short_id, "Approval channel closed");
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!("Slack approval response channel closed"))
-            }
-            Err(_) => {
-                warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                Err(anyhow::anyhow!("Slack approval request timed out"))
-            }
-        }
+        self.prompts
+            .approval(
+                self.transport.as_ref(),
+                &self.conversation_for(session_id),
+                command,
+                risk_level,
+                warnings,
+                permission_mode,
+                one_time_only,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Slack approval request failed: {e}"))
     }
 
     async fn request_goal_confirmation(
@@ -3539,92 +2692,16 @@ impl Channel for SlackChannel {
         details: &[String],
         style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        let (channel_id, thread_ts) = self.parse_session_id(session_id);
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
+        self.prompts
+            .goal(
+                self.transport.as_ref(),
+                &self.conversation_for(session_id),
+                goal_description,
+                details,
+                style,
+            )
             .await
-            .insert(approval_id.clone(), response_tx);
-
-        let pages =
-            super::approval_render::build_goal_confirmation_pages(goal_description, details, style);
-        let prefix = match style {
-            GoalConfirmationStyle::Standard => "goal",
-            GoalConfirmationStyle::Autopilot => "autopilot",
-        };
-        let approve_label = match style {
-            GoalConfirmationStyle::Standard => "Approve & activate",
-            GoalConfirmationStyle::Autopilot => "Enable Autopilot",
-        };
-        let page_count = pages.len();
-        for (index, text) in pages.iter().enumerate() {
-            if index + 1 != page_count {
-                if let Err(error) = self
-                    .post_message(&channel_id, text, thread_ts.as_deref())
-                    .await
-                {
-                    self.pending_approvals.lock().await.remove(&approval_id);
-                    return Err(error);
-                }
-                continue;
-            }
-            let mut action_buttons = vec![serde_json::json!({
-                "type": "button",
-                "text": { "type": "plain_text", "text": approve_label },
-                "action_id": format!("{prefix}:confirm:{approval_id}"),
-                "style": "primary"
-            })];
-            if matches!(style, GoalConfirmationStyle::Autopilot) {
-                action_buttons.push(serde_json::json!({
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Edit permissions" },
-                    "action_id": format!("{prefix}:edit:{approval_id}")
-                }));
-            }
-            action_buttons.push(serde_json::json!({
-                "type": "button",
-                "text": { "type": "plain_text", "text": "Cancel" },
-                "action_id": format!("{prefix}:cancel:{approval_id}"),
-                "style": "danger"
-            }));
-            let blocks = serde_json::json!([
-                {
-                    "type": "section",
-                    "text": { "type": "mrkdwn", "text": text }
-                },
-                {
-                    "type": "actions",
-                    "elements": action_buttons
-                }
-            ]);
-            let mut body = serde_json::json!({
-                "channel": channel_id,
-                "text": text,
-                "blocks": blocks,
-            });
-            if let Some(ts) = &thread_ts {
-                body["thread_ts"] = Value::String(ts.to_string());
-            }
-            if let Err(error) = self.slack_api_post("chat.postMessage", &body).await {
-                self.pending_approvals.lock().await.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Slack goal confirmation could not be delivered: {error}"
-                ));
-            }
-        }
-
-        match tokio::time::timeout(Duration::from_secs(1800), response_rx).await {
-            Ok(Ok(response)) => Ok(!matches!(response, ApprovalResponse::Deny)),
-            Ok(Err(_)) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!("Slack goal confirmation channel closed"))
-            }
-            Err(_) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!("Slack goal confirmation timed out"))
-            }
-        }
+            .map_err(|e| anyhow::anyhow!("Slack goal confirmation failed: {e}"))
     }
 }
 
@@ -3649,6 +2726,26 @@ fn restart_process() {
 
 /// Spawn a SlackChannel in a background task.
 /// This is a separate function to avoid async type inference cycles.
+#[cfg(test)]
+impl SlackChannel {
+    /// Talk to a mock API at `base` as bot user `bot_user_id`.
+    fn with_api(mut self, base: &str, bot_user_id: &str) -> Self {
+        self.api_base = base.to_string();
+        self.http = super::mock_api::MockApi::client();
+        self.bot_user_id = Mutex::new(Some(bot_user_id.to_string()));
+        self.transport = Arc::new(
+            aidaemon_channel_slack::SlackChannel::new("xoxb-synthetic", "xapp-synthetic")
+                .with_api_base(base)
+                .with_http_client(super::mock_api::MockApi::client()),
+        );
+        self
+    }
+}
+
+#[cfg(test)]
+#[path = "slack_tests.rs"]
+mod turn_tests;
+
 pub fn spawn_slack_channel(channel: Arc<SlackChannel>) {
     tokio::spawn(async move {
         channel.start_with_retry().await;

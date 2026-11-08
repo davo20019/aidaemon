@@ -143,7 +143,7 @@ keyring = { version = "3", features = ["windows-native"] }
 default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:aidaemon-channel-discord"]
-slack = ["dep:tokio-tungstenite", "dep:aidaemon-channel-slack"]
+slack = ["dep:aidaemon-channel-slack"]
 execution-docker = []
 terminal-bridge = [
     "dep:tokio-tungstenite",
