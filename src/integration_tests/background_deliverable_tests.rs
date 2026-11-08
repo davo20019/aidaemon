@@ -12,7 +12,7 @@ use crate::channels::{ChannelHub, SessionMap};
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::terminal::{ApprovalRequest, TerminalTool};
-use crate::traits::{Channel, ChannelCapabilities};
+use crate::traits::{HubChannel, ChannelCapabilities};
 use crate::types::{MediaKind, MediaMessage};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ impl MediaCaptureChannel {
 }
 
 #[async_trait]
-impl Channel for MediaCaptureChannel {
+impl HubChannel for MediaCaptureChannel {
     fn name(&self) -> String {
         "media_test".to_string()
     }
@@ -139,7 +139,7 @@ async fn make_terminal_with_hub(
         .await
         .insert(session_id.to_string(), "media_test".to_string());
     let hub = Arc::new(ChannelHub::new(
-        vec![channel.clone() as Arc<dyn Channel>],
+        vec![channel.clone() as Arc<dyn HubChannel>],
         session_map,
     ));
     let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();

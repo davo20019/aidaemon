@@ -11,7 +11,7 @@ mod live_status_surface_tests {
     use crate::channels::live_status::{HubSurfaceSink, LiveStatus, SurfaceSink};
     use crate::channels::{ChannelHub, SessionMap};
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
-    use crate::traits::{Channel, ChannelCapabilities};
+    use crate::traits::{HubChannel, ChannelCapabilities};
     use crate::types::{ApprovalResponse, MediaMessage};
 
     /// Test-only channel that supports `send_text_tracked` (returns a stable id)
@@ -23,7 +23,7 @@ mod live_status_surface_tests {
     }
 
     #[async_trait]
-    impl Channel for EditableChannel {
+    impl HubChannel for EditableChannel {
         fn name(&self) -> String {
             "editable-test".to_string()
         }
@@ -106,7 +106,7 @@ mod live_status_surface_tests {
         );
 
         let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn Channel>],
+            vec![channel.clone() as Arc<dyn HubChannel>],
             session_map,
         ));
         let sink = HubSurfaceSink::new(hub, "telegram:synthetic-user-1".to_string());
@@ -171,7 +171,7 @@ mod live_status_surface_tests {
             "editable-test".to_string(),
         );
         let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn Channel>],
+            vec![channel.clone() as Arc<dyn HubChannel>],
             session_map,
         ));
         let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();

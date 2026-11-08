@@ -26,7 +26,7 @@ use crate::testing::TestChannel;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
-use crate::traits::Channel;
+use crate::traits::HubChannel;
 use crate::types::{ChannelContext, UserRole};
 
 /// Check if live tests should run.
@@ -159,7 +159,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     map.insert("live_test".to_string(), "test".to_string());
     let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(map));
     let hub = Arc::new(ChannelHub::new(
-        vec![channel.clone() as Arc<dyn Channel>],
+        vec![channel.clone() as Arc<dyn HubChannel>],
         session_map,
     ));
 
@@ -336,7 +336,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     map.insert("live_test".to_string(), "test".to_string());
     let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(map));
     let hub = Arc::new(ChannelHub::new(
-        vec![channel.clone() as Arc<dyn Channel>],
+        vec![channel.clone() as Arc<dyn HubChannel>],
         session_map,
     ));
 

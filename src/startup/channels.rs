@@ -8,10 +8,10 @@ use crate::channels::DiscordChannel;
 use crate::channels::SlackChannel;
 use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramChannel};
 use crate::config::AppConfig;
-use crate::traits::Channel;
+use crate::traits::HubChannel;
 
 pub struct ChannelBundle {
-    pub channels: Vec<Arc<dyn Channel>>,
+    pub channels: Vec<Arc<dyn HubChannel>>,
     pub telegram_bots: Vec<Arc<TelegramChannel>>,
     pub dynamic_telegram_bots: Vec<Arc<TelegramChannel>>,
     #[cfg(feature = "discord")]
@@ -405,31 +405,35 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
         }
     }
 
-    let mut channels: Vec<Arc<dyn Channel>> = telegram_bots
+    let mut channels: Vec<Arc<dyn HubChannel>> = telegram_bots
         .iter()
-        .map(|t| t.clone() as Arc<dyn Channel>)
+        .map(|t| t.clone() as Arc<dyn HubChannel>)
         .collect();
     channels.extend(
         dynamic_telegram_bots
             .iter()
-            .map(|t| t.clone() as Arc<dyn Channel>),
+            .map(|t| t.clone() as Arc<dyn HubChannel>),
     );
     #[cfg(feature = "discord")]
     {
-        channels.extend(discord_bots.iter().map(|d| d.clone() as Arc<dyn Channel>));
+        channels.extend(
+            discord_bots
+                .iter()
+                .map(|d| d.clone() as Arc<dyn HubChannel>),
+        );
         channels.extend(
             dynamic_discord_bots
                 .iter()
-                .map(|d| d.clone() as Arc<dyn Channel>),
+                .map(|d| d.clone() as Arc<dyn HubChannel>),
         );
     }
     #[cfg(feature = "slack")]
     {
-        channels.extend(slack_bots.iter().map(|s| s.clone() as Arc<dyn Channel>));
+        channels.extend(slack_bots.iter().map(|s| s.clone() as Arc<dyn HubChannel>));
         channels.extend(
             dynamic_slack_bots
                 .iter()
-                .map(|s| s.clone() as Arc<dyn Channel>),
+                .map(|s| s.clone() as Arc<dyn HubChannel>),
         );
     }
 

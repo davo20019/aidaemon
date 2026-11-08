@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{Channel, ChannelCapabilities};
+use crate::traits::{ChannelCapabilities, HubChannel};
 use crate::types::{ApprovalResponse, MediaMessage};
 
 use super::domain::NODE_CHANNEL_NAME;
@@ -20,7 +20,7 @@ impl NodeChannel {
 }
 
 #[async_trait]
-impl Channel for NodeChannel {
+impl HubChannel for NodeChannel {
     fn name(&self) -> String {
         NODE_CHANNEL_NAME.to_string()
     }

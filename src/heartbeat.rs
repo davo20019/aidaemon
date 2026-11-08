@@ -3832,7 +3832,7 @@ mod tests {
             HashMap::from([("test_session".to_string(), "test".to_string())]),
         ));
         let hub = Arc::new(crate::channels::ChannelHub::new(
-            vec![channel.clone() as Arc<dyn crate::traits::Channel>],
+            vec![channel.clone() as Arc<dyn crate::traits::HubChannel>],
             session_map,
         ));
         let outbound: Arc<dyn OutboundRouter> = hub.clone();

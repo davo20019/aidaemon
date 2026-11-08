@@ -12,7 +12,7 @@ use crate::runtime_ports::SessionRouteLease;
 use crate::runtime_ports::{AssistantNoteSink, OutboundRouter};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::Channel;
+use crate::traits::HubChannel;
 use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 
 /// Shared map of session_id → channel name.
@@ -28,7 +28,7 @@ pub type SessionMap = Arc<RwLock<HashMap<String, String>>>;
 /// privacy leaks.
 pub struct ChannelHub {
     /// Registered channels. Uses RwLock to support dynamic registration.
-    channels: RwLock<Vec<Arc<dyn Channel>>>,
+    channels: RwLock<Vec<Arc<dyn HubChannel>>>,
     session_map: SessionMap,
     /// Ephemeral runtime-owned routes from a specialist session to the human
     /// conversation that spawned it. This lets approvals use the real parent
@@ -57,7 +57,7 @@ pub struct ChannelHub {
 }
 
 impl ChannelHub {
-    pub fn new(channels: Vec<Arc<dyn Channel>>, session_map: SessionMap) -> Self {
+    pub fn new(channels: Vec<Arc<dyn HubChannel>>, session_map: SessionMap) -> Self {
         Self {
             channels: RwLock::new(channels),
             session_map,
@@ -182,7 +182,7 @@ impl ChannelHub {
     /// Register a new channel dynamically.
     /// Returns the channel name after registration.
     #[allow(dead_code)]
-    pub async fn register_channel(&self, channel: Arc<dyn Channel>) -> String {
+    pub async fn register_channel(&self, channel: Arc<dyn HubChannel>) -> String {
         let name = channel.name();
         let mut channels = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -243,7 +243,7 @@ impl ChannelHub {
     /// Resolve both the channel and the externally addressable session. Every
     /// outbound operation must use the returned session, not the internal child
     /// identifier that was supplied by the caller.
-    async fn routed_channel(&self, session_id: &str) -> Option<(Arc<dyn Channel>, String)> {
+    async fn routed_channel(&self, session_id: &str) -> Option<(Arc<dyn HubChannel>, String)> {
         let routed_session = self.routed_session_id(session_id).await;
         let map =
             match tokio::time::timeout(std::time::Duration::from_secs(2), self.session_map.read())
@@ -282,7 +282,7 @@ impl ChannelHub {
     /// Find the channel that owns a session.
     /// Returns None for unknown sessions to prevent cross-channel privacy leaks.
     #[cfg(test)]
-    async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
+    async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn HubChannel>> {
         self.routed_channel(session_id)
             .await
             .map(|(channel, _)| channel)
@@ -894,7 +894,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
-    use crate::traits::{Channel, ChannelCapabilities};
+    use crate::traits::{ChannelCapabilities, HubChannel};
     use crate::types::{ApprovalResponse, MediaMessage};
 
     /// A test channel with a configurable name, used to verify routing.
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Channel for NamedTestChannel {
+    impl HubChannel for NamedTestChannel {
         fn name(&self) -> String {
             self.channel_name.clone()
         }
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Channel for FlakyTextChannel {
+    impl HubChannel for FlakyTextChannel {
         fn name(&self) -> String {
             "flaky".to_string()
         }
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Channel for CountingMediaChannel {
+    impl HubChannel for CountingMediaChannel {
         fn name(&self) -> String {
             "counting_media".to_string()
         }
@@ -1082,7 +1082,7 @@ mod tests {
             .write()
             .await
             .insert("s1".to_string(), "counting_media".to_string());
-        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn Channel>], session_map);
+        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn HubChannel>], session_map);
 
         // Same file delivered twice (e.g. notifier then model send_file) → one send.
         hub.send_media_strict("s1", &doc_msg("s1", "/inbox/r.txt", "r.txt"))
@@ -1118,8 +1118,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_for_session_known() {
-        let ch_telegram: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("telegram"));
-        let ch_slack: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("slack"));
+        let ch_telegram: Arc<dyn HubChannel> = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack: Arc<dyn HubChannel> = Arc::new(NamedTestChannel::new("slack"));
 
         let session_map = session_map_with(vec![("sess_1", "slack")]);
         let hub = ChannelHub::new(vec![ch_telegram, ch_slack], session_map);
@@ -1131,8 +1131,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_for_session_unknown_returns_none() {
-        let ch_telegram: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("telegram"));
-        let ch_slack: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("slack"));
+        let ch_telegram: Arc<dyn HubChannel> = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack: Arc<dyn HubChannel> = Arc::new(NamedTestChannel::new("slack"));
 
         let session_map = empty_session_map();
         let hub = ChannelHub::new(vec![ch_telegram, ch_slack], session_map);
@@ -1147,7 +1147,7 @@ mod tests {
         let channel = Arc::new(NamedTestChannel::new("telegram"));
         let session_map = session_map_with(vec![("parent-session", "telegram")]);
         let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn Channel>],
+            vec![channel.clone() as Arc<dyn HubChannel>],
             session_map,
         ));
         let route_guard = hub
@@ -1214,7 +1214,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let session_map = session_map_with(vec![("session", "flaky")]);
-        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn Channel>], session_map);
+        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn HubChannel>], session_map);
 
         assert!(hub.send_text("session", "important result").await.is_err());
         hub.send_text("session", "important result")
@@ -1229,7 +1229,7 @@ mod tests {
         let session_map =
             session_map_with(vec![("parent-one", "telegram"), ("parent-two", "telegram")]);
         let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn Channel>],
+            vec![channel.clone() as Arc<dyn HubChannel>],
             session_map,
         ));
         let old_guard = hub
@@ -1257,7 +1257,7 @@ mod tests {
         let channel = Arc::new(NamedTestChannel::new("telegram"));
         let session_map = session_map_with(vec![("parent", "telegram")]);
         let hub = Arc::new(ChannelHub::new(
-            vec![channel as Arc<dyn Channel>],
+            vec![channel as Arc<dyn HubChannel>],
             session_map,
         ));
         let child_hub = hub.clone();
@@ -1295,8 +1295,8 @@ mod tests {
         let ch_telegram = Arc::new(NamedTestChannel::new("telegram"));
         let ch_slack = Arc::new(NamedTestChannel::new("slack"));
 
-        let ch_telegram_dyn: Arc<dyn Channel> = ch_telegram.clone();
-        let ch_slack_dyn: Arc<dyn Channel> = ch_slack.clone();
+        let ch_telegram_dyn: Arc<dyn HubChannel> = ch_telegram.clone();
+        let ch_slack_dyn: Arc<dyn HubChannel> = ch_slack.clone();
 
         let session_map = session_map_with(vec![("sess_1", "slack")]);
         let hub = ChannelHub::new(vec![ch_telegram_dyn, ch_slack_dyn], session_map);
@@ -1321,7 +1321,7 @@ mod tests {
         // edit_text reports unsupported. This is the cross-channel fallback that
         // keeps the checklist's start-post + recap behavior intact off Telegram.
         let ch = Arc::new(NamedTestChannel::new("slack"));
-        let ch_dyn: Arc<dyn Channel> = ch.clone();
+        let ch_dyn: Arc<dyn HubChannel> = ch.clone();
         let session_map = session_map_with(vec![("sess_1", "slack")]);
         let hub = ChannelHub::new(vec![ch_dyn], session_map);
 
@@ -1373,8 +1373,8 @@ mod tests {
         let ch_telegram = Arc::new(NamedTestChannel::new("telegram"));
         let ch_slack = Arc::new(NamedTestChannel::new("slack"));
 
-        let ch_telegram_dyn: Arc<dyn Channel> = ch_telegram.clone();
-        let ch_slack_dyn: Arc<dyn Channel> = ch_slack.clone();
+        let ch_telegram_dyn: Arc<dyn HubChannel> = ch_telegram.clone();
+        let ch_slack_dyn: Arc<dyn HubChannel> = ch_slack.clone();
 
         let session_map =
             session_map_with(vec![("sess_telegram", "telegram"), ("sess_slack", "slack")]);
@@ -1401,7 +1401,7 @@ mod tests {
         assert!(hub.send_text("sess_1", "test").await.is_err());
 
         // Register a channel dynamically
-        let ch_discord: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("discord"));
+        let ch_discord: Arc<dyn HubChannel> = Arc::new(NamedTestChannel::new("discord"));
         let name = hub.register_channel(ch_discord).await;
         assert_eq!(name, "discord");
 

@@ -7,7 +7,7 @@ use crate::nodes::channel::NodeChannel;
 use crate::nodes::gateway::{NodeGatewayState, NodeRateLimiter};
 use crate::nodes::service::{AgentNodeConversationIngress, NodeService};
 use crate::nodes::{auth, NodeStore};
-use crate::traits::Channel;
+use crate::traits::HubChannel;
 
 pub async fn start(
     config: &AppConfig,
@@ -39,7 +39,7 @@ pub async fn start(
     }
     let service = Arc::new(service_value);
     let ingress = Arc::new(AgentNodeConversationIngress::new(agent));
-    hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn Channel>)
+    hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn HubChannel>)
         .await;
     let state = NodeGatewayState {
         service,

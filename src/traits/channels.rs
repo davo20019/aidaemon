@@ -20,13 +20,14 @@ pub struct ChannelCapabilities {
     pub max_message_len: usize,
 }
 
-/// A communication channel (Telegram, WhatsApp, Web, SMS, etc.).
+/// A bot as the [`ChannelHub`](crate::channels::ChannelHub) sees it: where
+/// a session's messages, media, approvals and goal confirmations go.
 ///
-/// Each implementation handles transport-specific details for sending messages,
-/// media, and approval requests. New channels (e.g., Discord, Slack, SMS) only
-/// need to implement this trait to integrate with aidaemon.
+/// Chat platforms implement it on top of an SDK transport
+/// (`aidaemon_channels::Channel`), which carries the traffic; this trait is
+/// the daemon's outbound surface, not a transport.
 #[async_trait]
-pub trait Channel: Send + Sync {
+pub trait HubChannel: Send + Sync {
     /// Unique name for this channel (e.g., "telegram", "telegram:my_bot", "discord").
     /// For multi-bot setups, includes the bot username (e.g., "telegram:coding_bot").
     fn name(&self) -> String;
@@ -38,9 +39,9 @@ pub trait Channel: Send + Sync {
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
 
     /// Send a text message and return a channel-specific message id that can be
-    /// passed to [`Channel::edit_text`] later. Channels that support in-place
+    /// passed to [`HubChannel::edit_text`] later. Channels that support in-place
     /// editing (e.g. Telegram) override this; the default sends via
-    /// [`Channel::send_text`] and returns `None` (no tracking), so callers fall
+    /// [`HubChannel::send_text`] and returns `None` (no tracking), so callers fall
     /// back to non-editing UX.
     async fn send_text_tracked(
         &self,

@@ -17,7 +17,7 @@ mod provider;
 mod tools;
 mod trigger_event;
 
-pub use channels::{Channel, ChannelCapabilities};
+pub use channels::{ChannelCapabilities, HubChannel};
 #[allow(unused_imports)]
 pub use conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,

@@ -231,7 +231,7 @@ mod tests {
     use crate::channels::ChannelHub;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
-    use crate::traits::{Channel, ChannelCapabilities};
+    use crate::traits::{ChannelCapabilities, HubChannel};
     use crate::types::{ApprovalResponse, MediaMessage};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Channel for EditingChannel {
+    impl HubChannel for EditingChannel {
         fn name(&self) -> String {
             "editing".to_string()
         }
@@ -308,7 +308,7 @@ mod tests {
             "editing".to_string(),
         )])));
         let hub = Arc::new(ChannelHub::new(
-            vec![channel.clone() as Arc<dyn Channel>],
+            vec![channel.clone() as Arc<dyn HubChannel>],
             session_map,
         ));
         let outbound: Arc<dyn OutboundRouter> = hub;

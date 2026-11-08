@@ -19,7 +19,7 @@ use crate::channels::{ChannelHub, ChannelRuntimeDeps};
 use crate::runtime_ports::ChannelAgentRuntime;
 use crate::tasks::{QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{Channel, ChannelCapabilities, StateStore};
+use crate::traits::{ChannelCapabilities, HubChannel, StateStore};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{
     ChannelContext, ChannelVisibility, UserRole, WorkspaceAccessLevel, WorkspaceGrant,
@@ -2613,7 +2613,7 @@ async fn slack_post_message(
 }
 
 #[async_trait]
-impl Channel for SlackChannel {
+impl HubChannel for SlackChannel {
     fn name(&self) -> String {
         self.channel_name()
     }

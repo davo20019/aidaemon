@@ -170,7 +170,11 @@ shared resolver so their behavior does not drift.
 The core interfaces are re-exported from `src/traits.rs`:
 
 - `Tool`: LLM-callable capability.
-- `Channel`: inbound/outbound chat channel abstraction.
+- `HubChannel`: a bot as the channel hub sees it (where a session's
+  messages, media and approvals go). The transport underneath is an SDK
+  adapter (`aidaemon_channels::Channel`); session turns run on
+  `channels::turns::TurnRunner` and prompts on `channels::prompts::Prompts`,
+  so a bot supplies only access, session ids, commands and a `TurnSurface`.
 - `StateStore` and domain store traits: persistence facade and SQLite-backed
   implementations.
 - `ModelProvider`: LLM backend abstraction.

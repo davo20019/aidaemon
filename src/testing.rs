@@ -24,7 +24,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
-    Channel, ChannelCapabilities, ChatOptions, ProviderResponse, TokenUsage, Tool, ToolCall,
+    ChannelCapabilities, ChatOptions, HubChannel, ProviderResponse, TokenUsage, Tool, ToolCall,
     ToolRole,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
@@ -607,7 +607,7 @@ impl TestChannel {
 }
 
 #[async_trait]
-impl Channel for TestChannel {
+impl HubChannel for TestChannel {
     fn name(&self) -> String {
         "test".to_string()
     }
@@ -1586,7 +1586,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // ChannelHub
     let hub = Arc::new(ChannelHub::new(
-        vec![channel.clone() as Arc<dyn Channel>],
+        vec![channel.clone() as Arc<dyn HubChannel>],
         session_map.clone(),
     ));
 

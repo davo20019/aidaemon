@@ -24,7 +24,7 @@ use super::prompts::Prompts;
 use super::turns::{repeat_while_working, Turn, TurnRunner, TurnSurface};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{Channel, ChannelCapabilities};
+use crate::traits::{ChannelCapabilities, HubChannel};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
@@ -604,7 +604,7 @@ fn base_session_id(session_id: &str) -> &str {
 }
 
 #[async_trait]
-impl Channel for DiscordChannel {
+impl HubChannel for DiscordChannel {
     fn name(&self) -> String {
         self.channel_name()
     }
