@@ -32,6 +32,10 @@ use crate::types::ApprovalResponse;
 /// How long a card waits for the owner.
 pub(crate) const OWNER_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a goal or Autopilot confirmation card waits for the owner (the
+/// same window the channel's goal prompt keeps its buttons).
+pub(crate) const GOAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(1800);
+
 /// Reason recorded when the owner answers Deny.
 const DECLINED_BY_OWNER: &str = "declined by the owner";
 /// Reason recorded when the card could not be delivered.
@@ -510,6 +514,9 @@ pub(crate) struct OwnerApprovals {
     pending: Mutex<HashMap<u64, oneshot::Sender<()>>>,
     next_card: AtomicU64,
     timeout: Duration,
+    /// How long a goal or Autopilot confirmation waits: the owner reads a
+    /// whole plan there, so it gets the channel's longer goal window.
+    goal_timeout: Duration,
 }
 
 impl Default for OwnerApprovals {
@@ -520,6 +527,7 @@ impl Default for OwnerApprovals {
             pending: Mutex::new(HashMap::new()),
             next_card: AtomicU64::new(0),
             timeout: OWNER_APPROVAL_TIMEOUT,
+            goal_timeout: GOAL_CONFIRMATION_TIMEOUT,
         }
     }
 }
@@ -544,6 +552,7 @@ impl OwnerApprovals {
     pub(crate) fn with_timeout(timeout: Duration) -> Self {
         Self {
             timeout,
+            goal_timeout: timeout,
             ..Self::default()
         }
     }
@@ -613,6 +622,15 @@ impl OwnerApprovals {
                 kind,
             })
             .await;
+        let wait = if matches!(
+            kind,
+            crate::types::ApprovalKind::GoalConfirmation
+                | crate::types::ApprovalKind::AutopilotConfirmation
+        ) {
+            self.goal_timeout
+        } else {
+            self.timeout
+        };
         let answer = if sent.is_err() {
             Answer::Declined(COULD_NOT_REACH.to_string())
         } else {
@@ -622,11 +640,11 @@ impl OwnerApprovals {
                     // The channel dropped the card without an answer.
                     Err(_) => Answer::Declined(COULD_NOT_REACH.to_string()),
                 },
-                _ = tokio::time::sleep(self.timeout) => {
-                    Answer::Declined(no_answer_reason(self.timeout))
+                _ = tokio::time::sleep(wait) => {
+                    Answer::Declined(no_answer_reason(wait))
                 }
                 // The waiting entry is gone (a restart): the card is stale.
-                _ = abandon_rx => Answer::Declined(no_answer_reason(self.timeout)),
+                _ = abandon_rx => Answer::Declined(no_answer_reason(wait)),
                 _ = cancel.cancelled() => {
                     Answer::Declined("the turn was cancelled before the owner answered".to_string())
                 }

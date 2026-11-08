@@ -5,6 +5,7 @@
 //! Who may answer is the caller's decision, made before [`Prompts::answer`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_channels::{
@@ -36,7 +37,57 @@ struct Open {
 /// The prompts a channel has open, by id.
 #[derive(Default)]
 pub(crate) struct Prompts {
-    open: Mutex<HashMap<String, Open>>,
+    open: Arc<Mutex<HashMap<String, Open>>>,
+}
+
+/// Closes a prompt that ends without an answer (it timed out, or whoever
+/// asked stopped waiting and dropped the request): the prompt leaves the
+/// open book and its message loses its buttons, so a stale card can never
+/// be pressed as if it still decided something.
+struct Unanswered {
+    id: String,
+    open: Arc<Mutex<HashMap<String, Open>>>,
+    channel: Arc<dyn Channel>,
+    done: bool,
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let (id, open, channel) = (self.id.clone(), self.open.clone(), self.channel.clone());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let Some(prompt) = open.lock().await.remove(&id) else {
+                return; // answered meanwhile
+            };
+            if let Some((message, text)) = prompt.shown {
+                if let Err(error) = channel
+                    .edit(&message, &expired_text(prompt.kind, &text))
+                    .await
+                {
+                    warn!(%error, prompt = %id, "Failed to mark an unanswered prompt expired");
+                }
+            }
+        });
+    }
+}
+
+/// A prompt's text once it ended without an answer.
+fn expired_text(kind: Kind, text: &str) -> String {
+    match kind {
+        Kind::Approval => format!(
+            "{}\n\n⌛ Expired: no answer in time, so it was declined. Nothing was done.",
+            approval_render::strip_approval_footer(text).trim_end()
+        ),
+        Kind::Goal(_) => format!(
+            "{}\n\n⌛ Expired: no answer in time. Nothing was activated.",
+            text.trim_end()
+        ),
+    }
 }
 
 /// What answering a prompt changed.
@@ -55,7 +106,7 @@ impl Prompts {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn approval(
         &self,
-        channel: &dyn Channel,
+        channel: Arc<dyn Channel>,
         conversation: &Conversation,
         command: &str,
         risk_level: RiskLevel,
@@ -88,7 +139,7 @@ impl Prompts {
     /// Ask to confirm a goal; waits up to thirty minutes. True to confirm.
     pub(crate) async fn goal(
         &self,
-        channel: &dyn Channel,
+        channel: Arc<dyn Channel>,
         conversation: &Conversation,
         description: &str,
         details: &[String],
@@ -111,7 +162,7 @@ impl Prompts {
 
     async fn ask(
         &self,
-        channel: &dyn Channel,
+        channel: Arc<dyn Channel>,
         conversation: &Conversation,
         kind: Kind,
         pages: &[String],
@@ -131,6 +182,12 @@ impl Prompts {
                 shown: None,
             },
         );
+        let mut unanswered = Unanswered {
+            id: id.clone(),
+            open: self.open.clone(),
+            channel: channel.clone(),
+            done: false,
+        };
         let sent = async {
             for page in leading {
                 channel
@@ -154,13 +211,17 @@ impl Prompts {
                 }
             }
             Err(error) => {
+                unanswered.done = true;
                 self.open.lock().await.remove(&id);
                 warn!(%error, "Failed to send a prompt");
                 anyhow::bail!("the prompt could not be delivered: {error}");
             }
         }
         let outcome = tokio::time::timeout(timeout, answered).await;
-        self.open.lock().await.remove(&id);
+        // An answer already took the prompt out of the book and replaced its
+        // message; anything else leaves it to `unanswered`, which expires it.
+        unanswered.done = matches!(outcome, Ok(Ok(_)));
+        drop(unanswered);
         match outcome {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => anyhow::bail!("the prompt was closed without an answer"),
@@ -293,6 +354,45 @@ fn goal_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A card nobody answers loses its buttons: when it times out, and when
+    /// whoever asked stops waiting and drops the request.
+    #[tokio::test]
+    async fn an_unanswered_card_expires() {
+        use aidaemon_channels::testing::{direct, TestChannel};
+        for dropped in [false, true] {
+            let channel = Arc::new(
+                TestChannel::new("synthetic")
+                    .with_buttons(true)
+                    .with_edits(true),
+            );
+            let prompts = Prompts::default();
+            let conversation = direct("synthetic-user-1");
+            let pages = ["Summarize the Acme forecast every Monday".to_string()];
+            let ask = prompts.ask(
+                channel.clone(),
+                &conversation,
+                Kind::Goal(GoalConfirmationStyle::Standard),
+                &pages,
+                goal_choices(GoalConfirmationStyle::Standard),
+                Duration::from_millis(if dropped { 60_000 } else { 50 }),
+            );
+            if dropped {
+                let _ = tokio::time::timeout(Duration::from_millis(50), ask).await;
+            } else {
+                assert!(ask.await.is_err(), "a timeout declines");
+            }
+            assert!(
+                channel
+                    .wait_for(Duration::from_secs(2), |c| !c.edits().is_empty())
+                    .await,
+                "dropped={dropped}: the card was not expired"
+            );
+            let edit = &channel.edits()[0];
+            assert!(edit.text.contains("Expired"), "{}", edit.text);
+            assert!(!prompts.is_open(&channel.prompts()[0].id).await);
+        }
+    }
 
     fn labels(choices: Vec<ApprovalChoice>) -> Vec<String> {
         choices.into_iter().map(|c| c.label).collect()

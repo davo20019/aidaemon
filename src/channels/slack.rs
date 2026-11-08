@@ -2673,7 +2673,7 @@ impl HubChannel for SlackChannel {
     ) -> anyhow::Result<ApprovalResponse> {
         self.prompts
             .approval(
-                self.transport.as_ref(),
+                self.transport.clone(),
                 &self.conversation_for(session_id),
                 command,
                 risk_level,
@@ -2694,7 +2694,7 @@ impl HubChannel for SlackChannel {
     ) -> anyhow::Result<bool> {
         self.prompts
             .goal(
-                self.transport.as_ref(),
+                self.transport.clone(),
                 &self.conversation_for(session_id),
                 goal_description,
                 details,

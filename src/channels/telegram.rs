@@ -4758,7 +4758,7 @@ impl HubChannel for TelegramChannel {
         let transport = self.sdk_transport();
         self.prompts
             .approval(
-                transport.as_ref(),
+                transport,
                 &self.conversation_for(session_id),
                 command,
                 risk_level,
@@ -4780,7 +4780,7 @@ impl HubChannel for TelegramChannel {
         let transport = self.sdk_transport();
         self.prompts
             .goal(
-                transport.as_ref(),
+                transport,
                 &self.conversation_for(session_id),
                 goal_description,
                 details,

@@ -84,7 +84,7 @@ pub(super) fn response_status_detail(response: &ApprovalResponse) -> Option<&'st
 }
 
 /// Strip the pre-decision footer (button hint) from an approval prompt message.
-fn strip_approval_footer(text: &str) -> String {
+pub(super) fn strip_approval_footer(text: &str) -> String {
     let mut body = text.trim_end().to_string();
     for marker in [
         "\n\n\"Allow Session\"",

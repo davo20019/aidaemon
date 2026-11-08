@@ -385,81 +385,106 @@ impl ChannelHub {
             let hub = self.clone();
             tokio::spawn(async move {
                 let queue_telemetry = hub.queue_telemetry.clone();
-                let route = hub.routed_channel(&request.session_id).await;
+                let mut response_tx = request.response_tx;
                 let mut had_error = false;
-                let response = match route {
-                    Some((ch, routed_session)) => match request.kind {
-                        ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation => {
-                            let style =
-                                if matches!(request.kind, ApprovalKind::AutopilotConfirmation) {
+                // Whoever asked may stop waiting (its own timeout, a cancelled
+                // turn); the card is then dropped, which expires it on the
+                // channel instead of leaving live buttons that decide nothing.
+                let asked = async {
+                    let route = hub.routed_channel(&request.session_id).await;
+                    let mut had_error = false;
+                    let response = match route {
+                        Some((ch, routed_session)) => match request.kind {
+                            ApprovalKind::GoalConfirmation
+                            | ApprovalKind::AutopilotConfirmation => {
+                                let style = if matches!(
+                                    request.kind,
+                                    ApprovalKind::AutopilotConfirmation
+                                ) {
                                     crate::types::GoalConfirmationStyle::Autopilot
                                 } else {
                                     crate::types::GoalConfirmationStyle::Standard
                                 };
-                            match ch
-                                .request_goal_confirmation(
-                                    &routed_session,
-                                    &request.command,
-                                    &request.warnings,
-                                    style,
-                                )
-                                .await
-                            {
-                                Ok(true) => Some(ApprovalResponse::AllowOnce),
-                                Ok(false) => Some(ApprovalResponse::Deny),
-                                Err(e) => {
-                                    warn!("Goal confirmation failed on {}: {}", ch.name(), e);
-                                    had_error = true;
-                                    None
-                                }
-                            }
-                        }
-                        ApprovalKind::Command | ApprovalKind::CommandOnce => {
-                            let one_time_only = matches!(request.kind, ApprovalKind::CommandOnce);
-                            match ch
-                                .request_approval(
-                                    &routed_session,
-                                    &request.command,
-                                    request.risk_level,
-                                    &request.warnings,
-                                    request.permission_mode,
-                                    one_time_only,
-                                )
-                                .await
-                            {
-                                Ok(resp) => Some(if one_time_only {
-                                    // Enforce the one-shot boundary even if an
-                                    // older or forged channel callback returns a
-                                    // broader choice that is no longer offered.
-                                    match resp {
-                                        ApprovalResponse::AllowSession
-                                        | ApprovalResponse::AllowAlways => {
-                                            ApprovalResponse::AllowOnce
-                                        }
-                                        other => other,
+                                match ch
+                                    .request_goal_confirmation(
+                                        &routed_session,
+                                        &request.command,
+                                        &request.warnings,
+                                        style,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => Some(ApprovalResponse::AllowOnce),
+                                    Ok(false) => Some(ApprovalResponse::Deny),
+                                    Err(e) => {
+                                        warn!("Goal confirmation failed on {}: {}", ch.name(), e);
+                                        had_error = true;
+                                        None
                                     }
-                                } else {
-                                    resp
-                                }),
-                                Err(e) => {
-                                    warn!("Approval request failed on {}: {}", ch.name(), e);
-                                    had_error = true;
-                                    None
                                 }
                             }
+                            ApprovalKind::Command | ApprovalKind::CommandOnce => {
+                                let one_time_only =
+                                    matches!(request.kind, ApprovalKind::CommandOnce);
+                                match ch
+                                    .request_approval(
+                                        &routed_session,
+                                        &request.command,
+                                        request.risk_level,
+                                        &request.warnings,
+                                        request.permission_mode,
+                                        one_time_only,
+                                    )
+                                    .await
+                                {
+                                    Ok(resp) => Some(if one_time_only {
+                                        // Enforce the one-shot boundary even if an
+                                        // older or forged channel callback returns a
+                                        // broader choice that is no longer offered.
+                                        match resp {
+                                            ApprovalResponse::AllowSession
+                                            | ApprovalResponse::AllowAlways => {
+                                                ApprovalResponse::AllowOnce
+                                            }
+                                            other => other,
+                                        }
+                                    } else {
+                                        resp
+                                    }),
+                                    Err(e) => {
+                                        warn!("Approval request failed on {}: {}", ch.name(), e);
+                                        had_error = true;
+                                        None
+                                    }
+                                }
+                            }
+                        },
+                        None => {
+                            warn!(
+                                "No channel found for session {}; approval unavailable",
+                                request.session_id
+                            );
+                            had_error = true;
+                            None
                         }
-                    },
-                    None => {
-                        warn!(
-                            "No channel found for session {}; approval unavailable",
-                            request.session_id
+                    };
+                    (response, had_error)
+                };
+                let response = tokio::select! {
+                    (response, failed) = asked => {
+                        had_error = failed;
+                        response
+                    }
+                    _ = response_tx.closed() => {
+                        info!(
+                            session_id = %request.session_id,
+                            "Approval requester stopped waiting; the card expires"
                         );
-                        had_error = true;
                         None
                     }
                 };
                 if let Some(response) = response {
-                    if request.response_tx.send(response).is_err() {
+                    if response_tx.send(response).is_err() {
                         had_error = true;
                         warn!(
                             session_id = %request.session_id,

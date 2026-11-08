@@ -663,7 +663,7 @@ impl HubChannel for DiscordChannel {
         let conversation = self.conversation_for(session_id).await?;
         self.prompts
             .approval(
-                self.transport().as_ref(),
+                self.transport(),
                 &conversation,
                 command,
                 risk_level,
@@ -685,7 +685,7 @@ impl HubChannel for DiscordChannel {
         let conversation = self.conversation_for(session_id).await?;
         self.prompts
             .goal(
-                self.transport().as_ref(),
+                self.transport(),
                 &conversation,
                 goal_description,
                 details,
