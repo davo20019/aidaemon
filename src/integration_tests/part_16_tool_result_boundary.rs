@@ -753,6 +753,7 @@ impl GuiStandIn {
     }
 }
 
+#[cfg(feature = "computer_use")]
 impl crate::traits::ToolSemantics for GuiStandIn {}
 
 /// A GUI success claim does not ship while the last coordinate click is
