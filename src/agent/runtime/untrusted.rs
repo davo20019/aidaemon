@@ -315,10 +315,11 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
 }
 
 /// Ask a clean model whether performing exactly this call is consistent with
-/// and needed for the owner's request. One tool-less, single-attempt call on
-/// the primary model; a timeout, error or unreadable reply is
-/// `could not verify` (not consistent). A cancelled turn stops waiting and
-/// the call is refused as `cancelled`.
+/// and needed for the owner's request. One tool-less call on the primary
+/// model, moving to the failover providers only while the provider cannot
+/// serve at all. A timeout, a failure tied to this request, an unreadable
+/// reply, or no provider left is `could not verify` (not consistent). A
+/// cancelled turn stops waiting and the call is refused as `cancelled`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn verify_untrusted_call(
     runtime: &SharedLlmRuntime,
@@ -332,8 +333,38 @@ pub(in crate::agent) async fn verify_untrusted_call(
 ) -> VerifierVerdict {
     let messages = verifier_messages(origin_request, origin_trusted, tool, description, arguments);
     let snapshot = runtime.snapshot();
-    let provider = snapshot.provider();
-    let model = snapshot.primary_model();
+    let models = snapshot.with_failover_models(vec![snapshot.primary_model()]);
+    let backend = snapshot.model_routed_backend();
+    let answer = tokio::select! {
+        answer = ask_verifier(&backend, &models, &messages, tool, telemetry) => answer,
+        _ = cancel.cancelled() => {
+            return VerifierVerdict {
+                consistent: false,
+                reason: "cancelled".to_string(),
+            };
+        }
+    };
+    let Some(response) = answer else {
+        return could_not_verify();
+    };
+    let raw = response
+        .content
+        .as_deref()
+        .or(response.thinking.as_deref())
+        .unwrap_or_default();
+    parse_verdict(raw)
+}
+
+/// The first answer from `models`, within one shared time budget. Only an
+/// infrastructure failure moves to the next model: a failure tied to this
+/// request must not let the content being judged pick a different judge.
+async fn ask_verifier(
+    backend: &crate::llm_runtime::ModelBackend,
+    models: &[String],
+    messages: &[Value],
+    tool: &str,
+    telemetry: Option<VerifierTelemetry<'_>>,
+) -> Option<crate::traits::ProviderResponse> {
     let options = ChatOptions {
         response_mode: ResponseMode::JsonSchema {
             name: VERIFIER_PURPOSE.to_string(),
@@ -345,68 +376,63 @@ pub(in crate::agent) async fn verify_untrusted_call(
         single_attempt_fail_closed: true,
         ..ChatOptions::default()
     };
-    let started = Instant::now();
-    let call = tokio::time::timeout(
-        VERIFIER_TIMEOUT,
-        provider.chat_with_options(&model, &messages, &[], &options),
-    );
-    let answer = tokio::select! {
-        answer = call => answer,
-        _ = cancel.cancelled() => {
-            return VerifierVerdict {
-                consistent: false,
-                reason: "cancelled".to_string(),
-            };
-        }
-    };
-    let outcome = match answer {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => {
-            warn!(tool, %error, "Untrusted call verifier failed");
-            Err(error.to_string())
-        }
-        Err(_) => {
-            warn!(tool, "Untrusted call verifier timed out");
-            Err(format!("timed out after {}s", VERIFIER_TIMEOUT.as_secs()))
-        }
-    };
-    if let Some(telemetry) = telemetry {
-        match &outcome {
-            Ok(response) => {
-                crate::events::record_background_model_call_telemetry(
-                    telemetry.event_store,
-                    telemetry.state,
-                    telemetry.session_id,
-                    VERIFIER_PURPOSE,
-                    &model,
-                    response,
-                    started.elapsed(),
-                )
-                .await
+    let deadline = Instant::now() + VERIFIER_TIMEOUT;
+    for model in models {
+        let started = Instant::now();
+        let remaining = deadline.saturating_duration_since(started);
+        let answer = tokio::time::timeout(
+            remaining,
+            backend.chat_with_options(model, messages, &[], &options),
+        )
+        .await;
+        let (failure, try_next) = match answer {
+            Ok(Ok(response)) => {
+                if let Some(telemetry) = &telemetry {
+                    crate::events::record_background_model_call_telemetry(
+                        telemetry.event_store.clone(),
+                        telemetry.state,
+                        telemetry.session_id,
+                        VERIFIER_PURPOSE,
+                        model,
+                        &response,
+                        started.elapsed(),
+                    )
+                    .await;
+                }
+                return Some(response);
             }
-            Err(error) => {
-                crate::events::record_background_model_call_failure(
-                    telemetry.event_store,
-                    telemetry.state,
-                    telemetry.session_id,
-                    VERIFIER_PURPOSE,
-                    &model,
-                    error,
-                    started.elapsed(),
-                )
-                .await
+            Ok(Err(error)) => {
+                warn!(tool, %model, %error, "Untrusted call verifier failed");
+                let infrastructure = error
+                    .downcast_ref::<crate::providers::ProviderError>()
+                    .is_some_and(|error| error.kind.is_infrastructure_failure());
+                (error.to_string(), infrastructure)
             }
+            Err(_) => {
+                warn!(tool, %model, "Untrusted call verifier timed out");
+                (
+                    format!("timed out after {}s", VERIFIER_TIMEOUT.as_secs()),
+                    false,
+                )
+            }
+        };
+        if let Some(telemetry) = &telemetry {
+            crate::events::record_background_model_call_failure(
+                telemetry.event_store.clone(),
+                telemetry.state,
+                telemetry.session_id,
+                VERIFIER_PURPOSE,
+                model,
+                &failure,
+                started.elapsed(),
+            )
+            .await;
+        }
+        if !try_next {
+            return None;
         }
     }
-    let Ok(response) = outcome else {
-        return could_not_verify();
-    };
-    let raw = response
-        .content
-        .as_deref()
-        .or(response.thinking.as_deref())
-        .unwrap_or_default();
-    parse_verdict(raw)
+    None
 }
 
 /// Settles the kernel's untrusted-egress interruptions with the verifier:
@@ -489,6 +515,116 @@ pub(in crate::agent) const UNTRUSTED_BLOCKED: &str = "[UNTRUSTED BLOCKED]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quota_exhausted() -> crate::providers::ProviderError {
+        let mut error = crate::providers::ProviderError::from_status(429, "plan limit");
+        error.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        error
+    }
+
+    /// A harness whose primary fails with `primary_error` and whose failover
+    /// provider has `failover` to answer with, for checking who was asked.
+    async fn verify_with_primary_error(
+        primary_error: crate::providers::ProviderError,
+        failover: Vec<crate::traits::ProviderResponse>,
+    ) -> (VerifierVerdict, Vec<String>) {
+        use crate::llm_runtime::{ModelBackend, ProviderRuntimeTarget};
+        use crate::testing::MockProvider;
+        let harness = crate::testing::setup_test_agent(MockProvider::new())
+            .await
+            .unwrap();
+        let primary: ModelBackend =
+            Arc::new(MockProvider::new().with_leading_provider_errors(vec![primary_error]));
+        let second = Arc::new(MockProvider::with_responses(failover));
+        harness.agent.llm_runtime.swap(
+            primary,
+            None,
+            crate::config::ProviderKind::OpenaiChatgpt,
+            "plan-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                second.clone() as ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "failover-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+        let verdict = verify_untrusted_call(
+            &harness.agent.llm_runtime,
+            None,
+            "Send Jordan Lee the summary.",
+            true,
+            "send_probe",
+            "Sends a synthetic message.",
+            &json!({"to": "jordan@example.invalid"}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let asked = second
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .map(|call| call.model.clone())
+            .collect();
+        (verdict, asked)
+    }
+
+    /// A provider that cannot serve must not disable the check while another
+    /// provider can still judge the call.
+    #[tokio::test]
+    async fn the_verifier_moves_to_a_failover_provider_when_the_plan_is_out() {
+        use crate::testing::MockProvider;
+        let (verdict, asked) = verify_with_primary_error(
+            quota_exhausted(),
+            vec![MockProvider::text_response(
+                r#"{"consistent":true,"reason":"asked"}"#,
+            )],
+        )
+        .await;
+        assert!(verdict.consistent, "{verdict:?}");
+        assert_eq!(asked, ["failover-model"]);
+    }
+
+    /// The failover provider's own verdict stands: moving providers never
+    /// turns a refusal into an approval.
+    #[tokio::test]
+    async fn a_failover_refusal_still_refuses() {
+        use crate::testing::MockProvider;
+        let (verdict, _) = verify_with_primary_error(
+            quota_exhausted(),
+            vec![MockProvider::text_response(
+                r#"{"consistent":false,"reason":"not asked"}"#,
+            )],
+        )
+        .await;
+        assert!(!verdict.consistent);
+        assert_eq!(verdict.reason, "not asked");
+    }
+
+    /// With every provider down the check still fails closed.
+    #[tokio::test]
+    async fn no_provider_left_is_could_not_verify() {
+        let (verdict, asked) = verify_with_primary_error(quota_exhausted(), vec![]).await;
+        assert_eq!(verdict, could_not_verify());
+        assert_eq!(asked, ["failover-model"]);
+    }
+
+    /// A failure tied to this request stays on the primary, so the content
+    /// being judged cannot steer the check onto another model.
+    #[tokio::test]
+    async fn a_request_failure_does_not_change_the_judge() {
+        use crate::testing::MockProvider;
+        let (verdict, asked) = verify_with_primary_error(
+            crate::providers::ProviderError::from_status(400, "rejected"),
+            vec![MockProvider::text_response(
+                r#"{"consistent":true,"reason":"asked"}"#,
+            )],
+        )
+        .await;
+        assert_eq!(verdict, could_not_verify());
+        assert!(asked.is_empty(), "{asked:?}");
+    }
 
     /// A turn cancelled while the verifier is deciding stops waiting at
     /// once and the call is refused.
