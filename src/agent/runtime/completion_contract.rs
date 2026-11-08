@@ -60,31 +60,6 @@ pub(super) enum ForbiddenMutationAction {
 
 impl ForbiddenMutationAction {}
 
-/// Parse a task-assessor operation constraint. Unknown values are ignored so a
-/// malformed model response cannot invent a new policy action.
-pub(super) fn parse_planned_forbidden_action(value: &str) -> Option<ForbiddenMutationAction> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "create" => Some(ForbiddenMutationAction::Create),
-        "delete" => Some(ForbiddenMutationAction::Delete),
-        "deploy" => Some(ForbiddenMutationAction::Deploy),
-        "publish" => Some(ForbiddenMutationAction::Publish),
-        "post" => Some(ForbiddenMutationAction::Post),
-        "send" => Some(ForbiddenMutationAction::Send),
-        _ => None,
-    }
-}
-
-/// The assessed contract's view of what the run may NOT do. No gate enforces
-/// it any more: tool authority is resolved from explicit facts
-/// (`agent::authority`) and the closeout arbiter reads that.
-pub(crate) struct RequestAuthority<'a> {
-    pub forbids_mutation: bool,
-    pub forbids_tool_use: bool,
-    pub allowed_tool_names: &'a [String],
-    pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
-    pub owner_control_plane_tools: &'a [String],
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionContract {
     /// Current task that owns every field, target, requirement, and constraint
@@ -107,8 +82,7 @@ pub(super) struct CompletionContract {
     /// Explicit allow-only tool boundary. Empty means no name-level allowlist.
     pub allowed_tool_names: Vec<String>,
     /// Owner control-plane tools the runtime keeps outside a narrowed
-    /// allowlist (owner, private channel, scope not forbidden). Never an
-    /// assessor output; only their gated calls are admitted.
+    /// allowlist. Kept so older persisted contracts keep round-tripping.
     pub owner_control_plane_tools: Vec<String>,
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
@@ -144,39 +118,6 @@ pub(super) struct CompletionContract {
 }
 
 impl CompletionContract {
-    /// The fail-closed authority half of this contract.
-    ///
-    /// The assessor's `allowed_tool_names` is a planning hint, not a limit: a
-    /// pre-run model sample must never hide or refuse a tool (it once hid
-    /// `manage_mandates` for a mandate request). The field stays on the
-    /// contract for persistence and logging, but this view exposes no
-    /// name-level allowlist (and so no control-plane carve-out either).
-    ///
-    /// No longer enforced: tool authority is resolved from explicit facts
-    /// (`agent::authority`). Not read by any gate.
-    #[allow(dead_code)]
-    pub(crate) fn authority(&self) -> RequestAuthority<'_> {
-        RequestAuthority {
-            forbids_mutation: self.forbids_mutation,
-            forbids_tool_use: self.forbids_tool_use,
-            allowed_tool_names: &[],
-            forbidden_tool_scopes: &self.forbidden_tool_scopes,
-            owner_control_plane_tools: &[],
-        }
-    }
-
-    /// The full assessed authority view, allowlist included. Used only for
-    /// `assessor_would_refuse` shadow logging; never a gate.
-    pub(crate) fn authority_as_assessed(&self) -> RequestAuthority<'_> {
-        RequestAuthority {
-            forbids_mutation: self.forbids_mutation,
-            forbids_tool_use: self.forbids_tool_use,
-            allowed_tool_names: &self.allowed_tool_names,
-            forbidden_tool_scopes: &self.forbidden_tool_scopes,
-            owner_control_plane_tools: &self.owner_control_plane_tools,
-        }
-    }
-
     pub(super) fn adopt_for_task(&mut self, task_id: &str) {
         if let Some(prior) = self
             .scope_task_id
@@ -538,146 +479,6 @@ pub(super) fn inherit_request_constraints(
     current
 }
 
-/// Map a planner-supplied task-kind string to the enum. Unknown values map
-/// to None so a hallucinated kind never overrides the keyword inference.
-pub(super) fn parse_planned_task_kind(value: &str) -> Option<CompletionTaskKind> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "conversational" => Some(CompletionTaskKind::Conversational),
-        "answer" => Some(CompletionTaskKind::Answer),
-        "check" => Some(CompletionTaskKind::Check),
-        "find" => Some(CompletionTaskKind::Find),
-        "change" => Some(CompletionTaskKind::Change),
-        "deliver" => Some(CompletionTaskKind::Deliver),
-        "schedule" => Some(CompletionTaskKind::Schedule),
-        "monitor" => Some(CompletionTaskKind::Monitor),
-        "diagnose" => Some(CompletionTaskKind::Diagnose),
-        _ => None,
-    }
-}
-
-/// Parse semantic outcome requirements from the task assessment. Unknown
-/// values reject the whole refinement so a malformed list cannot silently
-/// weaken or distort the completion contract.
-pub(super) fn parse_planned_mutation_effects(values: &[String]) -> Option<ToolMutationEffects> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut effects = ToolMutationEffects::NONE;
-    for value in values {
-        let effect = match value.trim().to_ascii_lowercase().as_str() {
-            "local_source_write" => ToolMutationEffects::LOCAL_SOURCE_WRITE,
-            "local_workspace_write" => ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
-            "local_derived_write" => ToolMutationEffects::LOCAL_DERIVED_WRITE,
-            "repository_write" => ToolMutationEffects::REPOSITORY_WRITE,
-            "remote_mutation" => ToolMutationEffects::REMOTE_MUTATION,
-            "remote_deploy" => ToolMutationEffects::REMOTE_DEPLOY,
-            "external_delivery" => ToolMutationEffects::EXTERNAL_DELIVERY,
-            "process_state" => ToolMutationEffects::PROCESS_STATE,
-            "configuration" => ToolMutationEffects::CONFIGURATION,
-            "destructive" => ToolMutationEffects::DESTRUCTIVE,
-            "unspecified" => ToolMutationEffects::UNSPECIFIED,
-            _ => return None,
-        };
-        effects = effects.union(effect);
-    }
-    Some(effects)
-}
-
-/// Add semantically classified positive proof obligations. This never grants
-/// permission and never erases deterministic requirements; it only prevents a
-/// mismatched mutation from being treated as completion.
-#[cfg(test)]
-pub(super) fn apply_planned_required_mutation_effects(
-    contract: &mut CompletionContract,
-    effects: Option<ToolMutationEffects>,
-) {
-    if contract.expects_mutation && !contract.forbids_mutation {
-        if let Some(effects) = effects.filter(|effects| !effects.is_empty()) {
-            contract.required_mutation_effects = contract.required_mutation_effects.union(effects);
-        }
-    }
-}
-
-/// Replace advisory text inference with a complete, validated semantic task
-/// contract. Exact resource identities survive because they are structural
-/// evidence extracted from the request; lexical obligation guesses do not.
-pub(super) struct SemanticCompletionRequirements {
-    pub expects_mutation: bool,
-    pub requires_observation: bool,
-    pub task_kind: CompletionTaskKind,
-    pub required_mutation_effects: ToolMutationEffects,
-}
-
-/// Evidence-quality policy is deliberately separate from task lifecycle.
-/// A malformed or inapplicable research threshold must not rewrite whether a
-/// task mutates state, requires an observation, or is complete.
-pub(super) struct SemanticEvidencePolicy {
-    pub minimum_sources: usize,
-    pub requires_primary_sources: bool,
-    pub requires_exact_history: bool,
-}
-
-pub(super) fn apply_semantic_evidence_policy(
-    contract: &mut CompletionContract,
-    policy: SemanticEvidencePolicy,
-) {
-    // Evidence policy is monotonic within one unfinished request lifecycle.
-    // A related continuation may add a stronger requirement, but a partial or
-    // empty assessment lane must never erase a persisted outstanding one.
-    // Installing a genuinely new semantic lifecycle resets these fields first.
-    contract.minimum_sources = contract.minimum_sources.max(policy.minimum_sources);
-    contract.requires_primary_sources |= policy.requires_primary_sources;
-    contract.requires_exact_history |= policy.requires_exact_history;
-}
-
-/// Restrictive capability and response-shape policy compiled independently
-/// from completion obligations. Applying this lane can only preserve or reduce
-/// authority; it never creates a mutation/evidence obligation.
-pub(super) struct SemanticAuthorityRequirements<'a> {
-    pub mutation_scope: &'a str,
-    pub forbidden_actions: &'a [ForbiddenMutationAction],
-    pub forbids_tool_use: bool,
-    pub allowed_tool_names: &'a [String],
-    pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
-}
-
-pub(super) fn apply_semantic_authority(
-    contract: &mut CompletionContract,
-    authority: SemanticAuthorityRequirements<'_>,
-) {
-    match authority.mutation_scope {
-        "read_only" | "read-only" => {
-            contract.forbids_mutation = true;
-            contract.expects_mutation = false;
-            contract.required_mutation_effects = ToolMutationEffects::NONE;
-            contract.requires_reverification_after_mutation = false;
-            contract.forbidden_mutation_actions.clear();
-        }
-        "scoped" => {
-            for action in authority.forbidden_actions {
-                if !contract.forbidden_mutation_actions.contains(action) {
-                    contract.forbidden_mutation_actions.push(*action);
-                }
-            }
-        }
-        _ => {}
-    }
-
-    if authority.forbids_tool_use {
-        contract.forbids_tool_use = true;
-        contract.allowed_tool_names.clear();
-        contract.requires_observation = false;
-        contract.explicit_verification_requested = false;
-    } else if !authority.allowed_tool_names.is_empty() {
-        contract.allowed_tool_names = authority.allowed_tool_names.to_vec();
-    }
-    for scope in authority.forbidden_tool_scopes {
-        if !contract.forbidden_tool_scopes.contains(scope) {
-            contract.forbidden_tool_scopes.push(*scope);
-        }
-    }
-}
-
 fn structural_evidence_requirement(
     targets: &[VerificationTarget],
 ) -> Option<RequestEvidenceRequirement> {
@@ -712,119 +513,9 @@ fn structural_evidence_requirement(
     })
 }
 
-pub(super) fn install_semantic_completion_contract(
-    contract: &mut CompletionContract,
-    requirements: SemanticCompletionRequirements,
-) {
-    let verification_targets = std::mem::take(&mut contract.verification_targets);
-    let scope_task_id = contract.scope_task_id.take();
-    let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
-    let expects_mutation = requirements.expects_mutation;
-
-    *contract = CompletionContract {
-        scope_task_id,
-        adopted_from_task_ids,
-        task_kind: requirements.task_kind,
-        expects_mutation,
-        required_mutation_effects: if expects_mutation {
-            requirements.required_mutation_effects
-        } else {
-            ToolMutationEffects::NONE
-        },
-        forbids_mutation: false,
-        forbids_tool_use: false,
-        allowed_tool_names: Vec::new(),
-        owner_control_plane_tools: Vec::new(),
-        forbidden_tool_scopes: Vec::new(),
-        dispatch_stop_rules: Vec::new(),
-        required_response_fields: Vec::new(),
-        response_contract: None,
-        forbidden_mutation_actions: Vec::new(),
-        requires_observation: requirements.requires_observation,
-        requires_reverification_after_mutation: expects_mutation
-            && requirements.requires_observation,
-        // This now records a semantic observation obligation, not an English
-        // verification-phrase match.
-        explicit_verification_requested: requirements.requires_observation,
-        minimum_sources: 0,
-        requires_primary_sources: false,
-        requires_exact_history: false,
-        evidence_requirements: Vec::new(),
-        adopted_evidence_bindings: Vec::new(),
-        connected_content_mode: super::intent_routing::ConnectedContentMode::None,
-        verification_targets,
-    };
-}
-
-/// Add independently recovered invocation proof without changing any
-/// authority decision. This is intentionally additive and non-authorizing:
-/// tool/mutation/filesystem policy remains owned by the complete semantic
-/// contract (or its fail-closed fallback).
-pub(super) fn append_required_invocation_obligations(
-    contract: &mut CompletionContract,
-    required_invocations: &[crate::traits::RequestReceiptPredicate],
-) {
-    if contract.forbids_tool_use || required_invocations.is_empty() {
-        return;
-    }
-    for receipt in required_invocations {
-        let duplicate = contract
-            .evidence_requirements
-            .iter()
-            .any(|requirement| requirement.receipt.as_ref() == Some(receipt));
-        if !duplicate {
-            contract
-                .evidence_requirements
-                .push(RequestEvidenceRequirement {
-                    summary: "Complete the exact requested machine invocation".to_string(),
-                    acceptable_scopes: Vec::new(),
-                    purpose: crate::traits::EvidencePurpose::Outcome,
-                    minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                    temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
-                    required_content_markers: Vec::new(),
-                    receipt: Some(receipt.clone()),
-                    target: None,
-                });
-        }
-    }
-    contract.requires_observation = true;
-}
-
-/// Add independently compiled subject-evidence obligations without replacing
-/// lifecycle state or authority. This is the non-receipt sibling of
-/// `append_required_invocation_obligations`; both lanes remain useful even when
-/// another semantic lane is malformed.
-pub(super) fn append_evidence_obligations(
-    contract: &mut CompletionContract,
-    requirements: &[RequestEvidenceRequirement],
-) {
-    if contract.forbids_tool_use || requirements.is_empty() {
-        return;
-    }
-    for mut requirement in requirements.iter().cloned() {
-        requirement.required_content_markers.clear();
-        requirement
-            .acceptable_scopes
-            .sort_by_key(|scope| scope.as_str());
-        requirement.acceptable_scopes.dedup();
-        let duplicate = contract.evidence_requirements.iter().any(|existing| {
-            existing.acceptable_scopes == requirement.acceptable_scopes
-                && existing.purpose == requirement.purpose
-                && existing.minimum_authority == requirement.minimum_authority
-                && existing.temporal_scope == requirement.temporal_scope
-                && existing.receipt == requirement.receipt
-                && existing.target == requirement.target
-        });
-        if !duplicate {
-            contract.evidence_requirements.push(requirement);
-        }
-    }
-    contract.requires_observation |= !requirements.is_empty();
-}
-
-/// Remove language-derived obligations when semantic assessment was skipped or
-/// failed. Exact URLs and structurally resolved paths remain target hints for
-/// one generic observation obligation.
+/// Reduce the bootstrap contract to what the request structurally names: exact
+/// URLs and structurally resolved paths remain target hints for one generic
+/// observation obligation.
 ///
 /// A resource identity is not itself a material information need. A request can
 /// mention a working directory, an executable path, an earlier comparison
@@ -833,24 +524,14 @@ pub(super) fn append_evidence_obligations(
 /// The successful observation must still match at least one exact target, but
 /// the fallback creates only one evidence need regardless of how many
 /// identities were extracted.
-pub(super) fn retain_structural_completion_contract(
-    contract: &mut CompletionContract,
-    typed_obligation_pending: bool,
-) {
+pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let scope_task_id = contract.scope_task_id.take();
     let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
-    let requires_observation = typed_obligation_pending || !verification_targets.is_empty();
-    // Structural resources are matching hints for a typed obligation when one
-    // already exists. Creating a second generic proof node from the same path
-    // would make one requested invocation require two unrelated observations.
-    let evidence_requirements = if typed_obligation_pending {
-        Vec::new()
-    } else {
-        structural_evidence_requirement(&verification_targets)
-            .into_iter()
-            .collect()
-    };
+    let requires_observation = !verification_targets.is_empty();
+    let evidence_requirements = structural_evidence_requirement(&verification_targets)
+        .into_iter()
+        .collect();
     *contract = CompletionContract {
         scope_task_id,
         adopted_from_task_ids,
@@ -869,8 +550,7 @@ pub(super) fn retain_structural_completion_contract(
 
 /// Construct the bootstrap contract from concrete resource identities only,
 /// with relative filesystem targets anchored to the turn's typed workspace
-/// (or the daemon cwd when the turn has none). Semantic obligations are
-/// installed later by task assessment.
+/// (or the daemon cwd when the turn has none).
 pub(super) fn infer_structural_completion_contract_anchored(
     text: &str,
     alias_roots: &[String],
@@ -884,90 +564,8 @@ pub(super) fn infer_structural_completion_contract_anchored(
         ),
         ..CompletionContract::default()
     };
-    retain_structural_completion_contract(&mut contract, false);
+    retain_structural_completion_contract(&mut contract);
     contract
-}
-
-/// Refine a keyword-inferred contract with the planning LLM's classification.
-/// The planner read the actual request (any language), so its signals win —
-/// with one exception: an explicit user verification request ("verify it",
-/// "make sure") is never relaxed by a planner saying observation isn't needed.
-#[cfg(test)]
-pub(super) fn apply_planned_contract_signals(
-    contract: &mut CompletionContract,
-    expects_mutation: Option<bool>,
-    requires_observation: Option<bool>,
-    task_kind: Option<CompletionTaskKind>,
-) {
-    let scoped_mutation_obligation =
-        contract.expects_mutation && !contract.forbidden_mutation_actions.is_empty();
-    if let Some(kind) = task_kind {
-        contract.task_kind = kind;
-    }
-    if let Some(mutation) = expects_mutation {
-        if contract.forbids_mutation {
-            contract.expects_mutation = false;
-            contract.required_mutation_effects = ToolMutationEffects::NONE;
-            contract.requires_reverification_after_mutation = false;
-        } else if !mutation && scoped_mutation_obligation {
-            // A planner can mistake "build locally, but do not deploy" for a
-            // report-only request. Preserve the positive work obligation while
-            // the operation-specific restriction remains independently enforced.
-        } else {
-            contract.expects_mutation = mutation;
-            if mutation && contract.required_mutation_effects.is_empty() {
-                contract.required_mutation_effects = ToolMutationEffects::UNSPECIFIED;
-            }
-        }
-        if !contract.expects_mutation {
-            contract.required_mutation_effects = ToolMutationEffects::NONE;
-            // No mutation expected → nothing to re-verify after one.
-            contract.requires_reverification_after_mutation = false;
-        }
-    }
-    if let Some(observation) = requires_observation {
-        if observation {
-            contract.requires_observation = true;
-        } else if !contract.explicit_verification_requested {
-            contract.requires_observation = false;
-        }
-    }
-}
-
-/// Apply semantic negative mutation constraints from the task assessment.
-///
-/// This is additive by design: a model classification may discover a
-/// non-English constraint, but it may never erase a deterministic constraint
-/// already found in the request. `read_only` is global; `scoped` blocks only
-/// the supplied operations and leaves other required mutations available.
-#[cfg(test)]
-pub(super) fn apply_planned_mutation_constraints(
-    contract: &mut CompletionContract,
-    mutation_scope: Option<&str>,
-    forbidden_actions: &[ForbiddenMutationAction],
-) {
-    let scope = mutation_scope
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match scope.as_str() {
-        "read_only" | "read-only" => {
-            contract.forbids_mutation = true;
-            contract.expects_mutation = false;
-            contract.required_mutation_effects = ToolMutationEffects::NONE;
-            contract.requires_reverification_after_mutation = false;
-        }
-        "scoped" => {
-            for action in forbidden_actions {
-                if !contract.forbidden_mutation_actions.contains(action) {
-                    contract.forbidden_mutation_actions.push(*action);
-                }
-            }
-        }
-        // `allowed`, absent, and unknown values cannot relax a deterministic
-        // negative obligation.
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -2603,196 +2201,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assessed_allowlist_neither_hides_nor_refuses_tools() {
-        let contract = CompletionContract {
-            allowed_tool_names: vec!["http_request".to_string()],
-            ..CompletionContract::default()
-        };
-        assert!(
-            crate::agent::closeout::ClosingAuthority::from_authority(contract.authority())
-                .admits_tool("manage_mandates", Some(false))
-        );
-    }
-
-    #[test]
-    fn semantic_contract_replaces_advisory_obligations_but_keeps_exact_targets() {
-        let target = VerificationTarget {
-            kind: VerificationTargetKind::Url,
-            value: "https://example.test/status".to_string(),
-        };
-        let mut contract = CompletionContract {
-            scope_task_id: Some("task-current".to_string()),
-            adopted_from_task_ids: Vec::new(),
-            task_kind: CompletionTaskKind::Deliver,
-            expects_mutation: true,
-            required_mutation_effects: ToolMutationEffects::REMOTE_DEPLOY,
-            forbids_mutation: true,
-            forbids_tool_use: false,
-            allowed_tool_names: Vec::new(),
-            owner_control_plane_tools: Vec::new(),
-            forbidden_tool_scopes: Vec::new(),
-            dispatch_stop_rules: Vec::new(),
-            required_response_fields: Vec::new(),
-            response_contract: None,
-            forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
-            requires_observation: true,
-            requires_reverification_after_mutation: true,
-            explicit_verification_requested: true,
-            minimum_sources: 3,
-            requires_primary_sources: true,
-            requires_exact_history: true,
-            evidence_requirements: Vec::new(),
-            adopted_evidence_bindings: Vec::new(),
-            connected_content_mode: super::super::intent_routing::ConnectedContentMode::DeliverOnly,
-            verification_targets: vec![target.clone()],
-        };
-
-        install_semantic_completion_contract(
-            &mut contract,
-            SemanticCompletionRequirements {
-                expects_mutation: false,
-                requires_observation: true,
-                task_kind: CompletionTaskKind::Check,
-                required_mutation_effects: ToolMutationEffects::NONE,
-            },
-        );
-
-        assert_eq!(contract.task_kind, CompletionTaskKind::Check);
-        assert!(!contract.expects_mutation);
-        assert!(!contract.forbids_mutation);
-        assert!(contract.forbidden_mutation_actions.is_empty());
-        assert_eq!(contract.minimum_sources, 0);
-        assert!(!contract.requires_exact_history);
-        assert_eq!(contract.verification_targets, vec![target]);
-    }
-
-    #[test]
-    fn explicit_no_tool_contract_keeps_limitations_without_verification_loop() {
-        let requirement = RequestEvidenceRequirement {
-            summary: "Establish the current synthetic release".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::ExternalRemote],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: Vec::new(),
-            receipt: None,
-            target: None,
-        };
-        let mut contract = CompletionContract::default();
-        install_semantic_completion_contract(
-            &mut contract,
-            SemanticCompletionRequirements {
-                expects_mutation: false,
-                requires_observation: true,
-                task_kind: CompletionTaskKind::Answer,
-                required_mutation_effects: ToolMutationEffects::NONE,
-            },
-        );
-        append_evidence_obligations(&mut contract, std::slice::from_ref(&requirement));
-        apply_semantic_authority(
-            &mut contract,
-            SemanticAuthorityRequirements {
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
-                forbids_tool_use: true,
-                allowed_tool_names: &[],
-                forbidden_tool_scopes: &[],
-            },
-        );
-
-        assert!(contract.forbids_tool_use);
-        assert!(!contract.requires_observation);
-        assert!(!contract.explicit_verification_requested);
-        assert_eq!(contract.evidence_requirements, vec![requirement]);
-        let progress = CompletionProgress::new(&contract, "test-task");
-        assert!(!progress.verification_pending);
-    }
-
-    #[test]
-    fn restricted_tool_contract_preserves_observation_obligation() {
-        let requirement = RequestEvidenceRequirement {
-            summary: "Inspect the execution environment".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: vec!["cargo".to_string()],
-            receipt: None,
-            target: None,
-        };
-        let mut contract = CompletionContract::default();
-        install_semantic_completion_contract(
-            &mut contract,
-            SemanticCompletionRequirements {
-                expects_mutation: false,
-                requires_observation: true,
-                task_kind: CompletionTaskKind::Check,
-                required_mutation_effects: ToolMutationEffects::NONE,
-            },
-        );
-        append_evidence_obligations(&mut contract, std::slice::from_ref(&requirement));
-        apply_semantic_authority(
-            &mut contract,
-            SemanticAuthorityRequirements {
-                mutation_scope: "allowed",
-                forbidden_actions: &[],
-                forbids_tool_use: false,
-                allowed_tool_names: &["check_environment".to_string()],
-                forbidden_tool_scopes: &[],
-            },
-        );
-        assert_eq!(contract.allowed_tool_names, ["check_environment"]);
-        assert!(contract.requires_observation);
-        assert!(!contract.forbids_tool_use);
-        assert_eq!(contract.evidence_requirements.len(), 1);
-        assert!(contract.evidence_requirements[0]
-            .required_content_markers
-            .is_empty());
-        assert_eq!(
-            contract.evidence_requirements[0].acceptable_scopes,
-            [crate::traits::ToolSemanticScope::HostLocal]
-        );
-    }
-
-    #[test]
-    fn semantic_contract_deduplicates_prose_variants_but_keeps_subject_scope() {
-        let make = |summary: &str, marker: &str| RequestEvidenceRequirement {
-            summary: summary.to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
-            required_content_markers: vec![marker.to_string()],
-            receipt: None,
-            target: None,
-        };
-        let requirements = vec![
-            make("Find the user's pet information", "pets"),
-            make("Determine whether animals are recorded", "animals"),
-        ];
-        let mut contract = CompletionContract::default();
-        install_semantic_completion_contract(
-            &mut contract,
-            SemanticCompletionRequirements {
-                expects_mutation: false,
-                requires_observation: true,
-                task_kind: CompletionTaskKind::Answer,
-                required_mutation_effects: ToolMutationEffects::NONE,
-            },
-        );
-        append_evidence_obligations(&mut contract, &requirements);
-
-        assert_eq!(contract.evidence_requirements.len(), 1);
-        assert_eq!(
-            contract.evidence_requirements[0].acceptable_scopes,
-            [crate::traits::ToolSemanticScope::UserMemory]
-        );
-        assert!(contract.evidence_requirements[0]
-            .required_content_markers
-            .is_empty());
-    }
-
-    #[test]
     fn persisted_impossible_evidence_is_quarantined_during_hydration() {
         let mut persisted = persistable_completion_contract(&CompletionContract::default());
         persisted.requires_observation = true;
@@ -2829,7 +2237,7 @@ mod tests {
             ..CompletionContract::default()
         };
 
-        retain_structural_completion_contract(&mut contract, false);
+        retain_structural_completion_contract(&mut contract);
 
         assert_eq!(contract.task_kind, CompletionTaskKind::Check);
         assert!(contract.requires_observation);
@@ -2860,7 +2268,7 @@ mod tests {
             ],
             ..CompletionContract::default()
         };
-        retain_structural_completion_contract(&mut contract, false);
+        retain_structural_completion_contract(&mut contract);
         let progress = CompletionProgress::new(&contract, "synthetic-task");
 
         assert!(contract.requires_observation);
@@ -2869,29 +2277,6 @@ mod tests {
         assert!(progress.verification_obligation_id.is_none());
         assert_eq!(progress.evidence_obligation_ids.len(), 1);
         assert!(progress.mutation_obligation_ids.is_empty());
-    }
-
-    #[test]
-    fn typed_invocation_reuses_structural_targets_without_duplicate_proof_node() {
-        let mut contract = CompletionContract {
-            verification_targets: vec![VerificationTarget {
-                kind: VerificationTargetKind::Path,
-                value: "/tmp".to_string(),
-            }],
-            ..CompletionContract::default()
-        };
-        let invocation = crate::traits::RequestReceiptPredicate {
-            tool_names: vec!["run_command".to_string()],
-            outcome_statuses: vec![crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult],
-            ..crate::traits::RequestReceiptPredicate::default()
-        };
-
-        retain_structural_completion_contract(&mut contract, true);
-        append_required_invocation_obligations(&mut contract, &[invocation]);
-
-        assert_eq!(contract.verification_targets.len(), 1);
-        assert_eq!(contract.evidence_requirements.len(), 1);
-        assert!(contract.evidence_requirements[0].receipt.is_some());
     }
 
     #[test]
@@ -3694,25 +3079,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_negative_mutation_constraint_is_hard_and_planner_cannot_override_it() {
-        let mut contract = infer_completion_contract(
-            "Inspect the repository and report only. Do not modify files or deploy.",
-            &[],
-        );
-        assert!(contract.forbids_mutation);
-        assert!(!contract.expects_mutation);
-
-        apply_planned_contract_signals(
-            &mut contract,
-            Some(true),
-            Some(true),
-            Some(CompletionTaskKind::Change),
-        );
-        assert!(contract.forbids_mutation);
-        assert!(!contract.expects_mutation);
-    }
-
-    #[test]
     fn object_scoped_modify_constraint_is_not_a_global_write_ban() {
         let contract = infer_completion_contract(
             "Update the application, but do not modify the deployment configuration.",
@@ -3746,33 +3112,6 @@ mod tests {
                 "requested edit must remain actionable: {request}"
             );
         }
-    }
-
-    #[test]
-    fn local_build_with_deployment_reserved_for_parent_remains_mutating() {
-        let request = "Inspect ~/projects for an appropriate existing app or create a new \
-            project directory there. Implement a polished website. Configure static hosting \
-            tooling and run the relevant build/check. Do not deploy externally; report the \
-            directory, changes, and verification results.";
-        let mut contract = infer_completion_contract(request, &[]);
-
-        assert!(!contract.forbids_mutation);
-        assert!(contract.expects_mutation);
-        assert_eq!(
-            contract.forbidden_mutation_actions,
-            vec![ForbiddenMutationAction::Deploy]
-        );
-
-        apply_planned_contract_signals(
-            &mut contract,
-            Some(false),
-            Some(true),
-            Some(CompletionTaskKind::Deliver),
-        );
-        assert!(
-            contract.expects_mutation,
-            "planner must not turn scoped deployment restraint into a blanket write ban"
-        );
     }
 
     #[test]
@@ -3857,195 +3196,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_effects_add_positive_proof_without_granting_permission() {
-        let parsed = parse_planned_mutation_effects(&[
-            "local_source_write".to_string(),
-            "remote_deploy".to_string(),
-        ])
-        .expect("valid effects");
-        let mut contract = CompletionContract {
-            expects_mutation: true,
-            required_mutation_effects: ToolMutationEffects::UNSPECIFIED,
-            ..CompletionContract::default()
-        };
-        apply_planned_required_mutation_effects(&mut contract, Some(parsed));
-        assert!(contract
-            .required_mutation_effects
-            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
-        assert!(contract
-            .required_mutation_effects
-            .contains(ToolMutationEffects::REMOTE_DEPLOY));
-        assert!(parse_planned_mutation_effects(&["made_up".to_string()]).is_none());
-
-        contract.forbids_mutation = true;
-        contract.expects_mutation = false;
-        let before = contract.required_mutation_effects;
-        apply_planned_required_mutation_effects(
-            &mut contract,
-            Some(ToolMutationEffects::REMOTE_MUTATION),
-        );
-        assert_eq!(contract.required_mutation_effects, before);
-    }
-
-    #[test]
-    fn planned_task_kind_parses_all_variants_and_rejects_garbage() {
-        for (s, expected) in [
-            ("conversational", CompletionTaskKind::Conversational),
-            ("answer", CompletionTaskKind::Answer),
-            ("check", CompletionTaskKind::Check),
-            ("find", CompletionTaskKind::Find),
-            ("change", CompletionTaskKind::Change),
-            ("deliver", CompletionTaskKind::Deliver),
-            ("schedule", CompletionTaskKind::Schedule),
-            ("monitor", CompletionTaskKind::Monitor),
-            ("diagnose", CompletionTaskKind::Diagnose),
-        ] {
-            assert_eq!(parse_planned_task_kind(s), Some(expected), "kind {s}");
-        }
-        assert_eq!(
-            parse_planned_task_kind(" Change "),
-            Some(CompletionTaskKind::Change)
-        );
-        assert_eq!(parse_planned_task_kind("destroy_everything"), None);
-        assert_eq!(parse_planned_task_kind(""), None);
-    }
-
-    #[test]
-    fn planned_forbidden_actions_parse_known_values_only() {
-        for (value, expected) in [
-            ("create", ForbiddenMutationAction::Create),
-            ("DELETE", ForbiddenMutationAction::Delete),
-            (" deploy ", ForbiddenMutationAction::Deploy),
-            ("publish", ForbiddenMutationAction::Publish),
-            ("post", ForbiddenMutationAction::Post),
-            ("send", ForbiddenMutationAction::Send),
-        ] {
-            assert_eq!(parse_planned_forbidden_action(value), Some(expected));
-        }
-        assert_eq!(parse_planned_forbidden_action("rewrite-history"), None);
-    }
-
-    #[test]
-    fn semantic_read_only_constraint_blocks_all_mutation() {
-        let mut contract = CompletionContract {
-            expects_mutation: true,
-            requires_reverification_after_mutation: true,
-            ..Default::default()
-        };
-
-        apply_planned_mutation_constraints(&mut contract, Some("read_only"), &[]);
-
-        assert!(contract.forbids_mutation);
-        assert!(!contract.expects_mutation);
-        assert!(!contract.requires_reverification_after_mutation);
-    }
-
-    #[test]
-    fn semantic_scoped_constraint_preserves_other_mutation_work() {
-        let mut contract = CompletionContract {
-            expects_mutation: true,
-            ..Default::default()
-        };
-
-        apply_planned_mutation_constraints(
-            &mut contract,
-            Some("scoped"),
-            &[ForbiddenMutationAction::Deploy],
-        );
-
-        assert!(!contract.forbids_mutation);
-        assert!(contract.expects_mutation);
-        assert_eq!(
-            contract.forbidden_mutation_actions,
-            vec![ForbiddenMutationAction::Deploy]
-        );
-
-        apply_planned_contract_signals(&mut contract, Some(false), Some(true), None);
-        assert!(
-            contract.expects_mutation,
-            "a scoped restriction must not collapse the remaining work into read-only mode"
-        );
-    }
-
-    #[test]
-    fn semantic_allowed_scope_cannot_erase_deterministic_restrictions() {
-        let mut contract = infer_completion_contract("Inspect the site, but do not deploy.", &[]);
-        let before = contract.clone();
-
-        apply_planned_mutation_constraints(&mut contract, Some("allowed"), &[]);
-
-        assert_eq!(contract, before);
-    }
-
-    #[test]
-    fn planned_signals_override_keyword_inference() {
-        // "Escribe un script en deploy.sh" — Spanish; keyword inference sees
-        // nothing and produces a conversational no-mutation contract.
-        let mut contract = CompletionContract::default();
-        assert!(!contract.expects_mutation);
-
-        apply_planned_contract_signals(
-            &mut contract,
-            Some(true),
-            Some(true),
-            Some(CompletionTaskKind::Change),
-        );
-        assert!(contract.expects_mutation);
-        assert!(contract.requires_observation);
-        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
-    }
-
-    #[test]
-    fn planned_mutation_false_clears_reverification() {
-        // Keyword false positive: "write a tweet about rust" infers a file
-        // mutation. The planner classifying it as pure text generation must
-        // clear both the mutation expectation and the dependent re-verify.
-        let mut contract = CompletionContract {
-            expects_mutation: true,
-            requires_reverification_after_mutation: true,
-            ..Default::default()
-        };
-        apply_planned_contract_signals(&mut contract, Some(false), None, None);
-        assert!(!contract.expects_mutation);
-        assert!(!contract.requires_reverification_after_mutation);
-    }
-
-    #[test]
-    fn explicit_verification_request_is_never_relaxed() {
-        let mut contract = CompletionContract {
-            requires_observation: true,
-            explicit_verification_requested: true,
-            ..Default::default()
-        };
-        apply_planned_contract_signals(&mut contract, None, Some(false), None);
-        assert!(
-            contract.requires_observation,
-            "user's explicit 'verify it' must survive planner relaxation"
-        );
-
-        // Without the explicit request, the planner may relax it.
-        let mut contract = CompletionContract {
-            requires_observation: true,
-            ..Default::default()
-        };
-        apply_planned_contract_signals(&mut contract, None, Some(false), None);
-        assert!(!contract.requires_observation);
-    }
-
-    #[test]
-    fn absent_signals_leave_contract_untouched() {
-        let mut contract = CompletionContract {
-            task_kind: CompletionTaskKind::Find,
-            expects_mutation: true,
-            requires_observation: true,
-            ..Default::default()
-        };
-        let before = contract.clone();
-        apply_planned_contract_signals(&mut contract, None, None, None);
-        assert_eq!(contract, before);
-    }
-
-    #[test]
     fn failed_mutation_attempt_is_visible_without_claiming_success() {
         let mut progress = CompletionProgress::default();
         progress.record_mutation_attempt(ToolOutcomeStatus::CompletedWithNegativeResult);
@@ -4053,32 +3203,5 @@ mod tests {
         assert_eq!(progress.mutation_attempt_count, 1);
         assert_eq!(progress.indeterminate_mutation_count, 1);
         assert_eq!(progress.mutation_count, 0);
-    }
-
-    #[test]
-    fn recovered_invocation_adds_proof_without_adding_authority() {
-        let mut contract = CompletionContract {
-            allowed_tool_names: vec!["already_allowed".to_string()],
-            forbids_mutation: true,
-            ..CompletionContract::default()
-        };
-        let receipt = crate::traits::RequestReceiptPredicate {
-            tool_names: vec!["synthetic_observer".to_string()],
-            outcome_statuses: vec![ToolOutcomeStatus::Succeeded],
-            requires_output: true,
-            ..crate::traits::RequestReceiptPredicate::default()
-        };
-
-        append_required_invocation_obligations(&mut contract, std::slice::from_ref(&receipt));
-
-        assert_eq!(contract.allowed_tool_names, ["already_allowed"]);
-        assert!(contract.forbids_mutation);
-        assert!(contract.requires_observation);
-        assert_eq!(contract.evidence_requirements.len(), 1);
-        assert_eq!(contract.evidence_requirements[0].receipt, Some(receipt));
-        assert_eq!(
-            contract.evidence_requirements[0].purpose,
-            crate::traits::EvidencePurpose::Outcome
-        );
     }
 }

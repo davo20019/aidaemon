@@ -453,7 +453,7 @@ mod tests {
         );
     }
 
-    /// A model-picking caller (task assessment) reaches the failover provider
+    /// A model-picking caller (the relationship router) reaches the failover provider
     /// by naming one of its models, and the background chain tries the
     /// failover provider's fast tier first.
     #[tokio::test]

@@ -854,26 +854,6 @@ pub struct AgentConfig {
     /// `[agent.engine]` settings for the SDK kernel that runs agent turns.
     #[serde(default)]
     pub engine: AgentEngineConfig,
-    /// `task_assessment = "on" | "shadow" | "off"` (default `shadow`).
-    #[serde(default)]
-    pub task_assessment: TaskAssessmentSetting,
-}
-
-/// Whether the pre-run task assessment model call runs.
-///
-/// The assessment no longer gates tools: authority comes from explicit facts.
-/// `on` and `shadow` behave alike (the contract is an expectations hint);
-/// `shadow` also records each call the assessor's authority view would have
-/// refused (`assessor_would_refuse`). `off` skips the assessment model call,
-/// so a turn runs without a contract (memory is then recall-only); it is
-/// accepted but not recommended.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskAssessmentSetting {
-    On,
-    #[default]
-    Shadow,
-    Off,
 }
 
 /// `[agent.engine]`: configures the agent kernel.
@@ -929,7 +909,6 @@ impl Default for AgentConfig {
             name: default_agent_name(),
             persona_file: None,
             engine: AgentEngineConfig::default(),
-            task_assessment: TaskAssessmentSetting::default(),
         }
     }
 }
@@ -4583,20 +4562,9 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
     }
 
     #[test]
-    fn task_assessment_parses_and_defaults_to_shadow() {
-        let base = "[provider]\napi_key = \"test\"\n";
-        let config: AppConfig = toml::from_str(base).unwrap();
-        assert_eq!(config.agent.task_assessment, TaskAssessmentSetting::Shadow);
-        for (value, expected) in [
-            ("on", TaskAssessmentSetting::On),
-            ("shadow", TaskAssessmentSetting::Shadow),
-            ("off", TaskAssessmentSetting::Off),
-        ] {
-            let config: AppConfig =
-                toml::from_str(&format!("{base}\n[agent]\ntask_assessment = \"{value}\"\n"))
-                    .unwrap();
-            assert_eq!(config.agent.task_assessment, expected);
-        }
+    fn retired_task_assessment_key_still_parses() {
+        let config = "[provider]\napi_key = \"test\"\n\n[agent]\ntask_assessment = \"off\"\n";
+        toml::from_str::<AppConfig>(config).expect("older configs keep parsing");
     }
 
     #[test]

@@ -268,9 +268,9 @@ coverage for a genuinely separate request or an explicit user constraint.
 ### Task-Kernel Freeze: Evidence Beats Contract
 
 The completion contract (`RunAggregate` obligations, cardinalities, evidence
-scopes, dispatch-stop rules, response contracts) is an LLM-proposed description
-of the work, produced by a small model several times per turn. It is a planning
-hint (and, while `task_assessment = "shadow"`, a logged comparison), not the
+scopes, dispatch-stop rules, response contracts) is a description
+of the work: the exact resources the request names, plus whatever the executing
+model declares through `track_requirements`. It is a planning hint, not the
 arbiter of whether work happened and not a source of tool authority: that comes
 only from the explicit `Authority` (role, workspace grant, goal workspace,
 session mode, config) enforced by the kernel `AuthorityHook`, and a no-tools
@@ -291,11 +291,8 @@ other stop-time asks (mandate decision commit, GUI click verification, reply
 repair) are `StopDemand`s judged by `closeout::stop_demand_verdict` against the
 same authority and visible tools, each with a budget, and recorded as
 `stop_demand` decision points; a new stop-time ask is a new `StopDemand`, not a
-new check. Tool authority is never read from the assessed contract:
-`CompletionContract::authority()` is no longer a gate, and
-`authority_as_assessed()` exists only for `assessor_would_refuse` shadow
-logging. `expectations()` is verified by receipts, never enforced directly. Do
-not add a gate anywhere else.
+new check. Tool authority is never read from the contract. `expectations()` is
+verified by receipts, never enforced directly. Do not add a gate anywhere else.
 
 Do not add new obligation classes, cardinality features, stop-trigger kinds,
 or response-projection rules to make a single live test pass. If a live
@@ -305,12 +302,12 @@ closes, never by making the kernel stricter. Measure autonomy changes as
 N-of-M pass rates over repeated runs, not single-shot rounds; a stochastic
 producer makes one pass or one fail meaningless.
 
-Expectations have two authors. The assessor's contract is one pre-work sample
-and may under-describe the request; the executing model's `track_requirements`
+Expectations come from the executing model. The structural contract only names
+exact resources; the model's `track_requirements`
 checklist (`ExecutorExpectationsDeclared` → `obligation:checklist:<n>`) is the
 model's own typed statement of what it will do, so open reachable checklist
 items are demanded even after other work completed and a run that ends with
-one open is `partial`, not evidence-closed. Only receipts close either kind.
+one open is `partial`, not evidence-closed. Only receipts close them.
 An item the model marks `deferred`/`skipped` or drops from its list becomes
 `RunObligationState::Deferred`: the closeout never demands it (stopping is
 permitted, `UnreachableReason::ExecutorDeferred`), but it never counts toward
@@ -319,9 +316,6 @@ permitted, `UnreachableReason::ExecutorDeferred`), but it never counts toward
 accomplished work. In the SDK kernel the same split is
 `StopDecision::AcceptUnmet` and `RunOutcome::is_succeeded()`: `Completed`
 means the run stopped, not that its objective was met.
-`task_assessment` defaults to `"shadow"` (assess and log what the assessor
-would have refused); `on` behaves the same without recording, and `off` skips
-the assessment call.
 
 ## Untrusted Content Rule
 
@@ -493,9 +487,7 @@ append-only transcript, so low reuse there means something rewrote the prefix
 any change to message assembly or provider request building.
 
 `--gate-outcomes` (with `--eval-hours N`) measures gates by what happened after
-they intervened (while `task_assessment = "shadow"`, `assessor_would_refuse`
-rows appear there too: calls the assessor's authority view would have refused,
-which ran anyway): each gate decision point or tool refusal is grouped by gate and
+they intervened: each gate decision point or tool refusal is grouped by gate and
 its task labelled with the goal run's terminal status (else its `task_end`
 status). Check it before calling a gate "too strict" or "working".
 

@@ -38,10 +38,6 @@ pub struct HarnessEvalFixture {
     pub session_mode: Option<String>,
     #[serde(default)]
     pub mock_responses: Vec<MockResponseSpec>,
-    /// Optional semantic task-assessment responses, kept separate from the
-    /// main-loop queue so fixtures never depend on lexical mock inference.
-    #[serde(default)]
-    pub task_assessments: Vec<MockResponseSpec>,
     pub expect: ExpectBlock,
     /// Optional DB seed data applied before handle_message.
     #[serde(default)]
@@ -595,8 +591,8 @@ fn assert_score_min(
 }
 
 /// Where recorded drafts are written by default. Deliberately outside
-/// [`fixtures_dir`], which the suite auto-loads: a draft is not replayable
-/// until a human scripts its task assessment (see [`record_fixture_from_events`]).
+/// [`fixtures_dir`], which the suite auto-loads: a draft needs a human
+/// check against its trace first (see [`record_fixture_from_events`]).
 pub fn recorded_fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/harness_eval/recorded")
 }
@@ -605,9 +601,7 @@ pub fn recorded_fixtures_dir() -> PathBuf {
 /// the draft is promoted into the suite.
 pub const RECORDED_FIXTURE_HEADER: &str = "\
 # DRAFT recorded from a production trace. Not auto-loaded by the suite.
-# 1. The task assessment is not persisted, so replay runs without the
-#    production contract until `task_assessments` is scripted.
-# 2. `mock_responses` is rebuilt from the responses the daemon SHIPPED, not
+# 1. `mock_responses` is rebuilt from the responses the daemon SHIPPED, not
 #    the raw model output: replies bounced by gates and calls blocked by guards
 #    are missing, and daemon-synthesized replies appear as model text.
 #    Check the script against the trace (db_probe --task <id>).
@@ -714,7 +708,6 @@ pub fn record_fixture_from_events(
         routing_models: false,
         session_mode: None,
         mock_responses,
-        task_assessments: Vec::new(),
         seed: FixtureSeed::default(),
         expect: ExpectBlock {
             orchestration_route: Some(eval.orchestration_route.clone()),

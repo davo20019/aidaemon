@@ -25,15 +25,7 @@ async fn deferring_every_checklist_item_leaves_the_request_partially_answered() 
         MockProvider::tool_call_response("track_requirements", &declare),
         MockProvider::tool_call_response("track_requirements", &defer),
         MockProvider::text_response("I deferred both steps; the removal was blocked."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "answer",
-        true,
-        false,
-        &[],
-        "new_request",
-        "none",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let _ = harness

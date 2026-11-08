@@ -26,39 +26,16 @@ struct RequiredContextProjection {
 }
 
 /// The scope-check fallback for a turn without a resolved task manifest: the
-/// request's text-derived project scopes (else the channel workspace root),
-/// widened by every filesystem target the assessor's manifest admitted, so it
-/// is never narrower than that manifest used as `task_access` was. An exact
-/// `Path` becomes a grant that covers only that path.
+/// request's text-derived project scopes, else the channel workspace root.
 fn owner_fallback_scopes(
     authorized_project_scopes: &[String],
     workspace_root: Option<String>,
-    filesystem_access: Option<&crate::traits::ToolCallAccessManifest>,
 ) -> Vec<String> {
-    let mut scopes = if authorized_project_scopes.is_empty() {
+    if authorized_project_scopes.is_empty() {
         workspace_root.into_iter().collect::<Vec<_>>()
     } else {
         authorized_project_scopes.to_vec()
-    };
-    if let Some(access) = filesystem_access {
-        for target in access
-            .read_targets
-            .iter()
-            .chain(access.write_targets.iter())
-            .filter(|target| {
-                matches!(
-                    target.kind,
-                    crate::traits::ToolTargetHintKind::ProjectScope
-                        | crate::traits::ToolTargetHintKind::Path
-                )
-            })
-        {
-            if !scopes.contains(&target.value) {
-                scopes.push(target.value.clone());
-            }
-        }
     }
-    scopes
 }
 
 /// Keep only the tool definitions the turn's authority admits by name (all
@@ -410,12 +387,12 @@ fn assimilate_continuation_receipt(
 }
 
 #[cfg(test)]
-fn task_assessment_conversation_context(
+fn relationship_conversation_context(
     followup_mode: Option<FollowupMode>,
     session_summary: Option<&str>,
     recent_messages: &[Value],
 ) -> Option<String> {
-    super::bootstrap::task_planning::task_assessment_conversation_context(
+    super::bootstrap::task_planning::relationship_conversation_context(
         followup_mode,
         session_summary,
         recent_messages,
@@ -472,7 +449,6 @@ impl Agent {
         let BootstrapData {
             user_text: canonical_user_text,
             task_id,
-            task_plan: bootstrap_task_plan,
             memory_pipeline_policy,
             resume_execution_snapshot,
             emitter,
@@ -546,8 +522,7 @@ impl Agent {
         let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         // Bootstrap finalized the immutable relationship, contract, memory policy,
         // and prompt context before this execution loop was constructed.
-        let task_plan = bootstrap_task_plan;
-        // The semantic assessment may refine the bootstrap relationship. Use
+        // The relationship router may refine the bootstrap relationship. Use
         // the finalized typed relationship—not the request wording or an
         // earlier provisional value—to decide whether prior turns can enter
         // the provider transcript.
@@ -944,39 +919,6 @@ impl Agent {
         )
         .await;
 
-        if let Some(plan) = task_plan.filter(|plan| {
-            plan.mode.includes_step_plan() && !plan.steps.is_empty()
-        }) {
-            use crate::agent::execution_state::LinearIntentStep;
-            let linear_steps: Vec<LinearIntentStep> = plan
-                .steps
-                .iter()
-                .enumerate()
-                .map(|(i, step)| LinearIntentStep {
-                    step_id: format!("task-plan-step-{}", i + 1),
-                    step_index: i + 1,
-                    tool: step.tool_hint.clone().unwrap_or_default(),
-                    target: String::new(),
-                    description: step.description.clone(),
-                    tool_calls_on_step: 0,
-                    completed: false,
-                    completion_evidence: None,
-                    last_evaluated_at: None,
-                })
-                .collect();
-
-            let step_count = linear_steps.len();
-            execution_state.install_linear_intent_plan(1, linear_steps);
-
-            execution_state.promote_budget_for_plan(step_count);
-            info!(
-                session_id,
-                goal = %plan.goal,
-                step_count,
-                "Task plan installed and budget evaluated"
-            );
-        }
-
         if let Some(mandate_id) = dialogue_state
             .as_ref()
             .and_then(|state| state.last_closed_question.as_ref())
@@ -1187,20 +1129,13 @@ impl Agent {
                     .filter(|_| preserve_archived_context),
                 restrict_untrusted_reference_tools: restrict_untrusted_external_reference_tools,
                 untrusted_reference_skills: active_untrusted_external_reference_skills.clone(),
-                continue_inline_after_background: turn_context
-                    .continue_inline_after_background_start
-                    || execution_state.linear_intent_plan_has_remaining_steps(),
-                // Where directory-less calls run: execution cwd first, then
-                // the request's primary scope. A channel
-                // workspace grant scopes the file tools itself.
+                // Where directory-less calls run: the request's primary
+                // scope. A channel workspace grant scopes the file tools
+                // itself.
                 known_project_dir: if channel_ctx.active_workspace_grant(user_role).is_some() {
                     None
                 } else {
-                    turn_context
-                        .filesystem_access
-                        .as_ref()
-                        .and_then(|access| access.execution_cwd.clone())
-                        .or_else(|| turn_context.primary_project_scope.clone())
+                    turn_context.primary_project_scope.clone()
                 },
                 explicit_workspace: turn_context.explicit_workspace().map(str::to_string),
                 project_scope: (!turn_context.allow_multi_project_scope)
@@ -1214,7 +1149,6 @@ impl Agent {
                     channel_ctx
                         .active_workspace_grant(user_role)
                         .map(|grant| grant.project_root.clone()),
-                    turn_context.filesystem_access.as_ref(),
                 ),
                 // Only a person's request is queued: a channel turn on the
                 // root agent, or a queued request's own re-run. Goal
@@ -1499,58 +1433,6 @@ mod offered_tool_tests {
         retain_authorized_tool_definitions(&mut none, &aidaemon_core::Authority::no_tools());
         assert!(none.is_empty());
     }
-    /// The owner fallback is never narrower than the assessor manifest base
-    /// used as `task_access`: an exact assessed write path stays admitted.
-    #[test]
-    fn owner_scope_lock_keeps_assessed_exact_paths() {
-        use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
-        let root = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
-        let proj = format!("{root}/proj");
-        let out = format!("{root}/out.txt");
-        let assessed = ToolCallAccessManifest {
-            execution_cwd: None,
-            read_targets: vec![
-                ToolTargetHint::new(ToolTargetHintKind::ProjectScope, &proj).unwrap()
-            ],
-            write_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, &out).unwrap()],
-            adapter_read_targets: Vec::new(),
-        };
-        let scopes = owner_fallback_scopes(std::slice::from_ref(&proj), None, Some(&assessed));
-        let call = ToolCallAccessManifest {
-            execution_cwd: None,
-            read_targets: Vec::new(),
-            write_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, &out).unwrap()],
-            adapter_read_targets: Vec::new(),
-        };
-        assert_eq!(
-            crate::agent::tool_execution::access_manifest_scope_check(
-                "write_file",
-                &call,
-                None,
-                &scopes,
-                None
-            ),
-            None,
-            "assessed exact write path must stay admitted"
-        );
-        // Still a lock: a sibling outside every assessed target is refused.
-        let sibling = ToolCallAccessManifest {
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::Path,
-                format!("{root}/other.txt"),
-            )
-            .unwrap()],
-            ..call
-        };
-        assert!(crate::agent::tool_execution::access_manifest_scope_check(
-            "write_file",
-            &sibling,
-            None,
-            &scopes,
-            None
-        )
-        .is_some());
-    }
 }
 
 #[cfg(test)]
@@ -1651,13 +1533,13 @@ mod stuck_fallback_tests {
     }
 
     #[test]
-    fn provisional_new_task_assessment_can_name_but_not_adopt_an_antecedent() {
+    fn provisional_new_task_relationship_can_name_but_not_adopt_an_antecedent() {
         let recent = vec![json!({
             "message_id": "synthetic-prior-user",
             "role": "assistant",
             "content": "The previous device check requires live health evidence."
         })];
-        let context = task_assessment_conversation_context(
+        let context = relationship_conversation_context(
             Some(FollowupMode::NewTask),
             Some("Prior device discussion"),
             &recent,
@@ -1668,14 +1550,14 @@ mod stuck_fallback_tests {
     }
 
     #[test]
-    fn followup_assessment_retains_the_preceding_exchange() {
+    fn followup_relationship_context_retains_the_preceding_exchange() {
         let recent = vec![json!({
             "message_id": "synthetic-user-1",
             "role": "user",
             "content": "Check the first device."
         })];
         let context =
-            task_assessment_conversation_context(Some(FollowupMode::Followup), None, &recent)
+            relationship_conversation_context(Some(FollowupMode::Followup), None, &recent)
                 .expect("follow-up context");
         assert!(context.contains("Check the first device."));
     }

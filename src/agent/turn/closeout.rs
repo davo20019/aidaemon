@@ -4,12 +4,11 @@
 //! arbiter (`RunAggregate::closeout`) is parameterized with.
 //!
 //! Authority is the turn's resolved authority (`agent::authority`, see
-//! `ClosingAuthority::from_resolved`), never the assessed contract.
+//! `ClosingAuthority::from_resolved`), never the contract.
 //! Expectations (obligations) are proposals: they may ask the
 //! loop for more work only when a tool admissible under Authority could
 //! satisfy them. Nothing here reads request wording.
 
-use crate::agent::completion_contract::RequestAuthority;
 use crate::events::RunObligation;
 use crate::traits::ToolSemanticScope;
 
@@ -51,18 +50,6 @@ impl ClosingAuthority<'static> {
 }
 
 impl<'a> ClosingAuthority<'a> {
-    /// The assessed contract's authority view. No longer enforced; used for
-    /// `assessor_would_refuse` shadow logging.
-    pub(in crate::agent) fn from_authority(authority: RequestAuthority<'a>) -> Self {
-        Self {
-            forbids_tool_use: authority.forbids_tool_use,
-            forbids_mutation: authority.forbids_mutation,
-            allowed_tool_names: authority.allowed_tool_names,
-            forbidden_tool_scopes: authority.forbidden_tool_scopes,
-            owner_control_plane_tools: authority.owner_control_plane_tools,
-        }
-    }
-
     /// The tool is admitted only because the runtime kept it as an owner
     /// control-plane tool; the caller must also check the exact call
     /// (`ToolSemantics::owner_control_plane_call`).

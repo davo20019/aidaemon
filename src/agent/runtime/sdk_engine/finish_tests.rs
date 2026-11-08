@@ -372,29 +372,45 @@ async fn background_detach_finishes_without_text_match() {
     assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
 }
 
-/// When the assessed task shape keeps inline work going, a background
-/// handoff does not end the run: the model carries on.
+/// Work the model declared beyond the background job keeps the run going:
+/// the handoff does not end it while a second checklist item is open.
 #[tokio::test]
-async fn background_handoff_with_inline_work_lets_the_model_continue() {
+async fn background_handoff_with_more_declared_work_lets_the_model_continue() {
+    let checklist = r#"{"items":[
+        {"text":"Start the job","status":"in_progress","mutation_effects":["process_state"]},
+        {"text":"Tidy up","status":"pending","mutation_effects":["process_state"]}
+    ]}"#;
+    let settled = r#"{"items":[
+        {"text":"Start the job","status":"completed","mutation_effects":["process_state"]},
+        {"text":"Tidy up","status":"deferred","mutation_effects":["process_state"]}
+    ]}"#;
     let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
         MockProvider::tool_call_response("synthetic_launcher", "{}"),
+        MockProvider::tool_call_response("track_requirements", settled),
         MockProvider::text_response("The job is running and the rest is done."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment_with_inline_continuation(
-            "change",
-            true,
-            false,
-            &["process_state"],
-            "new_request",
-            "host_local",
-            true,
-        ),
     ]);
     let harness = root(provider, vec![Arc::new(launcher(false))]).await;
     let reply = ask(&harness, "finish-inline", "Start the job, then tidy up").await;
 
     assert_eq!(reply, "The job is running and the rest is done.");
+    assert_eq!(harness.provider.call_count().await, 4);
+}
+
+/// The job as the only open item is a plain handoff: nothing is left to do
+/// inline, so the run ends on the tool's finish.
+#[tokio::test]
+async fn background_handoff_as_the_only_open_item_ends_the_run() {
+    let checklist = r#"{"items":[
+        {"text":"Start the job","status":"in_progress","mutation_effects":["process_state"]}
+    ]}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::tool_call_response("synthetic_launcher", "{}"),
+    ]);
+    let harness = root(provider, vec![Arc::new(launcher(false))]).await;
+    ask(&harness, "finish-one-item", "Start the job").await;
+
     assert_eq!(harness.provider.call_count().await, 2);
 }
 

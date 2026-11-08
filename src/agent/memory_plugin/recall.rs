@@ -403,20 +403,8 @@ mod tests {
         }
     }
 
-    fn memory_allowed() -> crate::traits::ProviderResponse {
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "general",
-        )
-    }
-
-    async fn harness(responses: Vec<crate::traits::ProviderResponse>, turns: usize) -> TestHarness {
-        let provider = MockProvider::with_responses(responses)
-            .with_task_assessments((0..turns).map(|_| memory_allowed()).collect());
+    async fn harness(responses: Vec<crate::traits::ProviderResponse>) -> TestHarness {
+        let provider = MockProvider::with_responses(responses);
         let harness = crate::testing::setup_test_agent_sdk(provider)
             .await
             .unwrap();
@@ -457,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_dm_request_carries_recalled_memory_note() {
-        let harness = harness(vec![MockProvider::text_response("Teal.")], 1).await;
+        let harness = harness(vec![MockProvider::text_response("Teal.")]).await;
         harness
             .agent
             .handle_inbound_message(request(
@@ -492,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_external_turn_has_no_personal_memory() {
-        let harness = harness(vec![MockProvider::text_response("Hello.")], 1).await;
+        let harness = harness(vec![MockProvider::text_response("Hello.")]).await;
         let channel_ctx = ChannelContext {
             visibility: ChannelVisibility::PublicExternal,
             platform: "slack".to_string(),
@@ -528,13 +516,10 @@ mod tests {
 
     #[tokio::test]
     async fn core_prompt_stable_across_queries() {
-        let harness = harness(
-            vec![
-                MockProvider::text_response("Teal."),
-                MockProvider::text_response("Jasmine tea."),
-            ],
-            2,
-        )
+        let harness = harness(vec![
+            MockProvider::text_response("Teal."),
+            MockProvider::text_response("Jasmine tea."),
+        ])
         .await;
         for text in ["what is my favorite color?", "which beverage do I like?"] {
             harness
@@ -571,20 +556,17 @@ mod tests {
 
     #[tokio::test]
     async fn memory_note_cached_within_a_turn() {
-        let harness = harness(
-            vec![
-                MockProvider::tool_call_response(
-                    "remember_fact",
-                    r#"{"category":"preference","key":"seat","value":"window"}"#,
-                ),
-                MockProvider::tool_call_response(
-                    "remember_fact",
-                    r#"{"category":"preference","key":"meal","value":"vegetarian"}"#,
-                ),
-                MockProvider::text_response("Saved both."),
-            ],
-            1,
-        )
+        let harness = harness(vec![
+            MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"seat","value":"window"}"#,
+            ),
+            MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"meal","value":"vegetarian"}"#,
+            ),
+            MockProvider::text_response("Saved both."),
+        ])
         .await;
         let reply = harness
             .agent

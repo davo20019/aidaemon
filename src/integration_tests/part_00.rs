@@ -21,22 +21,6 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Opt a memory-focused integration test into the normal automatic-memory
-/// path with an explicit, valid typed assessment. Production deliberately
-/// fail-closes automatic memory when assessment is unavailable; these tests
-/// are about the allowed path, so they must not rely on the mock's historical
-/// "no assessment" fallback.
-fn memory_allowed_task_assessment() -> ProviderResponse {
-    MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "new_request",
-        "general",
-    )
-}
-
 #[tokio::test]
 async fn test_basic_message_response() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -567,11 +551,8 @@ async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_schedul
 
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
-    // A simple conversational turn records both physical structured-assessment
-    // attempts and the main response. The mock deliberately returns an invalid
-    // assessment, so the lone producer gets its one bounded repair attempt.
-    // Both invalid attempts report zero usage and are durably classified as
-    // failed validation; the main response reports 10 input / 5 output tokens.
+    // A fresh session has no relationship to classify, so a simple turn records
+    // exactly its one main response: 10 input / 5 output tokens.
     let harness =
         setup_test_agent_with_models(MockProvider::new(), "gpt-5.6-terra", "gpt-5.6-terra")
             .await
@@ -599,14 +580,11 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .await
         .expect("llm stats should compute");
 
-    assert_eq!(
-        stats.total_calls, 3,
-        "expected an assessment, its bounded repair, and one response event"
-    );
-    assert_eq!(stats.failed_calls, 2);
-    assert_eq!(stats.avg_input_tokens, 3);
-    assert_eq!(stats.avg_output_tokens, 1);
-    assert_eq!(stats.fell_back_count, 1);
+    assert_eq!(stats.total_calls, 1, "expected one response event");
+    assert_eq!(stats.failed_calls, 0);
+    assert_eq!(stats.avg_input_tokens, 10);
+    assert_eq!(stats.avg_output_tokens, 5);
+    assert_eq!(stats.fell_back_count, 0);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);
 }
@@ -692,17 +670,7 @@ async fn test_memory_persistence() {
 
 #[tokio::test]
 async fn test_multi_turn_conversation() {
-    let provider = MockProvider::new().with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    let provider = MockProvider::new().with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     // First turn
@@ -750,32 +718,21 @@ async fn test_multi_turn_conversation() {
 
 #[tokio::test]
 async fn exact_history_follow_up_is_grounded_by_the_projected_antecedent() {
-    // Seed turn (no tools), then a follow-up whose contract requires exact
-    // history while forbidding tools. The runtime projects the persisted
+    // Seed turn (no tools), then a follow-up the relationship router binds to
+    // it. The runtime projects the persisted
     // antecedent into the prompt; that projection is the canonical retained
     // history, so the model's correct recall must ship unchanged instead of
     // being replaced by a "could not establish the exact wording" blocker.
-    let seed = MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none");
-    let base = MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "continuation",
-        "conversation_history",
-    );
-    let mut followup: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    followup["contract"]["requires_exact_history"] = serde_json::json!(true);
-    followup["contract"]["tool_scope"] = serde_json::json!("forbidden");
-    let followup = MockProvider::text_response(&followup.to_string());
     let marker = "context_recalled=CTX_SYNTHETIC_7F2K; source=conversation; memory=not_used; tools=0.";
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("context_seed=ack"),
         MockProvider::text_response(marker),
         MockProvider::text_response(marker),
     ])
-    .with_task_assessments(vec![seed, followup]);
+    .with_relationship_assessments(vec![MockProvider::relationship_assessment(
+        "continuation",
+        "conversation_history",
+    )]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     harness
@@ -1289,8 +1246,7 @@ async fn test_owner_system_prompt_has_no_restrictions() {
 
 #[tokio::test]
 async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let mut harness = setup_test_agent(provider).await.unwrap();
     harness.agent.set_test_orchestrator_mode();
 

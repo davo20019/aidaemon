@@ -30,10 +30,6 @@ pub(in crate::agent) struct BootstrapData {
     /// pre-bootstrap input so prompt assembly matches durable history.
     pub user_text: String,
     pub task_id: String,
-    /// One semantic assessment compiled before optional memory access. The
-    /// main loop consumes this exact artifact rather than issuing a second
-    /// classifier call that could disagree with the memory gate.
-    pub task_plan: Option<super::task_planning::TaskPlan>,
     pub memory_pipeline_policy: super::task_planning::MemoryPipelinePolicy,
     /// Durable execution identity recovered from an interrupted run. The new
     /// turn reuses it so operation-derived idempotency keys remain stable.
@@ -60,7 +56,7 @@ pub(in crate::agent) struct BootstrapData {
     /// prefix; rendered once per task by `render_core_prompt`.
     pub core_prompt_bytes: String,
     /// Pillar A: context tails compiled from one snapshot. The finalized typed
-    /// task relationship selects one after semantic assessment: fresh tasks
+    /// task relationship selects one after the relationship router: fresh tasks
     /// exclude conversation summaries/activity, while continuations retain the
     /// current task thread. Just-in-time project instructions are appended only
     /// to the selected tail.

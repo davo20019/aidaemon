@@ -78,59 +78,6 @@ impl crate::traits::ToolSemantics for RejectingArgumentTool {
 
 #[tokio::test]
 async fn typed_expected_negative_receipt_completes_without_validation_retry() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Observe one expected negative process result",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["run_command"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Use run_command exactly once and no other tool"],
-                "required_response_fields": ["phase", "exit", "outcome"],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [{
-                    "summary": "Observe the required process receipt",
-                    "acceptable_scopes": ["host_local"],
-                    "purpose": "outcome",
-                    "minimum_authority": "direct",
-                    "temporal_scope": "current",
-                    "required_content_markers": [],
-                    "receipt": {
-                        "tool_names": ["run_command"],
-                        "exit_codes": [1],
-                        "outcome_statuses": ["failed_permanent"],
-                        "requires_output": false,
-                        "contract_rejected": false
-                    }
-                }],
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "antecedent_user_message_id": null,
-                "semantic_scope": "host_local"
-            }
-        })
-        .to_string(),
-    );
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "run_command",
@@ -139,8 +86,7 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
         MockProvider::text_response(
             "phase=synthetic; exit=1; outcome=completed_with_negative_result",
         ),
-    ])
-    .with_task_assessments(vec![assessment]);
+    ]);
     let negative_receipt_tool = MockTool::new(
         "run_command",
         "Synthetic typed process observation",
@@ -189,72 +135,13 @@ async fn typed_expected_negative_receipt_completes_without_validation_retry() {
 
 #[tokio::test]
 async fn successful_memory_receipt_finalizes_without_a_validation_budget_loop() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 10,
-            "goal": "Read one synthetic family record",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "answer",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "forbidden",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["manage_memories"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": [],
-                "required_response_fields": [],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [{
-                    "summary": "Read the current synthetic family record",
-                    "acceptable_scopes": ["user_memory"],
-                    "purpose": "content",
-                    "minimum_authority": "canonical",
-                    "temporal_scope": "both",
-                    "required_content_markers": [],
-                    "receipt": {
-                        "tool_names": ["manage_memories"],
-                        "exit_codes": [],
-                        "outcome_statuses": ["succeeded"],
-                        "requires_output": true,
-                        "contract_rejected": false,
-                        "max_invocations": 1
-                    },
-                    "target": null
-                }],
-                "required_invocations": [],
-                "filesystem_access": {
-                    "execution_cwd": null,
-                    "read_paths": [],
-                    "write_paths": []
-                },
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false
-            }
-        })
-        .to_string(),
-    );
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "manage_memories",
             r#"{"action":"search","query":"synthetic family record"}"#,
         ),
         MockProvider::text_response("The synthetic family record is available."),
-    ])
-    .with_task_assessments(vec![assessment]);
+    ]);
     let semantics = ToolCallSemantics::observation()
         .with_evidence(vec![ToolEvidenceCapability {
             scope: ToolSemanticScope::UserMemory,
@@ -305,173 +192,15 @@ async fn successful_memory_receipt_finalizes_without_a_validation_budget_loop() 
 }
 
 #[tokio::test]
-async fn explicitly_required_permanent_failure_is_observation_not_retry_signal() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Observe one expected permanent adapter outcome",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["synthetic_adapter"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Use synthetic_adapter exactly once"],
-                "required_response_fields": ["phase", "outcome"],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "required_invocations": [{
-                    "tool_names": ["synthetic_adapter"],
-                    "exit_codes": [],
-                    "outcome_statuses": ["failed_permanent"],
-                    "requires_output": true,
-                    "contract_rejected": false
-                }],
-                "filesystem_access": {
-                    "execution_cwd": null,
-                    "read_paths": [],
-                    "write_paths": []
-                },
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "antecedent_user_message_id": null,
-                "semantic_scope": "host_local"
-            }
-        })
-        .to_string(),
-    );
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("synthetic_adapter", r#"{"mode":"observe"}"#),
-        MockProvider::text_response("phase=synthetic; outcome=failed_permanent"),
-    ])
-    .with_task_assessments(vec![assessment]);
-    let tool = MockTool::new(
-        "synthetic_adapter",
-        "Synthetic failing observation",
-        "adapter unavailable by construction",
-    )
-    .with_role(ToolRole::Universal)
-    .with_metadata(ToolCallMetadata {
-        outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
-        semantics: ToolCallSemantics::observation()
-            .with_verification_mode(ToolVerificationMode::ResultContent)
-            .with_evidence(vec![ToolEvidenceCapability {
-                scope: ToolSemanticScope::HostLocal,
-                purposes: vec![EvidencePurpose::Outcome],
-                authority: EvidenceAuthority::Direct,
-                temporal_scope: EvidenceTemporalScope::Current,
-            }]),
-        ..ToolCallMetadata::default()
-    });
-    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
-        provider,
-        vec![Arc::new(tool)],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "typed-permanent-negative",
-            "Use synthetic_adapter exactly once; failed_permanent is the expected observed outcome. Return phase and outcome.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(reply, "phase=synthetic; outcome=failed_permanent");
-    assert_eq!(
-        harness.provider.call_log.lock().await.len(),
-        2,
-        "the expected typed failure must not enter validation/retry recovery"
-    );
-}
-
-#[tokio::test]
 async fn typed_contract_rejection_requires_the_actual_tool_receipt() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Observe one expected invocation-contract rejection",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["read_file"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Use read_file exactly once and no other tool"],
-                "required_response_fields": ["phase", "outcome"],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [{
-                    "summary": "Observe the required invocation rejection",
-                    "acceptable_scopes": ["host_local"],
-                    "purpose": "outcome",
-                    "minimum_authority": "direct",
-                    "temporal_scope": "current",
-                    "required_content_markers": [],
-                    "receipt": {
-                        "tool_names": ["read_file"],
-                        "exit_codes": [],
-                        "outcome_statuses": ["completed_with_negative_result"],
-                        "requires_output": false,
-                        "contract_rejected": true
-                    }
-                }],
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "antecedent_user_message_id": null,
-                "semantic_scope": "host_local"
-            }
-        })
-        .to_string(),
-    );
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "read_file",
             r#"{"path":"/tmp/synthetic-contract.txt","start_line":1,"end_line":12,"tail_lines":1}"#,
         ),
         MockProvider::text_response("phase=synthetic; outcome=completed_with_negative_result"),
-    ])
-    .with_task_assessments(vec![assessment]);
+        MockProvider::text_response("phase=synthetic; outcome=completed_with_negative_result"),
+    ]);
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
         provider,
         vec![Arc::new(crate::tools::ReadFileTool::new(
@@ -500,67 +229,20 @@ async fn typed_contract_rejection_requires_the_actual_tool_receipt() {
         "phase=synthetic; outcome=completed_with_negative_result"
     );
     let calls = harness.provider.call_log.lock().await;
-    assert_eq!(calls.len(), 2, "zero-tool prose cannot satisfy the receipt");
+    assert_eq!(
+        calls.len(),
+        3,
+        "the call, the answer, and the one recovery pass an uncredited rejection earns"
+    );
 }
 
 #[tokio::test]
 async fn dispatcher_argument_rejection_is_canonical_non_success_receipt() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Observe a pre-I/O adapter contract rejection",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "check",
-                "expects_mutation": false,
-                "requires_observation": true,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "restricted",
-                "allowed_tool_names": ["synthetic_contract_tool"],
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Use synthetic_contract_tool exactly once"],
-                "required_response_fields": ["phase", "outcome"],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "required_invocations": [{
-                    "tool_names": ["synthetic_contract_tool"],
-                    "exit_codes": [],
-                    "outcome_statuses": ["completed_with_negative_result"],
-                    "requires_output": true,
-                    "contract_rejected": true
-                }],
-                "filesystem_access": {
-                    "execution_cwd": null,
-                    "read_paths": [],
-                    "write_paths": []
-                },
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "antecedent_user_message_id": null,
-                "semantic_scope": "host_local"
-            }
-        })
-        .to_string(),
-    );
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("synthetic_contract_tool", r#"{"mode":"reject"}"#),
         MockProvider::text_response("phase=synthetic; outcome=contract_rejected"),
-    ])
-    .with_task_assessments(vec![assessment]);
+        MockProvider::text_response("phase=synthetic; outcome=contract_rejected"),
+    ]);
     let io_calls = Arc::new(AtomicUsize::new(0));
     let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
         provider,
@@ -618,15 +300,7 @@ async fn dispatcher_argument_rejection_is_canonical_non_success_receipt() {
 
 #[tokio::test]
 async fn inbound_transport_lifecycle_is_persisted_before_agent_work() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response("timing-ok")])
-        .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        )]);
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("timing-ok")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let transport_received_at = chrono::Utc::now() - chrono::Duration::seconds(4);
     let queue_entered_at = transport_received_at + chrono::Duration::seconds(1);
@@ -683,15 +357,7 @@ async fn unavailable_relationship_assessments_fail_closed_to_fresh_context() {
             "Context acknowledged: phrase=VIOLET HARBOR; quantity=sixty-four.",
         ),
         MockProvider::text_response("The prior exchange is unavailable."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "new_request",
-        "none",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     harness
@@ -742,105 +408,11 @@ async fn unavailable_relationship_assessments_fail_closed_to_fresh_context() {
         .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
 }
 
-/// A request the assessment says forbids tools reduces what the loop demands:
-/// no evidence directive, no verification or recovery pass. It refuses
-/// nothing: tool authority comes from explicit facts, so the tools stay
-/// offered.
-#[tokio::test]
-async fn explicit_no_tool_request_demands_no_tool_work_but_keeps_tools_offered() {
-    let base = MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        true,
-        &[],
-        "new_request",
-        "external_remote",
-    );
-    let mut assessment: Value = serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["schema_version"] = 10.into();
-    assessment["contract"]["tool_scope"] = "forbidden".into();
-    assessment["contract"]["tool_constraint_evidence"] = json!(["Do not use any tools"]);
-    let assessment = MockProvider::text_response(&assessment.to_string());
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "I cannot establish the current release from the supplied context; that would require live evidence, which you asked me not to retrieve.",
-    )])
-    .with_task_assessments(vec![assessment]);
-    let harness = setup_test_agent(provider).await.unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "synthetic-no-tool-session",
-            "What is the current synthetic language release? Do not use any tools.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(reply.contains("require live evidence"));
-    let calls = harness.provider.call_log.lock().await;
-    assert_eq!(
-        calls.len(),
-        1,
-        "no verification or recovery pass is demanded"
-    );
-    assert!(
-        !calls[0].tools.is_empty(),
-        "the assessment refuses nothing: tools stay offered"
-    );
-    assert!(
-        !calls[0].messages.iter().any(|message| message["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("MATERIAL EVIDENCE STILL REQUIRED"))),
-        "the loop does not tell the model to gather evidence with tools"
-    );
-}
-
 #[tokio::test]
 async fn legacy_output_markers_do_not_control_finalization() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Return the requested readiness fields",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "answer",
-                "expects_mutation": false,
-                "requires_observation": false,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "forbidden",
-                "forbidden_tool_scopes": [],
-                "tool_constraint_evidence": ["Do not use tools"],
-                "required_response_fields": ["owner", "credential_status"],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "semantic_scope": "none"
-            }
-        })
-        .to_string(),
-    );
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "The requested fields have been reported.",
-    )])
-    .with_task_assessments(vec![assessment]);
+    )]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let reply = harness
@@ -858,76 +430,6 @@ async fn legacy_output_markers_do_not_control_finalization() {
 
     assert_eq!(reply, "The requested fields have been reported.");
     assert_eq!(harness.provider.call_count().await, 1);
-}
-
-#[tokio::test]
-async fn capability_specific_deny_set_hides_memory_without_disabling_other_tools() {
-    let assessment = MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Explain the synthetic concept without memory",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "answer",
-                "expects_mutation": false,
-                "requires_observation": false,
-                "required_effects": [],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "allowed",
-                "forbidden_tool_scopes": ["user_memory"],
-                "tool_constraint_evidence": ["Do not use memory"],
-                "required_response_fields": [],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [],
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "continue_inline_after_background_start": false,
-                "request_relationship": "new_request",
-                "semantic_scope": "none"
-            }
-        })
-        .to_string(),
-    );
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "A synthetic explanation that does not depend on personal memory.",
-    )])
-    .with_task_assessments(vec![assessment]);
-    let harness = setup_test_agent(provider).await.unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "synthetic-no-memory",
-            "Explain the synthetic concept. Do not use memory.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(reply.contains("does not depend on personal memory"));
-    let calls = harness.provider.call_log.lock().await;
-    assert_eq!(calls.len(), 1);
-    assert!(calls[0]
-        .tools
-        .iter()
-        .all(|tool| tool["function"]["name"] != "manage_memories"));
-    assert!(
-        !calls[0].tools.is_empty(),
-        "a scoped memory prohibition must not become an all-tool prohibition"
-    );
 }
 
 #[tokio::test]
@@ -1595,22 +1097,11 @@ async fn verification_characterization_blocks_completion_until_matching_observat
 }
 
 #[tokio::test]
-async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_change() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
-        MockProvider::text_response("This model text should be ignored."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment_with_inline_continuation(
-            "change",
-            true,
-            false,
-            &["process_state"],
-            "new_request",
-            "host_local",
-            true,
-        ),
-    ]);
+async fn background_ack_characterization_ends_the_run_as_a_partial_handoff() {
+    let provider = MockProvider::with_responses(vec![MockProvider::tool_call_response(
+        "background_task",
+        r#"{"job":"long-running"}"#,
+    )]);
 
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
@@ -1632,17 +1123,10 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
         .await
         .unwrap();
 
-    // The reply is the model's; what the turn records is typed: the change
-    // stays executable, its receipt is a background launch, and the task is
-    // a partial handoff (asserted below), not a completed change.
     let _ = reply;
 
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log.iter().skip(1).any(|call| !call.tools.is_empty()
-            && call.options.tool_choice != crate::traits::ToolChoiceMode::None),
-        "an unfulfilled Change contract must retain tool definitions and execution capability"
-    );
+    // The tool's typed handoff ends the run: no further model call.
+    assert_eq!(harness.provider.call_count().await, 1);
     let results = harness
         .agent
         .event_store()
@@ -1691,47 +1175,7 @@ async fn played_node_audio_receipt_closes_delivery_and_outcome_contract_in_one_c
             r#"{"node":"synthetic-node-1","text":"Dinner is ready."}"#,
         ),
         MockProvider::text_response("The audio was delivered and playback completed."),
-    ])
-    .with_task_assessments(vec![MockProvider::text_response(
-        &json!({
-            "schema_version": 7,
-            "goal": "Deliver a spoken message and confirm playback",
-            "steps": [],
-            "success_criteria": [],
-            "contract": {
-                "confidence": "high",
-                "task_kind": "deliver",
-                "expects_mutation": true,
-                "requires_observation": true,
-                "required_effects": ["external_delivery"],
-                "mutation_scope": "allowed",
-                "forbidden_actions": [],
-                "constraint_evidence": [],
-                "tool_scope": "allowed",
-                "tool_constraint_evidence": [],
-                "minimum_sources": 0,
-                "requires_primary_sources": false,
-                "requires_exact_history": false,
-                "evidence_requirements": [{
-                    "summary": "Confirm the spoken message playback outcome",
-                    "acceptable_scopes": ["external_remote"],
-                    "purpose": "outcome",
-                    "minimum_authority": "direct",
-                    "temporal_scope": "current"
-                }],
-                "project_reference": null
-            },
-            "task_shape": {
-                "execution_mode": "inline",
-                "confidence": "high",
-                "independent_workstreams": 1,
-                "requires_background_continuation": false,
-                "request_relationship": "new_request",
-                "semantic_scope": "external_remote"
-            }
-        })
-        .to_string(),
-    )]);
+    ]);
     let calls = Arc::new(AtomicUsize::new(0));
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
@@ -2142,66 +1586,6 @@ async fn prose_deferral_does_not_create_execution_obligation_without_typed_contr
             .iter()
             .all(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
         "expected no Required tool-choice for a non-tool-classified user text"
-    );
-}
-
-#[tokio::test]
-async fn planner_refined_observation_contract_requires_execution_until_observed() {
-    let mut provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            r#"{
-                "goal": "Compare two approaches using current system evidence",
-                "steps": [
-                    {"description": "Inspect current system evidence", "tool_hint": "system_info"},
-                    {"description": "Compare the approaches", "tool_hint": null}
-                ],
-                "success_criteria": ["The comparison cites inspected evidence"],
-                "contract": {
-                    "confidence": "high",
-                    "task_kind": "check",
-                    "expects_mutation": false,
-                    "requires_observation": true,
-                    "mutation_scope": "allowed",
-                    "forbidden_actions": [],
-                    "constraint_evidence": []
-                }
-            }"#,
-        ),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response(
-            "Based on the inspected system evidence, approach A is faster; approach B is safer.",
-        ),
-    ]);
-    provider.skip_planning_calls = false;
-
-    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
-        .await
-        .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "planner_refined_contract_tool_state",
-            "Write a comprehensive comparison of approach A and approach B with recommendations.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        reply,
-        "Based on the inspected system evidence, approach A is faster; approach B is safer."
-    );
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        call_log.iter().any(|entry| entry
-            .tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "system_info")),
-        "the finalized observation contract must remain execution-required until evidence exists"
     );
 }
 

@@ -54,21 +54,6 @@ impl RequestResponseContract {
             Self::ExactText { success_text, .. } => success_text,
         }
     }
-
-    pub fn source_message_hash(&self) -> &str {
-        match self {
-            Self::ExactText {
-                source_message_hash,
-                ..
-            } => source_message_hash,
-        }
-    }
-
-    pub fn mode(&self) -> &'static str {
-        match self {
-            Self::ExactText { .. } => "exact_text",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -461,26 +461,7 @@ async fn test_old_interaction_assistant_content_truncated() {
         MockProvider::text_response(&long_response_2),
         // Turn 3: direct text response
         MockProvider::text_response("Short answer."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history"), MockProvider::relationship_assessment("continuation", "conversation_history")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -591,18 +572,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         MockProvider::text_response("It is 4."),
         // Turn 2: different topic
         MockProvider::text_response("Rust 1.82.0"),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -682,27 +652,12 @@ async fn test_compaction_fires_on_window_overflow() {
         .map(|_| MockProvider::text_response("Synthetic response"))
         .collect();
 
-    let assessments = (0..8)
-        .map(|index| {
-            MockProvider::semantic_task_assessment(
-                "answer",
-                false,
-                false,
-                &[],
-                if index == 0 {
-                    "new_request"
-                } else {
-                    "continuation"
-                },
-                if index == 0 {
-                    "none"
-                } else {
-                    "conversation_history"
-                },
-            )
-        })
+    // A session's first turn has no antecedent, so the router runs from turn 2.
+    let relationships = (1..8)
+        .map(|_| MockProvider::relationship_assessment("continuation", "conversation_history"))
         .collect();
-    let provider = MockProvider::with_responses(responses).with_task_assessments(assessments);
+    let provider = MockProvider::with_responses(responses)
+        .with_relationship_assessments(relationships);
     let mut harness = setup_test_agent(provider).await.unwrap();
     harness
         .agent

@@ -144,16 +144,6 @@ mod tests {
 
     #[tokio::test]
     async fn memory_system_replaces_daemon_memory() {
-        let assessment = || {
-            MockProvider::semantic_task_assessment(
-                "answer",
-                false,
-                false,
-                &[],
-                "new_request",
-                "general",
-            )
-        };
         let provider = MockProvider::with_responses(vec![
             MockProvider::tool_call_response(
                 "remember",
@@ -161,8 +151,7 @@ mod tests {
             ),
             MockProvider::text_response("Saved."),
             MockProvider::text_response("Teal."),
-        ])
-        .with_task_assessments(vec![assessment(), assessment()]);
+        ]);
         let mut harness = crate::testing::setup_test_agent_root(provider)
             .await
             .unwrap();

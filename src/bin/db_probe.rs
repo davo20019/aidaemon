@@ -943,7 +943,6 @@ const GATE_INTERVENTION_CODES: &[&str] = &[
     "negative_completion_contract",
     "verification_pending",
     "scheduled_run_budget_pressure",
-    "assessor_would_refuse",
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1406,7 +1405,7 @@ async fn record_fixture_from_session(
     let yaml = serde_yaml::to_string(&fixture)?;
     std::fs::write(&output_path, format!("{RECORDED_FIXTURE_HEADER}{yaml}"))?;
     println!("Recorded draft fixture -> {}", output_path.display());
-    println!("Script its task_assessments before moving it into the suite.");
+    println!("Check it against the trace before moving it into the suite.");
     Ok(())
 }
 

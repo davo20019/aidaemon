@@ -196,18 +196,11 @@ async fn test_unresolved_observation_requires_receipt_before_completion() {
     let first_candidate = "The host inspection is still being prepared.";
     let clean_answer = "The host inspection completed from a current receipt.";
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         MockProvider::text_response(first_candidate),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(clean_answer),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let response = harness
         .agent
@@ -223,7 +216,7 @@ async fn test_unresolved_observation_requires_receipt_before_completion() {
         .unwrap();
 
     assert_eq!(response, clean_answer, "the retry's answer must ship");
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 4);
 }
 
 /// A dispatched typed failure remains unresolved until a later operation

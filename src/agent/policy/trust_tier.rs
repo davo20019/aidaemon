@@ -21,15 +21,6 @@ pub enum ModelTrustTier {
     Autonomous,
 }
 
-impl ModelTrustTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ModelTrustTier::Guided => "guided",
-            ModelTrustTier::Autonomous => "autonomous",
-        }
-    }
-}
-
 /// Operator override from config (`[policy] trust_tier = "auto" | "guided" | "autonomous"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrustTierSetting {

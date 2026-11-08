@@ -37,8 +37,8 @@ impl GateFilterStage {
     }
 }
 
-/// The task assessment's candidate models: the router's priority order, but
-/// an owner `/model` pin goes first so the whole turn runs on that model
+/// The relationship router's candidate models: the router's priority order,
+/// but an owner `/model` pin goes first so the whole turn runs on that model
 /// (the router's models stay behind it as fallbacks).
 fn assessment_model_order(
     router_models: Option<Vec<String>>,
@@ -119,29 +119,6 @@ fn build_tool_filter_gate_telemetry(
     )
 }
 
-/// A request assessment's tool narrowing keeps the owner's control-plane
-/// tools offered (see `ToolSemantics::owner_control_plane`), recorded apart from the
-/// assessor's allowlist so the per-call gate admits only their gated calls.
-/// Never when the request forbids tool use, never for a forbidden scope, and
-/// only tools the turn already offers. Each entry is a name and its scope.
-fn admit_owner_control_plane(
-    contract: &mut crate::agent::CompletionContract,
-    owner_control_plane_tools: &[(String, Option<crate::traits::ToolSemanticScope>)],
-) {
-    if contract.forbids_tool_use || contract.allowed_tool_names.is_empty() {
-        return;
-    }
-    for (name, scope) in owner_control_plane_tools {
-        let forbidden = scope.is_some_and(|scope| contract.forbidden_tool_scopes.contains(&scope));
-        if !forbidden
-            && !contract.allowed_tool_names.contains(name)
-            && !contract.owner_control_plane_tools.contains(name)
-        {
-            contract.owner_control_plane_tools.push(name.clone());
-        }
-    }
-}
-
 /// Commit one authoritative task envelope before any optional memory access,
 /// tool filtering, project-instruction loading, or prompt construction.
 /// Relationship, contract, and task ownership are deliberately finalized in
@@ -157,32 +134,11 @@ async fn finalize_turn_assessment(
     internal_continuation: bool,
     structural_resume: bool,
     initial_turn_context: &TurnContext,
-    plan: Option<&super::task_planning::TaskPlan>,
-    available_tool_names: &[String],
-    available_tool_receipt_kinds: &[(String, crate::traits::ToolReceiptKind)],
-    owner_control_plane_tools: &[(String, Option<crate::traits::ToolSemanticScope>)],
     relationship_fallback: Option<&super::task_planning::PlannedTaskShape>,
-    task_assessment_attempted: bool,
-    assessment_decision_type: crate::events::DecisionType,
-    model: &str,
-    planner_trust_tier: &str,
-) -> anyhow::Result<(TurnContext, bool)> {
-    // Only the relationship producer may select an antecedent. The contract
-    // producer's task shape remains useful for execution mode/confidence, but
-    // its relationship fields have no dialogue-state authority.
+) -> anyhow::Result<TurnContext> {
+    // Only the relationship producer may select an antecedent.
     let relationship_shape = relationship_fallback
         .filter(|shape| super::task_planning::planned_task_relationship_is_complete(shape));
-    let execution_shape = plan
-        .and_then(|plan| plan.task_shape.as_ref())
-        .filter(|shape| {
-            matches!(
-                shape
-                    .confidence
-                    .as_deref()
-                    .map(|value| value.trim().to_ascii_lowercase()),
-                Some(value) if matches!(value.as_str(), "medium" | "high")
-            )
-        });
 
     let mut requested_antecedent_user_message_id = None;
     let mut committed_antecedent_user_message_id = None;
@@ -301,183 +257,19 @@ async fn finalize_turn_assessment(
         )
         .await;
     turn_context.visible_antecedent_user_message_id = committed_antecedent_user_message_id;
-    let before_contract = turn_context.completion_contract.clone();
-    let mut semantic_contract_applied = false;
-    let mut contract_lane_decisions = Vec::new();
-    let mut compiled_evidence_requirements = Vec::new();
-    let mut compiled_required_invocations = Vec::new();
-    let mut compiled_dispatch_stop_rules = Vec::new();
-    let mut compiled_response_contract = None;
-    let mut compiled_authority = None;
-    let mut compiled_evidence_policy = None;
-    let mut compiled_filesystem_access = None;
-    let mut compiled_project_scope = None;
-
-    if let Some(shape) = execution_shape {
-        turn_context.continue_inline_after_background_start = shape
-            .continue_inline_after_background_start
-            .unwrap_or(false);
-    }
-
-    if let Some(signals) = plan.and_then(|plan| plan.contract.as_ref()) {
-        // The semantic producer assigns read/write/cwd roles, but it cannot
-        // invent filesystem authority. Ground every proposed path against an
-        // exact path-shaped resource identity authored in the current request.
-        // This parser recognizes filesystem grammar only; it does not infer
-        // intent from words or phrases. Relative references are anchored to
-        // the turn's typed workspace binding, never to the daemon's own cwd.
-        let bound_workspace = turn_context.bound_workspace.as_deref();
-        let structural_filesystem_resources =
-            crate::agent::project_scope::extract_exact_filesystem_resources_from_text_anchored(
-                user_text,
-                &agent.path_aliases.projects,
-                bound_workspace.map(std::path::Path::new),
-            );
-        let structural_project_scopes = structural_filesystem_resources.clone();
-        let compiled = super::contract_compiler::compile_task_contract(
-            super::contract_compiler::ContractCompilerInput {
-                signals,
-                task_shape: plan.and_then(|plan| plan.task_shape.as_ref()),
-                available_tool_names,
-                available_tool_receipt_kinds,
-                structural_filesystem_resources: &structural_filesystem_resources,
-                structural_project_scopes: &structural_project_scopes,
-                project_alias_roots: &agent.path_aliases.projects,
-                bound_workspace,
-                current_user_text: user_text,
-            },
-        );
-        contract_lane_decisions = compiled.decisions.clone();
-        let lifecycle_contract_complete = plan.is_some_and(|plan| plan.contract_complete);
-        if lifecycle_contract_complete {
-            compiled_evidence_requirements = compiled.evidence_requirements.clone();
-            compiled_required_invocations = compiled.required_invocations.clone();
-            compiled_dispatch_stop_rules = compiled.dispatch_stop_rules.clone();
-            compiled_response_contract = compiled.response_contract.clone();
-            compiled_evidence_policy = Some(compiled.evidence_policy.clone());
-            compiled_filesystem_access = compiled.filesystem_access.clone();
-            compiled_project_scope = compiled.project_scope.clone();
-        }
-        // Valid authority lanes are attenuation-only and survive an incomplete
-        // lifecycle product. They can remove capabilities while the task
-        // assessment repairs or fails closed, but can never grant execution or
-        // manufacture proof obligations on their own.
-        compiled_authority = (compiled.mutation_authority_valid || compiled.tool_authority_valid)
-            .then(|| compiled.authority.clone());
-
-        if lifecycle_contract_complete {
-            if let Some(core) = compiled.core.as_ref() {
-                crate::agent::install_semantic_completion_contract(
-                    &mut turn_context.completion_contract,
-                    crate::agent::SemanticCompletionRequirements {
-                        expects_mutation: core.expects_mutation,
-                        requires_observation: core.requires_observation,
-                        task_kind: core.task_kind,
-                        required_mutation_effects: core.required_mutation_effects,
-                    },
-                );
-                if turn_context.inherited_completion_contract {
-                    turn_context.completion_contract =
-                        if turn_context.inherited_outstanding_obligations {
-                            crate::agent::inherit_unfinished_request_contract(
-                                turn_context.completion_contract,
-                                &before_contract,
-                            )
-                        } else {
-                            crate::agent::inherit_request_constraints(
-                                turn_context.completion_contract,
-                                &before_contract,
-                            )
-                        };
-                }
-                semantic_contract_applied = true;
-            }
-        }
-    }
-
-    let effective_required_invocations = compiled_required_invocations.clone();
-    let typed_obligation_pending =
-        !compiled_evidence_requirements.is_empty() || !effective_required_invocations.is_empty();
-    if agent.mandate_execution.is_none()
-        && !semantic_contract_applied
-        && !turn_context.inherited_completion_contract
-    {
-        crate::agent::retain_structural_completion_contract(
-            &mut turn_context.completion_contract,
-            typed_obligation_pending,
-        );
-    }
-    if let Some(authority) = compiled_authority.as_ref() {
-        crate::agent::apply_semantic_authority(
-            &mut turn_context.completion_contract,
-            crate::agent::SemanticAuthorityRequirements {
-                mutation_scope: authority.mutation_scope,
-                forbidden_actions: &authority.forbidden_actions,
-                forbids_tool_use: authority.forbids_tool_use,
-                allowed_tool_names: &authority.allowed_tool_names,
-                forbidden_tool_scopes: &authority.forbidden_tool_scopes,
-            },
-        );
-    }
-    if let Some(policy) = compiled_evidence_policy {
-        crate::agent::apply_semantic_evidence_policy(
-            &mut turn_context.completion_contract,
-            crate::agent::SemanticEvidencePolicy {
-                minimum_sources: policy.minimum_sources,
-                requires_primary_sources: policy.requires_primary_sources,
-                requires_exact_history: policy.requires_exact_history,
-            },
-        );
-    }
-    // A typed workspace binding is the primary scope for the whole turn; the
-    // semantic project reference may only steer unbound turns.
-    if let Some(project_scope) = compiled_project_scope {
-        if turn_context.bound_workspace.is_none() {
-            turn_context.primary_project_scope = Some(project_scope);
-        }
-    }
-    turn_context.filesystem_access = compiled_filesystem_access.filter(|access| {
-        access.execution_cwd.is_some()
-            || !access.read_targets.is_empty()
-            || !access.write_targets.is_empty()
-            || !access.adapter_read_targets.is_empty()
-    });
-    crate::agent::append_evidence_obligations(
-        &mut turn_context.completion_contract,
-        &compiled_evidence_requirements,
-    );
-    crate::agent::append_required_invocation_obligations(
-        &mut turn_context.completion_contract,
-        &effective_required_invocations,
-    );
-    for rule in compiled_dispatch_stop_rules {
-        if !turn_context
-            .completion_contract
-            .dispatch_stop_rules
-            .contains(&rule)
-        {
-            turn_context
-                .completion_contract
-                .dispatch_stop_rules
-                .push(rule);
-        }
+    if agent.mandate_execution.is_none() && !turn_context.inherited_completion_contract {
+        crate::agent::retain_structural_completion_contract(&mut turn_context.completion_contract);
     }
     // Presentation follows the request lifecycle, not session recency. A new
     // external request clears it; a structural resume or a validated adoption
-    // of unfinished obligations retains the parent artifact unless the current
-    // semantic producer supplies a typed replacement for the current request.
-    if compiled_response_contract.is_some()
-        || !(internal_continuation
-            || structural_resume
-            || turn_context.inherited_outstanding_obligations)
+    // of unfinished obligations retains the parent artifact.
+    if !(internal_continuation
+        || structural_resume
+        || turn_context.inherited_outstanding_obligations)
     {
-        turn_context.completion_contract.response_contract = compiled_response_contract;
+        turn_context.completion_contract.response_contract = None;
     }
     turn_context.completion_contract.adopt_for_task(task_id);
-    admit_owner_control_plane(
-        &mut turn_context.completion_contract,
-        owner_control_plane_tools,
-    );
 
     // Persist the finalized contract on its own correctness-critical event.
     // Decision points are an optional flight recorder and may be disabled for
@@ -536,93 +328,7 @@ async fn finalize_turn_assessment(
         }
     }
 
-    if let Some(plan) = plan {
-        let contract_changed = turn_context.completion_contract != before_contract;
-        let assessment_complete = plan.contract_complete && semantic_contract_applied;
-        agent
-            .emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                assessment_decision_type,
-                if assessment_complete {
-                    "Task assessment succeeded"
-                } else {
-                    "Task assessment retained constraints but failed lifecycle validation"
-                }
-                .to_string(),
-                {
-                    let mut metadata = crate::agent::hand_holding_telemetry::planner_result_metadata(
-                        if assessment_complete {
-                            "succeeded"
-                        } else {
-                            "invalid_partial"
-                        },
-                        model,
-                        planner_trust_tier,
-                        crate::agent::hand_holding_telemetry::PlannerResultStats {
-                            step_count: plan.steps.len(),
-                            success_criteria_count: plan.success_criteria.len(),
-                            contract_present: plan.contract.is_some(),
-                            contract_changed,
-                        },
-                        (!assessment_complete).then_some("incomplete_completion_contract"),
-                    );
-                    metadata["assessment_mode"] = json!(plan.mode.as_str());
-                    metadata["task_shape"] = json!(plan.task_shape.as_ref());
-                    metadata["lifecycle_contract_coherent"] = json!(plan.contract_complete);
-                    metadata["full_contract_complete"] = json!(plan
-                        .contract
-                        .as_ref()
-                        .is_some_and(super::task_planning::planned_contract_is_complete));
-                    metadata["semantic_contract_applied"] = json!(semantic_contract_applied);
-                    metadata["contract_lane_decisions"] = json!(contract_lane_decisions);
-                    metadata["completion_contract"] = json!({
-                        "task_kind": format!("{:?}", turn_context.completion_contract.task_kind).to_ascii_lowercase(),
-                        "expects_mutation": turn_context.completion_contract.expects_mutation,
-                        "required_mutation_effects": turn_context
-                            .completion_contract
-                            .required_mutation_effects
-                            .telemetry_value(),
-                        "requires_observation": turn_context.completion_contract.requires_observation,
-                        "evidence_requirements": turn_context.completion_contract.evidence_requirements,
-                        "required_invocations": effective_required_invocations,
-                        "allowed_tool_names": turn_context.completion_contract.allowed_tool_names,
-                        "owner_control_plane_tools": turn_context.completion_contract.owner_control_plane_tools,
-                        "forbidden_tool_scopes": turn_context.completion_contract.forbidden_tool_scopes,
-                        "legacy_response_fields_ignored": turn_context.completion_contract.required_response_fields,
-                        "response_contract": turn_context.completion_contract.response_contract.as_ref().map(|contract| json!({
-                            "mode": contract.mode(),
-                            "source_message_hash": contract.source_message_hash(),
-                            "success_text_bytes": contract.success_text().len(),
-                        })),
-                        "filesystem_access": turn_context.filesystem_access,
-                        "primary_project_scope": turn_context.primary_project_scope,
-                    });
-                    metadata
-                },
-            )
-            .await;
-    } else if task_assessment_attempted {
-        agent
-            .emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                assessment_decision_type,
-                "Task assessment returned no result".to_string(),
-                crate::agent::hand_holding_telemetry::planner_result_metadata(
-                    "no_plan",
-                    model,
-                    planner_trust_tier,
-                    crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
-                    Some("assessment_returned_none"),
-                ),
-            )
-            .await;
-    }
-
-    Ok((turn_context, semantic_contract_applied))
+    Ok(turn_context)
 }
 
 /// Build mandate worker bootstrap state without consulting any owner-turn
@@ -755,7 +461,6 @@ async fn build_isolated_mandate_bootstrap(
     Ok(BootstrapOutcome::Continue(Box::new(BootstrapData {
         user_text: user_text.to_string(),
         task_id,
-        task_plan: None,
         memory_pipeline_policy:
             super::task_planning::MemoryPipelinePolicy::SuppressedByCurrentContract,
         resume_execution_snapshot: None,
@@ -985,7 +690,7 @@ pub(in crate::agent) async fn run_bootstrap(
     // Initialize learning context for post-task learning
     let mut learning_ctx = LearningContext {
         user_text: user_text.to_string(),
-        // Finalized below after semantic assessment, before this context can
+        // Finalized below after the relationship is committed, before this context can
         // reach any post-task learning path.
         memory_persistence_allowed: false,
         intent_domains: Vec::new(),
@@ -1209,9 +914,8 @@ pub(in crate::agent) async fn run_bootstrap(
     }
     let model = selected_model.clone();
 
-    // Compile task relationship and capability policy before any optional
-    // memory access. The same assessment artifact is handed to the main loop;
-    // policy and finalization therefore cannot diverge through two model calls.
+    // Compile task relationship and memory policy before any optional memory
+    // access, so policy and finalization cannot diverge.
     let non_owner_shared_context = user_role != UserRole::Owner
         && matches!(
             channel_ctx.visibility,
@@ -1235,7 +939,7 @@ pub(in crate::agent) async fn run_bootstrap(
         None
     };
 
-    // Resolve turn/project context before task assessment and prompt
+    // Resolve turn/project context before the relationship router and prompt
     // construction. The main loop reuses this exact snapshot.
     let initial_turn_context = agent
         .build_turn_context_from_recent_history_with_origin(
@@ -1244,24 +948,6 @@ pub(in crate::agent) async fn run_bootstrap(
             ctx.internal_continuation,
         )
         .await;
-    let model_trust_tier = agent.trust_tier_for_model(&model);
-    let planner_trust_tier = model_trust_tier.as_str();
-    let assessment_mode = match model_trust_tier {
-        crate::agent::trust_tier::ModelTrustTier::Guided => {
-            super::task_planning::TaskAssessmentMode::GuidedPlan
-        }
-        crate::agent::trust_tier::ModelTrustTier::Autonomous => {
-            super::task_planning::TaskAssessmentMode::AutonomousRouting
-        }
-    };
-    let assessment_decision_type = match assessment_mode {
-        super::task_planning::TaskAssessmentMode::GuidedPlan => {
-            crate::events::DecisionType::HandHoldingTelemetry
-        }
-        super::task_planning::TaskAssessmentMode::AutonomousRouting => {
-            crate::events::DecisionType::IntentGate
-        }
-    };
     let planner_skip_reason = if ctx.internal_continuation {
         Some("internal_continuation_uses_parent_contract")
     } else if resume_checkpoint.is_some() {
@@ -1276,10 +962,10 @@ pub(in crate::agent) async fn run_bootstrap(
             .await
             .map(|guard| *guard)
             .unwrap_or(false);
-    // Assessment classifies the request; it does not need the strongest
-    // model. The primary's fast tier leads (an owner model pin still leads),
-    // and the failover providers' models follow, so a used-up primary quota
-    // does not cost the turn its assessment.
+    // The relationship router classifies the request; it does not need the
+    // strongest model. The primary's fast tier leads (an owner model pin still
+    // leads), and the failover providers' models follow, so a used-up primary
+    // quota does not cost the turn its relationship edge.
     let mut cheap_first_models = vec![llm_runtime_snapshot.cheap_model()];
     for candidate in llm_router
         .as_ref()
@@ -1296,10 +982,7 @@ pub(in crate::agent) async fn run_bootstrap(
         model_override_active,
     ));
     let planner_backend = llm_runtime_snapshot.model_routed_backend();
-    let planner_model = planner_models
-        .first()
-        .map_or(model.as_str(), String::as_str);
-    let planner_context = super::task_planning::task_assessment_conversation_context(
+    let planner_context = super::task_planning::relationship_conversation_context(
         initial_turn_context.followup_mode,
         session_summary
             .as_ref()
@@ -1307,7 +990,7 @@ pub(in crate::agent) async fn run_bootstrap(
         &initial_turn_context.assessment_recent_messages,
     );
     // Owed owner requests are continuation targets even when the transcript
-    // window no longer shows them; the assessor must be able to name them.
+    // window no longer shows them; the router must be able to name them.
     let owed_candidates = agent
         .state
         .get_dialogue_state(session_id)
@@ -1326,151 +1009,38 @@ pub(in crate::agent) async fn run_bootstrap(
     let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
         emitter: &emitter,
         state: agent.state.as_ref(),
-        event_store: agent.event_store.as_ref(),
         session_id,
         task_id: &task_id,
     });
-    // `task_assessment = "off"`: the contract model call is skipped like an
-    // unavailable assessment, while the dialogue-relationship lane still runs.
-    let assessment_disabled =
-        agent.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Off;
-    let (task_plan, task_assessment_attempted, relationship_fallback) =
-        if let Some(reason) = planner_skip_reason {
-            agent
-                .emit_decision_point(
-                    &emitter,
-                    &task_id,
-                    0,
-                    assessment_decision_type,
-                    "Task assessment skipped".to_string(),
-                    crate::agent::hand_holding_telemetry::planner_skip_metadata(
-                        reason,
-                        &model,
-                        planner_trust_tier,
-                    ),
-                )
-                .await;
-            (None, false, None)
-        } else {
-            if assessment_disabled {
-                agent
-                    .emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        assessment_decision_type,
-                        "Task assessment skipped".to_string(),
-                        crate::agent::hand_holding_telemetry::planner_skip_metadata(
-                            "assessment_disabled_by_config",
-                            &model,
-                            planner_trust_tier,
-                        ),
-                    )
-                    .await;
-            } else {
-                agent
-                    .emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        assessment_decision_type,
-                        "Task assessment attempted".to_string(),
-                        crate::agent::hand_holding_telemetry::planner_result_metadata(
-                            "attempted",
-                            planner_model,
-                            planner_trust_tier,
-                            crate::agent::hand_holding_telemetry::PlannerResultStats::empty(),
-                            None,
-                        ),
-                    )
-                    .await;
-            }
-            // Contract and dialogue relationship are independent read-only
-            // producers. Run them concurrently under their own deadlines so a
-            // slow contract model cannot delay the lightweight relationship lane.
-            // Contract authority and obligations belong to the current request
-            // only. Prior conversation is visible exclusively to the relationship
-            // producer; carryover must cross its typed antecedent/adoption edge.
-            let contract_future = async {
-                if assessment_disabled {
-                    return None;
-                }
-                super::task_planning::generate_task_plan(
+    // Ingress already reduced an unresolved request to a typed
+    // follow-up/clarification edge. Do not make that persisted topology depend
+    // on a second language call; the finalizer resolves the exact graph node
+    // (or fails closed on ambiguity).
+    let relationship_fallback = if planner_skip_reason.is_some()
+        || matches!(
+            initial_turn_context.followup_mode,
+            Some(
+                crate::agent::followup::FollowupMode::Followup
+                    | crate::agent::followup::FollowupMode::ClarificationAnswer
+            )
+        ) {
+        None
+    } else {
+        match planner_context.as_deref() {
+            Some(context) => {
+                super::task_planning::generate_task_relationship_candidates(
                     planner_backend.clone(),
                     &planner_models,
                     user_text,
-                    assessment_mode,
+                    context,
                     planner_telemetry,
                 )
                 .await
-            };
-            let relationship_future = async {
-                // Ingress already reduced an unresolved request to a typed
-                // follow-up/clarification edge. Do not make that persisted
-                // topology depend on a second language call; the finalizer
-                // resolves the exact graph node (or fails closed on ambiguity).
-                if matches!(
-                    initial_turn_context.followup_mode,
-                    Some(
-                        crate::agent::followup::FollowupMode::Followup
-                            | crate::agent::followup::FollowupMode::ClarificationAnswer
-                    )
-                ) {
-                    return None;
-                }
-                match planner_context.as_deref() {
-                    Some(context) => {
-                        super::task_planning::generate_task_relationship_candidates(
-                            planner_backend.clone(),
-                            &planner_models,
-                            user_text,
-                            context,
-                            planner_telemetry,
-                        )
-                        .await
-                    }
-                    None => None,
-                }
-            };
-            let (task_plan, relationship) = tokio::join!(contract_future, relationship_future);
-            (task_plan, !assessment_disabled, relationship)
-        };
-    let available_tool_names = tool_defs
-        .iter()
-        .filter_map(|definition| {
-            definition
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .or_else(|| definition.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-    let available_tool_receipt_kinds = agent
-        .tools
-        .iter()
-        .map(|tool| (tool.name().to_string(), tool.receipt_kind("{}")))
-        .collect::<Vec<_>>();
-    // Only the owner in a private chat, never a mandate worker, keeps the
-    // control tools this turn already offers when an assessment narrows it.
-    let owner_control_plane_tools = if user_role == UserRole::Owner
-        && channel_ctx.visibility == ChannelVisibility::Private
-        && agent.mandate_execution.is_none()
-    {
-        agent
-            .tools
-            .iter()
-            .filter(|tool| tool.owner_control_plane())
-            .filter(|tool| available_tool_names.iter().any(|name| name == tool.name()))
-            .map(|tool| {
-                let scope = crate::agent::tool_execution::fallback_tool_semantic_scope(tool.name());
-                (tool.name().to_string(), scope)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
+            }
+            None => None,
+        }
     };
-    let (turn_context, semantic_contract_applied) = finalize_turn_assessment(
+    let turn_context = finalize_turn_assessment(
         agent,
         &emitter,
         session_id,
@@ -1479,31 +1049,11 @@ pub(in crate::agent) async fn run_bootstrap(
         ctx.internal_continuation,
         resume_checkpoint.is_some(),
         &initial_turn_context,
-        task_plan.as_ref(),
-        &available_tool_names,
-        &available_tool_receipt_kinds,
-        &owner_control_plane_tools,
         relationship_fallback.as_ref(),
-        task_assessment_attempted,
-        assessment_decision_type,
-        &model,
-        planner_trust_tier,
     )
     .await?;
-    // An assessment too unsure to install can still restrict memory.
-    let unapplied_forbidden_scopes = if semantic_contract_applied {
-        &[][..]
-    } else {
-        task_plan
-            .as_ref()
-            .and_then(|plan| plan.contract.as_ref())
-            .map(|contract| contract.forbidden_tool_scopes.as_slice())
-            .unwrap_or_default()
-    };
     let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
         &turn_context.completion_contract,
-        semantic_contract_applied,
-        unapplied_forbidden_scopes,
         planner_skip_reason.is_none(),
     );
     // Persistence and recall are separate: a turn no person wrote may recall
@@ -1747,7 +1297,6 @@ pub(in crate::agent) async fn run_bootstrap(
     let data = BootstrapData {
         user_text: user_text.to_string(),
         task_id,
-        task_plan,
         memory_pipeline_policy,
         resume_execution_snapshot: resume_checkpoint
             .as_ref()

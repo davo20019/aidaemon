@@ -41,8 +41,8 @@ pub(super) struct TurnContext {
     /// scope, or the workspace a parent handed to a spawned worker (including
     /// an executor's provisioned attempt workspace). Both are runtime state,
     /// not request prose. When present it anchors every relative path
-    /// reference in the request and is the filesystem authority boundary the
-    /// compiled access manifest may attenuate within but never relocate.
+    /// reference in the request and is the turn's filesystem authority
+    /// boundary.
     pub bound_workspace: Option<String>,
     /// Where `bound_workspace` came from: only an explicit binding is a
     /// trusted root (`explicit_workspace`).
@@ -53,20 +53,12 @@ pub(super) struct TurnContext {
     /// this list is never widened to a common ancestor and is therefore safe
     /// to compile into write confinement.
     pub authorized_project_scopes: Vec<String>,
-    /// Semantic least-privilege task authority. When absent, the dispatcher
-    /// falls back to structurally named scopes while still confining each call
-    /// to its explicit access manifest.
-    pub filesystem_access: Option<crate::traits::ToolCallAccessManifest>,
     pub allow_multi_project_scope: bool,
     pub followup_mode: Option<FollowupMode>,
     pub reasons: Vec<TurnContextReason>,
     pub completion_contract: CompletionContract,
-    /// Semantic task-assessment signal: after an asynchronous process starts,
-    /// this turn still has independent inline work it can execute immediately.
-    pub continue_inline_after_background_start: bool,
-    /// True when an unresolved request supplied a durable semantic contract.
-    /// Assessment failure may retain this contract instead of demoting it to
-    /// structural resource identity alone.
+    /// True when an unresolved request supplied a durable contract, which is
+    /// then retained instead of being demoted to structural resource identity.
     pub inherited_completion_contract: bool,
     /// Distinguishes an unfinished request's outstanding proof obligations
     /// from a completed antecedent whose durable safety constraints alone may
@@ -631,12 +623,10 @@ impl Agent {
             bound_workspace_origin,
             primary_project_scope,
             authorized_project_scopes,
-            filesystem_access: None,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),
             reasons,
             completion_contract,
-            continue_inline_after_background_start: false,
             inherited_completion_contract,
             inherited_outstanding_obligations,
         }

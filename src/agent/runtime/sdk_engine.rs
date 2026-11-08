@@ -103,9 +103,6 @@ pub(crate) struct SdkEngineSettings {
     /// `[authority] owner_default`: the owner's level when no session mode
     /// sets one.
     pub(crate) owner_default: crate::config::OwnerLevel,
-    /// `[agent] task_assessment`: whether the pre-run assessment runs
-    /// (`off` skips it) and whether would-refuse comparisons are recorded.
-    pub(crate) task_assessment: crate::config::TaskAssessmentSetting,
     /// `[authority] trusted_roots`: directories whose files are the owner's
     /// own, so reading them is not untrusted content.
     pub(crate) trusted_roots: Vec<String>,
@@ -119,7 +116,6 @@ impl Default for SdkEngineSettings {
             model_override: None,
             max_turns: DEFAULT_MAX_TURNS,
             owner_default: crate::config::OwnerLevel::default(),
-            task_assessment: crate::config::TaskAssessmentSetting::default(),
             trusted_roots: Vec::new(),
             outbound_secrets: Default::default(),
         }
@@ -165,7 +161,6 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         model_override,
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
         owner_default: config.authority.owner_default,
-        task_assessment: config.agent.task_assessment,
         trusted_roots: config.authority.trusted_roots.clone(),
         outbound_secrets: super::approvals::ConfiguredSecrets::new(config.outbound_secret_values()),
     };
@@ -177,8 +172,8 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
 /// Where a turn's trusted file roots come from. Trusted roots, like
 /// authority, come only from explicit owner grants: they are trusted only by
 /// explicit grant, never by inference from the request. A path the request
-/// or a mission names (the primary project scope, the assessor's execution
-/// cwd, a scope a parent handed down) may steer where tools run, but it
+/// or a mission names (the primary project scope, a scope a parent
+/// handed down) may steer where tools run, but it
 /// never vouches for content: callers pass only explicit values here.
 #[derive(Default)]
 pub(in crate::agent) struct TrustRootSources<'a> {
@@ -326,7 +321,7 @@ pub(super) enum DaemonCall {
 }
 
 /// What turn setup (`main_loop.rs`) settled before the SDK run starts:
-/// the recorded task, the assessed contract, the offered tools, the selected
+/// the recorded task, the structural contract, the offered tools, the selected
 /// model and the system prompt.
 pub(in crate::agent) struct SdkTurnSetup {
     /// The persisted user text (bootstrap may have added a transcript).
@@ -341,8 +336,6 @@ pub(in crate::agent) struct SdkTurnSetup {
     pub(in crate::agent) contract: crate::agent::completion_contract::CompletionContract,
     /// Post-task learning state from bootstrap; the run adds its tool calls.
     pub(in crate::agent) learning_ctx: crate::agent::post_task::LearningContext,
-    /// The assessed task shape continues inline work after a background start.
-    pub(in crate::agent) continue_inline_after_background: bool,
     /// Matched skills reference untrusted external content: tools that could
     /// act on it are blocked, naming these skills.
     pub(in crate::agent) restrict_untrusted_reference_tools: bool,
@@ -606,14 +599,16 @@ pub(in crate::agent) struct TurnScope<'a> {
     closeout_demands: std::sync::atomic::AtomicU32,
     /// `completed_results` at the last checklist demand (`u64::MAX`: none).
     executor_demanded_at: AtomicU64,
+    /// Checklist items the model has not finished or set aside, as last
+    /// declared through `track_requirements`.
+    open_checklist_items: AtomicU64,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
     /// The engine model, for vision gating of tool-observed images.
     model: &'a str,
     turn_id: &'a str,
-    /// The assessed contract: its expectations are credited from receipts;
-    /// its authority view is only compared in shadow logging.
+    /// The turn's contract: its expectations are credited from receipts.
     contract: &'a crate::agent::completion_contract::CompletionContract,
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
     /// Shared with the memory writer, which learns from it at run end.
@@ -626,8 +621,6 @@ pub(in crate::agent) struct TurnScope<'a> {
     text_only_next_call: Arc<AtomicBool>,
     /// The usage of the latest model call, until its budget check takes it.
     pending_charge: std::sync::Mutex<Option<crate::traits::TokenUsage>>,
-    /// The assessed task shape keeps inline work going after a detach.
-    continue_inline_after_background: bool,
     /// Where calls without a directory run; refined by the model's own
     /// explicit directories (see `SdkTurnSetup::known_project_dir`).
     known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
@@ -893,7 +886,6 @@ impl Agent {
             prefix,
             contract,
             learning_ctx,
-            continue_inline_after_background,
             instruction_tracker,
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
@@ -1382,7 +1374,6 @@ impl Agent {
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: text_only_next_call.clone(),
             pending_charge: std::sync::Mutex::new(None),
-            continue_inline_after_background,
             known_project_dir: known_project_dir.clone(),
             judged_terminal_calls,
             canonical_calls,
@@ -1449,6 +1440,7 @@ impl Agent {
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
             executor_demanded_at: AtomicU64::new(u64::MAX),
+            open_checklist_items: AtomicU64::new(0),
         };
         // A parent or goal cancellation stops the run at its next check.
         let cancel = self

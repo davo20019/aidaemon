@@ -454,25 +454,16 @@ pub(crate) mod tests {
         use crate::runtime_ports::AgentIngress;
         use crate::testing::MockProvider;
 
-        let mut harness = crate::testing::setup_test_agent_root(
-            MockProvider::with_responses(vec![
+        let mut harness =
+            crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
                 MockProvider::tool_call_response(
                     "remember_fact",
                     r#"{"category":"preference","key":"favorite_color","value":"teal"}"#,
                 ),
                 MockProvider::text_response("Saved."),
-            ])
-            .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-                "answer",
-                false,
-                false,
-                &[],
-                "new_request",
-                "general",
-            )]),
-        )
-        .await
-        .unwrap();
+            ]))
+            .await
+            .unwrap();
         let writes = Arc::new(RecordingWrites::default());
         harness
             .agent

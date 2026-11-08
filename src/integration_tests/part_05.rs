@@ -1429,32 +1429,6 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
     let target = "/etc/aidaemon-synthetic-denied.txt".to_string();
     let cwd = workspace.path().to_string_lossy().to_string();
 
-    let base = MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "local_workspace",
-    );
-    let mut assessment: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    assessment["contract"]["evidence_requirements"] = serde_json::json!([{
-        "summary": "Complete the exact requested machine invocation",
-        "acceptable_scopes": ["local_workspace"],
-        "purpose": "outcome",
-        "minimum_authority": "direct",
-        "temporal_scope": "historical",
-        "receipt": {
-            "tool_names": ["terminal"],
-            "outcome_condition": "non_success_terminal",
-            "requires_output": false,
-            "min_invocations": 1,
-            "max_invocations": 1
-        }
-    }]);
-    let assessment = MockProvider::text_response(&assessment.to_string());
-
     let write_args = serde_json::json!({
         "command": format!("printf SYNTHETIC_DENIED > '{target}'"),
         "working_dir": cwd,
@@ -1469,8 +1443,7 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
         // with the same typed reply; the test then fails on the final text.
         MockProvider::text_response(marker),
         MockProvider::text_response(marker),
-    ])
-    .with_task_assessments(vec![assessment]);
+    ]);
     let harness = setup_full_stack_test_agent(provider).await.unwrap();
 
     let session_id = "typed_recovery_after_denial";
@@ -1531,21 +1504,14 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
         !conditions.iter().any(|c| c == "tools_required_no_tool_response"),
         "gate looped: {conditions:?}"
     );
-    // The ledger-first arbiter (shadow by default) must agree: nothing is
-    // reachable after the credited denial, so the run is closed on evidence.
+    // No declared expectation is left for the arbiter to demand after the
+    // denial: the structural target is out of reach, so the run may stop.
     let closeout = decision_rows
         .iter()
         .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .find(|data| data["metadata"]["condition"].as_str() == Some("ledger_closeout"))
         .expect("ledger closeout verdict must be recorded");
-    assert_eq!(closeout["metadata"]["verdict"], "closed", "{closeout}");
-    assert!(
-        matches!(
-            closeout["metadata"]["proof_basis"].as_str(),
-            Some("contract") | Some("credited_denial")
-        ),
-        "{closeout}"
-    );
+    assert_eq!(closeout["metadata"]["verdict"], "unreachable", "{closeout}");
     assert!(closeout["metadata"]["reachable_obligation_ids"]
         .as_array()
         .is_some_and(Vec::is_empty));
@@ -1567,16 +1533,6 @@ async fn test_full_stack_executor_declared_checklist_is_demanded_until_receipts_
         .join("declared/note.txt")
         .to_string_lossy()
         .to_string();
-
-    // Assessor: nothing typed at all — no mutation, no observation.
-    let assessment = MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        false,
-        &[],
-        "new_request",
-        "local_workspace",
-    );
 
     let checklist_args = serde_json::json!({
         "items": [
@@ -1619,8 +1575,7 @@ async fn test_full_stack_executor_declared_checklist_is_demanded_until_receipts_
         MockProvider::tool_call_response("terminal", &read_args),
         MockProvider::text_response(done),
         MockProvider::text_response(done),
-    ])
-    .with_task_assessments(vec![assessment]);
+    ]);
 
     let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)

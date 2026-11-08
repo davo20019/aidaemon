@@ -23,9 +23,7 @@ async fn run_fixture_with_trace(
     fixture: &HarnessEvalFixture,
 ) -> anyhow::Result<(HarnessEvalRunResult, Vec<crate::events::Event>)> {
     let mock_responses = build_mock_responses(&fixture.mock_responses);
-    let provider = MockProvider::with_responses(mock_responses)
-        .with_strict_responses()
-        .with_task_assessments(build_mock_responses(&fixture.task_assessments));
+    let provider = MockProvider::with_responses(mock_responses).with_strict_responses();
 
     let harness = if fixture.orchestrator {
         setup_test_agent_orchestrator(provider).await?
@@ -235,7 +233,6 @@ mod tests {
             // The draft's own expectations must hold on the run it was
             // recorded from (floored scores, receipt-backed counts).
             let mut replay = recorded.clone();
-            replay.task_assessments = fixture.task_assessments.clone();
             replay.orchestrator = fixture.orchestrator;
             replay.routing_models = fixture.routing_models;
             run_and_assert(&replay).await.unwrap();

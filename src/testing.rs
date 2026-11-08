@@ -18,10 +18,12 @@ use crate::config::{IterationLimitConfig, ModelsConfig, ProviderKind};
 use crate::events::EventStore;
 use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
+use crate::plans::PlanStore;
 use crate::providers::ProviderError;
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
+use crate::tools::track_requirements::TrackRequirementsTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
     ChannelCapabilities, ChatOptions, HubChannel, ProviderResponse, TokenUsage, Tool, ToolCall,
@@ -46,7 +48,6 @@ pub struct MockChatCall {
 /// Mock LLM provider that returns scripted responses.
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
-    task_assessment_responses: Mutex<Vec<ProviderResponse>>,
     relationship_assessment_responses: Mutex<Vec<ProviderResponse>>,
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
@@ -61,10 +62,9 @@ pub struct MockProvider {
     /// Calls asking for one of these JSON-schema names fail (after being
     /// logged), whatever the script holds.
     failing_response_schemas: Vec<String>,
-    /// When true (default), assessment/re-planner LLM calls are silently
-    /// intercepted with an empty response (causing generate_task_plan()
-    /// to return None). Preserves existing test behavior — no plan
-    /// generated, no call_log entry, no plan context in prompts.
+    /// When true (default), relationship-router and progress-evaluator LLM
+    /// calls are silently intercepted (no call_log entry): a scripted
+    /// relationship answers the former, else an empty response.
     pub skip_planning_calls: bool,
 }
 
@@ -73,7 +73,6 @@ impl MockProvider {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(Vec::new()),
-            task_assessment_responses: Mutex::new(Vec::new()),
             relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
@@ -91,7 +90,6 @@ impl MockProvider {
     pub fn with_responses(responses: Vec<ProviderResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            task_assessment_responses: Mutex::new(Vec::new()),
             relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
@@ -112,7 +110,6 @@ impl MockProvider {
     ) -> Self {
         Self {
             responses: Mutex::new(responses),
-            task_assessment_responses: Mutex::new(Vec::new()),
             relationship_assessment_responses: Mutex::new(Vec::new()),
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
@@ -126,8 +123,6 @@ impl MockProvider {
         }
     }
 
-    /// Reject unexpected execution-model calls instead of inventing a reply.
-    /// Assessment lanes remain independently scripted via with_task_assessments.
     /// Fail the next main-loop calls with these provider errors (as a 400)
     /// before the scripted responses start.
     pub fn with_leading_errors(self, errors: Vec<&str>) -> Self {
@@ -176,19 +171,13 @@ impl MockProvider {
     /// script, hiding the regression.
     pub async fn assert_response_script_consumed(&self) -> anyhow::Result<()> {
         let responses = self.responses.lock().await.len();
-        let assessments = self.task_assessment_responses.lock().await.len();
         let relationships = self.relationship_assessment_responses.lock().await.len();
         anyhow::ensure!(
-            responses == 0 && assessments == 0 && relationships == 0,
-            "mock script not fully consumed: {responses} execution, {assessments} task-assessment, \
+            responses == 0 && relationships == 0,
+            "mock script not fully consumed: {responses} execution, \
              {relationships} relationship response(s) left unused"
         );
         Ok(())
-    }
-
-    /// Scripted task-assessment responses nobody requested.
-    pub async fn unconsumed_task_assessments(&self) -> usize {
-        self.task_assessment_responses.lock().await.len()
     }
 
     /// Simulate a provider/model that rejects advanced per-call options.
@@ -198,142 +187,38 @@ impl MockProvider {
         self
     }
 
-    /// Supply task-assessment responses without interleaving them with the
-    /// main-loop response queue. This keeps behavior tests explicit about the
-    /// typed contract they exercise instead of teaching the mock to classify
-    /// English request phrases.
-    pub fn with_task_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
-        let relationships = responses
-            .iter()
-            // A fresh session has no candidate antecedent, so production does
-            // not invoke the relationship lane for its first assessment.
-            .skip(1)
-            .filter_map(|response| {
-                let value: Value = serde_json::from_str(response.content.as_deref()?).ok()?;
-                let shape = value.get("task_shape")?;
-                Some(Self::text_response(
-                    &json!({
-                        "schema_version": 1,
-                        "confidence": shape.get("confidence").and_then(Value::as_str).unwrap_or("high"),
-                        "request_relationship": shape.get("request_relationship").and_then(Value::as_str).unwrap_or("new_request"),
-                        "antecedent_user_message_id": Value::Null,
-                        "semantic_scope": shape.get("semantic_scope").and_then(Value::as_str).unwrap_or("none")
-                    })
-                    .to_string(),
-                ))
-            })
-            .collect();
-        self.task_assessment_responses = Mutex::new(responses);
-        self.relationship_assessment_responses = Mutex::new(relationships);
-        self
-    }
-
-    /// Supply dialogue-edge responses independently from task contracts.
-    /// Production uses separate authority lanes, so the mock must not let a
-    /// relationship call consume the next turn's contract.
-    #[allow(dead_code)]
+    /// Supply the relationship router's dialogue-edge responses, kept apart
+    /// from the main-loop queue. A fresh session has no candidate antecedent,
+    /// so production does not call the router for a session's first turn.
     pub fn with_relationship_assessments(mut self, responses: Vec<ProviderResponse>) -> Self {
         self.relationship_assessment_responses = Mutex::new(responses);
         self
     }
 
-    /// Helper for a complete semantic assessment used by tests.
-    pub fn semantic_task_assessment(
-        task_kind: &str,
-        expects_mutation: bool,
-        requires_observation: bool,
-        required_effects: &[&str],
+    /// One typed dialogue edge from the relationship router, naming no exact
+    /// antecedent (the dialogue-state resolver binds it when unambiguous).
+    pub fn relationship_assessment(
         request_relationship: &str,
         semantic_scope: &str,
     ) -> ProviderResponse {
-        Self::semantic_task_assessment_with_inline_continuation(
-            task_kind,
-            expects_mutation,
-            requires_observation,
-            required_effects,
-            request_relationship,
-            semantic_scope,
-            false,
+        Self::text_response(
+            &json!({
+                "schema_version": 1,
+                "confidence": "high",
+                "request_relationship": request_relationship,
+                "antecedent_user_message_id": Value::Null,
+                "semantic_scope": semantic_scope
+            })
+            .to_string(),
         )
     }
 
-    /// Helper variant for a typed background edge that leaves independent
-    /// inline work outstanding after the detach receipt.
-    #[allow(clippy::too_many_arguments)]
-    pub fn semantic_task_assessment_with_inline_continuation(
-        task_kind: &str,
-        expects_mutation: bool,
-        requires_observation: bool,
-        required_effects: &[&str],
-        request_relationship: &str,
-        semantic_scope: &str,
-        continue_inline_after_background_start: bool,
-    ) -> ProviderResponse {
-        let evidence_requirements = if requires_observation {
-            let (scope, purpose, authority, temporal_scope) = match semantic_scope {
-                "conversation_history" => (
-                    "conversation_history",
-                    "historical_record",
-                    "canonical",
-                    "historical",
-                ),
-                "goal_state" => ("goal_state", "current_state", "canonical", "current"),
-                "user_memory" => ("user_memory", "current_state", "advisory", "current"),
-                "external_remote" => ("external_remote", "current_state", "direct", "current"),
-                "local_workspace" => ("local_workspace", "current_state", "direct", "current"),
-                _ => ("host_local", "current_state", "direct", "current"),
-            };
-            vec![json!({
-                "summary": "Establish the synthetic task's material state",
-                "acceptable_scopes": [scope],
-                "purpose": purpose,
-                "minimum_authority": authority,
-                "temporal_scope": temporal_scope
-            })]
-        } else {
-            Vec::new()
-        };
-        Self::text_response(
-            &json!({
-                "schema_version": 9,
-                "goal": "Synthetic typed task assessment",
-                "steps": [],
-                "success_criteria": [],
-                "contract": {
-                    "confidence": "high",
-                    "task_kind": task_kind,
-                    "expects_mutation": expects_mutation,
-                    "requires_observation": requires_observation,
-                    "required_effects": required_effects,
-                    "mutation_scope": "allowed",
-                    "forbidden_actions": [],
-                    "constraint_evidence": [],
-                    "tool_scope": "allowed",
-                    "tool_constraint_evidence": [],
-                    "required_response_fields": [],
-                    "minimum_sources": 0,
-                    "requires_primary_sources": false,
-                    "requires_exact_history": false,
-                    "evidence_requirements": evidence_requirements,
-                    "required_invocations": [],
-                    "filesystem_access": {
-                        "execution_cwd": null,
-                        "read_paths": [],
-                        "write_paths": []
-                    },
-                    "project_reference": null
-                },
-                "task_shape": {
-                    "execution_mode": "inline",
-                    "confidence": "high",
-                    "independent_workstreams": 1,
-                    "requires_background_continuation": false,
-                    "continue_inline_after_background_start": continue_inline_after_background_start,
-                    "request_relationship": request_relationship,
-                    "semantic_scope": semantic_scope
-                }
-            })
-            .to_string(),
+    /// The executing model declaring one open observation on its own
+    /// checklist: the source of a run's stop-time expectations.
+    pub fn observation_checklist() -> ProviderResponse {
+        Self::tool_call_response(
+            "track_requirements",
+            r#"{"items":[{"text":"Observe the requested state","status":"pending","requires_observation":true}]}"#,
         )
     }
 
@@ -458,33 +343,25 @@ impl MockProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
-        // Silently intercept assessment/re-planner calls: return empty response
-        // (causes generate_task_plan() to return None) without recording in call_log.
+        // Silently intercept relationship-router and evaluator calls without
+        // recording them in call_log.
         if self.skip_planning_calls {
             let is_relationship_call = messages.iter().any(|m| {
                 m.get("content")
                     .and_then(|c| c.as_str())
                     .is_some_and(|s| s.contains("task relationship router"))
             });
-            let is_planning_call = messages.iter().any(|m| {
-                m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
-                    s.contains("task planner")
-                        || s.contains("task assessment router")
-                        || s.contains("task-contract compiler")
-                        || s.contains("task relationship router")
-                        || s.contains("progress evaluator")
-                })
-            });
+            let is_planning_call = is_relationship_call
+                || messages.iter().any(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("progress evaluator"))
+                });
             if is_planning_call {
                 if is_relationship_call {
                     let mut relationships = self.relationship_assessment_responses.lock().await;
                     if !relationships.is_empty() {
                         return Ok(relationships.remove(0));
-                    }
-                } else {
-                    let mut task_assessments = self.task_assessment_responses.lock().await;
-                    if !task_assessments.is_empty() {
-                        return Ok(task_assessments.remove(0));
                     }
                 }
                 return Ok(ProviderResponse {
@@ -1036,6 +913,9 @@ async fn setup_test_agent_internal(
             Arc::new(RememberFactTool::new(
                 state.clone() as Arc<dyn crate::traits::StateStore>
             )),
+            Arc::new(TrackRequirementsTool::new(Arc::new(
+                PlanStore::new(state.pool()).await?,
+            ))),
         ]
     } else {
         Vec::new()
@@ -1195,6 +1075,9 @@ pub async fn setup_test_agent_with_models_and_policy(
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
+        Arc::new(TrackRequirementsTool::new(Arc::new(
+            PlanStore::new(state.pool()).await?,
+        ))),
     ];
 
     // Configure default + fallback so router is enabled in tests.
@@ -1290,6 +1173,9 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
+        Arc::new(TrackRequirementsTool::new(Arc::new(
+            PlanStore::new(state.pool()).await?,
+        ))),
     ];
 
     // Configure default + fallback so router is enabled in tests.

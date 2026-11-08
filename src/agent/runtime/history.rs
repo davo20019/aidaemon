@@ -12,13 +12,8 @@
 //! same names through `history::`.
 
 pub(super) use super::completion_contract::{
-    append_evidence_obligations, append_required_invocation_obligations, apply_semantic_authority,
-    apply_semantic_evidence_policy, inherit_unfinished_request_contract,
-    install_semantic_completion_contract, parse_planned_forbidden_action,
-    parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
-    CompletionContract, CompletionProgress, CompletionTaskKind, ForbiddenMutationAction,
-    SemanticAuthorityRequirements, SemanticCompletionRequirements, SemanticEvidencePolicy,
-    VerificationTarget, VerificationTargetKind,
+    retain_structural_completion_contract, CompletionContract, CompletionProgress,
+    CompletionTaskKind, VerificationTarget, VerificationTargetKind,
 };
 pub(super) use super::followup::FollowupMode;
 pub(super) use super::turn_context::TurnContext;

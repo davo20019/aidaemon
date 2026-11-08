@@ -341,15 +341,7 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
             &serde_json::json!({"path": file_path}).to_string(),
         ),
         MockProvider::text_response(&final_summary),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_source_write"],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
         vec![Arc::new(StructuredPatchTool) as Arc<dyn crate::traits::Tool>],
@@ -436,15 +428,7 @@ async fn operational_blocker_without_recovery_evidence_requires_recovery_receipt
         MockProvider::text_response(
             "Refreshed the workspace, reran the original build, and completed the task successfully.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_source_write"],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let harness = setup_full_stack_test_agent_with_extra_tools(
         provider,
         vec![Arc::new(StructuredPatchTool) as Arc<dyn crate::traits::Tool>],

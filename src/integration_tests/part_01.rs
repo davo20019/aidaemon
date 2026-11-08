@@ -130,25 +130,7 @@ async fn test_multi_turn_with_tool_use() {
         MockProvider::text_response("You have 16GB RAM."),
         // Turn 2: direct response referencing previous context
         MockProvider::text_response("Yes, 16GB is enough for Docker."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "check",
-            false,
-            true,
-            &[],
-            "new_request",
-            "host_local",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
 
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -1619,10 +1601,6 @@ async fn test_memory_fact_persists_across_turns() {
         MockProvider::text_response("Got it! I'll remember you prefer Rust."),
         // Turn 2: the agent should see the fact in its system prompt
         MockProvider::text_response("Yes, I know you prefer Rust!"),
-    ])
-    .with_task_assessments(vec![
-        memory_allowed_task_assessment(),
-        memory_allowed_task_assessment(),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();

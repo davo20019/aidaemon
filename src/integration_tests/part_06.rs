@@ -206,25 +206,7 @@ async fn test_identity_tool_result_survives_context_collapse() {
         ),
         MockProvider::text_response("Saved."),
         MockProvider::text_response("Continuing with your latest request."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "change",
-            true,
-            false,
-            &[],
-            "new_request",
-            "user_memory",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let _ = harness
@@ -281,18 +263,11 @@ async fn test_initial_routing_call_continues_for_actions() {
     //   2. Agent loop → tool call (system_info)
     //   3. Agent loop → final text with tool result
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         MockProvider::text_response("I'll check the system information for you."),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Your system is running macOS."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -328,31 +303,20 @@ async fn test_initial_routing_call_continues_for_actions() {
     );
 }
 
-/// An outstanding typed host observation keeps the loop active through any
-/// number of no-tool candidates until a compatible receipt arrives.
+/// A declared, unobserved checklist item bounces a no-tool candidate; the run
+/// answers once a compatible receipt arrives.
 #[tokio::test]
-async fn test_typed_observation_survives_multiple_no_tool_candidates() {
+async fn test_declared_observation_survives_a_no_tool_candidate() {
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1) First call (with tools): deferral text, bounced by the
         //    deferred-action gate
         MockProvider::text_response("I'll check the system information for you."),
-        // 2) Execution loop (bad): deferred action text, no tool calls
-        MockProvider::text_response(
-            "I'll check your system information now.\nStarting the system-information workflow...",
-        ),
-        // 3) Execution loop (good): actual tool execution
+        // 2) Execution loop: actual tool execution
         MockProvider::tool_call_response("system_info", "{}"),
-        // 4) Final answer
+        // 3) Final answer
         MockProvider::text_response("I checked the system information."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -391,18 +355,11 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
     let denial = "I cannot change that setting because no matching control is exposed.";
     let limitation = "I inspected the available runtime state. It still does not expose a speaker-volume control, so the requested change remains incomplete.";
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         MockProvider::text_response(denial),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(limitation),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        true,
-        &["configuration"],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let policy = crate::config::PolicyConfig {
         trust_tier: "autonomous".to_string(),
         ..Default::default()
@@ -431,8 +388,8 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
         "the unsupported claim needs an evidence pass"
     );
     let calls = harness.provider.call_log.lock().await;
-    assert_eq!(calls.len(), 3);
-    let recovery = &calls[1];
+    assert_eq!(calls.len(), 4);
+    let recovery = &calls[2];
     assert!(recovery.messages.iter().any(|message| {
         message
             .get("content")
@@ -449,6 +406,7 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
 #[tokio::test]
 async fn test_satisfied_observation_is_not_reopened_by_candidate_wording() {
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1) The typed observation keeps this candidate from completing.
         MockProvider::text_response("I'll find it for you."),
         // 2) A compatible receipt satisfies the contract.
@@ -457,15 +415,7 @@ async fn test_satisfied_observation_is_not_reopened_by_candidate_wording() {
         MockProvider::text_response(
             "I'll send it over once I locate the exact file. Give me a moment.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -488,7 +438,7 @@ async fn test_satisfied_observation_is_not_reopened_by_candidate_wording() {
         response,
         "I'll send it over once I locate the exact file. Give me a moment."
     );
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;
     // All calls should have tools available (no separate tool-free text-only pre-pass)

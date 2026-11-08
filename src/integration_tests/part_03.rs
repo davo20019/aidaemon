@@ -11,8 +11,7 @@
 /// fact store.
 #[tokio::test]
 async fn test_same_channel_relevant_fact_is_rendered() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let harness = setup_test_agent(provider).await.unwrap();
 
     harness
@@ -320,8 +319,7 @@ async fn test_cross_channel_hints() {
 /// A relevant legacy fact (NULL channel_id) remains eligible for bounded recall.
 #[tokio::test]
 async fn test_legacy_facts_backward_compat() {
-    let provider = MockProvider::new()
-        .with_task_assessments(vec![memory_allowed_task_assessment()]);
+    let provider = MockProvider::new();
     let harness = setup_test_agent(provider).await.unwrap();
 
     // Store a legacy fact (no channel_id, Global privacy — the default for old facts)

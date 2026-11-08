@@ -30,21 +30,14 @@ async fn test_orchestration_uniform_models_no_routing() {
 async fn test_orchestration_simple_falls_through_to_full_loop() {
     // The request goes through the full agent loop.
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1st call: deferral text, bounced by the deferred-action gate
         MockProvider::text_response("I'll check the system info and get back to you."),
         // 2nd call: full agent loop — tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // 3rd call: full agent loop — final response
         MockProvider::text_response("Your system is running macOS."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -113,6 +106,7 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1st call: deferral text, bounced by the deferred-action gate
         MockProvider::text_response("I'll run the diagnostics and get back to you."),
         // 2nd call: deferred-action retry produces a real tool call
@@ -123,15 +117,7 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -283,25 +269,7 @@ async fn test_structural_continuation_projects_exact_prior_exchange() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("There are 3 R's in strawberry."),
         MockProvider::text_response("Yes — strawberry has 3 R's."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation", "conversation_history")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let first = harness
@@ -471,15 +439,7 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         MockProvider::text_response(
             "I could not verify the deletion because no command was run.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_source_write"],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -545,20 +505,13 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
     let fabrication =
         "I've initiated a deep analysis using a specialized review agent. I'll return shortly.";
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         MockProvider::text_response(fabrication),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(
             "I could not start a specialist agent, so no delegated review is running.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -580,6 +533,6 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
     );
     // The ledger closeout demanded real work for the open check; the model
     // used a tool and answered from its receipt.
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 4);
 }
 

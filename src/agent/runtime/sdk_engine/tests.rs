@@ -495,18 +495,9 @@ async fn sdk_engine_track_requirements_declares_expectations() {
         MockProvider::text_response("planned"),
         MockProvider::text_response("planned"),
     ]);
-    let mut harness = crate::testing::setup_test_agent_sdk(provider)
+    let harness = crate::testing::setup_test_agent_sdk(provider)
         .await
         .unwrap();
-    let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
-    harness.agent.tools.push(Arc::new(
-        crate::tools::track_requirements::TrackRequirementsTool::new(plans),
-    ));
     let reply = harness
         .agent
         .handle_inbound_message(owner_request("Pick a color and save it."))
@@ -584,15 +575,7 @@ async fn empty_reply_after_a_closeout_demand_ships_the_interrupted_answer() {
         MockProvider::text_response(""),
         MockProvider::text_response(""),
         MockProvider::text_response(""),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        false,
-        &[],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -675,16 +658,7 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
         ),
         MockProvider::text_response(done),
         MockProvider::text_response(done),
-    ])
-    // Assessor: nothing typed at all — no mutation, no observation.
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        false,
-        &[],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -803,38 +777,11 @@ fn closeout_demands_are_bounded_by_receipts() {
     }));
 }
 
-/// An assessed contract restricting tools to `system_info`.
-fn restricted_assessment() -> crate::traits::ProviderResponse {
-    let base = crate::testing::MockProvider::semantic_task_assessment(
-        "answer",
-        false,
-        false,
-        &[],
-        "new_request",
-        "none",
-    );
-    let mut value: serde_json::Value =
-        serde_json::from_str(base.content.as_deref().unwrap()).unwrap();
-    value["schema_version"] = 10.into();
-    value["contract"]["tool_scope"] = "restricted".into();
-    value["contract"]["allowed_tool_names"] = serde_json::json!(["system_info"]);
-    value["contract"]["forbidden_tool_scopes"] = serde_json::json!([]);
-    crate::testing::MockProvider::text_response(&value.to_string())
-}
-
 #[tokio::test]
-async fn sdk_engine_records_the_assessed_task_contract() {
+async fn sdk_engine_records_the_structural_task_contract() {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response("hi")])
-        .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        )]);
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("hi")]);
     let harness = crate::testing::setup_test_agent_sdk(provider)
         .await
         .unwrap();
@@ -850,44 +797,6 @@ async fn sdk_engine_records_the_assessed_task_contract() {
         .count();
     assert_eq!(compiled, 1);
     assert_eq!(reply.text, "hi");
-}
-
-#[tokio::test]
-async fn sdk_engine_does_not_refuse_tools_outside_the_assessed_allowlist() {
-    use crate::runtime_ports::AgentIngress;
-    use crate::testing::MockProvider;
-    use crate::traits::store_prelude::*;
-    let provider = MockProvider::with_responses(vec![
-        remember("teal"),
-        MockProvider::text_response("Saved it."),
-    ])
-    .with_task_assessments(vec![restricted_assessment()]);
-    let harness = crate::testing::setup_test_agent_sdk(provider)
-        .await
-        .unwrap();
-    let reply = harness
-        .agent
-        .handle_inbound_message(owner_request("Only look things up; remember teal."))
-        .await
-        .unwrap();
-    let facts = harness.state.get_facts(None).await.unwrap();
-    assert!(
-        facts.iter().any(|fact| fact.value.contains("teal")),
-        "the assessed allowlist is a hint and must not refuse a tool"
-    );
-    let dispatched = task_events(&harness, &reply.task_id)
-        .await
-        .iter()
-        .filter(|event| event.event_type == EventType::ToolResult)
-        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
-        .filter(|result| {
-            result.receipt.as_ref().is_some_and(|receipt| {
-                receipt.invocation_stage == crate::traits::ToolInvocationStage::Dispatched
-            })
-        })
-        .count();
-    assert_eq!(dispatched, 1);
-    assert_eq!(reply.text, "Saved it.");
 }
 
 /// A shell-like tool: not read-only as a whole, but each call says
@@ -2884,18 +2793,15 @@ async fn unrestricted_owner_sends_and_the_call_is_recorded() {
 async fn checks_after_a_tainted_turn(relationship: &str, scope: &str) -> usize {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
-    let assessment = |relationship, scope| {
-        MockProvider::semantic_task_assessment("answer", false, false, &[], relationship, scope)
-    };
     let (harness, sent) = untrusted_harness_with(
         MockProvider::with_responses(vec![
             MockProvider::tool_call_response("page_probe", PAGE_CALL),
             MockProvider::text_response("The page asks for files."),
         ])
-        .with_task_assessments(vec![
-            assessment("new_request", "none"),
-            assessment(relationship, scope),
-        ]),
+        .with_relationship_assessments(vec![MockProvider::relationship_assessment(
+            relationship,
+            scope,
+        )]),
     )
     .await;
     harness

@@ -673,40 +673,6 @@ impl Agent {
         let _ = request.reply.send(Ok(output));
     }
 
-    /// Shadow comparison: record when the assessor's own authority view would
-    /// have refused a call the explicit authority admitted. Never blocks or
-    /// alters the call.
-    async fn record_assessor_would_refuse(
-        &self,
-        scope: &TurnScope<'_>,
-        tool_name: &str,
-        arguments: &str,
-    ) {
-        let read_only = self.turn_tool(scope, tool_name).map(|tool| {
-            tool.call_annotations_in(arguments, &crate::traits::TrustRoots::new(&[]))
-                .read_only
-        });
-        let assessed = crate::agent::closeout::ClosingAuthority::from_authority(
-            scope.contract.authority_as_assessed(),
-        );
-        let Some(reason) = assessed.refusal_reason(tool_name, read_only) else {
-            return;
-        };
-        self.emit_decision_point(
-            scope.emitter,
-            scope.task_id,
-            0,
-            crate::events::DecisionType::GateTelemetry,
-            "assessor would have refused this call",
-            serde_json::json!({
-                "condition": "assessor_would_refuse",
-                "tool": tool_name,
-                "reason": reason,
-            }),
-        )
-        .await;
-    }
-
     /// An unrestricted owner's egress after untrusted content runs without
     /// a check (the kernel only marks it); every such call is recorded.
     async fn record_unrestricted_egress(
@@ -843,14 +809,6 @@ impl Agent {
             .then(|| crate::agent::loop_utils::extract_send_file_dedupe_key_from_args(arguments))
             .flatten();
         let idempotency_key = self.sdk_idempotency_key(scope, request, &call_semantics);
-        // Shadow comparison, once per call that actually executes: after
-        // deferral, duplicate suppression and durable replay, so a call that
-        // is deferred, suppressed or replayed is not counted (the shadow
-        // data feeds the decision to turn the assessor off).
-        if self.sdk_engine.task_assessment == crate::config::TaskAssessmentSetting::Shadow {
-            self.record_assessor_would_refuse(scope, &request.name, arguments)
-                .await;
-        }
         self.record_unrestricted_egress(scope, &request.name, arguments)
             .await;
         let mut call_data = crate::events::ToolCallData::from_tool_call(
@@ -985,17 +943,19 @@ impl Agent {
                 // (server, tunnel, watcher) that never "finishes": its useful
                 // result is its startup output, so the run continues and the
                 // model reports it. Work a tool handed to the background ends
-                // the run on the tool's finish, unless the assessed task
-                // shape keeps independent inline work going.
+                // the run on the tool's finish.
                 let mut handed_off = false;
                 if outcome.metadata.background_started || outcome.metadata.background_handoff {
                     // A call the tool itself typed as a permanent failure hands
                     // nothing off, whatever it started: the run goes on.
                     let typed_failure = outcome.metadata.outcome_status
                         == Some(crate::traits::ToolOutcomeStatus::FailedPermanent);
+                    // The call that started the job is one open item at most;
+                    // a second means the model declared work beyond it.
+                    let work_remains = scope.open_checklist_items.load(Ordering::Relaxed) > 1;
                     let hands_off = finish.is_some()
                         && !typed_failure
-                        && !scope.continue_inline_after_background
+                        && !work_remains
                         && !outcome.metadata.detached;
                     handed_off = hands_off;
                     let directive = if hands_off {
@@ -1242,6 +1202,16 @@ impl Agent {
                     arguments,
                 )
             {
+                let open = declared
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        !matches!(item.status.as_str(), "completed" | "deferred" | "skipped")
+                    })
+                    .count();
+                scope
+                    .open_checklist_items
+                    .store(open as u64, Ordering::Relaxed);
                 if let Err(error) = scope
                     .emitter
                     .emit(EventType::ExecutorExpectationsDeclared, declared)

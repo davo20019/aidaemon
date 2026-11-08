@@ -34,39 +34,6 @@ pub struct OutcomeEntry {
     pub expected_step_count: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LinearIntentStep {
-    pub step_id: String,
-    pub step_index: usize, // 1-based
-    pub tool: String,
-    pub target: String,
-    pub description: String,
-    /// Number of tool calls made while this step was current.
-    #[serde(default)]
-    pub tool_calls_on_step: usize,
-    /// Whether this step has been marked complete (by re-planner or outcome ledger).
-    #[serde(default)]
-    pub completed: bool,
-    /// Evidence summary when step was marked complete.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_evidence: Option<String>,
-    /// Tool call count at which the re-planner last evaluated this step.
-    /// Prevents re-triggering on every single round after threshold.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_evaluated_at: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct LinearIntentPlan {
-    pub plan_version: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<LinearIntentStep>,
-    #[serde(default)]
-    pub current_step_cursor: usize, // 0-based cursor into `steps`
-}
-
-impl LinearIntentPlan {}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetTier {
@@ -252,8 +219,6 @@ pub struct ExecutionState {
     /// prerequisite merely because a new model turn proposed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_dependency_targets: Vec<ToolTargetHint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_linear_intent_plan: Option<LinearIntentPlan>,
     /// Cumulative milliseconds lost to LLM provider timeouts.  These are NOT
     /// the agent's fault (provider slowness, not agent stalling) and should be
     /// excluded from the wall-clock budget check.
@@ -332,7 +297,6 @@ impl ExecutionState {
             resource_pressure_emitted: false,
             outcome_ledger: Vec::new(),
             blocked_dependency_targets: Vec::new(),
-            active_linear_intent_plan: None,
             provider_timeout_ms: 0,
             tool_output_evidence: String::new(),
             tool_output_evidence_overflow: false,
@@ -346,50 +310,6 @@ impl ExecutionState {
 
     pub fn mark_persisted_now(&mut self) {
         self.persisted_at = Some(Utc::now());
-    }
-
-    pub fn install_linear_intent_plan(&mut self, plan_version: u32, steps: Vec<LinearIntentStep>) {
-        if steps.is_empty() {
-            self.active_linear_intent_plan = None;
-            return;
-        }
-        self.active_linear_intent_plan = Some(LinearIntentPlan {
-            plan_version,
-            steps,
-            current_step_cursor: 0,
-        });
-    }
-
-    pub fn linear_intent_plan_has_remaining_steps(&self) -> bool {
-        self.active_linear_intent_plan
-            .as_ref()
-            .is_some_and(|plan| plan.current_step_cursor < plan.steps.len())
-    }
-
-    /// Promote budget if a captured task plan indicates higher complexity
-    /// than the initial keyword-based selection predicted.
-    /// Only promotes upward — never reduces an existing budget.
-    pub fn promote_budget_for_plan(&mut self, step_count: usize) {
-        if step_count < 3 {
-            return;
-        }
-        if !matches!(self.budget_tier, BudgetTier::None | BudgetTier::Small) {
-            return;
-        }
-        let promoted = default_execution_budget(BudgetTier::Standard);
-        self.budget.max_llm_calls = self.budget.max_llm_calls.max(promoted.max_llm_calls);
-        self.budget.max_tool_calls = self.budget.max_tool_calls.max(promoted.max_tool_calls);
-        self.budget.max_steps = self.budget.max_steps.max(promoted.max_steps);
-        self.budget.max_wall_clock_ms = self
-            .budget
-            .max_wall_clock_ms
-            .max(promoted.max_wall_clock_ms);
-        tracing::info!(
-            step_count,
-            new_max_tool_calls = self.budget.max_tool_calls,
-            new_max_llm_calls = self.budget.max_llm_calls,
-            "Budget promoted for multi-step task plan"
-        );
     }
 }
 

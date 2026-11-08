@@ -163,28 +163,18 @@ mod tool_result_fit;
 mod turn_context;
 #[path = "runtime/untrusted.rs"]
 pub(crate) mod untrusted;
-pub(in crate::agent) use completion_contract::inherit_request_constraints;
 pub(in crate::agent) use completion_contract::persistable_completion_contract;
+pub(in crate::agent) use history::retain_structural_completion_contract;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
-pub(in crate::agent) use history::ForbiddenMutationAction;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
-pub(in crate::agent) use history::{
-    append_evidence_obligations, append_required_invocation_obligations, apply_semantic_authority,
-    apply_semantic_evidence_policy, inherit_unfinished_request_contract,
-    install_semantic_completion_contract, parse_planned_forbidden_action,
-    parse_planned_mutation_effects, parse_planned_task_kind, retain_structural_completion_contract,
-    SemanticAuthorityRequirements, SemanticCompletionRequirements, SemanticEvidencePolicy,
-};
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
-#[path = "turn/hand_holding_telemetry.rs"]
-mod hand_holding_telemetry;
 #[path = "turn/inquiry.rs"]
 mod inquiry;
 #[path = "runtime/llm.rs"]
