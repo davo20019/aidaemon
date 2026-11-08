@@ -1504,9 +1504,10 @@ pub(in crate::agent) async fn run_bootstrap(
         &turn_context.completion_contract,
         semantic_contract_applied,
         unapplied_forbidden_scopes,
+        planner_skip_reason.is_none(),
     );
-    // Persistence and recall are separate: an unsure assessment withholds
-    // learning but must not erase what the agent already knows.
+    // Persistence and recall are separate: a turn no person wrote may recall
+    // but never persist.
     let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
     let memory_recall_allowed = memory_pipeline_policy.allows_recall();
     learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;

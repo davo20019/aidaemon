@@ -1136,11 +1136,11 @@ pub(crate) enum MemoryPipelinePolicy {
     Allowed,
     SuppressedByCurrentContract,
     SuppressedByAssessment,
-    /// The assessment could not be applied (unavailable or low confidence) and
-    /// no denial was signalled. Recall stays on: without it the agent forgets
-    /// who the user is on every uncertain turn. Persistence stays off, because
-    /// learning needs an applied task description.
-    RecallOnlyAssessmentUnavailable,
+    /// No person wrote this turn's text (background continuation, runtime
+    /// resume, mandate cycle, control command). Recall stays on so the agent
+    /// still knows who it works for; persistence stays off so it cannot learn
+    /// from its own synthetic text.
+    RecallOnlyNonUserTurn,
 }
 
 impl MemoryPipelinePolicy {
@@ -1151,7 +1151,7 @@ impl MemoryPipelinePolicy {
 
     /// Whether stored memory may be recalled into this task's prompt.
     pub(crate) const fn allows_recall(self) -> bool {
-        matches!(self, Self::Allowed | Self::RecallOnlyAssessmentUnavailable)
+        matches!(self, Self::Allowed | Self::RecallOnlyNonUserTurn)
     }
 
     pub(crate) const fn reason_code(self) -> &'static str {
@@ -1159,7 +1159,7 @@ impl MemoryPipelinePolicy {
             Self::Allowed => "allowed_by_compiled_contract",
             Self::SuppressedByCurrentContract => "inherited_contract_denies_user_memory",
             Self::SuppressedByAssessment => "current_assessment_denies_user_memory",
-            Self::RecallOnlyAssessmentUnavailable => "assessment_unavailable_recall_only",
+            Self::RecallOnlyNonUserTurn => "non_user_turn_recall_only",
         }
     }
 }
@@ -1168,12 +1168,13 @@ impl MemoryPipelinePolicy {
 ///
 /// A denial is honoured from any source, including an assessment that was too
 /// unsure to install (`unapplied_forbidden_scopes`): restricting memory is the
-/// safe direction, so it needs no confidence. An unavailable assessment only
-/// withholds persistence.
+/// safe direction, so it needs no confidence. The absence of an assessment is
+/// not a denial: a person's turn keeps full memory whether or not one applied.
 pub(crate) fn compile_memory_pipeline_policy(
     current_contract: &crate::agent::CompletionContract,
     semantic_contract_applied: bool,
     unapplied_forbidden_scopes: &[crate::traits::ToolSemanticScope],
+    user_authored_turn: bool,
 ) -> MemoryPipelinePolicy {
     if current_contract
         .forbidden_tool_scopes
@@ -1189,8 +1190,10 @@ pub(crate) fn compile_memory_pipeline_policy(
         return if unapplied_forbidden_scopes.contains(&crate::traits::ToolSemanticScope::UserMemory)
         {
             MemoryPipelinePolicy::SuppressedByAssessment
+        } else if user_authored_turn {
+            MemoryPipelinePolicy::Allowed
         } else {
-            MemoryPipelinePolicy::RecallOnlyAssessmentUnavailable
+            MemoryPipelinePolicy::RecallOnlyNonUserTurn
         };
     }
     if !current_contract.allowed_tool_names.is_empty()
@@ -3158,42 +3161,52 @@ mod tests {
     fn memory_policy_is_compiled_once_from_typed_task_capabilities() {
         let user_memory = crate::traits::ToolSemanticScope::UserMemory;
         let current_contract = crate::agent::CompletionContract::default();
-        let unavailable = compile_memory_pipeline_policy(&current_contract, false, &[]);
+        let unavailable = compile_memory_pipeline_policy(&current_contract, false, &[], true);
         assert_eq!(
             unavailable,
-            MemoryPipelinePolicy::RecallOnlyAssessmentUnavailable,
-            "an unsure assessment must not erase what the agent knows about the user"
+            MemoryPipelinePolicy::Allowed,
+            "a missing or unsure assessment is not a denial on a person's turn"
         );
-        assert!(unavailable.allows_recall());
+        assert!(unavailable.allows_recall() && unavailable.allows_memory());
+
+        let synthetic = compile_memory_pipeline_policy(&current_contract, false, &[], false);
+        assert_eq!(synthetic, MemoryPipelinePolicy::RecallOnlyNonUserTurn);
+        assert!(synthetic.allows_recall());
         assert!(
-            !unavailable.allows_memory(),
-            "persistence still needs an applied assessment"
+            !synthetic.allows_memory(),
+            "the agent must not learn from its own synthetic text"
         );
 
-        let unsure_denial =
-            compile_memory_pipeline_policy(&current_contract, false, &[user_memory]);
-        assert_eq!(
-            unsure_denial,
-            MemoryPipelinePolicy::SuppressedByAssessment,
-            "a denial is honoured even when the assessment was too unsure to install"
-        );
-        assert!(!unsure_denial.allows_recall());
+        for user_authored_turn in [true, false] {
+            let unsure_denial = compile_memory_pipeline_policy(
+                &current_contract,
+                false,
+                &[user_memory],
+                user_authored_turn,
+            );
+            assert_eq!(
+                unsure_denial,
+                MemoryPipelinePolicy::SuppressedByAssessment,
+                "a denial is honoured even when the assessment was too unsure to install"
+            );
+            assert!(!unsure_denial.allows_recall());
+        }
 
         let mut inherited_denial = current_contract.clone();
         inherited_denial.forbidden_tool_scopes.push(user_memory);
         assert_eq!(
-            compile_memory_pipeline_policy(&inherited_denial, false, &[]),
+            compile_memory_pipeline_policy(&inherited_denial, false, &[], true),
             MemoryPipelinePolicy::SuppressedByCurrentContract
         );
 
         let mut current_denial = current_contract.clone();
         current_denial.forbidden_tool_scopes.push(user_memory);
         assert_eq!(
-            compile_memory_pipeline_policy(&current_denial, true, &[]),
+            compile_memory_pipeline_policy(&current_denial, true, &[], true),
             MemoryPipelinePolicy::SuppressedByAssessment
         );
 
-        let allowed = compile_memory_pipeline_policy(&current_contract, true, &[]);
+        let allowed = compile_memory_pipeline_policy(&current_contract, true, &[], true);
         assert_eq!(allowed, MemoryPipelinePolicy::Allowed);
         assert!(allowed.allows_recall() && allowed.allows_memory());
     }
