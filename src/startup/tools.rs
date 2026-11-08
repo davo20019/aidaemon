@@ -1166,7 +1166,7 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ShareMemory => BuiltBaseTool {
-            tool: Arc::new(ShareMemoryTool::new(state, approval_tx)),
+            tool: Arc::new(ShareMemoryTool::new(state)),
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {

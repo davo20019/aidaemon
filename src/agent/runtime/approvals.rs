@@ -1166,6 +1166,56 @@ mod tests {
         assert!(!request.subject.trim().is_empty());
     }
 
+    /// Sharing a stored memory asks the owner in every session; a call
+    /// naming no active fact changes nothing and needs no card, nor does a
+    /// call the dispatcher refuses.
+    #[tokio::test]
+    async fn share_memory_asks_before_widening_a_memory() {
+        use crate::traits::ToolSemantics;
+        let tool = Arc::new(crate::tools::ShareMemoryTool::with_synthetic_fact(
+            "preference",
+            "report_format",
+            "short summaries for Jordan Lee",
+        ));
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                tools: ApprovalTools::new([tool.clone() as Arc<dyn crate::traits::Tool>]),
+                trusted_session: trusted,
+                mandate_preapproved: trusted,
+                ..AppApprovalRules::default()
+            };
+            let share = sdk::ToolCall::new(
+                "c1",
+                "share_memory",
+                json!({"category": "preference", "key": "report_format"}),
+            );
+            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &share, &tool_info()).await
+            else {
+                panic!("sharing must ask (trusted={trusted})");
+            };
+            assert_eq!(request.risk, sdk::ApprovalRisk::High);
+            let missing = sdk::ToolCall::new(
+                "c2",
+                "share_memory",
+                json!({"category": "preference", "key": "absent"}),
+            );
+            assert_eq!(
+                rules.judge(&hook_ctx(), &missing, &tool_info()).await,
+                RuleDecision::Allow
+            );
+        }
+        let args = json!({"category": "preference", "key": "report_format"});
+        let refused = crate::traits::ApprovalCall {
+            refused: true,
+            ..crate::traits::ApprovalCall::as_sent(&args)
+        };
+        assert!(matches!(
+            tool.owner_approval_request(&refused, &Default::default())
+                .await,
+            crate::traits::OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
     #[test]
     fn risks_map_to_card_levels() {
         use crate::tools::command_risk::RiskLevel;
