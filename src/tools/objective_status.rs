@@ -1056,11 +1056,7 @@ mod tests {
         }
 
         use crate::traits::Tool as _;
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let mandates = crate::tools::manage_mandates::ManageMandatesTool::new(
-            state.clone(),
-            crate::tools::ApprovalBroker::new(approval_tx),
-        );
+        let mandates = crate::tools::manage_mandates::ManageMandatesTool::new(state.clone());
         let runs = crate::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(state.clone());
 
         let mandate_view = mandates

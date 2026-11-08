@@ -1302,11 +1302,7 @@ mod tests {
         let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
             .await
             .unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = crate::tools::ManageMandatesTool::new(
-            harness.state.clone(),
-            crate::tools::ApprovalBroker::new(approval_tx),
-        );
+        let tool = crate::tools::ManageMandatesTool::new(harness.state.clone());
         let schema = tool.schema();
         let properties = schema["parameters"]["properties"]
             .as_object()

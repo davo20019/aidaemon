@@ -1174,7 +1174,7 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
-            tool: Arc::new(ManageMandatesTool::new(state, approval_tx).with_skills_dir(
+            tool: Arc::new(ManageMandatesTool::new(state).with_skills_dir(
                 config.skills.enabled.then(|| {
                     config_path
                         .parent()

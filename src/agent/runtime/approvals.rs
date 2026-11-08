@@ -2219,6 +2219,63 @@ mod tests {
         }
     }
 
+    /// Creating a mandate is confirmed by the owner on the mandate's card
+    /// before anything is stored, in every session (a mandate run's
+    /// pre-approval does not cover delegating new authority); outside a
+    /// verified private owner chat the call is answered without a card.
+    #[tokio::test]
+    async fn mandate_create_asks_before_dispatch_on_its_confirmation_card() {
+        let store = approval_test_store().await;
+        let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ManageMandatesTool::new(
+            store.clone() as Arc<dyn crate::traits::StateStore>,
+        ));
+        let create = json!({
+            "action": "create",
+            "objective": "Never activate without confirmation",
+            "max_mutating_actions_per_cycle": 0,
+            "success_criteria": ["The bounded source is reviewed without unauthorized action"]
+        });
+        for trusted in [false, true] {
+            let rules = AppApprovalRules {
+                trusted_session: trusted,
+                mandate_preapproved: trusted,
+                ..rules_over(tool.clone())
+            };
+            let call = sdk::ToolCall::new("c1", "manage_mandates", create.clone());
+            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &call, &tool_info()).await
+            else {
+                panic!("a mandate create must ask (trusted={trusted})");
+            };
+            assert!(request.summary.starts_with("Delegate mandate:"));
+            assert_eq!(request.risk, sdk::ApprovalRisk::Medium);
+            assert!(matches!(
+                rules.card_kind("manage_mandates", &request),
+                crate::types::ApprovalKind::GoalConfirmation
+            ));
+            let call = sdk::ToolCall::new("c2", "manage_mandates", json!({"action": "list"}));
+            assert_eq!(
+                rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                RuleDecision::Allow
+            );
+        }
+        let public = AppApprovalRules {
+            channel_visibility: Some(crate::types::ChannelVisibility::Public),
+            ..rules_over(tool.clone())
+        };
+        let call = sdk::ToolCall::new("c3", "manage_mandates", create);
+        assert_eq!(
+            public.judge(&hook_ctx(), &call, &tool_info()).await,
+            RuleDecision::Allow
+        );
+        // Judging stores nothing.
+        use crate::traits::store_prelude::*;
+        assert!(store
+            .list_mandates(Some("telegram:synthetic-user-1"), true)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn configured_secrets_never_print() {
         let secrets = ConfiguredSecrets::new(vec!["synthetic-token-123456".to_string()]);

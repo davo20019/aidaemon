@@ -992,19 +992,12 @@ async fn setup_test_agent_internal(
         Vec::new()
     };
     if include_manage_mandates {
-        let (approval_tx, mut approval_rx) = mpsc::channel(8);
         tools.push(Arc::new(
             crate::tools::ManageMandatesTool::new(
-                state.clone() as Arc<dyn crate::traits::StateStore>,
-                crate::tools::ApprovalBroker::new(approval_tx),
+                state.clone() as Arc<dyn crate::traits::StateStore>
             )
             .with_skills_dir(Some(skills_dir.path().to_path_buf())),
         ));
-        tokio::spawn(async move {
-            while let Some(request) = approval_rx.recv().await {
-                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
-            }
-        });
     }
     tools.extend(extra_tools);
 
@@ -1065,6 +1058,27 @@ async fn setup_test_agent_internal(
         stt_config: crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         harness_eval_config: (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     });
+
+    if include_manage_mandates {
+        // The owner confirms every mandate card the kernel sends (once);
+        // any other card goes unanswered and is declined, as on a harness
+        // with no owner.
+        let (approval_tx, mut approval_rx) = mpsc::channel(8);
+        agent
+            .owner_approvals()
+            .set_broker(crate::tools::ApprovalBroker::new(approval_tx));
+        tokio::spawn(async move {
+            while let Some(request) = approval_rx.recv().await {
+                if matches!(
+                    request.kind,
+                    crate::types::ApprovalKind::GoalConfirmation
+                        | crate::types::ApprovalKind::AutopilotConfirmation
+                ) {
+                    let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
+                }
+            }
+        });
+    }
 
     if use_test_executor_mode {
         // Set executor mode so integration tests exercise the execution loop directly,

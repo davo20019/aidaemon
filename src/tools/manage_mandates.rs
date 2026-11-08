@@ -7,9 +7,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
 use crate::traits::{
     Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
     MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveControl,
@@ -20,7 +17,7 @@ use crate::traits::{
     ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
     ToolOutcomeStatus, ToolRole,
 };
-use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, UserRole};
+use crate::types::{ChannelVisibility, UserRole};
 
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
@@ -129,16 +126,123 @@ impl ResolvedReviewCapacity {
 /// dispatcher enforces the envelope when an action is attempted.
 pub struct ManageMandatesTool {
     state: Arc<dyn MandateToolStore>,
-    approval_tx: ApprovalBroker,
     skills_dir: Option<PathBuf>,
 }
 
+/// The owner's confirmation card for a mandate change, as the tool asked
+/// before the kernel did.
+struct MandateCard {
+    summary: String,
+    risk: aidaemon_core::ApprovalRisk,
+    warnings: Vec<String>,
+    /// The confirmed policy is Autopilot (the card is the Autopilot one).
+    autopilot: bool,
+}
+
+/// A validated `create`, before anything is stored.
+struct CreatePlan {
+    goal: crate::traits::Goal,
+    mandate: Mandate,
+    duration_secs: Option<i64>,
+    card: MandateCard,
+}
+
+/// A validated `update`: the mandate as it will be stored.
+struct UpdatePlan {
+    mandate: Mandate,
+    capacity: ResolvedReviewCapacity,
+    card: MandateCard,
+}
+
+/// A validated `transfer_owner`.
+struct TransferPlan {
+    mandate: Mandate,
+    owner: String,
+    target: String,
+    card: MandateCard,
+}
+
 impl ManageMandatesTool {
-    pub fn new(state: Arc<dyn StateStore>, approval_tx: ApprovalBroker) -> Self {
+    pub fn new(state: Arc<dyn StateStore>) -> Self {
         Self {
             state: state as Arc<dyn MandateToolStore>,
-            approval_tx,
             skills_dir: None,
+        }
+    }
+
+    /// A committing owner change (create, update, transfer_owner) runs only
+    /// after the owner confirmed it through the agent kernel.
+    fn require_kernel_approval(args: &ManageMandatesArgs) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            args.call_kernel_approved,
+            "manage_mandates {} requires approval through the agent kernel; it was called \
+             outside an approved agent call",
+            args.action
+        );
+        Ok(())
+    }
+
+    /// The owner approval one call needs: creating, updating and
+    /// transferring a mandate are confirmed by the owner, whatever the
+    /// session, exactly where the call would commit them. Every other call
+    /// (including one these actions answer without committing) needs none.
+    pub(crate) async fn owner_approval(
+        &self,
+        arguments: &Value,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        use crate::traits::OwnerApprovalNeed;
+        let Ok(mut args) = serde_json::from_value::<ManageMandatesArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        args.normalize_for_action();
+        args.bind_facts(facts);
+        let card = match args.action.as_str() {
+            "create" => match self.create_plan(&args).await {
+                Ok(Ok(plan)) => plan.card,
+                _ => return OwnerApprovalNeed::NotNeeded,
+            },
+            "update" => match self.update_plan(&args).await {
+                Ok(Ok(plan)) => plan.card,
+                _ => return OwnerApprovalNeed::NotNeeded,
+            },
+            "transfer_owner" => match self.transfer_plan(&args).await {
+                Ok(Ok(plan)) => plan.card,
+                _ => return OwnerApprovalNeed::NotNeeded,
+            },
+            _ => return OwnerApprovalNeed::NotNeeded,
+        };
+        // The exact arguments the owner approves (never `_` keys); a changed
+        // argument is a new card.
+        let approved: serde_json::Map<String, Value> = arguments
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, _)| !key.starts_with('_'))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: card.summary,
+            subject: json!({"arguments": approved, "autopilot": card.autopilot}).to_string(),
+            risk: card.risk,
+            warnings: card.warnings,
+        })
+    }
+
+    /// The card kind for a request from [`Self::owner_approval`]: the
+    /// Autopilot confirmation for an Autopilot policy, else the goal one.
+    fn card_kind_for(request: &aidaemon_core::OwnerApprovalRequest) -> crate::types::ApprovalKind {
+        let autopilot = serde_json::from_str::<Value>(&request.subject)
+            .ok()
+            .and_then(|subject| subject.get("autopilot")?.as_bool())
+            .unwrap_or(false);
+        if autopilot {
+            crate::types::ApprovalKind::AutopilotConfirmation
+        } else {
+            crate::types::ApprovalKind::GoalConfirmation
         }
     }
 
@@ -614,12 +718,17 @@ impl ManageMandatesTool {
         Ok(())
     }
 
-    async fn create(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+    /// Validate a `create` exactly as it commits, without storing anything.
+    /// `Ok(Err(answer))`: the call answers without creating a mandate.
+    async fn create_plan(
+        &self,
+        args: &ManageMandatesArgs,
+    ) -> anyhow::Result<Result<CreatePlan, String>> {
         if !Self::is_private_owner_control(args) {
-            return Ok(
+            return Ok(Err(
                 "Mandates can only be created by the owner in a verified private channel."
                     .to_string(),
-            );
+            ));
         }
         let session_id = Self::owner_session(args)?;
         let objective =
@@ -749,13 +858,7 @@ impl ManageMandatesTool {
             "source_goal_id": &mandate.source_goal_id,
         }))?);
 
-        self.state
-            .create_mandate_controller(&goal, &mandate)
-            .await?;
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let pending_version = mandate.version;
-        let proposed_policy_version = pending_version + 1;
+        let proposed_policy_version = mandate.version + 1;
         let mut warnings = Self::confirmation_warnings(
             &mandate,
             capacity,
@@ -768,80 +871,73 @@ impl ManageMandatesTool {
                     .to_string(),
             );
         }
-        let request = ApprovalRequest {
-            command: if autonomy_mode.is_autopilot() {
+        let card = MandateCard {
+            summary: if autonomy_mode.is_autopilot() {
                 format!("Enable Autopilot: {objective}")
             } else {
                 format!("Delegate mandate: {objective}")
             },
-            session_id: session_id.to_string(),
-            risk_level: if mandate.authority.max_mutating_actions_per_cycle == 0 {
-                RiskLevel::Medium
+            risk: if mandate.authority.max_mutating_actions_per_cycle == 0 {
+                aidaemon_core::ApprovalRisk::Medium
             } else {
-                RiskLevel::High
+                aidaemon_core::ApprovalRisk::High
             },
             warnings,
-            permission_mode: PermissionMode::Cautious,
-            response_tx,
-            kind: if autonomy_mode.is_autopilot() {
-                ApprovalKind::AutopilotConfirmation
-            } else {
-                ApprovalKind::GoalConfirmation
-            },
+            autopilot: autonomy_mode.is_autopilot(),
         };
-        if let Err(error) = self.approval_tx.send(request).await {
-            self.cancel_unconfirmed(&mandate).await?;
-            return Ok(format!(
-                "Mandate confirmation could not be delivered, so the pending mandate was cancelled: {error}"
-            ));
-        }
+        Ok(Ok(CreatePlan {
+            goal,
+            mandate,
+            duration_secs: timing.duration_secs,
+            card,
+        }))
+    }
 
-        match response_rx.await {
-            Ok(
-                ApprovalResponse::AllowOnce
-                | ApprovalResponse::AllowSession
-                | ApprovalResponse::AllowAlways,
-            ) => {
-                anyhow::ensure!(
-                    self.state
-                        .confirm_mandate(&mandate.id, pending_version, timing.duration_secs)
-                        .await?,
-                    "mandate could not be activated"
-                );
-                let activated =
-                    self.state.get_mandate(&mandate.id).await?.ok_or_else(|| {
-                        anyhow::anyhow!("activated mandate could not be reloaded")
-                    })?;
-                Ok(format!(
-                    "{} {} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
-                    if activated.autonomy_mode.is_autopilot() {
-                        "Autopilot enabled for mandate"
-                    } else {
-                        "Activated mandate"
-                    },
-                    activated.id,
-                    activated.confirmed_at.as_deref().unwrap_or("unavailable"),
-                    activated.version,
-                    activated.expires_at.as_deref().unwrap_or("none"),
-                    activated.min_review_secs / 60,
-                    activated.max_review_secs / 60
-                ))
-            }
-            Ok(ApprovalResponse::Deny) => {
-                self.cancel_unconfirmed(&mandate).await?;
-                Ok(format!(
-                    "Cancelled mandate {}; confirmation was declined.",
-                    mandate.id
-                ))
-            }
-            Err(_) => {
-                self.cancel_unconfirmed(&mandate).await?;
-                Ok(format!(
-                    "Mandate {} was cancelled because the confirmation response became unavailable.",
-                    mandate.id
-                ))
-            }
-        }
+    /// Create and activate a mandate. The owner confirmed it through the
+    /// agent kernel (`owner_approval_request`) before this runs; a declined
+    /// confirmation stores nothing.
+    async fn create(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        let plan = match self.create_plan(args).await? {
+            Err(answer) => return Ok(answer),
+            Ok(plan) => plan,
+        };
+        Self::require_kernel_approval(args)?;
+        let CreatePlan {
+            goal,
+            mandate,
+            duration_secs,
+            card: _,
+        } = plan;
+        // Stored paused, then confirmed: the confirmation timestamp makes the
+        // first deliberation immediately due.
+        self.state
+            .create_mandate_controller(&goal, &mandate)
+            .await?;
+        anyhow::ensure!(
+            self.state
+                .confirm_mandate(&mandate.id, mandate.version, duration_secs)
+                .await?,
+            "mandate could not be activated"
+        );
+        let activated = self
+            .state
+            .get_mandate(&mandate.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("activated mandate could not be reloaded"))?;
+        Ok(format!(
+            "{} {} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+            if activated.autonomy_mode.is_autopilot() {
+                "Autopilot enabled for mandate"
+            } else {
+                "Activated mandate"
+            },
+            activated.id,
+            activated.confirmed_at.as_deref().unwrap_or("unavailable"),
+            activated.version,
+            activated.expires_at.as_deref().unwrap_or("none"),
+            activated.min_review_secs / 60,
+            activated.max_review_secs / 60
+        ))
     }
 
     async fn list_snapshot(
@@ -1487,12 +1583,17 @@ impl ManageMandatesTool {
         Ok(format!("Mandate {} is now {}.", mandate.id, current.status))
     }
 
-    async fn transfer_owner(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+    /// Validate a `transfer_owner` exactly as it commits, without changing
+    /// anything. `Ok(Err(answer))`: the call answers without transferring.
+    async fn transfer_plan(
+        &self,
+        args: &ManageMandatesArgs,
+    ) -> anyhow::Result<Result<TransferPlan, String>> {
         if !Self::is_private_owner_control(args) {
-            return Ok(
+            return Ok(Err(
                 "Mandates can only be transferred by the owner in a verified private channel."
                     .to_string(),
-            );
+            ));
         }
         let owner = Self::owner_session(args)?;
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
@@ -1512,53 +1613,62 @@ impl ManageMandatesTool {
             "target_session_id is not a registered channel session; send a message from that session first"
         );
         let mandate = self.resolve_owned_mandate(id, owner).await?;
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: format!("Transfer mandate {} to session {}", mandate.id, target),
-                session_id: owner.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec![
-                    "The target session will be linked to this stable owner principal and become the primary route for the mandate, its schedules, pending notices, and future reviews. Open runs will be invalidated first.".to_string(),
-                    "No session-name similarity is used as proof of ownership.".to_string(),
-                ],
-                permission_mode: PermissionMode::Cautious,
-                response_tx,
-                kind: ApprovalKind::GoalConfirmation,
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("ownership transfer confirmation failed: {error}"))?;
-        match response_rx.await {
-            Ok(
-                ApprovalResponse::AllowOnce
-                | ApprovalResponse::AllowSession
-                | ApprovalResponse::AllowAlways,
-            ) => {
-                anyhow::ensure!(
-                    self.state
-                        .transfer_mandate_ownership(&mandate.id, mandate.version, owner, target,)
-                        .await?,
-                    "mandate authority changed before ownership could transfer"
-                );
-                Ok(format!(
-                    "Mandate {} now routes through {} under the same stable principal at policy version {}.",
-                    mandate.id,
-                    target,
-                    mandate.version + 1
-                ))
-            }
-            Ok(ApprovalResponse::Deny) | Err(_) => {
-                Ok("Mandate ownership transfer cancelled.".to_string())
-            }
-        }
+        let card = MandateCard {
+            summary: format!("Transfer mandate {} to session {}", mandate.id, target),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "The target session will be linked to this stable owner principal and become the primary route for the mandate, its schedules, pending notices, and future reviews. Open runs will be invalidated first.".to_string(),
+                "No session-name similarity is used as proof of ownership.".to_string(),
+            ],
+            autopilot: false,
+        };
+        Ok(Ok(TransferPlan {
+            mandate,
+            owner: owner.to_string(),
+            target: target.to_string(),
+            card,
+        }))
     }
 
-    async fn update(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+    /// Transfer a mandate the owner confirmed moving through the agent
+    /// kernel.
+    async fn transfer_owner(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        let plan = match self.transfer_plan(args).await? {
+            Err(answer) => return Ok(answer),
+            Ok(plan) => plan,
+        };
+        Self::require_kernel_approval(args)?;
+        let TransferPlan {
+            mandate,
+            owner,
+            target,
+            card: _,
+        } = plan;
+        anyhow::ensure!(
+            self.state
+                .transfer_mandate_ownership(&mandate.id, mandate.version, &owner, &target)
+                .await?,
+            "mandate authority changed before ownership could transfer"
+        );
+        Ok(format!(
+            "Mandate {} now routes through {} under the same stable principal at policy version {}.",
+            mandate.id,
+            target,
+            mandate.version + 1
+        ))
+    }
+
+    /// Validate an `update` exactly as it commits, without storing it.
+    /// `Ok(Err(answer))`: the call answers without changing the mandate.
+    async fn update_plan(
+        &self,
+        args: &ManageMandatesArgs,
+    ) -> anyhow::Result<Result<UpdatePlan, String>> {
         if !Self::is_private_owner_control(args) {
-            return Ok(
+            return Ok(Err(
                 "Mandate authority can only be changed by the owner in a verified private channel."
                     .to_string(),
-            );
+            ));
         }
         let owner = Self::owner_session(args)?;
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
@@ -1767,40 +1877,36 @@ impl ManageMandatesTool {
         let proposed_policy_version = mandate.version + 1;
         let warnings =
             Self::confirmation_warnings(&mandate, capacity, None, proposed_policy_version);
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: if mandate.autonomy_mode.is_autopilot() {
-                    format!("Enable or update Autopilot: {}", mandate.objective)
-                } else {
-                    format!("Update delegated mandate: {}", mandate.objective)
-                },
-                session_id: owner.to_string(),
-                risk_level: RiskLevel::High,
-                warnings,
-                permission_mode: PermissionMode::Cautious,
-                response_tx,
-                kind: if mandate.autonomy_mode.is_autopilot() {
-                    ApprovalKind::AutopilotConfirmation
-                } else {
-                    ApprovalKind::GoalConfirmation
-                },
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("mandate update confirmation unavailable: {error}"))?;
-        match response_rx.await {
-            Ok(
-                ApprovalResponse::AllowOnce
-                | ApprovalResponse::AllowSession
-                | ApprovalResponse::AllowAlways,
-            ) => {}
-            Ok(ApprovalResponse::Deny) => {
-                return Ok(
-                    "Mandate update cancelled; the existing envelope is unchanged.".to_string(),
-                )
-            }
-            Err(_) => anyhow::bail!("mandate update confirmation became unavailable"),
-        }
+        let card = MandateCard {
+            summary: if mandate.autonomy_mode.is_autopilot() {
+                format!("Enable or update Autopilot: {}", mandate.objective)
+            } else {
+                format!("Update delegated mandate: {}", mandate.objective)
+            },
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings,
+            autopilot: mandate.autonomy_mode.is_autopilot(),
+        };
+        Ok(Ok(UpdatePlan {
+            mandate,
+            capacity,
+            card,
+        }))
+    }
+
+    /// Store an update the owner confirmed through the agent kernel; a
+    /// declined confirmation leaves the existing envelope unchanged.
+    async fn update(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        let plan = match self.update_plan(args).await? {
+            Err(answer) => return Ok(answer),
+            Ok(plan) => plan,
+        };
+        Self::require_kernel_approval(args)?;
+        let UpdatePlan {
+            mut mandate,
+            capacity,
+            card: _,
+        } = plan;
         mandate.version += 1;
         let updated_at = chrono::Utc::now().to_rfc3339();
         mandate.next_review_at = updated_at.clone();
@@ -2263,6 +2369,10 @@ struct ManageMandatesArgs {
     call_goal_run_id: Option<String>,
     #[serde(skip)]
     call_task_attempt_id: Option<String>,
+    /// The agent kernel judged this call (and asked the owner where
+    /// `owner_approval_request` requires it).
+    #[serde(skip)]
+    call_kernel_approved: bool,
 }
 
 impl ManageMandatesArgs {
@@ -2274,6 +2384,8 @@ impl ManageMandatesArgs {
         self.call_goal_id = facts.goal_id.clone();
         self.call_goal_run_id = facts.goal_run_id.clone();
         self.call_task_attempt_id = facts.task_attempt_id.clone();
+        self.call_kernel_approved =
+            facts.kernel_approved == Some(crate::traits::ApprovalScope::Call);
     }
 
     /// Normalize compatibility noise from structured-tool providers before any
@@ -2484,6 +2596,15 @@ impl Tool for ManageMandatesTool {
         "manage_mandates"
     }
 
+    /// A mandate change is confirmed on its goal or Autopilot card (confirm
+    /// or cancel), which offers no session or persistent grant.
+    fn approval_card_kind(
+        &self,
+        request: &aidaemon_core::OwnerApprovalRequest,
+    ) -> crate::types::ApprovalKind {
+        Self::card_kind_for(request)
+    }
+
     fn description(&self) -> &str {
         "Draft, create, inspect, and govern owner-confirmed ongoing mandates."
     }
@@ -2635,7 +2756,39 @@ impl ManageMandatesTool {
     }
 }
 
+#[async_trait]
 impl crate::traits::ToolSemantics for ManageMandatesTool {
+    /// Creating, updating and transferring a mandate are confirmed by the
+    /// owner before they commit. The dispatcher runs the call only with that
+    /// answer; a decline is recorded by the kernel and changes nothing.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::traits::OwnerApprovalNeed {
+        if call.refused {
+            return crate::traits::OwnerApprovalNeed::NotNeeded;
+        }
+        self.owner_approval(call.arguments, facts).await
+    }
+
+    /// Reads (draft, list, get, list_intentions) have no effects. Every
+    /// other action changes durable delegated policy or schedules work, so
+    /// it stays undeclared; a declined create, update or transfer is
+    /// recorded by its approval subject, so the identical change is not put
+    /// to the owner again.
+    fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("action")?.as_str().map(str::to_string));
+        match action.as_deref() {
+            Some("draft" | "list" | "get" | "list_intentions") => {
+                aidaemon_core::CallEffects::none()
+            }
+            _ => aidaemon_core::CallEffects::unknown(),
+        }
+    }
+
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
@@ -2650,7 +2803,7 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
 
     fn owner_control_plane_call(&self, arguments: &str) -> bool {
         // Read-only actions, plus create and update, which commit only after
-        // the owner confirms through the approval broker. Transitions (pause,
+        // the owner confirms through the agent kernel. Transitions (pause,
         // resume, cancel, answer_question, resolve_reconciliation) take
         // effect without a confirmation and are not admitted here.
         serde_json::from_str::<Value>(arguments)
@@ -3343,6 +3496,94 @@ mod tests {
         }
     }
 
+    /// The owner's facts for a call the agent kernel judged (the owner
+    /// confirmed it where `owner_approval_request` asks).
+    fn approved_owner_facts() -> crate::traits::ToolCallContext {
+        crate::traits::ToolCallContext {
+            kernel_approved: Some(crate::traits::ApprovalScope::Call),
+            ..owner_facts()
+        }
+    }
+
+    /// Outside the kernel (no `kernel_approved`) a create, update or
+    /// transfer the owner would be asked about is refused and nothing is
+    /// stored; one the call answers without committing is answered as
+    /// before.
+    #[tokio::test]
+    async fn committing_owner_changes_refuse_without_kernel_approval() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let tool = ManageMandatesTool::new(state.clone());
+        let args = json!({
+            "action": "create",
+            "objective": "Never activate without confirmation",
+            "max_mutating_actions_per_cycle": 0,
+            "success_criteria": ["The bounded source is reviewed without unauthorized action"],
+        });
+        assert!(matches!(
+            tool.owner_approval(&args, &owner_facts()).await,
+            crate::traits::OwnerApprovalNeed::Ask(_)
+        ));
+        let error = tool
+            .call_with(&args.to_string(), owner_facts())
+            .await
+            .expect_err("refused outside the kernel");
+        assert!(
+            error
+                .to_string()
+                .contains("requires approval through the agent kernel"),
+            "{error}"
+        );
+        assert!(state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A guest, or the owner outside a private chat, is answered without
+        // a card or a commit.
+        for facts in [
+            crate::traits::ToolCallContext {
+                user_role: Some(crate::types::UserRole::Guest),
+                ..owner_facts()
+            },
+            crate::traits::ToolCallContext {
+                channel_visibility: Some(crate::types::ChannelVisibility::Public),
+                ..owner_facts()
+            },
+        ] {
+            assert_eq!(
+                tool.owner_approval(&args, &facts).await,
+                crate::traits::OwnerApprovalNeed::NotNeeded
+            );
+            let answer = tool.call_with(&args.to_string(), facts).await.unwrap();
+            assert!(answer.contains("verified private channel"), "{answer}");
+        }
+        for read in ["list", "draft", "get"] {
+            assert_eq!(
+                tool.owner_approval(&json!({"action": read}), &owner_facts())
+                    .await,
+                crate::traits::OwnerApprovalNeed::NotNeeded,
+                "{read}"
+            );
+        }
+
+        // The card binds the exact arguments and ignores injected `_` keys.
+        let crate::traits::OwnerApprovalNeed::Ask(first) =
+            tool.owner_approval(&args, &owner_facts()).await
+        else {
+            panic!("create asks");
+        };
+        let mut injected = args.clone();
+        injected["_session_id"] = json!("synthetic-session");
+        let crate::traits::OwnerApprovalNeed::Ask(same) =
+            tool.owner_approval(&injected, &owner_facts()).await
+        else {
+            panic!("create asks");
+        };
+        assert_eq!(first.subject, same.subject);
+    }
+
     use super::*;
     use crate::testing::CallWithFacts;
     use crate::testing::{setup_test_agent, MockProvider};
@@ -3403,9 +3644,7 @@ mod tests {
             )
             .await
             .unwrap());
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         let output = tool
             .call_with(
                 &json!({
@@ -3525,9 +3764,7 @@ mod tests {
             })
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state);
         let outcome = tool
             .call_with_execution_context(
                 &json!({
@@ -3640,9 +3877,7 @@ mod tests {
             .create_mandate_controller(&other_controller, &other_mandate)
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state);
         let outcome = tool
             .call_with_execution_context(
                 &json!({
@@ -3941,8 +4176,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
 
         let result = tool
             .call_with(
@@ -4203,8 +4437,7 @@ mod tests {
     }
 
     fn tool_for(run: &ReviewRun) -> ManageMandatesTool {
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        ManageMandatesTool::new(run.state.clone(), ApprovalBroker::new(approval_tx))
+        ManageMandatesTool::new(run.state.clone())
     }
 
     #[tokio::test]
@@ -4419,11 +4652,8 @@ mod tests {
     async fn owner_confirmation_activates_one_unscheduled_controller_atomically() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
-        let call = tokio::spawn(async move {
-            tool.call_with(
-                r#"{
+        let tool = ManageMandatesTool::new(state.clone());
+        let args = r#"{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
                     "duration_minutes":60,
@@ -4440,13 +4670,29 @@ mod tests {
                     "min_seconds_between_mutations":900,
                     "constraints":["No fabrication"],
                     "success_criteria":["Interventions measurably improve the usefulness of the account without degrading trust"]
-                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
-            .await
-        });
+                }"#;
 
-        let request = approval_rx.recv().await.expect("confirmation request");
-        assert!(matches!(request.kind, ApprovalKind::GoalConfirmation));
-        assert!(request.command.contains("Steward @aidaemon_ai"));
+        // The kernel asks the owner on the goal card before the call runs.
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(args).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        assert!(matches!(
+            ManageMandatesTool::card_kind_for(&request),
+            crate::types::ApprovalKind::GoalConfirmation
+        ));
+        assert!(request.summary.contains("Steward @aidaemon_ai"));
+        // Judging stores nothing.
+        assert!(state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(request.warnings.iter().any(|warning| {
             warning.contains("Access summary:")
                 && warning.contains("publish public posts and replies on X")
@@ -4469,11 +4715,7 @@ mod tests {
             warning.contains("Timing normalized")
                 && warning.contains("expires_at value was ignored")
         }));
-        request
-            .response_tx
-            .send(ApprovalResponse::AllowOnce)
-            .unwrap();
-        let result = call.await.unwrap().unwrap();
+        let result = tool.call_with(args, approved_owner_facts()).await.unwrap();
         assert!(result.contains("Activated mandate"));
 
         let mandates = state
@@ -4521,11 +4763,8 @@ mod tests {
     async fn typed_autopilot_mode_gets_distinct_version_bound_confirmation() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
-        let call = tokio::spawn(async move {
-            tool.call_with(
-                r#"{
+        let tool = ManageMandatesTool::new(state.clone());
+        let args = r#"{
                     "action":"create",
                     "objective":"Maintain the synthetic account without routine hand-holding",
                     "autonomy_mode":"autopilot",
@@ -4557,13 +4796,22 @@ mod tests {
                     "max_mutating_actions_per_rolling_24h":12,
                     "min_seconds_between_mutations":900,
                     "success_criteria":["Each intervention provides concrete value to the synthetic audience"]
-                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
-            .await
-        });
+                }"#;
 
-        let request = approval_rx.recv().await.expect("autopilot confirmation");
-        assert!(matches!(request.kind, ApprovalKind::AutopilotConfirmation));
-        assert!(request.command.starts_with("Enable Autopilot:"));
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(args).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("an Autopilot create asks the owner");
+        };
+        assert!(matches!(
+            ManageMandatesTool::card_kind_for(&request),
+            crate::types::ApprovalKind::AutopilotConfirmation
+        ));
+        assert!(request.summary.starts_with("Enable Autopilot:"));
         assert!(request.warnings.iter().any(|warning| {
             warning.contains("Autonomy mode: Autopilot")
                 && warning.contains("handles routine decisions")
@@ -4588,12 +4836,8 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.starts_with("Recovery policy:")));
-        request
-            .response_tx
-            .send(ApprovalResponse::AllowOnce)
-            .unwrap();
 
-        let result = call.await.unwrap().unwrap();
+        let result = tool.call_with(args, approved_owner_facts()).await.unwrap();
         assert!(result.contains("Autopilot enabled for mandate"));
         let mandate = state
             .list_mandates(Some("owner-session"), false)
@@ -4625,14 +4869,11 @@ mod tests {
         };
         crate::skills::write_skill_to_file(skills_dir.path(), &original_skill).unwrap();
 
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx))
+        let tool = ManageMandatesTool::new(state.clone())
             .with_skills_dir(Some(skills_dir.path().to_path_buf()));
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-        let call = tokio::spawn(async move {
-            tool.call_with(
-                &format!(
-                    r#"{{
+        let args = format!(
+            r#"{{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
                     "allow_observations":false,
@@ -4642,13 +4883,17 @@ mod tests {
                     "strategy_skill":"x-stewardship",
                     "expires_at":"{expires_at}"
                 }}"#,
-                ),
-                owner_facts(),
+        );
+
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&args).unwrap(),
+                &owner_facts(),
             )
             .await
-        });
-
-        let request = approval_rx.recv().await.expect("complete confirmation");
+        else {
+            panic!("create asks the owner");
+        };
         for expected in [
             "Objective:",
             "Constraints:",
@@ -4685,16 +4930,15 @@ mod tests {
             );
         }
 
+        tool.call_with(&args, approved_owner_facts()).await.unwrap();
+
+        // The snapshot is pinned when the confirmed call stores the mandate:
+        // a later filesystem edit does not alter it.
         let changed_skill = crate::skills::Skill {
-            body: "A later filesystem edit must not alter the pending snapshot.".to_string(),
+            body: "A later filesystem edit must not alter the pinned snapshot.".to_string(),
             ..original_skill
         };
         crate::skills::write_skill_to_file(skills_dir.path(), &changed_skill).unwrap();
-        request
-            .response_tx
-            .send(ApprovalResponse::AllowOnce)
-            .unwrap();
-        call.await.unwrap().unwrap();
 
         let mandate = state
             .list_mandates(Some("owner-session"), false)
@@ -4711,8 +4955,7 @@ mod tests {
 
     async fn draft_with_observation_tool(tool_name: &str) -> Value {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(harness.state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(harness.state.clone());
         let result = tool
             .call_with(
                 &json!({
@@ -4780,8 +5023,7 @@ mod tests {
     async fn draft_reports_missing_authority_without_writing() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         let result = tool
             .call_with(
                 r#"{
@@ -4823,8 +5065,7 @@ mod tests {
     async fn draft_normalizes_redundant_fixed_expiry_to_relative_duration() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         let result = tool
             .call_with(
                 r#"{
@@ -4859,8 +5100,7 @@ mod tests {
     #[tokio::test]
     async fn draft_uses_human_review_effort_and_hides_token_arithmetic() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(harness.state);
         let result = tool
             .call_with(
                 r#"{
@@ -4918,8 +5158,7 @@ mod tests {
     #[tokio::test]
     async fn draft_requires_daily_budget_to_fund_the_review_cadence() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(harness.state);
 
         let error = tool
             .call_with(
@@ -5004,8 +5243,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_legacy_cross_product_authority() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(harness.state);
         let error = tool
             .call_with(
                 r#"{
@@ -5043,8 +5281,7 @@ mod tests {
         assert_eq!(args.expires_at.as_deref(), Some("2027-02-15T13:31:00Z"));
 
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(harness.state);
         let schema = tool.schema();
         for field in ["source_goal_id", "priority", "duration_minutes"] {
             let description = schema["parameters"]["properties"][field]["description"]
@@ -5084,9 +5321,7 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state);
         let outcome = tool
             .call_with_execution_context(
                 &json!({
@@ -5137,43 +5372,39 @@ mod tests {
             .await
             .unwrap();
 
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
-        let mandate_id = mandate.id.clone();
-        let update = tokio::spawn(async move {
-            tool.call_with(
-                &json!({
-                    "action": "update",
-                    "mandate_id": mandate_id,
-                    "review_effort": "thorough",
-                    "source_goal_id": "",
-                    "priority": "critical",
-                    "duration_minutes": 1,
-                    "expires_at": "2099-02-15T13:31:00Z",
-                })
-                .to_string(),
-                crate::traits::ToolCallContext {
-                    session_id: "owner-session".into(),
-                    user_role: Some(crate::types::UserRole::Owner),
-                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
-                    ..Default::default()
-                },
-            )
-            .await
+        let tool = ManageMandatesTool::new(state.clone());
+        let update = json!({
+            "action": "update",
+            "mandate_id": mandate.id,
+            "review_effort": "thorough",
+            "source_goal_id": "",
+            "priority": "critical",
+            "duration_minutes": 1,
+            "expires_at": "2099-02-15T13:31:00Z",
         });
-        let request = approval_rx
-            .recv()
-            .await
-            .expect("budget update confirmation");
+        let crate::traits::OwnerApprovalNeed::Ask(request) =
+            tool.owner_approval(&update, &owner_facts()).await
+        else {
+            panic!("an update asks the owner");
+        };
         assert!(request
             .warnings
             .iter()
             .any(|warning| { warning == "Review depth: Thorough — extra care before acting" }));
-        request
-            .response_tx
-            .send(ApprovalResponse::AllowOnce)
+        // Judging changes nothing.
+        assert_eq!(
+            state
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            mandate.version
+        );
+        let result = tool
+            .call_with(&update.to_string(), approved_owner_facts())
+            .await
             .unwrap();
-        let result = update.await.unwrap().unwrap();
         assert!(result.contains("thorough review effort"));
 
         let updated_goal = state.get_goal(&goal.id).await.unwrap().unwrap();
@@ -5214,11 +5445,7 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = Arc::new(ManageMandatesTool::new(
-            state.clone(),
-            ApprovalBroker::new(approval_tx),
-        ));
+        let tool = Arc::new(ManageMandatesTool::new(state.clone()));
         let get = json!({"action": "get", "mandate_id": mandate.id, "section": "policy"});
         let policy: Value = serde_json::from_str(
             &tool
@@ -5261,59 +5488,13 @@ mod tests {
         ] {
             copied[field] = policy[field].clone();
         }
-        let update_tool = tool.clone();
-        let update = tokio::spawn(async move {
-            update_tool
-                .call_with(&copied.to_string(), owner_facts())
-                .await
-        });
-        approval_rx
-            .recv()
+        tool.call_with(&copied.to_string(), approved_owner_facts())
             .await
-            .expect("update confirmation")
-            .response_tx
-            .send(ApprovalResponse::AllowOnce)
             .unwrap();
-        update.await.unwrap().unwrap();
         let updated = state.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(updated.min_review_secs, mandate.min_review_secs);
         assert_eq!(updated.default_review_secs, mandate.default_review_secs);
         assert_eq!(updated.max_review_secs, mandate.max_review_secs);
-    }
-
-    #[tokio::test]
-    async fn unavailable_confirmation_cancels_instead_of_leaving_resumable_authority() {
-        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-        let state = harness.state.clone();
-        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
-        drop(approval_rx);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
-        let result = tool
-            .call_with(
-                r#"{
-                    "action":"create",
-                    "objective":"Never activate without confirmation",
-                    "max_mutating_actions_per_cycle":0,
-                    "success_criteria":["The bounded source is reviewed without unauthorized action"]
-                }"#, crate::traits::ToolCallContext { session_id: "owner-session".into(), user_role: Some(crate::types::UserRole::Owner), channel_visibility: Some(crate::types::ChannelVisibility::Private), ..Default::default() })
-            .await
-            .unwrap();
-        assert!(result.contains("pending mandate was cancelled"));
-        let mandates = state
-            .list_mandates(Some("owner-session"), true)
-            .await
-            .unwrap();
-        assert_eq!(mandates.len(), 1);
-        assert_eq!(mandates[0].status, MandateStatus::Cancelled);
-        assert_eq!(
-            state
-                .get_goal(&mandates[0].goal_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "cancelled"
-        );
     }
 
     #[tokio::test]
@@ -5349,9 +5530,7 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state);
         let result = tool
             .call_with(
                 &format!(r#"{{"action":"get","mandate_id":"{}"}}"#, mandate.id),
@@ -5403,9 +5582,7 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state);
         let error = tool
             .call_with(
                 &format!(r#"{{"action":"resume","mandate_id":"{}"}}"#, mandate.id),
@@ -5451,9 +5628,7 @@ mod tests {
             .unwrap()
             .status;
         assert!(!before.is_terminal());
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         for (role, visibility) in [
             (
                 crate::types::UserRole::Guest,
@@ -5608,9 +5783,7 @@ mod tests {
                 ..
             }
         ));
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         let missing = tool
             .call_with(
                 &format!(
@@ -5716,9 +5889,7 @@ mod tests {
             .start_goal_run(&goal.id, "mandate", None, None)
             .await
             .unwrap();
-
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
-        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let tool = ManageMandatesTool::new(state.clone());
         let error = tool
             .call_with(
                 r#"{"action":"record_decision","outcome":"wait","rationale":"stale"}"#,
