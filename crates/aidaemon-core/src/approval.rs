@@ -227,3 +227,85 @@ pub enum InterruptKind {
     /// The owner must approve the call.
     OwnerApproval(OwnerApprovalRequest),
 }
+
+/// Owner declines shared by a family of runs: a run and the child runs it
+/// starts (and their children). A decline recorded in any of them reaches
+/// every other one before its next call, so a parent is refused an effect
+/// the owner declined inside its child, and a running child is refused one
+/// the owner declined in its parent after the child started.
+///
+/// Attach it with [`crate::RunState::share_declines`]. The kernel exchanges
+/// it with the run's own [`crate::RunState::declined`] when a turn starts,
+/// before each call is judged, when the owner declines, and when the run
+/// ends; the run's own list stays the serialized source of truth (so a
+/// parent whose child was declined something never ends `Succeeded`). The
+/// handle itself is not serialized: a run resumed from saved state keeps
+/// its own declines and shares them again once the application reattaches
+/// a set.
+///
+/// It only grows. Clones share one set.
+#[derive(Clone, Default)]
+pub struct SharedDeclines(std::sync::Arc<std::sync::Mutex<Vec<EffectKey>>>);
+
+impl SharedDeclines {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<EffectKey>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add effects (duplicates are ignored).
+    pub fn record(&self, effects: &[EffectKey]) {
+        let mut shared = self.lock();
+        for effect in effects {
+            if !shared.contains(effect) {
+                shared.push(effect.clone());
+            }
+        }
+    }
+
+    /// Every effect declined so far, in the order first recorded.
+    pub fn snapshot(&self) -> Vec<EffectKey> {
+        self.lock().clone()
+    }
+
+    /// Publish `local`'s effects and take in the others'. Returns whether
+    /// `local` grew.
+    pub(crate) fn exchange(&self, local: &mut Vec<EffectKey>) -> bool {
+        let mut shared = self.lock();
+        for effect in local.iter() {
+            if !shared.contains(effect) {
+                shared.push(effect.clone());
+            }
+        }
+        let before = local.len();
+        for effect in shared.iter() {
+            if !local.contains(effect) {
+                local.push(effect.clone());
+            }
+        }
+        local.len() > before
+    }
+
+    /// Both handles share one set.
+    pub fn same_set(&self, other: &SharedDeclines) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Two handles are equal when they share one set.
+impl PartialEq for SharedDeclines {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_set(other)
+    }
+}
+
+impl std::fmt::Debug for SharedDeclines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedDeclines")
+            .field(&self.snapshot())
+            .finish()
+    }
+}

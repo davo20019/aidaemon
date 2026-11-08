@@ -122,6 +122,9 @@ impl<'a> Driver<'a> {
                 self.state.declined.push(effect.clone());
             }
         }
+        // The runs sharing this run's declines (its parent, its children)
+        // are refused the effect from their next call on.
+        self.state.sync_declines();
         let reason = if reason.starts_with(OWNER_DECLINED) {
             reason.clone()
         } else {
@@ -189,7 +192,9 @@ impl<'a> Driver<'a> {
                 return self.finish(RunStatus::Stopped { reason }, None).await;
             }
 
-            // 2. Build the request and let hooks shape it.
+            // 2. Build the request and let hooks shape it. Hooks see what
+            // the runs sharing this run's declines declined meanwhile.
+            self.state.sync_declines();
             self.state.turn += 1;
             let turn = self.state.turn;
             self.emit(Event::TurnStarted { turn }).await?;
@@ -611,8 +616,11 @@ impl<'a> Driver<'a> {
     /// A call with an effect the owner declined earlier in the run is
     /// refused before any hook sees it, and again after any rewrite: no
     /// hook or application can opt out, so a model cannot retry a declined
-    /// action through another tool.
-    async fn decide(&self, call: &mut ToolCall, info: &mut ToolInfo, from: usize) -> Verdict {
+    /// action through another tool. That includes effects declined in a
+    /// run sharing this run's declines ([`crate::SharedDeclines`]), however
+    /// recently: they are taken in first.
+    async fn decide(&mut self, call: &mut ToolCall, info: &mut ToolInfo, from: usize) -> Verdict {
+        self.state.sync_declines();
         if let Some(reason) = declined_reason(&self.state.declined, info) {
             return Verdict::Deny(reason);
         }
@@ -1094,7 +1102,8 @@ impl<'a> Driver<'a> {
         Ok(())
     }
 
-    async fn finish_batch(self, end: BatchEnd) -> Result<RunOutcome, CoreError> {
+    async fn finish_batch(mut self, end: BatchEnd) -> Result<RunOutcome, CoreError> {
+        self.state.sync_declines();
         let (status, final_text) = match end {
             BatchEnd::Interrupted(interruption) => (RunStatus::Interrupted { interruption }, None),
             BatchEnd::Stuck(signal) => (RunStatus::Stuck { signal }, None),
@@ -1124,6 +1133,10 @@ impl<'a> Driver<'a> {
         status: RunStatus,
         final_text: Option<String>,
     ) -> Result<RunOutcome, CoreError> {
+        // A decline in a run sharing this one's (a child that finished
+        // inside its last call) is part of this run's record: it never
+        // ends `Succeeded`.
+        self.state.sync_declines();
         self.checkpoint().await?;
         self.emit(Event::Finished {
             status: status.clone(),

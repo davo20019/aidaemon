@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::approval::{EffectKey, InterruptKind};
+use crate::approval::{EffectKey, InterruptKind, SharedDeclines};
 use crate::message::{Message, ToolCall};
 use crate::provider::Usage;
 use crate::receipt::Receipt;
@@ -137,6 +137,12 @@ pub struct RunState {
     /// run ([`RunState::with_user_message`]) starts with none.
     #[serde(default)]
     pub declined: Vec<EffectKey>,
+    /// Declines shared with related runs (a parent and its children), set
+    /// with [`RunState::share_declines`]. A runtime handle, never
+    /// serialized: `declined` is the run's record, and a resumed run shares
+    /// again once the application reattaches a set.
+    #[serde(skip)]
+    pub(crate) shared_declines: Option<SharedDeclines>,
     /// Requirements stop hooks reported as unmet when the run stopped
     /// ([`crate::StopDecision::AcceptUnmet`]), deduplicated, in hook order.
     /// Set only when the run ends `Completed`; a new run
@@ -172,6 +178,7 @@ impl RunState {
             untrusted_seen: false,
             stuck: StuckState::default(),
             declined: Vec::new(),
+            shared_declines: None,
             unmet: Vec::new(),
             finishing: None,
         }
@@ -189,7 +196,8 @@ impl RunState {
     /// per-run counters and budgets (`turn`, `tool_calls`, `run_usage`,
     /// elapsed time) start again from zero, and the run's
     /// [`RunState::declined`] effects and [`RunState::unmet`] requirements
-    /// are forgotten.
+    /// are forgotten, as is any [`SharedDeclines`] set: the new run shares
+    /// only a set attached to it.
     pub fn with_user_message(mut self, input: impl Into<Message>) -> Self {
         self.messages.push(input.into());
         self.run_id = RunId::new();
@@ -201,9 +209,35 @@ impl RunState {
         self.in_flight = None;
         self.stuck.reset();
         self.declined.clear();
+        self.shared_declines = None;
         self.unmet.clear();
         self.finishing = None;
         self
+    }
+
+    /// Share this run's declines with the other runs holding `declines`
+    /// (see [`SharedDeclines`]): each is refused the others' declined
+    /// effects from its next call on. The run's own declines are published
+    /// at once and the set's are taken in. Attach it again after resuming
+    /// saved state: the handle is not serialized.
+    pub fn share_declines(mut self, declines: SharedDeclines) -> Self {
+        declines.exchange(&mut self.declined);
+        self.shared_declines = Some(declines);
+        self
+    }
+
+    /// The decline set this run shares, if any.
+    pub fn shared_declines(&self) -> Option<&SharedDeclines> {
+        self.shared_declines.as_ref()
+    }
+
+    /// Take in what the runs sharing this run's set declined and publish
+    /// this run's own. Returns whether this run's declines grew.
+    pub(crate) fn sync_declines(&mut self) -> bool {
+        match self.shared_declines.as_ref() {
+            Some(shared) => shared.exchange(&mut self.declined),
+            None => false,
+        }
     }
 
     /// The serialization format version this state was written with.
