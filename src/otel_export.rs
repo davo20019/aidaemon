@@ -62,7 +62,9 @@ mod enabled {
         let mut sink = OtelSink::new(&provider);
         if config.capture_content {
             let redactor = Redactor::default();
-            sink = sink.with_content(move |text: &str| redactor.redact(text));
+            sink = sink
+                .with_content(move |text: &str| redactor.redact(text))
+                .with_wire_requests();
         }
         let _ = EXPORTER.set(Exporter {
             _provider: provider,
@@ -80,6 +82,12 @@ mod enabled {
             .get()
             .map(|exporter| exporter.sink.clone() as Arc<dyn sdk::EventSink>)
     }
+
+    pub(super) fn observe_sent(run: sdk::RunId, messages: &[serde_json::Value]) {
+        if let Some(exporter) = EXPORTER.get() {
+            exporter.sink.observe_wire(run, messages);
+        }
+    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -95,11 +103,20 @@ mod enabled {
     pub(super) fn sink() -> Option<Arc<dyn sdk::EventSink>> {
         None
     }
+
+    pub(super) fn observe_sent(_run: sdk::RunId, _messages: &[serde_json::Value]) {}
 }
 
 /// Start exporting, if the config asks for it. Call once at startup.
 pub(crate) fn start(config: &TelemetryConfig) {
     enabled::start(config);
+}
+
+/// The messages actually sent for a model call. The daemon builds them from
+/// the kernel's request (steering, directives, compaction, fitting), so only
+/// this shows what the model received.
+pub(crate) fn observe_sent(run: sdk::RunId, messages: &[serde_json::Value]) {
+    enabled::observe_sent(run, messages);
 }
 
 /// The exporter to add to each agent, when export is on.

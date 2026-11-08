@@ -70,6 +70,7 @@ pub struct OtelSink {
     tracer: SdkTracer,
     runs: Mutex<HashMap<RunId, OpenRun>>,
     content: Option<Redact>,
+    wire_requests: bool,
 }
 
 impl OtelSink {
@@ -78,6 +79,33 @@ impl OtelSink {
             tracer: provider.tracer("aidaemon"),
             runs: Mutex::default(),
             content: None,
+            wire_requests: false,
+        }
+    }
+
+    /// The application reshapes each request after the kernel's hooks, so
+    /// the prompt to export comes from [`OtelSink::observe_wire`] instead.
+    pub fn with_wire_requests(mut self) -> Self {
+        self.wire_requests = true;
+        self
+    }
+
+    /// Record the messages actually sent for the run's current model call.
+    pub fn observe_wire<T: serde::Serialize + ?Sized>(&self, run_id: RunId, messages: &T) {
+        if self.content.is_some() {
+            self.record_input(run_id, serde_json::to_string(messages).unwrap_or_default());
+        }
+    }
+
+    fn record_input(&self, run_id: RunId, messages: String) {
+        let Ok(mut runs) = self.runs.lock() else {
+            return;
+        };
+        let Some(span) = runs.get_mut(&run_id).and_then(|run| run.model.as_mut()) else {
+            return;
+        };
+        if let Some(messages) = self.captured(&messages) {
+            span.set_attribute(KeyValue::new("gen_ai.input.messages", messages));
         }
     }
 
@@ -323,18 +351,11 @@ impl EventSink for OtelSink {
     }
 
     fn observe_request(&self, run_id: RunId, request: &ModelRequest) {
-        if self.content.is_none() {
-            return;
-        }
-        let Ok(mut runs) = self.runs.lock() else {
-            return;
-        };
-        let Some(span) = runs.get_mut(&run_id).and_then(|run| run.model.as_mut()) else {
-            return;
-        };
-        let messages = serde_json::to_string(&request.messages).unwrap_or_default();
-        if let Some(messages) = self.captured(&messages) {
-            span.set_attribute(KeyValue::new("gen_ai.input.messages", messages));
+        if self.content.is_some() && !self.wire_requests {
+            self.record_input(
+                run_id,
+                serde_json::to_string(&request.messages).unwrap_or_default(),
+            );
         }
     }
 }

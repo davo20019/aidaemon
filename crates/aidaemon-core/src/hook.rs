@@ -220,8 +220,8 @@ pub enum HookFailure {
 /// | `edit_transcript` | the transcript stays as it was |
 /// | `on_run_start`, `before_model`, `on_stuck`, `on_run_end` | the run goes on |
 ///
-/// `on_run_start`, `edit_transcript`, `answer_model`, `on_model_error` and
-/// `on_limit` are unstable: tests cover them
+/// `on_run_start`, `edit_transcript`, `answer_model` and `on_limit` are
+/// unstable: tests cover them
 /// but no shipped policy depends on them yet, so they may still change.
 ///
 /// Timeouts and cancels stop a hook at its next `.await`, so a hook that

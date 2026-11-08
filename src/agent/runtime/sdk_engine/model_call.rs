@@ -127,45 +127,62 @@ impl Agent {
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply.
     pub(super) async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
-        let reply = loop {
-            let reply = self.sdk_model_call(scope, &call.request).await;
-            // The provider rejected the request as too long: its window is
-            // now recorded, so the retry compacts the run to fit.
-            if reply.is_err()
-                && scope.context_overflowed.swap(false, Ordering::Relaxed)
-                && scope
-                    .context_overflow_retries
-                    .fetch_add(1, Ordering::Relaxed)
-                    < MAX_CONTEXT_OVERFLOW_RETRIES
-            {
-                continue;
-            }
-            // Only a timed-out call comes back Transient here: the provider
-            // stack has already retried everything else it can.
-            let Err(sdk::ProviderError::Transient(_)) = &reply else {
-                break reply;
-            };
-            let retries = scope.model_call_timeouts.fetch_add(1, Ordering::Relaxed);
-            if retries >= MAX_MODEL_CALL_TIMEOUT_RETRIES {
-                break reply;
-            }
-            let timeout_secs = self.sdk_model_call_timeout().as_secs();
-            warn!(
-                session_id = scope.session_id,
-                task_id = scope.task_id,
-                retry = retries + 1,
-                "SDK engine: retrying a timed-out model call"
-            );
-            if let Ok(mut extra) = scope.extra_system.lock() {
-                extra.push(
-                    crate::agent::system_directives::SystemDirective::ModelCallTimedOut {
-                        timeout_secs,
-                    }
-                    .render(),
-                );
-            }
-        };
+        let reply = self.sdk_model_call(scope, &call.request).await;
         let _ = call.reply.send(reply);
+    }
+
+    /// Whether to try a failed model call again. The kernel runs the retry
+    /// as a new turn, so `before_model` hooks shape it afresh.
+    pub(super) async fn serve_sdk_model_error(
+        &self,
+        scope: &TurnScope<'_>,
+        check: ModelErrorCheck,
+    ) {
+        let _ = check
+            .reply
+            .send(self.model_error_decision(scope, check.timed_out));
+    }
+
+    fn model_error_decision(
+        &self,
+        scope: &TurnScope<'_>,
+        timed_out: bool,
+    ) -> sdk::ModelErrorDecision {
+        let retry = sdk::ModelErrorDecision::Retry {
+            after: Duration::ZERO,
+        };
+        // The provider rejected the request as too long: its window is now
+        // recorded, so the retry compacts the run to fit.
+        if scope.context_overflowed.swap(false, Ordering::Relaxed)
+            && scope
+                .context_overflow_retries
+                .fetch_add(1, Ordering::Relaxed)
+                < MAX_CONTEXT_OVERFLOW_RETRIES
+        {
+            return retry;
+        }
+        if !timed_out {
+            return sdk::ModelErrorDecision::Fail;
+        }
+        let retries = scope.model_call_timeouts.fetch_add(1, Ordering::Relaxed);
+        if retries >= MAX_MODEL_CALL_TIMEOUT_RETRIES {
+            return sdk::ModelErrorDecision::Fail;
+        }
+        warn!(
+            session_id = scope.session_id,
+            task_id = scope.task_id,
+            retry = retries + 1,
+            "SDK engine: retrying a timed-out model call"
+        );
+        if let Ok(mut extra) = scope.extra_system.lock() {
+            extra.push(
+                crate::agent::system_directives::SystemDirective::ModelCallTimedOut {
+                    timeout_secs: self.sdk_model_call_timeout().as_secs(),
+                }
+                .render(),
+            );
+        }
+        retry
     }
 
     /// The per-call ceiling: a hung provider must not hold the turn.
@@ -186,18 +203,6 @@ impl Agent {
         scope: &TurnScope<'_>,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
-        // A computer_use GUI loop pins a vision-capable model for its task;
-        // every later call of the task uses it.
-        #[cfg(feature = "computer_use")]
-        let pinned_request = {
-            let mut pinned = request.clone();
-            pinned.model =
-                crate::agent::computer_use::resolve_model_for_task(scope.task_id, &pinned.model)
-                    .await;
-            pinned
-        };
-        #[cfg(feature = "computer_use")]
-        let request = &pinned_request;
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime.snapshot();
         let tools = to_daemon_tools(&request.tools);
@@ -242,20 +247,8 @@ impl Agent {
             .sdk_compacted_run(scope, &request.model, prefix_tokens, &run, budget)
             .await;
         let messages = fit_run_values(&prefix, run, budget);
+        crate::otel_export::observe_sent(scope.run_id, &messages);
         let mut options = to_chat_options(request);
-        // A reasoning model that spent its whole output budget thinking was
-        // usually on a hard step: give it more output room first, and lower
-        // reasoning effort only when the cutoffs repeat.
-        let raised = scope.raised_output_tokens.load(Ordering::Relaxed);
-        if raised > 0 {
-            options.max_tokens_override = Some(
-                options
-                    .max_tokens_override
-                    .map_or(raised, |cap| cap.max(raised)),
-            );
-        }
-        options.reasoning_effort_override =
-            thinking_cutoff_effort(scope.thinking_truncations.load(Ordering::Relaxed));
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
         // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
         // `None` and use the provider's background slot.
@@ -512,34 +505,6 @@ impl Agent {
                 return Err(sdk::ProviderError::Other(error.to_string()));
             }
         };
-        let produced_output = !response.tool_calls.is_empty()
-            || response
-                .content
-                .as_deref()
-                .is_some_and(|content| !content.trim().is_empty());
-        if produced_output {
-            scope.thinking_truncations.store(0, Ordering::Relaxed);
-        } else if response
-            .response_note
-            .as_deref()
-            .is_some_and(|note| note.contains("truncated"))
-        {
-            let count = scope.thinking_truncations.fetch_add(1, Ordering::Relaxed) + 1;
-            let raised = raised_output_ceiling(
-                usage.as_ref().map(|usage| usage.output_tokens),
-                scope.raised_output_tokens.load(Ordering::Relaxed),
-            );
-            if let Some(raised) = raised {
-                scope.raised_output_tokens.store(raised, Ordering::Relaxed);
-            }
-            warn!(
-                task_id = scope.task_id,
-                consecutive_truncations = count,
-                raised_output_tokens = ?raised,
-                next_effort = ?thinking_cutoff_effort(count),
-                "SDK engine: response truncated at the token limit with no output"
-            );
-        }
         *scope
             .pending_charge
             .lock()

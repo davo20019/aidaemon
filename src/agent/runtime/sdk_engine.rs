@@ -322,6 +322,7 @@ pub(super) enum DaemonCall {
     Model(ModelCall),
     Stop(StopCheck),
     Budget(BudgetCheck),
+    ModelError(ModelErrorCheck),
 }
 
 /// What turn setup (`main_loop.rs`) settled before the SDK run starts:
@@ -386,6 +387,13 @@ pub(in crate::agent) struct SdkTurnSetup {
 pub(super) struct BudgetCheck {
     response: sdk::ModelResponse,
     reply: oneshot::Sender<sdk::ModelDecision>,
+}
+
+/// A failed model call, for the daemon to say whether to try again.
+pub(super) struct ModelErrorCheck {
+    /// The provider stack gave up on a timeout; it retried the rest itself.
+    timed_out: bool,
+    reply: oneshot::Sender<sdk::ModelErrorDecision>,
 }
 
 pub(super) struct StopCheck {
@@ -618,12 +626,6 @@ pub(in crate::agent) struct TurnScope<'a> {
     text_only_next_call: Arc<AtomicBool>,
     /// The usage of the latest model call, until its budget check takes it.
     pending_charge: std::sync::Mutex<Option<crate::traits::TokenUsage>>,
-    /// Consecutive responses cut off at the token limit with no output (the
-    /// whole budget went to thinking). The next call first gets more output
-    /// room; only repeated cutoffs lower reasoning effort.
-    thinking_truncations: std::sync::atomic::AtomicU8,
-    /// Raised output-token ceiling after a thinking cutoff (0: none).
-    raised_output_tokens: std::sync::atomic::AtomicU32,
     /// The assessed task shape keeps inline work going after a detach.
     continue_inline_after_background: bool,
     /// Where calls without a directory run; refined by the model's own
@@ -1202,6 +1204,13 @@ impl Agent {
             stuck: StuckNotice {
                 notices: refusals_tx.clone(),
             },
+            model_pin: ModelPin {
+                task_id: task_id.clone(),
+            },
+            cutoff: CutoffAdjust::default(),
+            retry: ModelRetry {
+                calls: calls_tx.clone(),
+            },
             dispatch: DispatchGate {
                 calls: calls_tx.clone(),
             },
@@ -1373,8 +1382,6 @@ impl Agent {
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: text_only_next_call.clone(),
             pending_charge: std::sync::Mutex::new(None),
-            thinking_truncations: std::sync::atomic::AtomicU8::new(0),
-            raised_output_tokens: std::sync::atomic::AtomicU32::new(0),
             continue_inline_after_background,
             known_project_dir: known_project_dir.clone(),
             judged_terminal_calls,
@@ -1515,6 +1522,9 @@ impl Agent {
                     }
                     DaemonCall::Stop(check) => {
                         in_flight.push(self.serve_sdk_stop(&scope, check).boxed());
+                    }
+                    DaemonCall::ModelError(check) => {
+                        in_flight.push(self.serve_sdk_model_error(&scope, check).boxed());
                     }
                     DaemonCall::Budget(check) => {
                         in_flight.push(self.serve_sdk_budget(&scope, check).boxed());

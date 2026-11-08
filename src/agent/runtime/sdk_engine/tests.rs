@@ -3771,6 +3771,13 @@ fn hook_order_is_pinned() {
         stuck: StuckNotice {
             notices: mpsc::unbounded_channel().0,
         },
+        model_pin: ModelPin {
+            task_id: "synthetic-task".into(),
+        },
+        cutoff: CutoffAdjust::default(),
+        retry: ModelRetry {
+            calls: calls.clone(),
+        },
         dispatch: DispatchGate {
             calls: calls.clone(),
         },
@@ -3787,6 +3794,9 @@ fn hook_order_is_pinned() {
             HookSlot::TextOnly,
             HookSlot::Budget,
             HookSlot::Stuck,
+            HookSlot::ModelPin,
+            HookSlot::Cutoff,
+            HookSlot::Retry,
             HookSlot::Memory,
             HookSlot::Egress,
             HookSlot::Untrusted,

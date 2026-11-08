@@ -112,3 +112,57 @@ async fn a_finished_run_leaves_no_open_spans_behind() {
     assert_eq!(spans.len(), 4);
     assert_eq!(named(&spans, "invoke_agent").len(), 1);
 }
+
+#[tokio::test]
+async fn the_prompt_actually_sent_replaces_the_kernels_view() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let sink = Arc::new(
+        OtelSink::new(&provider)
+            .with_content(|text: &str| text.to_string())
+            .with_wire_requests(),
+    );
+    let run = aidaemon_core::RunId::new();
+    use aidaemon_core::{Event, EventSink, Message, ModelRequest};
+    sink.emit(
+        run,
+        &Event::RunStarted {
+            session_id: "s".into(),
+        },
+    );
+    sink.emit(
+        run,
+        &Event::ModelRequested {
+            turn: 1,
+            model: "m".into(),
+            messages: 1,
+            tools: 0,
+        },
+    );
+    sink.observe_request(
+        run,
+        &ModelRequest {
+            messages: vec![Message::user("the kernel's view")],
+            ..Default::default()
+        },
+    );
+    sink.observe_wire(run, &json!([{"role": "user", "content": "what was sent"}]));
+    sink.emit(
+        run,
+        &Event::ModelResponded {
+            turn: 1,
+            usage: Default::default(),
+            text: "ok".into(),
+            tool_calls: 0,
+            note: None,
+        },
+    );
+
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let input = attr(named(&spans, "chat m")[0], "gen_ai.input.messages").unwrap();
+    assert!(input.contains("what was sent"));
+    assert!(!input.contains("the kernel's view"));
+}

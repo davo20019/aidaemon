@@ -1,6 +1,7 @@
 //! The kernel-side adapters: hooks and the bridged daemon tools. Each one
 //! only forwards to the daemon over the turn's `DaemonCall` channel.
 
+use super::model_call::{raised_output_ceiling, thinking_cutoff_effort};
 use super::*;
 
 /// The ledger closeout as an SDK stop hook: before a final answer ships, the
@@ -94,6 +95,9 @@ pub(super) enum HookSlot {
     TextOnly,
     Budget,
     Stuck,
+    ModelPin,
+    Cutoff,
+    Retry,
     Memory,
     Egress,
     Untrusted,
@@ -117,6 +121,9 @@ pub(super) struct TurnHooks {
     pub(super) text_only: TextOnlyNext,
     pub(super) budget: BudgetGate,
     pub(super) stuck: StuckNotice,
+    pub(super) model_pin: ModelPin,
+    pub(super) cutoff: CutoffAdjust,
+    pub(super) retry: ModelRetry,
     pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
     pub(super) egress: aidaemon_policies::EgressGuard,
     pub(super) untrusted: sdk::UntrustedHook,
@@ -134,6 +141,9 @@ impl TurnHooks {
             (HookSlot::TextOnly, Arc::new(self.text_only)),
             (HookSlot::Budget, Arc::new(self.budget)),
             (HookSlot::Stuck, Arc::new(self.stuck)),
+            (HookSlot::ModelPin, Arc::new(self.model_pin)),
+            (HookSlot::Cutoff, Arc::new(self.cutoff)),
+            (HookSlot::Retry, Arc::new(self.retry)),
         ];
         chain.extend(self.memory.into_iter().map(|hook| (HookSlot::Memory, hook)));
         chain.push((HookSlot::Egress, Arc::new(self.egress)));
@@ -191,6 +201,120 @@ impl sdk::Hook for BudgetGate {
             return sdk::ModelDecision::Accept;
         }
         answer.await.unwrap_or(sdk::ModelDecision::Accept)
+    }
+}
+
+/// A computer_use GUI loop pins a vision-capable model for its task; every
+/// later call of the task uses it. Early in the chain, so hooks that size the
+/// request by its model see the one that will answer.
+pub(super) struct ModelPin {
+    pub(super) task_id: String,
+}
+
+#[async_trait]
+impl sdk::Hook for ModelPin {
+    async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
+        #[cfg(feature = "computer_use")]
+        {
+            request.model =
+                crate::agent::computer_use::resolve_model_for_task(&self.task_id, &request.model)
+                    .await;
+        }
+        #[cfg(not(feature = "computer_use"))]
+        let _ = (&self.task_id, request);
+    }
+}
+
+/// A reasoning model that spent its whole output budget thinking was usually
+/// on a hard step: give it more output room first, and lower reasoning
+/// effort only when the cutoffs repeat.
+#[derive(Default)]
+pub(super) struct CutoffAdjust {
+    consecutive: std::sync::atomic::AtomicU8,
+    raised_output_tokens: std::sync::atomic::AtomicU32,
+}
+
+impl CutoffAdjust {
+    #[cfg(test)]
+    pub(super) fn cutoffs(&self) -> u8 {
+        self.consecutive.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl sdk::Hook for CutoffAdjust {
+    async fn before_model(&self, _ctx: &sdk::HookContext<'_>, request: &mut sdk::ModelRequest) {
+        let raised = self.raised_output_tokens.load(Ordering::Relaxed);
+        if raised > 0 {
+            request.max_output_tokens = Some(
+                request
+                    .max_output_tokens
+                    .map_or(raised, |cap| cap.max(raised)),
+            );
+        }
+        if let Some(effort) = thinking_cutoff_effort(self.consecutive.load(Ordering::Relaxed)) {
+            request.options.reasoning_effort = Some(effort);
+        }
+    }
+
+    async fn after_model(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        response: &mut sdk::ModelResponse,
+    ) -> sdk::ModelDecision {
+        let produced_output = !response.tool_calls.is_empty() || !response.text.trim().is_empty();
+        if produced_output {
+            self.consecutive.store(0, Ordering::Relaxed);
+        } else if response
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("truncated"))
+        {
+            let count = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
+            let raised = raised_output_ceiling(
+                u32::try_from(response.usage.output_tokens).ok(),
+                self.raised_output_tokens.load(Ordering::Relaxed),
+            );
+            if let Some(raised) = raised {
+                self.raised_output_tokens.store(raised, Ordering::Relaxed);
+            }
+            warn!(
+                session_id = ctx.session_id,
+                consecutive_truncations = count,
+                raised_output_tokens = ?raised,
+                next_effort = ?thinking_cutoff_effort(count),
+                "SDK engine: response truncated at the token limit with no output"
+            );
+        }
+        sdk::ModelDecision::Accept
+    }
+}
+
+/// Asks the daemon whether a failed model call is worth another try.
+/// Served on the turn's task.
+pub(super) struct ModelRetry {
+    pub(super) calls: mpsc::Sender<DaemonCall>,
+}
+
+#[async_trait]
+impl sdk::Hook for ModelRetry {
+    async fn on_model_error(
+        &self,
+        _ctx: &sdk::HookContext<'_>,
+        error: &sdk::ProviderError,
+    ) -> sdk::ModelErrorDecision {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .calls
+            .send(DaemonCall::ModelError(ModelErrorCheck {
+                timed_out: matches!(error, sdk::ProviderError::Transient(_)),
+                reply,
+            }))
+            .await;
+        if sent.is_err() {
+            return sdk::ModelErrorDecision::Fail;
+        }
+        answer.await.unwrap_or(sdk::ModelErrorDecision::Fail)
     }
 }
 
