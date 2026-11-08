@@ -4,14 +4,17 @@ fn should_replay_durable_result(
     result: &crate::events::ToolResultData,
     tool_is_idempotent: bool,
 ) -> bool {
-    // A producer-owned retryable failure may be attempted again only when the
-    // adapter also declares repeated invocation safe. Every other durable
-    // outcome—including backgrounded and blocked—is replayed to avoid
-    // duplicating an indeterminate or already-completed effect.
-    !(tool_is_idempotent
-        && result.receipt.as_ref().is_some_and(|receipt| {
-            receipt.outcome_status == crate::traits::ToolOutcomeStatus::FailedRetryable
-        }))
+    // A retryable failure is the tool's own statement that the operation did
+    // not take effect, so it may run again. A timeout carries that status too
+    // but proves nothing about the effect: it runs again only when repeating
+    // is safe. Every other durable outcome, including backgrounded and
+    // blocked, is replayed to avoid duplicating an indeterminate or
+    // already-completed effect.
+    let may_run_again = result.receipt.as_ref().is_some_and(|receipt| {
+        receipt.outcome_status == crate::traits::ToolOutcomeStatus::FailedRetryable
+            && (tool_is_idempotent || !receipt.timed_out)
+    });
+    !may_run_again
 }
 
 fn durable_result_identity(result: &crate::events::ToolResultData) -> String {
@@ -160,10 +163,21 @@ mod replay_tests {
     }
 
     #[test]
-    fn durable_replay_only_reexecutes_safe_retryable_failures() {
+    fn durable_replay_reexecutes_only_failures_that_took_no_effect() {
         let retryable = result_with_status(crate::traits::ToolOutcomeStatus::FailedRetryable);
         assert!(!should_replay_durable_result(&retryable, true));
-        assert!(should_replay_durable_result(&retryable, false));
+        assert!(
+            !should_replay_durable_result(&retryable, false),
+            "a retryable failure took no effect, so a write may run again"
+        );
+
+        let mut timed_out = result_with_status(crate::traits::ToolOutcomeStatus::FailedRetryable);
+        timed_out.receipt.as_mut().unwrap().timed_out = true;
+        assert!(
+            should_replay_durable_result(&timed_out, false),
+            "a timed-out write may have taken effect and must not run again"
+        );
+        assert!(!should_replay_durable_result(&timed_out, true));
 
         for status in [
             crate::traits::ToolOutcomeStatus::Succeeded,

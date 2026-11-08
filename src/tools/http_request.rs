@@ -362,14 +362,30 @@ impl HttpRequestTool {
         Self::scoped_resource_id("account", account_id)
     }
 
-    fn outcome_status_for_http(status: u16, mandate_execution: bool) -> ToolOutcomeStatus {
+    /// 429 and 503 on a write mean the server refused it, so it may be sent
+    /// again. On a read the status is itself the observation; 502 and 504
+    /// leave a write's effect unknown.
+    fn outcome_status_for_http(
+        status: u16,
+        mandate_execution: bool,
+        write_request: bool,
+    ) -> ToolOutcomeStatus {
         if ((200..300).contains(&status) && !(mandate_execution && status == 202))
             || (!mandate_execution && (300..400).contains(&status))
         {
             ToolOutcomeStatus::Succeeded
+        } else if write_request && matches!(status, 429 | 503) {
+            ToolOutcomeStatus::FailedRetryable
         } else {
             ToolOutcomeStatus::CompletedWithNegativeResult
         }
+    }
+
+    fn is_write_request(arguments: &str) -> bool {
+        let method = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| args["method"].as_str().map(str::to_ascii_uppercase));
+        !matches!(method.as_deref(), None | Some("GET" | "HEAD" | "OPTIONS"))
     }
 
     fn same_origin(original: &reqwest::Url, candidate: &reqwest::Url) -> bool {
@@ -2030,8 +2046,9 @@ impl Tool for HttpRequestTool {
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
-                outcome_status: http_status
-                    .map(|status| Self::outcome_status_for_http(status, false)),
+                outcome_status: http_status.map(|status| {
+                    Self::outcome_status_for_http(status, false, Self::is_write_request(arguments))
+                }),
                 http_status,
                 truncation,
                 ..Default::default()
@@ -2131,7 +2148,11 @@ impl Tool for HttpRequestTool {
             output,
             metadata: ToolCallMetadata {
                 outcome_status: http_status.map(|status| {
-                    Self::outcome_status_for_http(status, exec_ctx.mandate_execution)
+                    Self::outcome_status_for_http(
+                        status,
+                        exec_ctx.mandate_execution,
+                        Self::is_write_request(arguments),
+                    )
                 }),
                 http_status,
                 truncation,
@@ -3193,10 +3214,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_a_refused_write_is_retryable() {
+        let status = |code, write| HttpRequestTool::outcome_status_for_http(code, false, write);
+        assert_eq!(status(503, true), ToolOutcomeStatus::FailedRetryable);
+        assert_eq!(status(429, true), ToolOutcomeStatus::FailedRetryable);
+        for code in [500, 502, 504, 404] {
+            assert_eq!(
+                status(code, true),
+                ToolOutcomeStatus::CompletedWithNegativeResult,
+                "{code} leaves a write's effect unknown or is not transient"
+            );
+        }
+        assert_eq!(
+            status(503, false),
+            ToolOutcomeStatus::CompletedWithNegativeResult,
+            "a 503 on a read is the observation itself"
+        );
+    }
+
+    #[test]
+    fn write_requests_are_recognized_by_their_method() {
+        assert!(HttpRequestTool::is_write_request(r#"{"method":"post"}"#));
+        assert!(HttpRequestTool::is_write_request(r#"{"method":"DELETE"}"#));
+        assert!(!HttpRequestTool::is_write_request(r#"{"method":"GET"}"#));
+        assert!(!HttpRequestTool::is_write_request(r#"{"url":"x"}"#));
+    }
+
     #[tokio::test]
     async fn mandate_202_accepted_is_not_completion_evidence() {
         assert_eq!(
-            HttpRequestTool::outcome_status_for_http(202, false),
+            HttpRequestTool::outcome_status_for_http(202, false, false),
             ToolOutcomeStatus::Succeeded,
             "ordinary HTTP behavior remains backward-compatible"
         );

@@ -488,3 +488,124 @@ async fn handoff_typed_as_a_permanent_failure_does_not_end_the_run() {
     assert_ne!(reply, "The helper was refused before it started.");
     assert!(harness.provider.call_count().await >= 2);
 }
+
+/// A send whose first attempt reports `first`, then succeeds.
+struct FlakySend {
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+    first: ToolCallMetadata,
+}
+
+impl crate::traits::ToolSemantics for FlakySend {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+        )
+    }
+
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Trusted
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FlakySend {
+    fn name(&self) -> &str {
+        "flaky_send"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "flaky_send",
+            "description": "Send a message",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("delivered".to_string())
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        _arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        use std::sync::atomic::Ordering;
+        let first = self.executions.fetch_add(1, Ordering::SeqCst) == 0;
+        Ok(crate::traits::ToolCallOutcome {
+            output: if first { "not delivered" } else { "delivered" }.to_string(),
+            metadata: if first {
+                self.first.clone()
+            } else {
+                ToolCallMetadata {
+                    outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                    ..ToolCallMetadata::default()
+                }
+            },
+            finish: None,
+        })
+    }
+}
+
+async fn executions_after_three_identical_sends(session: &str, first: ToolCallMetadata) -> usize {
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("flaky_send", "{}"),
+        MockProvider::tool_call_response("flaky_send", "{}"),
+        MockProvider::tool_call_response("flaky_send", "{}"),
+        MockProvider::text_response("Done."),
+    ]);
+    let tool = FlakySend {
+        executions: executions.clone(),
+        first,
+    };
+    let harness = root(provider, vec![Arc::new(tool)]).await;
+    ask(&harness, session, "Send it").await;
+    executions.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A refused send runs again, and once it has succeeded an identical call
+/// replays the success instead of sending twice.
+#[tokio::test]
+async fn refused_send_runs_again_and_its_success_is_never_repeated() {
+    let refused = ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedRetryable),
+        ..ToolCallMetadata::default()
+    };
+    assert_eq!(
+        executions_after_three_identical_sends("retry-refused", refused).await,
+        2
+    );
+}
+
+/// A timed-out send may have gone through, so it is never sent again.
+#[tokio::test]
+async fn timed_out_send_is_not_sent_again() {
+    let timed_out = ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedRetryable),
+        timed_out: true,
+        ..ToolCallMetadata::default()
+    };
+    assert_eq!(
+        executions_after_three_identical_sends("retry-timeout", timed_out).await,
+        1
+    );
+}
