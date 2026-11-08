@@ -156,6 +156,13 @@ impl TurnRunner {
         }
     }
 
+    /// A runner whose turns get `limit` instead of [`TURN_WALL_CLOCK`].
+    #[cfg(test)]
+    pub(crate) fn with_wall_clock(mut self, limit: Duration) -> Self {
+        self.wall_clock = limit;
+        self
+    }
+
     /// Remember that `session_id` belongs to `channel_name`, so outbound
     /// messages (approvals, media, notifications) route back to it.
     pub(crate) async fn register_session(&self, session_id: &str, channel_name: &str) {

@@ -59,7 +59,10 @@ async fn approvals_harness(
     script: Vec<crate::traits::ProviderResponse>,
     answers: Vec<Option<crate::types::ApprovalResponse>>,
     timeout: Option<std::time::Duration>,
-) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+) -> (
+    crate::testing::TestHarness,
+    crate::testing::ScriptedApprover,
+) {
     approvals_harness_with(script, answers, timeout, Vec::new()).await
 }
 
@@ -70,7 +73,10 @@ async fn approvals_harness_with(
     answers: Vec<Option<crate::types::ApprovalResponse>>,
     timeout: Option<std::time::Duration>,
     extra: Vec<Arc<dyn crate::traits::Tool>>,
-) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+) -> (
+    crate::testing::TestHarness,
+    crate::testing::ScriptedApprover,
+) {
     let pool_file = tempfile::NamedTempFile::new().unwrap();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
@@ -81,7 +87,8 @@ async fn approvals_harness_with(
     let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
     std::mem::forget(_tool_rx);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
-        crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
+        crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
             vec![],
             crate::tools::ApprovalBroker::new(tool_tx),
             1,
@@ -104,11 +111,9 @@ async fn approvals_harness_with(
     .await
     .unwrap();
     if let Some(timeout) = timeout {
-        harness
-            .agent
-            .set_owner_approvals(Arc::new(crate::agent::approvals::OwnerApprovals::with_timeout(
-                timeout,
-            )));
+        harness.agent.set_owner_approvals(Arc::new(
+            crate::agent::approvals::OwnerApprovals::with_timeout(timeout),
+        ));
     }
     let (broker, approver) = crate::testing::ScriptedApprover::start(answers);
     harness.agent.owner_approvals().set_broker(broker);
@@ -204,14 +209,22 @@ async fn http_post_card_comes_from_kernel_interrupt() {
     assert_eq!(approver.card_count(), 1);
     let card = approver.cards.lock().unwrap()[0].clone();
     assert!(card.command.starts_with(&format!("POST {url}")), "{card:?}");
-    assert!(card.command.contains("\nBody: {\"owner\":\"Alice Rivera\"}"), "{card:?}");
+    assert!(
+        card.command
+            .contains("\nBody: {\"owner\":\"Alice Rivera\"}"),
+        "{card:?}"
+    );
     assert_eq!(card.session_id, APPROVALS_SESSION);
     assert_eq!(card.risk_level, crate::tools::command_risk::RiskLevel::High);
     assert!(
         card.warnings.iter().any(|w| w.contains("Write operation")),
         "{card:?}"
     );
-    assert_eq!(requests_sent(&sent), 1, "the approved POST is delivered once");
+    assert_eq!(
+        requests_sent(&sent),
+        1,
+        "the approved POST is delivered once"
+    );
     let decisions = approval_conditions(&harness).await;
     assert_eq!(
         conditions(&decisions),
@@ -326,7 +339,11 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 2, "the POST and the config change only");
+    assert_eq!(
+        approver.card_count(),
+        2,
+        "the POST and the config change only"
+    );
     let cards = approver.cards.lock().unwrap().clone();
     assert!(cards[1].command.contains("manage_config"), "{cards:?}");
     let results = tool_results(&harness).await;
@@ -339,7 +356,9 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
         facts.iter().any(|fact| fact.key == "report_format"),
         "the fact was stored: {facts:?}"
     );
-    assert!(std::fs::read_to_string(&config_path).unwrap().contains("synthetic-model"));
+    assert!(std::fs::read_to_string(&config_path)
+        .unwrap()
+        .contains("synthetic-model"));
 }
 
 #[tokio::test]
@@ -359,11 +378,21 @@ async fn approval_timeout_is_a_decline() {
     assert_eq!(approver.card_count(), 1);
     let results = tool_results(&harness).await;
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
-    assert!(results[0].contains("no answer from the owner"), "{results:?}");
+    assert!(
+        results[0].contains("no answer from the owner"),
+        "{results:?}"
+    );
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
     // The card held past the timeout approves nothing.
-    let held = approver.held.lock().unwrap().pop().expect("the card is held");
-    assert!(held.send(crate::types::ApprovalResponse::AllowOnce).is_err());
+    let held = approver
+        .held
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the card is held");
+    assert!(held
+        .send(crate::types::ApprovalResponse::AllowOnce)
+        .is_err());
 }
 
 #[tokio::test]
@@ -384,7 +413,11 @@ async fn allow_session_skips_next_card_same_host() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "the session grant covers the retry");
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "the session grant covers the retry"
+    );
     assert_eq!(requests_sent(&sent), 2);
 }
 
@@ -415,13 +448,176 @@ async fn stale_card_after_restart_approves_nothing() {
 
     let results = tool_results(&harness).await;
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
-    assert!(results[0].contains("no answer from the owner"), "{results:?}");
+    assert!(
+        results[0].contains("no answer from the owner"),
+        "{results:?}"
+    );
     // The owner answers the old card after the run ended: nothing runs.
-    let held = approver.held.lock().unwrap().pop().expect("the card is held");
+    let held = approver
+        .held
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the card is held");
     let _ = held.send(crate::types::ApprovalResponse::AllowOnce);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(requests_sent(&sent), 0);
     assert_eq!(approver.card_count(), 1);
+}
+
+/// Records what a turn runner says.
+#[derive(Default)]
+struct SaidInChat(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl crate::channels::turns::TurnSurface for SaidInChat {
+    fn platform(&self) -> &'static str {
+        "test"
+    }
+    async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+        self.0.lock().unwrap().push(text.to_string());
+        Ok(Vec::new())
+    }
+    fn show_working(
+        &self,
+        _: tokio_util::sync::CancellationToken,
+        _: Arc<std::sync::atomic::AtomicU64>,
+        _: u64,
+    ) {
+    }
+}
+
+fn card_turn(key: &str) -> crate::channels::turns::Turn {
+    crate::channels::turns::Turn {
+        session_id: APPROVALS_SESSION.to_string(),
+        text: "Post the synthetic report for Alice Rivera".to_string(),
+        attachments: Vec::new(),
+        user_role: UserRole::Owner,
+        channel_ctx: ChannelContext::private("telegram"),
+        dedup_key: Some(key.to_string()),
+        ingress_timing: None,
+    }
+}
+
+/// A channel's turn runner over `agent`, and the registry its turns join.
+fn card_runner(
+    agent: crate::agent::Agent,
+    state: Arc<crate::state::SqliteStateStore>,
+) -> (
+    crate::channels::turns::TurnRunner,
+    Arc<crate::tasks::TaskRegistry>,
+) {
+    let inbox = tempfile::tempdir().unwrap().keep();
+    let registry = Arc::new(crate::tasks::TaskRegistry::new(50));
+    let runner = crate::channels::turns::TurnRunner::new(crate::channels::ChannelRuntimeDeps {
+        agent: Arc::new(agent),
+        config_path: inbox.join("config.toml"),
+        session_map: Arc::default(),
+        task_registry: registry.clone(),
+        files_enabled: false,
+        inbox_dir: inbox,
+        max_file_size_mb: 10,
+        state,
+        watchdog_stale_threshold_secs: 0,
+    });
+    (runner, registry)
+}
+
+/// The goal card's 30 minutes against the turn's 20, through the real turn
+/// runner and kernel approval path (scaled down, same order): a card that
+/// outlasts the turn limit does not kill the turn, and the run goes on once
+/// the card expires.
+#[tokio::test]
+async fn a_card_outlasting_the_turn_limit_does_not_kill_the_turn() {
+    let (port, sent) = spawn_approvals_server().await;
+    let url = format!("http://localhost:{port}/report");
+    let (harness, approver) = approvals_harness(
+        vec![
+            http_call("POST", &url, Some("report")),
+            MockProvider::text_response("Nothing was sent."),
+        ],
+        vec![None],
+        Some(std::time::Duration::from_secs(4)),
+    )
+    .await;
+    let state = harness.state.clone();
+    let (runner, _registry) = card_runner(harness.agent, state);
+    let runner = runner.with_wall_clock(std::time::Duration::from_secs(2));
+    let surface = Arc::new(SaidInChat::default());
+
+    let started = std::time::Instant::now();
+    runner.submit(surface.clone(), card_turn("m1")).await;
+    let said = || surface.0.lock().unwrap().clone();
+    for _ in 0..2000 {
+        if said()
+            .iter()
+            .any(|s| s.contains("Nothing was sent") || s.contains("wall-clock"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let said = said();
+    assert!(!said.iter().any(|s| s.contains("wall-clock")), "{said:?}");
+    assert!(
+        said.iter().any(|s| s.contains("Nothing was sent")),
+        "{said:?}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+    assert_eq!(approver.card_count(), 1);
+    assert_eq!(requests_sent(&sent), 0);
+}
+
+/// A turn stopped while its card is open closes the delivered card (through
+/// the durable broker), which is what makes the channel expire it.
+#[tokio::test]
+async fn stopping_a_turn_closes_its_open_card() {
+    let (port, _sent) = spawn_approvals_server().await;
+    let url = format!("http://localhost:{port}/report");
+    let (harness, _unused) = approvals_harness(
+        vec![
+            http_call("POST", &url, Some("report")),
+            MockProvider::text_response("Nothing was sent."),
+        ],
+        vec![None],
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await;
+    let store = Arc::new(
+        crate::events::EventStore::new(harness.state.pool())
+            .await
+            .unwrap(),
+    );
+    let (broker, approver) = crate::testing::ScriptedApprover::start(vec![None]);
+    harness
+        .agent
+        .owner_approvals()
+        .set_broker(broker.with_event_store(store));
+    let state = harness.state.clone();
+    let (runner, registry) = card_runner(harness.agent, state);
+    let surface = Arc::new(SaidInChat::default());
+
+    runner.submit(surface.clone(), card_turn("m1")).await;
+    for _ in 0..1000 {
+        if !approver.held.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut card = approver
+        .held
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the card is out");
+    assert!(!card.is_closed());
+
+    registry.cancel_running_for_session(APPROVALS_SESSION).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), card.closed())
+        .await
+        .expect("the card outlived its stopped turn");
 }
 
 #[tokio::test]
@@ -444,11 +640,18 @@ async fn egress_guard_blocks_secret_in_http_body_and_curl() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 0, "a secret is refused before any card");
+    assert_eq!(
+        approver.card_count(),
+        0,
+        "a secret is refused before any card"
+    );
     let results = tool_results(&harness).await;
     assert_eq!(results.len(), 2, "{results:?}");
     for result in &results {
-        assert!(result.contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
+        assert!(
+            result.contains(aidaemon_core::EGRESS_BLOCKED),
+            "{results:?}"
+        );
         assert!(!result.contains(SYNTHETIC_AWS_KEY), "{results:?}");
     }
     let decisions = approval_conditions(&harness).await;
@@ -458,13 +661,12 @@ async fn egress_guard_blocks_secret_in_http_body_and_curl() {
         "{decisions:?}"
     );
     // The refused calls' rows in the ledger never hold the secret.
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT event_type, data FROM events WHERE session_id = ? ORDER BY id",
-    )
-    .bind(APPROVALS_SESSION)
-    .fetch_all(&harness.state.pool())
-    .await
-    .unwrap();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT event_type, data FROM events WHERE session_id = ? ORDER BY id")
+            .bind(APPROVALS_SESSION)
+            .fetch_all(&harness.state.pool())
+            .await
+            .unwrap();
     // The model's own reply (`assistant_response`) holds what it wrote; the
     // refused calls' rows (`tool_call`, and anything else the dispatcher
     // records) hold redacted arguments.
@@ -482,7 +684,10 @@ async fn egress_guard_blocks_secret_in_http_body_and_curl() {
             event_type == "tool_call" && data.contains("[REDACTED:aws_access_key]")
         })
         .count();
-    assert_eq!(refused_calls, 2, "both refused calls are recorded, redacted");
+    assert_eq!(
+        refused_calls, 2,
+        "both refused calls are recorded, redacted"
+    );
 }
 
 #[tokio::test]
@@ -502,7 +707,10 @@ async fn egress_guard_allows_local_port_url() {
     assert_eq!(approver.card_count(), 0, "a plain GET needs no card");
     assert_eq!(requests_sent(&sent), 1);
     let results = tool_results(&harness).await;
-    assert!(!results[0].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
+    assert!(
+        !results[0].contains(aidaemon_core::EGRESS_BLOCKED),
+        "{results:?}"
+    );
 }
 
 /// Review Focus 5 for curl, end to end: a POST to a local `IP:port` is
@@ -527,12 +735,22 @@ async fn egress_guard_curl_local_port_passes_and_secret_body_is_blocked() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "only the clean POST is asked about");
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "only the clean POST is asked about"
+    );
     assert_eq!(requests_sent(&sent), 1, "only the clean POST is sent");
     let results = tool_results(&harness).await;
     assert_eq!(results.len(), 2, "{results:?}");
-    assert!(!results[0].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
-    assert!(results[1].contains(aidaemon_core::EGRESS_BLOCKED), "{results:?}");
+    assert!(
+        !results[0].contains(aidaemon_core::EGRESS_BLOCKED),
+        "{results:?}"
+    );
+    assert!(
+        results[1].contains(aidaemon_core::EGRESS_BLOCKED),
+        "{results:?}"
+    );
     assert!(!results[1].contains("AKIAIOSFODNN7EXAMPLE"), "{results:?}");
 }
 
@@ -564,7 +782,11 @@ async fn scheduled_trusted_session_post_has_no_card() {
     let (port, sent) = spawn_approvals_server().await;
     let (harness, approver) = approvals_harness(
         vec![
-            http_call("POST", &format!("http://localhost:{port}/report"), Some("report")),
+            http_call(
+                "POST",
+                &format!("http://localhost:{port}/report"),
+                Some("report"),
+            ),
             MockProvider::text_response("Posted."),
         ],
         vec![],
@@ -645,7 +867,8 @@ async fn terminal_harness(
     std::mem::forget(pool_file);
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
-    let mut terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
+    let mut terminal = crate::tools::TerminalTool::new(
+        crate::execution::active_execution_backend(),
         setup.allowed,
         crate::tools::ApprovalBroker::new(tool_tx),
         5,
@@ -716,7 +939,9 @@ async fn terminal_unknown_command_interrupts_for_owner() {
         "{card:?}"
     );
     assert!(
-        card.warnings.iter().any(|w| w.starts_with("Execution target:")),
+        card.warnings
+            .iter()
+            .any(|w| w.starts_with("Execution target:")),
         "{card:?}"
     );
     let results = tool_results(&harness).await;
@@ -760,7 +985,11 @@ async fn terminal_allow_always_persists_prefix() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "the persisted prefix covers the retry");
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "the persisted prefix covers the retry"
+    );
     let results = tool_results(&harness).await;
     assert!(results[1].contains("synthetic-second"), "{results:?}");
     let persisted: Vec<String> =
@@ -840,7 +1069,11 @@ async fn terminal_semantic_timeout_fails_closed_to_card() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "a slow assessor fails closed to a card");
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "a slow assessor fails closed to a card"
+    );
     let card = approver.cards.lock().unwrap()[0].clone();
     assert_eq!(
         card.risk_level,
@@ -865,7 +1098,8 @@ async fn terminal_outside_kernel_requires_kernel_approval() {
         .unwrap();
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
-    let terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
+    let terminal = crate::tools::TerminalTool::new(
+        crate::execution::active_execution_backend(),
         Vec::new(),
         crate::tools::ApprovalBroker::new(tool_tx),
         5,
@@ -982,7 +1216,10 @@ async fn terminal_cards_offer_the_old_buttons() {
         ),
     ] {
         let (harness, approver, _pool) = terminal_harness(
-            vec![terminal_run(command), MockProvider::text_response("Declined.")],
+            vec![
+                terminal_run(command),
+                MockProvider::text_response("Declined."),
+            ],
             vec![Some(crate::types::ApprovalResponse::Deny)],
             TerminalSetup {
                 mode,
@@ -1271,24 +1508,39 @@ async fn unjudged_terminal_call_is_refused_by_the_dispatcher() {
         no_assessor(&["printf"]),
     )
     .await;
-    crate::agent::approvals::JUDGMENT_SEAMS.lock().unwrap().insert(
-        session.clone(),
-        crate::agent::approvals::JudgmentSeam::DropJudgment,
-    );
-    run_owner_turn_in(&harness.agent, &session, ChannelContext::private("telegram")).await;
+    crate::agent::approvals::JUDGMENT_SEAMS
+        .lock()
+        .unwrap()
+        .insert(
+            session.clone(),
+            crate::agent::approvals::JudgmentSeam::DropJudgment,
+        );
+    run_owner_turn_in(
+        &harness.agent,
+        &session,
+        ChannelContext::private("telegram"),
+    )
+    .await;
     crate::agent::approvals::JUDGMENT_SEAMS
         .lock()
         .unwrap()
         .remove(&session);
 
-    assert_eq!(approver.card_count(), 0, "the allowlisted command needs no card");
+    assert_eq!(
+        approver.card_count(),
+        0,
+        "the allowlisted command needs no card"
+    );
     let results = tool_results(&harness).await;
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(
         results[0].contains("requires approval through the agent kernel"),
         "{results:?}"
     );
-    assert!(!results[0].contains("synthetic-probe-ran"), "the command ran: {results:?}");
+    assert!(
+        !results[0].contains("synthetic-probe-ran"),
+        "the command ran: {results:?}"
+    );
     assert_eq!(
         ledger_refusals(&harness, &session, "kernel_judgment_missing").await,
         1
@@ -1310,15 +1562,23 @@ async fn dispatcher_executes_with_the_judged_scope() {
         no_assessor(&["printf"]),
     )
     .await;
-    crate::agent::approvals::JUDGMENT_SEAMS.lock().unwrap().insert(
-        session.clone(),
-        crate::agent::approvals::JudgmentSeam::JudgedScope(
-            crate::agent::approvals::TerminalScope::Refused(
-                "synthetic judged refusal".to_string(),
+    crate::agent::approvals::JUDGMENT_SEAMS
+        .lock()
+        .unwrap()
+        .insert(
+            session.clone(),
+            crate::agent::approvals::JudgmentSeam::JudgedScope(
+                crate::agent::approvals::TerminalScope::Refused(
+                    "synthetic judged refusal".to_string(),
+                ),
             ),
-        ),
-    );
-    run_owner_turn_in(&harness.agent, &session, ChannelContext::private("telegram")).await;
+        );
+    run_owner_turn_in(
+        &harness.agent,
+        &session,
+        ChannelContext::private("telegram"),
+    )
+    .await;
     crate::agent::approvals::JUDGMENT_SEAMS
         .lock()
         .unwrap()
@@ -1327,8 +1587,14 @@ async fn dispatcher_executes_with_the_judged_scope() {
     assert_eq!(approver.card_count(), 0);
     let results = tool_results(&harness).await;
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(results[0].contains("synthetic judged refusal"), "{results:?}");
-    assert!(!results[0].contains("synthetic-probe-ran"), "the command ran: {results:?}");
+    assert!(
+        results[0].contains("synthetic judged refusal"),
+        "{results:?}"
+    );
+    assert!(
+        !results[0].contains("synthetic-probe-ran"),
+        "the command ran: {results:?}"
+    );
     assert_eq!(
         ledger_refusals(&harness, &session, "controller_scope_contract_rejected").await,
         1
@@ -1337,8 +1603,8 @@ async fn dispatcher_executes_with_the_judged_scope() {
     // kernel denial, and the ledger holds it once (above).
     let seen = all_tool_messages(&harness.provider).await;
     assert!(
-        seen.iter()
-            .any(|message| message.starts_with("Denied:") && message.contains("synthetic judged refusal")),
+        seen.iter().any(|message| message.starts_with("Denied:")
+            && message.contains("synthetic judged refusal")),
         "{seen:?}"
     );
 }
@@ -1349,7 +1615,10 @@ async fn dispatcher_executes_with_the_judged_scope() {
 async fn mcp_approvals_harness(
     script: Vec<crate::traits::ProviderResponse>,
     answers: Vec<Option<crate::types::ApprovalResponse>>,
-) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+) -> (
+    crate::testing::TestHarness,
+    crate::testing::ScriptedApprover,
+) {
     mcp_approvals_harness_with(script, answers, Vec::new()).await
 }
 
@@ -1358,7 +1627,10 @@ async fn mcp_approvals_harness_with(
     script: Vec<crate::traits::ProviderResponse>,
     answers: Vec<Option<crate::types::ApprovalResponse>>,
     extra: Vec<Arc<dyn crate::traits::Tool>>,
-) -> (crate::testing::TestHarness, crate::testing::ScriptedApprover) {
+) -> (
+    crate::testing::TestHarness,
+    crate::testing::ScriptedApprover,
+) {
     let (mut harness, approver) = approvals_harness_with(script, answers, None, extra).await;
     let registry = crate::testing::fake_mcp_registry(harness.state.clone()).await;
     harness.agent.set_test_mcp_registry(registry);
@@ -1534,12 +1806,15 @@ impl crate::traits::ToolSemantics for OfferedManageMcpTool {
 /// the kernel before any server can start, including repeat additions.
 #[tokio::test]
 async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
-    let backing = setup_test_agent(MockProvider::with_responses(vec![])).await.unwrap();
+    let backing = setup_test_agent(MockProvider::with_responses(vec![]))
+        .await
+        .unwrap();
     let registry = crate::mcp::McpRegistry::new(backing.state.clone());
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(OfferedManageMcpTool(
         crate::tools::ManageMcpTool::new(registry.clone()),
     ));
-    let args = r#"{"action":"add","name":"synthetic","command":"node","args":["synthetic-server.js"]}"#;
+    let args =
+        r#"{"action":"add","name":"synthetic","command":"node","args":["synthetic-server.js"]}"#;
     let (harness, approver) = approvals_harness_with(
         vec![
             MockProvider::tool_call_response("manage_mcp", args),
@@ -1549,10 +1824,21 @@ async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
         vec![Some(crate::types::ApprovalResponse::Deny)],
         Some(std::time::Duration::from_millis(300)),
         vec![tool],
-    ).await;
+    )
+    .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
     assert_eq!(approver.card_count(), 1);
-    assert!(registry.list_servers_with_status().await.unwrap().is_empty());
-    assert_eq!(ledger_refusals(&harness, APPROVALS_SESSION, "owner_approval_declined").await, 2);
-    assert_eq!(latest_task_outcome(&harness, APPROVALS_SESSION).await, crate::events::TaskOutcome::Partial);
+    assert!(registry
+        .list_servers_with_status()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ledger_refusals(&harness, APPROVALS_SESSION, "owner_approval_declined").await,
+        2
+    );
+    assert_eq!(
+        latest_task_outcome(&harness, APPROVALS_SESSION).await,
+        crate::events::TaskOutcome::Partial
+    );
 }
