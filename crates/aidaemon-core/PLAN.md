@@ -185,9 +185,11 @@ adapters, tested against local mock servers.
 
 ### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
 
-Status: 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-3 of 10; 8.8 providers
-done and MCP transport moved, channels on the SDK adapters; 8.1, 8.5-8.7,
-8.7b and 8.9 not started or open. The first unchecked item below is next.
+Status: 8.1, 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-3 of 10; 8.8
+providers done and MCP transport moved, channels on the SDK adapters; 8.5-8.7,
+8.7b and 8.9 open. Next: 8.5 (in-tool approvals) and 8.6 (declines between
+parent and child runs), which close safety gaps. 8.4, 8.8 (MCP and store) and
+8.9 move working code between crates and wait for a second user of the SDK.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -209,10 +211,14 @@ Direction (owner): promote the daemon's implementations into the SDK
 crates, replacing the thinner SDK versions, one domain per plan.
 
 Order:
-- [ ] 8.1 Authority Phase 3a: typed call effects, owner approvals as typed
+- [x] 8.1 Authority Phase 3a: typed call effects, owner approvals as typed
       kernel interrupts, a decline binds the run across tools (kernel
       run-loop invariant), and `aidaemon_policies::EgressGuard` sharing
-      `Redactor`'s patterns. Plan:
+      `Redactor`'s patterns. Shipped 2026-11-04..06 (`f489c1c` kernel
+      resolver, `1df0944` typed scope, `c3d9fa2`/`9c32fa4` terminal,
+      `606066a`/`848455a` a declined run never succeeds, `319af63` children
+      start with the parent's declines, `6cf68f3` one `[EGRESS BLOCKED]`,
+      `46ed3e9` manage_mcp). Plan:
       `docs/superpowers/plans/2026-11-04-authority-phase-3a-effects-and-approvals.md`
       (local; `docs/` is gitignored).
 - [x] 8.1b Provider failover in the kernel (done by a parallel session).
