@@ -428,35 +428,33 @@ Order:
           back to long polling like the daemon's.
         Since (`1083c06`): name lookups, a configurable message length and
         Slack's typing substitute.
-        The bots (`[channels] telegram|discord|slack = "sdk"`, the default;
-        `"legacy"` keeps the old transport until each is checked live):
-        - Discord (`5863020`): runs on the adapter; its logic is transport
-          neutral (an `Outlet` for replies, normalized inbound), with the
-          first daemon-level Discord tests. Fixed on the way: session ids
-          never resolved to a conversation, so proactive Discord sends
-          (approvals, notifications) failed;
-        - Slack (`e60a672`): the adapter holds the Socket Mode connection
-          (`run_envelopes`) and hands raw envelopes to the unchanged
-          handling, which reads Slack's own event shapes;
-        - Telegram (`1a3be8a`): the adapter receives updates (webhook or
-          polling, `run_updates`); the daemon parses them into teloxide
-          types (rebuilt with `update_id` first) and runs its handlers per
-          chat in order. Outbound still uses teloxide's `Bot`.
-        Remaining, the structural part: the daemon still has its own
-        `Channel` trait and 2,000-6,500 lines of inbound handling per
-        platform (access, sessions, commands, files, approvals), so adding a
-        platform to the daemon still means copying a module. The fix is one
-        inbound handler written once against `aidaemon_channels::Channel`,
-        each platform shrinking to its adapter plus platform-only features
-        (Telegram web apps and reply keyboards, Slack workspace grants).
-        Then delete the legacy transports and the daemon `Channel` trait.
-        Earlier note on the bridge: Each daemon channel's inbound handlers
-        (access, auto-claim, commands, files, dispatch) are written against
-        serenity, teloxide or raw Slack payloads and must be ported onto
-        `ChannelEvent`, with session-id mapping, behind a per-platform
-        opt-in so each bot can be live-tested before its old transport is
-        deleted. Daemon Discord has no tests today. Live behavior needs a
-        manual smoke test per bot.
+        The bots, each checked live on its adapter (2026-11-07), then:
+        - one turn runner (`57788a2`, `channels::turns`): session
+          registration, cancel words, queueing and dedup, task tracking,
+          the inactivity watchdog and wall-clock limit, the working
+          indicator, throttled status, delivery receipts and the queue
+          drain are written once; a bot supplies a `TurnSurface` (how it
+          says, shows work and status, delivers, and rechecks a queued
+          message);
+        - one prompt book (`channels::prompts`): approval and goal cards
+          are sent with the adapter's `ask` and resolved from its answer,
+          with the same buttons and outcomes on every platform;
+        - Discord (`57788a2`): on both, serenity deleted;
+        - Slack (`fda3475`): on both, the hand-written Socket Mode client
+          deleted; the message path is tested against a mock Web API;
+        - Telegram (`0fa59fe`): on both, the teloxide dispatcher, its
+          poll-health watchdog and the HTML approval builders deleted;
+        - the `[channels]` switch is gone (`3a9a7ff`) and the daemon's
+          `Channel` trait is `HubChannel` (`95f552c`), the hub's outbound
+          surface over an SDK transport.
+        A new platform now needs its adapter crate, an access rule, a
+        session-id scheme and a `TurnSurface`; turns, approvals and goal
+        confirmations come for free. What stays per platform is genuinely
+        platform behavior: Slack workspace grants, mention resolution and
+        `file_shared` hydration (it still reads raw envelopes), Telegram's
+        web app, terminal and setup commands. Telegram's outbound calls
+        still go through teloxide's `Bot` (its HTTP client), as do those
+        commands; moving them to the adapter is the last teloxide removal.
 - [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
       scenario format and the trajectory assertions are duplicated.
       `src/harness_eval/report.rs` formats live telemetry and is not a
