@@ -7,7 +7,6 @@
 //! - Supports resume capability for long-running tasks
 
 pub mod detection;
-mod generation;
 mod recovery;
 mod store;
 mod tracking;

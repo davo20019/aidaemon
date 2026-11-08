@@ -657,7 +657,7 @@ pub struct LlmCallData {
     /// Unique identifier correlating this event with a token_usage row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
-    /// Background or auxiliary call purpose (e.g. summarization, intent_classifier).
+    /// Background or auxiliary call purpose (e.g. summarization, skill_confirmation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_purpose: Option<String>,
     /// Associated task ID.

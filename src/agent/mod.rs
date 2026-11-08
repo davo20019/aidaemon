@@ -67,8 +67,6 @@ use response_analysis::{reply_defers_file_access, user_text_references_file};
 mod intent_keywords;
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
-#[path = "intent/llm_classifier.rs"]
-pub mod llm_classifier;
 #[path = "intent/relational_prefilter.rs"]
 #[cfg(test)]
 pub mod relational_prefilter;
