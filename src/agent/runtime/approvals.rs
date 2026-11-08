@@ -604,6 +604,8 @@ impl OwnerApprovals {
         let Some(broker) = broker else {
             return Answer::Declined(COULD_NOT_REACH.to_string());
         };
+        // Time on this card is the owner's, not the turn's.
+        let _waiting = crate::tools::OwnerWaitClock::begin_waiting();
         let card = self.next_card.fetch_add(1, Ordering::Relaxed);
         let (abandon_tx, abandon_rx) = oneshot::channel::<()>();
         self.pending

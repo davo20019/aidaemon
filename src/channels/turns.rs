@@ -25,8 +25,11 @@ use crate::tasks::{QueueOutcome, QueuedMessage};
 use crate::traits::MessageAttachment;
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
-/// Longest a single turn may run, whatever the heartbeat says.
+/// Longest a single turn may work, whatever the heartbeat says. Time waiting
+/// for the owner to answer a card does not count.
 const TURN_WALL_CLOCK: Duration = Duration::from_secs(20 * 60);
+/// How often the turn limit looks at the clock again.
+const TURN_LIMIT_CHECK: Duration = Duration::from_secs(1);
 /// Least time between two ordinary status messages.
 const STATUS_INTERVAL: Duration = Duration::from_secs(3);
 const CANCELLED: &str = "Task cancelled";
@@ -119,6 +122,21 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
     /// have narrowed while it waited.
     async fn before_queued(&self, queued: QueuedMessage) -> QueuedMessage {
         queued
+    }
+}
+
+/// Resolves once the turn has worked for `limit`, not counting the time its
+/// cards waited for the owner.
+async fn turn_limit_reached(limit: Duration, owner_wait: &crate::tools::OwnerWaitClock) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let worked = started.elapsed().saturating_sub(owner_wait.waited());
+        match limit.checked_sub(worked) {
+            Some(left) if !left.is_zero() => {
+                tokio::time::sleep(left.min(TURN_LIMIT_CHECK)).await;
+            }
+            _ => return,
+        }
     }
 }
 
@@ -258,7 +276,7 @@ impl TurnRunner {
         loop {
             // Each turn gets the whole limit; a message queued behind a long
             // turn does not inherit what that turn used.
-            let wall_clock_deadline = tokio::time::Instant::now() + self.wall_clock;
+            let owner_wait = crate::tools::OwnerWaitClock::default();
             let description: String = text.chars().take(80).collect();
             let (task_id, cancel) = registry.register(&session_id, &description).await;
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
@@ -278,16 +296,19 @@ impl TurnRunner {
             }
 
             let result = tokio::select! {
-                result = agent.handle_inbound_message(InboundMessageRequest {
-                    session_id: session_id.clone(),
-                    user_text: text.clone(),
-                    attachments: attachments.clone(),
-                    status_tx: Some(status_tx),
-                    user_role: role,
-                    channel_ctx: channel_ctx.clone(),
-                    heartbeat: Some(heartbeat.clone()),
-                    ingress_timing: timing.clone(),
-                }) => result,
+                result = crate::tools::OwnerWaitClock::within(
+                    Some(owner_wait.clone()),
+                    agent.handle_inbound_message(InboundMessageRequest {
+                        session_id: session_id.clone(),
+                        user_text: text.clone(),
+                        attachments: attachments.clone(),
+                        status_tx: Some(status_tx),
+                        user_role: role,
+                        channel_ctx: channel_ctx.clone(),
+                        heartbeat: Some(heartbeat.clone()),
+                        ingress_timing: timing.clone(),
+                    }),
+                ) => result,
                 _ = cancel.cancelled() => Err(anyhow::anyhow!(CANCELLED)),
                 stale_mins = super::wait_for_stale_heartbeat(heartbeat.clone(), stale_secs, 4), if stale_secs > 0 => {
                     Err(anyhow::anyhow!(
@@ -296,7 +317,7 @@ impl TurnRunner {
                         if stale_mins == 1 { "" } else { "s" }
                     ))
                 },
-                _ = tokio::time::sleep_until(wall_clock_deadline) => {
+                _ = turn_limit_reached(self.wall_clock, &owner_wait) => {
                     let minutes = self.wall_clock.as_secs() / 60;
                     tracing::error!(session_id = %session_id, minutes, "Task hit its hard wall-clock limit");
                     Err(anyhow::anyhow!("Task exceeded maximum wall-clock time ({minutes} minutes). This may indicate a hang."))
@@ -768,6 +789,32 @@ mod tests {
         assert!(said.iter().any(|s| s.contains("first done")), "{said:?}");
         assert!(said.iter().any(|s| s.contains("second done")), "{said:?}");
         assert!(!said.iter().any(|s| s.contains("wall-clock")), "{said:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_waiting_for_the_owner_does_not_use_up_the_turn() {
+        use crate::tools::OwnerWaitClock;
+        let clock = OwnerWaitClock::default();
+        let limit = Duration::from_secs(60);
+        let reached = tokio::spawn({
+            let clock = clock.clone();
+            async move { turn_limit_reached(limit, &clock).await }
+        });
+        OwnerWaitClock::within(Some(clock.clone()), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let waiting = OwnerWaitClock::begin_waiting();
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            assert!(!reached.is_finished(), "a wait on the owner used the limit");
+            drop(waiting);
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            assert!(
+                !reached.is_finished(),
+                "fired before the turn used its limit"
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(reached.is_finished(), "the limit never fired");
+        })
+        .await;
     }
 
     #[test]

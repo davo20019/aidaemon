@@ -2479,18 +2479,22 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
-        let mut join = tokio::spawn(async move {
-            child
-                .handle_message(
-                    &session_for_task,
-                    &task_for_task,
-                    status_tx,
-                    user_role,
-                    channel_ctx,
-                    None,
-                )
-                .await
-        });
+        let owner_wait = crate::tools::OwnerWaitClock::current();
+        let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
+            owner_wait,
+            async move {
+                child
+                    .handle_message(
+                        &session_for_task,
+                        &task_for_task,
+                        status_tx,
+                        user_role,
+                        channel_ctx,
+                        None,
+                    )
+                    .await
+            },
+        ));
         let _abort = AbortOnDrop(join.abort_handle());
         let result = if let Some(attempt) = task_attempt.as_ref() {
             let mut heartbeat = tokio::time::interval(Duration::from_secs(45));

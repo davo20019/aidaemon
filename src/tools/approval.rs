@@ -8,11 +8,13 @@
 //! the human wait state reconstructable instead of keeping it solely in an
 //! in-memory oneshot channel.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -21,6 +23,79 @@ use crate::events::{
     Event, EventStore, EventType, InteractionRequestedData, InteractionResolvedData,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
+
+tokio::task_local! {
+    static TURN_OWNER_WAIT: OwnerWaitClock;
+}
+
+/// How long a turn has spent waiting for its owner to answer a card. Waiting
+/// on a person is not the turn working, so the turn's hang limit leaves it out.
+#[derive(Clone, Default)]
+pub(crate) struct OwnerWaitClock(Arc<Mutex<OwnerWaitState>>);
+
+#[derive(Default)]
+struct OwnerWaitState {
+    /// Cards open now (a turn's child agents can ask at the same time).
+    open: usize,
+    /// When the open cards began; overlapping cards count once.
+    since: Option<Instant>,
+    /// Waits already finished.
+    waited: Duration,
+}
+
+/// Ends one card's wait when dropped, however the wait ends.
+pub(crate) struct OwnerWaiting(OwnerWaitClock);
+
+impl OwnerWaitClock {
+    /// Total time spent waiting so far, including a wait still open.
+    pub(crate) fn waited(&self) -> Duration {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.waited + state.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// The clock of the turn running this task, if any (scheduled work has
+    /// none, and no turn limit to exempt).
+    pub(crate) fn current() -> Option<Self> {
+        TURN_OWNER_WAIT.try_with(Clone::clone).ok()
+    }
+
+    /// Run `future` with `clock` as its turn's clock. Task locals are not
+    /// inherited by spawned tasks, so a child agent's task re-enters it here.
+    pub(crate) async fn within<F: std::future::Future>(
+        clock: Option<Self>,
+        future: F,
+    ) -> F::Output {
+        match clock {
+            Some(clock) => TURN_OWNER_WAIT.scope(clock, future).await,
+            None => future.await,
+        }
+    }
+
+    /// Mark a card as waiting on the owner in the current turn.
+    pub(crate) fn begin_waiting() -> Option<OwnerWaiting> {
+        let clock = Self::current()?;
+        {
+            let mut state = clock.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.open += 1;
+            if state.open == 1 {
+                state.since = Some(Instant::now());
+            }
+        }
+        Some(OwnerWaiting(clock))
+    }
+}
+
+impl Drop for OwnerWaiting {
+    fn drop(&mut self) {
+        let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        state.open = state.open.saturating_sub(1);
+        if state.open == 0 {
+            if let Some(since) = state.since.take() {
+                state.waited += since.elapsed();
+            }
+        }
+    }
+}
 
 /// Named wrapper around the approval channel's transmit half.
 ///
@@ -124,9 +199,18 @@ impl ApprovalBroker {
             return Err(error);
         }
 
+        let mut response_tx = response_tx;
         tokio::spawn(async move {
-            match broker_response_rx.await {
-                Ok(response) => {
+            // A requester that stops waiting (a killed or cancelled turn)
+            // drops the delivered card's receiver with this select, so the
+            // channel expires the card instead of leaving live buttons.
+            let answer = tokio::select! {
+                biased;
+                answer = broker_response_rx => Some(answer),
+                _ = response_tx.closed() => None,
+            };
+            match answer {
+                Some(Ok(response)) => {
                     if let Err(error) = persist_resolution(
                         &event_store,
                         &session_id,
@@ -146,14 +230,15 @@ impl ApprovalBroker {
                         let _ = response_tx.send(response);
                     }
                 }
-                Err(_) => {
-                    if let Err(error) = persist_resolution(
-                        &event_store,
-                        &session_id,
-                        &interaction_id,
-                        "unavailable",
-                    )
-                    .await
+                unanswered => {
+                    let resolution = if unanswered.is_none() {
+                        "abandoned"
+                    } else {
+                        "unavailable"
+                    };
+                    if let Err(error) =
+                        persist_resolution(&event_store, &session_id, &interaction_id, resolution)
+                            .await
                     {
                         warn!(
                             %error,
@@ -325,5 +410,58 @@ mod tests {
             response_rx.await.is_err(),
             "non-durable resolution authorized execution"
         );
+    }
+
+    /// A turn killed while its card is open must close the delivered card,
+    /// so the channel expires it instead of leaving buttons nothing listens to.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_owner_waits_count_once() {
+        let clock = OwnerWaitClock::default();
+        OwnerWaitClock::within(Some(clock.clone()), async {
+            let first = OwnerWaitClock::begin_waiting();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            let second = OwnerWaitClock::begin_waiting();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            drop(first);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            drop(second);
+            tokio::time::advance(Duration::from_secs(10)).await;
+        })
+        .await;
+        assert_eq!(clock.waited(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_requester_that_stops_waiting_closes_the_delivered_card() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.path().display()))
+            .await
+            .unwrap();
+        let store = Arc::new(EventStore::new(pool).await.unwrap());
+        let (tx, mut rx) = mpsc::channel(1);
+        let broker = ApprovalBroker::new(tx).with_event_store(store.clone());
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        broker
+            .send(ApprovalRequest {
+                command: "activate a goal".to_string(),
+                session_id: "session-abandoned".to_string(),
+                risk_level: RiskLevel::High,
+                warnings: Vec::new(),
+                permission_mode: PermissionMode::Cautious,
+                response_tx,
+                kind: ApprovalKind::GoalConfirmation,
+            })
+            .await
+            .unwrap();
+        let mut delivered = rx.recv().await.unwrap();
+        drop(response_rx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            delivered.response_tx.closed(),
+        )
+        .await
+        .expect("the delivered card outlived the requester");
     }
 }

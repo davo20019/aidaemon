@@ -40,6 +40,7 @@ pub mod web_fetch;
 mod web_search;
 
 pub use approval::ApprovalBroker;
+pub(crate) use approval::OwnerWaitClock;
 #[cfg(feature = "browser")]
 pub use browser::BrowserTool;
 #[cfg(feature = "slack")]
