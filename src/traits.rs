@@ -78,8 +78,8 @@ pub use people::{Person, PersonFact};
 pub use provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
-#[allow(unused_imports)]
 pub(crate) use tools::NothingSentError;
+#[allow(unused_imports)]
 pub use tools::{
     default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
     ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
