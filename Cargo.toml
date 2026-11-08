@@ -47,7 +47,7 @@ required-features = ["computer_use-macos"]
 aidaemon-node-protocol = { version = "0.1.0", path = "crates/node-protocol" }
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
-teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
+teloxide = "0.17"
 reqwest = { version = "0.12", features = ["json", "blocking", "gzip", "deflate", "brotli", "stream"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { version = "1", features = ["derive"] }

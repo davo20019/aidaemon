@@ -3,24 +3,20 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
-use teloxide::error_handlers::{ErrorHandler, LoggingErrorHandler};
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
     KeyboardButton, KeyboardMarkup, LinkPreviewOptions, ParseMode, WebAppInfo,
 };
-use teloxide::update_listeners::webhooks;
 use teloxide::RequestError;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, html_escape, markdown_to_telegram_html, markdown_to_telegram_plain_fallback,
@@ -30,20 +26,22 @@ use super::telegram_bootstrap_signing::{
     random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
     terminal_tenant_bot_bootstrap_url,
 };
+use super::turns::{repeat_while_working, Delivered, Turn, TurnEnd, TurnRunner, TurnSurface};
 #[cfg(feature = "discord")]
 use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
 use crate::config::{AppConfig, TelegramWebhookConfig};
-use crate::runtime_ports::{ChannelAgentRuntime, InboundMessageRequest};
-use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
+use crate::runtime_ports::{AgentResponseEnvelope, ChannelAgentRuntime};
+use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{Channel, ChannelCapabilities, StateStore};
+use crate::traits::{ChannelCapabilities, HubChannel, StateStore};
 use crate::types::{
     ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate,
     UserRole,
 };
+use aidaemon_channels::Channel as _;
 
 fn disabled_link_preview() -> LinkPreviewOptions {
     LinkPreviewOptions {
@@ -73,8 +71,6 @@ pub struct TelegramChannel {
     owner_user_ids: Vec<u64>,
     agent: Arc<dyn ChannelAgentRuntime>,
     config_path: PathBuf,
-    /// Pending approvals keyed by a unique callback ID.
-    pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
     /// Shared session map — maps session_id to channel name.
     session_map: SessionMap,
     /// Task registry for tracking background agent work.
@@ -92,9 +88,13 @@ pub struct TelegramChannel {
     channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
-    transports: crate::config::ChannelsConfig,
     /// The Bot API server (a test points it at a mock); `None`: Telegram's.
     api_url: Option<String>,
+    runner: TurnRunner,
+    /// The SDK adapter: receives updates and asks prompts. Replaced with
+    /// the configured one when the bot starts.
+    transport: StdRwLock<Arc<aidaemon_channel_telegram::TelegramChannel>>,
+    prompts: super::prompts::Prompts,
     /// URL for the Telegram Mini App terminal frontend.
     terminal_web_app_url: String,
     /// Terminal-lite session manager.
@@ -239,7 +239,9 @@ impl TelegramChannel {
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
             .collect::<HashSet<_>>();
+        let runner = TurnRunner::new(runtime.clone());
         Self {
+            runner,
             bot_username: StdRwLock::new("telegram".to_string()),
             cached_channel_name: StdRwLock::new("telegram".to_string()),
             session_namespace: StdRwLock::new(None),
@@ -250,7 +252,6 @@ impl TelegramChannel {
             owner_user_ids,
             agent: runtime.agent,
             config_path: runtime.config_path,
-            pending_approvals: Mutex::new(HashMap::new()),
             session_map: runtime.session_map,
             task_registry: runtime.task_registry,
             files_enabled: runtime.files_enabled,
@@ -259,8 +260,11 @@ impl TelegramChannel {
             state: runtime.state,
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs: runtime.watchdog_stale_threshold_secs,
-            transports: runtime.transports,
             api_url: None,
+            transport: StdRwLock::new(Arc::new(aidaemon_channel_telegram::TelegramChannel::new(
+                bot_token.to_string(),
+            ))),
+            prompts: super::prompts::Prompts::default(),
             terminal_web_app_url,
             terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
                 terminal_allowed_prefixes,
@@ -279,7 +283,35 @@ impl TelegramChannel {
             max_file_size_mb: self.max_file_size_mb,
             state: self.state.clone(),
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
-            transports: self.transports,
+        }
+    }
+
+    fn sdk_transport(&self) -> Arc<aidaemon_channel_telegram::TelegramChannel> {
+        self.transport
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The chat a session's prompts go to (the first allowed user's private
+    /// chat when the session names none).
+    fn conversation_for(&self, session_id: &str) -> aidaemon_channels::Conversation {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+        aidaemon_channels::Conversation {
+            id: chat_id.to_string(),
+            kind: if chat_id > 0 {
+                aidaemon_channels::ConversationKind::Direct
+            } else {
+                aidaemon_channels::ConversationKind::Group
+            },
         }
     }
 
@@ -597,117 +629,7 @@ impl TelegramChannel {
             warn!(error = %e, "Failed to register bot commands with Telegram");
         }
 
-        if self.transports.telegram == crate::config::ChannelTransport::Sdk {
-            self.start_sdk(&bot_username).await;
-            return;
-        }
-
-        let handler = dptree::entry()
-            .branch(Update::filter_message().endpoint({
-                let channel = Arc::clone(&self);
-                move |msg: teloxide::types::Message, bot: Bot| {
-                    let channel = Arc::clone(&channel);
-                    async move {
-                        channel.handle_message(msg, bot).await;
-                        respond(())
-                    }
-                }
-            }))
-            .branch(Update::filter_callback_query().endpoint({
-                let channel = Arc::clone(&self);
-                move |q: CallbackQuery, bot: Bot| {
-                    let channel = Arc::clone(&channel);
-                    async move {
-                        channel.handle_callback(q, bot).await;
-                        respond(())
-                    }
-                }
-            }));
-
-        let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
-            .enable_ctrlc_handler()
-            .build();
-
-        if let Some((listen_addr, webhook_opts)) = self.build_webhook_options(&bot_username) {
-            info!(
-                name = %bot_username,
-                listen_addr = %listen_addr,
-                "Starting Telegram webhook listener"
-            );
-            match webhooks::axum_to_router(self.bot.clone(), webhook_opts).await {
-                Ok((listener, stop_flag, router)) => {
-                    match tokio::net::TcpListener::bind(listen_addr).await {
-                        Ok(tcp_listener) => {
-                            tokio::spawn(async move {
-                                if let Err(err) = axum::serve(tcp_listener, router)
-                                    .with_graceful_shutdown(stop_flag)
-                                    .await
-                                {
-                                    warn!(error = %err, "Telegram webhook server stopped with error");
-                                }
-                            });
-                            dispatcher
-                                .dispatch_with_listener(
-                                    listener,
-                                    LoggingErrorHandler::with_custom_text(
-                                        "An error from the Telegram webhook listener",
-                                    ),
-                                )
-                                .await;
-                            return;
-                        }
-                        Err(err) => {
-                            warn!(
-                                name = %bot_username,
-                                listen_addr = %listen_addr,
-                                error = %err,
-                                hint = "for multi-bot webhook mode, use a unique listen_addr per bot",
-                                "Failed to bind Telegram webhook listener, falling back to long polling"
-                            );
-                            let _ = self.bot.delete_webhook().send().await;
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        name = %bot_username,
-                        error = %err,
-                        "Failed to initialize Telegram webhook mode, falling back to long polling"
-                    );
-                    let _ = self.bot.delete_webhook().send().await;
-                }
-            }
-        }
-
-        // Clear any stale webhook before starting long polling. If a webhook
-        // was previously set (e.g., via `/setup lowlatency apply`) but we're
-        // now falling back to polling, Telegram will keep sending updates to
-        // the old webhook URL and getUpdates will return nothing.
-        info!(name = %bot_username, "Clearing any existing webhook before starting long polling");
-        if let Err(err) = self.bot.delete_webhook().send().await {
-            warn!(
-                name = %bot_username,
-                error = %err,
-                "Failed to delete webhook before long polling (updates may not arrive)"
-            );
-        }
-
-        // Long polling. Use an explicit polling listener + a loud error handler
-        // (teloxide's default logs under a target our filter drops, which is how
-        // a wedged getUpdates went silent). A watchdog runs alongside: if
-        // getUpdates keeps failing past the threshold, it returns, which drops
-        // the dispatch future and lets `start_with_retry` reconnect with a fresh
-        // getUpdates connection instead of staying silently dead.
-        let error_count = Arc::new(AtomicU64::new(0));
-        let err_handler = Arc::new(PollingErrorHandler {
-            bot_username: bot_username.clone(),
-            error_count: Arc::clone(&error_count),
-        });
-        let listener = teloxide::update_listeners::polling_default(self.bot.clone()).await;
-        tokio::select! {
-            _ = dispatcher.dispatch_with_listener(listener, err_handler) => {}
-            _ = poll_health_watchdog(error_count, bot_username.clone()) => {}
-        }
+        self.start_sdk(&bot_username).await;
     }
 
     /// The SDK adapter receives updates (webhook or long polling, offsets,
@@ -722,12 +644,7 @@ impl TelegramChannel {
         if let Some(api_url) = &self.api_url {
             transport = transport.api_base(api_url.clone()).poll_timeout_secs(1);
         }
-        if let Some((listen, options)) = self.build_webhook_options(bot_username) {
-            let mut webhook =
-                aidaemon_channel_telegram::WebhookConfig::new(listen, options.url.to_string());
-            webhook.secret = options.secret_token.clone();
-            webhook.max_connections = options.max_connections;
-            webhook.drop_pending_updates = options.drop_pending_updates;
+        if let Some(webhook) = self.build_webhook_options(bot_username) {
             transport = transport.with_webhook(webhook);
         } else {
             // A webhook left from an earlier setup would starve long polling.
@@ -744,6 +661,10 @@ impl TelegramChannel {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let runner = {
             let shutdown = shutdown.clone();
+            let transport = Arc::new(transport);
+            if let Ok(mut slot) = self.transport.write() {
+                *slot = transport.clone();
+            }
             tokio::spawn(async move { transport.run_updates(updates_tx, shutdown).await })
         };
         info!(name = %bot_username, "Telegram updates received by the SDK adapter");
@@ -791,6 +712,10 @@ impl TelegramChannel {
         self.bot = Bot::new(&self.bot_token)
             .set_api_url(reqwest::Url::parse(api_url).expect("a valid URL"));
         self.api_url = Some(api_url.to_string());
+        self.transport = StdRwLock::new(Arc::new(
+            aidaemon_channel_telegram::TelegramChannel::new(self.bot_token.clone())
+                .api_base(api_url.to_string()),
+        ));
         self
     }
 
@@ -810,7 +735,7 @@ impl TelegramChannel {
     fn build_webhook_options(
         &self,
         bot_username: &str,
-    ) -> Option<(std::net::SocketAddr, webhooks::Options)> {
+    ) -> Option<aidaemon_channel_telegram::WebhookConfig> {
         if !self.webhook.enabled {
             return None;
         }
@@ -875,9 +800,8 @@ impl TelegramChannel {
             }
         };
 
-        // Teloxide sends the URL verbatim to Telegram's setWebhook, so we
-        // must include the path in the URL. The `opts.path()` call only sets
-        // the local axum route, NOT the URL registered with Telegram.
+        // The URL goes to setWebhook verbatim and the listener serves its
+        // path, so a configured path is part of the URL.
         let path = self
             .webhook
             .path
@@ -898,13 +822,12 @@ impl TelegramChannel {
         } else {
             public_url
         };
-        let mut opts = webhooks::Options::new(listen_addr, webhook_url);
-        if let Some(path) = path {
-            opts = opts.path(path);
-        }
+        // The adapter generates the secret Telegram echoes back.
+        let mut opts =
+            aidaemon_channel_telegram::WebhookConfig::new(listen_addr, webhook_url.to_string());
         if let Some(max_connections) = self.webhook.max_connections {
             if (1..=100).contains(&max_connections) {
-                opts = opts.max_connections(max_connections);
+                opts.max_connections = Some(max_connections);
             } else {
                 warn!(
                     name = %bot_username,
@@ -913,10 +836,8 @@ impl TelegramChannel {
                 );
             }
         }
-        if self.webhook.drop_pending_updates {
-            opts = opts.drop_pending_updates();
-        }
-        Some((listen_addr, opts))
+        opts.drop_pending_updates = self.webhook.drop_pending_updates;
+        Some(opts)
     }
 
     /// How long a resolved approval card stays visible before it is auto-deleted,
@@ -981,83 +902,21 @@ impl TelegramChannel {
             return;
         }
 
-        // Parse callback data: "approve:{once|session|always|deny}:{id}",
-        // "goal:{confirm|cancel}:{id}", or the structurally distinct
-        // "autopilot:{confirm|edit|cancel}:{id}".
-        let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3
-            || !matches!(parts[0], "approve" | "goal" | "autopilot")
-            || parts[2].is_empty()
-        {
+        let Some((prompt_id, choice_id)) = self.sdk_transport().approval_choice(&data) else {
             let _ = bot
                 .answer_callback_query(q.id)
                 .text("This action is no longer valid. Please run the command again.")
                 .show_alert(true)
                 .await;
             return;
-        }
-
-        let prefix = parts[0];
-        let action = parts[1];
-        let approval_id = parts[2];
-
-        let (response, label) = if matches!(prefix, "goal" | "autopilot") {
-            match action {
-                "confirm" => (
-                    ApprovalResponse::AllowOnce,
-                    if prefix == "autopilot" {
-                        "Autopilot enabled ✅"
-                    } else {
-                        "Goal approved ✅"
-                    }
-                    .to_string(),
-                ),
-                "cancel" | "edit" => (
-                    ApprovalResponse::Deny,
-                    if prefix == "autopilot" && action == "edit" {
-                        "Edit Autopilot permissions"
-                    } else if prefix == "autopilot" {
-                        "Autopilot cancelled"
-                    } else {
-                        "Goal cancelled"
-                    }
-                    .to_string(),
-                ),
-                _ => {
-                    let _ = bot
-                        .answer_callback_query(q.id)
-                        .text("This confirmation action is no longer valid.")
-                        .show_alert(true)
-                        .await;
-                    return;
-                }
-            }
-        } else {
-            let response = match action {
-                "once" => ApprovalResponse::AllowOnce,
-                "session" => ApprovalResponse::AllowSession,
-                "always" => ApprovalResponse::AllowAlways,
-                "deny" => ApprovalResponse::Deny,
-                _ => {
-                    let _ = bot
-                        .answer_callback_query(q.id)
-                        .text("This approval action is no longer valid.")
-                        .show_alert(true)
-                        .await;
-                    return;
-                }
-            };
-            let (icon, label) = approval_render::response_status(&response);
-            (response, format!("{icon} {label}"))
         };
-
-        // Send the response (check pending before updating the message)
-        let mut pending = self.pending_approvals.lock().await;
-        let response_tx = pending.remove(approval_id);
-        drop(pending);
-
-        let Some(response_tx) = response_tx else {
-            warn!(approval_id, "Stale approval callback (no pending request)");
+        let answered = if self.prompts.is_open(&prompt_id).await {
+            self.prompts.answer(&prompt_id, &choice_id).await
+        } else {
+            None
+        };
+        let Some(answered) = answered else {
+            warn!(prompt = %prompt_id, "Stale approval callback (no pending request)");
             let _ = bot
                 .answer_callback_query(q.id.clone())
                 .text("Approval expired. Please run the command again.")
@@ -1080,52 +939,23 @@ impl TelegramChannel {
             }
             return;
         };
-
-        // Acknowledge the callback and update the message
-        let _ = bot.answer_callback_query(q.id).text(&label).await;
-
-        if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
-            let original = m.text().unwrap_or("");
-            let updated = if matches!(prefix, "goal" | "autopilot") {
-                let status = if prefix == "autopilot" && action == "edit" {
-                    "✏️ Autopilot not activated\nSend the accounts, actions, limits, or guardrails you want changed."
-                } else if matches!(response, ApprovalResponse::Deny) {
-                    if prefix == "autopilot" {
-                        "❌ Autopilot cancelled\nNo new autonomy was activated."
-                    } else {
-                        "❌ Goal cancelled\nNothing was activated."
-                    }
-                } else {
-                    if prefix == "autopilot" {
-                        "✅ Autopilot enabled\nActivation is continuing now."
-                    } else {
-                        "✅ Goal approved\nActivation is continuing now."
-                    }
-                };
-                format!("{}\n\n{status}", original.trim_end())
-            } else {
-                approval_render::finalize_approval_message(original, &response)
-            };
-            let _ = bot.edit_message_text(m.chat.id, m.id, updated).await;
-
-            // Auto-dismiss the resolved card after a short delay so an answered
-            // approval doesn't linger and get mistaken for one still awaiting a
-            // response. This runs only after the user has responded, so a
-            // still-pending prompt is never removed out from under them.
-            if !matches!(prefix, "goal" | "autopilot") {
+        let _ = bot.answer_callback_query(q.id).text(&answered.label).await;
+        if let Some((message, text)) = answered.update {
+            let transport = self.sdk_transport();
+            if let Err(e) = transport.edit(&message, &text).await {
+                warn!("Failed to update a Telegram approval message: {}", e);
+            }
+            // Remove an answered approval after a moment, so it isn't
+            // mistaken for one still waiting.
+            if answered.approval {
                 if let Some(delay) = Self::resolved_approval_dismiss_delay() {
-                    let bot = bot.clone();
-                    let chat_id = m.chat.id;
-                    let msg_id = m.id;
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let _ = bot.delete_message(chat_id, msg_id).await;
+                        let _ = transport.delete(&message).await;
                     });
                 }
             }
         }
-
-        let _ = response_tx.send(response);
     }
 
     async fn handle_command(&self, text: &str, msg: &teloxide::types::Message, bot: &Bot) {
@@ -3550,7 +3380,7 @@ impl TelegramChannel {
 
                 // Register with the hub
                 let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
                     .await;
                 info!(channel = %channel_name, "Registered new Telegram bot with hub");
 
@@ -3649,7 +3479,7 @@ impl TelegramChannel {
 
                 // Register with the hub
                 let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
                     .await;
                 info!(channel = %channel_name, "Registered new Discord bot with hub");
 
@@ -3755,7 +3585,7 @@ impl TelegramChannel {
 
                 // Register with the hub
                 let channel_name = hub
-                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
                     .await;
                 info!(channel = %channel_name, "Registered new Slack bot with hub");
 
@@ -4537,20 +4367,6 @@ impl TelegramChannel {
         let session_id = self.session_id(msg.chat.id.0).await;
         let channel_id = crate::session::derive_channel_id_from_session(&session_id);
 
-        // Register this session with the channel hub so outbound messages
-        // (approvals, media, notifications) route back to this Telegram bot.
-        {
-            let channel_name = self.channel_name().await;
-            {
-                let mut map = self.session_map.write().await;
-                map.insert(session_id.clone(), channel_name.clone());
-            }
-            let _ = self
-                .state
-                .save_session_channel(&session_id, &channel_name)
-                .await;
-        }
-
         // Build channel context from Telegram chat type
         let channel_ctx = {
             use teloxide::types::{ChatKind, PublicChatKind};
@@ -4586,653 +4402,206 @@ impl TelegramChannel {
             }
         };
 
-        // Handle cancel/stop commands - these bypass the queue
-        let text_lower = text.to_lowercase();
-        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
-            if user_role != UserRole::Owner {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Only the owner can cancel running work in this session.",
-                    )
-                    .await;
-                return;
-            }
-            let cancelled = self
-                .task_registry
-                .cancel_running_for_session(&session_id)
-                .await;
-            let queued_work_preserved = self.task_registry.queue_len(&session_id).await;
-            let cancelled_goals = self
-                .agent
-                .cancel_active_goals_for_session(&session_id)
-                .await;
-            if cancelled.is_empty() {
-                if cancelled_goals.is_empty() {
-                    let _ = bot
-                        .send_message(msg.chat.id, "No running task to cancel.")
-                        .await;
-                } else if cancelled_goals.len() == 1 {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!("⏹️ Cancelled goal: {}", cancelled_goals[0]),
-                        )
-                        .await;
-                } else {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!(
-                                "⏹️ Cancelled {} goals:\n{}",
-                                cancelled_goals.len(),
-                                cancelled_goals
-                                    .iter()
-                                    .map(|d| format!("- {}", d))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ),
-                        )
-                        .await;
-                }
-            } else {
-                let desc = cancelled
-                    .first()
-                    .map(|(_, d)| d.as_str())
-                    .unwrap_or("unknown");
-                let mut response = format!("⏹️ Cancelled: {}", desc);
-                if queued_work_preserved > 0 {
-                    response.push_str(&format!(
-                        " ({} queued request(s) will continue in order)",
-                        queued_work_preserved
-                    ));
-                }
-                if !cancelled_goals.is_empty() {
-                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
-                }
-                let _ = bot.send_message(msg.chat.id, response).await;
-            }
-            return;
-        }
-
-        // Stable per-message identity for dedup. Telegram's `message_id` is
-        // unique per chat and reused on webhook/poll redeliveries, but a user
-        // re-typing the same text gets a NEW message_id — so this drops genuine
-        // duplicates while letting a deliberate re-ask through.
-        let dedup_key = msg.id.0.to_string();
-
-        // Check if a task is already running - if so, queue this message
-        if self.task_registry.has_running_task(&session_id).await {
-            // Atomic check-and-queue: if the task finished between the
-            // has_running_task() check above and this call, the registry
-            // reports NoRunningTask and we fall through to direct processing
-            // instead of stranding the message in an undrained queue.
-            match self
-                .task_registry
-                .queue_message_if_running(
-                    &session_id,
-                    QueuedMessage::new(
-                        &text,
-                        user_role,
-                        channel_ctx.clone(),
-                        inbound_attachments.clone(),
-                    )
-                    .with_ingress_timing(ingress_timing.clone()),
-                    Some(&dedup_key),
-                )
-                .await
-            {
-                QueueOutcome::Queued(queue_pos) => {
-                    // Only notify the user for the first 3 queued messages to avoid spam
-                    // (long messages fragmented by Telegram Web can produce 10+ fragments).
-                    if queue_pos <= 3 {
-                        let current_task = self
-                            .task_registry
-                            .get_running_task_description(&session_id)
-                            .await
-                            .unwrap_or_else(|| "processing".to_string());
-                        let notice = crate::channels::presentation::queued_message_notice(
-                            &text,
-                            &current_task,
-                            !inbound_attachments.is_empty(),
-                        );
-                        let _ = bot.send_message(msg.chat.id, notice).await;
-                    }
-                    return;
-                }
-                QueueOutcome::Duplicate => {
-                    // Duplicate message detected — silently ignore
-                    debug!(session_id, "Dropped duplicate queued message");
-                    return;
-                }
-                QueueOutcome::NoRunningTask => {
-                    info!(
-                        session_id,
-                        "Task finished during queue attempt — processing message directly"
-                    );
-                    // Fall through to direct processing below.
-                }
-            }
-        }
-
-        // Dedup gate: atomically mark this message as "seen" so concurrent
-        // webhook handlers for the same text don't ALL start direct processing.
-        if !self
-            .task_registry
-            .mark_seen(&session_id, &text, Some(&dedup_key))
-            .await
-        {
-            debug!(
-                session_id,
-                "Dropped duplicate message (direct processing race)"
-            );
-            return;
-        }
-
+        self.runner
+            .register_session(&session_id, &self.channel_name().await)
+            .await;
         info!(session_id, "Received message from user {}", user_id);
 
-        // Create heartbeat for watchdog — agent bumps this on every activity point.
-        let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ));
-
-        // Send typing indicator immediately, then repeat every 3s while agent works.
-        // Telegram's typing indicator expires after ~5s, so 3s keeps it continuous
-        // even if the occasional send_chat_action call fails silently.
-        // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
-        let typing_bot = bot.clone();
-        let typing_chat_id = msg.chat.id;
-        let typing_cancel = tokio_util::sync::CancellationToken::new();
-        let typing_token = typing_cancel.clone();
-        let heartbeat_for_typing = heartbeat.clone();
-        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
-        tokio::spawn(async move {
-            // Hard maximum: stop typing after 30 minutes regardless of heartbeat/cancel.
-            // Prevents infinite typing loops from leaked heartbeat keepers.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
-            loop {
-                let _ = typing_bot
-                    .send_chat_action(typing_chat_id, ChatAction::Typing)
-                    .await;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                        if stale_threshold_secs > 0 {
-                            let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
-                                .unwrap_or_default().as_secs();
-                            if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                break; // Stop typing indicator
-                            }
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            tracing::warn!(chat_id = %typing_chat_id, "Typing indicator reached 30-minute hard limit");
-                            break;
-                        }
-                    }
-                    _ = typing_token.cancelled() => break,
-                }
-            }
-        });
-
-        // Upgrade the channel hub weak reference while `self` is still in scope.
-        // The hub is needed for the live-status surface (Task 4/5).
-        let status_hub = self
+        // The hub backs the live status message. Startup wires it before
+        // any traffic arrives, so its absence only degrades to plain status
+        // messages.
+        let hub = self
             .channel_hub
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()));
-
-        // Status update channel — agent emits updates, we display them rate-limited.
-        let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
-        let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
-
-        // Build the single live-status surface (owner + hub-backed sink) when the hub
-        // is available. The normal core.rs startup path wires the hub before any channel
-        // traffic arrives, so the None branch is purely defensive.
-        let (live_owner, live_sink): (
-            Option<std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>>,
-            Option<std::sync::Arc<crate::channels::live_status::HubSurfaceSink>>,
-        ) = if let Some(hub) = status_hub.clone() {
-            let owner = std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::channels::live_status::LiveStatus::new(),
-            ));
-            let sink = std::sync::Arc::new(crate::channels::live_status::HubSurfaceSink::new(
-                hub,
-                session_id.clone(),
-            ));
-            (Some(owner), Some(sink))
-        } else {
+        if hub.is_none() {
             warn!(
                 session_id = %session_id,
                 "Telegram status surface disabled: ChannelHub is not wired"
             );
-            (None, None)
-        };
-
-        let status_task = match (&live_owner, &live_sink) {
-            (Some(owner), Some(sink)) => tokio::spawn(run_status_consumer(
-                status_rx,
-                owner.clone(),
-                sink.clone(),
-                bot.clone(),
-                msg.chat.id,
-                is_dm,
+        }
+        let live = hub.as_ref().map(|hub| LiveSurface {
+            owner: Arc::new(Mutex::new(crate::channels::live_status::LiveStatus::new())),
+            sink: Arc::new(crate::channels::live_status::HubSurfaceSink::new(
+                hub.clone(),
+                session_id.clone(),
             )),
-            _ => {
-                // Fallback: hub unavailable — legacy consumer keeps basic progress
-                // visible so user requests still work in degraded mode.
-                tokio::spawn(run_legacy_status_consumer(
-                    status_rx,
-                    bot.clone(),
-                    msg.chat.id,
-                    is_dm,
-                ))
-            }
-        };
-
-        // Register this task for tracking and cancellation.
-        let description: String = text.chars().take(80).collect();
-        let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
-        // Associate the typing indicator with this task so cancel_running_for_session
-        // also stops the typing loop (fixes typing persisting after cancel/panic).
-        self.task_registry
-            .set_typing_cancel(task_id, typing_cancel.clone())
-            .await;
-        let registry = Arc::clone(&self.task_registry);
-
-        // Spawn the agent work in a separate task so the dispatcher can continue
-        // processing other updates (especially callback queries for tool approval).
-        let agent = Arc::clone(&self.agent);
-        let chat_id = msg.chat.id;
-        tokio::spawn(async move {
-            // Drop guard: if this task panics, ensure the typing indicator stops.
-            // Without this, a panic in handle_message() would skip the explicit
-            // typing_cancel.cancel() call, leaving the typing loop running.
-            // Uses Arc<Mutex<>> so the guard always tracks the *current* typing token
-            // even when queued messages replace it.
-            let typing_guard_token = Arc::new(std::sync::Mutex::new(typing_cancel.clone()));
-            struct TypingGuard(Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>);
-            impl Drop for TypingGuard {
-                fn drop(&mut self) {
-                    if let Ok(token) = self.0.lock() {
-                        token.cancel();
-                    }
-                }
-            }
-            let _typing_guard = TypingGuard(typing_guard_token.clone());
-
-            let mut current_text = text;
-            let mut current_attachments = inbound_attachments;
-            let mut current_user_role = user_role;
-            let mut current_channel_ctx = channel_ctx;
-            let mut current_task_id = task_id;
-            let mut current_cancel_token = cancel_token;
-            let mut current_status_tx = status_tx;
-            let mut current_typing_cancel = typing_cancel;
-            let mut current_status_task = status_task;
-            let mut current_heartbeat = heartbeat;
-            let mut current_ingress_timing = Some(ingress_timing);
-            // live_owner/live_sink are carried through all queue-drain iterations so
-            // that Task 6 can finalize the surface after the agent reply is ready.
-            let live_owner = live_owner;
-            let live_sink = live_sink;
-            // Hard wall-clock deadline: no single message handling can exceed this,
-            // regardless of heartbeat or LLM watchdog state. This catches hangs in
-            // non-LLM code paths (DB queries, bootstrap phase, etc.) that the
-            // heartbeat-based watchdog cannot detect.
-            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
-
-            loop {
-                if let Some(timing) = current_ingress_timing.as_mut() {
-                    timing.mark_dispatched_now();
-                }
-                let result = tokio::select! {
-                    r = agent.handle_inbound_message(InboundMessageRequest {
-                        session_id: session_id.clone(),
-                        user_text: current_text.clone(),
-                        attachments: current_attachments.clone(),
-                        status_tx: Some(current_status_tx.clone()),
-                        user_role: current_user_role,
-                        channel_ctx: current_channel_ctx.clone(),
-                        heartbeat: Some(current_heartbeat.clone()),
-                        ingress_timing: current_ingress_timing.clone(),
-                    }) => r,
-                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
-                        Err(anyhow::anyhow!(
-                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
-                            stale_mins,
-                            if stale_mins == 1 { "" } else { "s" }
-                        ))
-                    },
-                    _ = tokio::time::sleep_until(task_wall_deadline) => {
-                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
-                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
-                    },
-                };
-                current_typing_cancel.cancel();
-                // Abort the status display task to prevent blocking if a background
-                // CLI agent monitoring task still holds a status_tx clone.
-                current_status_task.abort();
-
-                // Track whether this iteration ended in error (for deferred finalization).
-                let mut task_error: Option<String> = None;
-
-                match result {
-                    Ok(envelope) => {
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "telegram",
-                                    crate::events::ResponseDeliveryState::Queued,
-                                    Vec::new(),
-                                    None,
-                                ),
-                            )
-                            .await;
-                        let reply = crate::channels::prepare_chat_message(&envelope.text);
-                        // NOTE: Task intentionally stays "running" during response
-                        // sending. This prevents a race condition where incoming
-                        // messages see no running task (has_running_task = false),
-                        // skip the queue, and spawn concurrent tasks — silently
-                        // dropping themselves. Finalized below before queue check.
-                        let mut delivery_state =
-                            crate::events::ResponseDeliveryState::PlatformAcknowledged;
-                        let mut platform_message_ids = Vec::new();
-                        let mut delivery_error = None;
-                        if !reply.trim().is_empty() {
-                            let background_handoff = envelope.disposition
-                                == crate::events::AssistantResponseDisposition::BackgroundHandoff;
-                            // Progress edits are not terminal delivery: Telegram
-                            // can acknowledge editMessageText while a connected
-                            // client delays rendering the update. Ordinary final
-                            // answers therefore use a fresh sendMessage, which
-                            // creates a new delivery event for clients. Only the
-                            // explicitly nonterminal background-handoff surface
-                            // remains editable for later progress/completion.
-                            let handled = if background_handoff {
-                                if let (Some(live_owner), Some(live_sink)) =
-                                    (live_owner.as_ref(), live_sink.as_ref())
-                                {
-                                    use crate::channels::live_status::SurfaceSink;
-                                    let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                    live_owner
-                                        .lock()
-                                        .await
-                                        .finalize_text(sink_ref, &reply)
-                                        .await
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                            // A delivered background handoff becomes the
-                            // session's status surface. Registered before reset()
-                            // clears the surface id below.
-                            if handled && background_handoff {
-                                if let (Some(hub), Some(live_owner)) =
-                                    (status_hub.as_ref(), live_owner.as_ref())
-                                {
-                                    if let Some(id) = live_owner.lock().await.surface_message_id() {
-                                        platform_message_ids.push(id.clone());
-                                        hub.register_background_status_surface(&session_id, &id)
-                                            .await;
-                                    }
-                                }
-                            }
-                            if handled {
-                                delivery_state = crate::events::ResponseDeliveryState::Edited;
-                                if platform_message_ids.is_empty() {
-                                    if let Some(live_owner) = live_owner.as_ref() {
-                                        if let Some(id) =
-                                            live_owner.lock().await.surface_message_id()
-                                        {
-                                            platform_message_ids.push(id);
-                                        }
-                                    }
-                                }
-                            }
-                            if !handled {
-                                match send_full_or_expandable_reply(&bot, chat_id, &reply).await {
-                                    Ok(message_ids) => {
-                                        platform_message_ids.extend(message_ids);
-                                        if let (Some(live_owner), Some(live_sink)) =
-                                            (live_owner.as_ref(), live_sink.as_ref())
-                                        {
-                                            use crate::channels::live_status::SurfaceSink;
-                                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                            live_owner.lock().await.clear(sink_ref).await;
-                                        }
-                                        if background_handoff {
-                                            if let (Some(hub), Some(id)) =
-                                                (status_hub.as_ref(), platform_message_ids.last())
-                                            {
-                                                hub.register_background_status_surface(
-                                                    &session_id,
-                                                    id,
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to send Telegram message: {}", e);
-                                        delivery_state =
-                                            crate::events::ResponseDeliveryState::Failed;
-                                        delivery_error = Some("telegram_send_failed".to_string());
-                                    }
-                                }
-                            }
-                        } else if let (Some(live_owner), Some(live_sink)) =
-                            (live_owner.as_ref(), live_sink.as_ref())
-                        {
-                            // Empty reply: resolve any live surface so it doesn't stay
-                            // stuck on "⏳ Running…" forever.
-                            use crate::channels::live_status::SurfaceSink;
-                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                            live_owner.lock().await.clear(sink_ref).await;
-                        }
-                        let _ = agent
-                            .record_response_delivery(
-                                &session_id,
-                                envelope.delivery(
-                                    "telegram",
-                                    delivery_state,
-                                    platform_message_ids,
-                                    delivery_error,
-                                ),
-                            )
-                            .await;
-                        if let Some(live_owner) = live_owner.as_ref() {
-                            live_owner.lock().await.reset();
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        let is_stale_watchdog =
-                            error_msg.starts_with("Task auto-cancelled due to inactivity");
-                        // Cancellation is a terminal transition, but it must
-                        // still pass through finalize_and_drain below. Returning
-                        // here strands the FIFO and lets a later direct message
-                        // leapfrog queued work.
-                        if error_msg == "Task cancelled" {
-                            task_error = Some(error_msg);
-                            info!("Task #{} cancelled", current_task_id);
-                        } else {
-                            // Other errors: defer fail() so the task stays "running"
-                            // while we send the error message (same race-prevention
-                            // logic as the Ok path).
-                            task_error = Some(error_msg.clone());
-                            if is_stale_watchdog {
-                                info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
-                                let _ =
-                                    bot.send_message(chat_id, format!("⚠️ {}", error_msg)).await;
-                            } else {
-                                warn!("Agent error: {}", e);
-                            }
-                            if !is_stale_watchdog {
-                                // Terminal failures use a fresh platform message
-                                // for the same reason as successful final answers:
-                                // a progress-message edit is not a client-visible
-                                // delivery receipt.
-                                let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
-                            }
-                            if let (Some(live_owner), Some(live_sink)) =
-                                (live_owner.as_ref(), live_sink.as_ref())
-                            {
-                                use crate::channels::live_status::SurfaceSink;
-                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                                live_owner.lock().await.clear(sink_ref).await;
-                            }
-                            if let Some(live_owner) = live_owner.as_ref() {
-                                live_owner.lock().await.reset();
-                            }
-                        }
-                    }
-                }
-
-                if let Some(error) = task_error.as_ref() {
-                    let status = if error == "Task cancelled" {
-                        crate::events::TaskStatus::Cancelled
-                    } else {
-                        crate::events::TaskStatus::Failed
-                    };
-                    if let Err(terminalize_error) = agent
-                        .terminalize_supervised_task(&session_id, status, error.clone())
-                        .await
-                    {
-                        warn!(%terminalize_error, "Failed to persist supervised task termination");
-                    }
-                }
-
-                // Finalize the current task AFTER sending the response/error,
-                // and drain the queue in the SAME critical section: a message
-                // arriving concurrently is then either drained here or sees
-                // NoRunningTask and processes directly — never stranded in a
-                // queue nothing will drain.
-                if let Some(queued) = registry
-                    .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
-                    .await
-                {
-                    // Small delay to ensure previous message is fully committed to DB
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    info!(
-                        session_id,
-                        "Processing queued message: {}",
-                        queued.text.chars().take(50).collect::<String>()
-                    );
-                    let _ = bot
-                        .send_message(
-                            chat_id,
-                            format!(
-                                "▶️ Processing queued: \"{}\"",
-                                queued.text.chars().take(50).collect::<String>()
-                            ),
-                        )
-                        .await;
-
-                    // Set up for next iteration
-                    current_text = queued.text;
-                    current_user_role = queued.user_role;
-                    current_channel_ctx = queued.channel_ctx;
-                    current_attachments = queued.attachments;
-                    current_ingress_timing = queued.ingress_timing;
-                    let desc: String = current_text.chars().take(80).collect();
-                    let (new_task_id, new_cancel_token) =
-                        registry.register(&session_id, &desc).await;
-                    current_task_id = new_task_id;
-                    current_cancel_token = new_cancel_token;
-
-                    // Create new status channel for the queued turn.
-                    let (new_status_tx, new_status_rx) =
-                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
-                    current_status_tx = new_status_tx;
-
-                    // Reset the live surface and spawn a fresh consumer for the
-                    // queued turn, reusing the same owner/sink (Task 6 will finalize).
-                    current_status_task = match (&live_owner, &live_sink) {
-                        (Some(owner), Some(sink)) => {
-                            owner.lock().await.reset();
-                            tokio::spawn(run_status_consumer(
-                                new_status_rx,
-                                owner.clone(),
-                                sink.clone(),
-                                bot.clone(),
-                                chat_id,
-                                is_dm,
-                            ))
-                        }
-                        _ => {
-                            // Legacy fallback: hub unavailable — shared legacy consumer
-                            // so queued turns still show progress in degraded mode.
-                            tokio::spawn(run_legacy_status_consumer(
-                                new_status_rx,
-                                bot.clone(),
-                                chat_id,
-                                is_dm,
-                            ))
-                        }
-                    };
-
-                    // Fresh heartbeat for queued message
-                    let new_heartbeat = Arc::new(AtomicU64::new(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ));
-                    current_heartbeat = new_heartbeat.clone();
-
-                    // New typing indicator with watchdog
-                    let typing_bot = bot.clone();
-                    let new_typing_cancel = tokio_util::sync::CancellationToken::new();
-                    current_typing_cancel = new_typing_cancel.clone();
-                    // Associate typing token with the new queued task for cancel support
-                    registry
-                        .set_typing_cancel(current_task_id, new_typing_cancel.clone())
-                        .await;
-                    // Update the drop guard to track the new typing token
-                    if let Ok(mut guard_token) = typing_guard_token.lock() {
-                        *guard_token = new_typing_cancel.clone();
-                    }
-                    let heartbeat_for_queued = new_heartbeat;
-                    tokio::spawn(async move {
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
-                        loop {
-                            let _ = typing_bot
-                                .send_chat_action(chat_id, ChatAction::Typing)
-                                .await;
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                                    if stale_threshold_secs > 0 {
-                                        let last_hb = heartbeat_for_queued.load(Ordering::Relaxed);
-                                        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default().as_secs();
-                                        if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                            break;
-                                        }
-                                    }
-                                    if tokio::time::Instant::now() >= deadline {
-                                        tracing::warn!(chat_id = %chat_id, "Queued typing indicator reached 30-minute hard limit");
-                                        break;
-                                    }
-                                }
-                                _ = new_typing_cancel.cancelled() => break,
-                            }
-                        }
-                    });
-                } else {
-                    // No more queued messages, exit loop
-                    break;
-                }
-            }
         });
+        let surface = TelegramSurface {
+            bot,
+            chat_id: msg.chat.id,
+            session_id: session_id.clone(),
+            hub,
+            live,
+        };
+        self.runner
+            .submit(
+                Arc::new(surface),
+                Turn {
+                    session_id,
+                    text,
+                    attachments: inbound_attachments,
+                    user_role,
+                    channel_ctx,
+                    // `message_id` is unique per chat and reused on
+                    // redeliveries; the same text typed again gets a new one.
+                    dedup_key: Some(msg.id.0.to_string()),
+                    ingress_timing: Some(ingress_timing),
+                },
+            )
+            .await;
+    }
+}
+
+/// The live status message of one chat.
+struct LiveSurface {
+    owner: Arc<Mutex<crate::channels::live_status::LiveStatus>>,
+    sink: Arc<crate::channels::live_status::HubSurfaceSink>,
+}
+
+impl LiveSurface {
+    /// Resolve the status message so it doesn't stay on "⏳ Running…".
+    async fn clear(&self) {
+        use crate::channels::live_status::SurfaceSink;
+        let sink: &dyn SurfaceSink = self.sink.as_ref();
+        self.owner.lock().await.clear(sink).await;
+    }
+}
+
+/// One Telegram chat, as the turn runner shows it.
+struct TelegramSurface {
+    bot: Bot,
+    chat_id: ChatId,
+    session_id: String,
+    hub: Option<Arc<ChannelHub>>,
+    live: Option<LiveSurface>,
+}
+
+#[async_trait]
+impl TurnSurface for TelegramSurface {
+    fn platform(&self) -> &'static str {
+        "telegram"
+    }
+
+    async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+        send_markdown_chunks_or_fallback_result(&self.bot, self.chat_id, text).await
+    }
+
+    /// Telegram's typing indicator lasts about five seconds.
+    fn show_working(
+        &self,
+        stop: tokio_util::sync::CancellationToken,
+        heartbeat: Arc<AtomicU64>,
+        stale_secs: u64,
+    ) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        repeat_while_working(
+            Duration::from_secs(3),
+            stop,
+            heartbeat,
+            stale_secs,
+            move || {
+                let bot = bot.clone();
+                async move {
+                    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                }
+            },
+        );
+    }
+
+    fn show_status(
+        &self,
+        updates: mpsc::Receiver<StatusUpdate>,
+        private: bool,
+    ) -> Result<tokio::task::JoinHandle<()>, mpsc::Receiver<StatusUpdate>> {
+        Ok(match &self.live {
+            Some(live) => {
+                let owner = live.owner.clone();
+                let sink = live.sink.clone();
+                let bot = self.bot.clone();
+                let chat_id = self.chat_id;
+                tokio::spawn(async move {
+                    owner.lock().await.reset();
+                    run_status_consumer(updates, owner, sink, bot, chat_id, private).await;
+                })
+            }
+            None => tokio::spawn(run_legacy_status_consumer(
+                updates,
+                self.bot.clone(),
+                self.chat_id,
+                private,
+            )),
+        })
+    }
+
+    async fn deliver(&self, envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
+        let background_handoff =
+            envelope.disposition == crate::events::AssistantResponseDisposition::BackgroundHandoff;
+        let mut message_ids = Vec::new();
+        // A progress edit is not a delivery: Telegram can acknowledge
+        // editMessageText while a client delays showing it. Final answers
+        // are therefore new messages; only a background handoff, which is
+        // not final, becomes the editable status message.
+        if background_handoff {
+            if let Some(live) = &self.live {
+                use crate::channels::live_status::SurfaceSink;
+                let sink: &dyn SurfaceSink = live.sink.as_ref();
+                let mut owner = live.owner.lock().await;
+                if owner.finalize_text(sink, reply).await {
+                    if let Some(id) = owner.surface_message_id() {
+                        if let Some(hub) = &self.hub {
+                            hub.register_background_status_surface(&self.session_id, &id)
+                                .await;
+                        }
+                        message_ids.push(id);
+                    }
+                    return Delivered {
+                        state: crate::events::ResponseDeliveryState::Edited,
+                        message_ids,
+                        error: None,
+                    };
+                }
+            }
+        }
+        match send_full_or_expandable_reply(&self.bot, self.chat_id, reply).await {
+            Ok(ids) => {
+                message_ids.extend(ids);
+                if let Some(live) = &self.live {
+                    live.clear().await;
+                }
+                if background_handoff {
+                    if let (Some(hub), Some(id)) = (&self.hub, message_ids.last()) {
+                        hub.register_background_status_surface(&self.session_id, id)
+                            .await;
+                    }
+                }
+                Delivered {
+                    state: crate::events::ResponseDeliveryState::PlatformAcknowledged,
+                    message_ids,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to send Telegram message: {}", e);
+                Delivered {
+                    state: crate::events::ResponseDeliveryState::Failed,
+                    message_ids,
+                    error: Some("telegram_send_failed".to_string()),
+                }
+            }
+        }
+    }
+
+    async fn turn_ended(&self, ended: TurnEnd) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        if ended != TurnEnd::Delivered {
+            live.clear().await;
+        }
+        live.owner.lock().await.reset();
     }
 }
 
@@ -5279,7 +4648,7 @@ fn fallback_session_namespace_from_token(bot_token: &str) -> String {
 }
 
 #[async_trait]
-impl Channel for TelegramChannel {
+impl HubChannel for TelegramChannel {
     fn name(&self) -> String {
         self.cached_channel_name
             .read()
@@ -5468,88 +4837,20 @@ impl Channel for TelegramChannel {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-
-        info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
-
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let short_id = &approval_id[..8];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        // Store the response sender
-        {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.insert(approval_id.clone(), response_tx);
-            info!(approval_id = %short_id, pending_count = pending.len(), "Stored pending approval");
-        }
-
-        // Determine which buttons to show based on permission_mode and risk_level
-        // - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
-        // - Cautious mode: All get [Once, Session, Deny]
-        // - YOLO mode: All get [Once, Always, Deny]
-        let use_session_button =
-            approval_render::approval_use_session_button(permission_mode, risk_level);
-
-        let keyboard = approval_render::build_approval_keyboard(
-            &approval_id,
-            use_session_button,
-            one_time_only,
-        );
-
-        let text = approval_render::build_approval_message_text(
-            command,
-            risk_level,
-            warnings,
-            use_session_button,
-            one_time_only,
-        );
-
-        match self
-            .bot
-            .send_message(ChatId(chat_id), &text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard)
+        info!(session_id, command, risk = %risk_level, mode = %permission_mode, "Approval requested");
+        let transport = self.sdk_transport();
+        self.prompts
+            .approval(
+                transport.as_ref(),
+                &self.conversation_for(session_id),
+                command,
+                risk_level,
+                warnings,
+                permission_mode,
+                one_time_only,
+            )
             .await
-        {
-            Ok(_) => {
-                info!(approval_id = %short_id, "Approval message sent to Telegram");
-            }
-            Err(e) => {
-                warn!("Failed to send approval request: {}", e);
-                // Remove pending approval since we couldn't ask
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Telegram approval request could not be delivered: {e}"
-                ));
-            }
-        }
-
-        // Wait for response with 5-minute timeout to prevent memory leak
-        info!(approval_id = %short_id, "Waiting for user approval response...");
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                warn!(approval_id = %short_id, "Approval channel closed");
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram approval response channel closed"))
-            }
-            Err(_) => {
-                warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram approval request timed out"))
-            }
-        }
+            .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
     }
 
     async fn request_goal_confirmation(
@@ -5559,77 +4860,17 @@ impl Channel for TelegramChannel {
         details: &[String],
         style: crate::types::GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
-
-        let approval_id = uuid::Uuid::new_v4().to_string();
-        let short_id = &approval_id[..8];
-
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-
-        {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.insert(approval_id.clone(), response_tx);
-        }
-
-        let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id, style);
-        let pages =
-            approval_render::build_goal_confirmation_pages(goal_description, details, style);
-        let page_count = pages.len();
-
-        for (index, text) in pages.iter().enumerate() {
-            let request = self.bot.send_message(ChatId(chat_id), text);
-            let result = if index + 1 == page_count {
-                request.reply_markup(keyboard.clone()).await
-            } else {
-                request.await
-            };
-            if let Err(error) = result {
-                warn!(
-                    page = index + 1,
-                    page_count, "Failed to send goal confirmation: {}", error
-                );
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                return Err(anyhow::anyhow!(
-                    "Telegram goal confirmation page {}/{} could not be delivered: {error}",
-                    index + 1,
-                    page_count
-                ));
-            }
-        }
-        info!(approval_id = %short_id, page_count, "Goal confirmation message sent");
-
-        // Wait with 30-minute timeout (generous window to avoid race conditions
-        // when users confirm near the timeout boundary).
-        match tokio::time::timeout(Duration::from_secs(1800), response_rx).await {
-            Ok(Ok(response)) => Ok(matches!(
-                response,
-                ApprovalResponse::AllowOnce
-                    | ApprovalResponse::AllowSession
-                    | ApprovalResponse::AllowAlways
-            )),
-            Ok(Err(_)) => {
-                warn!(approval_id = %short_id, "Goal confirmation channel closed");
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Err(anyhow::anyhow!(
-                    "Telegram goal confirmation response channel closed"
-                ))
-            }
-            Err(_) => {
-                warn!(approval_id = %short_id, "Goal confirmation timed out after 30 minutes");
-                let mut pending = self.pending_approvals.lock().await;
-                pending.remove(&approval_id);
-                Err(anyhow::anyhow!("Telegram goal confirmation timed out"))
-            }
-        }
+        let transport = self.sdk_transport();
+        self.prompts
+            .goal(
+                transport.as_ref(),
+                &self.conversation_for(session_id),
+                goal_description,
+                details,
+                style,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Telegram goal confirmation failed: {e}"))
     }
 }
 
@@ -6124,86 +5365,6 @@ async fn run_legacy_status_consumer(
     }
 }
 
-/// Tracks whether Telegram long-polling has been failing continuously long
-/// enough to be considered "wedged" — e.g. a persistent getUpdates 409 after a
-/// restart that teloxide's internal retry never recovers from. Pure and
-/// testable: the caller supplies the current cumulative error count and `now`.
-#[derive(Default)]
-struct PollHealth {
-    streak_started_at: Option<Instant>,
-    last_count: u64,
-}
-
-impl PollHealth {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns true when getUpdates has been erroring continuously for at least
-    /// `threshold`. A tick with no new errors clears the streak (teloxide
-    /// recovered on its own).
-    fn observe(&mut self, current_count: u64, now: Instant, threshold: Duration) -> bool {
-        if current_count > self.last_count {
-            let started = *self.streak_started_at.get_or_insert(now);
-            self.last_count = current_count;
-            now.saturating_duration_since(started) >= threshold
-        } else {
-            self.streak_started_at = None;
-            self.last_count = current_count;
-            false
-        }
-    }
-}
-
-/// Error handler for the Telegram polling listener. teloxide's default handler
-/// logs under the `teloxide` target, which our tracing filter drops — that's how
-/// a wedged getUpdates went completely silent. This logs loudly under our own
-/// target and counts errors so the watchdog can force a reconnect.
-struct PollingErrorHandler {
-    bot_username: String,
-    error_count: Arc<AtomicU64>,
-}
-
-impl<E: std::fmt::Debug> ErrorHandler<E> for PollingErrorHandler {
-    fn handle_error(self: Arc<Self>, error: E) -> BoxFuture<'static, ()> {
-        let n = self.error_count.fetch_add(1, Ordering::Relaxed) + 1;
-        // Loud on the first error, then periodically, so a sustained wedge is
-        // visible without flooding the log on every retry.
-        if n == 1 || n.is_multiple_of(10) {
-            warn!(
-                name = %self.bot_username,
-                consecutive_errors = n,
-                error = ?error,
-                "Telegram getUpdates polling error"
-            );
-        }
-        Box::pin(async {})
-    }
-}
-
-/// Watchdog that returns once Telegram polling has been failing continuously
-/// past the wedge threshold, so the caller (`start_with_retry`) can restart the
-/// dispatcher with a fresh getUpdates connection. A healthy or merely quiet bot
-/// keeps it parked indefinitely (it only trips on *sustained* errors).
-async fn poll_health_watchdog(error_count: Arc<AtomicU64>, bot_username: String) {
-    const TICK: Duration = Duration::from_secs(30);
-    const WEDGE_THRESHOLD: Duration = Duration::from_secs(120);
-    let mut health = PollHealth::new();
-    loop {
-        tokio::time::sleep(TICK).await;
-        let count = error_count.load(Ordering::Relaxed);
-        if health.observe(count, Instant::now(), WEDGE_THRESHOLD) {
-            warn!(
-                name = %bot_username,
-                total_errors = count,
-                threshold_secs = WEDGE_THRESHOLD.as_secs(),
-                "Telegram long-polling wedged (getUpdates failing continuously); restarting dispatcher to re-establish the connection"
-            );
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "telegram_sdk_tests.rs"]
 mod sdk_tests;
@@ -6245,32 +5406,6 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("invalid proof"));
         assert!(!retryable);
-    }
-
-    #[test]
-    fn poll_health_flags_wedge_after_sustained_errors() {
-        let mut h = PollHealth::new();
-        let t0 = Instant::now();
-        let threshold = Duration::from_secs(120);
-        // Errors begin.
-        assert!(!h.observe(1, t0, threshold));
-        // Still erroring, but within the threshold — give teloxide time to recover.
-        assert!(!h.observe(3, t0 + Duration::from_secs(60), threshold));
-        // Errors sustained past the threshold — wedged, force a restart.
-        assert!(h.observe(5, t0 + Duration::from_secs(121), threshold));
-    }
-
-    #[test]
-    fn poll_health_clears_streak_when_errors_stop() {
-        let mut h = PollHealth::new();
-        let t0 = Instant::now();
-        let threshold = Duration::from_secs(120);
-        assert!(!h.observe(1, t0, threshold));
-        // A tick with no new errors means teloxide recovered: clear the streak.
-        assert!(!h.observe(1, t0 + Duration::from_secs(60), threshold));
-        // A later error starts a fresh streak, so it is not immediately a wedge
-        // even though wall-clock is now past t0 + threshold.
-        assert!(!h.observe(2, t0 + Duration::from_secs(130), threshold));
     }
 
     #[test]

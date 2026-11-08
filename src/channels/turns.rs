@@ -72,6 +72,16 @@ impl Delivered {
     }
 }
 
+/// How a turn ended, for [`TurnSurface::turn_ended`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    Delivered,
+    /// The agent had nothing to say.
+    Empty,
+    Failed,
+    Cancelled,
+}
+
 /// Where one conversation's turns are shown.
 #[async_trait]
 pub(crate) trait TurnSurface: Send + Sync + 'static {
@@ -101,8 +111,9 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
         Delivered::from_send(self.say(reply).await, self.platform())
     }
 
-    /// A turn ended in an error, after its message was shown.
-    async fn turn_failed(&self) {}
+    /// A turn is over: its reply was delivered, or it had none, or it
+    /// failed or was cancelled (after any error message was shown).
+    async fn turn_ended(&self, _ended: TurnEnd) {}
 
     /// Re-check a queued message just before it runs; its authority may
     /// have narrowed while it waited.
@@ -304,7 +315,8 @@ impl TurnRunner {
                         )
                         .await;
                     let reply = super::prepare_chat_message(&envelope.text);
-                    let delivered = if reply.trim().is_empty() {
+                    let empty = reply.trim().is_empty();
+                    let delivered = if empty {
                         Delivered {
                             state: ResponseDeliveryState::PlatformAcknowledged,
                             message_ids: Vec::new(),
@@ -324,12 +336,20 @@ impl TurnRunner {
                             ),
                         )
                         .await;
+                    surface
+                        .turn_ended(if empty {
+                            TurnEnd::Empty
+                        } else {
+                            TurnEnd::Delivered
+                        })
+                        .await;
                     None
                 }
                 Err(error) => {
                     let message = error.to_string();
                     if message == CANCELLED {
                         info!("Task #{} cancelled", task_id);
+                        surface.turn_ended(TurnEnd::Cancelled).await;
                     } else {
                         if message.starts_with(INACTIVITY_PREFIX) {
                             info!("Task #{} auto-cancelled by stale watchdog", task_id);
@@ -338,7 +358,7 @@ impl TurnRunner {
                             warn!("Agent error: {}", error);
                             let _ = surface.say(&format!("Error: {message}")).await;
                         }
-                        surface.turn_failed().await;
+                        surface.turn_ended(TurnEnd::Failed).await;
                     }
                     Some(message)
                 }

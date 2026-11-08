@@ -3,9 +3,6 @@
 //! Pure helpers that build inline keyboards and message text for command-approval
 //! and scheduled-goal-confirmation prompts.
 
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
-
-use super::formatting::html_escape;
 use super::formatting::split_message;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle};
@@ -135,70 +132,6 @@ fn truncate_command(command: &str) -> String {
     }
 }
 
-/// Build the inline keyboard for a command-approval prompt.
-pub(super) fn build_approval_keyboard(
-    approval_id: &str,
-    use_session_button: bool,
-    one_time_only: bool,
-) -> InlineKeyboardMarkup {
-    if one_time_only {
-        InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("Allow Once", format!("approve:once:{}", approval_id)),
-            InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
-        ]])
-    } else if use_session_button {
-        InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("Allow Once", format!("approve:once:{}", approval_id)),
-            InlineKeyboardButton::callback(
-                "Allow Session",
-                format!("approve:session:{}", approval_id),
-            ),
-            InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
-        ]])
-    } else {
-        InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("Allow Once", format!("approve:once:{}", approval_id)),
-            InlineKeyboardButton::callback(
-                "Allow Always",
-                format!("approve:always:{}", approval_id),
-            ),
-            InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
-        ]])
-    }
-}
-
-/// Build the HTML body for a Telegram command-approval prompt.
-pub(super) fn build_approval_message_text(
-    command: &str,
-    risk_level: RiskLevel,
-    warnings: &[String],
-    use_session_button: bool,
-    one_time_only: bool,
-) -> String {
-    let display_cmd = truncate_command(command);
-    let escaped_cmd = html_escape(&display_cmd);
-    let (risk_icon, risk_label, risk_subtitle) = risk_header(risk_level);
-
-    let mut text = format!(
-        "{} <b>{}</b>\n{}\n\n<b>Requested action</b>\n{}",
-        risk_icon, risk_label, risk_subtitle, escaped_cmd
-    );
-
-    if !warnings.is_empty() {
-        text.push('\n');
-        for warning in warnings {
-            text.push_str(&format!("\n• {}", html_escape(warning)));
-        }
-    }
-
-    text.push_str(&format!(
-        "\n\n<i>{}</i>",
-        html_escape(allow_button_hint(use_session_button, one_time_only))
-    ));
-
-    text
-}
-
 /// Build the Markdown body for a command-approval prompt.
 pub(super) fn build_approval_message_markdown(
     command: &str,
@@ -228,35 +161,6 @@ pub(super) fn build_approval_message_markdown(
     ));
 
     text
-}
-
-/// Build the inline keyboard for a scheduled-goal-confirmation prompt.
-pub(super) fn build_goal_confirmation_keyboard(
-    approval_id: &str,
-    style: GoalConfirmationStyle,
-) -> InlineKeyboardMarkup {
-    match style {
-        GoalConfirmationStyle::Standard => InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback(
-                "Approve & activate ✅",
-                format!("goal:confirm:{approval_id}"),
-            ),
-            InlineKeyboardButton::callback("Cancel", format!("goal:cancel:{approval_id}")),
-        ]]),
-        GoalConfirmationStyle::Autopilot => InlineKeyboardMarkup::new(vec![
-            vec![InlineKeyboardButton::callback(
-                "Enable Autopilot ✅",
-                format!("autopilot:confirm:{approval_id}"),
-            )],
-            vec![
-                InlineKeyboardButton::callback(
-                    "Edit permissions",
-                    format!("autopilot:edit:{approval_id}"),
-                ),
-                InlineKeyboardButton::callback("Cancel", format!("autopilot:cancel:{approval_id}")),
-            ],
-        ]),
-    }
 }
 
 fn goal_detail_section(detail: &str) -> (&'static str, &str) {
@@ -390,7 +294,7 @@ mod tests {
 
     #[test]
     fn finalize_strips_footer_and_adds_status() {
-        let prompt = build_approval_message_text(
+        let prompt = build_approval_message_markdown(
             "Open website: https://example.com",
             RiskLevel::Medium,
             &[],
@@ -406,21 +310,15 @@ mod tests {
 
     #[test]
     fn finalize_denied_shows_denied_status() {
-        let prompt = build_approval_message_text("rm -rf /", RiskLevel::Critical, &[], true, false);
+        let prompt =
+            build_approval_message_markdown("rm -rf /", RiskLevel::Critical, &[], true, false);
         let final_msg = finalize_approval_message(&prompt, &ApprovalResponse::Deny);
         assert!(final_msg.contains("❌ Denied"));
     }
 
     #[test]
     fn one_time_only_prompt_has_no_persistent_choice() {
-        let keyboard = build_approval_keyboard("approval-1", false, true);
-        let serialized = serde_json::to_string(&keyboard).unwrap();
-        assert!(serialized.contains("Allow Once"));
-        assert!(serialized.contains("Deny"));
-        assert!(!serialized.contains("Allow Always"));
-        assert!(!serialized.contains("Allow Session"));
-
-        let prompt = build_approval_message_text(
+        let prompt = build_approval_message_markdown(
             "Run JavaScript on https://example.com (10 bytes)",
             RiskLevel::High,
             &[],
@@ -472,23 +370,10 @@ mod tests {
         assert!(rendered.contains("🛡️ Rules it must follow\n1. Verify identity.\n2. Never retry"));
         assert!(rendered.contains("⏱️ Ends"));
         assert!(rendered.contains("Nothing starts until you approve this goal."));
-
-        let keyboard =
-            build_goal_confirmation_keyboard("approval-1", GoalConfirmationStyle::Standard);
-        let serialized = serde_json::to_string(&keyboard).unwrap();
-        assert!(serialized.contains("Approve & activate"));
     }
 
     #[test]
     fn autopilot_confirmation_is_structurally_distinct() {
-        let keyboard =
-            build_goal_confirmation_keyboard("approval-1", GoalConfirmationStyle::Autopilot);
-        let serialized = serde_json::to_string(&keyboard).unwrap();
-        assert!(serialized.contains("Enable Autopilot"));
-        assert!(serialized.contains("Edit permissions"));
-        assert!(serialized.contains("autopilot:confirm:approval-1"));
-        assert!(!serialized.contains("goal:confirm"));
-
         let pages = build_goal_confirmation_pages(
             "Maintain the synthetic account",
             &["Autonomy mode: Autopilot".to_string()],

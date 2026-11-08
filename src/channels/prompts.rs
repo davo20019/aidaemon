@@ -43,6 +43,10 @@ pub(crate) struct Prompts {
 pub(crate) struct Answered {
     /// The message to replace, and its new text (without buttons).
     pub update: Option<(MessageRef, String)>,
+    /// A short confirmation of the answer ("✅ Allowed this once").
+    pub label: String,
+    /// It was an approval (not a goal confirmation).
+    pub approval: bool,
 }
 
 impl Prompts {
@@ -61,15 +65,7 @@ impl Prompts {
     ) -> anyhow::Result<ApprovalResponse> {
         let session_button =
             approval_render::approval_use_session_button(permission_mode, risk_level);
-        let mut choices = vec![choice("once", "Allow Once")];
-        if !one_time_only {
-            choices.push(if session_button {
-                choice("session", "Allow Session")
-            } else {
-                choice("always", "Allow Always")
-            });
-        }
-        choices.push(choice("deny", "Deny"));
+        let choices = approval_choices(session_button, one_time_only);
         let text = approval_render::build_approval_message_markdown(
             command,
             risk_level,
@@ -99,17 +95,7 @@ impl Prompts {
         style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
         let pages = approval_render::build_goal_confirmation_pages(description, details, style);
-        let mut choices = vec![choice(
-            "confirm",
-            match style {
-                GoalConfirmationStyle::Standard => "Approve & activate",
-                GoalConfirmationStyle::Autopilot => "Enable Autopilot",
-            },
-        )];
-        if matches!(style, GoalConfirmationStyle::Autopilot) {
-            choices.push(choice("edit", "Edit permissions"));
-        }
-        choices.push(choice("cancel", "Cancel"));
+        let choices = goal_choices(style);
         let response = self
             .ask(
                 channel,
@@ -205,8 +191,50 @@ impl Prompts {
             };
             (message, outcome)
         });
-        Some(Answered { update })
+        let label = match kind {
+            Kind::Approval => {
+                let (icon, status) = approval_render::response_status(&response);
+                format!("{icon} {status}")
+            }
+            Kind::Goal(style) => goal_label(style, choice_id, &response).to_string(),
+        };
+        Some(Answered {
+            update,
+            label,
+            approval: matches!(kind, Kind::Approval),
+        })
     }
+}
+
+/// Allow once, then (unless the grant is one-time only) for the session or
+/// always, then deny.
+fn approval_choices(session_button: bool, one_time_only: bool) -> Vec<ApprovalChoice> {
+    let mut choices = vec![choice("once", "Allow Once")];
+    if !one_time_only {
+        choices.push(if session_button {
+            choice("session", "Allow Session")
+        } else {
+            choice("always", "Allow Always")
+        });
+    }
+    choices.push(choice("deny", "Deny"));
+    choices
+}
+
+/// Confirm, (for Autopilot) edit, cancel.
+fn goal_choices(style: GoalConfirmationStyle) -> Vec<ApprovalChoice> {
+    let mut choices = vec![choice(
+        "confirm",
+        match style {
+            GoalConfirmationStyle::Standard => "Approve & activate",
+            GoalConfirmationStyle::Autopilot => "Enable Autopilot",
+        },
+    )];
+    if matches!(style, GoalConfirmationStyle::Autopilot) {
+        choices.push(choice("edit", "Edit permissions"));
+    }
+    choices.push(choice("cancel", "Cancel"));
+    choices
 }
 
 fn choice(id: &str, label: &str) -> ApprovalChoice {
@@ -226,6 +254,21 @@ fn response_for(kind: Kind, choice_id: &str) -> Option<ApprovalResponse> {
         (Kind::Goal(_), "cancel" | "edit") => ApprovalResponse::Deny,
         _ => return None,
     })
+}
+
+fn goal_label(
+    style: GoalConfirmationStyle,
+    choice_id: &str,
+    response: &ApprovalResponse,
+) -> &'static str {
+    let autopilot = matches!(style, GoalConfirmationStyle::Autopilot);
+    match (autopilot, choice_id, response) {
+        (true, "edit", _) => "Edit Autopilot permissions",
+        (true, _, ApprovalResponse::Deny) => "Autopilot cancelled",
+        (true, _, _) => "Autopilot enabled ✅",
+        (false, _, ApprovalResponse::Deny) => "Goal cancelled",
+        (false, _, _) => "Goal approved ✅",
+    }
 }
 
 fn goal_outcome(
@@ -250,6 +293,36 @@ fn goal_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(choices: Vec<ApprovalChoice>) -> Vec<String> {
+        choices.into_iter().map(|c| c.label).collect()
+    }
+
+    #[test]
+    fn approval_buttons_follow_the_grant_offered() {
+        assert_eq!(
+            labels(approval_choices(false, false)),
+            ["Allow Once", "Allow Always", "Deny"]
+        );
+        assert_eq!(
+            labels(approval_choices(true, false)),
+            ["Allow Once", "Allow Session", "Deny"]
+        );
+        // A one-time grant offers nothing that persists.
+        assert_eq!(labels(approval_choices(true, true)), ["Allow Once", "Deny"]);
+    }
+
+    #[test]
+    fn autopilot_confirmation_can_be_sent_back_for_edits() {
+        assert_eq!(
+            labels(goal_choices(GoalConfirmationStyle::Standard)),
+            ["Approve & activate", "Cancel"]
+        );
+        assert_eq!(
+            labels(goal_choices(GoalConfirmationStyle::Autopilot)),
+            ["Enable Autopilot", "Edit permissions", "Cancel"]
+        );
+    }
 
     #[test]
     fn choices_belong_to_their_kind() {

@@ -108,6 +108,13 @@ impl TelegramChannel {
 
     /// Split messages at `len` UTF-16 units (1 to
     /// [`TELEGRAM_MAX_MESSAGE_LEN`]).
+    /// The `(prompt_id, choice_id)` a button made by `ask` carries in its
+    /// `callback_data`, for a host that reads raw updates
+    /// ([`TelegramChannel::run_updates`]). `None` for any other data.
+    pub fn approval_choice(&self, callback_data: &str) -> Option<(String, String)> {
+        self.state.codec.decode(callback_data)
+    }
+
     pub fn with_max_message_len(mut self, len: usize) -> Self {
         self.max_message_len = len.clamp(1, TELEGRAM_MAX_MESSAGE_LEN);
         self
