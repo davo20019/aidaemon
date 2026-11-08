@@ -377,24 +377,19 @@ async fn background_detach_finishes_without_text_match() {
 #[tokio::test]
 async fn background_handoff_with_more_declared_work_lets_the_model_continue() {
     let checklist = r#"{"items":[
-        {"text":"Start the job","status":"in_progress","mutation_effects":["process_state"]},
-        {"text":"Tidy up","status":"pending","mutation_effects":["process_state"]}
-    ]}"#;
-    let settled = r#"{"items":[
-        {"text":"Start the job","status":"completed","mutation_effects":["process_state"]},
-        {"text":"Tidy up","status":"deferred","mutation_effects":["process_state"]}
+        {"text":"Start the job","status":"in_progress"},
+        {"text":"Tidy up","status":"pending"}
     ]}"#;
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("track_requirements", checklist),
         MockProvider::tool_call_response("synthetic_launcher", "{}"),
-        MockProvider::tool_call_response("track_requirements", settled),
         MockProvider::text_response("The job is running and the rest is done."),
     ]);
     let harness = root(provider, vec![Arc::new(launcher(false))]).await;
     let reply = ask(&harness, "finish-inline", "Start the job, then tidy up").await;
 
     assert_eq!(reply, "The job is running and the rest is done.");
-    assert_eq!(harness.provider.call_count().await, 4);
+    assert_eq!(harness.provider.call_count().await, 3);
 }
 
 /// The job as the only open item is a plain handoff: nothing is left to do
