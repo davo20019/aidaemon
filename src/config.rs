@@ -333,8 +333,26 @@ pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
 }
 
+/// Where to export run traces. Nothing is exported unless an endpoint is
+/// set, and prompts and replies only with `capture_content`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TelemetryConfig {
+    /// OTLP/HTTP base URL, for example `https://api.smith.langchain.com/otel`.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Request headers. A value of `keychain` is read from the OS keychain
+    /// under `otlp_header_<name>`.
+    #[serde(default)]
+    pub otlp_headers: HashMap<String, String>,
+    /// Also export prompts, replies and tool arguments, with secrets removed.
+    #[serde(default)]
+    pub capture_content: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]

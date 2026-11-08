@@ -99,8 +99,9 @@ Rules every channel follows:
   inside `call`; that is a hook's job. Return failures as
   `ToolOutput::error`, not panics.
 - **Hook**: implement only the methods you need (`before_model`,
-  `before_tool`, `after_tool`, `on_stop`, `on_stuck`). Base decisions on
-  typed state in `HookContext`, `ToolInfo` and receipts.
+  `before_tool`, `after_tool`, `on_stop`, and the others on the `Hook`
+  trait). Base decisions on typed state in `HookContext`, `ToolInfo` and
+  receipts. Compile hooks in; never load them from a repository or config.
 - **Memory**: implement `MemoryStore` to plug in a database (override
   `search_facts`/`search_episodes` if it ranks natively), `Embedder` for an
   embedding API, or `Scorer` for different ranking. To replace the whole

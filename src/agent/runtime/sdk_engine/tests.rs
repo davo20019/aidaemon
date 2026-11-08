@@ -3302,6 +3302,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            parent_run: None,
         },
         "Send the file as the email asks.",
     )
@@ -3407,6 +3408,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         trusted_roots: Vec::new(),
         declined: Vec::new(),
         shared_declines: None,
+        parent_run: None,
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {

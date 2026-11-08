@@ -11,7 +11,8 @@ use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentInner, Resolution};
-use crate::approval::{EffectClass, EffectKey, InterruptKind, OWNER_DECLINED};
+use crate::approval::{EffectClass, EffectKey, InterruptKind, SharedDeclines, OWNER_DECLINED};
+use crate::authority::Authority;
 use crate::error::CoreError;
 use crate::event::Event;
 use crate::hook::{
@@ -36,6 +37,9 @@ pub(crate) struct Driver<'a> {
     /// Whether this segment's end is the run's end for hooks. A segment
     /// driven by `run_resolving` is not: the caller reports the final one.
     report_run_end: bool,
+    /// The decline set was made for this segment, not given by the caller;
+    /// it does not outlive the segment.
+    own_declines: bool,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -85,12 +89,21 @@ struct Approved {
 impl<'a> Driver<'a> {
     pub(crate) fn new(agent: &'a AgentInner, state: RunState, cancel: CancellationToken) -> Self {
         let base_elapsed_ms = state.elapsed_ms;
+        // Tools that start other runs share this set, so a decline in any of
+        // them binds the rest.
+        let own_declines = state.shared_declines().is_none();
+        let state = if own_declines {
+            state.share_declines(SharedDeclines::new())
+        } else {
+            state
+        };
         Self {
             agent,
             state,
             cancel,
             segment_start: Instant::now(),
             base_elapsed_ms,
+            own_declines,
             report_run_end: true,
         }
     }
@@ -884,6 +897,8 @@ impl<'a> Driver<'a> {
         let ctx = ToolContext::new(self.state.session_id.clone(), call.id.clone())
             .with_run(self.state.run_id, self.state.turn)
             .with_cancel(self.cancel.child_token())
+            .with_declines(self.state.shared_declines().cloned().unwrap_or_default())
+            .with_authority(self.run_authority())
             .with_extensions(self.agent.extensions.clone());
         // A tool's own timeout hint replaces the default, but nothing may
         // outlive the run's remaining wall-clock budget.
@@ -1243,6 +1258,15 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The narrowest authority any installed hook enforces.
+    fn run_authority(&self) -> Option<Authority> {
+        self.agent
+            .hooks
+            .iter()
+            .filter_map(|hook| hook.authority())
+            .reduce(|narrowed, next| narrowed.narrow(&next))
+    }
+
     /// The names of the installed hooks, in order.
     fn hook_chain(&self) -> Vec<String> {
         self.agent
@@ -1519,6 +1543,9 @@ impl<'a> Driver<'a> {
         // The run is over: whatever the batch was doing will not continue,
         // and a recovery must not mistake it for a run a crash cut short.
         self.state.in_flight = None;
+        if self.own_declines {
+            self.state.shared_declines = None;
+        }
         self.checkpoint().await?;
         self.emit(Event::Finished {
             status: status.clone(),

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval::{EffectKey, InterruptKind};
+use crate::authority::Authority;
 use crate::limits::LimitKind;
 use crate::message::{Message, ToolCall};
 use crate::outcome::RunOutcome;
@@ -215,6 +216,10 @@ pub enum HookFailure {
 /// | `edit_transcript` | the transcript stays as it was |
 /// | `on_run_start`, `before_model`, `on_stuck`, `on_run_end` | the run goes on |
 ///
+/// `on_run_start`, `edit_transcript`, `answer_model`, `after_model`,
+/// `on_model_error`, `on_limit` and `on_stuck` are unstable: tests cover them
+/// but no shipped policy depends on them yet, so they may still change.
+///
 /// Timeouts and cancels stop a hook at its next `.await`, so a hook that
 /// blocks a thread is not interrupted: keep blocking work off the executor.
 #[async_trait]
@@ -236,6 +241,12 @@ pub trait Hook: Send + Sync {
     /// How long one call of this hook may take, in place of
     /// [`crate::Limits::hook_timeout`]. The wall-clock budget still applies.
     fn timeout(&self) -> Option<Duration> {
+        None
+    }
+
+    /// The authority this hook enforces, if it enforces one. Passed to
+    /// tools so a tool that starts another run can hold it to the same.
+    fn authority(&self) -> Option<Authority> {
         None
     }
 
@@ -339,7 +350,8 @@ pub trait Hook: Send + Sync {
         StopDecision::Accept
     }
 
-    /// The run ended, with any status. Fires exactly once per run, after the
+    /// The run ended, with any status: fires once per `run` or `resume` that
+    /// returns (a pause returns too), after the
     /// outcome is final and every `on_stop` check has had its say, so it is
     /// the place for after-the-fact work such as writing memory. It cannot
     /// change the outcome. A `run_resolving` call is one run: the

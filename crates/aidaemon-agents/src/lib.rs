@@ -47,9 +47,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{
-    Agent, AgentBuilder, BuildError, FinishOutcome, Hook, HookContext, Limits, Message,
-    ModelRequest, Role, RunOutcome, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError,
-    ToolOutput, ToolResult, ToolSpec,
+    Agent, AgentBuilder, AuthorityHook, BuildError, FinishOutcome, Hook, HookContext, Limits,
+    Message, ModelRequest, Role, RunOutcome, RunState, RunStatus, Tool, ToolAnnotations,
+    ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -393,9 +393,18 @@ impl Tool for AgentTool {
         let input = self.compose_input(task, context, ctx);
         let session = child_session_id(&ctx.session_id, &ctx.call_id);
 
-        let outcome = self
-            .agent
-            .run_with_cancel(&session, &input, ctx.cancel.clone())
+        // The child answers to everything the parent does: its authority
+        // stacks on the child's own, and a decline in one binds the other.
+        let agent = match &ctx.authority {
+            Some(authority) => self.agent.with_hook(AuthorityHook::new(authority.clone())),
+            None => self.agent.clone(),
+        };
+        let mut state = RunState::new(agent.id(), &session, &input).with_parent(ctx.run_id);
+        if let Some(declines) = &ctx.declines {
+            state = state.share_declines(declines.clone());
+        }
+        let outcome = agent
+            .run_from(state, ctx.cancel.clone())
             .await
             .map_err(|e| ToolError(format!("sub-agent `{}` could not run: {e}", self.name)))?;
 

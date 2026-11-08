@@ -563,3 +563,119 @@ async fn finished_child_returns_its_finish_reply() {
         );
     }
 }
+
+// ---------- what a child inherits ----------
+
+fn write_tool(name: &'static str, calls: Arc<std::sync::atomic::AtomicUsize>) -> impl Tool {
+    FnTool::new(
+        spec(name, "Changes something", &[]),
+        ToolAnnotations::default(),
+        move |_: Value| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutput::text("written"))
+            }
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_child_cannot_do_what_its_parent_may_not() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let child = Arc::new(ScriptedProvider::new([
+        tool_calls([call("w1", "write", json!({}))]),
+        text("tried"),
+    ]));
+    let tool = AgentTool::new(
+        child_builder(child)
+            .tool(write_tool("write", calls.clone()))
+            .build()
+            .unwrap(),
+    )
+    .name("research")
+    .description("Research")
+    .read_only();
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "change it")]),
+        text("done"),
+    ]));
+    let agent = Agent::builder("orchestrator")
+        .allow_unguarded()
+        .model("test-model")
+        .provider(parent_provider)
+        .hook(aidaemon_core::AuthorityHook::new(
+            aidaemon_core::Authority::read_only(),
+        ))
+        .tool(tool)
+        .build()
+        .unwrap();
+
+    agent.run("s", "go").await.unwrap();
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_child_names_the_run_that_started_it() {
+    let child_events: Arc<Mutex<Vec<aidaemon_core::Event>>> = Arc::default();
+    let sink = child_events.clone();
+    let child = Arc::new(ScriptedProvider::new([text("found")]));
+    let tool = AgentTool::new(
+        child_builder(child)
+            .event_sink(move |_, e: &aidaemon_core::Event| sink.lock().unwrap().push(e.clone()))
+            .build()
+            .unwrap(),
+    )
+    .name("research")
+    .description("Research");
+    let agent = parent(
+        Arc::new(ScriptedProvider::new([
+            tool_calls([delegate("c1", "look")]),
+            text("done"),
+        ])),
+        tool,
+    );
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    let parent_run = out.state.run_id;
+    assert!(child_events.lock().unwrap().iter().any(|e| matches!(
+        e,
+        aidaemon_core::Event::RunLinked { parent_run: p } if *p == parent_run
+    )));
+}
+
+struct DeclinesFromInside;
+#[async_trait]
+impl Tool for DeclinesFromInside {
+    fn spec(&self) -> ToolSpec {
+        spec("decline", "Records a decline", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
+    }
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> ToolResult {
+        let effect = aidaemon_core::EffectKey::named(aidaemon_core::EffectClass::Call, "x");
+        ctx.declines.as_ref().unwrap().record(&[effect]);
+        Ok(ToolOutput::text("declined"))
+    }
+}
+
+#[tokio::test]
+async fn a_tool_holds_the_runs_live_decline_set() {
+    let agent = Agent::builder("a")
+        .allow_unguarded()
+        .model("test-model")
+        .provider(Arc::new(ScriptedProvider::new([
+            tool_calls([call("c1", "decline", json!({}))]),
+            text("done"),
+        ])))
+        .tool(DeclinesFromInside)
+        .build()
+        .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+
+    assert_eq!(out.state.declined.len(), 1);
+}

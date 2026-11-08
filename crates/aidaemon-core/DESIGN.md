@@ -150,6 +150,15 @@ transcript (`edit_transcript`). Four rules keep those from weakening the loop:
 Every intervention is an `Event`. Grants live in `RunState::limit_grants`, so
 they survive a resume and can be audited. `HARD_TURN_CAP` is never put to a hook.
 
+Hooks are also contained, because a kernel that isolates tools and trusts its
+hooks has only moved the problem. A panic, a timeout or a cancel costs one
+answer and records `HookFailed`; `Hook`'s docs list what each point does with
+no answer. Checks that guard something fail closed, the rest fail open, and a
+broken completion check ends the run unverified, never as a success or a trap.
+A restrictive answer (`Forbid`, `Abort`, `Halt`) beats a permissive one
+regardless of hook order. Stop continuations are capped by a count only new
+successful calls reset, so a hook and a refusing model cannot circle.
+
 What stays fixed: the order of a turn, tool concurrency, validation and the
 decline check before any hook, and output truncation before `after_tool`.
 
@@ -168,8 +177,10 @@ Anthropic's tool guidance).
 **Checkpoint every turn.** With a `RunStore`, state is saved after each turn
 and at every exit, and every event is journaled. After a crash,
 `store.load_state(run_id)` followed by `Agent::run_from` continues from the
-last completed turn. The turn in flight is redone, so a non-idempotent tool
-in it may run twice (see "Idempotent replay" below).
+last completed turn. A batch cut short finishes without repeating what it
+already did: an idempotent call runs again, any other that had started gets an
+`Indeterminate` receipt. A run that ended normally clears its batch, so a
+recovery cannot restart it.
 
 ## Added after the first sketch
 
@@ -316,6 +327,22 @@ see images is the caller's decision; the kernel does not gate it. `Debug` on
 | Approach pivot, self-correction ledger | `on_stuck` |
 | Budget auto-extension | `on_limit` → `Extend` |
 | Decision points, gate telemetry | `EventSink` |
+
+## Choosing an extension point
+
+Hooks are one of four seams, and each exists because the others fit badly:
+
+| To | Use | Because |
+|---|---|---|
+| Decide or veto at a moment of the loop | `Hook` | Typed answers the kernel can fold, audit and contain |
+| Wrap the model call (retries, fallback, quotas) | a `Provider` wrapper | It owns the attempt; a hook only sees either side of it |
+| Watch everything, change nothing | `EventSink` | It cannot alter the run, so it cannot break it |
+| Give the model a capability | `Tool` | The kernel validates, schedules and receipts it |
+
+Onion middleware is left out on purpose: it makes authority a matter of
+position. Hooks are compiled in, never loaded from a repository or config, and
+they are not the security boundary. Tools declare typed effects, and sandboxes
+enforce them.
 
 ## The SDK crates
 

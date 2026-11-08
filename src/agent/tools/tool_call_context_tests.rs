@@ -146,6 +146,7 @@ fn real_authority() -> crate::agent::authority::InheritedAuthority {
         trusted_roots: vec![PROJECT.to_string()],
         declined: Vec::new(),
         shared_declines: None,
+        parent_run: None,
     }
 }
 

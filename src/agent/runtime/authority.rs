@@ -196,6 +196,9 @@ pub(crate) struct InheritedAuthority {
     /// runtime handle, never serialized.
     #[serde(skip)]
     pub shared_declines: Option<aidaemon_core::SharedDeclines>,
+    /// The kernel run that started this child, for tracing the family.
+    #[serde(default)]
+    pub parent_run: Option<aidaemon_core::RunId>,
 }
 
 /// The parent turn's authority the dispatcher handed `spawn_agent`: an
@@ -657,6 +660,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            parent_run: None,
         }
     }
 
@@ -765,6 +769,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            parent_run: None,
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,

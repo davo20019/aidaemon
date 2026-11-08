@@ -133,6 +133,10 @@ impl Hook for AuthorityHook {
         &[Safeguard::Authority]
     }
 
+    fn authority(&self) -> Option<Authority> {
+        Some(self.authority.clone())
+    }
+
     async fn before_tool(
         &self,
         _ctx: &HookContext<'_>,

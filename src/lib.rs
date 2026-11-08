@@ -17,6 +17,7 @@ mod db;
 mod duration_format;
 #[allow(dead_code)]
 mod events;
+mod otel_export;
 pub use events::{
     CompletionProofReference, Event, EventType, TaskCompletionProofData, TaskEndData, ToolCallData,
     UserMessageData,

@@ -2139,6 +2139,7 @@ impl Agent {
             // Inside a chain the child shares the chain's live declines; a
             // root dispatch starts a family of its own.
             shared_declines: inherited.and_then(|inherited| inherited.shared_declines.clone()),
+            parent_run: inherited.and_then(|inherited| inherited.parent_run),
         }
     }
 

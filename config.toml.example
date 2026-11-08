@@ -233,6 +233,14 @@ daemon_ws_url = "wss://terminal.aidaemon.ai/v1/ws/daemon"
 # [path_aliases]
 # projects = ["~/projects"]
 
+# Export run traces over OTLP/HTTP to LangSmith, Langfuse or a collector.
+# Nothing leaves unless an endpoint is set; spans carry names, timings and token
+# counts. capture_content adds prompts and replies, with secrets removed.
+# [telemetry]
+# otlp_endpoint = "https://api.smith.langchain.com/otel"
+# otlp_headers = { "x-api-key" = "keychain" }   # keychain name: otlp_header_x-api-key
+# capture_content = false
+
 [daemon]
 health_port = 8080
 

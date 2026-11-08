@@ -30,6 +30,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     }
 
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+    crate::otel_export::start(&config.telemetry);
 
     let write_consistency_thresholds = config.policy.write_consistency.thresholds();
     let queue_policy = config.daemon.queue_policy.normalized();

@@ -1130,6 +1130,7 @@ mod tests {
                 None,
             )],
             shared_declines: None,
+            parent_run: None,
         };
         let mut facts = ToolCallContext::default();
         assert!(crate::agent::authority::parent_authority(&facts).is_none());

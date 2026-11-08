@@ -11,6 +11,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::CallEffects;
+use crate::approval::SharedDeclines;
+use crate::authority::Authority;
 use crate::message::Image;
 use crate::outcome::FinishOutcome;
 use crate::provider::{ToolSpec, Usage};
@@ -159,6 +161,12 @@ pub struct ToolContext {
     pub cancel: CancellationToken,
     /// Application values set with [`crate::AgentBuilder::tool_extensions`].
     pub extensions: Extensions,
+    /// The owner's declines in this run, live. A tool that starts another
+    /// run shares them with it.
+    pub declines: Option<SharedDeclines>,
+    /// What this run may do, when a hook enforces it. A tool that starts
+    /// another run must not let it do more.
+    pub authority: Option<Authority>,
 }
 
 impl ToolContext {
@@ -172,6 +180,8 @@ impl ToolContext {
             turn: 0,
             cancel: CancellationToken::new(),
             extensions: Extensions::default(),
+            declines: None,
+            authority: None,
         }
     }
 
@@ -188,6 +198,16 @@ impl ToolContext {
 
     pub fn with_extensions(mut self, extensions: Extensions) -> Self {
         self.extensions = extensions;
+        self
+    }
+
+    pub fn with_declines(mut self, declines: SharedDeclines) -> Self {
+        self.declines = Some(declines);
+        self
+    }
+
+    pub fn with_authority(mut self, authority: Option<Authority>) -> Self {
+        self.authority = authority;
         self
     }
 }

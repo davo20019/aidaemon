@@ -637,6 +637,7 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// is a child) and with the children it spawns: the kernel refuses any
     /// of them an effect the owner declined in another.
     shared_declines: sdk::SharedDeclines,
+    run_id: sdk::RunId,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
     /// See `SdkTurnSetup::authority`.
@@ -1201,6 +1202,9 @@ impl Agent {
             let store: Arc<dyn sdk::RunStore> = store;
             builder = builder.store(store);
         }
+        if let Some(sink) = crate::otel_export::sink() {
+            builder = builder.event_sink_arc(sink);
+        }
         builder = builder.event_sink(move |_run, event: &sdk::Event| {
             touch_heartbeat(&sink_heartbeat);
             match event {
@@ -1279,8 +1283,13 @@ impl Agent {
             .as_ref()
             .and_then(|parent| parent.shared_declines.clone())
             .unwrap_or_default();
-        let state = state.share_declines(shared_declines.clone());
+        let mut state = state.share_declines(shared_declines.clone());
+        state.parent_run = self
+            .inherited_authority
+            .as_ref()
+            .and_then(|parent| parent.parent_run);
         let prefix_len = state.messages.len();
+        let run_id = state.run_id;
 
         // Drive the run and the tool dispatcher together on this task.
         let budget_goal = match self.budget_goal_id(session_id).await {
@@ -1332,6 +1341,7 @@ impl Agent {
             crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
                 && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
+            run_id,
             session_id,
             mcp_tools,
             ledger_redactor,

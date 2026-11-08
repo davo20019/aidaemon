@@ -16,8 +16,16 @@ serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
+
+[features]
+# `OtelSink`: export runs as OpenTelemetry spans.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

@@ -334,6 +334,12 @@ impl AgentBuilder {
         self
     }
 
+    /// [`AgentBuilder::event_sink`] for a sink that is shared.
+    pub fn event_sink_arc(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sinks.push(sink);
+        self
+    }
+
     pub fn store(mut self, store: Arc<dyn RunStore>) -> Self {
         self.store = Some(store);
         self

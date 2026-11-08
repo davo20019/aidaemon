@@ -107,6 +107,7 @@ aidaemon-core = { path = "crates/aidaemon-core" }
 # The kernel's run journal and checkpoints, on the daemon's own pool.
 aidaemon-store-sqlite = { path = "crates/aidaemon-store-sqlite" }
 aidaemon-policies = { path = "crates/aidaemon-policies" }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { path = "crates/aidaemon-tools" }
 aidaemon-providers = { path = "crates/aidaemon-providers" }
@@ -139,7 +140,7 @@ tikv-jemallocator = "0.6"
 keyring = { version = "3", features = ["windows-native"] }
 
 [features]
-default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
@@ -152,6 +153,8 @@ terminal-bridge = [
 ]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
+# Export runs to an OTLP backend when `[telemetry]` names one.
+otel = ["aidaemon-policies/otel", "dep:opentelemetry_sdk"]
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
 # The aidaemon-memory crate as the memory plugin for agent turns.
 sdk-memory = ["aidaemon-memory/fastembed"]
