@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use crate::config::SearchConfig;
 use crate::oauth::{OAuthGateway, SharedHttpProfiles};
 use crate::tools::web_search::{SearchBackend, SearchResult};
-use crate::tools::ApprovalBroker;
 use crate::tools::{HttpRequestTool, ManageHttpAuthTool, ManageOAuthTool, ManageSkillsTool};
 use crate::traits::{
     ApprovalScope, SkillsStore, StateStore, Tool, ToolCallContext, ToolCallOutcome,
@@ -75,7 +74,6 @@ impl ManageApiTool {
         skill_registry_urls: Vec<String>,
         search_config: SearchConfig,
         profiles: SharedHttpProfiles,
-        approval_tx: ApprovalBroker,
         state_store: Arc<dyn StateStore>,
         oauth_gateway: OAuthGateway,
     ) -> Self {

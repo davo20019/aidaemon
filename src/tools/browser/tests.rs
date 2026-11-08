@@ -4603,10 +4603,15 @@ async fn click_that_navigates_waits_for_navigation() {
     // so the nav branch of the race wins and the probe is recorded.
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
     let args = json!({ "action": "click", "selector": "#go"});
-    let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
-        .await
-        .unwrap();
+    let out = crate::testing::call_through_kernel(
+        &tool,
+        &args.to_string(),
+        crate::testing::call_facts("s"),
+        Some(ApprovalResponse::AllowOnce),
+    )
+    .await
+    .unwrap()
+    .output;
     assert_eq!(out, "Clicked element '#go'");
     let calls = backend.calls();
     let calls = calls.lock().await;
@@ -4633,10 +4638,15 @@ async fn click_that_does_not_navigate_returns_fast_via_settle() {
     // bounded-timeout path specifically.
     let (tool, backend) = wait_tool(MockBackend::new());
     let args = json!({ "action": "click", "selector": "#noop"});
-    let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
-        .await
-        .unwrap();
+    let out = crate::testing::call_through_kernel(
+        &tool,
+        &args.to_string(),
+        crate::testing::call_facts("s"),
+        Some(ApprovalResponse::AllowOnce),
+    )
+    .await
+    .unwrap()
+    .output;
     assert_eq!(out, "Clicked element '#noop'");
     // The race still launched the nav probe (recorded), but the result is the
     // fast settle path — the click succeeded without a popup/navigation.
@@ -4679,10 +4689,15 @@ async fn click_navrace_still_detects_popup() {
         .await;
 
     let args = json!({ "action": "click", "selector": "#open"});
-    let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
-        .await
-        .unwrap();
+    let out = crate::testing::call_through_kernel(
+        &tool,
+        &args.to_string(),
+        crate::testing::call_facts("s"),
+        Some(ApprovalResponse::AllowOnce),
+    )
+    .await
+    .unwrap()
+    .output;
     assert!(
         out.contains("opened new tab") && out.contains("popup-xyz"),
         "click nav-race must still detect the spawned popup: {out}"

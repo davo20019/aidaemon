@@ -758,7 +758,6 @@ pub async fn call_through_kernel<T: Tool + ?Sized>(
     facts: crate::traits::ToolCallContext,
     answer: Option<ApprovalResponse>,
 ) -> anyhow::Result<KernelCall> {
-    use crate::traits::ToolSemantics as _;
     let parsed: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let call = crate::traits::ApprovalCall::as_sent(&parsed);
     let asked = match tool.owner_approval_request(&call, &facts).await {

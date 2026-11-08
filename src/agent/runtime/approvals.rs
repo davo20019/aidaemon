@@ -1238,7 +1238,6 @@ mod tests {
     /// a read and an ordinary setting need no card.
     #[tokio::test]
     async fn sensitive_config_change_asks_before_dispatch() {
-        use crate::traits::ToolSemantics;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[provider]\nkind = \"openai_compatible\"\n").unwrap();
@@ -2101,7 +2100,7 @@ mod tests {
     }
 
     /// Rules over one real tool.
-    fn rules_over(tool: Arc<dyn crate::traits::Tool>) -> AppApprovalRules {
+    fn rules_over_one(tool: Arc<dyn crate::traits::Tool>) -> AppApprovalRules {
         AppApprovalRules {
             session_id: "telegram:synthetic-user-1".to_string(),
             user_role: Some(crate::types::UserRole::Owner),
@@ -2126,7 +2125,7 @@ mod tests {
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 trusted_session: trusted,
-                ..rules_over(tool.clone())
+                ..rules_over_one(tool.clone())
             };
             for args in [
                 json!({"action":"add","url":"https://example.com/skill.md"}),
@@ -2176,7 +2175,7 @@ mod tests {
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 trusted_session: trusted,
-                ..rules_over(tool.clone())
+                ..rules_over_one(tool.clone())
             };
             let call = sdk::ToolCall::new("c1", "manage_memories", goal.clone());
             let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &call, &tool_info()).await
@@ -2204,11 +2203,11 @@ mod tests {
         for rules in [
             AppApprovalRules {
                 user_role: Some(crate::types::UserRole::Guest),
-                ..rules_over(tool.clone())
+                ..rules_over_one(tool.clone())
             },
             AppApprovalRules {
                 channel_visibility: Some(crate::types::ChannelVisibility::Internal),
-                ..rules_over(tool.clone())
+                ..rules_over_one(tool.clone())
             },
         ] {
             let call = sdk::ToolCall::new("c4", "manage_memories", goal.clone());
@@ -2239,7 +2238,7 @@ mod tests {
             let rules = AppApprovalRules {
                 trusted_session: trusted,
                 mandate_preapproved: trusted,
-                ..rules_over(tool.clone())
+                ..rules_over_one(tool.clone())
             };
             let call = sdk::ToolCall::new("c1", "manage_mandates", create.clone());
             let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &call, &tool_info()).await
@@ -2260,7 +2259,7 @@ mod tests {
         }
         let public = AppApprovalRules {
             channel_visibility: Some(crate::types::ChannelVisibility::Public),
-            ..rules_over(tool.clone())
+            ..rules_over_one(tool.clone())
         };
         let call = sdk::ToolCall::new("c3", "manage_mandates", create);
         assert_eq!(

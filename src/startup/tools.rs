@@ -127,7 +127,6 @@ pub async fn setup_tools(
         event_store,
         llm_runtime.clone(),
         health_store,
-        approval_tx.clone(),
         media_tx.clone(),
         execution_backend.clone(),
     )
@@ -160,7 +159,6 @@ pub async fn setup_tools(
         http_profiles,
         state,
         mcp_registry.clone(),
-        approval_tx.clone(),
     )
     .await?;
 
@@ -695,7 +693,6 @@ pub async fn register_optional_tools(
     event_store: Arc<EventStore>,
     llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
-    approval_tx: ApprovalBroker,
     media_tx: mpsc::Sender<MediaMessage>,
     execution_backend: crate::execution::SharedExecutionBackend,
 ) -> anyhow::Result<OptionalToolsOutcome> {
@@ -907,7 +904,6 @@ pub async fn register_runtime_tools(
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<dyn StateStore>,
     mcp_registry: McpRegistry,
-    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
     validate_runtime_manifest(RUNTIME_TOOL_MANIFEST)?;
 
@@ -956,7 +952,6 @@ pub async fn register_runtime_tools(
             config_path,
             state.clone(),
             mcp_registry.clone(),
-            approval_tx.clone(),
             http_profiles.clone(),
             &mut http_request_tool,
             &mut spawn_tool,
@@ -985,7 +980,6 @@ async fn register_runtime_tool_by_id(
     config_path: &Path,
     state: Arc<dyn StateStore>,
     mcp_registry: McpRegistry,
-    approval_tx: ApprovalBroker,
     http_profiles: crate::oauth::SharedHttpProfiles,
     http_request_tool: &mut Option<Arc<HttpRequestTool>>,
     spawn_tool: &mut Option<Arc<SpawnAgentTool>>,
@@ -1085,7 +1079,6 @@ async fn register_runtime_tool_by_id(
                 config.skills.registries.clone(),
                 config.search.clone(),
                 http_profiles,
-                approval_tx,
                 state.clone() as Arc<dyn crate::traits::StateStore>,
                 gateway,
             )));
@@ -1334,7 +1327,6 @@ mod tests {
             event_store.clone(),
             llm_runtime,
             None,
-            bundle.approval_tx.clone(),
             bundle.media_tx.clone(),
             bundle.execution_backend.clone(),
         )
@@ -1351,7 +1343,6 @@ mod tests {
             http_profiles,
             state.clone(),
             mcp_registry,
-            bundle.approval_tx.clone(),
         )
         .await?;
 

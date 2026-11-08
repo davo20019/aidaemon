@@ -3867,6 +3867,20 @@ mutation CreateWidget {
         assert!(!ManageSkillsTool::effects_for(r#"{"action":"remove","name":"x"}"#, &[]).complete);
     }
 
+    fn make_skill(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("{} skill", name),
+            triggers: vec!["deploy".to_string()],
+            body: "Do the thing.".to_string(),
+            origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
+            source: Some("inline".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn remove_fuzzy_name_removes_skill_and_dismisses_matching_draft() {
         let (tool, state, skills_dir) = setup_tool().await;
