@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::tools::{
+use aidaemon_tools::semantics::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolCollectionCompleteness,
     ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolOutcomeStatus,
     ToolReceiptKind, ToolSemanticFacet, ToolSemanticScope,
@@ -209,7 +209,7 @@ pub struct RequestReceiptPredicate {
     pub exit_codes: Vec<i32>,
     /// Alternative acceptable typed invocation outcomes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub outcome_statuses: Vec<super::tools::ToolOutcomeStatus>,
+    pub outcome_statuses: Vec<aidaemon_tools::semantics::ToolOutcomeStatus>,
     /// Request-level outcome policy. Semantic assessment chooses this compact
     /// condition; deterministic receipt matching evaluates it against the
     /// adapter-specific protocol. Legacy low-level fields remain readable for
@@ -612,9 +612,7 @@ impl DialogueState {
     /// Project the persisted dialogue lifecycle into the shared obligation
     /// graph. Relationships come exclusively from stable IDs and typed status;
     /// no response wording participates in whether work remains open.
-    pub(crate) fn obligation_graph(
-        &self,
-    ) -> Result<crate::execution_graph::ExecutionGraph, String> {
+    pub fn obligation_graph(&self) -> Result<crate::execution_graph::ExecutionGraph, String> {
         use crate::execution_graph::{
             ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
         };
@@ -686,7 +684,7 @@ impl DialogueState {
         Ok(graph)
     }
 
-    pub(crate) fn has_unresolved_request_obligation(&self) -> bool {
+    pub fn has_unresolved_request_obligation(&self) -> bool {
         use crate::execution_graph::ExecutionNodeState;
 
         let Some(request) = self.open_request.as_ref() else {

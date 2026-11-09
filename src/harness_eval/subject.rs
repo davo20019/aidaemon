@@ -2,6 +2,7 @@
 //! `Agent::handle_message` with a strict scripted provider and checks the
 //! daemon's own snapshot assertions.
 
+use crate::events::EventStoreForTests as _;
 use std::fmt::Display;
 use std::path::PathBuf;
 

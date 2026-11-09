@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -24,9 +24,12 @@ use crate::tools::process_control::{
     configure_command_for_process_group, send_sigkill, send_sigterm, terminate_process_tree,
 };
 
+use aidaemon_tools::backend::{
+    normalize_lexically, normalize_local_lexically, normalize_posix_absolute,
+};
 pub use aidaemon_tools::{
     shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
-    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, ProcessHandle,
+    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
     SpawnedProcess, WriteMode,
 };
 
@@ -42,46 +45,6 @@ pub fn active_execution_backend() -> SharedExecutionBackend {
     DEFAULT_LOCAL_BACKEND.clone()
 }
 
-/// What lexical path normalization needs from a backend: its path flavor and
-/// the two bases that give relative and `~` paths a meaning. A plain value, so
-/// code that compares paths without touching the target (the run ledger) can
-/// hold it without holding the backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexicalPaths {
-    kind: BackendKind,
-    workspace_root: BackendPath,
-    home: BackendPath,
-}
-
-impl LexicalPaths {
-    pub fn of(backend: &dyn ExecutionBackend) -> Self {
-        Self {
-            kind: backend.kind(),
-            workspace_root: backend.workspace_root().clone(),
-            home: backend.home_hint().clone(),
-        }
-    }
-
-    /// The daemon host's own paths, for a store opened outside the daemon's
-    /// run (a one-shot CLI command) where no execution backend exists.
-    pub fn daemon_host() -> Self {
-        Self::of(&LocalBackend::current_unrestricted())
-    }
-
-    pub fn normalize(&self, path: &str) -> anyhow::Result<BackendPath> {
-        normalize_lexically(self.kind, &self.workspace_root, &self.home, path)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn posix(workspace_root: &str, home: &str) -> Self {
-        Self {
-            kind: BackendKind::Ssh,
-            workspace_root: BackendPath::new(workspace_root),
-            home: BackendPath::new(home),
-        }
-    }
-}
-
 /// Synchronous lexical normalization for policy/scope code that cannot perform
 /// backend I/O. Actual tool calls still run `resolve_path` and its confinement
 /// checks before touching the target.
@@ -95,33 +58,6 @@ pub fn normalize_path_lexically(
         backend.home_hint(),
         path,
     )
-}
-
-fn normalize_lexically(
-    kind: BackendKind,
-    workspace_root: &BackendPath,
-    home: &BackendPath,
-    path: &str,
-) -> anyhow::Result<BackendPath> {
-    let expanded = if path == "~" {
-        home.as_str().to_string()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest).to_string()
-    } else if Path::new(path).is_absolute() {
-        path.to_string()
-    } else {
-        workspace_root.join(path).to_string()
-    };
-    match kind {
-        BackendKind::Local => Ok(BackendPath::new(
-            normalize_local_lexically(Path::new(&expanded))?
-                .to_string_lossy()
-                .into_owned(),
-        )),
-        BackendKind::Docker | BackendKind::Ssh => {
-            Ok(BackendPath::new(normalize_posix_absolute(&expanded)?))
-        }
-    }
 }
 
 /// Build the executable search path used by local agent processes.
@@ -227,6 +163,7 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    #[cfg(test)]
     fn current_unrestricted() -> Self {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_workspace_root =
@@ -1448,27 +1385,6 @@ fn valid_env_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn normalize_posix_absolute(path: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        path.starts_with('/'),
-        "Remote execution path must be absolute: {path}"
-    );
-    let mut parts = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                anyhow::ensure!(
-                    parts.pop().is_some(),
-                    "Path traversal escapes filesystem root: {path}"
-                );
-            }
-            other => parts.push(other),
-        }
-    }
-    Ok(format!("/{}", parts.join("/")))
-}
-
 fn ensure_posix_descendant(path: &str, root: &str) -> anyhow::Result<()> {
     let root = root.trim_end_matches('/');
     anyhow::ensure!(
@@ -1476,24 +1392,6 @@ fn ensure_posix_descendant(path: &str, root: &str) -> anyhow::Result<()> {
         "Path is outside execution workspace {root}: {path}"
     );
     Ok(())
-}
-
-fn normalize_local_lexically(path: &Path) -> anyhow::Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                anyhow::ensure!(
-                    normalized.pop(),
-                    "Path traversal escapes filesystem root: {}",
-                    path.display()
-                );
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    Ok(normalized)
 }
 
 async fn canonicalize_existing_or_parent(path: &Path) -> anyhow::Result<PathBuf> {

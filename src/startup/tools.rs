@@ -1287,6 +1287,7 @@ async fn build_base_tool(
 mod tests {
     use super::*;
     use crate::agent::Agent;
+    use crate::events::EventStoreForTests as _;
     use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;

@@ -790,7 +790,7 @@ pub struct LlmCallData {
     /// `error` remains human-readable context and is never parsed for health or
     /// recovery decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+    pub provider_error_kind: Option<crate::provider::ProviderErrorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_status: Option<u16>,
 }
@@ -848,7 +848,7 @@ pub struct PolicyDecisionData {
 }
 
 /// Runtime policy metrics snapshot exposed by the dashboard API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyMetricsData {
     pub tool_exposure_samples: u64,
     pub tool_exposure_before_sum: u64,
@@ -1671,10 +1671,7 @@ impl ToolCallData {
     /// Admission compares every claim field atomically. Keeping that projection
     /// in one constructor prevents dispatched and pre-dispatch-rejected paths
     /// from drifting on idempotency, lineage, ownership, or cardinality.
-    pub(crate) fn with_task_kernel_claim(
-        mut self,
-        claim: &super::TaskKernelOperationClaim,
-    ) -> Self {
+    pub fn with_task_kernel_claim(mut self, claim: &TaskKernelOperationClaim) -> Self {
         self.tool_call_id = claim.operation_id.clone();
         self.name = claim.tool_name.clone();
         self.idempotency_key = claim.idempotency_key.clone();
@@ -1692,7 +1689,7 @@ impl ToolCallData {
     }
 
     fn generate_summary(name: &str, arguments: &JsonValue) -> String {
-        use crate::utils::truncate_str;
+        use crate::text::truncate_str;
         // Generate a brief human-readable summary of the tool call
         match name {
             "terminal" => {
@@ -1773,6 +1770,19 @@ impl ErrorData {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskKernelOperationClaim {
+    pub operation_id: String,
+    pub stable_operation_key: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub obligation_ids: Vec<String>,
+    pub max_attempts: usize,
+    pub max_invocations: usize,
+    pub idempotency_key: Option<String>,
+    pub operation_lineage: Option<ToolOperationLineage>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,7 +1856,7 @@ mod tests {
             token_usage_evidence: TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
-            provider_error_kind: Some(crate::providers::ProviderErrorKind::Auth),
+            provider_error_kind: Some(crate::provider::ProviderErrorKind::Auth),
             provider_status: Some(401),
         };
         let json = serde_json::to_value(&data).expect("serialize");
@@ -1881,7 +1891,7 @@ mod tests {
         assert!(back.error.is_none());
         assert_eq!(
             back.provider_error_kind,
-            Some(crate::providers::ProviderErrorKind::Auth)
+            Some(crate::provider::ProviderErrorKind::Auth)
         );
         assert_eq!(back.provider_status, Some(401));
     }

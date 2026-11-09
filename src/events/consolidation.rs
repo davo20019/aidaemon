@@ -496,6 +496,7 @@ mod golden_tests;
 mod tests {
     use super::*;
     use crate::config::ProviderKind;
+    use crate::events::EventStoreForTests as _;
     use crate::events::{DiagnosticSeverity, Event, EventType, TaskStatus};
     use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;

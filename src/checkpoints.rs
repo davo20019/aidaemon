@@ -2239,6 +2239,7 @@ fn directory_size(path: &Path) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventStoreForTests as _;
 
     #[test]
     fn shell_source_has_no_checkpoint_authority() {

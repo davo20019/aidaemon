@@ -5,27 +5,21 @@
 //! - adding/changing one area (e.g. store traits) doesn't cause a full-file rebuild
 
 mod channels;
-mod conversation;
-mod dialogue;
 mod dynamic;
-mod goals;
 mod history;
-mod mandates;
 mod memory;
 mod people;
-mod provider;
 mod tools;
 mod trigger_event;
 
-pub use channels::{ChannelCapabilities, HubChannel};
 #[allow(unused_imports)]
-pub use conversation::{
+pub use aidaemon_events::conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,
     message_content_is_structural_only, AttachmentProvenance, ConversationSummary, Message,
     MessageAnnotation, MessageAttachment, ToolCall,
 };
 #[allow(unused_imports)]
-pub use dialogue::{
+pub use aidaemon_events::dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AdoptedEvidenceBinding, AssistantTurnKind,
     AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
     QuestionKind, RequestCollectionCoverageRequirement, RequestCompletionContract,
@@ -34,24 +28,21 @@ pub use dialogue::{
     RequestVerificationTarget, RequestVerificationTargetKind, RequestedOutcomeCondition,
     UserRequestBinding, UserTurnKind, UserTurnSummary,
 };
-pub use dynamic::{
-    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
-    OAuthConnection, PendingOAuthFlow, SkillDraft,
+pub use aidaemon_events::provider::{
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
-pub(crate) use goals::{task_execution_graph, ExpiredAttemptRecovery};
-pub use goals::{
+#[allow(unused_imports)]
+pub(crate) use aidaemon_work::goals::{task_execution_graph, ExpiredAttemptRecovery};
+#[allow(unused_imports)]
+pub use aidaemon_work::goals::{
     BackgroundSpawn, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact,
     NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
     ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
     TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
     WorkerProfile, DEFAULT_PROJECT_ID,
 };
-pub use history::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
-    ProjectionStats, RecentToolTurn, TaskBookends,
-};
 #[allow(unused_imports)]
-pub use mandates::{
+pub use aidaemon_work::mandates::{
     is_runtime_fallback_rationale, mandate_owner_label, owner_question_excerpt, Intention,
     IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority, MandateAuthorityGrant,
     MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
@@ -67,6 +58,15 @@ pub use mandates::{
     MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
     SAFE_FALLBACK_WAIT_RATIONALE,
 };
+pub use channels::{ChannelCapabilities, HubChannel};
+pub use dynamic::{
+    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
+    OAuthConnection, PendingOAuthFlow, SkillDraft,
+};
+pub use history::{
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
+    ProjectionStats, RecentToolTurn, TaskBookends,
+};
 #[allow(unused_imports)]
 pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, ExtractedMemoryEntity,
@@ -75,9 +75,6 @@ pub use memory::{
     PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
-pub use provider::{
-    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
-};
 pub(crate) use tools::NothingSentError;
 #[cfg(test)]
 pub use tools::ToolCalls;

@@ -12,6 +12,7 @@ publish = false
 aidaemon-core = { path = "../aidaemon-core" }
 anyhow = "1"
 async-trait = "0.1"
+dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 globset = "0.4"
 htmd = "0.1"

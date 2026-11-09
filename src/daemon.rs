@@ -300,6 +300,7 @@ pub fn spawn_macos_keep_awake() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventStoreForTests as _;
 
     async fn health_fixture() -> (
         SqlitePool,

@@ -270,8 +270,7 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
     mandate
         .validate_content_bounds()
         .map_err(anyhow::Error::msg)?;
-    crate::mandates::authority::validate_objective_measurement_source(mandate)
-        .map_err(anyhow::Error::msg)?;
+    crate::authority::validate_objective_measurement_source(mandate).map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         !mandate.created_by_session.trim().is_empty(),
         "mandate owner session is required"
@@ -433,7 +432,7 @@ async fn validate_current_run_receipt_refs(
         .bind(goal_run_id)
         .bind(receipt_id)
         .bind(receipt_id)
-        .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION))
+        .bind(i64::from(aidaemon_events::ToolReceiptV1::SCHEMA_VERSION))
         .fetch_optional(&mut *connection)
         .await?;
         anyhow::ensure!(
@@ -1495,9 +1494,7 @@ async fn quarantine_uncontrolled_autopilot_mandates(
 /// management surface can observe legacy rows. Waiting until the next due
 /// lease leaves an unmeasurable autopilot mandate visibly `active` after a
 /// restart, even though no safe controller run can execute it.
-pub(super) async fn enforce_mandate_invariants_on_startup(
-    pool: &sqlx::SqlitePool,
-) -> anyhow::Result<()> {
+pub async fn enforce_mandate_invariants_on_startup(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
     quarantine_uncontrolled_autopilot_mandates(&mut transaction, &now).await?;
@@ -1506,7 +1503,7 @@ pub(super) async fn enforce_mandate_invariants_on_startup(
 }
 
 #[async_trait]
-impl MandateStore for SqliteStateStore {
+impl<S: WorkDatabase> MandateStore for S {
     async fn create_mandate_controller(
         &self,
         goal: &Goal,
@@ -1544,7 +1541,7 @@ impl MandateStore for SqliteStateStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         validate_source_goal(
             &mut tx,
             mandate.source_goal_id.as_deref(),
@@ -1633,7 +1630,7 @@ impl MandateStore for SqliteStateStore {
         let query = format!("SELECT {MANDATE_COLUMNS} FROM mandates WHERE id = ?");
         let row = sqlx::query(&query)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.work_pool())
             .await?;
         row.as_ref().map(mandate_from_row).transpose()
     }
@@ -1642,7 +1639,7 @@ impl MandateStore for SqliteStateStore {
         let query = format!("SELECT {MANDATE_COLUMNS} FROM mandates WHERE goal_id = ?");
         let row = sqlx::query(&query)
             .bind(goal_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.work_pool())
             .await?;
         row.as_ref().map(mandate_from_row).transpose()
     }
@@ -1670,14 +1667,15 @@ impl MandateStore for SqliteStateStore {
         query.push_str(" ORDER BY julianday(m.updated_at) DESC, m.id DESC");
         let rows = if let Some(session_id) = session_id {
             let stable_principal =
-                crate::session::stable_private_owner_principal_id(session_id).unwrap_or_default();
+                aidaemon_events::session::stable_private_owner_principal_id(session_id)
+                    .unwrap_or_default();
             sqlx::query(&query)
                 .bind(session_id)
                 .bind(stable_principal)
-                .fetch_all(&self.pool)
+                .fetch_all(self.work_pool())
                 .await?
         } else {
-            sqlx::query(&query).fetch_all(&self.pool).await?
+            sqlx::query(&query).fetch_all(self.work_pool()).await?
         };
         rows.iter().map(mandate_from_row).collect()
     }
@@ -1688,7 +1686,8 @@ impl MandateStore for SqliteStateStore {
         session_id: &str,
     ) -> anyhow::Result<bool> {
         let stable_principal =
-            crate::session::stable_private_owner_principal_id(session_id).unwrap_or_default();
+            aidaemon_events::session::stable_private_owner_principal_id(session_id)
+                .unwrap_or_default();
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS (
                 SELECT 1 FROM mandates m
@@ -1704,7 +1703,7 @@ impl MandateStore for SqliteStateStore {
         .bind(mandate_id)
         .bind(session_id)
         .bind(stable_principal)
-        .fetch_one(&self.pool)
+        .fetch_one(self.work_pool())
         .await?
             != 0)
     }
@@ -1735,7 +1734,7 @@ impl MandateStore for SqliteStateStore {
         );
         anyhow::ensure!(expected_version > 0, "mandate version must be positive");
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT m.goal_id, m.owner_principal_id
              FROM mandates m
@@ -1847,7 +1846,7 @@ impl MandateStore for SqliteStateStore {
             observed_at <= chrono::Utc::now() + chrono::Duration::minutes(5),
             "objective measurement cannot be future-dated"
         );
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let run_started_at = sqlx::query_scalar::<_, Option<String>>(
             "SELECT gr.started_at
              FROM mandates m
@@ -1935,7 +1934,7 @@ impl MandateStore for SqliteStateStore {
         )
         .bind(mandate_id)
         .bind(limit.clamp(1, 200))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         rows.iter().map(objective_measurement_from_row).collect()
     }
@@ -1948,7 +1947,7 @@ impl MandateStore for SqliteStateStore {
             .filter(|version| *version > 0)
             .ok_or_else(|| anyhow::anyhow!("updated mandate version must be at least 2"))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "UPDATE mandates
              SET objective = ?, autonomy_mode = ?, authority_json = ?, strategy_json = ?, objective_control_json = ?, constraints_json = ?,
@@ -2062,7 +2061,7 @@ impl MandateStore for SqliteStateStore {
             })
             .transpose()?;
         let now = activated_at.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', confirmed_at = ?, next_review_at = ?,
@@ -2125,7 +2124,7 @@ impl MandateStore for SqliteStateStore {
             )),
             MandateStatus::Active | MandateStatus::Completed | MandateStatus::Cancelled => None,
         };
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = ?,
@@ -2204,7 +2203,7 @@ impl MandateStore for SqliteStateStore {
             serde_json::from_str::<serde_json::Value>(context)?;
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', next_review_at = ?,
@@ -2274,7 +2273,7 @@ impl MandateStore for SqliteStateStore {
         .bind(mandate_id)
         .bind(expected_version)
         .bind(owner_session)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(updated.rows_affected() == 1)
     }
@@ -2306,7 +2305,7 @@ impl MandateStore for SqliteStateStore {
 
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT m.goal_id, g.project_id
              FROM mandates m
@@ -2454,7 +2453,7 @@ impl MandateStore for SqliteStateStore {
         .bind(&now)
         .bind(mandate_id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -2477,7 +2476,7 @@ impl MandateStore for SqliteStateStore {
         let now_string = now.to_rfc3339();
         let lease_expires_at = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
         let lease_token = format!("{}:{}", lease_owner.trim(), uuid::Uuid::new_v4());
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
 
         // Recover the only crash state produced by the pre-atomic dispatcher:
         // an open mandate run whose root task was never inserted. No work can
@@ -2657,7 +2656,7 @@ impl MandateStore for SqliteStateStore {
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(mandate_id)
         .bind(lease_token)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -2700,7 +2699,7 @@ impl MandateStore for SqliteStateStore {
         );
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         // First write: acquire the writer lock and prove the complete authority
         // chain in one CAS. A pause, policy revision, run replacement, or root
         // attempt replacement either linearizes before this statement (and
@@ -2834,7 +2833,7 @@ impl MandateStore for SqliteStateStore {
         let lease_secs = lease_secs.clamp(1, 86_400);
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let fenced = sqlx::query(
             "UPDATE task_attempts
              SET last_heartbeat_at = datetime('now')
@@ -3083,7 +3082,7 @@ impl MandateStore for SqliteStateStore {
 
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         if let Some(task_attempt_id) = task_attempt_id {
             anyhow::ensure!(
                 !task_attempt_id.trim().is_empty() && task_attempt_id.trim() == task_attempt_id,
@@ -3242,8 +3241,8 @@ impl MandateStore for SqliteStateStore {
                 }
                 let quota =
                     mutation_quota_state_on_connection(&mut tx, &mandate.id, &now_string).await?;
-                let admissible = crate::mandates::admissibility::admissible_outcomes(
-                    &crate::mandates::admissibility::OutcomeState {
+                let admissible = crate::admissibility::admissible_outcomes(
+                    &crate::admissibility::OutcomeState {
                         stagnant: objective_is_stagnant(control, &readings),
                         quota_block: quota.and_then(|quota| quota.block_reason),
                         adapts_strategy: operating_updates.is_some_and(|updates| {
@@ -3500,7 +3499,7 @@ impl MandateStore for SqliteStateStore {
             format!("SELECT {DECISION_COLUMNS} FROM mandate_decision_cycles WHERE goal_run_id = ?");
         let row = sqlx::query(&query)
             .bind(goal_run_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.work_pool())
             .await?;
         row.as_ref().map(decision_from_row).transpose()
     }
@@ -3512,7 +3511,7 @@ impl MandateStore for SqliteStateStore {
     ) -> anyhow::Result<Vec<String>> {
         // The predicate of `validate_current_run_receipt_refs`, so every id
         // returned here passes that check.
-        let excluded = crate::mandates::MANDATE_PROTOCOL_TOOLS
+        let excluded = crate::MANDATE_PROTOCOL_TOOLS
             .iter()
             .map(|_| "?")
             .collect::<Vec<_>>()
@@ -3534,13 +3533,13 @@ impl MandateStore for SqliteStateStore {
         );
         let mut statement = sqlx::query_scalar::<_, String>(&query)
             .bind(goal_run_id)
-            .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION));
-        for tool in crate::mandates::MANDATE_PROTOCOL_TOOLS {
+            .bind(i64::from(aidaemon_events::ToolReceiptV1::SCHEMA_VERSION));
+        for tool in crate::MANDATE_PROTOCOL_TOOLS {
             statement = statement.bind(*tool);
         }
         Ok(statement
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?)
     }
 
@@ -3556,7 +3555,7 @@ impl MandateStore for SqliteStateStore {
         let rows = sqlx::query(&query)
             .bind(mandate_id)
             .bind(limit.clamp(1, 200))
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?;
         rows.iter().map(decision_from_row).collect()
     }
@@ -3573,14 +3572,14 @@ impl MandateStore for SqliteStateStore {
         let rows = sqlx::query(&query)
             .bind(mandate_id)
             .bind(limit.clamp(1, 200))
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?;
         rows.iter().map(intention_from_row).collect()
     }
 
     async fn record_mandate_learning_note(&self, note: &MandateLearningNote) -> anyhow::Result<()> {
         note.validate().map_err(anyhow::Error::msg)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let decision_exists = sqlx::query_scalar::<_, i64>(
             "SELECT 1
              FROM mandate_decision_cycles dc
@@ -3622,7 +3621,7 @@ impl MandateStore for SqliteStateStore {
             )
             .bind(&note.mandate_id)
             .bind(receipt_id)
-            .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION))
+            .bind(i64::from(aidaemon_events::ToolReceiptV1::SCHEMA_VERSION))
             .fetch_optional(&mut *tx)
             .await?;
             anyhow::ensure!(
@@ -3662,7 +3661,7 @@ impl MandateStore for SqliteStateStore {
         let rows = sqlx::query(&query)
             .bind(mandate_id)
             .bind(limit.clamp(1, 100))
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?;
         rows.iter().map(learning_note_from_row).collect()
     }
@@ -3688,7 +3687,7 @@ impl MandateStore for SqliteStateStore {
         let rows = sqlx::query(&query)
             .bind(mandate_id)
             .bind(limit.clamp(1, 100))
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?;
         rows.iter().map(strategy_revision_from_row).collect()
     }
@@ -3719,10 +3718,11 @@ impl MandateStore for SqliteStateStore {
         );
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut awakened = Vec::new();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for mandate in mandates.into_iter().filter(|mandate| {
-            crate::mandates::authority::mandate_accepts_wake_signal(mandate, signal)
-        }) {
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
+        for mandate in mandates
+            .into_iter()
+            .filter(|mandate| crate::authority::mandate_accepts_wake_signal(mandate, signal))
+        {
             let inserted = sqlx::query(
                 "INSERT OR IGNORE INTO mandate_wake_signals (
                     mandate_id, mandate_version, signal_digest, kind, source,
@@ -3814,7 +3814,7 @@ impl MandateStore for SqliteStateStore {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query(
             "SELECT goal_id, created_by_session, suspension_json, objective_control_json
              FROM mandates
@@ -3912,7 +3912,7 @@ impl MandateStore for SqliteStateStore {
         let targets_json = serde_json::to_string(&reservation.targets)?;
         let account_identifiers_json = serde_json::to_string(&reservation.account_identifiers)?;
         let ledger_id = uuid::Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
 
         // This UPDATE is deliberately the transaction's first database access.
         // SQLite therefore acquires the writer lock before evaluating the
@@ -4188,7 +4188,7 @@ impl MandateStore for SqliteStateStore {
         .bind(&claim.claimed_at)
         .bind(&claim.claimed_at)
         .bind(&claim.claimed_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -4199,7 +4199,7 @@ impl MandateStore for SqliteStateStore {
         as_of: &str,
     ) -> anyhow::Result<Option<MandateMutationQuotaState>> {
         validate_canonical_identifier("mandate id", mandate_id, 256)?;
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.work_pool().acquire().await?;
         mutation_quota_state_on_connection(&mut connection, mandate_id, as_of).await
     }
 
@@ -4214,7 +4214,7 @@ impl MandateStore for SqliteStateStore {
         );
         let rows = sqlx::query(&query)
             .bind(goal_run_id)
-            .fetch_all(&self.pool)
+            .fetch_all(self.work_pool())
             .await?;
         rows.iter().map(mutation_attempt_from_row).collect()
     }
@@ -4233,7 +4233,7 @@ impl MandateStore for SqliteStateStore {
             });
         }
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         // Acquire SQLite's writer lock before reading the proof snapshot. All
         // subsequent task, ledger, policy, and lifecycle checks therefore
         // linearize with owner updates and worker finalization writes.
@@ -4985,8 +4985,7 @@ impl MandateStore for SqliteStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::store_prelude::*;
+    use crate::traits::*;
     use crate::traits::{
         Goal, Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateMutationTarget,
         MandateObjectiveControl, MandateOperationKind, MandateOperationScope,
@@ -4994,16 +4993,9 @@ mod tests {
     };
     use std::sync::Arc;
 
-    async fn test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
+    async fn test_store() -> (SqliteWorkStore, tempfile::NamedTempFile) {
         let database = tempfile::NamedTempFile::new().unwrap();
-        let store = SqliteStateStore::new(
-            database.path().to_str().unwrap(),
-            100,
-            None,
-            Arc::new(EmbeddingService::new().unwrap()),
-        )
-        .await
-        .unwrap();
+        let store = open_for_tests(database.path().to_str().unwrap()).await;
         (store, database)
     }
 
@@ -5247,7 +5239,7 @@ mod tests {
     }
 
     async fn claim_and_start_run(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         goal: &Goal,
         mandate: &Mandate,
     ) -> crate::traits::GoalRun {
@@ -5287,7 +5279,7 @@ mod tests {
     }
 
     async fn claim_mutation_fence(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         goal: &Goal,
         mandate: &Mandate,
         run: &GoalRun,
@@ -5392,7 +5384,7 @@ mod tests {
         }
     }
 
-    async fn complete_mutation_fence(store: &SqliteStateStore, fence: &MutationFence) {
+    async fn complete_mutation_fence(store: &SqliteWorkStore, fence: &MutationFence) {
         let complete = crate::traits::TaskAttemptPatch {
             status: "completed".to_string(),
             result: Some("verified".to_string()),
@@ -5626,7 +5618,7 @@ mod tests {
                 "success": true,
                 "duration_ms": 1,
                 "receipt": {
-                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "schema_version": aidaemon_events::ToolReceiptV1::SCHEMA_VERSION,
                     "outcome_status": "succeeded",
                     "outcome_evidence": "structured_metadata"
                 }
@@ -6263,7 +6255,7 @@ mod tests {
             context: None,
             handoff: None,
         };
-        async fn run_status(store: &SqliteStateStore, run_id: &str) -> String {
+        async fn run_status(store: &SqliteWorkStore, run_id: &str) -> String {
             sqlx::query_scalar::<_, String>("SELECT status FROM goal_runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&store.pool)
@@ -7122,7 +7114,7 @@ mod tests {
                 "success": true,
                 "duration_ms": 1,
                 "receipt": {
-                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "schema_version": aidaemon_events::ToolReceiptV1::SCHEMA_VERSION,
                     "outcome_status": "succeeded",
                     "outcome_evidence": "structured_metadata",
                     "result_provenance": { "result_id": "sha256:synthetic-metric-digest" }
@@ -7533,17 +7525,17 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let receipt = crate::events::ToolReceiptV1::from_metadata(
+        let receipt = aidaemon_events::ToolReceiptV1::from_metadata(
             &crate::traits::ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
                 semantics: crate::traits::ToolCallSemantics::observation(),
                 ..Default::default()
             },
             crate::traits::ToolOutcomeStatus::Succeeded,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            aidaemon_events::ToolOutcomeEvidenceSource::StructuredMetadata,
             None,
         );
-        let result = crate::events::ToolResultData {
+        let result = aidaemon_events::ToolResultData {
             message_id: None,
             tool_call_id: "observation-receipt-1".to_string(),
             name: "web_fetch".to_string(),
@@ -7747,14 +7739,7 @@ mod tests {
         store.pool.close().await;
         drop(store);
 
-        let reopened = SqliteStateStore::new(
-            database.path().to_str().unwrap(),
-            100,
-            None,
-            Arc::new(EmbeddingService::new().unwrap()),
-        )
-        .await
-        .unwrap();
+        let reopened = open_for_tests(database.path().to_str().unwrap()).await;
         let loaded = reopened.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(loaded.goal_id, goal.id);
         assert_eq!(loaded.version, mandate.version);
@@ -7764,7 +7749,7 @@ mod tests {
     /// Seed one objective reading on a closed prior review run, as the
     /// history of an earlier cycle would leave it.
     async fn seed_prior_measurement(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         mandate: &Mandate,
         current_run: &GoalRun,
         value_micros: i64,
@@ -7793,7 +7778,7 @@ mod tests {
     }
 
     async fn seed_measurement_on_run(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         mandate: &Mandate,
         run_id: &str,
         value_micros: i64,
@@ -8016,17 +8001,17 @@ mod tests {
         stop.termination_kind = Some(MandateTerminationKind::SuccessCriteriaSatisfied);
         stop.termination_match = Some("One grounded note is posted".to_string());
         let root_task_id = run.root_task_id.clone().expect("review root task");
-        let receipt = crate::events::ToolReceiptV1::from_metadata(
+        let receipt = aidaemon_events::ToolReceiptV1::from_metadata(
             &crate::traits::ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
                 semantics: crate::traits::ToolCallSemantics::observation(),
                 ..Default::default()
             },
             crate::traits::ToolOutcomeStatus::Succeeded,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            aidaemon_events::ToolOutcomeEvidenceSource::StructuredMetadata,
             None,
         );
-        let result = crate::events::ToolResultData {
+        let result = aidaemon_events::ToolResultData {
             message_id: None,
             tool_call_id: "call_read_notes".to_string(),
             name: "http_request".to_string(),
@@ -8060,7 +8045,7 @@ mod tests {
     /// Drive one review to a finalized ASK exactly as the task lead would,
     /// leaving the mandate parked in `awaiting_input` with its question.
     async fn park_mandate_on_ask(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         goal: &Goal,
         mandate: &Mandate,
         question: &str,
@@ -8114,7 +8099,7 @@ mod tests {
         run
     }
 
-    async fn make_review_due(store: &SqliteStateStore, mandate: &Mandate) {
+    async fn make_review_due(store: &SqliteWorkStore, mandate: &Mandate) {
         sqlx::query("UPDATE mandates SET next_review_at = ? WHERE id = ?")
             .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
             .bind(&mandate.id)
@@ -8237,7 +8222,7 @@ mod tests {
     }
 
     async fn start_existing_claimed_run(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         goal: &Goal,
         mandate: &Mandate,
     ) -> GoalRun {
@@ -8268,7 +8253,7 @@ mod tests {
     /// canonical tool-result append does at its own event time. Quota and
     /// cooldown tests need the time chosen; the transition is the same.
     async fn finish_attempt(
-        store: &SqliteStateStore,
+        store: &SqliteWorkStore,
         reservation: &MandateMutationReservation,
         status: MandateMutationAttemptStatus,
         http_status: Option<u16>,
@@ -8424,7 +8409,7 @@ mod tests {
             crate::traits::ToolTargetHintKind::Url,
             "https://api.x.com/2/tweets",
         );
-        assert!(crate::mandates::authority::authorize_mandate_observation(
+        assert!(crate::authority::authorize_mandate_observation(
             &mandate,
             "http_request",
             r#"{"method":"GET","url":"https://api.x.com/2/tweets"}"#,
@@ -8596,7 +8581,7 @@ mod tests {
         let semantics = crate::traits::ToolCallSemantics::mutation_with(
             crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
         );
-        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+        let mut receipt = aidaemon_events::ToolReceiptV1::from_metadata(
             &crate::traits::ToolCallMetadata {
                 outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
                 http_status: Some(201),
@@ -8604,11 +8589,11 @@ mod tests {
                 ..Default::default()
             },
             crate::traits::ToolOutcomeStatus::Succeeded,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            aidaemon_events::ToolOutcomeEvidenceSource::StructuredMetadata,
             Some("mandate-atomic-receipt".to_string()),
         );
         receipt.mandate_authority = Some(reservation.grant.clone());
-        let result = crate::events::ToolResultData {
+        let result = aidaemon_events::ToolResultData {
             message_id: None,
             tool_call_id: reservation.tool_call_id.clone(),
             name: "http_request".to_string(),
@@ -8622,11 +8607,17 @@ mod tests {
             attachments: vec![],
             receipt: Some(receipt),
         };
-        let event_store = crate::events::EventStore::new(store.pool()).await.unwrap();
+        let event_store = aidaemon_events::EventStore::on_paths(
+            store.pool(),
+            aidaemon_tools::LexicalPaths::daemon_host(),
+            Arc::new(aidaemon_events::NoEventHost),
+        )
+        .await
+        .unwrap();
         event_store
-            .append(crate::events::Event::new(
+            .append(aidaemon_events::Event::new(
                 "specialist:mandate",
-                crate::events::EventType::ToolResult,
+                aidaemon_events::EventType::ToolResult,
                 serde_json::to_value(result).unwrap(),
             ))
             .await

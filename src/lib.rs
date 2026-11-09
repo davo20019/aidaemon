@@ -23,7 +23,7 @@ pub use events::{
     UserMessageData,
 };
 pub(crate) mod execution;
-mod execution_graph;
+pub(crate) use aidaemon_events::execution_graph;
 mod execution_policy;
 mod goal_tokens;
 pub mod harness_eval;
@@ -47,7 +47,7 @@ mod queue_telemetry;
 mod reminders;
 mod router;
 mod runtime_ports;
-mod session;
+pub(crate) use aidaemon_events::session;
 mod single_instance;
 mod skills;
 mod startup;

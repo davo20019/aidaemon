@@ -99,7 +99,7 @@ pub(super) async fn enqueue_mandate_run_notification_on_connection(
 }
 
 #[async_trait]
-impl crate::traits::NotificationStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::NotificationStore for S {
     async fn record_background_spawn(
         &self,
         spawn: &crate::traits::BackgroundSpawn,
@@ -112,7 +112,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         .bind(&spawn.session_id)
         .bind(&spawn.mission)
         .bind(&spawn.started_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -120,7 +120,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
     async fn finish_background_spawn(&self, id: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM background_spawns WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(())
     }
@@ -134,7 +134,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
              WHERE session_id = ? ORDER BY started_at",
         )
         .bind(session_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(background_spawn_from_row).collect())
     }
@@ -143,7 +143,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         let rows = sqlx::query(
             "DELETE FROM background_spawns RETURNING id, session_id, mission, started_at",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(background_spawn_from_row).collect())
     }
@@ -172,7 +172,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         .bind(&entry.task_id)
         .bind(&entry.action_token)
         .bind(entry.untrusted)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -181,7 +181,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         &self,
         entry: &crate::traits::NotificationEntry,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let notified_at = chrono::Utc::now().to_rfc3339();
         let claimed = sqlx::query(
             "UPDATE goals
@@ -275,7 +275,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         )
         .bind(limit)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         let mut entries = Vec::with_capacity(rows.len());
@@ -302,7 +302,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
     async fn mark_notification_delivered(&self, notification_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE notification_queue SET delivered_at = datetime('now') WHERE id = ?")
             .bind(notification_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(())
     }
@@ -310,7 +310,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
     async fn increment_notification_attempt(&self, notification_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE notification_queue SET attempts = attempts + 1 WHERE id = ?")
             .bind(notification_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(())
     }
@@ -322,7 +322,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
                AND expires_at IS NOT NULL
                AND datetime(expires_at) <= datetime('now')",
         )
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() as i64)
     }
@@ -331,23 +331,14 @@ impl crate::traits::NotificationStore for SqliteStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::store_prelude::*;
+    use crate::traits::*;
     use crate::traits::{
         MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts,
     };
-    use std::sync::Arc;
 
-    async fn test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
+    async fn test_store() -> (SqliteWorkStore, tempfile::NamedTempFile) {
         let database = tempfile::NamedTempFile::new().unwrap();
-        let store = SqliteStateStore::new(
-            database.path().to_str().unwrap(),
-            100,
-            None,
-            Arc::new(EmbeddingService::new().unwrap()),
-        )
-        .await
-        .unwrap();
+        let store = open_for_tests(database.path().to_str().unwrap()).await;
         (store, database)
     }
 

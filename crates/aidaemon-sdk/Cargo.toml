@@ -18,13 +18,15 @@ sqlite = ["dep:aidaemon-store-sqlite"]
 mcp = ["dep:aidaemon-mcp"]
 eval = ["dep:aidaemon-eval"]
 memory = ["dep:aidaemon-memory"]
+events = ["dep:aidaemon-events"]
+work = ["events", "dep:aidaemon-work"]
 fastembed = ["memory", "aidaemon-memory/fastembed"]
 channels = ["dep:aidaemon-channels"]
 telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
 testing = ["aidaemon-core/testing", "aidaemon-channels?/testing"]
-full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "telegram", "slack", "discord"]
+full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord"]
 
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
@@ -36,6 +38,8 @@ aidaemon-store-sqlite = { path = "../aidaemon-store-sqlite", optional = true }
 aidaemon-mcp = { path = "../aidaemon-mcp", optional = true }
 aidaemon-eval = { path = "../aidaemon-eval", optional = true }
 aidaemon-memory = { path = "../aidaemon-memory", optional = true }
+aidaemon-events = { path = "../aidaemon-events", optional = true }
+aidaemon-work = { path = "../aidaemon-work", optional = true }
 aidaemon-channels = { path = "../aidaemon-channels", optional = true }
 aidaemon-channel-telegram = { path = "../aidaemon-channel-telegram", optional = true }
 aidaemon-channel-slack = { path = "../aidaemon-channel-slack", optional = true }

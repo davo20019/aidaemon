@@ -1,6 +1,54 @@
 use serde_json::Value;
 
-use super::ToolCall;
+use crate::conversation::ToolCall;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    /// 401/403 — bad API key or permissions.
+    Auth,
+    /// 402 — billing/quota exhausted.
+    Billing,
+    /// 429 — rate limited; check retry_after_secs.
+    RateLimit,
+    /// A usage quota (a subscription plan's cap, a daily allowance) is used
+    /// up until `resets_at`; waiting seconds does not help.
+    QuotaExhausted,
+    /// 400 — malformed request (e.g. missing thought_signature, invalid schema).
+    BadRequest,
+    /// 404 or "model not found" — bad model name.
+    NotFound,
+    /// 408, request timeout, or provider took too long.
+    Timeout,
+    /// Connection refused, DNS failure, reset, etc.
+    Network,
+    /// 500/502/503/504 — provider-side outage.
+    ServerError,
+    /// Provider returned a malformed success payload.
+    /// Recovery is reason-aware (parse may be transient; shape is often deterministic).
+    MalformedResponse,
+    /// Anything else.
+    Unknown,
+}
+
+impl ProviderErrorKind {
+    /// Provider/account/platform failures that should preserve autonomous work
+    /// for a later retry rather than count as semantic no-progress. Request
+    /// shape and malformed-response failures are deliberately excluded.
+    pub fn is_infrastructure_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Auth
+                | Self::Billing
+                | Self::QuotaExhausted
+                | Self::RateLimit
+                | Self::NotFound
+                | Self::Timeout
+                | Self::Network
+                | Self::ServerError
+        )
+    }
+}
 
 /// Structured response mode requested for a provider call.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -168,4 +216,99 @@ pub struct TokenUsageRecord {
     pub call_id: Option<String>,
     #[allow(dead_code)] // Used for database queries
     pub created_at: String,
+}
+
+/// Token usage persistence.
+#[async_trait::async_trait]
+pub trait TokenUsageStore: Send + Sync {
+    /// Record token usage from an LLM call.
+    #[allow(dead_code)]
+    async fn record_token_usage(
+        &self,
+        _session_id: &str,
+        _usage: &TokenUsage,
+        _call_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(()) // default no-op
+    }
+
+    /// Get token usage records since a given datetime string (ISO 8601).
+    async fn get_token_usage_since(&self, _since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        Ok(vec![]) // default no-op
+    }
+
+    /// Get token usage grouped by session_id since a given datetime.
+    /// Returns Vec of (session_id, total_input_tokens, total_output_tokens, request_count).
+    #[allow(dead_code)] // Used by token usage tooling when that tool is enabled.
+    async fn get_token_usage_by_session(
+        &self,
+        _since: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
+        Ok(vec![]) // default no-op
+    }
+
+    /// Create (once) and read the immutable token budget for one mandate
+    /// decision run. Implementations must validate the exact active mandate
+    /// authority epoch and running goal-run fence. Returning success without
+    /// durable enforcement would make autonomous execution fail open, so the
+    /// default is deliberately unsupported.
+    async fn ensure_mandate_run_token_budget(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _budget_per_cycle: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Try to serialize one model call across every worker in a mandate run.
+    /// Returns `(acquired, tokens_used, budget_per_cycle)`. `acquired = false`
+    /// means either another call holds the lease or the immutable cycle budget
+    /// is exhausted; callers distinguish those states from the counters.
+    async fn try_acquire_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<(bool, i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Mark the exact acquired lease as physically dispatched and
+    /// pessimistically reserve its entire remaining cycle balance. This must
+    /// commit before provider I/O begins.
+    async fn mark_mandate_run_token_lease_dispatched(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Atomically replace a dispatched call's pessimistic reservation with
+    /// trusted actual usage and release the exact call lease. Returns
+    /// `(tokens_used, budget_per_cycle)`.
+    async fn settle_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+        _delta_tokens: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Release a call lease only when the caller proves provider dispatch never
+    /// began. A stale/mismatched lease must not release a newer worker's call.
+    async fn release_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
 }

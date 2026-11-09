@@ -15,6 +15,8 @@
 //! | [`mcp`] | `mcp` | MCP servers as tools |
 //! | [`eval`] | `eval` | YAML scenarios, N-of-M pass rates, baseline comparison |
 //! | [`memory`] | `memory` (+ `fastembed`) | Long-term memory: facts, episodes, hybrid recall; every part swappable |
+//! | [`events`] | `events` | The immutable event store, its payloads and the run aggregate |
+//! | [`work`] | `work` | Goals, mandates, tasks, work coordination and notifications, with their SQLite store |
 //! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
 //! | [`testing`] | `testing` | Scripted provider for tests |
@@ -78,6 +80,12 @@ pub use aidaemon_eval as eval;
 
 #[cfg(feature = "memory")]
 pub use aidaemon_memory as memory;
+
+#[cfg(feature = "events")]
+pub use aidaemon_events as events;
+
+#[cfg(feature = "work")]
+pub use aidaemon_work as work;
 
 /// Chat channels: the contract, the runner, and the built-in adapters.
 #[cfg(feature = "channels")]

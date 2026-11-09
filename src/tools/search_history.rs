@@ -682,6 +682,7 @@ impl crate::traits::ToolSemantics for SearchHistoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::events::{Event, EventStore, EventType};
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;

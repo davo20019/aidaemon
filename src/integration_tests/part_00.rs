@@ -4,6 +4,7 @@
 // multi-turn history, and session isolation — the same code path all
 // channels use via `Agent::handle_message()`.
 
+use crate::events::EventStoreForTests as _;
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_orchestrator, setup_test_agent_root,

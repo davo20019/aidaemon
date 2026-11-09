@@ -64,9 +64,11 @@ Crates must be published in dependency order:
 2. `aidaemon-channels`, `aidaemon-providers`, `aidaemon-tools`,
    `aidaemon-store-sqlite`, `aidaemon-mcp`, `aidaemon-agents`,
    `aidaemon-policies`, `aidaemon-eval`
-3. `aidaemon-memory` (depends on policies), `aidaemon-channel-telegram`,
-   `aidaemon-channel-slack`, `aidaemon-channel-discord`
-4. `aidaemon-sdk`
+3. `aidaemon-memory` (depends on policies), `aidaemon-events` (depends on
+   tools and policies), `aidaemon-channel-telegram`, `aidaemon-channel-slack`,
+   `aidaemon-channel-discord`
+4. `aidaemon-work` (depends on events)
+5. `aidaemon-sdk`
 
 ## Automation
 

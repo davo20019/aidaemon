@@ -824,6 +824,7 @@ impl crate::traits::ToolSemantics for GenerateImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use std::sync::Mutex as StdMutex;

@@ -2,6 +2,7 @@
 //! leaves behind. `golden` records those rows as the previous implementation
 //! wrote them, so a change to what is learned has to change this file too.
 
+use crate::events::EventStoreForTests as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

@@ -403,6 +403,7 @@ pub(crate) fn summary_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::events::{Event, EventType};
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
