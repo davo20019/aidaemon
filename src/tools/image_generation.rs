@@ -784,28 +784,14 @@ impl Tool for GenerateImageTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self
-            .generate_outcome(arguments, None, &ToolCallContext::default())
-            .await?
-            .output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.generate_outcome(arguments, status_tx, &ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         self.generate_outcome(arguments, status_tx, &facts).await
     }
 }
@@ -838,6 +824,7 @@ impl crate::traits::ToolSemantics for GenerateImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use std::sync::Mutex as StdMutex;
 

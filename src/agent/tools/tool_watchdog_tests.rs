@@ -26,9 +26,17 @@ impl Tool for SlowTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        Ok("done".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("done".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -57,9 +65,17 @@ impl Tool for SlowCliAgentTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        Ok("ok".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("ok".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -109,22 +125,20 @@ impl Tool for MandateMutationSpy {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-        Ok("mutated".to_string())
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let exec_ctx = facts.clone();
+
         self.saw_mandate_preapproval
             .store(exec_ctx.mandate_preapproved, AtomicOrdering::SeqCst);
-        self.call(arguments)
-            .await
-            .map(crate::traits::ToolCallOutcome::from_output)
+        let _ = arguments;
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "mutated".to_string(),
+        ))
     }
 }
 
@@ -442,17 +456,14 @@ impl Tool for EchoSpawnAgentTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(arguments.to_string())
-    }
-
     /// Echoes the arguments and the dispatcher's typed facts.
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: crate::traits::ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
         Ok(crate::traits::ToolCallOutcome::from_output(
             json!({
                 "arguments": serde_json::from_str::<Value>(arguments)?,
@@ -1136,9 +1147,17 @@ impl Tool for JudgedMcpStandIn {
         })
     }
 
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
-        self.0.fetch_add(1, AtomicOrdering::SeqCst);
-        Ok("ran the judged instance".to_string())
+    async fn execute(
+        &self,
+        _args: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok("ran the judged instance".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

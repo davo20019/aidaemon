@@ -21,7 +21,6 @@ pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;
 mod health_probe;
 pub mod image_generation;
-pub(crate) mod kernel_tool;
 mod manage_mandates;
 mod manage_memories;
 mod manage_people;

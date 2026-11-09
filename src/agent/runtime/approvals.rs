@@ -1086,8 +1086,14 @@ mod tests {
         fn schema(&self) -> serde_json::Value {
             json!({"name": "manage_api", "description": "", "parameters": {"type": "object"}})
         }
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            anyhow::bail!("not run in these tests")
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> =
+                async move { anyhow::bail!("not run in these tests") }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -1125,8 +1131,14 @@ mod tests {
         fn schema(&self) -> serde_json::Value {
             json!({"name": "file_tool", "description": "", "parameters": {"type": "object"}})
         }
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            anyhow::bail!("not run in these tests")
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> =
+                async move { anyhow::bail!("not run in these tests") }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -1226,8 +1238,14 @@ mod tests {
         fn schema(&self) -> serde_json::Value {
             json!({"name": "manage_mcp", "description": "", "parameters": {"type": "object"}})
         }
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            anyhow::bail!("not run in these tests")
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> =
+                async move { anyhow::bail!("not run in these tests") }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -1588,8 +1606,14 @@ mod tests {
         fn schema(&self) -> serde_json::Value {
             json!({"name": "manage_cli_agents", "description": "", "parameters": {"type": "object"}})
         }
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            anyhow::bail!("not run in these tests")
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> =
+                async move { anyhow::bail!("not run in these tests") }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 

@@ -1345,34 +1345,14 @@ impl Tool for ManageOAuthTool {
         manage_oauth_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.run(arguments, status_tx, &ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let facts = facts.clone();
 
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
         if args.action == "list" {
             let (output, members) = self.handle_list_snapshot().await?;
@@ -1607,6 +1587,7 @@ impl crate::traits::ToolSemantics for ManageOAuthTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use std::collections::HashMap;
     use std::net::SocketAddr;

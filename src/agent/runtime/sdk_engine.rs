@@ -1027,13 +1027,13 @@ impl Agent {
                         ),
                         DaemonToolOffer::Hidden => continue,
                     };
-                builder = builder.tool(BridgedTool {
+                builder = builder.tool(turn_tool(
                     spec,
-                    tool: tool.clone(),
+                    tool.clone(),
                     goal_actions_only,
-                    calls: calls_tx.clone(),
-                    trust_roots: bridge_roots.clone(),
-                });
+                    calls_tx.clone(),
+                    bridge_roots.clone(),
+                ));
             }
         }
         // The offered MCP-registry tools, bridged the same way so every
@@ -1062,13 +1062,13 @@ impl Agent {
                         warn!(tool = %name, "MCP tool name is not a valid kernel tool name; not offered");
                         continue;
                     }
-                    builder = builder.tool(BridgedTool {
-                        spec: tool_spec(tool.as_ref()),
-                        tool: tool.clone(),
-                        goal_actions_only: false,
-                        calls: calls_tx.clone(),
-                        trust_roots: bridge_roots.clone(),
-                    });
+                    builder = builder.tool(turn_tool(
+                        tool_spec(tool.as_ref()),
+                        tool.clone(),
+                        false,
+                        calls_tx.clone(),
+                        bridge_roots.clone(),
+                    ));
                     mcp_tools.push(tool);
                 }
             }

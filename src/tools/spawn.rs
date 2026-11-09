@@ -547,35 +547,14 @@ impl Tool for SpawnAgentTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_outcome(arguments, status_tx)
-            .await
-            .map(|outcome| outcome.output)
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let facts = facts.clone();
 
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
@@ -1540,6 +1519,7 @@ mod child_runtime_tests {
     use crate::runtime_ports::{ChildWorkReport, SalvagedTaskOutcome};
     use crate::state::SqliteStateStore;
     use crate::traits::NotificationStore;
+    use crate::traits::ToolCalls as _;
     use std::sync::Mutex as StdMutex;
 
     /// A child runtime that answers from a script, recording what it was asked.

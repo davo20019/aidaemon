@@ -523,16 +523,13 @@ impl Tool for TrackRequirementsTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
         self.run(arguments, &facts)
             .await
             .map(crate::traits::ToolCallOutcome::from_output)
@@ -731,6 +728,7 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
 mod tests {
     use super::*;
     use crate::testing::CallWithFacts;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use sqlx::sqlite::SqlitePoolOptions;
 

@@ -31,9 +31,12 @@ impl crate::traits::Tool for InjectedPage {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok(INJECTION.replace("{sentinel}", &self.0))
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for InjectedPage {
@@ -65,12 +68,15 @@ impl crate::traits::Tool for DeleteProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         let path = args["path"].as_str().unwrap_or_default();
         std::fs::remove_file(path)?;
         Ok("deleted".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for DeleteProbe {
@@ -105,14 +111,17 @@ impl crate::traits::Tool for MessageProbe {
             "parameters": {"type": "object", "properties": {"to": {"type": "string"}}}
         })
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         self.0
             .lock()
             .unwrap()
             .push(args["to"].as_str().unwrap_or_default().to_string());
         Ok("sent".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for MessageProbe {
@@ -147,11 +156,14 @@ impl crate::traits::Tool for TerminalProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         std::fs::write(args["path"].as_str().unwrap_or_default(), "ran")?;
         Ok("ran".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for TerminalProbe {
@@ -632,9 +644,12 @@ impl crate::traits::Tool for PlainPage {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok("A synthetic page about gardening.".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for PlainPage {

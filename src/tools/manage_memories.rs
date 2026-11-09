@@ -713,24 +713,13 @@ impl Tool for ManageMemoriesTool {
         crate::types::ApprovalKind::GoalConfirmation
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.outcome(arguments, &ToolCallContext::default()).await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let exec_ctx = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        exec_ctx: crate::traits::ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         self.outcome(arguments, &exec_ctx).await
     }
 }
@@ -2517,6 +2506,7 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 

@@ -1,5 +1,7 @@
 //! The daemon's policy for the SDK file tools.
 
+#[cfg(test)]
+use crate::traits::ToolCalls as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

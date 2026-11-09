@@ -1,3 +1,4 @@
+use crate::traits::ToolCalls as _;
 // ======================== Phase 4: Learning Integration Tests ========================
 
 #[tokio::test]
@@ -107,7 +108,7 @@ async fn test_orchestration_context_accumulation_end_to_end() {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::tools::manage_goal_tasks::ManageGoalTasksTool;
-    use crate::traits::Tool;
+    
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();

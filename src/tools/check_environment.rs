@@ -89,80 +89,88 @@ impl Tool for CheckEnvironmentTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let path_str = args["path"].as_str().unwrap_or(".");
-        let backend = self.backend.clone();
-        let check_dir = backend.resolve_path(path_str).await?;
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let path_str = args["path"].as_str().unwrap_or(".");
+            let backend = self.backend.clone();
+            let check_dir = backend.resolve_path(path_str).await?;
 
-        let mut output = String::new();
-        output.push_str("## Execution Environment\n\n");
-        output.push_str(&format!(
-            "  Backend             {} ({})\n  Workspace           {}\n\n",
-            backend.kind().as_str(),
-            backend.id(),
-            backend.workspace_root()
-        ));
-
-        if let Some(runtime_context) = format_daemon_runtime_context(std::env::var) {
-            output.push_str("## Local Daemon Control Plane\n\n");
-            output.push_str(&runtime_context);
-            output.push('\n');
-        }
-
-        // Check tools in parallel
-        output.push_str("## Available Tools\n\n");
-
-        let mut handles = Vec::new();
-        for (tool, flag) in TOOLS_TO_CHECK {
-            let tool = tool.to_string();
-            let flag = flag.to_string();
-            let backend = backend.clone();
-            handles.push(tokio::spawn(async move {
-                check_tool(backend, &tool, &flag).await
-            }));
-        }
-
-        let results = futures::future::join_all(handles).await;
-        let mut found = Vec::new();
-        let mut not_found = Vec::new();
-
-        for (i, result) in results.into_iter().enumerate() {
-            let (tool_name, _) = TOOLS_TO_CHECK[i];
-            match result {
-                Ok(Some((path, version))) => found.push((tool_name, path, version)),
-                Ok(None) => not_found.push(tool_name),
-                Err(_) => not_found.push(tool_name),
-            }
-        }
-
-        for (name, path, version) in &found {
+            let mut output = String::new();
+            output.push_str("## Execution Environment\n\n");
             output.push_str(&format!(
-                "  {} {}\n    path: {}\n",
-                pad_right(name, 18),
-                version,
-                path
+                "  Backend             {} ({})\n  Workspace           {}\n\n",
+                backend.kind().as_str(),
+                backend.id(),
+                backend.workspace_root()
             ));
-        }
 
-        if !not_found.is_empty() {
-            output.push_str(&format!("\nNot found: {}\n", not_found.join(", ")));
-        }
-
-        // Check config files
-        let configs = check_config_files(backend, &check_dir).await;
-        if !configs.is_empty() {
-            output.push_str("\n## Config Files\n\n");
-            for (file, desc, content) in &configs {
-                output.push_str(&format!("  {} ({})", file, desc));
-                if let Some(c) = content {
-                    output.push_str(&format!(" → {}", c));
-                }
+            if let Some(runtime_context) = format_daemon_runtime_context(std::env::var) {
+                output.push_str("## Local Daemon Control Plane\n\n");
+                output.push_str(&runtime_context);
                 output.push('\n');
             }
-        }
 
-        Ok(output)
+            // Check tools in parallel
+            output.push_str("## Available Tools\n\n");
+
+            let mut handles = Vec::new();
+            for (tool, flag) in TOOLS_TO_CHECK {
+                let tool = tool.to_string();
+                let flag = flag.to_string();
+                let backend = backend.clone();
+                handles.push(tokio::spawn(async move {
+                    check_tool(backend, &tool, &flag).await
+                }));
+            }
+
+            let results = futures::future::join_all(handles).await;
+            let mut found = Vec::new();
+            let mut not_found = Vec::new();
+
+            for (i, result) in results.into_iter().enumerate() {
+                let (tool_name, _) = TOOLS_TO_CHECK[i];
+                match result {
+                    Ok(Some((path, version))) => found.push((tool_name, path, version)),
+                    Ok(None) => not_found.push(tool_name),
+                    Err(_) => not_found.push(tool_name),
+                }
+            }
+
+            for (name, path, version) in &found {
+                output.push_str(&format!(
+                    "  {} {}\n    path: {}\n",
+                    pad_right(name, 18),
+                    version,
+                    path
+                ));
+            }
+
+            if !not_found.is_empty() {
+                output.push_str(&format!("\nNot found: {}\n", not_found.join(", ")));
+            }
+
+            // Check config files
+            let configs = check_config_files(backend, &check_dir).await;
+            if !configs.is_empty() {
+                output.push_str("\n## Config Files\n\n");
+                for (file, desc, content) in &configs {
+                    output.push_str(&format!("  {} ({})", file, desc));
+                    if let Some(c) = content {
+                        output.push_str(&format!(" → {}", c));
+                    }
+                    output.push('\n');
+                }
+            }
+
+            Ok(output)
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -315,6 +323,7 @@ async fn check_config_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {

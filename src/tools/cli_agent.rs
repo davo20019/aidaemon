@@ -4408,28 +4408,24 @@ impl Tool for CliAgentTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.outcome_with_facts(arguments, status_tx, false, &ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let exec_ctx = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
             .await
+    }
+}
+
+/// Direct calls from tests, without the dispatcher's native-access checks.
+#[cfg(test)]
+impl CliAgentTool {
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.call_with_status(arguments, None).await
     }
 
     async fn call_with_status(
@@ -4445,6 +4441,15 @@ impl Tool for CliAgentTool {
             &ToolCallContext::default(),
         )
         .await
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome_with_facts(arguments, status_tx, false, &ToolCallContext::default())
+            .await
     }
 }
 
@@ -5003,6 +5008,7 @@ impl CliAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     /// The model-facing descriptions must not promise an auto-approve mode.

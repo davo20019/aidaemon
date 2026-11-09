@@ -53,50 +53,58 @@ impl Tool for GitInfoTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let path_str = args["path"].as_str().unwrap_or(".");
-        let backend = self.backend.clone();
-        let repo_dir = backend.resolve_path(path_str).await?;
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let path_str = args["path"].as_str().unwrap_or(".");
+            let backend = self.backend.clone();
+            let repo_dir = backend.resolve_path(path_str).await?;
 
-        let check =
-            fs_utils::run_cmd_backend(&*backend, "git rev-parse --git-dir", Some(&repo_dir), 5)
-                .await?;
-        if check.exit_code != 0 {
-            anyhow::bail!("Not a git repository: {}", path_str);
-        }
+            let check =
+                fs_utils::run_cmd_backend(&*backend, "git rev-parse --git-dir", Some(&repo_dir), 5)
+                    .await?;
+            if check.exit_code != 0 {
+                anyhow::bail!("Not a git repository: {}", path_str);
+            }
 
-        let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else {
-            VALID_SECTIONS.iter().map(|s| s.to_string()).collect()
-        };
-
-        let mut output = String::new();
-
-        for section in &sections {
-            let section_output = match section.as_str() {
-                "status" => get_status(&*backend, &repo_dir).await,
-                "log" => get_log(&*backend, &repo_dir).await,
-                "branches" => get_branches(&*backend, &repo_dir).await,
-                "remotes" => get_remotes(&*backend, &repo_dir).await,
-                "diff" => get_diff(&*backend, &repo_dir).await,
-                "stash" => get_stash(&*backend, &repo_dir).await,
-                _ => continue,
+            let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            } else {
+                VALID_SECTIONS.iter().map(|s| s.to_string()).collect()
             };
 
-            if !section_output.is_empty() {
-                output.push_str(&format!("## {}\n{}\n", capitalize(section), section_output));
+            let mut output = String::new();
+
+            for section in &sections {
+                let section_output = match section.as_str() {
+                    "status" => get_status(&*backend, &repo_dir).await,
+                    "log" => get_log(&*backend, &repo_dir).await,
+                    "branches" => get_branches(&*backend, &repo_dir).await,
+                    "remotes" => get_remotes(&*backend, &repo_dir).await,
+                    "diff" => get_diff(&*backend, &repo_dir).await,
+                    "stash" => get_stash(&*backend, &repo_dir).await,
+                    _ => continue,
+                };
+
+                if !section_output.is_empty() {
+                    output.push_str(&format!("## {}\n{}\n", capitalize(section), section_output));
+                }
             }
-        }
 
-        if output.is_empty() {
-            output.push_str("No git information available.");
-        }
+            if output.is_empty() {
+                output.push_str("No git information available.");
+            }
 
-        Ok(output)
+            Ok(output)
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -261,6 +269,7 @@ async fn get_stash(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {

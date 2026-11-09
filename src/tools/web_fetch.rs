@@ -8,20 +8,18 @@ pub use aidaemon_tools::web::{
 pub(crate) use aidaemon_tools::web::{read_body_capped, MAX_FETCH_BODY_BYTES};
 use aidaemon_tools::ToolText;
 
-use super::kernel_tool::KernelTool;
+/// The daemon's constructors for the SDK's [`aidaemon_tools::WebFetch`].
+pub struct WebFetchTool;
 
-pub type WebFetchTool = KernelTool<aidaemon_tools::WebFetch>;
-
+#[allow(clippy::new_ret_no_self)]
 impl WebFetchTool {
-    pub fn new() -> Self {
-        Self::wrap(
-            aidaemon_tools::WebFetch::new()
+    pub fn new() -> aidaemon_tools::WebFetch {
+        aidaemon_tools::WebFetch::new()
                 .browser_identity()
                 .follow_public_redirects()
                 .with_text(ToolText {
                     short: "Fetch a readable web page and extract its content; not for REST/JSON API endpoints".to_string(),
                     schema: "Fetch a readable web page and extract its content. Strips ads/navigation. Do NOT use for REST/JSON API endpoints or machine-readable responses; use http_request for APIs. For login-required sites, use browser instead.".to_string(),
-                }),
-        )
+                })
     }
 }

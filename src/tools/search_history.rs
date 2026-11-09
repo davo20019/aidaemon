@@ -14,7 +14,7 @@ use crate::traits::{
     TaskBookends, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
     ToolCapabilities, ToolOutcomeStatus, ToolVerificationMode,
 };
-use crate::types::{ChannelVisibility, StatusUpdate, UserRole};
+use crate::types::{ChannelVisibility, UserRole};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -176,7 +176,7 @@ impl SearchHistoryTool {
             || (scope.visibility == ChannelVisibility::Internal && scope.trusted)
     }
 
-    async fn execute(
+    async fn run_search(
         &self,
         arguments: &str,
         facts: &ToolCallContext,
@@ -568,28 +568,14 @@ impl Tool for SearchHistoryTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self
-            .execute(arguments, &ToolCallContext::default())
-            .await?
-            .output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(arguments, &ToolCallContext::default()).await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(arguments, &facts).await
+        self.run_search(arguments, &facts).await
     }
 }
 
@@ -700,6 +686,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     async fn tool() -> (SearchHistoryTool, Arc<EventStore>, tempfile::NamedTempFile) {

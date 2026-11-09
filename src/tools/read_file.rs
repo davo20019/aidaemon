@@ -15,31 +15,34 @@ use aidaemon_tools::{render_read_file_output, MAX_READ_CHARS};
 use serde_json::json;
 
 use super::file_policy::{daemon_file_policy, DaemonPaths};
-use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
-pub type ReadFileTool = KernelTool<aidaemon_tools::ReadFile>;
+/// The daemon's constructors for the SDK's [`aidaemon_tools::ReadFile`].
+pub struct ReadFileTool;
 
+#[allow(clippy::new_ret_no_self)]
 impl ReadFileTool {
     /// Without the daemon's own files protected; production passes them.
     #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> Self {
+    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::ReadFile {
         Self::on_backend(backend, DaemonPaths::default())
     }
 
-    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
-        Self::wrap(
-            aidaemon_tools::ReadFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
+    pub fn on_backend(
+        backend: SharedExecutionBackend,
+        paths: DaemonPaths,
+    ) -> aidaemon_tools::ReadFile {
+        aidaemon_tools::ReadFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Read file contents with line numbers and metadata. Read a fitting file in full once; for large files, search first and then read one exact non-overlapping range.".to_string(),
                 schema: "Read file contents with line numbers and metadata. Use this instead of terminal cat/head/tail. Read a file in full once when it fits the limit; oversized reads return the first page plus an exact continuation call to follow. For a large file with a known target, use search_files first, then read one exact surrounding range. Sequential ranges must not overlap; previously covered content is replayed from the task-local artifact.".to_string(),
-            }),
-        )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use std::io::Write;
     use std::path::Path;
 

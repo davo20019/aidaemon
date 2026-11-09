@@ -10,25 +10,27 @@ use crate::traits::{DurableReplayDecision, Tool};
 use serde_json::json;
 
 use super::file_policy::{daemon_file_policy, DaemonPaths};
-use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
-pub type WriteFileTool = KernelTool<aidaemon_tools::WriteFile>;
+/// The daemon's constructors for the SDK's [`aidaemon_tools::WriteFile`].
+pub struct WriteFileTool;
 
+#[allow(clippy::new_ret_no_self)]
 impl WriteFileTool {
     /// Without the daemon's own files protected; production passes them.
     #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> Self {
+    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::WriteFile {
         Self::on_backend(backend, DaemonPaths::default())
     }
 
-    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
-        Self::wrap(
-            aidaemon_tools::WriteFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
+    pub fn on_backend(
+        backend: SharedExecutionBackend,
+        paths: DaemonPaths,
+    ) -> aidaemon_tools::WriteFile {
+        aidaemon_tools::WriteFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Write or create a file with given content".to_string(),
                 schema: "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.".to_string(),
-            }),
-        )
+            })
     }
 }
 
@@ -88,6 +90,7 @@ mod durable_replay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     #[test]

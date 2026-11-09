@@ -360,9 +360,12 @@ impl crate::traits::Tool for ExternalActionTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok("Created remote record id=abc123".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for ExternalActionTool {
@@ -400,12 +403,15 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok(crate::tools::sanitize::wrap_untrusted_output(
             "prewrapped_external_action",
             "Created remote record id=wrapped123",
         ))
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for PreWrappedExternalActionTool {
@@ -444,7 +450,8 @@ impl crate::traits::Tool for StructuredExternalActionTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok(
             r#"HTTP 201 Created
 content-type: application/json; charset=utf-8
@@ -463,7 +470,9 @@ Top-level keys: data
 }"#
             .to_string(),
         )
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for StructuredExternalActionTool {
@@ -554,7 +563,8 @@ impl crate::traits::Tool for UrlProbeTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let args: serde_json::Value = serde_json::from_str(arguments)?;
         let url = args
             .get("url")
@@ -564,7 +574,9 @@ impl crate::traits::Tool for UrlProbeTool {
             "Checked {} and confirmed the posts are visible.",
             url
         ))
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for UrlProbeTool {
@@ -796,10 +808,13 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
-        }
+        }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
     }
 
     impl crate::traits::ToolSemantics for CountingSendFileTool {
@@ -943,10 +958,13 @@ async fn test_repeated_send_file_executes_once() {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("File sent by counting send_file tool".to_string())
-        }
+        }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
     }
 
     impl crate::traits::ToolSemantics for CountingSendFileTool {
@@ -1286,9 +1304,12 @@ impl crate::traits::Tool for FailingExternalActionTool {
             "parameters": {"type": "object", "properties": {}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         anyhow::bail!("synthetic external action failure")
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for FailingExternalActionTool {

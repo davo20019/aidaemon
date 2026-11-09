@@ -14,7 +14,7 @@ use crate::traits::{
     Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolRole,
 };
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 mod approvals;
 pub mod cache;
@@ -1537,26 +1537,13 @@ impl Tool for ComputerUseTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let outcome = self.call_with_status_outcome(arguments, None).await?;
-        Ok(outcome.output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         self.clear_pending_meta().await;
         let started = std::time::Instant::now();

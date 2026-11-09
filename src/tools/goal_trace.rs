@@ -543,39 +543,47 @@ impl Tool for GoalTraceTool {
         goal_trace_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: GoalTraceArgs = serde_json::from_str(arguments)?;
-        match args.action.as_str() {
-            "goal_trace" => {
-                if let Some(goal_id) = args.goal_id.as_deref() {
-                    self.goal_trace(
-                        goal_id,
-                        args.max_tasks.unwrap_or(20),
-                        args.max_activities_per_task.unwrap_or(6),
-                    )
-                    .await
-                } else {
-                    self.recent_goal_summary(8).await
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: GoalTraceArgs = serde_json::from_str(arguments)?;
+            match args.action.as_str() {
+                "goal_trace" => {
+                    if let Some(goal_id) = args.goal_id.as_deref() {
+                        self.goal_trace(
+                            goal_id,
+                            args.max_tasks.unwrap_or(20),
+                            args.max_activities_per_task.unwrap_or(6),
+                        )
+                        .await
+                    } else {
+                        self.recent_goal_summary(8).await
+                    }
                 }
-            }
-            "tool_trace" => {
-                if args.goal_id.is_none() && args.task_id.is_none() {
-                    self.recent_goal_summary(8).await
-                } else {
-                    self.tool_trace(
-                        args.goal_id.as_deref(),
-                        args.task_id.as_deref(),
-                        args.tool_name.as_deref(),
-                        args.limit.unwrap_or(30),
-                    )
-                    .await
+                "tool_trace" => {
+                    if args.goal_id.is_none() && args.task_id.is_none() {
+                        self.recent_goal_summary(8).await
+                    } else {
+                        self.tool_trace(
+                            args.goal_id.as_deref(),
+                            args.task_id.as_deref(),
+                            args.tool_name.as_deref(),
+                            args.limit.unwrap_or(30),
+                        )
+                        .await
+                    }
                 }
+                other => Ok(format!(
+                    "Unknown action: '{}'. Use goal_trace or tool_trace.",
+                    other
+                )),
             }
-            other => Ok(format!(
-                "Unknown action: '{}'. Use goal_trace or tool_trace.",
-                other
-            )),
         }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -605,6 +613,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolCalls as _;
     use crate::traits::{Goal, Task, TaskActivity};
 
     async fn setup_state() -> Arc<dyn StateStore> {

@@ -141,22 +141,30 @@ impl Tool for HealthProbeTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: HealthProbeArgs = serde_json::from_str(arguments)?;
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: HealthProbeArgs = serde_json::from_str(arguments)?;
 
-        match args.action.as_str() {
-            "create" => self.create(args).await,
-            "list" => self.list().await,
-            "delete" => self.delete(args).await,
-            "pause" => self.pause(args).await,
-            "resume" => self.resume(args).await,
-            "run_now" => self.run_now(args).await,
-            "status" => self.status(args).await,
-            other => Ok(format!(
+            match args.action.as_str() {
+                "create" => self.create(args).await,
+                "list" => self.list().await,
+                "delete" => self.delete(args).await,
+                "pause" => self.pause(args).await,
+                "resume" => self.resume(args).await,
+                "run_now" => self.run_now(args).await,
+                "status" => self.status(args).await,
+                other => Ok(format!(
                 "Unknown action '{}'. Use: create, list, delete, pause, resume, run_now, status",
                 other
             )),
+            }
         }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

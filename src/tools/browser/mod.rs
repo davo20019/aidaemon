@@ -2355,28 +2355,14 @@ impl Tool for BrowserTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self
-            .run_action(arguments, &ToolCallContext::default())
-            .await?
-            .text)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
         let result = self.run_action(arguments, &facts).await?;
         Ok(ToolCallOutcome {

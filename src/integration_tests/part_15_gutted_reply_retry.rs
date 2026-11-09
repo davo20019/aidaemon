@@ -240,9 +240,12 @@ async fn test_typed_failed_operation_requires_recovery_before_completion() {
                 "parameters": {"type": "object", "properties": {}}
             })
         }
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
             anyhow::bail!("synthetic probe failure")
-        }
+        }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
     }
 
     impl crate::traits::ToolSemantics for FailingProbeTool {}

@@ -39,49 +39,57 @@ impl Tool for SystemInfoTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let backend = self.backend.clone();
-        let mut info = format!(
-            "Execution target: {} ({})\nWorkspace: {}\n",
-            backend.kind().as_str(),
-            backend.id(),
-            backend.workspace_root()
-        );
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let backend = self.backend.clone();
+            let mut info = format!(
+                "Execution target: {} ({})\nWorkspace: {}\n",
+                backend.kind().as_str(),
+                backend.id(),
+                backend.workspace_root()
+            );
 
-        // Current date and time
-        if let Some(date) = command_output(backend.clone(), "date", &[]).await {
-            info.push_str(&format!("Date: {}\n", date));
+            // Current date and time
+            if let Some(date) = command_output(backend.clone(), "date", &[]).await {
+                info.push_str(&format!("Date: {}\n", date));
+            }
+
+            // Hostname
+            if let Some(hostname) = command_output(backend.clone(), "hostname", &[]).await {
+                info.push_str(&format!("Hostname: {}\n", hostname));
+            }
+
+            // OS info
+            if let Some(uname) = command_output(backend.clone(), "uname", &["-a"]).await {
+                info.push_str(&format!("OS: {}\n", uname));
+            }
+
+            // Uptime
+            if let Some(uptime) = command_output(backend.clone(), "uptime", &[]).await {
+                info.push_str(&format!("Uptime: {}\n", uptime));
+            }
+
+            // Probe the execution target rather than compiling this decision for
+            // the daemon host's operating system.
+            let memory = if backend.executable_exists("free").await.unwrap_or(false) {
+                command_output(backend.clone(), "free", &["-h"]).await
+            } else if backend.executable_exists("vm_stat").await.unwrap_or(false) {
+                command_output(backend, "vm_stat", &[]).await
+            } else {
+                None
+            };
+            if let Some(memory) = memory {
+                info.push_str(&format!("Memory:\n{}\n", memory));
+            }
+
+            Ok(info)
         }
-
-        // Hostname
-        if let Some(hostname) = command_output(backend.clone(), "hostname", &[]).await {
-            info.push_str(&format!("Hostname: {}\n", hostname));
-        }
-
-        // OS info
-        if let Some(uname) = command_output(backend.clone(), "uname", &["-a"]).await {
-            info.push_str(&format!("OS: {}\n", uname));
-        }
-
-        // Uptime
-        if let Some(uptime) = command_output(backend.clone(), "uptime", &[]).await {
-            info.push_str(&format!("Uptime: {}\n", uptime));
-        }
-
-        // Probe the execution target rather than compiling this decision for
-        // the daemon host's operating system.
-        let memory = if backend.executable_exists("free").await.unwrap_or(false) {
-            command_output(backend.clone(), "free", &["-h"]).await
-        } else if backend.executable_exists("vm_stat").await.unwrap_or(false) {
-            command_output(backend, "vm_stat", &[]).await
-        } else {
-            None
-        };
-        if let Some(memory) = memory {
-            info.push_str(&format!("Memory:\n{}\n", memory));
-        }
-
-        Ok(info)
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

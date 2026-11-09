@@ -248,25 +248,13 @@ impl Tool for ReadNodeSensorsTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         Ok(ToolCallOutcome {
             output: self.run(arguments, &facts).await?,
             metadata: ToolCallMetadata {
@@ -383,25 +371,13 @@ impl Tool for ReadNodeHealthTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         Ok(ToolCallOutcome {
             output: self.run(arguments, &facts).await?,
             metadata: ToolCallMetadata {
@@ -511,28 +487,13 @@ impl Tool for SendNodeAudioTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self
-            .execute_delivery(arguments, &ToolCallContext::default())
-            .await?
-            .0)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let (output, status) = self.execute_delivery(arguments, &facts).await?;
         Ok(ToolCallOutcome {
             output,
@@ -611,16 +572,13 @@ impl Tool for ManageNodeMonitorsTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
         self.run(arguments, &facts)
             .await
             .map(ToolCallOutcome::from_output)

@@ -38,16 +38,13 @@ impl Tool for RecordingTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("the dispatcher calls with a context")
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: crate::traits::ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let exec_ctx = facts.clone();
+
         let arguments: Value = serde_json::from_str(arguments)?;
         self.seen.lock().unwrap().push((arguments, exec_ctx));
         Ok(crate::traits::ToolCallOutcome::from_output(

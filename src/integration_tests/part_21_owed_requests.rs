@@ -23,9 +23,12 @@ impl crate::traits::Tool for ForgetProbe {
             "parameters": {"type": "object", "properties": {"key": {"type": "string"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok("forgotten".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for ForgetProbe {

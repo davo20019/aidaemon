@@ -11,7 +11,7 @@ use crate::traits::{
     ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolTargetHintKind,
     ToolVerificationMode,
 };
-use crate::types::{ChannelContext, StatusUpdate, UserRole};
+use crate::types::{ChannelContext, UserRole};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,9 +45,17 @@ impl Tool for RejectingArgumentTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.io_calls.fetch_add(1, Ordering::SeqCst);
-        Ok("unexpected I/O".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.io_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected I/O".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -513,11 +521,19 @@ impl Tool for RecordingSearchFilesTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.calls.lock().await.push(arguments.to_string());
-        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        let path = args["path"].as_str().unwrap_or(".");
-        Ok(format!("No matches found (0 files scanned in {})", path))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.calls.lock().await.push(arguments.to_string());
+            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            let path = args["path"].as_str().unwrap_or(".");
+            Ok(format!("No matches found (0 files scanned in {})", path))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -562,22 +578,30 @@ impl Tool for RecordingProjectInspectTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.calls.lock().await.push(arguments.to_string());
-        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        let primary = args["path"]
-            .as_str()
-            .or_else(|| {
-                args["paths"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or(".");
-        Ok(format!(
-            "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
-            primary
-        ))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.calls.lock().await.push(arguments.to_string());
+            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            let primary = args["path"]
+                .as_str()
+                .or_else(|| {
+                    args["paths"]
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or(".");
+            Ok(format!(
+                "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
+                primary
+            ))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -620,13 +644,21 @@ impl Tool for MockProjectInspectTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        let path = args["path"].as_str().unwrap_or(".");
-        Ok(format!(
-            "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
-            path
-        ))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            let path = args["path"].as_str().unwrap_or(".");
+            Ok(format!(
+                "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
+                path
+            ))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -685,23 +717,19 @@ impl Tool for PlayedNodeAudioTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({
-            "node_id": "synthetic-node-1",
-            "delivery_status": "played",
-            "playback_complete": true
-        })
-        .to_string())
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ToolCallOutcome {
-            output: self.call(arguments).await?,
+            output: json!({
+                "node_id": "synthetic-node-1",
+                "delivery_status": "played",
+                "playback_complete": true
+            })
+            .to_string(),
             metadata: ToolCallMetadata {
                 outcome_status: Some(ToolOutcomeStatus::Succeeded),
                 semantics: Self::receipt_semantics(),
@@ -758,15 +786,13 @@ impl Tool for BackgroundDetachTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("Background job started.".to_string())
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+
         let _ = (arguments, status_tx);
         let outcome = ToolCallOutcome {
             output: "Background job started.".to_string(),
@@ -822,10 +848,18 @@ impl Tool for MockRemoteMutationTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        let url = args["url"].as_str().unwrap_or("https://example.com/status");
-        Ok(format!("Updated {}", url))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            let url = args["url"].as_str().unwrap_or("https://example.com/status");
+            Ok(format!("Updated {}", url))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -864,10 +898,18 @@ impl Tool for MockRemoteObservationTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-        let url = args["url"].as_str().unwrap_or("https://example.com/status");
-        Ok(format!("Verified {} shows the updated status.", url))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+            let url = args["url"].as_str().unwrap_or("https://example.com/status");
+            Ok(format!("Verified {} shows the updated status.", url))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -921,17 +963,25 @@ impl Tool for CountingLocalWriteTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing path"))?;
-        let content = args["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing content"))?;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        std::fs::write(path, content)?;
-        Ok(format!("Successfully wrote file: {path}"))
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+            let content = args["content"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing content"))?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(path, content)?;
+            Ok(format!("Successfully wrote file: {path}"))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

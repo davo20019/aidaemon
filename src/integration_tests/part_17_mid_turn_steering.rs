@@ -32,12 +32,15 @@ impl crate::traits::Tool for QueueOnCall {
         })
     }
 
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _args: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.registry
             .queue_message(&self.session, self.message.clone(), None)
             .await;
         Ok("step done".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for QueueOnCall {}

@@ -436,9 +436,12 @@ impl crate::traits::Tool for OfferedConfigTool {
     fn schema(&self) -> serde_json::Value {
         self.0.schema()
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.0.call(arguments).await
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for OfferedConfigTool {
@@ -861,7 +864,7 @@ async fn egress_guard_curl_local_port_passes_and_secret_body_is_blocked() {
 
 #[tokio::test]
 async fn http_request_outside_kernel_requires_kernel_approval() {
-    use crate::traits::Tool as _;
+    
     let (port, sent) = spawn_approvals_server().await;
     let tool = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
         std::collections::HashMap::new(),
@@ -1196,7 +1199,7 @@ async fn terminal_semantic_timeout_fails_closed_to_card() {
 
 #[tokio::test]
 async fn terminal_outside_kernel_requires_kernel_approval() {
-    use crate::traits::Tool as _;
+    
     let pool_file = tempfile::NamedTempFile::new().unwrap();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
@@ -1879,9 +1882,12 @@ impl crate::traits::Tool for OfferedManageMcpTool {
     fn schema(&self) -> serde_json::Value {
         self.0.schema()
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.0.call(arguments).await
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 #[async_trait::async_trait]

@@ -229,225 +229,235 @@ impl Tool for RememberFactTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: RememberArgs = serde_json::from_str(arguments)?;
-        let channel_id = self.current_channel_id.read().await.clone();
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: RememberArgs = serde_json::from_str(arguments)?;
+            let channel_id = self.current_channel_id.read().await.clone();
 
-        let mut results = Vec::new();
+            let mut results = Vec::new();
 
-        // An empty personal_memory block (models often send every schema
-        // section) carries nothing to reconcile. Treating it as present used
-        // to short-circuit the call and silently drop the plain facts beside
-        // it while reporting "No changes (already current)".
-        let personal = args.personal_memory.filter(|personal| {
-            !(personal.entities.is_empty()
-                && personal.aliases.is_empty()
-                && personal.facts.is_empty()
-                && personal.relationships.is_empty())
-        });
-        let has_personal = personal.is_some();
-        if let Some(mut personal) = personal {
-            personal.direct_user_statement = true;
-            let result = self
-                .state
-                .reconcile_personal_memory(
-                    &personal,
-                    "agent",
-                    None,
-                    channel_id.as_deref(),
-                    FactPrivacy::Private,
-                )
-                .await?;
-            results.push(format!("Personal memory: {}", result.concise_summary()));
-        }
-
-        let facts = args.facts.filter(|facts| !facts.is_empty());
-        let single_key = args.key.filter(|key| !key.trim().is_empty());
-        if has_personal && facts.is_none() && single_key.is_none() {
-            return Ok(results.join("\n"));
-        }
-
-        // Build the list of facts to store (batch or single)
-        let entries: Vec<FactEntry> = if let Some(facts) = facts {
-            facts
-        } else {
-            // Single-fact mode: require all three fields
-            let category = args
-                .category
-                .ok_or_else(|| anyhow::anyhow!("'category' is required (or use 'facts' array)"))?;
-            let key = single_key
-                .ok_or_else(|| anyhow::anyhow!("'key' is required (or use 'facts' array)"))?;
-            let value = args
-                .value
-                .ok_or_else(|| anyhow::anyhow!("'value' is required (or use 'facts' array)"))?;
-            vec![FactEntry {
-                category,
-                key,
-                value,
-            }]
-        };
-
-        let mut structured = PersonalMemoryWrite {
-            direct_user_statement: true,
-            ..Default::default()
-        };
-        let mut owner_added = false;
-        let mut structured_indices = std::collections::BTreeSet::new();
-        for (index, entry) in entries.iter().enumerate() {
-            if !matches!(
-                entry.category.trim().to_ascii_lowercase().as_str(),
-                "user" | "personal" | "profile"
-            ) {
-                continue;
+            // An empty personal_memory block (models often send every schema
+            // section) carries nothing to reconcile. Treating it as present used
+            // to short-circuit the call and silently drop the plain facts beside
+            // it while reporting "No changes (already current)".
+            let personal = args.personal_memory.filter(|personal| {
+                !(personal.entities.is_empty()
+                    && personal.aliases.is_empty()
+                    && personal.facts.is_empty()
+                    && personal.relationships.is_empty())
+            });
+            let has_personal = personal.is_some();
+            if let Some(mut personal) = personal {
+                personal.direct_user_statement = true;
+                let result = self
+                    .state
+                    .reconcile_personal_memory(
+                        &personal,
+                        "agent",
+                        None,
+                        channel_id.as_deref(),
+                        FactPrivacy::Private,
+                    )
+                    .await?;
+                results.push(format!("Personal memory: {}", result.concise_summary()));
             }
-            let key = entry.key.trim().to_ascii_lowercase();
-            let supported = matches!(
-                key.as_str(),
-                "name"
-                    | "full_name"
-                    | "preferred_name"
-                    | "nickname"
-                    | "username"
-                    | "online_nickname"
-                    | "online_handle"
-                    | "handle"
-                    | "birthday"
-                    | "birth_date"
-                    | "date_of_birth"
-                    | "residence"
-                    | "current_residence"
-                    | "birthplace"
-                    | "place_of_birth"
-            );
-            if !supported || entry.value.trim().is_empty() {
-                continue;
+
+            let facts = args.facts.filter(|facts| !facts.is_empty());
+            let single_key = args.key.filter(|key| !key.trim().is_empty());
+            if has_personal && facts.is_none() && single_key.is_none() {
+                return Ok(results.join("\n"));
             }
-            if !owner_added {
-                structured.entities.push(PersonalEntityCandidate {
-                    local_id: "owner".to_string(),
-                    entity_type: "person".to_string(),
-                    canonical_name: if matches!(key.as_str(), "name" | "full_name") {
-                        entry.value.clone()
-                    } else {
-                        "Owner".to_string()
-                    },
-                    is_reference: false,
-                    canonical_name_confirmed: matches!(key.as_str(), "name" | "full_name"),
-                });
-                owner_added = true;
-            } else if matches!(key.as_str(), "name" | "full_name") {
-                if let Some(owner) = structured.entities.first_mut() {
-                    owner.canonical_name = entry.value.clone();
-                    owner.canonical_name_confirmed = true;
+
+            // Build the list of facts to store (batch or single)
+            let entries: Vec<FactEntry> = if let Some(facts) = facts {
+                facts
+            } else {
+                // Single-fact mode: require all three fields
+                let category = args.category.ok_or_else(|| {
+                    anyhow::anyhow!("'category' is required (or use 'facts' array)")
+                })?;
+                let key = single_key
+                    .ok_or_else(|| anyhow::anyhow!("'key' is required (or use 'facts' array)"))?;
+                let value = args
+                    .value
+                    .ok_or_else(|| anyhow::anyhow!("'value' is required (or use 'facts' array)"))?;
+                vec![FactEntry {
+                    category,
+                    key,
+                    value,
+                }]
+            };
+
+            let mut structured = PersonalMemoryWrite {
+                direct_user_statement: true,
+                ..Default::default()
+            };
+            let mut owner_added = false;
+            let mut structured_indices = std::collections::BTreeSet::new();
+            for (index, entry) in entries.iter().enumerate() {
+                if !matches!(
+                    entry.category.trim().to_ascii_lowercase().as_str(),
+                    "user" | "personal" | "profile"
+                ) {
+                    continue;
                 }
-            }
-            match key.as_str() {
-                "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
-                    entity_local_id: "owner".to_string(),
-                    value: entry.value.clone(),
-                    alias_type: "legal_name_variant".to_string(),
-                }),
-                "preferred_name" | "nickname" => structured.aliases.push(PersonalAliasCandidate {
-                    entity_local_id: "owner".to_string(),
-                    value: entry.value.clone(),
-                    alias_type: key,
-                }),
-                "username" | "online_nickname" | "online_handle" | "handle" => {
-                    structured.aliases.push(PersonalAliasCandidate {
+                let key = entry.key.trim().to_ascii_lowercase();
+                let supported = matches!(
+                    key.as_str(),
+                    "name"
+                        | "full_name"
+                        | "preferred_name"
+                        | "nickname"
+                        | "username"
+                        | "online_nickname"
+                        | "online_handle"
+                        | "handle"
+                        | "birthday"
+                        | "birth_date"
+                        | "date_of_birth"
+                        | "residence"
+                        | "current_residence"
+                        | "birthplace"
+                        | "place_of_birth"
+                );
+                if !supported || entry.value.trim().is_empty() {
+                    continue;
+                }
+                if !owner_added {
+                    structured.entities.push(PersonalEntityCandidate {
+                        local_id: "owner".to_string(),
+                        entity_type: "person".to_string(),
+                        canonical_name: if matches!(key.as_str(), "name" | "full_name") {
+                            entry.value.clone()
+                        } else {
+                            "Owner".to_string()
+                        },
+                        is_reference: false,
+                        canonical_name_confirmed: matches!(key.as_str(), "name" | "full_name"),
+                    });
+                    owner_added = true;
+                } else if matches!(key.as_str(), "name" | "full_name") {
+                    if let Some(owner) = structured.entities.first_mut() {
+                        owner.canonical_name = entry.value.clone();
+                        owner.canonical_name_confirmed = true;
+                    }
+                }
+                match key.as_str() {
+                    "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
                         entity_local_id: "owner".to_string(),
                         value: entry.value.clone(),
-                        alias_type: "online_handle".to_string(),
-                    })
+                        alias_type: "legal_name_variant".to_string(),
+                    }),
+                    "preferred_name" | "nickname" => {
+                        structured.aliases.push(PersonalAliasCandidate {
+                            entity_local_id: "owner".to_string(),
+                            value: entry.value.clone(),
+                            alias_type: key,
+                        })
+                    }
+                    "username" | "online_nickname" | "online_handle" | "handle" => {
+                        structured.aliases.push(PersonalAliasCandidate {
+                            entity_local_id: "owner".to_string(),
+                            value: entry.value.clone(),
+                            alias_type: "online_handle".to_string(),
+                        })
+                    }
+                    _ => structured.facts.push(PersonalFactCandidate {
+                        subject_local_id: "owner".to_string(),
+                        predicate: key,
+                        value: entry.value.clone(),
+                        display_value: None,
+                        valid_from: None,
+                        valid_to: None,
+                    }),
                 }
-                _ => structured.facts.push(PersonalFactCandidate {
-                    subject_local_id: "owner".to_string(),
-                    predicate: key,
-                    value: entry.value.clone(),
-                    display_value: None,
-                    valid_from: None,
-                    valid_to: None,
-                }),
+                structured_indices.insert(index);
             }
-            structured_indices.insert(index);
-        }
 
-        if !structured.entities.is_empty() {
-            let result = self
-                .state
-                .reconcile_personal_memory(
-                    &structured,
-                    "agent",
-                    None,
-                    channel_id.as_deref(),
-                    FactPrivacy::Private,
-                )
-                .await?;
-            results.push(format!("Personal memory: {}", result.concise_summary()));
-            for index in &structured_indices {
-                let entry = &entries[*index];
+            if !structured.entities.is_empty() {
+                let result = self
+                    .state
+                    .reconcile_personal_memory(
+                        &structured,
+                        "agent",
+                        None,
+                        channel_id.as_deref(),
+                        FactPrivacy::Private,
+                    )
+                    .await?;
+                results.push(format!("Personal memory: {}", result.concise_summary()));
+                for index in &structured_indices {
+                    let entry = &entries[*index];
+                    results.push(format!(
+                        "Remembered: [{}] {} = {} (canonical)",
+                        entry.category, entry.key, entry.value
+                    ));
+                }
+            }
+
+            for (index, entry) in entries.iter().enumerate() {
+                if structured_indices.contains(&index) {
+                    continue;
+                }
+                // Reject persona/identity manipulation saves
+                if is_persona_manipulation(&entry.category, &entry.key, &entry.value) {
+                    results.push(format!(
+                        "Rejected [{}] {}: cannot save persona/identity changes",
+                        entry.category, entry.key
+                    ));
+                    continue;
+                }
+
+                // Reject personal goal tracking in facts
+                if is_goal_fact(&entry.category, &entry.key, &entry.value) {
+                    results.push(format!(
+                        "Rejected [{}] {}: use manage_memories(create_personal_goal) for goals",
+                        entry.category, entry.key
+                    ));
+                    continue;
+                }
+
+                // Empty/whitespace-only value or explicit deletion markers → delete the fact
+                if is_deletion_marker(&entry.value) {
+                    let deleted = self
+                        .state
+                        .delete_fact_by_key(&entry.category, &entry.key)
+                        .await?;
+                    if deleted {
+                        results.push(format!("Deleted: [{}] {}", entry.category, entry.key));
+                    } else {
+                        results.push(format!(
+                            "Not found (nothing to delete): [{}] {}",
+                            entry.category, entry.key
+                        ));
+                    }
+                    continue;
+                }
+
+                self.state
+                    .upsert_fact(
+                        &entry.category,
+                        &entry.key,
+                        &entry.value,
+                        "agent",
+                        channel_id.as_deref(),
+                        FactPrivacy::Global,
+                    )
+                    .await?;
                 results.push(format!(
-                    "Remembered: [{}] {} = {} (canonical)",
+                    "Remembered: [{}] {} = {}",
                     entry.category, entry.key, entry.value
                 ));
             }
+
+            Ok(results.join("\n"))
         }
-
-        for (index, entry) in entries.iter().enumerate() {
-            if structured_indices.contains(&index) {
-                continue;
-            }
-            // Reject persona/identity manipulation saves
-            if is_persona_manipulation(&entry.category, &entry.key, &entry.value) {
-                results.push(format!(
-                    "Rejected [{}] {}: cannot save persona/identity changes",
-                    entry.category, entry.key
-                ));
-                continue;
-            }
-
-            // Reject personal goal tracking in facts
-            if is_goal_fact(&entry.category, &entry.key, &entry.value) {
-                results.push(format!(
-                    "Rejected [{}] {}: use manage_memories(create_personal_goal) for goals",
-                    entry.category, entry.key
-                ));
-                continue;
-            }
-
-            // Empty/whitespace-only value or explicit deletion markers → delete the fact
-            if is_deletion_marker(&entry.value) {
-                let deleted = self
-                    .state
-                    .delete_fact_by_key(&entry.category, &entry.key)
-                    .await?;
-                if deleted {
-                    results.push(format!("Deleted: [{}] {}", entry.category, entry.key));
-                } else {
-                    results.push(format!(
-                        "Not found (nothing to delete): [{}] {}",
-                        entry.category, entry.key
-                    ));
-                }
-                continue;
-            }
-
-            self.state
-                .upsert_fact(
-                    &entry.category,
-                    &entry.key,
-                    &entry.value,
-                    "agent",
-                    channel_id.as_deref(),
-                    FactPrivacy::Global,
-                )
-                .await?;
-            results.push(format!(
-                "Remembered: [{}] {} = {}",
-                entry.category, entry.key, entry.value
-            ));
-        }
-
-        Ok(results.join("\n"))
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -500,6 +510,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     async fn setup() -> (

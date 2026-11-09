@@ -79,22 +79,25 @@ pub use provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 pub(crate) use tools::NothingSentError;
+#[cfg(test)]
+pub use tools::ToolCalls;
 #[allow(unused_imports)]
 pub use tools::{
-    default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
-    ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
-    DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, FileGuard,
-    GoalContext, NetworkReach, OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, RuntimePreparationFailure, SameToolStreak, ScopeEscalation,
-    SpecialistKind, StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
+    default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, status_sender,
+    with_status, AgentRole, ApprovalCall, ApprovalScope, AuthorizationPreflightRecord,
+    AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
+    EvidenceTemporalScope, FileGuard, GoalContext, NetworkReach, OwnerApprovalNeed,
+    PreparedToolInvocation, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    RuntimePreparationFailure, SameToolStreak, ScopeEscalation, SpecialistKind,
+    StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
     ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallContext, ToolCallEffect,
     ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolCollectionCompleteness, ToolCollectionObservation, ToolDispatchFacts,
     ToolEvidenceCapability, ToolInvocationStage, ToolMutationEffects, ToolObservationEvidence,
     ToolOutcomeStatus, ToolReceiptKind, ToolResultCompleteness, ToolResultContentSource,
     ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticFacet, ToolSemanticScope,
-    ToolSemantics, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
-    TrustRoots, EGRESS_EFFECTS,
+    ToolSemantics, ToolStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };
 pub use trigger_event::TriggerEvent;
 

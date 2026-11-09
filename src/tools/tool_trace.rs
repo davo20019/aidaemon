@@ -71,17 +71,31 @@ impl Tool for ToolTraceTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ToolTraceArgs = serde_json::from_str(arguments)?;
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: ToolTraceArgs = serde_json::from_str(arguments)?;
 
-        let delegated = json!({
-            "action": "tool_trace",
-            "goal_id": args.goal_id,
-            "task_id": args.task_id,
-            "tool_name": args.tool_name,
-            "limit": args.limit
-        });
-        self.inner.call(&delegated.to_string()).await
+            let delegated = json!({
+                "action": "tool_trace",
+                "goal_id": args.goal_id,
+                "task_id": args.task_id,
+                "tool_name": args.tool_name,
+                "limit": args.limit
+            });
+            self.inner
+                .execute(
+                    &delegated.to_string(),
+                    &crate::traits::ToolCallContext::default(),
+                )
+                .await
+                .map(|outcome| outcome.output)
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -111,6 +125,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::ToolCalls as _;
     use crate::traits::{Goal, Task, TaskActivity};
 
     async fn setup_state() -> Arc<dyn StateStore> {

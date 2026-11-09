@@ -122,8 +122,9 @@ async fn call_scoped_builtin_file_tool(
         Ok(prepared) => prepared,
         Err(rejection) => return Ok(*rejection),
     };
+    let exec_ctx = crate::traits::with_status(exec_ctx, status_tx);
     let mut outcome = tool
-        .call_with_execution_context(&prepared.canonical_arguments, status_tx, exec_ctx)
+        .execute(&prepared.canonical_arguments, &exec_ctx)
         .await?;
     outcome = finalize_dispatched_outcome(&prepared, outcome);
     Ok(outcome)
@@ -922,8 +923,9 @@ impl Agent {
                 };
                 let mut exec_ctx = call_facts.clone();
                 exec_ctx.mandate_preapproved = mandate_preapproved;
+                let exec_ctx = crate::traits::with_status(exec_ctx, ctx.status_tx.clone());
                 let result = tool
-                    .call_with_execution_context(prepared_args, ctx.status_tx.clone(), exec_ctx)
+                    .execute(prepared_args, &exec_ctx)
                     .await
                     .map(|outcome| finalize_dispatched_outcome(&prepared, outcome));
                 if result.as_ref().is_ok_and(|outcome| {
@@ -977,12 +979,9 @@ impl Agent {
                 };
                 let mut exec_ctx = call_facts.clone();
                 exec_ctx.mandate_preapproved = mandate_preapproved;
+                let exec_ctx = crate::traits::with_status(exec_ctx, ctx.status_tx.clone());
                 return tool
-                    .call_with_execution_context(
-                        &prepared.canonical_arguments,
-                        ctx.status_tx.clone(),
-                        exec_ctx,
-                    )
+                    .execute(&prepared.canonical_arguments, &exec_ctx)
                     .await
                     .map(|outcome| finalize_dispatched_outcome(&prepared, outcome));
             }

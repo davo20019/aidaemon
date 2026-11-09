@@ -538,17 +538,12 @@ impl crate::traits::Tool for TrustProbeTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("the dispatcher calls with a context")
-    }
+    
 
     /// Records the dispatcher's typed trust fact for the call.
-    async fn call_with_execution_context(
-        &self,
-        _arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+    async fn execute(&self, _arguments: &str, facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let facts = facts.clone();
+
         let trusted = facts.trusted_session;
         self.seen.lock().await.push(trusted);
         Ok(crate::traits::ToolCallOutcome::from_output(

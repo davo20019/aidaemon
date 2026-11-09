@@ -5,6 +5,7 @@
 //! later tasks will touch.
 
 use crate::testing::CallWithFacts;
+use crate::traits::ToolCalls as _;
 use std::sync::Arc;
 use std::time::Duration;
 

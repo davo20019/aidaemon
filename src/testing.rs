@@ -3,6 +3,7 @@
 //! Provides a fully wired Agent with a mock LLM and in-memory state,
 //! suitable for integration tests that exercise the real agent loop.
 
+use crate::traits::ToolCalls as _;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1355,18 +1356,13 @@ impl Tool for MockTool {
         })
     }
 
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
-        Ok(self.return_value.clone())
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let output = self.call_with_status(arguments, status_tx).await?;
         Ok(crate::traits::ToolCallOutcome {
-            output,
+            output: self.return_value.clone(),
             metadata: self.return_metadata.clone(),
             finish: self.return_finish.clone(),
         })

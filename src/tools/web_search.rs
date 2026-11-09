@@ -667,65 +667,73 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let query = args["query"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
-        let max_results = args["max_results"]
-            .as_u64()
-            .map(|n| n as usize)
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(1, MAX_MAX_RESULTS);
-        let freshness = args["freshness"].as_str().and_then(Freshness::parse);
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let query = args["query"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
+            let max_results = args["max_results"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .clamp(1, MAX_MAX_RESULTS);
+            let freshness = args["freshness"].as_str().and_then(Freshness::parse);
 
-        // Fan out to every backend concurrently; tolerate individual failures.
-        let searches = self.backends.iter().map(|backend| async move {
-            let name = backend.name();
-            match tokio::time::timeout(
-                BACKEND_TIMEOUT,
-                backend.search(query, max_results, freshness),
-            )
-            .await
-            {
-                Ok(Ok(results)) => (name, Ok(results)),
-                Ok(Err(e)) => (name, Err(e.to_string())),
-                Err(_) => (
-                    name,
-                    Err(format!("timed out after {}s", BACKEND_TIMEOUT.as_secs())),
-                ),
+            // Fan out to every backend concurrently; tolerate individual failures.
+            let searches = self.backends.iter().map(|backend| async move {
+                let name = backend.name();
+                match tokio::time::timeout(
+                    BACKEND_TIMEOUT,
+                    backend.search(query, max_results, freshness),
+                )
+                .await
+                {
+                    Ok(Ok(results)) => (name, Ok(results)),
+                    Ok(Err(e)) => (name, Err(e.to_string())),
+                    Err(_) => (
+                        name,
+                        Err(format!("timed out after {}s", BACKEND_TIMEOUT.as_secs())),
+                    ),
+                }
+            });
+            let outcomes = futures::future::join_all(searches).await;
+
+            let mut successes: Vec<(&'static str, Vec<SearchResult>)> = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            for (name, outcome) in outcomes {
+                match outcome {
+                    Ok(results) => successes.push((name, results)),
+                    Err(err) => failures.push(format!("{}: {}", name, err)),
+                }
             }
-        });
-        let outcomes = futures::future::join_all(searches).await;
 
-        let mut successes: Vec<(&'static str, Vec<SearchResult>)> = Vec::new();
-        let mut failures: Vec<String> = Vec::new();
-        for (name, outcome) in outcomes {
-            match outcome {
-                Ok(results) => successes.push((name, results)),
-                Err(err) => failures.push(format!("{}: {}", name, err)),
+            if successes.is_empty() {
+                anyhow::bail!("All search backends failed — {}", failures.join("; "));
             }
-        }
 
-        if successes.is_empty() {
-            anyhow::bail!("All search backends failed — {}", failures.join("; "));
-        }
+            let merged = merge_ranked(&successes, max_results);
 
-        let merged = merge_ranked(&successes, max_results);
-
-        if merged.is_empty() {
-            let mut msg = format!("No results found for: {}", query);
-            if !failures.is_empty() {
-                msg.push_str(&format!(
-                    "\n(Note: some backends were unavailable — {})",
-                    failures.join("; ")
-                ));
+            if merged.is_empty() {
+                let mut msg = format!("No results found for: {}", query);
+                if !failures.is_empty() {
+                    msg.push_str(&format!(
+                        "\n(Note: some backends were unavailable — {})",
+                        failures.join("; ")
+                    ));
+                }
+                return Ok(msg);
             }
-            return Ok(msg);
-        }
 
-        let multi_source = self.backends.len() > 1;
-        Ok(format_search_output(&merged, multi_source, &failures))
+            let multi_source = self.backends.len() > 1;
+            Ok(format_search_output(&merged, multi_source, &failures))
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

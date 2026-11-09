@@ -387,127 +387,14 @@ impl sdk::Hook for DispatchGate {
     }
 }
 
-/// A daemon tool as the SDK sees it. It only forwards the call; the daemon
-/// dispatcher executes it on the turn's own task.
-pub(super) struct BridgedTool {
-    pub(super) spec: sdk::ToolSpec,
-    pub(super) tool: Arc<dyn crate::traits::Tool>,
-    /// `manage_memories` offered with only its goal actions.
-    pub(super) goal_actions_only: bool,
+/// Runs a turn's tool calls on the daemon dispatcher, on the turn's own task.
+pub(super) struct TurnDispatch {
     pub(super) calls: mpsc::Sender<DaemonCall>,
-    /// The turn's trusted roots: where an effect lands can decide its class.
-    pub(super) trust_roots: Arc<Vec<String>>,
 }
 
 #[async_trait]
-impl sdk::Tool for BridgedTool {
-    fn spec(&self) -> sdk::ToolSpec {
-        self.spec.clone()
-    }
-
-    /// Worst case for the tool as a whole: only a tool that is read-only
-    /// for every call says so; any other may be destructive and egress.
-    fn annotations(&self) -> sdk::ToolAnnotations {
-        if self.tool.capabilities().read_only {
-            sdk::ToolAnnotations::READ_ONLY
-        } else {
-            sdk::ToolAnnotations {
-                read_only: false,
-                destructive: true,
-                idempotent: false,
-                egress: true,
-            }
-        }
-    }
-
-    /// Judged per call: a mixed tool such as `terminal` reads for `ls` and
-    /// writes for `rm`.
-    fn annotations_for(&self, arguments: &Value) -> sdk::ToolAnnotations {
-        self.tool.call_annotations_in(
-            &arguments.to_string(),
-            &crate::traits::TrustRoots::new(&self.trust_roots),
-        )
-    }
-
-    fn outbound(&self, arguments: &Value) -> sdk::Outbound {
-        self.tool.call_outbound(&arguments.to_string())
-    }
-
-    /// The daemon tool's own declaration for the arguments it will be
-    /// dispatched with (after its argument canonicalization).
-    fn effects(&self, arguments: &Value) -> sdk::CallEffects {
-        let raw = arguments.to_string();
-        let canonical = self.tool.canonicalize_arguments(&raw).unwrap_or(raw);
-        self.tool.call_effects(&canonical)
-    }
-
-    /// The declared effects as the kernel's access manifest: egress
-    /// targets as hosts, path effects as writes, and the terminal's command
-    /// line of a `shell_command_line` tool, given as `command` or `script`
-    /// (so the approval policy's catastrophic-command check sees it).
-    fn access(&self, arguments: &Value) -> sdk::AccessManifest {
-        let mut manifest = sdk::AccessManifest::default();
-        if self.tool.dispatch_facts().shell_command_line {
-            for field in ["command", "script"] {
-                if let Some(text) = arguments
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    manifest.commands.push(text.to_string());
-                }
-            }
-        }
-        for key in self.effects(arguments).keys {
-            let list = match key.class {
-                sdk::EffectClass::Egress => &mut manifest.hosts,
-                sdk::EffectClass::Write
-                | sdk::EffectClass::Delete
-                | sdk::EffectClass::Configuration => &mut manifest.writes,
-                _ => continue,
-            };
-            if !list.contains(&key.target) {
-                list.push(key.target);
-            }
-        }
-        // A file tool's paths, for the protected-path guard. Effects do not
-        // name reads, and name no writes on a remote backend.
-        if self.tool.dispatch_facts().file_guard != crate::traits::FileGuard::None {
-            let raw = arguments.to_string();
-            let canonical = self.tool.canonicalize_arguments(&raw).unwrap_or(raw);
-            let (reads, writes) = self.tool.guarded_paths(&canonical);
-            manifest.reads.extend(reads);
-            for write in writes {
-                if !manifest.writes.contains(&write) {
-                    manifest.writes.push(write);
-                }
-            }
-        }
-        manifest
-    }
-
-    /// Fallback only: the dispatcher stamps each result with the exact
-    /// call's trust (`ToolSemantics::output_trust`).
-    fn source_trust(&self, _arguments: &Value) -> sdk::SourceTrust {
-        sdk::SourceTrust::Untrusted
-    }
-
-    /// Daemon tools check their own arguments (some accept aliases for
-    /// schema-required keys) and report bad ones through the dispatcher.
-    /// Only the goal-actions view of `manage_memories` is narrowed here; the
-    /// kernel records that refusal in the run ledger.
-    fn validate(&self, arguments: &Value) -> Result<(), String> {
-        if self.goal_actions_only {
-            crate::agent::memory_plugin::check_goal_action(arguments)?;
-        }
-        Ok(())
-    }
-
-    fn timeout(&self) -> Option<Duration> {
-        Some(TOOL_TIMEOUT)
-    }
-
-    async fn call(&self, arguments: Value, ctx: &sdk::ToolContext) -> sdk::ToolResult {
+impl aidaemon_tools::OutcomeRunner for TurnDispatch {
+    async fn run(&self, tool: &str, arguments: Value, ctx: &sdk::ToolContext) -> sdk::ToolResult {
         let (reply, answer) = oneshot::channel();
         let abandoned = tokio_util::sync::CancellationToken::new();
         let _stop_when_dropped = abandoned.clone().drop_guard();
@@ -516,7 +403,7 @@ impl sdk::Tool for BridgedTool {
                 abandoned,
                 call: KernelCall {
                     run_id: ctx.run_id,
-                    name: self.spec.name.clone(),
+                    name: tool.to_string(),
                     arguments,
                     call_id: ctx.call_id.clone(),
                 },
@@ -528,6 +415,31 @@ impl sdk::Tool for BridgedTool {
             .await
             .map_err(|_| sdk::ToolError("tool dispatcher dropped the call".to_string()))?
     }
+}
+
+/// A daemon tool as this turn's kernel agent runs it. Daemon tools check
+/// their own arguments (some accept aliases for schema-required keys) and
+/// report bad ones through the dispatcher; only the goal-actions view of
+/// the memory tool is narrowed here, so the kernel records that refusal in
+/// the run ledger.
+pub(super) fn turn_tool(
+    spec: sdk::ToolSpec,
+    tool: Arc<dyn crate::traits::Tool>,
+    goal_actions_only: bool,
+    calls: mpsc::Sender<DaemonCall>,
+    trust_roots: Arc<Vec<String>>,
+) -> aidaemon_tools::KernelAdapter<dyn crate::traits::Tool> {
+    aidaemon_tools::KernelAdapter::new(tool)
+        .with_spec(spec)
+        .with_trust_roots(trust_roots)
+        .with_timeout(TOOL_TIMEOUT)
+        .with_validator(Arc::new(move |arguments| {
+            if goal_actions_only {
+                crate::agent::memory_plugin::check_goal_action(arguments)?;
+            }
+            Ok(())
+        }))
+        .with_runner(Arc::new(TurnDispatch { calls }))
 }
 
 /// Build an SDK tool spec from a daemon tool's OpenAI-style function schema.

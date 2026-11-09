@@ -7763,36 +7763,14 @@ impl Tool for TerminalTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender.
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_outcome(arguments, status_tx)
-            .await
-            .map(|outcome| outcome.output)
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let exec_ctx = facts.clone();
 
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, &ToolCallContext::default())
-            .await
-    }
-
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         self.execute_terminal(arguments, status_tx, &exec_ctx).await
     }
 }
@@ -8054,8 +8032,9 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
     use crate::testing::MockProvider;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
-    use crate::traits::{NotificationStore, StateStore, Tool};
+    use crate::traits::{NotificationStore, StateStore};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;

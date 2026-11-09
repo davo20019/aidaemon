@@ -11,8 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::tools::ManageMemoriesTool;
 use crate::traits::{
-    StateStore, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolOutcomeStatus,
+    StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolOutcomeStatus,
 };
 
 pub struct SetReminderTool {
@@ -78,30 +78,13 @@ impl Tool for SetReminderTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.scheduler
-            .run(
-                &scheduler_arguments(arguments)?,
-                &ToolCallContext::default(),
-            )
-            .await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let output = self
             .scheduler
             .run(&scheduler_arguments(arguments)?, &facts)
@@ -150,6 +133,7 @@ impl crate::traits::ToolSemantics for SetReminderTool {
 mod tests {
     use super::*;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolCalls as _;
 
     async fn state() -> Arc<crate::state::SqliteStateStore> {
         let db = tempfile::NamedTempFile::new().unwrap();
@@ -175,7 +159,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
-                ToolCallContext {
+                crate::traits::ToolCallContext {
                     session_id: "telegram:synthetic-user-1".into(),
                     user_role: Some(crate::types::UserRole::Owner),
                     ..Default::default()
@@ -218,7 +202,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
-                ToolCallContext {
+                crate::traits::ToolCallContext {
                     session_id: "telegram:synthetic-user-2".into(),
                     user_role: Some(crate::types::UserRole::Guest),
                     ..Default::default()

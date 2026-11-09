@@ -818,9 +818,17 @@ impl crate::traits::Tool for ShellProbe {
             "parameters": {"type": "object", "properties": {"write": {"type": "boolean"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("acme.md\nmia.txt".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("acme.md\nmia.txt".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -865,8 +873,13 @@ impl crate::traits::Tool for EffectsProbe {
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("sent".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { Ok("sent".to_string()) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -893,13 +906,13 @@ fn bridged_tool_exposes_effects_to_kernel() {
     use aidaemon_core::Tool as _;
     let probe: Arc<dyn crate::traits::Tool> = Arc::new(EffectsProbe);
     let (calls, _rx) = mpsc::channel(1);
-    let bridged = BridgedTool {
-        spec: tool_spec(probe.as_ref()),
-        tool: probe.clone(),
-        goal_actions_only: false,
+    let bridged = turn_tool(
+        tool_spec(probe.as_ref()),
+        probe.clone(),
+        false,
         calls,
-        trust_roots: Arc::new(Vec::new()),
-    };
+        Arc::new(Vec::new()),
+    );
     let arguments = serde_json::json!({"path": "/tmp/aidaemon-test/report/out.md"});
     let info = sdk::ToolInfo {
         annotations: bridged.annotations_for(&arguments),
@@ -932,8 +945,13 @@ impl crate::traits::Tool for DownProbe {
             "parameters": {"type": "object", "properties": {}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("unreachable".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { Ok("unreachable".to_string()) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -981,13 +999,13 @@ fn read_only_authority_admits_observing_and_administrative_calls_of_a_mixed_tool
     let probe: Arc<dyn crate::traits::Tool> =
         Arc::new(ShellProbe(Arc::new(std::sync::atomic::AtomicUsize::new(0))));
     let (calls, _rx) = mpsc::channel(1);
-    let bridged = BridgedTool {
-        spec: tool_spec(probe.as_ref()),
-        tool: probe,
-        goal_actions_only: false,
+    let bridged = turn_tool(
+        tool_spec(probe.as_ref()),
+        probe,
+        false,
         calls,
-        trust_roots: Arc::new(Vec::new()),
-    };
+        Arc::new(Vec::new()),
+    );
     let authority = sdk::Authority::read_only();
     let permits = |arguments: serde_json::Value| {
         authority
@@ -1822,13 +1840,13 @@ async fn bridged_terminal_access_lists_command_and_script() {
         .await,
     );
     let (calls, _rx) = mpsc::channel(1);
-    let bridged = BridgedTool {
-        spec: tool_spec(terminal.as_ref()),
-        tool: terminal,
-        goal_actions_only: false,
+    let bridged = turn_tool(
+        tool_spec(terminal.as_ref()),
+        terminal,
+        false,
         calls,
-        trust_roots: Arc::new(Vec::new()),
-    };
+        Arc::new(Vec::new()),
+    );
     let command = "rm -rf --no-preserve-root /";
     let by_command = bridged.access(&serde_json::json!({"action": "run", "command": command}));
     assert_eq!(by_command.commands, [command]);
@@ -1859,13 +1877,13 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
         .await,
     );
     let (calls, _rx) = mpsc::channel(1);
-    let bridged = BridgedTool {
-        spec: tool_spec(terminal.as_ref()),
-        tool: terminal,
-        goal_actions_only: false,
+    let bridged = turn_tool(
+        tool_spec(terminal.as_ref()),
+        terminal,
+        false,
         calls,
-        trust_roots: Arc::new(Vec::new()),
-    };
+        Arc::new(Vec::new()),
+    );
     // The worst case for the whole tool is a write.
     assert!(!bridged.annotations().read_only);
     let read_only = |args: serde_json::Value| bridged.annotations_for(&args).read_only;
@@ -2406,12 +2424,14 @@ async fn bridged_tool_annotations_follow_call_annotations_in() {
     use aidaemon_core::Tool as _;
     let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
     let (calls, _rx) = mpsc::channel(1);
-    let bridge = |tool: Arc<dyn crate::traits::Tool>| BridgedTool {
-        spec: tool_spec(tool.as_ref()),
-        tool,
-        goal_actions_only: false,
-        calls: calls.clone(),
-        trust_roots: Arc::new(Vec::new()),
+    let bridge = |tool: Arc<dyn crate::traits::Tool>| {
+        turn_tool(
+            tool_spec(tool.as_ref()),
+            tool,
+            false,
+            calls.clone(),
+            Arc::new(Vec::new()),
+        )
     };
     let send = bridge(Arc::new(crate::tools::SendFileTool::new(
         crate::execution::active_execution_backend(),
@@ -2454,8 +2474,13 @@ impl crate::traits::Tool for PageProbe {
             "parameters": {"type": "object", "properties": {"url": {"type": "string"}}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(INJECTED_PAGE.to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { Ok(INJECTED_PAGE.to_string()) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -2492,9 +2517,17 @@ impl crate::traits::Tool for SendProbe {
             }
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("sent".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("sent".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -2971,13 +3004,21 @@ impl crate::traits::Tool for TaintRecordProbe {
             "parameters": {"type": "object", "properties": {}}
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let state = self.state.get().expect("store set").clone();
-        let turns =
-            crate::agent::untrusted::tainted_turns(state.as_ref(), "telegram:synthetic-user-1")
-                .await?;
-        *self.seen.lock().unwrap() = Some(turns.len());
-        Ok("ok".to_string())
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let state = self.state.get().expect("store set").clone();
+            let turns =
+                crate::agent::untrusted::tainted_turns(state.as_ref(), "telegram:synthetic-user-1")
+                    .await?;
+            *self.seen.lock().unwrap() = Some(turns.len());
+            Ok("ok".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -3049,18 +3090,16 @@ impl crate::traits::Tool for SpawnRecorder {
             }
         })
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("the dispatcher calls with a context")
-    }
 
     /// Records the model's arguments plus, under `parent_authority_fact`,
     /// the parent authority the dispatcher handed over in the call facts.
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: crate::traits::ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
         let mut recorded: serde_json::Value = serde_json::from_str(arguments)?;
         recorded["parent_authority_fact"] =
             serde_json::to_value(crate::agent::authority::parent_authority(&facts))?;
@@ -3252,12 +3291,20 @@ impl crate::traits::Tool for ArgsRecorder {
             "parameters": {"type": "object", "properties": {"mission": {"type": "string"}}}
         })
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(serde_json::from_str(arguments)?);
-        Ok("recorded".to_string())
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(arguments)?);
+            Ok("recorded".to_string())
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -3370,8 +3417,14 @@ impl crate::traits::Tool for OfferedGoalRuns {
     fn schema(&self) -> serde_json::Value {
         crate::traits::Tool::schema(&self.0)
     }
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        crate::traits::Tool::call(&self.0, arguments).await
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> =
+            async move { crate::traits::ToolCalls::call(&self.0, arguments).await }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -4602,8 +4655,13 @@ impl crate::traits::Tool for ScopeFileTool {
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({"name": self.0, "description": "", "parameters": {"type": "object"}})
     }
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        anyhow::bail!("not run")
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { anyhow::bail!("not run") }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

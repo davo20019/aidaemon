@@ -297,8 +297,13 @@ Order:
       - after-call bookkeeping (result fitting, receipts, status line,
         learning, taint) still runs inside the bridged tool's dispatch; it
         needs daemon metadata the kernel does not carry;
-      - the daemon `Tool` trait and `BridgedTool` go with 8.4 (tools on the
-        kernel `Tool`);
+      - Done 2026-11-09: the daemon `Tool` trait, `KernelTool` and
+        `BridgedTool` are gone. Every daemon tool is an
+        `aidaemon_tools::OutcomeTool` with one `execute(arguments, facts)`
+        (`crate::traits::Tool` is that trait re-exported); progress travels
+        in `facts.extensions`. `aidaemon_tools::KernelAdapter` makes any
+        `OutcomeTool` a kernel `Tool`, and the daemon supplies only its
+        `OutcomeRunner` (the turn's dispatcher);
       - about 45 readers of the global `active_execution_backend()`
         outside `src/tools` (one backend per process, so plumbing it is
         cleanup, not a behavior change). Checked 2026-11-09: not mechanical.
@@ -355,9 +360,7 @@ Order:
       The daemon's classifier is now a `DaemonPaths` value built once in
       `run()` and passed through `Agent` to the file tools, the scope
       checks, the approval rules and Slack.
-      Left: nothing from the ten steps. Moving the tools onto the kernel
-      `Tool` (deleting the daemon `Tool` and `BridgedTool`) is not one of
-      them; it is tracked under 8.3.
+      Left: nothing from the ten steps.
 - [x] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.

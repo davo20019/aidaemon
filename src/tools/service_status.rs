@@ -53,49 +53,57 @@ impl Tool for ServiceStatusTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let filters: Vec<String> = args["services"]
-            .as_array()
-            .map(|arr| {
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let filters: Vec<String> = args["services"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect()
-            })
-            .unwrap_or_default();
-
-        let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else {
-            VALID_SECTIONS.iter().map(|s| s.to_string()).collect()
-        };
-
-        let mut output = String::new();
-
-        for section in &sections {
-            let section_output = match section.as_str() {
-                "ports" => get_listening_ports(&*self.backend, &filters).await,
-                "docker" => get_docker_status(&*self.backend, &filters).await,
-                "processes" => get_dev_processes(&*self.backend, &filters).await,
-                _ => continue,
+            } else {
+                VALID_SECTIONS.iter().map(|s| s.to_string()).collect()
             };
 
-            if !section_output.is_empty() {
-                output.push_str(&format!(
-                    "## {}\n{}\n",
-                    capitalize_first(section),
-                    section_output
-                ));
+            let mut output = String::new();
+
+            for section in &sections {
+                let section_output = match section.as_str() {
+                    "ports" => get_listening_ports(&*self.backend, &filters).await,
+                    "docker" => get_docker_status(&*self.backend, &filters).await,
+                    "processes" => get_dev_processes(&*self.backend, &filters).await,
+                    _ => continue,
+                };
+
+                if !section_output.is_empty() {
+                    output.push_str(&format!(
+                        "## {}\n{}\n",
+                        capitalize_first(section),
+                        section_output
+                    ));
+                }
             }
-        }
 
-        if output.is_empty() {
-            output.push_str("No services detected.");
-        }
+            if output.is_empty() {
+                output.push_str("No services detected.");
+            }
 
-        Ok(output)
+            Ok(output)
+        }
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -246,6 +254,7 @@ fn filter_output(output: &str, filters: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {

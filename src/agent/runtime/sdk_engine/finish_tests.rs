@@ -193,16 +193,13 @@ impl Tool for Connector {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok(CONNECTOR_REPLY.to_string())
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         _arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: crate::traits::ToolCallContext,
+        facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
+
         let outcome = crate::traits::ToolCallOutcome {
             output: CONNECTOR_REPLY.to_string(),
             metadata: ToolCallMetadata {
@@ -539,14 +536,10 @@ impl Tool for FlakySend {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        Ok("delivered".to_string())
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         _arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+        _facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         use std::sync::atomic::Ordering;
         let first = self.executions.fetch_add(1, Ordering::SeqCst) == 0;

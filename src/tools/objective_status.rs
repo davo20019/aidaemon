@@ -608,6 +608,7 @@ mod tests {
     use super::*;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::{Goal, GoalSchedule};
 
     #[tokio::test]
@@ -1055,7 +1056,6 @@ mod tests {
             created.push(objective_resource_id(&goal.id));
         }
 
-        use crate::traits::Tool as _;
         let mandates = crate::tools::manage_mandates::ManageMandatesTool::new(state.clone());
         let runs = crate::tools::scheduled_goal_runs::ScheduledGoalRunsTool::new(state.clone());
 

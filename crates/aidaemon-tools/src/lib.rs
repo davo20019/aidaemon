@@ -75,7 +75,7 @@ pub use fs::{
     FilePolicy, ProtectedPathGuard, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy,
     WriteFile, DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
 };
-pub use outcome::OutcomeTool;
+pub use outcome::{CallValidator, KernelAdapter, OutcomeRunner, OutcomeTool};
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use search_files::SearchFiles;

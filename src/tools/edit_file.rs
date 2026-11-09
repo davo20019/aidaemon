@@ -10,31 +10,34 @@ use crate::traits::Tool;
 use serde_json::json;
 
 use super::file_policy::{daemon_file_policy, DaemonPaths};
-use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
-pub type EditFileTool = KernelTool<aidaemon_tools::EditFile>;
+/// The daemon's constructors for the SDK's [`aidaemon_tools::EditFile`].
+pub struct EditFileTool;
 
+#[allow(clippy::new_ret_no_self)]
 impl EditFileTool {
     /// Without the daemon's own files protected; production passes them.
     #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> Self {
+    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::EditFile {
         Self::on_backend(backend, DaemonPaths::default())
     }
 
-    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
-        Self::wrap(
-            aidaemon_tools::EditFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
+    pub fn on_backend(
+        backend: SharedExecutionBackend,
+        paths: DaemonPaths,
+    ) -> aidaemon_tools::EditFile {
+        aidaemon_tools::EditFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Find and replace text in a file".to_string(),
                 schema: "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous. On not-found/ambiguous text, read_file the same path and retry once before asking the user.".to_string(),
-            }),
-        )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     #[test]

@@ -36,9 +36,12 @@ impl crate::traits::Tool for StructuredPatchTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok(format!("Synthetic patch applied: {arguments}"))
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for StructuredPatchTool {
@@ -88,9 +91,12 @@ impl crate::traits::Tool for HighImpactCliAgentMock {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok("cli agent executed".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for HighImpactCliAgentMock {
@@ -623,7 +629,7 @@ async fn test_spawn_timeout_salvages_persisted_executor_outcome() {
 
     let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
     let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0);
-    let result = crate::traits::Tool::call(
+    let result = crate::traits::ToolCalls::call(
         &spawn_tool,
         &json!({
             "mission": "Run the ddev composer update",

@@ -2693,25 +2693,13 @@ impl Tool for ManageMandatesTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let mut args: ManageMandatesArgs = serde_json::from_str(arguments)?;
         args.normalize_for_action();
         args.bind_facts(&facts);
@@ -3539,6 +3527,7 @@ fn display_policy(values: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::traits::ToolCalls as _;
     /// The dispatcher's facts for the owner in a private chat.
     fn owner_facts() -> crate::traits::ToolCallContext {
         crate::traits::ToolCallContext {

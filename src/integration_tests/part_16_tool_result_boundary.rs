@@ -194,13 +194,16 @@ impl crate::traits::Tool for RecordingTerminal {
         })
     }
 
-    async fn call(&self, args: &str) -> anyhow::Result<String> {
+    async fn execute(&self, args: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.seen
             .lock()
             .unwrap()
             .push(serde_json::from_str(args).unwrap_or(serde_json::Value::Null));
         Ok("ok".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for RecordingTerminal {}
@@ -766,17 +769,12 @@ impl crate::traits::Tool for GuiStandIn {
         })
     }
 
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
-        anyhow::bail!("the dispatcher calls with a context")
-    }
+    
 
     /// Pins and flags the call's task, from the dispatcher's typed facts.
-    async fn call_with_execution_context(
-        &self,
-        _args: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+    async fn execute(&self, _args: &str, facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let facts = facts.clone();
+
         self.run(facts.task_id.unwrap_or_default())
             .await
             .map(crate::traits::ToolCallOutcome::from_output)

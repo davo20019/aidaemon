@@ -465,10 +465,13 @@ impl crate::traits::Tool for IdempotencyProbeTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok("mutation applied".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for IdempotencyProbeTool {
@@ -522,10 +525,13 @@ impl crate::traits::Tool for ReconciledIdempotencyProbeTool {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok("mutation applied".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 #[async_trait::async_trait]
@@ -1027,12 +1033,15 @@ impl crate::traits::Tool for SpawnAgentMock {
         })
     }
 
-    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         Ok(
             "Resume review found weak impact metrics and excessive task-oriented bullets."
                 .to_string(),
         )
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for SpawnAgentMock {
@@ -1691,7 +1700,8 @@ impl crate::traits::Tool for SlowReadTool {
             }
         })
     }
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _args: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let start = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         self.windows
@@ -1699,7 +1709,9 @@ impl crate::traits::Tool for SlowReadTool {
             .unwrap()
             .push((start, std::time::Instant::now()));
         Ok("slow data".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for SlowReadTool {
@@ -1741,14 +1753,17 @@ impl crate::traits::Tool for FlakyProbeTool {
             }
         })
     }
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _args: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+let output: anyhow::Result<String> = async move {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if n <= self.fail_first {
             anyhow::bail!("Error: probe endpoint unreachable (attempt {n})");
         }
         self.successes.fetch_add(1, Ordering::SeqCst);
         Ok("probe data recovered".to_string())
-    }
+    }.await;
+output.map(crate::traits::ToolCallOutcome::from_output)
+}
 }
 
 impl crate::traits::ToolSemantics for FlakyProbeTool {

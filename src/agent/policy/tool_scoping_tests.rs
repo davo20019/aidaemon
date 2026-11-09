@@ -33,8 +33,13 @@ impl Tool for MockRoleTool {
             "parameters": { "type": "object", "properties": {} }
         })
     }
-    async fn call(&self, _args: &str) -> anyhow::Result<String> {
-        Ok("ok".to_string())
+    async fn execute(
+        &self,
+        _args: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { Ok("ok".to_string()) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

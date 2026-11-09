@@ -9,31 +9,34 @@ use aidaemon_tools::ToolText;
 use serde_json::json;
 
 use super::file_policy::{daemon_file_policy, DaemonPaths};
-use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
-pub type SearchFilesTool = KernelTool<aidaemon_tools::SearchFiles>;
+/// The daemon's constructors for the SDK's [`aidaemon_tools::SearchFiles`].
+pub struct SearchFilesTool;
 
+#[allow(clippy::new_ret_no_self)]
 impl SearchFilesTool {
     /// Without the daemon's own files protected; production passes them.
     #[cfg(test)]
-    pub fn new(backend: SharedExecutionBackend) -> Self {
+    pub fn new(backend: SharedExecutionBackend) -> aidaemon_tools::SearchFiles {
         Self::on_backend(backend, DaemonPaths::default())
     }
 
-    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
-        Self::wrap(
-            aidaemon_tools::SearchFiles::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
+    pub fn on_backend(
+        backend: SharedExecutionBackend,
+        paths: DaemonPaths,
+    ) -> aidaemon_tools::SearchFiles {
+        aidaemon_tools::SearchFiles::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Search for files by name pattern or content regex".to_string(),
                 schema: "Search for files by name pattern (glob) and/or content (regex). Use this instead of terminal find/grep. Automatically skips .git, node_modules, target, etc.".to_string(),
-            }),
-        )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[tokio::test]
     async fn default_path_no_match_suggests_user_directories() {

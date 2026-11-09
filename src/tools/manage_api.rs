@@ -515,7 +515,15 @@ impl ManageApiTool {
                     "client_id": client_id,
                     "client_secret": client_secret,
                 });
-                sections.push(self.manage_oauth.call(&credential_args.to_string()).await?);
+                sections.push(
+                    self.manage_oauth
+                        .execute(
+                            &credential_args.to_string(),
+                            &crate::traits::ToolCallContext::default(),
+                        )
+                        .await?
+                        .output,
+                );
             }
             (None, None) => {}
             _ => anyhow::bail!("Provide both client_id and client_secret together, or omit both."),
@@ -720,7 +728,7 @@ impl ManageApiTool {
         });
         let probe_ctx = Self::probe_context(kernel_approved, args, &probe);
         self.http_request
-            .call_with_execution_context(&verify_args.to_string(), None, probe_ctx)
+            .execute(&verify_args.to_string(), &probe_ctx)
             .await
             .map(|outcome| Self::format_live_probe_result(&probe.reason, &outcome.output))
     }
@@ -994,25 +1002,14 @@ impl Tool for ManageApiTool {
         manage_api_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.dispatch(arguments, status_tx, &ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let exec_ctx = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         self.dispatch(arguments, status_tx, &exec_ctx)
             .await
             .map(ToolCallOutcome::from_output)
@@ -1103,6 +1100,7 @@ impl ManageApiTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[test]
     fn schema_fits_payload_budget() {

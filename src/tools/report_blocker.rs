@@ -430,15 +430,11 @@ impl Tool for ReportBlockerTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.report(arguments).await.map(|outcome| outcome.output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         self.report(arguments).await
     }
 }
@@ -707,6 +703,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, Task};
 

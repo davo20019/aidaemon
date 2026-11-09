@@ -3,19 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Permission persistence mode for commands requiring owner approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PermissionMode {
-    /// Safe/Medium/High persist; Critical remains session-scoped.
-    #[default]
-    Default,
-    /// All approvals remain session-scoped.
-    Cautious,
-    /// All approvals persist, including Critical.
-    Yolo,
-}
-
 /// Where `terminal` commands execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,16 +26,6 @@ impl std::fmt::Display for TerminalConfinement {
         match self {
             Self::Host => write!(f, "host"),
             Self::Sandbox => write!(f, "sandbox"),
-        }
-    }
-}
-
-impl std::fmt::Display for PermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PermissionMode::Default => write!(f, "default"),
-            PermissionMode::Cautious => write!(f, "cautious"),
-            PermissionMode::Yolo => write!(f, "yolo"),
         }
     }
 }
@@ -271,26 +248,7 @@ impl ChannelContext {
 
 pub use aidaemon_core::ChannelVisibility;
 pub use aidaemon_memory::records::FactPrivacy;
-pub use aidaemon_tools::semantics::UserRole;
-
-/// Distinguishes different kinds of approval requests so channels can render
-/// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel
-/// for scheduled-goal confirmations).
-#[derive(Debug, Clone, Copy, Default)]
-pub enum ApprovalKind {
-    /// Standard command approval (Allow Once / Allow Session / Allow Always / Deny).
-    #[default]
-    Command,
-    /// Point-of-action approval that can authorize only this invocation.
-    /// Channels must not offer session or persistent approval buttons.
-    CommandOnce,
-    /// Scheduled-goal confirmation (Confirm / Cancel).
-    GoalConfirmation,
-    /// Exact owner confirmation for a persisted Autopilot mandate policy.
-    /// Kept distinct so channels never infer high-autonomy presentation from
-    /// user or model prose.
-    AutopilotConfirmation,
-}
+pub use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, PermissionMode, UserRole};
 
 /// Typed presentation requested for an exact goal/mandate confirmation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -298,19 +256,6 @@ pub enum GoalConfirmationStyle {
     #[default]
     Standard,
     Autopilot,
-}
-
-/// Response to an approval request from the user.
-#[derive(Debug, Clone)]
-pub enum ApprovalResponse {
-    /// Allow this specific command only
-    AllowOnce,
-    /// Allow this command prefix for the current session (resets on restart)
-    AllowSession,
-    /// Allow this command prefix forever (persists to database)
-    AllowAlways,
-    /// Deny the command
-    Deny,
 }
 
 /// Status updates emitted by tools and the agent loop for live feedback to the user.

@@ -1,5 +1,7 @@
+#[cfg(test)]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -81,88 +83,73 @@ impl SpecialistKind {
     }
 }
 
-/// A daemon tool: its identity and execution. What it says about a call
-/// without running it lives on the [`ToolSemantics`] supertrait.
+/// A tool: the SDK's [`aidaemon_tools::OutcomeTool`]. What it says about a
+/// call without running it lives on the [`ToolSemantics`] supertrait.
+pub use aidaemon_tools::OutcomeTool as Tool;
+
+/// The channel a call's live progress goes to, carried in
+/// [`ToolCallContext::extensions`].
+#[derive(Clone)]
+pub struct ToolStatus(pub mpsc::Sender<StatusUpdate>);
+
+/// Where this call's live progress goes, if anywhere.
+pub fn status_sender(facts: &ToolCallContext) -> Option<mpsc::Sender<StatusUpdate>> {
+    facts
+        .extensions
+        .get::<ToolStatus>()
+        .map(|status| status.0.clone())
+}
+
+/// `facts` with this call's progress channel added.
+pub fn with_status(
+    mut facts: ToolCallContext,
+    status_tx: Option<mpsc::Sender<StatusUpdate>>,
+) -> ToolCallContext {
+    if let Some(status_tx) = status_tx {
+        facts.extensions.insert(ToolStatus(status_tx));
+    }
+    facts
+}
+
+/// Calling a tool directly from a test.
+#[cfg(test)]
 #[async_trait]
-pub trait Tool: ToolSemantics {
-    fn name(&self) -> &str;
-    /// The permission mode the owner's cards for this tool are sent with
-    /// (it picks the buttons offered). `None`: the default, Cautious.
-    fn approval_card_mode(&self) -> Option<crate::tools::command_risk::PermissionMode> {
-        None
-    }
-    /// The kind of card the owner is asked `request` (from
-    /// [`ToolSemantics::owner_approval_request`]) with, which picks the
-    /// buttons offered: a one-time card or a goal confirmation offers no
-    /// session or persistent grant. The default is a standard command card.
-    fn approval_card_kind(
-        &self,
-        _request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> crate::types::ApprovalKind {
-        crate::types::ApprovalKind::Command
-    }
-    /// Apply the owner's answer to a card asked for `call` (from
-    /// [`ToolSemantics::owner_approval_request`]) to the tool's own grant
-    /// stores. `None`: the card timed out or never reached the owner. The
-    /// default keeps nothing; the kernel's session grants are separate.
-    async fn record_owner_answer(
-        &self,
-        _call: &ApprovalCall<'_>,
-        _facts: &ToolCallContext,
-        _response: Option<crate::types::ApprovalResponse>,
-    ) {
-    }
-    fn description(&self) -> &str;
-    /// Returns the OpenAI-format function schema as a JSON Value.
-    fn schema(&self) -> Value;
-
-    /// Execute the tool with the given JSON arguments string, returns result text.
-    async fn call(&self, arguments: &str) -> anyhow::Result<String>;
-
-    /// Execute the tool with access to a status update channel for streaming feedback.
-    /// Default implementation just calls `call()` - override for tools that emit progress.
-    async fn call_with_status(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        // Default: ignore status channel and just call the basic method
-        let _ = status_tx;
-        self.call(arguments).await
+pub trait ToolCalls: Tool {
+    /// Run with no call facts and return the output text.
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self
+            .execute(arguments, &ToolCallContext::default())
+            .await?
+            .output)
     }
 
-    /// Structured execution path used by the agent loop.
-    ///
-    /// Default behavior preserves compatibility for existing tools by wrapping
-    /// plain text output with empty metadata.
+    /// Run with a progress channel and return the typed outcome.
     async fn call_with_status_outcome(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let output = self.call_with_status(arguments, status_tx).await?;
-        Ok(ToolCallOutcome::from_output(output))
+        self.execute(
+            arguments,
+            &with_status(ToolCallContext::default(), status_tx),
+        )
+        .await
     }
 
-    /// Context-aware execution path used by the agent loop.
-    ///
-    /// The default implementation discards `exec_ctx` and delegates to
-    /// `call_with_status_outcome`, so existing tools are completely unaffected.
-    /// Tools that honor dispatcher-owned authority (`terminal`, `http_request`)
-    /// override this method and inspect `exec_ctx` (e.g. `mandate_preapproved`).
-    ///
-    /// **Security invariant:** `exec_ctx` is a Rust-side control-plane value — it must
-    /// never be serialized, logged at info level, or reflected back into tool args.
+    /// Run with a progress channel and these call facts.
     async fn call_with_execution_context(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolCallContext,
+        facts: ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = exec_ctx;
-        self.call_with_status_outcome(arguments, status_tx).await
+        self.execute(arguments, &with_status(facts, status_tx))
+            .await
     }
 }
+
+#[cfg(test)]
+impl<T: Tool + ?Sized> ToolCalls for T {}
 
 /// A tool could not reach its target at all, so nothing took effect and the
 /// call may run again.
@@ -310,8 +297,13 @@ mod tests {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> = async move { Ok("ok".to_string()) }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -341,8 +333,13 @@ mod tests {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> = async move { Ok("ok".to_string()) }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -391,8 +388,13 @@ mod tests {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> = async move { Ok("ok".to_string()) }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 
@@ -529,8 +531,13 @@ mod tests {
             })
         }
 
-        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let output: anyhow::Result<String> = async move { Ok("ok".to_string()) }.await;
+            output.map(crate::traits::ToolCallOutcome::from_output)
         }
     }
 

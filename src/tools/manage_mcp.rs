@@ -291,15 +291,10 @@ impl Tool for ManageMcpTool {
         manage_mcp_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments).await
-    }
-
-    async fn call_with_execution_context(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
-        _facts: ToolCallContext,
+        _facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         self.run(arguments)
             .await

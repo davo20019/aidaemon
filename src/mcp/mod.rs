@@ -88,53 +88,61 @@ impl Tool for McpTool {
         self.tool_schema.clone()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value =
-            serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value =
+                serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
 
-        // Audit log: truncate args for logging to avoid flooding logs with large payloads
-        let args_preview: String = {
-            let s = args.to_string();
-            crate::utils::truncate_str(&s, 203)
-        };
+            // Audit log: truncate args for logging to avoid flooding logs with large payloads
+            let args_preview: String = {
+                let s = args.to_string();
+                crate::utils::truncate_str(&s, 203)
+            };
 
-        // Threat detection: flag suspicious patterns in tool arguments
-        detect_suspicious_args(&self.tool_name, &args_preview);
+            // Threat detection: flag suspicious patterns in tool arguments
+            detect_suspicious_args(&self.tool_name, &args_preview);
 
-        info!(mcp_tool = %self.tool_name, args = %args_preview, "MCP tool call started");
+            info!(mcp_tool = %self.tool_name, args = %args_preview, "MCP tool call started");
 
-        let start = std::time::Instant::now();
-        let result = self
-            .tool
-            .call_raw(args, None)
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| render::format_tool_call_result(&result));
-        let elapsed = start.elapsed();
+            let start = std::time::Instant::now();
+            let result = self
+                .tool
+                .call_raw(args, None)
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| render::format_tool_call_result(&result));
+            let elapsed = start.elapsed();
 
-        match &result {
-            Ok(output) => {
-                // Threat detection: flag suspicious patterns in tool output
-                detect_suspicious_output(&self.tool_name, output);
+            match &result {
+                Ok(output) => {
+                    // Threat detection: flag suspicious patterns in tool output
+                    detect_suspicious_output(&self.tool_name, output);
 
-                info!(
-                    mcp_tool = %self.tool_name,
-                    duration_ms = elapsed.as_millis() as u64,
-                    output_bytes = output.len(),
-                    "MCP tool call completed"
-                );
+                    info!(
+                        mcp_tool = %self.tool_name,
+                        duration_ms = elapsed.as_millis() as u64,
+                        output_bytes = output.len(),
+                        "MCP tool call completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        mcp_tool = %self.tool_name,
+                        duration_ms = elapsed.as_millis() as u64,
+                        error = %e,
+                        "MCP tool call failed"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::error!(
-                    mcp_tool = %self.tool_name,
-                    duration_ms = elapsed.as_millis() as u64,
-                    error = %e,
-                    "MCP tool call failed"
-                );
-            }
+
+            result
         }
-
-        result
+        .await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 

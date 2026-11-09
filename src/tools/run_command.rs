@@ -8,7 +8,6 @@ use crate::traits::{
     ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolTargetHint,
     ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::StatusUpdate;
 
 use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
@@ -215,15 +214,11 @@ impl Tool for RunCommandTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run_outcome(arguments).await?.output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         self.run_outcome(arguments).await
     }
 }
@@ -606,6 +601,7 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {

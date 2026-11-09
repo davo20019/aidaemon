@@ -153,25 +153,13 @@ impl Tool for SendFileTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run(arguments, &ToolCallContext::default()).await?.text)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let SendReply {
             status: outcome_status,
             text: output,
@@ -524,6 +512,7 @@ mod tests {
     use crate::events::{ResourceProvenance, ResourceRegisteredData};
     use crate::testing::CallWithFacts;
     use crate::tools::file_delivery::is_recoverable_source;
+    use crate::traits::ToolCalls as _;
     use std::path::Path;
 
     async fn test_event_store() -> Arc<EventStore> {

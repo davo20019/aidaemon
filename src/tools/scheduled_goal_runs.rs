@@ -3,14 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 
 use crate::traits::{
     semantics_for_exact_read_actions, Goal, ScheduledGoalRunsStore, StateStore, Task, TaskActivity,
     Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
 };
-use crate::types::StatusUpdate;
 
 pub struct ScheduledGoalRunsTool {
     state: Arc<dyn ScheduledGoalRunsStore>,
@@ -1209,25 +1207,13 @@ impl Tool for ScheduledGoalRunsTool {
         scheduled_goal_runs_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.run(arguments, &ToolCallContext::default()).await
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.call_with_execution_context(arguments, status_tx, ToolCallContext::default())
-            .await
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let facts = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
         let (output, objective_evidence) = if args.action == "overview" {
             let (output, portfolio) = self
@@ -1446,6 +1432,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task};
 

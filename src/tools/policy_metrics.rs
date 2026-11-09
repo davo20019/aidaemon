@@ -41,7 +41,12 @@ impl Tool for PolicyMetricsTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
         let args_input = if arguments.trim().is_empty() {
             "{}"
         } else {
@@ -215,6 +220,8 @@ impl Tool for PolicyMetricsTool {
             }
         });
         Ok(serde_json::to_string_pretty(&payload)?)
+    }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -237,6 +244,7 @@ impl crate::traits::ToolSemantics for PolicyMetricsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
 
     #[tokio::test]
     async fn returns_metrics_json_payload() {

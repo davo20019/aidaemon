@@ -45,7 +45,12 @@ impl Tool for UseSkillTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
         let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
             .as_str()
@@ -72,6 +77,8 @@ impl Tool for UseSkillTool {
                 available.join(", ")
             ))
         }
+    }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -91,6 +98,7 @@ impl crate::traits::ToolSemantics for UseSkillTool {
 mod tests {
     use super::*;
     use crate::skills::Skill;
+    use crate::traits::ToolCalls as _;
 
     fn make_skill(name: &str, body: &str) -> Skill {
         Skill {

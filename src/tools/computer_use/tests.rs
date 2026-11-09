@@ -1,3 +1,4 @@
+use crate::traits::ToolCalls as _;
 use serde_json::json;
 use tempfile::TempDir;
 

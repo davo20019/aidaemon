@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::config::HttpAuthProfile;
@@ -16,7 +16,6 @@ use crate::traits::{
     ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
     ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
-use crate::types::StatusUpdate;
 
 /// Maximum number of redirect hops to follow.
 const MAX_REDIRECTS: usize = 5;
@@ -1473,7 +1472,7 @@ impl HttpRequestTool {
         }
     }
 
-    async fn execute(
+    async fn run_http(
         &self,
         arguments: &str,
         mandate_preapproved: bool,
@@ -2111,39 +2110,14 @@ impl Tool for HttpRequestTool {
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments, false, false, None)
-            .await
-            .map(|(output, _, _)| output)
-    }
-
-    async fn call_with_status_outcome(
+    async fn execute(
         &self,
         arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        let _ = status_tx;
-        let (output, http_status, truncation) = self.execute(arguments, false, false, None).await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: ToolCallMetadata {
-                outcome_status: http_status.map(|status| {
-                    Self::outcome_status_for_http(status, false, Self::is_write_request(arguments))
-                }),
-                http_status,
-                truncation,
-                ..Default::default()
-            },
-            finish: None,
-        })
-    }
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let status_tx = crate::traits::status_sender(facts);
+        let exec_ctx = facts.clone();
 
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        exec_ctx: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
         let authenticated_request = serde_json::from_str::<Value>(arguments)
             .ok()
@@ -2218,7 +2192,7 @@ impl Tool for HttpRequestTool {
             });
         }
         let (output, http_status, truncation) = self
-            .execute(
+            .run_http(
                 arguments,
                 exec_ctx.mandate_preapproved,
                 exec_ctx.mandate_execution,
@@ -2467,6 +2441,7 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     #[test]
@@ -2536,7 +2511,7 @@ mod tests {
         let args = json!({"method": "GET", "url": "http://shop.localhost/"}).to_string();
 
         let unapproved = tool
-            .execute(&args, false, false, None)
+            .run_http(&args, false, false, None)
             .await
             .expect_err("no approval, no request");
         assert!(
@@ -2545,14 +2520,14 @@ mod tests {
         );
 
         let (mandate, _, _) = tool
-            .execute(&args, true, true, None)
+            .run_http(&args, true, true, None)
             .await
             .expect("refused before any request");
         assert!(mandate.contains("Request blocked"), "{mandate}");
 
         // Approved calls get past the policy; the name may not resolve here.
         let approved = tool
-            .execute(
+            .run_http(
                 &args,
                 false,
                 false,

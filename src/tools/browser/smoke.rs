@@ -5,6 +5,7 @@
 //! cargo test --features browser browser_smoke_real_chrome -- --ignored --nocapture
 //! ```
 
+use crate::traits::ToolCalls as _;
 use std::time::Duration;
 
 use serde_json::json;
@@ -14,7 +15,6 @@ use tokio::sync::mpsc;
 use crate::config::BrowserConfig;
 use crate::testing::CallWithFacts;
 use crate::tools::BrowserTool;
-use crate::traits::Tool;
 use crate::types::ApprovalResponse;
 
 /// Run `arguments` as the kernel does, the owner approving any card for the

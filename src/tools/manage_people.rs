@@ -110,7 +110,12 @@ impl Tool for ManagePeopleTool {
         manage_people_schema()
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
         // Toggle actions are always allowed regardless of enabled state
@@ -146,6 +151,8 @@ impl Tool for ManagePeopleTool {
             "confirm" => self.handle_confirm(&args).await,
             other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
         }
+    }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
     }
 }
 
@@ -878,6 +885,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+    use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
 
     #[test]
