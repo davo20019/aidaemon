@@ -3476,3 +3476,155 @@ mod state_version_tests {
         assert_eq!(recorded(&pool).await.len(), 1);
     }
 }
+
+/// Guards the relocation of these tables' migrations into their crates: every
+/// object, in creation order, and every recorded version must stay what a
+/// database upgrades to today. The goldens were written before the move.
+#[cfg(test)]
+mod schema_golden_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    async fn open(path: &std::path::Path) -> SqlitePool {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap()
+    }
+
+    /// `sqlite_master` in creation order, the versions, and each table's row
+    /// count. Full-text tables are left out: their presence depends on how
+    /// SQLite was built, and they are a rebuildable projection.
+    async fn dump(pool: &SqlitePool) -> String {
+        let objects = sqlx::query(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let virtual_tables: Vec<String> = objects
+            .iter()
+            .filter(|o| {
+                o.get::<Option<String>, _>("sql")
+                    .is_some_and(|sql| sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL"))
+            })
+            .map(|o| o.get::<String, _>("name"))
+            .collect();
+        let projected = |name: &str| {
+            virtual_tables
+                .iter()
+                .any(|table| name == table || name.starts_with(&format!("{table}_")))
+        };
+        let mut out = String::new();
+        for object in &objects {
+            let tbl_name: String = object.get("tbl_name");
+            if projected(&tbl_name) {
+                continue;
+            }
+            out.push_str(&format!(
+                "{} {} on {}\n{}\n\n",
+                object.get::<String, _>("type"),
+                object.get::<String, _>("name"),
+                tbl_name,
+                object.get::<Option<String>, _>("sql").unwrap_or_default(),
+            ));
+        }
+        for object in &objects {
+            let name: String = object.get("name");
+            if object.get::<String, _>("type") != "table" || projected(&name) {
+                continue;
+            }
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{name}\""))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            out.push_str(&format!("rows {name} = {rows}\n"));
+        }
+        for row in sqlx::query("SELECT version, name FROM state_schema_versions ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        {
+            out.push_str(&format!(
+                "version {} {}\n",
+                row.get::<i64, _>("version"),
+                row.get::<String, _>("name")
+            ));
+        }
+        out
+    }
+
+    fn assert_matches_golden(name: &str, actual: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/state/sqlite/schema_golden")
+            .join(name);
+        if std::env::var_os("UPDATE_SCHEMA_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap();
+        if expected != actual {
+            let difference = expected
+                .lines()
+                .zip(actual.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right);
+            panic!(
+                "schema differs from {name}: first difference {difference:?}, \
+                 {} expected lines, {} actual",
+                expected.lines().count(),
+                actual.lines().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_database_keeps_its_exact_schema() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = open(database.path()).await;
+        migrate_state(&pool).await.unwrap();
+        assert_matches_golden("new_database.txt", &dump(&pool).await);
+    }
+
+    #[tokio::test]
+    async fn a_current_database_keeps_its_exact_schema() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = open(database.path()).await;
+        migrate_state(&pool).await.unwrap();
+        migrate_state(&pool).await.unwrap();
+        // Memory's triggers are rebuilt on every start, so this differs from a
+        // new database only by their position.
+        assert_matches_golden("current_database.txt", &dump(&pool).await);
+    }
+
+    #[tokio::test]
+    async fn an_old_goal_database_upgrades_to_its_exact_schema() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = open(database.path()).await;
+        for statement in [
+            "CREATE TABLE goals (
+                id INTEGER PRIMARY KEY, description TEXT NOT NULL, status TEXT,
+                priority TEXT, progress_notes TEXT, source_episode_id INTEGER,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+            )",
+            "INSERT INTO goals (id, description, status, created_at, updated_at)
+             VALUES (7, 'Plan the Acme launch', 'active', '2025-01-01', '2025-01-01')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        migrate_state(&pool).await.unwrap();
+        assert_matches_golden("old_goal_database.txt", &dump(&pool).await);
+        let imported: String =
+            sqlx::query_scalar("SELECT description FROM goals WHERE legacy_int_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(imported, "Plan the Acme launch");
+    }
+}
