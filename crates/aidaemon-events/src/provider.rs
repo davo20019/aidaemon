@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::ToolCall;
+use crate::conversation::ToolCall;
 
 /// Structured response mode requested for a provider call.
 #[derive(Debug, Clone, PartialEq, Default)]

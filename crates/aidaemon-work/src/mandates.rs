@@ -1,8 +1,10 @@
+pub use aidaemon_events::mandate_grant::MandateAuthorityGrant;
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::tools::ToolCallOperation;
+use aidaemon_tools::semantics::ToolCallOperation;
 
 const MAX_MANDATE_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_MANDATE_POLICY_ENTRIES: usize = 16;
@@ -253,7 +255,7 @@ impl Mandate {
             // controller must explicitly clear this proof before persistence.
             confirmed_at: Some(now.clone()),
             version: 1,
-            owner_principal_id: crate::session::stable_private_owner_principal_id(
+            owner_principal_id: aidaemon_events::session::stable_private_owner_principal_id(
                 created_by_session,
             )
             .unwrap_or_else(|| format!("principal:{}", uuid::Uuid::new_v4())),
@@ -1153,7 +1155,7 @@ impl MandateAuthority {
                 );
             }
             if !(Self::DELEGABLE_DATA_TOOLS.contains(&trimmed)
-                || (cfg!(test) && trimmed == "mandate_mutation_spy"))
+                || (cfg!(any(test, feature = "testing")) && trimmed == "mandate_mutation_spy"))
             {
                 return Err(format!(
                     "{trimmed} is not a directly governed v1 mandate data tool"
@@ -2017,30 +2019,6 @@ impl Intention {
     }
 }
 
-/// Action-bound grant issued by the deterministic mandate gate. It is carried
-/// only through Rust control-plane structs, never model-visible arguments.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MandateAuthorityGrant {
-    pub mandate_id: String,
-    pub mandate_version: i64,
-    /// Stable owner identity at the exact policy version that authorized this
-    /// action. Session routing never substitutes for this principal binding.
-    #[serde(default)]
-    pub owner_principal_id: String,
-    pub decision_cycle_id: String,
-    pub action_digest: String,
-    pub counts_toward_cycle_budget: bool,
-    /// One-based fenced reservation number for a mutation; zero for a legacy
-    /// or non-mutating grant. The state-store CAS must reserve this exact slot.
-    #[serde(default)]
-    pub reserved_action_attempt: i64,
-    /// Dispatcher-owned tool call identity, bound after deterministic policy
-    /// authorization and before the atomic ledger reservation. Never supplied
-    /// by or exposed to the model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
-
 /// Content-safe target identifier persisted for one governed mutation. Raw
 /// arguments, request bodies, query strings, responses, and credentials never
 /// enter the mandate mutation ledger.
@@ -2538,9 +2516,9 @@ impl MandateRunNotification {
         }
     }
 
-    pub fn to_notification_entry(&self) -> super::goals::NotificationEntry {
+    pub fn to_notification_entry(&self) -> crate::goals::NotificationEntry {
         let id = self.notification_id();
-        super::goals::NotificationEntry {
+        crate::goals::NotificationEntry {
             id: id.clone(),
             goal_id: self.goal_id.clone(),
             session_id: self.owner_session_id.clone(),

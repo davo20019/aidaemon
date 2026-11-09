@@ -12,7 +12,7 @@ const MAX_GRAPH_EDGES: usize = 2_048;
 const MAX_NODE_ID_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ExecutionNodeKind {
+pub enum ExecutionNodeKind {
     Request,
     Obligation,
     PlanStep,
@@ -23,7 +23,7 @@ pub(crate) enum ExecutionNodeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecutionNodeState {
+pub enum ExecutionNodeState {
     Pending,
     Running,
     Satisfied,
@@ -34,13 +34,13 @@ pub(crate) enum ExecutionNodeState {
 }
 
 impl ExecutionNodeState {
-    pub(crate) fn satisfies_dependency(self) -> bool {
+    pub fn satisfies_dependency(self) -> bool {
         matches!(self, Self::Satisfied | Self::Superseded)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ExecutionEdgeKind {
+pub enum ExecutionEdgeKind {
     /// `from` cannot start until `to` is satisfied.
     DependsOn,
     /// `from` cannot complete until `to` is satisfied.
@@ -58,14 +58,14 @@ impl ExecutionEdgeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionNode {
+pub struct ExecutionNode {
     pub id: String,
     pub kind: ExecutionNodeKind,
     pub state: ExecutionNodeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionEdge {
+pub struct ExecutionEdge {
     pub from: String,
     pub to: String,
     pub kind: ExecutionEdgeKind,
@@ -73,20 +73,20 @@ pub(crate) struct ExecutionEdge {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ExecutionGraph {
+pub struct ExecutionGraph {
     nodes: BTreeMap<String, ExecutionNode>,
     edges: Vec<ExecutionEdge>,
 }
 
 /// Persistence-independent projection used to build a task dependency graph.
-pub(crate) struct ExecutionTaskNode {
+pub struct ExecutionTaskNode {
     pub id: String,
     pub status: String,
     pub dependency_ids: Vec<String>,
 }
 
 impl ExecutionGraph {
-    pub(crate) fn from_task_nodes(tasks: &[ExecutionTaskNode]) -> Result<Self, String> {
+    pub fn from_task_nodes(tasks: &[ExecutionTaskNode]) -> Result<Self, String> {
         let mut graph = Self::default();
         for task in tasks {
             if graph.nodes.contains_key(&task.id) {
@@ -112,7 +112,7 @@ impl ExecutionGraph {
         Ok(graph)
     }
 
-    pub(crate) fn add_node(
+    pub fn add_node(
         &mut self,
         id: impl Into<String>,
         kind: ExecutionNodeKind,
@@ -139,7 +139,7 @@ impl ExecutionGraph {
         Ok(())
     }
 
-    pub(crate) fn set_state(&mut self, id: &str, state: ExecutionNodeState) -> Result<(), String> {
+    pub fn set_state(&mut self, id: &str, state: ExecutionNodeState) -> Result<(), String> {
         let node = self
             .nodes
             .get_mut(id)
@@ -148,15 +148,15 @@ impl ExecutionGraph {
         Ok(())
     }
 
-    pub(crate) fn state(&self, id: &str) -> Option<ExecutionNodeState> {
+    pub fn state(&self, id: &str) -> Option<ExecutionNodeState> {
         self.nodes.get(id).map(|node| node.state)
     }
 
-    pub(crate) fn node_kind(&self, id: &str) -> Option<ExecutionNodeKind> {
+    pub fn node_kind(&self, id: &str) -> Option<ExecutionNodeKind> {
         self.nodes.get(id).map(|node| node.kind)
     }
 
-    pub(crate) fn add_edge(
+    pub fn add_edge(
         &mut self,
         from: &str,
         to: &str,
@@ -202,7 +202,7 @@ impl ExecutionGraph {
     }
 
     /// Returns the unresolved nodes that `id` directly depends on.
-    pub(crate) fn unresolved_dependencies(&self, id: &str) -> Vec<&ExecutionNode> {
+    pub fn unresolved_dependencies(&self, id: &str) -> Vec<&ExecutionNode> {
         self.edges
             .iter()
             .filter(|edge| edge.from == id && edge.kind == ExecutionEdgeKind::DependsOn)
@@ -211,11 +211,11 @@ impl ExecutionGraph {
             .collect()
     }
 
-    pub(crate) fn dependencies_satisfied(&self, id: &str) -> bool {
+    pub fn dependencies_satisfied(&self, id: &str) -> bool {
         self.nodes.contains_key(id) && self.unresolved_dependencies(id).is_empty()
     }
 
-    pub(crate) fn requirements_satisfied(&self, id: &str) -> bool {
+    pub fn requirements_satisfied(&self, id: &str) -> bool {
         self.nodes.contains_key(id)
             && self
                 .edges
@@ -229,7 +229,7 @@ impl ExecutionGraph {
     }
 
     #[cfg(test)]
-    pub(crate) fn ready_nodes(&self, kind: ExecutionNodeKind) -> Vec<&ExecutionNode> {
+    pub fn ready_nodes(&self, kind: ExecutionNodeKind) -> Vec<&ExecutionNode> {
         self.nodes
             .values()
             .filter(|node| {
@@ -243,7 +243,7 @@ impl ExecutionGraph {
     /// Record typed evidence for an obligation and mark the obligation
     /// satisfied. Only receipt, verification, human-input, artifact, or outcome
     /// nodes are accepted as proof.
-    pub(crate) fn satisfy_with_evidence(
+    pub fn satisfy_with_evidence(
         &mut self,
         obligation_id: &str,
         evidence_id: &str,
@@ -283,7 +283,7 @@ impl ExecutionGraph {
     /// stored on `Satisfies` edges even when the graph evidence node is a
     /// verification wrapper, so callers never infer proof from prose or from
     /// mere task-local tool activity.
-    pub(crate) fn obligations_satisfied_by_receipt(&self, receipt_id: &str) -> Vec<String> {
+    pub fn obligations_satisfied_by_receipt(&self, receipt_id: &str) -> Vec<String> {
         self.edges
             .iter()
             .filter(|edge| {
@@ -294,7 +294,7 @@ impl ExecutionGraph {
             .collect()
     }
 
-    pub(crate) fn invalidate(
+    pub fn invalidate(
         &mut self,
         invalidator_id: &str,
         target_id: &str,
@@ -308,7 +308,7 @@ impl ExecutionGraph {
         self.set_state(target_id, ExecutionNodeState::Invalidated)
     }
 
-    pub(crate) fn has_precedence_cycle(&self) -> bool {
+    pub fn has_precedence_cycle(&self) -> bool {
         let mut in_degree: BTreeMap<&str, usize> =
             self.nodes.keys().map(|id| (id.as_str(), 0_usize)).collect();
         let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -344,7 +344,7 @@ impl ExecutionGraph {
     }
 
     #[cfg(test)]
-    pub(crate) fn edges(&self) -> &[ExecutionEdge] {
+    pub fn edges(&self) -> &[ExecutionEdge] {
         &self.edges
     }
 }

@@ -5,27 +5,22 @@
 //! - adding/changing one area (e.g. store traits) doesn't cause a full-file rebuild
 
 mod channels;
-mod conversation;
-mod dialogue;
 mod dynamic;
-mod goals;
 mod history;
-mod mandates;
 mod memory;
 mod people;
-mod provider;
 mod tools;
 mod trigger_event;
 
 pub use channels::{ChannelCapabilities, HubChannel};
 #[allow(unused_imports)]
-pub use conversation::{
+pub use aidaemon_events::conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,
     message_content_is_structural_only, AttachmentProvenance, ConversationSummary, Message,
     MessageAnnotation, MessageAttachment, ToolCall,
 };
 #[allow(unused_imports)]
-pub use dialogue::{
+pub use aidaemon_events::dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AdoptedEvidenceBinding, AssistantTurnKind,
     AssistantTurnSummary, DialogueState, OpenQuestion, OpenRequest, OpenRequestStatus,
     QuestionKind, RequestCollectionCoverageRequirement, RequestCompletionContract,
@@ -38,8 +33,8 @@ pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
     OAuthConnection, PendingOAuthFlow, SkillDraft,
 };
-pub(crate) use goals::{task_execution_graph, ExpiredAttemptRecovery};
-pub use goals::{
+pub(crate) use aidaemon_work::goals::{task_execution_graph, ExpiredAttemptRecovery};
+pub use aidaemon_work::goals::{
     BackgroundSpawn, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact,
     NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
     ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
@@ -51,7 +46,7 @@ pub use history::{
     ProjectionStats, RecentToolTurn, TaskBookends,
 };
 #[allow(unused_imports)]
-pub use mandates::{
+pub use aidaemon_work::mandates::{
     is_runtime_fallback_rationale, mandate_owner_label, owner_question_excerpt, Intention,
     IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority, MandateAuthorityGrant,
     MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome,
@@ -75,7 +70,7 @@ pub use memory::{
     PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
-pub use provider::{
+pub use aidaemon_events::provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
 pub(crate) use tools::NothingSentError;

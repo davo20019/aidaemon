@@ -443,30 +443,30 @@ impl Task {
     }
 }
 
-pub(crate) fn task_execution_graph(
+pub fn task_execution_graph(
     tasks: &[Task],
-) -> Result<crate::execution_graph::ExecutionGraph, String> {
+) -> Result<aidaemon_events::execution_graph::ExecutionGraph, String> {
     let nodes = tasks
         .iter()
         .map(|task| {
-            Ok(crate::execution_graph::ExecutionTaskNode {
+            Ok(aidaemon_events::execution_graph::ExecutionTaskNode {
                 id: task.id.clone(),
                 status: task.status.clone(),
                 dependency_ids: task.dependency_ids()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    crate::execution_graph::ExecutionGraph::from_task_nodes(&nodes)
+    aidaemon_events::execution_graph::ExecutionGraph::from_task_nodes(&nodes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExpiredAttemptRecovery {
+pub enum ExpiredAttemptRecovery {
     Requeue,
     RequireVerification,
 }
 
 impl ExpiredAttemptRecovery {
-    pub(crate) fn classify(idempotent: bool, retry_count: i32, max_retries: i32) -> Self {
+    pub fn classify(idempotent: bool, retry_count: i32, max_retries: i32) -> Self {
         if idempotent && retry_count < max_retries {
             Self::Requeue
         } else {

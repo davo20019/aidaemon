@@ -2,3 +2,10 @@
 //!
 //! Sits on a host's SQLite pool the way `aidaemon-store-sqlite` and
 //! `aidaemon_memory::sqlite` do, and owns the `events` table contract.
+
+pub mod conversation;
+pub mod dialogue;
+pub mod execution_graph;
+pub mod mandate_grant;
+pub mod provider;
+pub mod session;
