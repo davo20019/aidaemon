@@ -576,11 +576,18 @@ pub fn contains_shell_operator(cmd: &str) -> bool {
                 in_double = !in_double;
                 i += 1;
             }
-            b'\\' if (in_double || in_single) && i + 1 < len => {
+            // Nothing is special inside single quotes, a backslash included.
+            _ if in_single => {
+                i += 1;
+            }
+            b'\\' if in_double && i + 1 < len => {
                 i += 2; // skip escaped char
             }
-            _ if in_single || in_double => {
-                i += 1; // inside quotes, skip
+            // The shell still runs command substitutions in double quotes.
+            b'`' if in_double => return true,
+            b'$' if in_double && i + 1 < len && bytes[i + 1] == b'(' => return true,
+            _ if in_double => {
+                i += 1; // inside double quotes, skip
             }
             b';' | b'|' | b'`' | b'\n' => return true,
             b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
@@ -604,6 +611,20 @@ mod tests {
     }
 
     const WORKSPACE: &str = "/Users/alice/projects/acme";
+
+    #[test]
+    fn command_substitution_counts_inside_double_quotes_only() {
+        assert!(contains_shell_operator("ls \"$(id)\""));
+        assert!(contains_shell_operator("ls \"`id`\""));
+        assert!(!contains_shell_operator("echo '$(id)'"));
+        assert!(!contains_shell_operator("echo \"a; b | c\""));
+        assert!(!contains_shell_operator("echo \"\\$(id)\""));
+    }
+
+    #[test]
+    fn a_backslash_does_not_escape_inside_single_quotes() {
+        assert!(contains_shell_operator("echo 'a\\'; rm x"));
+    }
 
     #[test]
     fn launchers_do_not_hide_a_catastrophic_command() {
