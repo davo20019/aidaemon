@@ -302,6 +302,7 @@ pub(crate) struct DaemonMemory {
 
 pub(crate) struct DaemonMemoryInner {
     state: Arc<dyn StateStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<crate::events::EventStore>,
     llm_runtime: crate::llm_runtime::SharedLlmRuntime,
     context_window_config: crate::config::ContextWindowConfig,
@@ -315,8 +316,10 @@ pub(crate) struct DaemonMemoryInner {
 }
 
 impl DaemonMemory {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: Arc<dyn StateStore>,
+        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
         event_store: Arc<crate::events::EventStore>,
         llm_runtime: crate::llm_runtime::SharedLlmRuntime,
         context_window_config: crate::config::ContextWindowConfig,
@@ -327,6 +330,7 @@ impl DaemonMemory {
         Self {
             inner: Arc::new(DaemonMemoryInner {
                 state,
+                store,
                 event_store,
                 llm_runtime,
                 context_window_config,
@@ -349,6 +353,7 @@ impl MemoryWrites for DaemonMemoryInner {
             self.llm_runtime.clone(),
             fast_model(&snapshot, &turn.model),
             self.state.clone(),
+            self.store.clone(),
             self.event_store.clone(),
             turn.task_id.clone(),
             turn.user_text.clone(),
@@ -382,7 +387,7 @@ impl MemoryWrites for DaemonMemoryInner {
     }
 
     fn learn(&self, learning: crate::agent::post_task::LearningContext) {
-        crate::agent::post_turn::spawn_learning(self.state.clone(), learning);
+        crate::agent::post_turn::spawn_learning(self.store.clone(), learning);
     }
 }
 
@@ -606,7 +611,10 @@ mod tests {
         drop(log);
 
         let manage_memories: Arc<dyn crate::traits::Tool> =
-            Arc::new(crate::tools::ManageMemoriesTool::new(harness.state.clone()));
+            Arc::new(crate::tools::ManageMemoriesTool::new(
+                harness.state.clone(),
+                harness.state.memory_stores(),
+            ));
         let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
             MockProvider::with_responses(vec![MockProvider::text_response("Hi.")]),
             vec![manage_memories],
@@ -657,6 +665,7 @@ mod tests {
             .unwrap();
         let schema = crate::traits::Tool::schema(&crate::tools::ManageMemoriesTool::new(
             harness.state.clone(),
+            harness.state.memory_stores(),
         ));
         let declared: Vec<String> = schema["parameters"]["properties"]["action"]["enum"]
             .as_array()

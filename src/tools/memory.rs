@@ -519,7 +519,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        (RememberFactTool::new(state.clone()), state, db_file)
+        (RememberFactTool::new(state.memory_stores()), state, db_file)
     }
 
     #[tokio::test]

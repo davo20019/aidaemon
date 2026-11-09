@@ -57,6 +57,7 @@ impl DaemonRecall {
         let memory = &self.memory;
         let turn = &self.turn;
         let state = &memory.state;
+        let store = &memory.store;
         let channel_ctx = &turn.channel_ctx;
         let user_role = turn.user_role;
         let allowed = turn.memory_pipeline_allowed;
@@ -71,7 +72,7 @@ impl DaemonRecall {
             vec![]
         } else {
             or_logged(
-                state
+                store
                     .get_relevant_facts_for_channel(
                         query,
                         memory.max_facts,
@@ -90,7 +91,7 @@ impl DaemonRecall {
             let mut identity_facts = Vec::new();
             for category in IDENTITY_CATEGORIES {
                 identity_facts.append(&mut or_logged(
-                    state.get_facts(Some(category)).await,
+                    store.get_facts(Some(category)).await,
                     "critical_facts",
                 ));
             }
@@ -106,12 +107,12 @@ impl DaemonRecall {
         let episodes = if !allowed {
             vec![]
         } else if inject_personal {
-            or_logged(state.get_relevant_episodes(query, 3).await, "episodes")
+            or_logged(store.get_relevant_episodes(query, 3).await, "episodes")
         } else {
             match channel_ctx.visibility {
                 ChannelVisibility::PublicExternal => vec![],
                 _ => or_logged(
-                    state
+                    store
                         .get_relevant_episodes_for_channel(
                             query,
                             3,
@@ -135,9 +136,9 @@ impl DaemonRecall {
             if !allowed || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
                 vec![]
             } else if inject_personal {
-                or_logged(state.get_behavior_patterns(0.5).await, "patterns")
+                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
             } else {
-                or_logged(state.get_behavior_patterns(0.5).await, "patterns")
+                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
                     .into_iter()
                     .filter(|pattern| pattern.pattern_type == "failure")
                     .collect()
@@ -149,15 +150,15 @@ impl DaemonRecall {
                 (vec![], vec![])
             } else {
                 (
-                    or_logged(state.get_relevant_procedures(query, 5).await, "procedures"),
+                    or_logged(store.get_relevant_procedures(query, 5).await, "procedures"),
                     or_logged(
-                        state.get_relevant_error_solutions(query, 5).await,
+                        store.get_relevant_error_solutions(query, 5).await,
                         "error_solutions",
                     ),
                 )
             };
         let profile = if allowed && inject_personal {
-            or_logged(state.get_user_profile().await, "profile")
+            or_logged(store.get_user_profile().await, "profile")
         } else {
             None
         };
@@ -172,18 +173,18 @@ impl DaemonRecall {
             // In owner DMs the people list only selects the privacy rules; the
             // owner's own profile arrives through the core profile.
             (
-                or_logged(state.get_all_people().await, "people"),
+                or_logged(store.get_all_people().await, "people"),
                 None,
                 vec![],
             )
         } else if let Some(ref sender_id) = channel_ctx.sender_id {
-            match state.get_person_by_platform_id(sender_id).await {
+            match store.get_person_by_platform_id(sender_id).await {
                 Ok(Some(person)) => {
-                    if let Err(error) = state.touch_person_interaction(person.id).await {
+                    if let Err(error) = store.touch_person_interaction(person.id).await {
                         warn!(%error, "failed to record person interaction");
                     }
                     let facts = or_logged(
-                        state.get_person_facts(person.id, None).await,
+                        store.get_person_facts(person.id, None).await,
                         "person_facts",
                     );
                     (vec![], Some(person), facts)
@@ -209,7 +210,7 @@ impl DaemonRecall {
                 .cloned();
             let (profile_str, new_ids, digest) = or_logged(
                 crate::memory::core_profile::build_core_profile(
-                    state.as_ref(),
+                    store.as_ref(),
                     cached_ids,
                     people_enabled,
                 )
@@ -258,7 +259,7 @@ impl DaemonRecall {
             current_person_facts: &current_person_facts,
         };
         let report = skills::render_memory_section(&memory_context, memory.max_facts);
-        if let Err(error) = state
+        if let Err(error) = store
             .record_memory_recall(&report.rendered_fact_ids, &report.rendered_episode_ids)
             .await
         {
@@ -353,7 +354,7 @@ impl aidaemon_policies::Recall for DaemonRecall {
         let channel_ctx = &self.turn.channel_ctx;
         let facts = self
             .memory
-            .state
+            .store
             .get_relevant_facts_for_channel(
                 query,
                 limit,
@@ -620,6 +621,7 @@ mod tests {
         let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
         let memory = super::super::DaemonMemory::new(
             state,
+            harness.state.memory_stores(),
             harness.agent.event_store().clone(),
             harness.agent.llm_runtime.clone(),
             crate::config::ContextWindowConfig::default(),
@@ -677,6 +679,7 @@ mod tests {
         let state: Arc<dyn crate::traits::StateStore> = harness.state.clone();
         let memory = super::super::DaemonMemory::new(
             state,
+            harness.state.memory_stores(),
             harness.agent.event_store().clone(),
             harness.agent.llm_runtime.clone(),
             crate::config::ContextWindowConfig::default(),

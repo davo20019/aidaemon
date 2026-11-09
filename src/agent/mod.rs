@@ -302,6 +302,7 @@ pub(crate) struct MandateExecutionFence {
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
     state: Arc<dyn StateStore>,
+    memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<EventStore>,
     tools: Vec<Arc<dyn Tool>>,
     model: RwLock<String>,
@@ -677,6 +678,7 @@ impl Agent {
         // The turn's post-reply compaction reads the writer's own copy.
         self.transcript_writes = memory_plugin::DaemonMemory::new(
             self.state.clone(),
+            self.memory_store.clone(),
             self.event_store.clone(),
             self.llm_runtime.clone(),
             self.context_window_config.clone(),

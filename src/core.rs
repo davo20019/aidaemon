@@ -46,6 +46,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let stores::StoreBundle {
         embedding_service,
         state,
+        memory_store,
         pool,
         event_store,
         plan_store,
@@ -76,12 +77,21 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     } = memory_pipeline::build_memory_pipeline(
         &config,
         state.clone(),
+        memory_store.clone(),
         pool.clone(),
         event_store.clone(),
         plan_store.clone(),
         llm_runtime.clone(),
         embedding_service.clone(),
     );
+
+    let memory = crate::agent::memory_plugin::configured_memory(
+        &config.memory,
+        &llm_runtime,
+        state.clone(),
+        event_store.clone(),
+    )
+    .await;
 
     let startup_tools::ToolSetup {
         tools,
@@ -101,6 +111,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         &config_path,
         startup_tools::ToolSetupDependencies {
             state: state.clone(),
+            memory: startup_tools::ToolMemoryAccess {
+                store: memory_store.clone(),
+                own_memory: memory.own_memory(),
+            },
             pool: pool.clone(),
             event_store: event_store.clone(),
             llm_runtime: llm_runtime.clone(),
@@ -136,13 +150,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Vec::new()
     };
     let custom_persona = startup_prompt::load_agent_persona(&config, &config_path)?;
-    let memory = crate::agent::memory_plugin::configured_memory(
-        &config.memory,
-        &llm_runtime,
-        state.clone(),
-        event_store.clone(),
-    )
-    .await;
     let base_system_prompt = startup_prompt::build_base_system_prompt(
         &config,
         &skill_names,
@@ -180,6 +187,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     #[allow(unused_mut)]
     let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: memory_store.clone(),
             llm_runtime: llm_runtime.clone(),
             state: state.clone(),
             event_store: event_store.clone(),
@@ -286,6 +294,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             pruner: pruner.clone(),
             memory_manager: memory_manager.clone(),
             own_memory,
+            memory_store: memory_store.clone(),
             memory_services,
             wake_rx,
             inbox_dir: inbox_dir.clone(),

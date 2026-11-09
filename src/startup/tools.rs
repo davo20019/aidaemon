@@ -63,8 +63,18 @@ pub struct ToolSetup {
 /// not the concrete persistence implementation. This keeps SQLite-specific
 /// construction inside `startup::stores` while still allowing infrastructure
 /// tools to use the pool directly where their APIs require it.
+/// How tools reach the daemon's own memory.
+#[derive(Clone)]
+pub struct ToolMemoryAccess {
+    pub store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    /// False when another memory system replaced the daemon's. Its tools are
+    /// hidden then, and tools outside memory stop reading the daemon's store.
+    pub own_memory: bool,
+}
+
 pub struct ToolSetupDependencies {
     pub state: Arc<dyn StateStore>,
+    pub memory: ToolMemoryAccess,
     pub pool: SqlitePool,
     pub event_store: Arc<EventStore>,
     pub llm_runtime: SharedLlmRuntime,
@@ -85,6 +95,7 @@ pub async fn setup_tools(
 ) -> anyhow::Result<ToolSetup> {
     let ToolSetupDependencies {
         state,
+        memory,
         pool,
         event_store,
         llm_runtime,
@@ -104,6 +115,7 @@ pub async fn setup_tools(
         config,
         config_path.to_path_buf(),
         state.clone(),
+        memory.clone(),
         pool.clone(),
         event_store.clone(),
         approval_capacity,
@@ -123,6 +135,7 @@ pub async fn setup_tools(
         &mut tools,
         config,
         state.clone(),
+        memory.clone(),
         pool.clone(),
         event_store,
         llm_runtime.clone(),
@@ -158,6 +171,7 @@ pub async fn setup_tools(
         config_path,
         http_profiles,
         state,
+        memory.clone(),
         mcp_registry.clone(),
     )
     .await?;
@@ -601,10 +615,12 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_base_tools(
     config: &AppConfig,
     config_path: PathBuf,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_queue_capacity: usize,
@@ -649,6 +665,7 @@ pub async fn build_base_tools(
             config,
             &config_path,
             state.clone(),
+            memory.clone(),
             pool.clone(),
             event_store.clone(),
             approval_tx.clone(),
@@ -689,6 +706,7 @@ pub async fn register_optional_tools(
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     llm_runtime: SharedLlmRuntime,
@@ -818,13 +836,16 @@ pub async fn register_optional_tools(
                 if !register_cli && !register_manage_cli {
                     continue;
                 }
-                let cli_tool = CliAgentTool::discover(
+                let mut cli_tool = CliAgentTool::discover(
                     execution_backend.clone(),
                     config.cli_agents.clone(),
                     state.clone(),
                     llm_runtime.clone(),
                 )
                 .await;
+                if memory.own_memory {
+                    cli_tool = cli_tool.with_context_facts(memory.store.clone());
+                }
                 has_cli_agents = cli_tool.has_tools();
                 let arc = Arc::new(cli_tool);
                 cli_agent_tool = Some(arc.clone());
@@ -903,6 +924,7 @@ pub async fn register_runtime_tools(
     config_path: &Path,
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     mcp_registry: McpRegistry,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
     validate_runtime_manifest(RUNTIME_TOOL_MANIFEST)?;
@@ -951,6 +973,7 @@ pub async fn register_runtime_tools(
             config,
             config_path,
             state.clone(),
+            memory.clone(),
             mcp_registry.clone(),
             http_profiles.clone(),
             &mut http_request_tool,
@@ -979,6 +1002,7 @@ async fn register_runtime_tool_by_id(
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     mcp_registry: McpRegistry,
     http_profiles: crate::oauth::SharedHttpProfiles,
     http_request_tool: &mut Option<Arc<HttpRequestTool>>,
@@ -991,7 +1015,10 @@ async fn register_runtime_tool_by_id(
             tools.push(Arc::new(manage_mcp));
         }
         RuntimeToolId::ManagePeople => {
-            tools.push(Arc::new(ManagePeopleTool::new(state.clone())));
+            tools.push(Arc::new(ManagePeopleTool::new(
+                state.clone(),
+                memory.store.clone(),
+            )));
             // Seed the DB setting from config if not already set.
             if state.get_setting("people_enabled").await?.is_none() {
                 state
@@ -1106,6 +1133,7 @@ async fn build_base_tool(
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
+    memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     approval_tx: ApprovalBroker,
@@ -1148,19 +1176,22 @@ async fn build_base_tool(
             }
         }
         BaseToolId::RememberFact => BuiltBaseTool {
-            tool: Arc::new(RememberFactTool::new(state)),
+            tool: Arc::new(RememberFactTool::new(memory.store.clone())),
             terminal_tool: None,
         },
         BaseToolId::ShareMemory => BuiltBaseTool {
-            tool: Arc::new(ShareMemoryTool::new(state)),
+            tool: Arc::new(ShareMemoryTool::new(memory.store.clone())),
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
-            tool: Arc::new(ManageMemoriesTool::new(state)),
+            tool: Arc::new(ManageMemoriesTool::new(state, memory.store.clone())),
             terminal_tool: None,
         },
         BaseToolId::SetReminder => BuiltBaseTool {
-            tool: Arc::new(crate::tools::SetReminderTool::new(state)),
+            tool: Arc::new(crate::tools::SetReminderTool::new(
+                state,
+                memory.store.clone(),
+            )),
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
@@ -1175,10 +1206,14 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::SearchHistory => BuiltBaseTool {
-            tool: Arc::new(SearchHistoryTool::new(
-                state,
-                config.state.retention.messages_days,
-            )),
+            tool: {
+                let search = SearchHistoryTool::new(state, config.state.retention.messages_days);
+                Arc::new(if memory.own_memory {
+                    search.with_episodes(memory.store.clone())
+                } else {
+                    search
+                })
+            },
             terminal_tool: None,
         },
         BaseToolId::ScheduledGoalRuns => BuiltBaseTool {
@@ -1307,6 +1342,10 @@ mod tests {
             &config,
             config_file.path().to_path_buf(),
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store.clone(),
             32,
@@ -1323,6 +1362,10 @@ mod tests {
             &mut bundle.tools,
             &config,
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store.clone(),
             llm_runtime,
@@ -1342,6 +1385,10 @@ mod tests {
             config_file.path(),
             http_profiles,
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             mcp_registry,
         )
         .await?;
@@ -1649,6 +1696,10 @@ mod tests {
             &config,
             config_file.path().to_path_buf(),
             state.clone(),
+            ToolMemoryAccess {
+                store: state.memory_stores(),
+                own_memory: true,
+            },
             state.pool(),
             event_store,
             8,

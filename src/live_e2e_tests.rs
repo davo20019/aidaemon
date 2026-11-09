@@ -96,9 +96,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         terminal_tool,
     ];
 
@@ -112,6 +110,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
 
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -277,9 +276,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         terminal_tool,
     ];
 
@@ -293,6 +290,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
 
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,

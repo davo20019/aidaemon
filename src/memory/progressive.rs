@@ -20,6 +20,7 @@ pub fn spawn_progressive_extraction(
     llm_runtime: crate::llm_runtime::SharedLlmRuntime,
     fast_model: String,
     state: Arc<dyn StateStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<EventStore>,
     source_task_id: String,
     user_text: String,
@@ -55,7 +56,7 @@ pub fn spawn_progressive_extraction(
         if facts.is_empty() {
             return; // Expected for most interactions.
         }
-        let written = extractor.write(state.as_ref(), &exchange, facts).await;
+        let written = extractor.write(store.as_ref(), &exchange, facts).await;
         if written.is_empty() {
             return;
         }
@@ -67,7 +68,7 @@ pub fn spawn_progressive_extraction(
             .await
         {
             Ok(Some(event_id)) => {
-                if let Err(error) = state.repair_memory_projections().await {
+                if let Err(error) = store.repair_memory_projections().await {
                     debug!(%error, %source_task_id, "Failed to bind selected message provenance to extracted memory");
                 }
                 Some(event_id)

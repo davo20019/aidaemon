@@ -1253,8 +1253,14 @@ mod scoped_workspace_tests {
             Box::new(crate::tools::EditFileTool::new(backend())),
             Box::new(crate::tools::RunCommandTool::new(backend())),
             Box::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60)),
-            Box::new(crate::tools::ManagePeopleTool::new(state.clone())),
-            Box::new(crate::tools::ManageMemoriesTool::new(state.clone())),
+            Box::new(crate::tools::ManagePeopleTool::new(
+                state.clone(),
+                harness.state.memory_stores(),
+            )),
+            Box::new(crate::tools::ManageMemoriesTool::new(
+                state.clone(),
+                harness.state.memory_stores(),
+            )),
             Box::new(crate::tools::ManageGoalTasksTool::new(
                 "goal-synthetic-1".to_string(),
                 state.clone(),

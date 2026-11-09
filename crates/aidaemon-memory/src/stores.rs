@@ -12,7 +12,7 @@ use crate::records::*;
 
 /// Exact-history operations exposed to the search tool through a domain port.
 #[async_trait]
-pub trait HistorySearchStore: EpisodeStore {
+pub trait HistorySearchStore: Send + Sync {
     async fn history_snapshot_max_event_id(&self) -> anyhow::Result<i64>;
     async fn history_coverage(&self) -> anyhow::Result<HistoryCoverage>;
     async fn repair_history_projection(
@@ -501,4 +501,20 @@ where
         tracing::warn!(%error, "Failed to fold restated facts");
     }
     store.decay(policy, chrono::Utc::now()).await
+}
+
+/// Every store behind the daemon-shaped memory contract, as one handle.
+pub trait MemoryStores:
+    FactStore + EpisodeStore + PeopleStore + crate::LearningStore + MemoryGraphStore + MemoryDecay
+{
+}
+
+impl<T> MemoryStores for T where
+    T: FactStore
+        + EpisodeStore
+        + PeopleStore
+        + crate::LearningStore
+        + MemoryGraphStore
+        + MemoryDecay
+{
 }

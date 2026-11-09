@@ -2428,7 +2428,13 @@ mod tests {
     #[tokio::test]
     async fn scheduled_goal_asks_before_dispatch_on_a_goal_card() {
         let tool: Arc<dyn crate::traits::Tool> = Arc::new(crate::tools::ManageMemoriesTool::new(
-            approval_test_store().await as Arc<dyn crate::traits::StateStore>,
+            {
+                let state = approval_test_store().await;
+                let store = state.memory_stores();
+                (state as Arc<dyn crate::traits::StateStore>, store)
+            }
+            .0,
+            approval_test_store().await.memory_stores(),
         ));
         let goal = json!({
             "action": "create_scheduled_goal",

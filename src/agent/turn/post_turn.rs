@@ -4,11 +4,11 @@ use super::*;
 
 /// Learn from a finished task in the background.
 pub(in crate::agent) fn spawn_learning(
-    state: Arc<dyn crate::traits::StateStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     learning_ctx: LearningContext,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = post_task::process_learning(&state, learning_ctx).await {
+        if let Err(e) = post_task::process_learning(&store, learning_ctx).await {
             warn!("Learning failed: {}", e);
         }
     });

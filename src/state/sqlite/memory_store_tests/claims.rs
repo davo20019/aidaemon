@@ -284,7 +284,7 @@ async fn graph_traversal_is_bounded_to_two_hops() {
             .unwrap();
 
     let neighbors = MemoryGraphStore::neighbors(
-        &store,
+        store.memory(),
         owner_id,
         99,
         &GraphSearchScope {

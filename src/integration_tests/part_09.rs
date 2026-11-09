@@ -11,7 +11,7 @@ async fn test_orchestration_goal_context_feed_forward() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
     let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let state: Arc<dyn StateStore> = Arc::new(
+    let state: Arc<SqliteStateStore> = Arc::new(
         SqliteStateStore::new(&db_path, 100, None, embedding_service)
             .await
             .unwrap(),
@@ -195,4 +195,3 @@ async fn test_orchestration_context_accumulation_end_to_end() {
 
     std::mem::forget(db_file);
 }
-

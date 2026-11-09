@@ -7,18 +7,23 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::traits::{
-    semantics_for_exact_read_actions, PeopleToolStore, Person, PersonFact, StateStore, Tool,
-    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    semantics_for_exact_read_actions, Person, PersonFact, StateStore, Tool, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects,
 };
 
 pub struct ManagePeopleTool {
-    state: Arc<dyn PeopleToolStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    settings: Arc<dyn crate::traits::SettingsStore>,
 }
 
 impl ManagePeopleTool {
-    pub fn new(state: Arc<dyn StateStore>) -> Self {
+    pub fn new(
+        state: Arc<dyn StateStore>,
+        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    ) -> Self {
         Self {
-            state: state as Arc<dyn PeopleToolStore>,
+            store,
+            settings: state,
         }
     }
 }
@@ -247,13 +252,13 @@ impl ManagePeopleTool {
 
     async fn resolve_person(&self, args: &ManagePeopleArgs) -> anyhow::Result<Option<Person>> {
         if let Some(id) = args.id {
-            return self.state.get_person(id).await;
+            return self.store.get_person(id).await;
         }
         if let Some(ref name) = args.name {
-            return self.state.find_person_by_name(name).await;
+            return self.store.find_person_by_name(name).await;
         }
         if let Some(ref person_name) = args.person_name {
-            return self.state.find_person_by_name(person_name).await;
+            return self.store.find_person_by_name(person_name).await;
         }
         Ok(None)
     }
@@ -279,12 +284,12 @@ impl ManagePeopleTool {
             updated_at: chrono::Utc::now(),
         };
 
-        let id = self.state.upsert_person(&person).await?;
+        let id = self.store.upsert_person(&person).await?;
         Ok(format!("Added person '{}' with ID {}", name, id))
     }
 
     async fn handle_list(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
-        let people = self.state.get_all_people().await?;
+        let people = self.store.get_all_people().await?;
         if people.is_empty() {
             return Ok("No people tracked yet.".to_string());
         }
@@ -316,9 +321,9 @@ impl ManagePeopleTool {
 
     async fn handle_view(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         let person = if let Some(id) = args.id {
-            self.state.get_person(id).await?
+            self.store.get_person(id).await?
         } else if let Some(ref name) = args.name {
-            self.state.find_person_by_name(name).await?
+            self.store.find_person_by_name(name).await?
         } else {
             return Ok("Provide 'name' or 'id' to view a person.".to_string());
         };
@@ -328,7 +333,7 @@ impl ManagePeopleTool {
             None => return Ok("Person not found.".to_string()),
         };
 
-        let facts = self.state.get_person_facts(person.id, None).await?;
+        let facts = self.store.get_person_facts(person.id, None).await?;
         let mut result = format!("## {}", person.name);
         if let Some(ref rel) = person.relationship {
             result.push_str(&format!(" ({})", rel));
@@ -390,7 +395,7 @@ impl ManagePeopleTool {
             Some(p) => p,
             None => return Ok("Provide 'name', 'person_name', or 'id' for brief.".to_string()),
         };
-        let facts = self.state.get_person_facts(person.id, None).await?;
+        let facts = self.store.get_person_facts(person.id, None).await?;
 
         let relationship = person.relationship.as_deref().unwrap_or("unknown");
         let style = person
@@ -471,9 +476,9 @@ impl ManagePeopleTool {
         let today = chrono::Utc::now().date_naive();
         let mut rows: Vec<(i64, Person, PersonFact)> = Vec::new();
 
-        let people = self.state.get_all_people().await?;
+        let people = self.store.get_all_people().await?;
         for person in people {
-            let facts = self.state.get_person_facts(person.id, None).await?;
+            let facts = self.store.get_person_facts(person.id, None).await?;
             for fact in facts {
                 if fact.category != "birthday" && fact.category != "important_date" {
                     continue;
@@ -522,7 +527,7 @@ impl ManagePeopleTool {
     async fn handle_reconnect(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         let inactive_days = args.inactive_days.unwrap_or(30).clamp(1, 3650);
         let people = self
-            .state
+            .store
             .get_people_needing_reconnect(inactive_days)
             .await?;
         if people.is_empty() {
@@ -564,9 +569,9 @@ impl ManagePeopleTool {
 
     async fn handle_update(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         let person = if let Some(id) = args.id {
-            self.state.get_person(id).await?
+            self.store.get_person(id).await?
         } else if let Some(ref name) = args.name {
-            self.state.find_person_by_name(name).await?
+            self.store.find_person_by_name(name).await?
         } else {
             return Ok("Provide 'name' or 'id' to update a person.".to_string());
         };
@@ -595,15 +600,15 @@ impl ManagePeopleTool {
             person.language_preference = Some(lang.clone());
         }
 
-        self.state.upsert_person(&person).await?;
+        self.store.upsert_person(&person).await?;
         Ok(format!("Updated person '{}'", person.name))
     }
 
     async fn handle_remove(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         let person = if let Some(id) = args.id {
-            self.state.get_person(id).await?
+            self.store.get_person(id).await?
         } else if let Some(ref name) = args.name {
-            self.state.find_person_by_name(name).await?
+            self.store.find_person_by_name(name).await?
         } else {
             return Ok("Provide 'name' or 'id' to remove a person.".to_string());
         };
@@ -613,7 +618,7 @@ impl ManagePeopleTool {
             None => return Ok("Person not found.".to_string()),
         };
 
-        self.state.delete_person(person.id).await?;
+        self.store.delete_person(person.id).await?;
         Ok(format!(
             "Removed '{}' and all associated facts.",
             person.name
@@ -638,7 +643,7 @@ impl ManagePeopleTool {
             None => return Ok("Missing required field: value".to_string()),
         };
 
-        let person = match self.state.find_person_by_name(person_name).await? {
+        let person = match self.store.find_person_by_name(person_name).await? {
             Some(p) => p,
             None => {
                 return Ok(format!(
@@ -648,7 +653,7 @@ impl ManagePeopleTool {
             }
         };
 
-        self.state
+        self.store
             .upsert_person_fact(person.id, category, key, value, "agent", 1.0)
             .await?;
         Ok(format!(
@@ -663,7 +668,7 @@ impl ManagePeopleTool {
             None => return Ok("Missing required field: fact_id".to_string()),
         };
 
-        self.state.delete_person_fact(fact_id).await?;
+        self.store.delete_person_fact(fact_id).await?;
         Ok(format!("Removed fact {}", fact_id))
     }
 
@@ -683,12 +688,12 @@ impl ManagePeopleTool {
         };
         let display_name = args.display_name.as_deref().unwrap_or("");
 
-        let person = match self.state.find_person_by_name(person_name).await? {
+        let person = match self.store.find_person_by_name(person_name).await? {
             Some(p) => p,
             None => return Ok(format!("Person '{}' not found.", person_name)),
         };
 
-        self.state
+        self.store
             .link_platform_id(person.id, platform_id, display_name)
             .await?;
         Ok(format!(
@@ -706,12 +711,12 @@ impl ManagePeopleTool {
             },
         };
 
-        let person = match self.state.find_person_by_name(person_name).await? {
+        let person = match self.store.find_person_by_name(person_name).await? {
             Some(p) => p,
             None => return Ok(format!("Person '{}' not found.", person_name)),
         };
 
-        let facts = self.state.get_person_facts(person.id, None).await?;
+        let facts = self.store.get_person_facts(person.id, None).await?;
         let export = json!({
             "person": person,
             "facts": facts,
@@ -729,13 +734,13 @@ impl ManagePeopleTool {
             },
         };
 
-        let person = match self.state.find_person_by_name(person_name).await? {
+        let person = match self.store.find_person_by_name(person_name).await? {
             Some(p) => p,
             None => return Ok(format!("Person '{}' not found.", person_name)),
         };
 
-        let facts = self.state.get_person_facts(person.id, None).await?;
-        self.state.delete_person(person.id).await?;
+        let facts = self.store.get_person_facts(person.id, None).await?;
+        self.store.delete_person(person.id).await?;
         Ok(format!(
             "Purged '{}': deleted person record + {} facts + all platform links.",
             person.name,
@@ -745,12 +750,12 @@ impl ManagePeopleTool {
 
     async fn handle_audit(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         if let Some(ref name) = args.person_name.as_ref().or(args.name.as_ref()) {
-            let person = match self.state.find_person_by_name(name).await? {
+            let person = match self.store.find_person_by_name(name).await? {
                 Some(p) => p,
                 None => return Ok(format!("Person '{}' not found.", name)),
             };
 
-            let facts = self.state.get_person_facts(person.id, None).await?;
+            let facts = self.store.get_person_facts(person.id, None).await?;
             let auto_facts: Vec<&PersonFact> =
                 facts.iter().filter(|f| f.confidence < 1.0).collect();
 
@@ -781,12 +786,12 @@ impl ManagePeopleTool {
             Ok(result)
         } else {
             // Audit all people
-            let people = self.state.get_all_people().await?;
+            let people = self.store.get_all_people().await?;
             let mut total_unverified = 0;
             let mut result = String::from("**Audit Summary**\n");
 
             for p in &people {
-                let facts = self.state.get_person_facts(p.id, None).await?;
+                let facts = self.store.get_person_facts(p.id, None).await?;
                 let unverified = facts.iter().filter(|f| f.confidence < 1.0).count();
                 if unverified > 0 {
                     result.push_str(&format!(
@@ -814,7 +819,7 @@ impl ManagePeopleTool {
             None => return Ok("Missing required field: fact_id".to_string()),
         };
 
-        self.state.confirm_person_fact(fact_id).await?;
+        self.store.confirm_person_fact(fact_id).await?;
         Ok(format!(
             "Confirmed fact {} (confidence set to 100%, source set to 'owner').",
             fact_id
@@ -822,7 +827,7 @@ impl ManagePeopleTool {
     }
 
     async fn is_people_enabled(&self) -> bool {
-        self.state
+        self.settings
             .get_setting("people_enabled")
             .await
             .ok()
@@ -832,20 +837,20 @@ impl ManagePeopleTool {
     }
 
     async fn handle_enable(&self) -> anyhow::Result<String> {
-        self.state.set_setting("people_enabled", "true").await?;
+        self.settings.set_setting("people_enabled", "true").await?;
         Ok("People Intelligence enabled. I'll now track contacts, learn about people you mention, and provide proactive social reminders.".to_string())
     }
 
     async fn handle_disable(&self) -> anyhow::Result<String> {
-        self.state.set_setting("people_enabled", "false").await?;
+        self.settings.set_setting("people_enabled", "false").await?;
         Ok("People Intelligence disabled. All existing data is preserved — use 'enable' to turn it back on.".to_string())
     }
 
     async fn handle_status(&self) -> anyhow::Result<String> {
         let enabled = self.is_people_enabled().await;
-        let people_count = self.state.get_all_people().await.unwrap_or_default().len();
+        let people_count = self.store.get_all_people().await.unwrap_or_default().len();
         let canonical = self
-            .state
+            .store
             .get_canonical_memory_facts()
             .await
             .unwrap_or_default();
@@ -922,7 +927,10 @@ mod tests {
         );
         state.set_setting("people_enabled", "true").await.unwrap();
         std::mem::forget(db_file);
-        ManagePeopleTool::new(state as Arc<dyn StateStore>)
+        {
+            let store = state.memory_stores();
+            ManagePeopleTool::new(state as Arc<dyn StateStore>, store)
+        }
     }
 
     #[tokio::test]

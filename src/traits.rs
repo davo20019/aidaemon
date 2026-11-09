@@ -112,10 +112,10 @@ pub mod store_prelude {
         DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
         GoalScheduleStore, GoalStore, GoalTraceStore, HealthCheckStore, HistorySearchStore,
         LearningStore, MandateStore, MandateToolStore, McpRegistryStore, MessageStore,
-        NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore, PeopleToolStore,
-        PromptSnapshotStore, ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore,
-        SessionChannelStore, SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore,
-        TaskStore, TokenUsageStore, WorkCoordinationStore,
+        NotificationStore, OAuthGatewayStore, OAuthStore, PeopleStore, PromptSnapshotStore,
+        ReportBlockerStore, ScheduledGoalRunsStore, ScheduledRunStore, SessionChannelStore,
+        SettingsStore, SkillStore, SkillsStore, StateStore, TaskDispatchStore, TaskStore,
+        TokenUsageStore, WorkCoordinationStore,
     };
 }
 

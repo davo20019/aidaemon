@@ -219,7 +219,7 @@ async fn episode_search_finds_older_than_500_without_counting_a_recall() {
     assert_eq!(recall_count, 1);
 
     let channel_results = crate::traits::EpisodeStore::get_relevant_episodes_for_channel(
-        &store,
+        store.memory(),
         query,
         5,
         Some("slack:C1"),

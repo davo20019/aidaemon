@@ -552,6 +552,7 @@ async fn fact_reading_tools_receive_call_context() {
         .tools
         .push(Arc::new(crate::tools::ManageMemoriesTool::new(
             state.clone(),
+            harness.state.memory_stores(),
         )));
     harness
         .agent

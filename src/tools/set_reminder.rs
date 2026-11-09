@@ -20,9 +20,12 @@ pub struct SetReminderTool {
 }
 
 impl SetReminderTool {
-    pub fn new(state: Arc<dyn StateStore>) -> Self {
+    pub fn new(
+        state: Arc<dyn StateStore>,
+        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    ) -> Self {
         Self {
-            scheduler: ManageMemoriesTool::new(state),
+            scheduler: ManageMemoriesTool::new(state, store),
         }
     }
 }
@@ -146,8 +149,9 @@ impl crate::traits::ToolSemantics for SetReminderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::store_prelude::*;
 
-    async fn state() -> Arc<dyn StateStore> {
+    async fn state() -> Arc<crate::state::SqliteStateStore> {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();
         std::mem::forget(db);
@@ -162,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn sets_an_active_typed_reminder() {
         let state = state().await;
-        let tool = SetReminderTool::new(state.clone());
+        let tool = SetReminderTool::new(state.clone(), state.memory_stores());
         let outcome = tool
             .call_with_execution_context(
                 &json!({
@@ -204,7 +208,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_owner_cannot_set_a_reminder() {
-        let tool = SetReminderTool::new(state().await);
+        let state = state().await;
+        let tool = SetReminderTool::new(state.clone(), state.memory_stores());
         let outcome = tool
             .call_with_execution_context(
                 &json!({

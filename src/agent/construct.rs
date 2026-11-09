@@ -34,6 +34,7 @@ use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
 pub(crate) struct AgentRuntimeDependencies {
     pub llm_runtime: SharedLlmRuntime,
     pub state: Arc<dyn StateStore>,
+    pub memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pub event_store: Arc<EventStore>,
     pub tools: Vec<Arc<dyn Tool>>,
 }
@@ -119,6 +120,7 @@ impl Agent {
                 AgentRuntimeDependencies {
                     llm_runtime,
                     state,
+                    memory_store,
                     event_store,
                     tools,
                 },
@@ -188,6 +190,7 @@ impl Agent {
 
         let daemon_memory = super::memory_plugin::DaemonMemory::new(
             state.clone(),
+            memory_store.clone(),
             event_store.clone(),
             llm_runtime.clone(),
             context_window_config.clone(),
@@ -200,6 +203,7 @@ impl Agent {
         Self {
             llm_runtime,
             state,
+            memory_store,
             event_store,
             tools,
             model: RwLock::new(model),
@@ -401,6 +405,7 @@ impl Agent {
     pub(in crate::agent) fn with_depth(
         llm_runtime: SharedLlmRuntime,
         state: Arc<dyn StateStore>,
+        memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
         event_store: Arc<EventStore>,
         tools: Vec<Arc<dyn Tool>>,
         model: String,
@@ -448,6 +453,7 @@ impl Agent {
             .unwrap_or_else(|| model.clone());
         let daemon_memory = super::memory_plugin::DaemonMemory::new(
             state.clone(),
+            memory_store.clone(),
             event_store.clone(),
             llm_runtime.clone(),
             context_window_config.clone(),
@@ -460,6 +466,7 @@ impl Agent {
         Self {
             llm_runtime,
             state,
+            memory_store,
             event_store,
             tools,
             model: RwLock::new(model),

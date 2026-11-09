@@ -19,6 +19,7 @@ const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 /// facts, procedures, and error solutions, then stores them in the state store.
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<crate::events::EventStore>,
     llm_runtime: crate::llm_runtime::SharedLlmRuntime,
     model: String,
@@ -101,7 +102,7 @@ pub async fn extract_task_knowledge(
     );
     aidaemon_memory::task_learning::TaskLearner::new(Arc::new(provider), model)
         .learn(
-            state.as_ref(),
+            store.as_ref(),
             &aidaemon_memory::task_learning::FinishedTask {
                 description: &task.description,
                 result: task.result.as_deref(),

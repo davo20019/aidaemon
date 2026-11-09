@@ -53,6 +53,7 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) pruner: Arc<crate::events::Pruner>,
     pub(crate) memory_manager: Arc<crate::memory::manager::MemoryManager>,
     pub(crate) own_memory: bool,
+    pub(crate) memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pub(crate) memory_services: Vec<Arc<dyn aidaemon_core::Service>>,
     pub(crate) wake_rx: tokio::sync::mpsc::Receiver<()>,
     pub(crate) inbox_dir: String,
@@ -75,6 +76,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         pruner,
         memory_manager,
         own_memory,
+        memory_store,
         memory_services,
         wake_rx,
         inbox_dir,
@@ -330,10 +332,11 @@ pub(crate) async fn init_heartbeat_coordinator(
         }
 
         // People intelligence (daily)
-        {
+        if own_memory {
             let people_intel =
                 Arc::new(crate::memory::people_intelligence::PeopleIntelligence::new(
                     state.clone(),
+                    memory_store,
                     config.people.clone(),
                 ));
             heartbeat.register_job(

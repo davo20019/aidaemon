@@ -15,6 +15,8 @@ pub struct StoreBundle {
     /// Domain-facing state contract. The concrete SQLite implementation stays
     /// inside this adapter module and is not leaked through startup wiring.
     pub state: Arc<dyn StateStore>,
+    /// The daemon's own memory, in the same database.
+    pub memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     /// Shared relational handle used by infrastructure components that need a
     /// pool directly (events, plans, health, nodes, and checkpoints).
     pub pool: SqlitePool,
@@ -41,13 +43,13 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
     );
     info!("State store initialized ({})", config.state.db_path);
 
-    if let Ok(count) = state.backfill_episode_embeddings().await {
+    if let Ok(count) = state.memory().backfill_episode_embeddings().await {
         if count > 0 {
             info!(count, "Backfilled missing episode embeddings");
         }
     }
 
-    if let Ok(count) = state.backfill_fact_embeddings().await {
+    if let Ok(count) = state.memory().backfill_fact_embeddings().await {
         if count > 0 {
             info!(count, "Backfilled missing fact embeddings");
         }
@@ -116,7 +118,11 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
                 }
             }
         }
-        match projection_state.backfill_missing_memory_projections().await {
+        match projection_state
+            .memory()
+            .backfill_missing_memory_projections()
+            .await
+        {
             Ok((facts, episodes, spans, procedures, error_solutions))
                 if facts > 0
                     || episodes > 0
@@ -140,7 +146,11 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
         }
         const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
         for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
-            match projection_state.backfill_structured_personal_memory().await {
+            match projection_state
+                .memory()
+                .backfill_structured_personal_memory()
+                .await
+            {
                 Ok(count) => {
                     if count > 0 {
                         tracing::info!(count, "Backfilled safe structured personal memories");
@@ -168,6 +178,7 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
     });
 
     Ok(StoreBundle {
+        memory_store: state.memory_stores(),
         embedding_service,
         pool: state.pool(),
         state: state as Arc<dyn StateStore>,

@@ -1583,8 +1583,9 @@ async fn closeout_sees_only_offered_memory_tools() {
     let seed = crate::testing::setup_test_agent_sdk(crate::testing::MockProvider::new())
         .await
         .unwrap();
-    let manage_memories: Arc<dyn crate::traits::Tool> =
-        Arc::new(crate::tools::ManageMemoriesTool::new(seed.state.clone()));
+    let manage_memories: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::tools::ManageMemoriesTool::new(seed.state.clone(), seed.state.memory_stores()),
+    );
     let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
         crate::testing::MockProvider::new(),
         vec![manage_memories],

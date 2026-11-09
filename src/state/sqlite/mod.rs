@@ -42,8 +42,20 @@ pub struct SqliteStateStore {
     embedding_service: Arc<EmbeddingService>,
 }
 
-/// Memory's own methods, reached through the state store until callers hold
-/// the memory store directly.
+impl SqliteStateStore {
+    /// The daemon's own memory, over this database.
+    pub fn memory(&self) -> &aidaemon_memory::sqlite::SqliteMemory {
+        &self.memory
+    }
+
+    /// The same memory as the contract its users depend on.
+    pub fn memory_stores(&self) -> Arc<dyn aidaemon_memory::stores::MemoryStores> {
+        Arc::new(self.memory.clone())
+    }
+}
+
+/// Lets tests seed and read memory on the store they already hold.
+#[cfg(test)]
 impl std::ops::Deref for SqliteStateStore {
     type Target = aidaemon_memory::sqlite::SqliteMemory;
 
@@ -263,7 +275,6 @@ mod goals;
 mod health_checks;
 pub(crate) mod history_search;
 mod mandates;
-mod memory_delegates;
 mod messages;
 pub(crate) mod migrations;
 mod notifications;

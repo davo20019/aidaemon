@@ -20,6 +20,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub struct SearchHistoryTool {
     state: Arc<dyn HistorySearchStore>,
+    /// Summaries that narrow a search, when the daemon's own memory keeps them.
+    episodes: Option<Arc<dyn aidaemon_memory::stores::EpisodeStore>>,
     retention_days: u32,
     cursor_secret: Vec<u8>,
 }
@@ -28,9 +30,19 @@ impl SearchHistoryTool {
     pub fn new(state: Arc<dyn HistorySearchStore>, retention_days: u32) -> Self {
         Self {
             state,
+            episodes: None,
             retention_days,
             cursor_secret: Uuid::new_v4().as_bytes().to_vec(),
         }
+    }
+
+    /// Let searches be narrowed by the sessions these summaries point at.
+    pub fn with_episodes(
+        mut self,
+        episodes: Arc<dyn aidaemon_memory::stores::EpisodeStore>,
+    ) -> Self {
+        self.episodes = Some(episodes);
+        self
     }
 
     fn encode_cursor(&self, payload: &CursorPayload) -> anyhow::Result<String> {
@@ -132,18 +144,21 @@ impl SearchHistoryTool {
         if query.trim().is_empty() {
             return HashSet::new();
         }
+        let Some(store) = &self.episodes else {
+            return HashSet::new();
+        };
         let episodes = match scope.visibility {
-            ChannelVisibility::Private => self.state.get_relevant_episodes(query, 16).await,
+            ChannelVisibility::Private => store.get_relevant_episodes(query, 16).await,
             ChannelVisibility::PrivateGroup | ChannelVisibility::Public => {
-                self.state
+                store
                     .get_relevant_episodes_for_channel(query, 16, scope.channel_id.as_deref())
                     .await
             }
             ChannelVisibility::Internal if scope.trusted => {
-                self.state.get_relevant_episodes(query, 16).await
+                store.get_relevant_episodes(query, 16).await
             }
             ChannelVisibility::Internal => {
-                self.state
+                store
                     .get_relevant_episodes_for_session(query, 16, &scope.session_id)
                     .await
             }

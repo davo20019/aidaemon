@@ -7,7 +7,6 @@ use regex::Regex;
 use tracing::warn;
 
 use crate::events::TaskOutcome;
-use crate::traits::StateStore;
 
 use super::{semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
 
@@ -37,7 +36,7 @@ impl LearningContext {}
 
 /// Process learning from a completed task - runs in background.
 pub(super) async fn process_learning(
-    state: &Arc<dyn StateStore>,
+    state: &Arc<dyn aidaemon_memory::stores::MemoryStores>,
     ctx: LearningContext,
 ) -> anyhow::Result<()> {
     use crate::memory::{expertise, procedures};

@@ -909,9 +909,7 @@ async fn setup_test_agent_internal(
             Arc::new(SystemInfoTool::new(
                 crate::execution::active_execution_backend(),
             )),
-            Arc::new(RememberFactTool::new(
-                state.clone() as Arc<dyn crate::traits::StateStore>
-            )),
+            Arc::new(RememberFactTool::new(state.memory_stores())),
             Arc::new(TrackRequirementsTool::new(Arc::new(
                 PlanStore::new(state.pool()).await?,
             ))),
@@ -947,6 +945,7 @@ async fn setup_test_agent_internal(
 
     let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1073,9 +1072,7 @@ pub async fn setup_test_agent_with_models_and_policy(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         Arc::new(TrackRequirementsTool::new(Arc::new(
             PlanStore::new(state.pool()).await?,
         ))),
@@ -1099,6 +1096,7 @@ pub async fn setup_test_agent_with_models_and_policy(
 
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1173,9 +1171,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         Arc::new(TrackRequirementsTool::new(Arc::new(
             PlanStore::new(state.pool()).await?,
         ))),
@@ -1199,6 +1195,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
 
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1476,9 +1473,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         terminal_tool,
     ];
     tools.extend(extra_tools);
@@ -1504,6 +1499,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1636,9 +1632,7 @@ pub async fn setup_live_agent(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
+        Arc::new(RememberFactTool::new(state.memory_stores())),
         Arc::new(crate::tools::ReadFileTool::new(
             crate::execution::active_execution_backend(),
         )),
@@ -1663,6 +1657,7 @@ pub async fn setup_live_agent(
     );
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
+            memory_store: state.memory_stores(),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store: event_store.clone(),

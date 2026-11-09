@@ -25,6 +25,7 @@ pub struct MemoryManager {
     consolidator: Option<Arc<Consolidator>>,
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
+    memory: Option<Arc<dyn aidaemon_memory::stores::MemoryStores>>,
 }
 
 impl MemoryManager {
@@ -44,6 +45,7 @@ impl MemoryManager {
             consolidator,
             event_store: None,
             state: None,
+            memory: None,
         }
     }
 
@@ -56,6 +58,12 @@ impl MemoryManager {
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
         self.history = EventHistory::new(self.pool.clone(), Some(state.clone()));
         self.state = Some(state);
+        self
+    }
+
+    /// Set the memory the background jobs read and write.
+    pub fn with_memory(mut self, memory: Arc<dyn aidaemon_memory::stores::MemoryStores>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -279,6 +287,9 @@ impl MemoryManager {
         let Some(state) = self.state.clone() else {
             return Ok(());
         };
+        let Some(memory) = self.memory.clone() else {
+            return Ok(());
+        };
         let snapshot = self.llm_runtime.snapshot();
         // Background work does not need the strongest model.
         let model = snapshot.cheap_model();
@@ -298,7 +309,7 @@ impl MemoryManager {
             .consolidate(
                 &self.history,
                 &self.history,
-                state.as_ref(),
+                memory.as_ref(),
                 chrono::Utc::now(),
             )
             .await?;
@@ -338,6 +349,9 @@ impl MemoryManager {
         let Some(state) = self.state.clone() else {
             anyhow::bail!("No memory store to record the episode in");
         };
+        let Some(memory) = self.memory.clone() else {
+            anyhow::bail!("No memory store to record the episode in");
+        };
         let entries = transcript_entries(messages);
         let start_time = messages
             .first()
@@ -365,7 +379,7 @@ impl MemoryManager {
         let (episode_id, analysis) =
             aidaemon_memory::episodes::SessionAnalyst::new(provider, model)
                 .record_episode(
-                    state.as_ref(),
+                    memory.as_ref(),
                     session_id,
                     &entries,
                     messages.len(),
@@ -479,11 +493,11 @@ impl MemoryManager {
     /// Merge restated facts, then let unrecalled memory fade (the SDK
     /// memory crate's decay over the daemon store).
     pub async fn decay_memories(&self) -> anyhow::Result<()> {
-        let Some(state) = &self.state else {
+        let Some(memory) = self.memory.clone() else {
             return Ok(());
         };
         aidaemon_memory::stores::decay_memory(
-            state.as_ref(),
+            memory.as_ref(),
             &aidaemon_memory::stores::DecayPolicy::default(),
         )
         .await?;
@@ -775,7 +789,7 @@ impl MemoryManager {
             return Ok(());
         }
 
-        let Some(state) = &self.state else {
+        let Some(memory) = self.memory.clone() else {
             return Ok(());
         };
         // Habitual tool sequences, from the calls in order.
@@ -791,7 +805,7 @@ impl MemoryManager {
             })
             .collect();
         let patterns =
-            aidaemon_memory::record_tool_sequence_patterns(state.as_ref(), &tools).await?;
+            aidaemon_memory::record_tool_sequence_patterns(memory.as_ref(), &tools).await?;
         if !patterns.is_empty() {
             info!(count = patterns.len(), "Detected behavior patterns");
         }
@@ -802,7 +816,7 @@ impl MemoryManager {
             .filter(|m| m.role == "user")
             .filter_map(|m| m.content.as_deref())
             .collect();
-        if aidaemon_memory::update_communication_profile(state.as_ref(), &owner_texts)
+        if aidaemon_memory::update_communication_profile(memory.as_ref(), &owner_texts)
             .await?
             .is_some()
         {
@@ -1144,7 +1158,8 @@ mod tests {
             Duration::from_secs(60),
             None,
         )
-        .with_state(store.clone());
+        .with_state(store.clone())
+        .with_memory(store.memory_stores());
         (store, provider, manager, db_file)
     }
 
@@ -1453,7 +1468,8 @@ mod tests {
             Duration::from_secs(60),
             None,
         )
-        .with_state(store.clone());
+        .with_state(store.clone())
+        .with_memory(store.memory_stores());
 
         mgr.consolidate_memories().await.unwrap();
 
@@ -1559,7 +1575,8 @@ mod tests {
             Duration::from_secs(60),
             None,
         )
-        .with_state(store.clone());
+        .with_state(store.clone())
+        .with_memory(store.memory_stores());
 
         mgr.consolidate_memories().await.unwrap();
 

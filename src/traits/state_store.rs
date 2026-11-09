@@ -3,11 +3,6 @@ use async_trait::async_trait;
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
 pub use aidaemon_tools::services::{OAuthGatewayStore, OAuthStore, SettingsStore};
 
-/// Focused persistence contract used by people management.
-pub trait PeopleToolStore: PeopleStore + FactStore + SettingsStore {}
-
-impl<T> PeopleToolStore for T where T: PeopleStore + FactStore + SettingsStore {}
-
 /// Session message storage and context retrieval.
 #[async_trait]
 pub trait MessageStore: Send + Sync {
@@ -1554,27 +1549,21 @@ pub trait StateStore:
     + Sync
     + MessageStore
     + DialogueStateStore
-    + FactStore
-    + EpisodeStore
     + super::HistorySearchStore
     + GoalTraceStore
     + MandateToolStore
-    + PeopleToolStore
     + McpRegistryStore
     + SkillsStore
     + ReportBlockerStore
     + ScheduledGoalRunsStore
     + OAuthGatewayStore
     + TokenUsageStore
-    + LearningStore
-    + aidaemon_memory::stores::MemoryDecay
     + SkillStore
     + DynamicBotStore
     + SessionChannelStore
     + DynamicMcpServerStore
     + DynamicCliAgentStore
     + SettingsStore
-    + PeopleStore
     + OAuthStore
     + GoalStore
     + MandateStore
@@ -1597,27 +1586,21 @@ impl<T> StateStore for T where
         + Sync
         + MessageStore
         + DialogueStateStore
-        + FactStore
-        + EpisodeStore
         + super::HistorySearchStore
         + GoalTraceStore
         + MandateToolStore
-        + PeopleToolStore
         + McpRegistryStore
         + SkillsStore
         + ReportBlockerStore
         + ScheduledGoalRunsStore
         + OAuthGatewayStore
         + TokenUsageStore
-        + LearningStore
-        + aidaemon_memory::stores::MemoryDecay
         + SkillStore
         + DynamicBotStore
         + SessionChannelStore
         + DynamicMcpServerStore
         + DynamicCliAgentStore
         + SettingsStore
-        + PeopleStore
         + OAuthStore
         + GoalStore
         + MandateStore

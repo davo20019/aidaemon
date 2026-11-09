@@ -124,6 +124,7 @@ fn merge_search_results(
 
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
+    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
 }
 
 /// One parsed schedule of a `create_scheduled_goal` call.
@@ -178,8 +179,11 @@ impl ScheduledGoalPlan {
 }
 
 impl ManageMemoriesTool {
-    pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+    pub fn new(
+        state: Arc<dyn StateStore>,
+        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    ) -> Self {
+        Self { state, store }
     }
 
     /// Validate a `create_scheduled_goal` call with the dispatcher's facts
@@ -845,22 +849,22 @@ impl ManageMemoriesTool {
 
         match args.action.as_str() {
             "health" => {
-                let report = self.state.memory_health_report().await?;
+                let report = self.store.memory_health_report().await?;
                 Ok(serde_json::to_string_pretty(&report)?)
             }
             "repair" => {
-                let report = self.state.repair_memory_projections().await?;
+                let report = self.store.repair_memory_projections().await?;
                 Ok(serde_json::to_string_pretty(&report)?)
             }
             "list" => {
-                let mut facts = self.state.get_canonical_memory_facts().await?;
+                let mut facts = self.store.get_canonical_memory_facts().await?;
                 let canonical_owner_keys: std::collections::HashSet<String> = facts
                     .iter()
                     .filter(|fact| fact.category == "user")
                     .map(|fact| canonical_personal_display_key(&fact.key))
                     .collect();
                 facts.extend(
-                    self.state
+                    self.store
                         .get_all_facts_with_provenance()
                         .await?
                         .into_iter()
@@ -990,7 +994,7 @@ impl ManageMemoriesTool {
                 let mut to_delete: Vec<(i64, String, String)> = Vec::new();
                 let mut seen_ids = std::collections::HashSet::new();
 
-                let facts = self.state.get_facts(Some(category)).await?;
+                let facts = self.store.get_facts(Some(category)).await?;
                 let has_exact = facts.iter().any(&exact_in_category);
                 for f in &facts {
                     let selected = if has_exact {
@@ -1004,7 +1008,7 @@ impl ManageMemoriesTool {
                 }
 
                 // Also check OTHER categories for exact/canonical duplicates only.
-                let all_facts = self.state.get_facts(None).await?;
+                let all_facts = self.store.get_facts(None).await?;
                 for f in &all_facts {
                     if f.category == category {
                         continue;
@@ -1019,7 +1023,7 @@ impl ManageMemoriesTool {
                 } else {
                     let mut forgotten = Vec::new();
                     for (id, cat, k) in &to_delete {
-                        self.state.delete_fact(*id).await?;
+                        self.store.delete_fact(*id).await?;
                         forgotten.push(format!("[{}] {}", cat, k));
                     }
                     Ok(format!("Forgotten {} fact(s): {}", forgotten.len(), forgotten.join(", ")))
@@ -1031,12 +1035,12 @@ impl ManageMemoriesTool {
                 let privacy_str = args.privacy.as_deref().ok_or_else(|| anyhow::anyhow!("'privacy' is required for set_privacy action"))?;
                 let privacy = FactPrivacy::from_str_lossy(privacy_str);
 
-                let facts = self.state.get_facts(Some(category)).await?;
+                let facts = self.store.get_facts(Some(category)).await?;
                 let fact = facts.iter().find(|f| f.key == key && f.superseded_at.is_none());
 
                 match fact {
                     Some(f) => {
-                        self.state.update_fact_privacy(f.id, privacy).await?;
+                        self.store.update_fact_privacy(f.id, privacy).await?;
                         Ok(format!("Updated privacy: [{}] {} → {}", category, key, privacy))
                     }
                     None => Ok(format!("No active fact found: [{}] {}", category, key)),
@@ -1053,14 +1057,14 @@ impl ManageMemoriesTool {
                 // Pass 1 — keyword (lexical) search. High precision for exact
                 // keys/values (port numbers, names, structured keys). Uses
                 // word-boundary token matching so "port" doesn't match "report".
-                let mut facts = self.state.get_canonical_memory_facts().await?;
+                let mut facts = self.store.get_canonical_memory_facts().await?;
                 let canonical_owner_keys: std::collections::HashSet<String> = facts
                     .iter()
                     .filter(|fact| fact.category == "user")
                     .map(|fact| canonical_personal_display_key(&fact.key))
                     .collect();
                 facts.extend(
-                    self.state
+                    self.store
                         .get_all_facts_with_provenance()
                         .await?
                         .into_iter()
@@ -1096,7 +1100,7 @@ impl ManageMemoriesTool {
                 // facts the keyword pass misses (e.g. "DB setup" → the port). The
                 // dedicated method returns thresholded matches only — no padding.
                 let semantic: Vec<crate::traits::Fact> = self
-                    .state
+                    .store
                     .search_facts_semantic(query, limit)
                     .await
                     .unwrap_or_default()
@@ -1201,7 +1205,7 @@ impl ManageMemoriesTool {
                     if !candidates.is_empty() {
                         let t0 = std::time::Instant::now();
                         if let Ok(neighborhood) = self
-                            .state
+                            .store
                             .assemble_neighborhood(&candidates, &initial_ids)
                             .await
                         {
@@ -1245,10 +1249,10 @@ impl ManageMemoriesTool {
                     .unwrap_or(ChannelVisibility::Internal);
                 let episodes = match visibility {
                     ChannelVisibility::Private => {
-                        self.state.get_relevant_episodes(query, limit).await?
+                        self.store.get_relevant_episodes(query, limit).await?
                     }
                     ChannelVisibility::PrivateGroup | ChannelVisibility::Public => {
-                        self.state
+                        self.store
                             .get_relevant_episodes_for_channel(
                                 query,
                                 limit,
@@ -1263,17 +1267,17 @@ impl ManageMemoriesTool {
                         );
                     }
                     ChannelVisibility::Internal if trusted_session => {
-                        self.state.get_relevant_episodes(query, limit).await?
+                        self.store.get_relevant_episodes(query, limit).await?
                     }
                     ChannelVisibility::Internal => {
                         let session_id = facts.session().unwrap_or("");
-                        self.state
+                        self.store
                             .get_relevant_episodes_for_session(query, limit, session_id)
                             .await?
                     }
                 };
                 let recalled: Vec<i64> = episodes.iter().map(|episode| episode.id).collect();
-                let _ = self.state.record_memory_recall(&[], &recalled).await;
+                let _ = self.store.record_memory_recall(&[], &recalled).await;
                 if episodes.is_empty() {
                     return Ok(if query.is_empty() {
                         "No past conversations recorded yet.".to_string()
@@ -2496,6 +2500,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
+    use crate::traits::store_prelude::*;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
@@ -2519,7 +2524,7 @@ mod tests {
     /// actions stay undeclared.
     #[tokio::test]
     async fn memory_store_actions_declare_no_effects() {
-        let tool = ManageMemoriesTool::new(setup_state().await);
+        let tool = test_tool(setup_state().await);
         let effects = |args: Value| tool.call_effects(&args.to_string());
         for action in ["forget", "repair", "list", "search"] {
             assert!(effects(json!({"action": action})).complete, "{action}");
@@ -2538,7 +2543,7 @@ mod tests {
     #[tokio::test]
     async fn scheduled_actions_declare_goal_identity_contract() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state);
+        let tool = test_tool(state);
         assert!(tool
             .validate_arguments(r#"{"action":"diagnose_scheduled"}"#)
             .is_err());
@@ -2586,7 +2591,7 @@ mod tests {
             .unwrap();
 
         // No MockProvider needed — expansion is driven purely by result entities.
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         // limit=1 keeps only the top-ranked initial hit (mother_name) so
         // initial_ids does NOT contain father_name. The neighborhood expansion
@@ -2648,7 +2653,7 @@ mod tests {
             .unwrap();
 
         // No MockProvider — result-signal is sufficient.
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         // limit=1 so only the top-ranked initial hit is in the base results;
         // neighborhood expansion is the only path that can surface "Frank".
@@ -2708,7 +2713,7 @@ mod tests {
             .unwrap();
 
         // No MockProvider — the result-derived entity path is the only path.
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         // limit=1 ensures only the top-ranked initial hit (mother_name) is in the
         // primary block; neighborhood expansion is the ONLY path that can surface Frank.
@@ -2911,7 +2916,7 @@ mod tests {
         // bury `local_dev_db_port` under substring noise (report/portfolio/…) and
         // truncate it away. The hybrid search must surface it.
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         state
             .upsert_fact_with_provenance(
@@ -2991,7 +2996,7 @@ mod tests {
                 .unwrap(),
         );
         std::mem::forget(db_file);
-        let tool = ManageMemoriesTool::new(concrete.clone() as Arc<dyn StateStore>);
+        let tool = test_tool(concrete.clone());
         let now = chrono::Utc::now();
         let ep = crate::traits::Episode {
             id: 0,
@@ -3056,7 +3061,7 @@ mod tests {
                 .unwrap(),
         );
         std::mem::forget(db_file);
-        let tool = ManageMemoriesTool::new(concrete.clone() as Arc<dyn StateStore>);
+        let tool = test_tool(concrete.clone());
         let now = chrono::Utc::now();
         for (session, summary) in [
             (
@@ -3119,7 +3124,12 @@ mod tests {
         assert!(trusted.contains("Jordan Lee"), "{trusted}");
     }
 
-    async fn setup_state() -> Arc<dyn StateStore> {
+    fn test_tool(state: Arc<SqliteStateStore>) -> ManageMemoriesTool {
+        let store = state.memory_stores();
+        ManageMemoriesTool::new(state, store)
+    }
+
+    async fn setup_state() -> Arc<SqliteStateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().to_str().unwrap().to_string();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
@@ -3129,10 +3139,10 @@ mod tests {
                 .unwrap(),
         );
         std::mem::forget(db_file);
-        state as Arc<dyn StateStore>
+        state
     }
 
-    async fn add_schedule(state: &Arc<dyn StateStore>, goal_id: &str, cron_expr: &str) {
+    async fn add_schedule(state: &Arc<SqliteStateStore>, goal_id: &str, cron_expr: &str) {
         let now = chrono::Utc::now().to_rfc3339();
         let next_run = crate::cron_utils::compute_next_run(cron_expr)
             .unwrap()
@@ -3171,7 +3181,7 @@ mod tests {
     #[tokio::test]
     async fn add_schedule_creates_schedule_row() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let goal = Goal::new_continuous(
             "English research for pronunciation",
@@ -3204,7 +3214,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_now_uses_run_aware_path_and_preserves_goal_context() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Publish one researched daily insight",
@@ -3250,7 +3260,7 @@ mod tests {
     #[tokio::test]
     async fn add_schedule_rejects_personal_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut goal = Goal::new_finite("Personal goal", "user-session");
         goal.domain = "personal".to_string();
@@ -3276,7 +3286,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_scheduled_blocks_protected_system_maintenance_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let goal = Goal::new_continuous(
             "Maintain memory health: prune old events, clean up retention, remove stale data",
@@ -3307,7 +3317,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_scheduled_allows_non_system_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let goal = Goal::new_continuous(
             "English research for pronunciation",
@@ -3338,7 +3348,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_scheduled_all_keyword_cancels_cancellable_goals() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let g1 = Goal::new_continuous("Recurring A", "user-session", Some(1000), Some(5000));
         let g2 = Goal::new_continuous("Recurring B", "user-session", Some(1000), Some(5000));
@@ -3389,7 +3399,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_scheduled_all_keyword_scoped_to_session() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let same_session = Goal::new_continuous(
             "Recurring Same Session",
@@ -3446,7 +3456,7 @@ mod tests {
     #[tokio::test]
     async fn retry_scheduled_reactivates_failed_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Retryable scheduled goal",
@@ -3480,7 +3490,7 @@ mod tests {
     #[tokio::test]
     async fn retry_scheduled_reactivates_stalled_goal_and_resets_breaker() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut goal = Goal::new_continuous(
             "Stalled synthetic blog goal",
@@ -3514,7 +3524,7 @@ mod tests {
     #[tokio::test]
     async fn retry_scheduled_rejects_non_failed_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let goal = Goal::new_continuous(
             "Already active scheduled goal",
@@ -3545,7 +3555,7 @@ mod tests {
     #[tokio::test]
     async fn retry_failed_scheduled_reactivates_all_failed() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut failed_one = Goal::new_continuous(
             "Maintain knowledge base: process embeddings, consolidate memories, decay old facts",
@@ -3589,7 +3599,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_scheduled_matching_cancels_matching_goals() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let g1 = Goal::new_continuous(
             "English pronunciation slot A",
@@ -3644,7 +3654,7 @@ mod tests {
     #[tokio::test]
     async fn diagnose_scheduled_reports_latest_failed_task() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let mut goal = Goal::new_continuous("Diagnose me", "user-session", Some(2000), Some(20000));
         goal.status = "failed".to_string();
@@ -3709,7 +3719,7 @@ mod tests {
     #[tokio::test]
     async fn create_personal_goal_creates_goal_in_registry() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -3738,7 +3748,7 @@ mod tests {
     #[tokio::test]
     async fn created_goal_with_rate_limit_language_reports_typed_success() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state);
+        let tool = test_tool(state);
 
         let outcome = tool
             .call_with_execution_context(
@@ -3767,7 +3777,7 @@ mod tests {
         let foreign = crate::traits::Goal::new_personal("Foreign goal", "other-session");
         state.create_goal(&foreign).await.unwrap();
         state.create_goal(&compatible).await.unwrap();
-        let tool = ManageMemoriesTool::new(state);
+        let tool = test_tool(state);
 
         let output = tool
             .call_with(
@@ -3797,7 +3807,7 @@ mod tests {
     #[tokio::test]
     async fn create_personal_goal_with_priority() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -3820,7 +3830,7 @@ mod tests {
     #[tokio::test]
     async fn create_personal_goal_rejects_invalid_priority() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -3843,7 +3853,7 @@ mod tests {
     #[tokio::test]
     async fn create_personal_goal_rejects_empty_description() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -3862,7 +3872,7 @@ mod tests {
     #[tokio::test]
     async fn create_personal_goal_rejects_missing_internal_session() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call(
@@ -3891,7 +3901,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_success_recurring() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -3934,7 +3944,7 @@ mod tests {
     #[tokio::test]
     async fn activate_scheduled_is_typed_owner_and_session_scoped() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         // A goal still pending confirmation (one created before the kernel
         // confirmed goals up front).
         let mut goal =
@@ -3988,7 +3998,7 @@ mod tests {
     #[tokio::test]
     async fn activate_scheduled_rejects_non_owner() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state);
+        let tool = test_tool(state);
         let result = tool
             .call_with(
                 &json!({
@@ -4012,7 +4022,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_refuses_without_kernel_approval() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         let error = tool
             .call_with(
                 &json!({
@@ -4050,7 +4060,7 @@ mod tests {
     async fn create_scheduled_goal_judges_its_own_approval() {
         use crate::traits::OwnerApprovalNeed;
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         let owner = crate::traits::ToolCallContext {
             user_role: Some(crate::types::UserRole::Owner),
             session_id: "test-session".into(),
@@ -4160,7 +4170,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_success_one_shot() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4199,7 +4209,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_uses_schedule_when_schedules_is_empty() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4246,7 +4256,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_with_reminder_message_is_active_at_once() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4285,7 +4295,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_the_last_schedule_cancels_the_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         tool.call_with(
             &json!({
                 "action": "create_scheduled_goal",
@@ -4339,7 +4349,7 @@ mod tests {
     #[tokio::test]
     async fn list_scheduled_shows_and_cancels_unscheduled_active_goals() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         let mut orphan = crate::traits::Goal::new_continuous(
             "Post one synthetic update for Acme Corp",
             "telegram:synthetic-user-1",
@@ -4401,7 +4411,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_cleans_filler_and_schedule_from_goal_text() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4434,7 +4444,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_rejects_non_owner() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4462,7 +4472,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_rejects_missing_session_id() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4489,7 +4499,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_rejects_bad_schedule() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4517,7 +4527,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_rejects_missing_schedule() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4541,7 +4551,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_multiple_schedules() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4582,7 +4592,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_starts_paused() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4617,7 +4627,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_rejects_internal_execution_context() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4647,7 +4657,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_deduplicates_same_description_and_schedule() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let first = tool
             .call_with(
@@ -4698,7 +4708,7 @@ mod tests {
     #[tokio::test]
     async fn create_scheduled_goal_bad_schedule_in_multi_does_not_create_goal() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         let result = tool
             .call_with(
@@ -4733,7 +4743,7 @@ mod tests {
     #[tokio::test]
     async fn forget_rejects_empty_or_whitespace_key() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         for (cat, key, val) in [
             ("preferences", "favorite_color", "blue"),
@@ -4779,7 +4789,7 @@ mod tests {
     #[tokio::test]
     async fn forget_rejects_single_character_key() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         state
             .upsert_fact(
@@ -4821,7 +4831,7 @@ mod tests {
     #[tokio::test]
     async fn forget_substring_matches_within_requested_category() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         state
             .upsert_fact(
@@ -4878,7 +4888,7 @@ mod tests {
     #[tokio::test]
     async fn forget_never_deletes_keys_contained_in_the_requested_key() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         for (key, value) in [
             ("qa_pet_name", "SYNTH-FINCH"),
             ("name", "Alice Rivera"),
@@ -4914,7 +4924,7 @@ mod tests {
     #[tokio::test]
     async fn forget_partial_key_matches_whole_segments_only() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
         for key in ["favorite_color", "colorado_trip"] {
             state
                 .upsert_fact("preferences", key, "x", "test", None, FactPrivacy::Global)
@@ -4937,7 +4947,7 @@ mod tests {
     #[tokio::test]
     async fn forget_cross_category_only_exact_or_canonical() {
         let state = setup_state().await;
-        let tool = ManageMemoriesTool::new(state.clone());
+        let tool = test_tool(state.clone());
 
         // Exact duplicate across categories should be cleaned up.
         state

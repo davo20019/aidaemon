@@ -74,6 +74,7 @@ pub struct Consolidator {
     llm_runtime: Option<SharedLlmRuntime>,
     embedding_service: Option<Arc<EmbeddingService>>,
     state: Option<Arc<dyn crate::traits::StateStore>>,
+    memory: Option<Arc<dyn aidaemon_memory::stores::MemoryStores>>,
     learning_evidence_gate_enforce: bool,
 }
 
@@ -92,6 +93,7 @@ impl Consolidator {
             llm_runtime,
             embedding_service,
             state: None,
+            memory: None,
             learning_evidence_gate_enforce: false,
         }
     }
@@ -99,6 +101,12 @@ impl Consolidator {
     /// Set the state store for token usage tracking.
     pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Set the memory the consolidator's lessons are written to.
+    pub fn with_memory(mut self, memory: Arc<dyn aidaemon_memory::stores::MemoryStores>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -436,7 +444,7 @@ impl Consolidator {
 
     /// Mine operational warning/error decision points into durable failure patterns.
     async fn extract_failure_patterns_from_decisions(&self, events: &[Event]) -> usize {
-        let Some(state) = self.state.as_ref() else {
+        let Some(memory) = self.memory.as_ref() else {
             return 0;
         };
 
@@ -484,7 +492,7 @@ impl Consolidator {
                     continue;
                 }
 
-                match state
+                match memory
                     .record_behavior_pattern(
                         "failure",
                         &pattern.description,
@@ -1294,7 +1302,8 @@ mod tests {
         let plan_store = Arc::new(PlanStore::new(state.pool()).await.expect("plan store"));
         let consolidator =
             Consolidator::new(event_store.clone(), plan_store, state.pool(), None, None)
-                .with_state(state.clone() as Arc<dyn StateStore>);
+                .with_state(state.clone() as Arc<dyn StateStore>)
+                .with_memory(state.memory_stores());
         (state, event_store, consolidator, db_file)
     }
 
@@ -1413,7 +1422,8 @@ mod tests {
                 Some(runtime),
                 None,
             )
-            .with_state(state.clone() as Arc<dyn StateStore>),
+            .with_state(state.clone() as Arc<dyn StateStore>)
+            .with_memory(state.memory_stores()),
         );
         sqlx::query(
             "INSERT INTO events (session_id, event_type, data, created_at)
@@ -1475,7 +1485,8 @@ mod tests {
                 Some(runtime),
                 None,
             )
-            .with_state(state.clone() as Arc<dyn StateStore>),
+            .with_state(state.clone() as Arc<dyn StateStore>)
+            .with_memory(state.memory_stores()),
         );
 
         // Deliberately use an owner-looking session ID for the mandate: the

@@ -16,9 +16,11 @@ pub struct MemoryPipelineBundle {
     pub memory_manager: Arc<MemoryManager>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_memory_pipeline(
     config: &AppConfig,
     state: Arc<dyn StateStore>,
+    memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
@@ -34,6 +36,7 @@ pub fn build_memory_pipeline(
             Some(embedding_service.clone()),
         )
         .with_state(state.clone())
+        .with_memory(memory_store.clone())
         .with_learning_evidence_gate(config.policy.learning_evidence_gate_enforce),
     );
 
@@ -54,7 +57,8 @@ pub fn build_memory_pipeline(
             Some(consolidator.clone()),
         )
         .with_event_store(event_store)
-        .with_state(state),
+        .with_state(state)
+        .with_memory(memory_store),
     );
 
     MemoryPipelineBundle {

@@ -1625,6 +1625,7 @@ impl Agent {
         let mut child = Agent::with_depth(
             self.llm_runtime.clone(),
             self.state.clone(),
+            self.memory_store.clone(),
             self.event_store.clone(),
             tools,
             model,
@@ -2859,8 +2860,9 @@ impl Agent {
             if let Some(ref task_id) = saved_task_id {
                 if result.is_ok() {
                     if let Ok(Some(completed_task)) = self.state.get_task(task_id).await {
-                        if completed_task.status == "completed" {
+                        if completed_task.status == "completed" && self.memory.is_daemons_own() {
                             let state = self.state.clone();
+                            let store = self.memory_store.clone();
                             let event_store = self.event_store.clone();
                             let llm_runtime = self.llm_runtime.clone();
                             let tid = task_id.clone();
@@ -2883,6 +2885,7 @@ impl Agent {
                                 if let Err(e) =
                                     crate::memory::task_learning::extract_task_knowledge(
                                         state,
+                                        store,
                                         event_store,
                                         llm_runtime,
                                         model,

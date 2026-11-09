@@ -12,9 +12,13 @@ pub struct PeopleIntelligence {
 }
 
 impl PeopleIntelligence {
-    pub fn new(state: Arc<dyn StateStore>, config: PeopleConfig) -> Self {
+    pub fn new(
+        state: Arc<dyn StateStore>,
+        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+        config: PeopleConfig,
+    ) -> Self {
         let upkeep = aidaemon_memory::people_intelligence::PeopleIntelligence::new(
-            state.clone(),
+            store,
             aidaemon_memory::people_intelligence::PeopleIntelligenceConfig {
                 fact_retention_days: config.fact_retention_days,
                 reconnect_reminder_days: config.reconnect_reminder_days,

@@ -611,6 +611,9 @@ fn make_dedup_prompt(prompt: &str) -> String {
 }
 
 pub struct CliAgentTool {
+    /// Stored facts handed to delegated agents, when the daemon's own memory
+    /// keeps them.
+    context_facts: Option<Arc<dyn crate::traits::FactStore>>,
     backend: SharedExecutionBackend,
     // MUST be std::sync::RwLock because schema() is sync
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
@@ -1490,6 +1493,7 @@ impl CliAgentTool {
         tool_names.sort();
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend,
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
@@ -1515,6 +1519,11 @@ impl CliAgentTool {
     }
 
     /// Set channel hub reference for immediate background completion delivery.
+    pub fn with_context_facts(mut self, facts: Arc<dyn crate::traits::FactStore>) -> Self {
+        self.context_facts = Some(facts);
+        self
+    }
+
     pub fn set_hub(&self, hub: Weak<dyn OutboundRouter>) {
         self.hub
             .set(hub)
@@ -1836,11 +1845,11 @@ impl CliAgentTool {
 
         // Relevant facts (query both task prompt and recent user message)
         let mut facts_text = String::new();
-        {
+        if let Some(store) = &self.context_facts {
             let mut seen = HashSet::new();
             let mut facts_accum = Vec::new();
 
-            if let Ok(facts) = self.state.get_relevant_facts(task_prompt, 15).await {
+            if let Ok(facts) = store.get_relevant_facts(task_prompt, 15).await {
                 for fact in facts {
                     if seen.insert((fact.category.clone(), fact.key.clone())) {
                         facts_accum.push(fact);
@@ -1853,7 +1862,7 @@ impl CliAgentTool {
                     if let Some(content) = last_user_msg.content.as_deref() {
                         let user_text: String = content.chars().take(500).collect();
                         if user_text != task_prompt {
-                            if let Ok(facts) = self.state.get_relevant_facts(&user_text, 10).await {
+                            if let Ok(facts) = store.get_relevant_facts(&user_text, 10).await {
                                 for fact in facts {
                                     if seen.insert((fact.category.clone(), fact.key.clone())) {
                                         facts_accum.push(fact);
@@ -1867,7 +1876,7 @@ impl CliAgentTool {
 
             facts_accum.truncate(20);
             let recalled: Vec<i64> = facts_accum.iter().map(|fact| fact.id).collect();
-            let _ = self.state.record_memory_recall(&recalled, &[]).await;
+            let _ = store.record_memory_recall(&recalled, &[]).await;
             if !facts_accum.is_empty() {
                 let fact_lines: Vec<String> = facts_accum
                     .iter()
@@ -5281,6 +5290,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
@@ -5337,6 +5347,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
@@ -7079,6 +7090,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
@@ -7156,6 +7168,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
@@ -7326,6 +7339,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            context_facts: None,
             backend: crate::execution::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
