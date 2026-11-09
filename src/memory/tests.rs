@@ -1,6 +1,6 @@
-use crate::memory::math::cosine_similarity;
 use crate::memory::scoring::score_message;
 use crate::traits::Message;
+use aidaemon_memory::cosine as cosine_similarity;
 use chrono::Utc;
 
 #[test]

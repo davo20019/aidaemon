@@ -1282,7 +1282,12 @@ impl EventStore {
         let Some(event_id) = event_id else {
             return Ok(None);
         };
-        crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await?;
+        aidaemon_memory::sqlite::project_event_span(
+            &self.pool,
+            &crate::memory::DaemonChannelIds,
+            event_id,
+        )
+        .await?;
         let projected = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ? AND deleted_at IS NULL",
         )

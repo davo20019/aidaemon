@@ -1,14 +1,14 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::EpisodeStore for SqliteStateStore {
+impl EpisodeStore for SqliteMemory {
     /// Insert the episode with the event span it covers, then embed its
     /// summary and project it into the memory index. Multiple episodes per
     /// session are allowed (mid-session ones for long conversations, then a
     /// final one when the session goes idle).
     async fn record_session_episode(
         &self,
-        episode: &aidaemon_memory::episodes::SessionEpisode,
+        episode: &crate::episodes::SessionEpisode,
     ) -> anyhow::Result<i64> {
         let bounds = sqlx::query(
             "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
@@ -60,7 +60,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
         let episode_id = result.last_insert_rowid();
         if let Ok(embedding) = self.embedding_service.embed(episode.summary.clone()).await {
             sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
-                .bind(crate::memory::binary::encode_embedding(&embedding))
+                .bind(encode_embedding(&embedding))
                 .bind(episode_id)
                 .execute(&self.pool)
                 .await?;
@@ -72,7 +72,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
     }
 
     async fn project_episode_memory(&self, episode_id: i64) -> anyhow::Result<()> {
-        SqliteStateStore::project_episode_memory(self, episode_id).await
+        SqliteMemory::project_episode_memory(self, episode_id).await
     }
 
     async fn get_relevant_episodes(
@@ -81,7 +81,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Episode>> {
         // Delegate to inherent method
-        SqliteStateStore::get_relevant_episodes(self, query, limit).await
+        SqliteMemory::get_relevant_episodes(self, query, limit).await
     }
 
     async fn get_relevant_episodes_for_channel(
@@ -110,7 +110,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                     (None, None) => true,
                     (None, Some(_)) => false,
                     (Some(ep_ch), Some(current_ch)) => {
-                        crate::session::stored_channel_matches_current(ep_ch, current_ch)
+                        self.channels.same_channel(ep_ch, current_ch)
                     }
                     (Some(_), None) => false,
                 };
@@ -143,9 +143,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
             let include = match (&ep_channel_id, channel_id) {
                 (None, None) => true,
                 (None, Some(_)) => false,
-                (Some(ep_ch), Some(current_ch)) => {
-                    crate::session::stored_channel_matches_current(ep_ch, current_ch)
-                }
+                (Some(ep_ch), Some(current_ch)) => self.channels.same_channel(ep_ch, current_ch),
                 (Some(_), None) => false, // Has channel but no current: skip
             };
             if !include {
@@ -160,24 +158,23 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                     .or_else(|| {
                         row.get::<Option<Vec<u8>>, _>("embedding")
                             .and_then(|blob| decode_embedding(&blob).ok())
-                            .map(|vec| crate::memory::math::cosine_similarity(query_vec, &vec))
+                            .map(|vec| cosine_similarity(query_vec, &vec))
                     })
                     .or_else(|| {
-                        Some(crate::memory::scoring::lexical_relevance(
+                        Some(crate::word_overlap(
                             query,
                             row.get::<String, _>("summary").as_str(),
                         ))
                     })
             } else {
-                Some(crate::memory::scoring::lexical_relevance(
+                Some(crate::word_overlap(
                     query,
                     row.get::<String, _>("summary").as_str(),
                 ))
             };
             if let Some(similarity) = similarity {
                 let episode = self.row_to_episode(&row)?;
-                let score =
-                    crate::memory::scoring::episode_search_score(similarity, episode.recall_count);
+                let score = episode_search_score(similarity, episode.recall_count);
                 if score > 0.25 {
                     scored.push((episode, score));
                 }
@@ -239,24 +236,23 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                     .or_else(|| {
                         row.get::<Option<Vec<u8>>, _>("embedding")
                             .and_then(|blob| decode_embedding(&blob).ok())
-                            .map(|vec| crate::memory::math::cosine_similarity(query_vec, &vec))
+                            .map(|vec| cosine_similarity(query_vec, &vec))
                     })
                     .or_else(|| {
-                        Some(crate::memory::scoring::lexical_relevance(
+                        Some(crate::word_overlap(
                             query,
                             row.get::<String, _>("summary").as_str(),
                         ))
                     })
             } else {
-                Some(crate::memory::scoring::lexical_relevance(
+                Some(crate::word_overlap(
                     query,
                     row.get::<String, _>("summary").as_str(),
                 ))
             };
             if let Some(similarity) = similarity {
                 let episode = self.row_to_episode(&row)?;
-                let score =
-                    crate::memory::scoring::episode_search_score(similarity, episode.recall_count);
+                let score = episode_search_score(similarity, episode.recall_count);
                 if score > 0.25 {
                     scored.push((episode, score));
                 }

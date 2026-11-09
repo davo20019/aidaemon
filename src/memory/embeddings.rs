@@ -155,6 +155,34 @@ impl EmbeddingService {
     }
 }
 
+#[async_trait::async_trait]
+impl aidaemon_memory::Embedder for EmbeddingService {
+    fn model_id(&self) -> &str {
+        EMBEDDING_MODEL_ID
+    }
+
+    fn dimensions(&self) -> usize {
+        384
+    }
+
+    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts.to_vec())
+            .await
+            .map_err(|error| aidaemon_memory::MemoryError::Embedding(format!("{error:#}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl aidaemon_memory::sqlite::Reranker for EmbeddingService {
+    async fn rerank(
+        &self,
+        query: String,
+        documents: Vec<String>,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        EmbeddingService::rerank(self, query, documents).await
+    }
+}
+
 #[cfg(test)]
 fn deterministic_test_embedding(text: &str) -> Vec<f32> {
     use std::hash::{Hash, Hasher};

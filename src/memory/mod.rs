@@ -3,10 +3,8 @@ pub mod core_profile;
 pub mod embedding_index;
 pub mod embeddings;
 pub mod expertise;
-pub mod graph_store;
 pub mod history_source;
 pub mod manager;
-pub mod math;
 pub mod neighborhood;
 pub mod people_intelligence;
 pub mod procedures;
@@ -35,3 +33,35 @@ mod tests;
 
 #[cfg(test)]
 mod comprehensive_tests;
+
+/// Channel ids the way the daemon's sessions spell them.
+pub struct DaemonChannelIds;
+
+impl aidaemon_memory::sqlite::ChannelIds for DaemonChannelIds {
+    fn same_channel(&self, stored: &str, current: &str) -> bool {
+        crate::session::stored_channel_matches_current(stored, current)
+    }
+
+    fn channel_of_session(&self, session_id: &str) -> Option<String> {
+        crate::session::derive_channel_id_from_session(session_id)
+    }
+}
+
+/// The daemon's memory store over its state database. Errors keep only what
+/// the failing tool said, without the daemon's own wrapper lines.
+pub(crate) fn sqlite_memory(
+    pool: sqlx::SqlitePool,
+    embeddings: std::sync::Arc<embeddings::EmbeddingService>,
+) -> aidaemon_memory::sqlite::SqliteMemory {
+    fn without_scaffolding(error: &str) -> String {
+        error
+            .lines()
+            .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    aidaemon_memory::sqlite::SqliteMemory::new(pool, embeddings.clone())
+        .with_reranker(embeddings)
+        .with_channel_ids(std::sync::Arc::new(DaemonChannelIds))
+        .with_error_cleaner(without_scaffolding)
+}

@@ -1913,7 +1913,9 @@ async fn test_message_scoring_keywords() {
 async fn test_user_profile_defaults() {
     let (store, _db) = setup_test_store().await;
 
-    let profile = store.get_user_profile().await.unwrap();
+    let profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(profile.verbosity_preference, "medium");
     assert_eq!(profile.tone_preference, "neutral");
     assert!(profile.prefers_explanations);
@@ -1924,12 +1926,16 @@ async fn test_user_profile_defaults() {
 async fn test_user_profile_update() {
     let (store, _db) = setup_test_store().await;
 
-    let mut profile = store.get_user_profile().await.unwrap();
+    let mut profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     profile.verbosity_preference = "brief".to_string();
     profile.emoji_preference = "frequent".to_string();
     store.update_user_profile(&profile).await.unwrap();
 
-    let updated = store.get_user_profile().await.unwrap();
+    let updated = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(updated.verbosity_preference, "brief");
     assert_eq!(updated.emoji_preference, "frequent");
 }

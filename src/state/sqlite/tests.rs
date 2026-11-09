@@ -6,6 +6,7 @@ use crate::traits::{
     GoalSchedule, Message, Procedure, SkillDraft, TokenUsage,
 };
 use crate::types::FactPrivacy;
+use aidaemon_memory::encode_embedding;
 use std::sync::Arc;
 
 async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
@@ -1658,7 +1659,9 @@ async fn test_update_personal_goal_progress_note() {
 async fn test_default_user_profile() {
     let (store, _db) = setup_test_store().await;
 
-    let profile = store.get_user_profile().await.unwrap();
+    let profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(profile.verbosity_preference, "medium");
     assert_eq!(profile.explanation_depth, "moderate");
     assert_eq!(profile.tone_preference, "neutral");
@@ -1674,7 +1677,9 @@ async fn test_update_user_profile() {
     let (store, _db) = setup_test_store().await;
 
     // First call creates the default profile
-    let mut profile = store.get_user_profile().await.unwrap();
+    let mut profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
 
     profile.verbosity_preference = "brief".to_string();
     profile.tone_preference = "casual".to_string();
@@ -1683,7 +1688,9 @@ async fn test_update_user_profile() {
 
     store.update_user_profile(&profile).await.unwrap();
 
-    let updated = store.get_user_profile().await.unwrap();
+    let updated = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(updated.verbosity_preference, "brief");
     assert_eq!(updated.tone_preference, "casual");
     assert_eq!(updated.emoji_preference, "frequent");
@@ -5089,7 +5096,7 @@ async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
         ("acme_app_path", "/srv/projects/acme-app", "agent", 1),
         ("database_engine", "PostgreSQL 16", "progressive", 0),
     ] {
-        let text = super::facts::build_fact_embedding_text("project", key, value);
+        let text = aidaemon_memory::sqlite::build_fact_embedding_text("project", key, value);
         let vector = store.embedding_service.embed(text).await.unwrap();
         sqlx::query(
             "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, privacy, embedding)

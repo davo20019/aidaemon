@@ -1,15 +1,15 @@
 use super::*;
 
-use aidaemon_memory::{MemoryError, Result as MemoryResult};
+use crate::error::{MemoryError, Result as MemoryResult};
 
 /// The daemon store implements the SDK memory crate's learning contract.
 #[async_trait]
-impl crate::traits::LearningStore for SqliteStateStore {
+impl LearningStore for SqliteMemory {
     async fn get_behavior_patterns(
         &self,
         min_confidence: f32,
     ) -> MemoryResult<Vec<BehaviorPattern>> {
-        SqliteStateStore::get_behavior_patterns(self, min_confidence)
+        SqliteMemory::get_behavior_patterns(self, min_confidence)
             .await
             .map_err(store_error)
     }
@@ -23,7 +23,7 @@ impl crate::traits::LearningStore for SqliteStateStore {
         confidence_hint: f32,
         occurrence_delta: i32,
     ) -> MemoryResult<()> {
-        SqliteStateStore::record_behavior_pattern(
+        SqliteMemory::record_behavior_pattern(
             self,
             pattern_type,
             description,
@@ -41,7 +41,7 @@ impl crate::traits::LearningStore for SqliteStateStore {
         query: &str,
         limit: usize,
     ) -> MemoryResult<Vec<Procedure>> {
-        SqliteStateStore::get_relevant_procedures(self, query, limit)
+        SqliteMemory::get_relevant_procedures(self, query, limit)
             .await
             .map_err(store_error)
     }
@@ -51,20 +51,20 @@ impl crate::traits::LearningStore for SqliteStateStore {
         error: &str,
         limit: usize,
     ) -> MemoryResult<Vec<ErrorSolution>> {
-        SqliteStateStore::get_relevant_error_solutions(self, error, limit)
+        SqliteMemory::get_relevant_error_solutions(self, error, limit)
             .await
             .map_err(store_error)
     }
 
     async fn get_user_profile(&self) -> MemoryResult<Option<UserProfile>> {
-        SqliteStateStore::get_user_profile(self)
+        SqliteMemory::get_user_profile(self)
             .await
             .map(Some)
             .map_err(store_error)
     }
 
     async fn update_user_profile(&self, profile: &UserProfile) -> MemoryResult<()> {
-        SqliteStateStore::update_user_profile(self, profile)
+        SqliteMemory::update_user_profile(self, profile)
             .await
             .map_err(store_error)
     }
@@ -75,13 +75,13 @@ impl crate::traits::LearningStore for SqliteStateStore {
         success: bool,
         error: Option<&str>,
     ) -> MemoryResult<()> {
-        SqliteStateStore::increment_expertise(self, domain, success, error)
+        SqliteMemory::increment_expertise(self, domain, success, error)
             .await
             .map_err(store_error)
     }
 
     async fn upsert_procedure(&self, procedure: &Procedure) -> MemoryResult<i64> {
-        SqliteStateStore::insert_procedure(self, procedure)
+        SqliteMemory::insert_procedure(self, procedure)
             .await
             .map_err(store_error)
     }
@@ -92,13 +92,13 @@ impl crate::traits::LearningStore for SqliteStateStore {
         success: bool,
         duration: Option<f32>,
     ) -> MemoryResult<()> {
-        SqliteStateStore::update_procedure(self, procedure_id, success, None, duration)
+        SqliteMemory::update_procedure(self, procedure_id, success, None, duration)
             .await
             .map_err(store_error)
     }
 
     async fn insert_error_solution(&self, solution: &ErrorSolution) -> MemoryResult<i64> {
-        SqliteStateStore::insert_error_solution(self, solution)
+        SqliteMemory::insert_error_solution(self, solution)
             .await
             .map_err(store_error)
     }
@@ -108,7 +108,7 @@ impl crate::traits::LearningStore for SqliteStateStore {
         solution_id: i64,
         success: bool,
     ) -> MemoryResult<()> {
-        SqliteStateStore::update_error_solution(self, solution_id, success)
+        SqliteMemory::update_error_solution(self, solution_id, success)
             .await
             .map_err(store_error)
     }
@@ -116,10 +116,10 @@ impl crate::traits::LearningStore for SqliteStateStore {
 
 /// Fading of unrecalled facts, episodes and behavior patterns.
 #[async_trait]
-impl aidaemon_memory::stores::MemoryDecay for SqliteStateStore {
+impl crate::stores::MemoryDecay for SqliteMemory {
     async fn decay(
         &self,
-        policy: &aidaemon_memory::stores::DecayPolicy,
+        policy: &crate::stores::DecayPolicy,
         now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
         let fact_cutoff = (now - chrono::Duration::days(policy.fact_idle_days)).to_rfc3339();

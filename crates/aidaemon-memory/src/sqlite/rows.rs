@@ -1,0 +1,1279 @@
+use super::*;
+
+impl SqliteMemory {
+    pub async fn insert_episode(&self, episode: &Episode) -> anyhow::Result<i64> {
+        let topics_json = episode
+            .topics
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_default());
+        let bounds = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events WHERE session_id = ?
+               AND event_type IN ('user_message','assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(&episode.session_id)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        let start_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("start_event_id").ok())
+            .flatten();
+        let end_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
+            .flatten();
+        let channel_id = episode
+            .channel_id
+            .clone()
+            .or_else(|| self.channels.channel_of_session(&episode.session_id));
+        let result = sqlx::query(
+            "INSERT INTO episodes
+                (session_id, summary, topics, emotional_tone, outcome, embedding,
+                 importance, recall_count, last_recalled_at, message_count,
+                 start_time, end_time, created_at, channel_id, start_event_id, end_event_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&episode.session_id)
+        .bind(&episode.summary)
+        .bind(&topics_json)
+        .bind(&episode.emotional_tone)
+        .bind(&episode.outcome)
+        .bind::<Option<Vec<u8>>>(None) // embedding - set separately
+        .bind(episode.importance)
+        .bind(episode.recall_count)
+        .bind(episode.last_recalled_at.map(|t| t.to_rfc3339()))
+        .bind(episode.message_count)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .bind(episode.created_at.to_rfc3339())
+        .bind(channel_id)
+        .bind(start_event_id)
+        .bind(end_event_id)
+        .execute(&self.pool)
+        .await?;
+        let id = result.last_insert_rowid();
+        if let Err(error) = self.project_episode_memory(id).await {
+            tracing::warn!(%error, episode_id = id, "Deferred episode memory projection");
+        }
+        Ok(id)
+    }
+
+    /// Get episodes relevant to a query using embedding similarity.
+    pub async fn get_relevant_episodes(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Episode>> {
+        // Search the complete retained episode set. Exact history search uses
+        // these results only as a soft prior, so this must not impose a
+        // newest-N semantic gate.
+        let rows = sqlx::query(
+            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id, embedding
+             FROM episodes ORDER BY created_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() || query.trim().is_empty() {
+            // Return most recent if no query
+            return self.get_recent_episodes(limit).await;
+        }
+
+        // Embed the query
+        let query_vec = self.embedding_service.embed(query.to_string()).await.ok();
+
+        // Score by similarity with memory decay
+        // Lowered from 0.5 to 0.3 to match fact retrieval threshold — 0.5 was too
+        // aggressive and caused useful episodes to be filtered out.
+        const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.25;
+        let indexed_scores = if let Some(query_vec) = query_vec.as_ref() {
+            self.episode_embedding_scores(query_vec, rows.len())
+                .await
+                .unwrap_or_default()
+        } else {
+            tracing::warn!("Episode embedding unavailable; using explicit lexical degraded mode");
+            std::collections::HashMap::new()
+        };
+
+        let mut scored: Vec<(Episode, f32)> = Vec::new();
+        for row in rows {
+            let episode_id: i64 = row.get("id");
+            let similarity = if let Some(query_vec) = query_vec.as_ref() {
+                indexed_scores
+                    .get(&episode_id)
+                    .copied()
+                    .or_else(|| {
+                        row.get::<Option<Vec<u8>>, _>("embedding")
+                            .and_then(|blob| decode_embedding(&blob).ok())
+                            .map(|vec| cosine_similarity(query_vec, &vec))
+                    })
+                    .or_else(|| {
+                        // A just-created or partially repaired legacy episode can
+                        // briefly lack both embedding projections. Keep it
+                        // discoverable in an explicit lexical degraded mode.
+                        Some(crate::word_overlap(
+                            query,
+                            row.get::<String, _>("summary").as_str(),
+                        ))
+                    })
+            } else {
+                Some(crate::word_overlap(
+                    query,
+                    row.get::<String, _>("summary").as_str(),
+                ))
+            };
+            if let Some(similarity) = similarity {
+                let episode = self.row_to_episode(&row)?;
+                let score = episode_search_score(similarity, episode.recall_count);
+                if score > EPISODE_SIMILARITY_THRESHOLD {
+                    scored.push((episode, score));
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Log retrieved episodes to help debug cross-session contamination
+        if !scored.is_empty() {
+            tracing::debug!(
+                count = scored.len(),
+                top_score = scored.first().map(|(_, s)| *s).unwrap_or(0.0),
+                top_summary = scored
+                    .first()
+                    .map(|(e, _)| truncate_str(&e.summary, 50))
+                    .unwrap_or_default(),
+                "Retrieved relevant episodes"
+            );
+        }
+
+        let episodes: Vec<Episode> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
+        Ok(episodes)
+    }
+
+    /// Get most recent episodes.
+    pub async fn get_recent_episodes(&self, limit: usize) -> anyhow::Result<Vec<Episode>> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id
+             FROM episodes ORDER BY created_at DESC LIMIT ?"
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut episodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            episodes.push(self.row_to_episode(&row)?);
+        }
+        for episode in &episodes {
+            if let Err(error) = self.increment_episode_recall(episode.id).await {
+                tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
+            }
+        }
+        Ok(episodes)
+    }
+
+    /// Increment recall count for an episode.
+    #[allow(dead_code)]
+    pub async fn increment_episode_recall(&self, episode_id: i64) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE episodes SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(episode_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update episode embedding.
+    #[allow(dead_code)]
+    pub async fn update_episode_embedding(
+        &self,
+        episode_id: i64,
+        embedding: &[f32],
+    ) -> anyhow::Result<()> {
+        let blob = encode_embedding(embedding);
+        sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
+            .bind(blob)
+            .bind(episode_id)
+            .execute(&self.pool)
+            .await?;
+        if let Err(error) = self.project_episode_memory(episode_id).await {
+            tracing::warn!(%error, episode_id, "Deferred episode memory projection");
+        }
+        Ok(())
+    }
+
+    /// Backfill missing episode embeddings.
+    /// Called on startup to ensure all episodes have embeddings for semantic search.
+    pub async fn backfill_episode_embeddings(&self) -> anyhow::Result<usize> {
+        let rows: Vec<sqlx::sqlite::SqliteRow> =
+            sqlx::query("SELECT id, summary FROM episodes WHERE embedding IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!(count = rows.len(), "Backfilling missing episode embeddings");
+
+        let mut backfilled = 0;
+        for row in rows {
+            let id: i64 = row.get("id");
+            let summary: String = row.get("summary");
+
+            match self.embedding_service.embed(summary).await {
+                Ok(embedding) => {
+                    let blob = encode_embedding(&embedding);
+                    sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
+                        .bind(blob)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                    if let Err(error) = self.project_episode_memory(id).await {
+                        tracing::warn!(%error, episode_id = id, "Deferred episode memory projection");
+                    }
+                    backfilled += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(episode_id = id, error = %e, "Failed to generate embedding for episode");
+                }
+            }
+        }
+
+        tracing::info!(backfilled, "Episode embedding backfill complete");
+        Ok(backfilled)
+    }
+
+    /// Backfill missing fact embeddings.
+    /// Called on startup to ensure all active facts have pre-computed embeddings.
+    pub async fn backfill_fact_embeddings(&self) -> anyhow::Result<usize> {
+        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
+            "SELECT id, category, key, value FROM facts WHERE embedding IS NULL AND superseded_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!(count = rows.len(), "Backfilling missing fact embeddings");
+
+        let mut backfilled = 0;
+        for row in rows {
+            let id: i64 = row.get("id");
+            let category: String = row.get("category");
+            let key: String = row.get("key");
+            let value: String = row.get("value");
+            let fact_text = super::facts::build_fact_embedding_text(&category, &key, &value);
+
+            match self.embedding_service.embed(fact_text).await {
+                Ok(embedding) => {
+                    let blob = encode_embedding(&embedding);
+                    sqlx::query("UPDATE facts SET embedding = ? WHERE id = ?")
+                        .bind(blob)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                    if let Err(error) = self.project_fact_memory(id).await {
+                        tracing::warn!(%error, fact_id = id, "Deferred fact memory projection");
+                    }
+                    backfilled += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(fact_id = id, error = %e, "Failed to generate embedding for fact");
+                }
+            }
+        }
+
+        tracing::info!(backfilled, "Fact embedding backfill complete");
+        Ok(backfilled)
+    }
+
+    pub(super) fn row_to_fact(row: &sqlx::sqlite::SqliteRow) -> Fact {
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let superseded_str: Option<String> = row.get("superseded_at");
+        let last_recalled_str: Option<String> = row.get("last_recalled_at");
+        let privacy_str: Option<String> = row.try_get("privacy").unwrap_or(None);
+        let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
+        let first_seen_str: Option<String> = row.try_get("first_seen_at").unwrap_or(None);
+        let source_excerpt: Option<String> = row.try_get("source_excerpt").unwrap_or(None);
+
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        Fact {
+            id: row.get("id"),
+            category: row.get("category"),
+            key: row.get("key"),
+            value: row.get("value"),
+            source: row.get("source"),
+            created_at,
+            updated_at,
+            superseded_at: superseded_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            recall_count: row.try_get("recall_count").unwrap_or(0),
+            last_recalled_at: last_recalled_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            channel_id,
+            privacy: privacy_str
+                .map(|s| FactPrivacy::from_str_lossy(&s))
+                .unwrap_or(FactPrivacy::Global),
+            first_seen_at: first_seen_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            source_excerpt,
+        }
+    }
+
+    pub(super) fn row_to_episode(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Episode> {
+        let topics_json: Option<String> = row.get("topics");
+        let topics = topics_json.and_then(|j| serde_json::from_str(&j).ok());
+
+        let start_str: String = row.get("start_time");
+        let end_str: String = row.get("end_time");
+        let created_str: String = row.get("created_at");
+        let last_recalled_str: Option<String> = row.get("last_recalled_at");
+        let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
+
+        Ok(Episode {
+            id: row.get("id"),
+            session_id: row.get("session_id"),
+            summary: row.get("summary"),
+            topics,
+            emotional_tone: row.get("emotional_tone"),
+            outcome: row.get("outcome"),
+            importance: row.get("importance"),
+            recall_count: row.get("recall_count"),
+            last_recalled_at: last_recalled_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            message_count: row.get("message_count"),
+            start_time: chrono::DateTime::parse_from_rfc3339(&start_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            end_time: chrono::DateTime::parse_from_rfc3339(&end_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            channel_id,
+        })
+    }
+
+    // ==================== UserProfile Methods ====================
+
+    /// Get or create the user profile.
+    pub async fn get_user_profile(&self) -> anyhow::Result<UserProfile> {
+        let row = sqlx::query(
+            "SELECT id, verbosity_preference, explanation_depth, tone_preference, emoji_preference, typical_session_length, active_hours, common_workflows, asks_before_acting, prefers_explanations, likes_suggestions, updated_at
+             FROM user_profile LIMIT 1"
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            let active_hours_json: Option<String> = row.get("active_hours");
+            let workflows_json: Option<String> = row.get("common_workflows");
+            let updated_str: String = row.get("updated_at");
+
+            Ok(UserProfile {
+                id: row.get("id"),
+                verbosity_preference: row.get("verbosity_preference"),
+                explanation_depth: row.get("explanation_depth"),
+                tone_preference: row.get("tone_preference"),
+                emoji_preference: row.get("emoji_preference"),
+                typical_session_length: row.get("typical_session_length"),
+                active_hours: active_hours_json.and_then(|j| serde_json::from_str(&j).ok()),
+                common_workflows: workflows_json.and_then(|j| serde_json::from_str(&j).ok()),
+                asks_before_acting: row.get::<i32, _>("asks_before_acting") == 1,
+                prefers_explanations: row.get::<i32, _>("prefers_explanations") == 1,
+                likes_suggestions: row.get::<i32, _>("likes_suggestions") == 1,
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        } else {
+            // Create default profile
+            let now = Utc::now();
+            sqlx::query("INSERT INTO user_profile (updated_at) VALUES (?)")
+                .bind(now.to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+
+            Ok(UserProfile {
+                id: 1,
+                verbosity_preference: "medium".to_string(),
+                explanation_depth: "moderate".to_string(),
+                tone_preference: "neutral".to_string(),
+                emoji_preference: "none".to_string(),
+                typical_session_length: None,
+                active_hours: None,
+                common_workflows: None,
+                asks_before_acting: false,
+                prefers_explanations: true,
+                likes_suggestions: false,
+                updated_at: now,
+            })
+        }
+    }
+
+    /// Update user profile fields.
+    #[allow(dead_code)]
+    pub async fn update_user_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
+        let active_hours_json = profile
+            .active_hours
+            .as_ref()
+            .map(|h| serde_json::to_string(h).unwrap_or_default());
+        let workflows_json = profile
+            .common_workflows
+            .as_ref()
+            .map(|w| serde_json::to_string(w).unwrap_or_default());
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "UPDATE user_profile SET verbosity_preference = ?, explanation_depth = ?, tone_preference = ?, emoji_preference = ?, typical_session_length = ?, active_hours = ?, common_workflows = ?, asks_before_acting = ?, prefers_explanations = ?, likes_suggestions = ?, updated_at = ? WHERE id = ?"
+        )
+        .bind(&profile.verbosity_preference)
+        .bind(&profile.explanation_depth)
+        .bind(&profile.tone_preference)
+        .bind(&profile.emoji_preference)
+        .bind(profile.typical_session_length)
+        .bind(&active_hours_json)
+        .bind(&workflows_json)
+        .bind(profile.asks_before_acting as i32)
+        .bind(profile.prefers_explanations as i32)
+        .bind(profile.likes_suggestions as i32)
+        .bind(&now)
+        .bind(profile.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ==================== BehaviorPattern Methods ====================
+
+    /// Insert a new behavior pattern.
+    #[allow(dead_code)]
+    pub async fn insert_behavior_pattern(&self, pattern: &BehaviorPattern) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&pattern.pattern_type)
+        .bind(&pattern.description)
+        .bind(&pattern.trigger_context)
+        .bind(&pattern.action)
+        .bind(pattern.confidence)
+        .bind(pattern.occurrence_count)
+        .bind(pattern.last_seen_at.map(|t| t.to_rfc3339()))
+        .bind(pattern.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get behavior patterns above a confidence threshold.
+    pub async fn get_behavior_patterns(
+        &self,
+        min_confidence: f32,
+    ) -> anyhow::Result<Vec<BehaviorPattern>> {
+        let rows = sqlx::query(
+            "SELECT id, pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at
+             FROM behavior_patterns WHERE confidence >= ? ORDER BY confidence DESC, occurrence_count DESC"
+        )
+        .bind(min_confidence)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut patterns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created_str: String = row.get("created_at");
+            let last_seen_str: Option<String> = row.get("last_seen_at");
+
+            patterns.push(BehaviorPattern {
+                id: row.get("id"),
+                pattern_type: row.get("pattern_type"),
+                description: row.get("description"),
+                trigger_context: row.get("trigger_context"),
+                action: row.get("action"),
+                confidence: row.get("confidence"),
+                occurrence_count: row.get("occurrence_count"),
+                last_seen_at: last_seen_str.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok(patterns)
+    }
+
+    /// Insert or update a behavior pattern by logical key
+    /// (pattern_type + trigger_context + action).
+    pub async fn record_behavior_pattern(
+        &self,
+        pattern_type: &str,
+        description: &str,
+        trigger_context: Option<&str>,
+        action: Option<&str>,
+        confidence_hint: f32,
+        occurrence_delta: i32,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        let existing = sqlx::query(
+            "SELECT id FROM behavior_patterns
+             WHERE pattern_type = ?
+               AND COALESCE(trigger_context, '') = COALESCE(?, '')
+               AND COALESCE(action, '') = COALESCE(?, '')
+             LIMIT 1",
+        )
+        .bind(pattern_type)
+        .bind(trigger_context)
+        .bind(action)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let delta = occurrence_delta.max(1);
+        let confidence_hint = confidence_hint.clamp(0.1, 0.98);
+
+        if let Some(row) = existing {
+            let id: i64 = row.get("id");
+            sqlx::query(
+                "UPDATE behavior_patterns
+                 SET description = ?,
+                     occurrence_count = occurrence_count + ?,
+                     confidence = MIN(0.98, MAX(confidence, ?) + 0.02),
+                     last_seen_at = ?
+                 WHERE id = ?",
+            )
+            .bind(description)
+            .bind(delta)
+            .bind(confidence_hint)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(pattern_type)
+            .bind(description)
+            .bind(trigger_context)
+            .bind(action)
+            .bind(confidence_hint)
+            .bind(delta)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Update pattern occurrence and confidence.
+    #[allow(dead_code)]
+    pub async fn update_behavior_pattern(
+        &self,
+        pattern_id: i64,
+        confidence_delta: f32,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE behavior_patterns SET occurrence_count = occurrence_count + 1, confidence = MIN(1.0, confidence + ?), last_seen_at = ? WHERE id = ?"
+        )
+        .bind(confidence_delta)
+        .bind(&now)
+        .bind(pattern_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ==================== Procedure Methods ====================
+
+    /// Insert a new procedure.
+    pub async fn insert_procedure(&self, procedure: &Procedure) -> anyhow::Result<i64> {
+        let steps_json = serde_json::to_string(&procedure.steps)?;
+        // Best-effort embedding for semantic retrieval. This runs off the hot-path
+        // (learning is background) and will be backfilled by MemoryManager if missing.
+        let trigger_vector = self
+            .embedding_service
+            .embed(procedure.trigger_pattern.clone())
+            .await
+            .ok();
+        let trigger_embedding = trigger_vector.as_deref().map(encode_embedding);
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO procedures (name, trigger_pattern, trigger_embedding, steps, success_count, failure_count, avg_duration_secs, last_used_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+                trigger_pattern = excluded.trigger_pattern,
+                steps = excluded.steps,
+                success_count = procedures.success_count + excluded.success_count,
+                failure_count = procedures.failure_count + excluded.failure_count,
+                avg_duration_secs = COALESCE(excluded.avg_duration_secs, procedures.avg_duration_secs),
+                last_used_at = COALESCE(excluded.last_used_at, procedures.last_used_at),
+                updated_at = excluded.updated_at,
+                trigger_embedding = CASE
+                    WHEN procedures.trigger_pattern != excluded.trigger_pattern
+                    THEN excluded.trigger_embedding
+                    ELSE COALESCE(procedures.trigger_embedding, excluded.trigger_embedding)
+                END
+             RETURNING id"
+        )
+        .bind(&procedure.name)
+        .bind(&procedure.trigger_pattern)
+        .bind(&trigger_embedding)
+        .bind(&steps_json)
+        .bind(procedure.success_count)
+        .bind(procedure.failure_count)
+        .bind(procedure.avg_duration_secs)
+        .bind(procedure.last_used_at.map(|t| t.to_rfc3339()))
+        .bind(procedure.created_at.to_rfc3339())
+        .bind(procedure.updated_at.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        if let Some(vector) = trigger_vector {
+            if let Err(error) = self
+                .upsert_owner_embedding(
+                    "procedure",
+                    id,
+                    "trigger",
+                    &procedure.trigger_pattern,
+                    vector,
+                )
+                .await
+            {
+                tracing::warn!(%error, procedure_id = id, "Deferred procedure embedding projection");
+            }
+        }
+        Ok(id)
+    }
+
+    /// Get procedures relevant to a query.
+    pub async fn get_relevant_procedures(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Procedure>> {
+        let rows = sqlx::query(
+            "SELECT id, name, trigger_pattern, steps, success_count, failure_count, avg_duration_secs, last_used_at, created_at, updated_at, trigger_embedding
+             FROM procedures WHERE success_count > failure_count ORDER BY success_count DESC LIMIT 100"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() || query.trim().is_empty() {
+            let mut procedures = Vec::new();
+            for row in rows.into_iter().take(limit) {
+                procedures.push(self.row_to_procedure(&row)?);
+            }
+            return Ok(procedures);
+        }
+
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(_) => {
+                let mut procedures = Vec::new();
+                for row in rows.into_iter().take(limit) {
+                    procedures.push(self.row_to_procedure(&row)?);
+                }
+                return Ok(procedures);
+            }
+        };
+        let indexed_scores: std::collections::HashMap<i64, f32> = self
+            .search_embedding_owners(&query_vec, "procedure", "trigger", rows.len())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|hit| {
+                hit.owner
+                    .owner_id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|id| (id, hit.score))
+            })
+            .collect();
+
+        let mut scored: Vec<(Procedure, f32)> = Vec::new();
+        for row in rows {
+            let embedding: Option<Vec<u8>> = row.get("trigger_embedding");
+            let procedure = self.row_to_procedure(&row)?;
+
+            let score = if let Some(score) = indexed_scores.get(&procedure.id) {
+                *score
+            } else if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    cosine_similarity(&query_vec, &vec)
+                } else {
+                    0.0
+                }
+            } else {
+                // Fall back to text matching
+                if procedure
+                    .trigger_pattern
+                    .to_lowercase()
+                    .contains(&query.to_lowercase())
+                {
+                    0.5
+                } else {
+                    0.0
+                }
+            };
+
+            if score > 0.4 {
+                scored.push((procedure, score));
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().take(limit).map(|(p, _)| p).collect())
+    }
+
+    /// Update procedure success/failure and optionally update steps.
+    #[allow(dead_code)] // Wired to trait but reserved for feedback loop
+    pub async fn update_procedure(
+        &self,
+        procedure_id: i64,
+        success: bool,
+        new_steps: Option<&[String]>,
+        duration_secs: Option<f32>,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        if success {
+            sqlx::query("UPDATE procedures SET success_count = success_count + 1, last_used_at = ?, updated_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(procedure_id)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query("UPDATE procedures SET failure_count = failure_count + 1, last_used_at = ?, updated_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(procedure_id)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        if let Some(steps) = new_steps {
+            let steps_json = serde_json::to_string(steps)?;
+            sqlx::query("UPDATE procedures SET steps = ?, updated_at = ? WHERE id = ?")
+                .bind(&steps_json)
+                .bind(&now)
+                .bind(procedure_id)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        if let Some(duration) = duration_secs {
+            // Update running average
+            sqlx::query("UPDATE procedures SET avg_duration_secs = COALESCE((avg_duration_secs * (success_count + failure_count - 1) + ?) / (success_count + failure_count), ?), updated_at = ? WHERE id = ?")
+                .bind(duration)
+                .bind(duration)
+                .bind(&now)
+                .bind(procedure_id)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn row_to_procedure(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> anyhow::Result<Procedure> {
+        let steps_json: String = row.get("steps");
+        let steps: Vec<String> = serde_json::from_str(&steps_json).unwrap_or_default();
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let last_used_str: Option<String> = row.get("last_used_at");
+
+        Ok(Procedure {
+            id: row.get("id"),
+            name: row.get("name"),
+            trigger_pattern: row.get("trigger_pattern"),
+            steps,
+            success_count: row.get("success_count"),
+            failure_count: row.get("failure_count"),
+            avg_duration_secs: row.get("avg_duration_secs"),
+            last_used_at: last_used_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    // ==================== Expertise Methods ====================
+
+    /// Get or create expertise for a domain.
+    pub async fn get_or_create_expertise(&self, domain: &str) -> anyhow::Result<Expertise> {
+        let row = sqlx::query(
+            "SELECT id, domain, tasks_attempted, tasks_succeeded, tasks_failed, current_level, confidence_score, common_errors, last_task_at, created_at, updated_at
+             FROM expertise WHERE domain = ?"
+        )
+        .bind(domain)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            self.row_to_expertise(&row)
+        } else {
+            let now = Utc::now().to_rfc3339();
+            let result = sqlx::query(
+                "INSERT INTO expertise (domain, tasks_attempted, tasks_succeeded, tasks_failed, current_level, confidence_score, created_at, updated_at)
+                 VALUES (?, 0, 0, 0, 'novice', 0.0, ?, ?)"
+            )
+            .bind(domain)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(Expertise {
+                id: result.last_insert_rowid(),
+                domain: domain.to_string(),
+                tasks_attempted: 0,
+                tasks_succeeded: 0,
+                tasks_failed: 0,
+                current_level: "novice".to_string(),
+                confidence_score: 0.0,
+                common_errors: None,
+                last_task_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+        }
+    }
+
+    /// Increment expertise counters and update level.
+    pub async fn increment_expertise(
+        &self,
+        domain: &str,
+        success: bool,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = self.get_or_create_expertise(domain).await?; // Ensure exists
+        let now = Utc::now().to_rfc3339();
+
+        if success {
+            sqlx::query("UPDATE expertise SET tasks_attempted = tasks_attempted + 1, tasks_succeeded = tasks_succeeded + 1, last_task_at = ?, updated_at = ? WHERE domain = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(domain)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query("UPDATE expertise SET tasks_attempted = tasks_attempted + 1, tasks_failed = tasks_failed + 1, last_task_at = ?, updated_at = ? WHERE domain = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(domain)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Record error if provided
+        if let Some(err) = error {
+            let row = sqlx::query("SELECT common_errors FROM expertise WHERE domain = ?")
+                .bind(domain)
+                .fetch_one(&self.pool)
+                .await?;
+            let errors_json: Option<String> = row.get("common_errors");
+            let mut errors: Vec<String> = errors_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            if !errors.contains(&err.to_string()) {
+                errors.push(err.to_string());
+                if errors.len() > 10 {
+                    errors.remove(0);
+                }
+                let errors_json = serde_json::to_string(&errors)?;
+                sqlx::query("UPDATE expertise SET common_errors = ? WHERE domain = ?")
+                    .bind(&errors_json)
+                    .bind(domain)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        // Update level based on new counts
+        let expertise = self.get_or_create_expertise(domain).await?;
+        let (level, confidence) =
+            crate::expertise_level(expertise.tasks_succeeded, expertise.tasks_failed);
+
+        sqlx::query("UPDATE expertise SET current_level = ?, confidence_score = ?, updated_at = ? WHERE domain = ?")
+            .bind(level)
+            .bind(confidence)
+            .bind(&now)
+            .bind(domain)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    pub(super) fn row_to_expertise(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> anyhow::Result<Expertise> {
+        let errors_json: Option<String> = row.get("common_errors");
+        let common_errors = errors_json.and_then(|j| serde_json::from_str(&j).ok());
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let last_task_str: Option<String> = row.get("last_task_at");
+
+        Ok(Expertise {
+            id: row.get("id"),
+            domain: row.get("domain"),
+            tasks_attempted: row.get("tasks_attempted"),
+            tasks_succeeded: row.get("tasks_succeeded"),
+            tasks_failed: row.get("tasks_failed"),
+            current_level: row.get("current_level"),
+            confidence_score: row.get("confidence_score"),
+            common_errors,
+            last_task_at: last_task_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    // ==================== ErrorSolution Methods ====================
+
+    /// Insert a new error solution.
+    pub async fn insert_error_solution(&self, solution: &ErrorSolution) -> anyhow::Result<i64> {
+        // Normalize so duplicates conflict and retrieval similarity is stable.
+        let error_pattern = crate::error_pattern(&(self.clean_error_text)(&solution.error_pattern));
+        if error_pattern.is_empty() {
+            anyhow::bail!("error solution has no error text after removing harness scaffolding");
+        }
+        let domain = solution.domain.clone().unwrap_or_default();
+        let steps_json = solution
+            .solution_steps
+            .as_ref()
+            .map(|s| serde_json::to_string(s).unwrap_or_default());
+        // Best-effort embedding for semantic retrieval. Backfilled by MemoryManager if missing.
+        let error_vector = self
+            .embedding_service
+            .embed(error_pattern.clone())
+            .await
+            .ok();
+        let error_embedding = error_vector.as_deref().map(encode_embedding);
+        let now = Utc::now();
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO error_solutions (
+                error_pattern, error_embedding, domain, solution_summary, solution_steps,
+                success_count, failure_count, last_used_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(error_pattern, domain, solution_summary) DO UPDATE SET
+                error_embedding = COALESCE(error_solutions.error_embedding, excluded.error_embedding),
+                solution_steps = COALESCE(excluded.solution_steps, error_solutions.solution_steps),
+                success_count = error_solutions.success_count + excluded.success_count,
+                failure_count = error_solutions.failure_count + excluded.failure_count,
+                last_used_at = excluded.last_used_at
+            RETURNING id
+            "#,
+        )
+        .bind(&error_pattern)
+        .bind(&error_embedding)
+        .bind(&domain)
+        .bind(&solution.solution_summary)
+        .bind(&steps_json)
+        .bind(solution.success_count)
+        .bind(solution.failure_count)
+        .bind(solution.last_used_at.unwrap_or(now).to_rfc3339())
+        .bind(solution.created_at.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        if let Some(vector) = error_vector {
+            if let Err(error) = self
+                .upsert_owner_embedding("error_solution", row.0, "error", &error_pattern, vector)
+                .await
+            {
+                tracing::warn!(%error, error_solution_id = row.0, "Deferred error-solution embedding projection");
+            }
+        }
+        Ok(row.0)
+    }
+
+    /// Get error solutions relevant to an error message.
+    pub async fn get_relevant_error_solutions(
+        &self,
+        error: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ErrorSolution>> {
+        let rows = sqlx::query(
+            "SELECT id, error_pattern, domain, solution_summary, solution_steps, success_count, failure_count, last_used_at, created_at, error_embedding
+             FROM error_solutions
+             WHERE success_count > failure_count
+             ORDER BY (success_count - failure_count) DESC, COALESCE(last_used_at, created_at) DESC
+             LIMIT 1000",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() || error.trim().is_empty() {
+            let mut solutions = Vec::new();
+            for row in rows.into_iter().take(limit) {
+                solutions.push(self.row_to_error_solution(&row)?);
+            }
+            return Ok(solutions);
+        }
+
+        let query_vec = match self.embedding_service.embed(error.to_string()).await {
+            Ok(v) => v,
+            Err(_) => {
+                let mut solutions = Vec::new();
+                for row in rows.into_iter().take(limit) {
+                    solutions.push(self.row_to_error_solution(&row)?);
+                }
+                return Ok(solutions);
+            }
+        };
+        let indexed_scores: std::collections::HashMap<i64, f32> = self
+            .search_embedding_owners(&query_vec, "error_solution", "error", rows.len())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|hit| {
+                hit.owner
+                    .owner_id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|id| (id, hit.score))
+            })
+            .collect();
+
+        let mut scored: Vec<(ErrorSolution, f32)> = Vec::new();
+        for row in rows {
+            let embedding: Option<Vec<u8>> = row.get("error_embedding");
+            let solution = self.row_to_error_solution(&row)?;
+
+            let score = if let Some(score) = indexed_scores.get(&solution.id) {
+                *score
+            } else if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    cosine_similarity(&query_vec, &vec)
+                } else {
+                    0.0
+                }
+            } else {
+                // Fall back to text matching
+                if solution
+                    .error_pattern
+                    .to_lowercase()
+                    .contains(&error.to_lowercase())
+                {
+                    0.5
+                } else {
+                    0.0
+                }
+            };
+
+            if score > 0.4 {
+                scored.push((solution, score));
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().take(limit).map(|(s, _)| s).collect())
+    }
+
+    /// Update error solution success/failure.
+    #[allow(dead_code)] // Wired to trait but reserved for feedback loop
+    pub async fn update_error_solution(
+        &self,
+        solution_id: i64,
+        success: bool,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        if success {
+            sqlx::query("UPDATE error_solutions SET success_count = success_count + 1, last_used_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(solution_id)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query("UPDATE error_solutions SET failure_count = failure_count + 1, last_used_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(solution_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn row_to_error_solution(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> anyhow::Result<ErrorSolution> {
+        let steps_json: Option<String> = row.get("solution_steps");
+        let solution_steps = steps_json.and_then(|j| serde_json::from_str(&j).ok());
+        let created_str: String = row.get("created_at");
+        let last_used_str: Option<String> = row.get("last_used_at");
+        let domain_raw: Option<String> = row.get("domain");
+        let domain = domain_raw.and_then(|d| {
+            let t = d.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+
+        Ok(ErrorSolution {
+            id: row.get("id"),
+            error_pattern: row.get("error_pattern"),
+            domain,
+            solution_summary: row.get("solution_summary"),
+            solution_steps,
+            success_count: row.get("success_count"),
+            failure_count: row.get("failure_count"),
+            last_used_at: last_used_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    // ==================== Fact History Methods ====================
+
+    /// Get the history of a fact (all versions including superseded).
+    #[allow(dead_code)]
+    pub async fn get_fact_history(&self, category: &str, key: &str) -> anyhow::Result<Vec<Fact>> {
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at
+             FROM facts WHERE category = ? AND key = ? ORDER BY created_at DESC"
+        )
+        .bind(category)
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            facts.push(self.row_to_fact_with_history(&row)?);
+        }
+        Ok(facts)
+    }
+
+    /// Increment recall count for a fact.
+    #[allow(dead_code)]
+    pub async fn increment_fact_recall(&self, fact_id: i64) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE facts SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn row_to_fact_with_history(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> anyhow::Result<Fact> {
+        Ok(Self::row_to_fact(row))
+    }
+
+    pub(super) fn row_to_person(row: &sqlx::sqlite::SqliteRow) -> crate::records::Person {
+        let aliases_str: String = row
+            .try_get("aliases_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let platform_ids_str: String = row
+            .try_get("platform_ids_json")
+            .unwrap_or_else(|_| "{}".to_string());
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let last_interaction_str: Option<String> =
+            row.try_get("last_interaction_at").unwrap_or(None);
+
+        crate::records::Person {
+            id: row.get("id"),
+            name: row.get("name"),
+            aliases: serde_json::from_str(&aliases_str).unwrap_or_default(),
+            relationship: row.try_get("relationship").unwrap_or(None),
+            platform_ids: serde_json::from_str(&platform_ids_str).unwrap_or_default(),
+            notes: row.try_get("notes").unwrap_or(None),
+            communication_style: row.try_get("communication_style").unwrap_or(None),
+            language_preference: row.try_get("language_preference").unwrap_or(None),
+            last_interaction_at: last_interaction_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            interaction_count: row.try_get("interaction_count").unwrap_or(0),
+            created_at: parse_dt(created_str),
+            updated_at: parse_dt(updated_str),
+        }
+    }
+
+    pub(super) fn row_to_person_fact(row: &sqlx::sqlite::SqliteRow) -> crate::records::PersonFact {
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+
+        crate::records::PersonFact {
+            id: row.get("id"),
+            person_id: row.get("person_id"),
+            category: row.get("category"),
+            key: row.get("key"),
+            value: row.get("value"),
+            source: row.get("source"),
+            confidence: row.get("confidence"),
+            created_at: parse_dt(created_str),
+            updated_at: parse_dt(updated_str),
+        }
+    }
+}

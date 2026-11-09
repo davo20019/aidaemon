@@ -90,7 +90,7 @@ fn hybrid_fact_score(
     graph_match: bool,
     freshness: f32,
 ) -> f32 {
-    aidaemon_memory::HybridWeights::default().fuse(&aidaemon_memory::Signals {
+    crate::HybridWeights::default().fuse(&crate::Signals {
         semantic,
         lexical,
         graph: if graph_match { 1.0 } else { 0.0 },
@@ -115,7 +115,7 @@ fn hybrid_fact_score(
 ///
 /// Natural language embeds much better against natural language queries
 /// like "What tech stack does my project use?".
-pub(crate) fn build_fact_embedding_text(category: &str, key: &str, value: &str) -> String {
+pub fn build_fact_embedding_text(category: &str, key: &str, value: &str) -> String {
     // Convert underscore/hyphen keys to readable form
     let readable_key = key.replace(['_', '-'], " ");
 
@@ -190,7 +190,7 @@ fn keys_name_distinct_concepts(
 
 /// Sources that record the owner's own words. Background extractors can
 /// never overwrite these, only restate or add beside them.
-pub(crate) fn is_owner_authored_fact_source(source: &str) -> bool {
+pub fn is_owner_authored_fact_source(source: &str) -> bool {
     matches!(source, "agent" | "user_stated" | "owner" | "owner-stated")
 }
 
@@ -203,7 +203,7 @@ pub(crate) const FACT_RESTATEMENT_MIN_SIMILARITY: f32 = 0.93;
 
 /// Categories whose keys name a person or their attributes, where a key that
 /// differs by an entity token must stay separate even at high similarity.
-pub(crate) fn fact_category_is_personal(category: &str) -> bool {
+pub fn fact_category_is_personal(category: &str) -> bool {
     matches!(
         category.trim().to_ascii_lowercase().as_str(),
         "user" | "people" | "relationship" | "relationships" | "family"
@@ -241,7 +241,7 @@ fn values_make_the_same_claim(a: &str, b: &str) -> bool {
 }
 
 /// Whether two active facts in one category are the same knowledge.
-pub(crate) fn facts_are_restatements(
+pub fn facts_are_restatements(
     category: &str,
     (key_a, value_a): (&str, &str),
     (key_b, value_b): (&str, &str),
@@ -457,15 +457,15 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
 }
 
 #[async_trait]
-impl crate::traits::FactStore for SqliteStateStore {
+impl FactStore for SqliteMemory {
     async fn reconcile_personal_memory(
         &self,
-        write: &crate::traits::PersonalMemoryWrite,
+        write: &crate::records::PersonalMemoryWrite,
         source: &str,
         source_excerpt: Option<&str>,
         channel_id: Option<&str>,
         privacy: FactPrivacy,
-    ) -> anyhow::Result<crate::traits::PersonalMemoryWriteResult> {
+    ) -> anyhow::Result<crate::records::PersonalMemoryWriteResult> {
         self.reconcile_structured_personal_memory(
             write,
             source,
@@ -565,8 +565,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                 let candidate = &candidates[index];
                 let representative = kept.iter().copied().find(|&kept_index| {
                     let rep = &candidates[kept_index];
-                    let sim =
-                        crate::memory::math::cosine_similarity(&candidate.vector, &rep.vector);
+                    let sim = cosine_similarity(&candidate.vector, &rep.vector);
                     facts_are_restatements(
                         &candidate.category,
                         (&candidate.key, &candidate.value),
@@ -613,11 +612,13 @@ impl crate::traits::FactStore for SqliteStateStore {
         Ok(folded.len())
     }
 
-    async fn memory_health_report(&self) -> anyhow::Result<crate::traits::MemoryHealthReport> {
+    async fn memory_health_report(&self) -> anyhow::Result<crate::records::MemoryHealthReport> {
         self.canonical_memory_health().await
     }
 
-    async fn repair_memory_projections(&self) -> anyhow::Result<crate::traits::MemoryHealthReport> {
+    async fn repair_memory_projections(
+        &self,
+    ) -> anyhow::Result<crate::records::MemoryHealthReport> {
         self.backfill_missing_memory_projections().await?;
         self.canonical_memory_health().await
     }
@@ -642,7 +643,7 @@ impl crate::traits::FactStore for SqliteStateStore {
         category: &str,
         key: &str,
         source_excerpt: &str,
-        graph: &crate::traits::ExtractedMemoryGraph,
+        graph: &crate::records::ExtractedMemoryGraph,
     ) -> anyhow::Result<()> {
         self.persist_extracted_fact_graph(category, key, source_excerpt, graph)
             .await
@@ -770,7 +771,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                     let existing_key_text = build_dedup_key_text(category_clean, &existing_key);
                     if let Ok(existing_vec) = self.embedding_service.embed(existing_key_text).await
                     {
-                        let sim = crate::memory::math::cosine_similarity(&new_vec, &existing_vec);
+                        let sim = cosine_similarity(&new_vec, &existing_vec);
                         if sim > 0.85 {
                             let score = best_match.as_ref().map(|m| m.3).unwrap_or(0.0);
                             if sim > score {
@@ -858,7 +859,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                     let other_value: String = row.get("value");
                     let blob: Vec<u8> = row.get("embedding");
                     let other_vec = decode_embedding(&blob).ok()?;
-                    let sim = crate::memory::math::cosine_similarity(&new_vec, &other_vec);
+                    let sim = cosine_similarity(&new_vec, &other_vec);
                     facts_are_restatements(
                         category_clean,
                         (key_clean, value),
@@ -1183,7 +1184,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                         }
 
                         if let Ok(other_vec) = decode_embedding(&blob) {
-                            let sim = crate::memory::math::cosine_similarity(&new_vec, &other_vec);
+                            let sim = cosine_similarity(&new_vec, &other_vec);
                             // High similarity on full-fact embedding (value-aware)
                             // means these facts describe the same concept.  Only
                             // supersede if the values actually differ (otherwise
@@ -1318,7 +1319,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
                 row.get::<Option<Vec<u8>>, _>("embedding")
                     .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+                    .map(|vec| cosine_similarity(&query_vec, &vec))
             });
             let lexical = if fts_fact_ids.contains(&fact.id) {
                 FACT_LEXICAL_MAX_SCORE
@@ -1440,7 +1441,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
                 row.get::<Option<Vec<u8>>, _>("embedding")
                     .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+                    .map(|vec| cosine_similarity(&query_vec, &vec))
             });
             if let Some(semantic) = semantic {
                 if semantic > EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE {
@@ -1569,9 +1570,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                     }
                 }
                 FactPrivacy::Channel => match (channel_id, &f.channel_id) {
-                    (Some(current), Some(fact_ch)) => {
-                        crate::session::stored_channel_matches_current(fact_ch, current)
-                    }
+                    (Some(current), Some(fact_ch)) => self.channels.same_channel(fact_ch, current),
                     (None, None) => true,
                     _ => false,
                 },
@@ -1633,7 +1632,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                 rows[ri]
                     .get::<Option<Vec<u8>>, _>("embedding")
                     .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+                    .map(|vec| cosine_similarity(&query_vec, &vec))
             });
             let lexical = if fts_fact_ids.contains(&fact.id) {
                 FACT_LEXICAL_MAX_SCORE
@@ -1780,11 +1779,11 @@ impl crate::traits::FactStore for SqliteStateStore {
         entities: &[String],
         initial_ids: &std::collections::HashSet<i64>,
     ) -> anyhow::Result<Vec<Fact>> {
-        use crate::memory::neighborhood::{
+        use crate::neighborhood::{
             entity_mentioned_as_words, is_relationship_key, select_neighborhood_facts,
             NeighborhoodCaps,
         };
-        use crate::traits::PeopleStore;
+        use PeopleStore;
 
         if entities.is_empty() {
             return Ok(vec![]);
@@ -1840,220 +1839,5 @@ impl crate::traits::FactStore for SqliteStateStore {
             initial_ids,
             NeighborhoodCaps::default(),
         ))
-    }
-}
-
-#[cfg(test)]
-mod assemble_neighborhood_tests {
-    use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::{FactStore, PeopleStore};
-    use crate::types::FactPrivacy;
-    use std::sync::Arc;
-
-    async fn setup_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(
-            db_file.path().to_str().unwrap(),
-            100,
-            None,
-            embedding_service,
-        )
-        .await
-        .unwrap();
-        (store, db_file)
-    }
-
-    #[tokio::test]
-    async fn assemble_neighborhood_pulls_owner_family_cluster() {
-        let (store, _db) = setup_store().await;
-
-        store
-            .upsert_fact(
-                "user",
-                "mother_name",
-                "Carol Mendez",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-        store
-            .upsert_fact(
-                "user",
-                "father",
-                "Frank Mendez",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-        store
-            .upsert_fact(
-                "user",
-                "partner_name",
-                "Alice Rivera",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-
-        // Pretend the search already matched the mother fact (id resolved below).
-        let mother = store
-            .get_facts(Some("user"))
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|f| f.key == "mother_name")
-            .unwrap();
-        let initial: std::collections::HashSet<i64> = [mother.id].into_iter().collect();
-
-        let out = store
-            .assemble_neighborhood(&["Carol".to_string()], &initial)
-            .await
-            .unwrap();
-        let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
-        assert!(
-            values.iter().any(|v| v.contains("Frank")),
-            "father pulled into cluster: {:?}",
-            values
-        );
-    }
-
-    /// Tests the *primary* person-resolution path: entity name → resolved Person
-    /// with a `relationship` role → `owner_relationship = true` → cluster pulls
-    /// in co-relations.
-    ///
-    /// Critically, `initial_ids` is EMPTY so the fallback "initial-match has a
-    /// relationship key" trigger cannot fire.  Only the Person-record path can
-    /// enable the owner cluster here.
-    #[tokio::test]
-    async fn assemble_neighborhood_resolves_person_relationship() {
-        let (store, _db) = setup_store().await;
-
-        // Seed a Person record with a relationship role.
-        let person = crate::traits::Person {
-            id: 0,
-            name: "Carol Mendez".to_string(),
-            aliases: vec![],
-            relationship: Some("mother".to_string()),
-            platform_ids: std::collections::HashMap::new(),
-            notes: None,
-            communication_style: None,
-            language_preference: None,
-            last_interaction_at: None,
-            interaction_count: 0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        store.upsert_person(&person).await.unwrap();
-
-        // Seed flat facts that belong to the owner-relationship cluster.
-        store
-            .upsert_fact(
-                "user",
-                "father",
-                "Frank Mendez",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-        store
-            .upsert_fact(
-                "user",
-                "partner_name",
-                "Alice Rivera",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-
-        // Empty initial_ids — the fallback trigger (initial fact has relationship
-        // key) CANNOT fire.  Only the Person-record resolution path can enable
-        // the owner cluster.
-        let initial: std::collections::HashSet<i64> = std::collections::HashSet::new();
-
-        let out = store
-            .assemble_neighborhood(&["Carol".to_string()], &initial)
-            .await
-            .unwrap();
-        let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
-        assert!(
-            values.iter().any(|v| v.contains("Frank")),
-            "father should be pulled into cluster via person-resolution path: {:?}",
-            values
-        );
-    }
-
-    /// Word-boundary guard: entity "Ana" must NOT resolve the person "Banana Doe".
-    #[tokio::test]
-    async fn assemble_neighborhood_person_match_is_word_boundary() {
-        let (store, _db) = setup_store().await;
-
-        // "Banana Doe" — contains "ana" as a substring but NOT as a whole word.
-        let person = crate::traits::Person {
-            id: 0,
-            name: "Banana Doe".to_string(),
-            aliases: vec![],
-            relationship: Some("friend".to_string()),
-            platform_ids: std::collections::HashMap::new(),
-            notes: None,
-            communication_style: None,
-            language_preference: None,
-            last_interaction_at: None,
-            interaction_count: 0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        store.upsert_person(&person).await.unwrap();
-
-        // A fact whose value would only appear if the person cluster were enabled.
-        store
-            .upsert_fact(
-                "user",
-                "best_friend",
-                "Banana Doe",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-        store
-            .upsert_fact(
-                "user",
-                "hobby",
-                "gardening",
-                "test",
-                None,
-                FactPrivacy::Global,
-            )
-            .await
-            .unwrap();
-
-        // Search for "Ana" — should NOT match "Banana Doe" via word-boundary.
-        let initial: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let out = store
-            .assemble_neighborhood(&["Ana".to_string()], &initial)
-            .await
-            .unwrap();
-        // The owner cluster must NOT be triggered by false substring match.
-        // "hobby" fact is unrelated; if "Ana" matched "Banana Doe", the friend's
-        // relationship role would enable the cluster and pull in all relationship
-        // facts.  Assert the result is empty (no initial hits, no cluster).
-        assert!(
-            out.is_empty(),
-            "entity 'Ana' must not resolve person 'Banana Doe' via substring: {:?}",
-            out
-        );
     }
 }

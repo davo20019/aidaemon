@@ -1,8 +1,8 @@
 use super::*;
 
 #[async_trait]
-impl crate::traits::PeopleStore for SqliteStateStore {
-    async fn upsert_person(&self, person: &crate::traits::Person) -> anyhow::Result<i64> {
+impl PeopleStore for SqliteMemory {
+    async fn upsert_person(&self, person: &crate::records::Person) -> anyhow::Result<i64> {
         let aliases_json = serde_json::to_string(&person.aliases)?;
         let platform_ids_json = serde_json::to_string(&person.platform_ids)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -54,7 +54,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
         }
     }
 
-    async fn get_person(&self, id: i64) -> anyhow::Result<Option<crate::traits::Person>> {
+    async fn get_person(&self, id: i64) -> anyhow::Result<Option<crate::records::Person>> {
         let row = sqlx::query(
             "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
              communication_style, language_preference, last_interaction_at, interaction_count, \
@@ -70,7 +70,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
     async fn get_person_by_platform_id(
         &self,
         platform_id: &str,
-    ) -> anyhow::Result<Option<crate::traits::Person>> {
+    ) -> anyhow::Result<Option<crate::records::Person>> {
         // Search platform_ids_json for a key matching the platform_id
         // SQLite json_each lets us iterate JSON object keys
         let row = sqlx::query(
@@ -90,7 +90,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
     async fn find_person_by_name(
         &self,
         name: &str,
-    ) -> anyhow::Result<Option<crate::traits::Person>> {
+    ) -> anyhow::Result<Option<crate::records::Person>> {
         let name_lower = name.to_lowercase();
         // Check name first (case-insensitive)
         let row = sqlx::query(
@@ -127,7 +127,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
         Ok(None)
     }
 
-    async fn get_all_people(&self) -> anyhow::Result<Vec<crate::traits::Person>> {
+    async fn get_all_people(&self) -> anyhow::Result<Vec<crate::records::Person>> {
         let rows = sqlx::query(
             "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
              communication_style, language_preference, last_interaction_at, interaction_count, \
@@ -231,7 +231,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
         &self,
         person_id: i64,
         category: Option<&str>,
-    ) -> anyhow::Result<Vec<crate::traits::PersonFact>> {
+    ) -> anyhow::Result<Vec<crate::records::PersonFact>> {
         let rows = if let Some(cat) = category {
             sqlx::query(
                 "SELECT id, person_id, category, key, value, source, confidence, created_at, updated_at \
@@ -275,7 +275,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
     async fn get_people_with_upcoming_dates(
         &self,
         within_days: i32,
-    ) -> anyhow::Result<Vec<(crate::traits::Person, crate::traits::PersonFact)>> {
+    ) -> anyhow::Result<Vec<(crate::records::Person, crate::records::PersonFact)>> {
         // Get all birthday/important_date facts, then filter by upcoming date in Rust
         let rows = sqlx::query(
             "SELECT pf.id as fact_id, pf.person_id, pf.category, pf.key, pf.value, pf.source, pf.confidence, \
@@ -298,7 +298,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
             if let Some(upcoming_in) = days_until_date(&value, today) {
                 if upcoming_in <= within_days as i64 && upcoming_in >= 0 {
                     let person = Self::row_to_person(r);
-                    let fact = crate::traits::PersonFact {
+                    let fact = crate::records::PersonFact {
                         id: r.get("fact_id"),
                         person_id: r.get("person_id"),
                         category: r.get("category"),
@@ -332,7 +332,7 @@ impl crate::traits::PeopleStore for SqliteStateStore {
     async fn get_people_needing_reconnect(
         &self,
         inactive_days: u32,
-    ) -> anyhow::Result<Vec<crate::traits::Person>> {
+    ) -> anyhow::Result<Vec<crate::records::Person>> {
         let cutoff =
             (chrono::Utc::now() - chrono::Duration::days(inactive_days as i64)).to_rfc3339();
         let rows = sqlx::query(
