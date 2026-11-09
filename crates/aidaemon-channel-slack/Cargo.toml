@@ -22,4 +22,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net", "io-util"] }

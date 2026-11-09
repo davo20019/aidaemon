@@ -13,12 +13,13 @@ use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::split::TRUNCATION_MARK;
 use aidaemon_channels::{
     ApprovalAnswer, ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError,
-    ChannelEvent, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
+    ChannelEvent, CommandSpec, Conversation, DisplayNameCache, MessageRef, OutboundFile,
+    OutboundMessage,
 };
 
 use crate::api::{ApiError, BotApi, InlineKeyboardButton, SentMessage, Update, User};
 use crate::callback::CallbackCodec;
-use crate::format::{html_to_plain, markdown_to_html, split_html};
+use crate::format::{html_to_plain, render_html, split_html};
 use crate::mapping::{
     conversation_for_chat, map_message, parse_conversation_id, sender_for, BotIdentity,
 };
@@ -61,6 +62,8 @@ pub struct TelegramChannel {
     state: Arc<Shared>,
     /// Longest message sent, at most [`TELEGRAM_MAX_MESSAGE_LEN`].
     max_message_len: usize,
+    strip_latex: bool,
+    names: DisplayNameCache,
     #[cfg(feature = "webhook")]
     webhook: Option<crate::webhook::WebhookConfig>,
 }
@@ -107,6 +110,8 @@ impl TelegramChannel {
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Shared::default()),
             max_message_len: TELEGRAM_MAX_MESSAGE_LEN,
+            strip_latex: true,
+            names: DisplayNameCache::default(),
             #[cfg(feature = "webhook")]
             webhook: None,
         }
@@ -149,6 +154,13 @@ impl TelegramChannel {
     /// does not shadow [`Channel::name`]).
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Whether LaTeX in outgoing text becomes plain text, as Telegram cannot
+    /// render it. Code is never touched. Default on.
+    pub fn with_latex_stripping(mut self, on: bool) -> Self {
+        self.strip_latex = on;
         self
     }
 
@@ -474,11 +486,63 @@ impl TelegramChannel {
         self.serve(Sink::Raw(&updates), shutdown).await
     }
 
+    /// Telegram Markdown with this channel's LaTeX setting applied.
+    fn to_html(&self, markdown: &str) -> String {
+        if self.strip_latex {
+            render_html(&aidaemon_channels::latex::strip_latex_keeping_code(
+                markdown,
+            ))
+        } else {
+            render_html(markdown)
+        }
+    }
+
+    /// Clean the sender's name, or look it up when the update has none.
+    async fn with_sender_name(&self, mut event: ChannelEvent) -> ChannelEvent {
+        self.names
+            .prepare_event(&mut event, |id| async move { self.fetch_name(&id).await })
+            .await;
+        event
+    }
+
+    /// A private chat with the bot carries the person's name (`getChat` on
+    /// their user id); `None` when the bot has never talked to them.
+    async fn fetch_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let Ok(chat_id) = user_id.parse::<i64>() else {
+            return Ok(None);
+        };
+        match self
+            .call_with_retry::<Value>("getChat", &json!({ "chat_id": chat_id }))
+            .await
+        {
+            Ok(chat) => {
+                let field = |key: &str| {
+                    chat.get(key)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                };
+                let full = match (field("first_name"), field("last_name")) {
+                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                    (Some(first), None) => Some(first.to_string()),
+                    _ => None,
+                };
+                Ok(full
+                    .or_else(|| field("title").map(str::to_string))
+                    .or_else(|| field("username").map(str::to_string)))
+            }
+            Err(e) if e.is_auth() => Err(e.into()),
+            // An unknown chat (the bot never talked to them): no name.
+            Err(e) if e.code() == Some(400) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn handle_update(&self, update: Update, events: &mpsc::Sender<ChannelEvent>) -> bool {
         if let Some(msg) = update.message {
             let identity = self.identity();
             if let Some(inbound) = map_message(&msg, &identity) {
-                return events.send(ChannelEvent::Message(inbound)).await.is_ok();
+                let event = self.with_sender_name(ChannelEvent::Message(inbound)).await;
+                return events.send(event).await.is_ok();
             }
             return true;
         }
@@ -514,6 +578,7 @@ impl TelegramChannel {
                 ApprovalAnswer::new(prompt_id, choice_id, sender, conversation)
                     .with_message(message),
             );
+            let event = self.with_sender_name(event).await;
             return events.send(event).await.is_ok();
         }
         true
@@ -579,7 +644,7 @@ impl TelegramChannel {
             ))
         })?;
         let reply_to = reply_to.and_then(|r| r.parse::<i64>().ok());
-        let html = markdown_to_html(text);
+        let html = self.to_html(text);
         let mut chunks = split_html(&html, self.max_message_len);
         if chunks.is_empty() {
             // Telegram rejects empty messages; send something visible.
@@ -702,7 +767,7 @@ impl Channel for TelegramChannel {
     /// Sent without `reply_markup`, which is what removes the buttons.
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {
         let (chat_id, message_id) = message_target(message)?;
-        let html = html_for_edit(&markdown_to_html(text), self.max_message_len);
+        let html = html_for_edit(&self.to_html(text), self.max_message_len);
         let mut body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -833,7 +898,7 @@ impl Channel for TelegramChannel {
         }
         if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             // Plain text: an HTML caption cut at the limit could break a tag.
-            let plain = html_to_plain(&markdown_to_html(caption));
+            let plain = html_to_plain(&self.to_html(caption));
             let caption: String = plain.chars().take(CAPTION_MAX_LEN).collect();
             form = form.text("caption", caption);
         }
@@ -889,34 +954,15 @@ impl Channel for TelegramChannel {
         Ok(downloaded.bytes)
     }
 
-    /// A private chat with the bot carries the person's name (`getChat` on
-    /// their user id); `None` when the bot has never talked to them.
+    fn strips_latex(&self) -> bool {
+        self.strip_latex
+    }
+
+    /// Cached; see [`Self::fetch_name`] for where the name comes from.
     async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
-        let Ok(chat_id) = user_id.parse::<i64>() else {
-            return Ok(None);
-        };
-        match self
-            .call_with_retry::<Value>("getChat", &json!({ "chat_id": chat_id }))
+        self.names
+            .lookup(user_id, || self.fetch_name(user_id))
             .await
-        {
-            Ok(chat) => {
-                let field = |key: &str| {
-                    chat.get(key)
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                };
-                let full = match (field("first_name"), field("last_name")) {
-                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
-                    (Some(first), None) => Some(first.to_string()),
-                    _ => None,
-                };
-                Ok(full.or_else(|| field("username").map(str::to_string)))
-            }
-            Err(e) if e.is_auth() => Err(e.into()),
-            // An unknown chat (the bot never talked to them): no name.
-            Err(e) if e.code() == Some(400) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// The bot's `/` menu (`setMyCommands`).

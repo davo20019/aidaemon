@@ -33,7 +33,7 @@ use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
-    CommandInvocation, Conversation, MessageRef, OutboundFile, OutboundMessage,
+    CommandInvocation, Conversation, DisplayNameCache, MessageRef, OutboundFile, OutboundMessage,
     DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 use async_trait::async_trait;
@@ -104,6 +104,8 @@ pub struct SlackChannel {
     /// `(ts, text)` of recently pressed prompts. `chat.update` needs the
     /// text to remove a message's buttons, and a press carries it.
     pressed_prompts: Mutex<VecDeque<(String, String)>>,
+    strip_latex: bool,
+    names: DisplayNameCache,
 }
 
 impl std::fmt::Debug for SlackChannel {
@@ -179,7 +181,16 @@ impl SlackChannel {
             last_inbound: Mutex::new(HashMap::new()),
             reacting: Mutex::new(HashMap::new()),
             pressed_prompts: Mutex::new(VecDeque::new()),
+            strip_latex: true,
+            names: DisplayNameCache::default(),
         }
+    }
+
+    /// Whether [`aidaemon_channels::ChannelRunner`] rewrites LaTeX in the
+    /// text it sends here as plain text (code excepted). Default on.
+    pub fn with_latex_stripping(mut self, on: bool) -> Self {
+        self.strip_latex = on;
+        self
     }
 
     /// Split messages at `len` characters (1 to [`SECTION_TEXT_LIMIT`], the
@@ -549,7 +560,12 @@ impl SlackChannel {
                     );
                 }
             }
-            if let Some(event) = event {
+            if let Some(mut event) = event {
+                // Slack's events carry no name. The envelope is already
+                // acknowledged and the lookup is cached and time-limited.
+                self.names
+                    .prepare_event(&mut event, |id| async move { self.fetch_name(&id).await })
+                    .await;
                 tokio::select! {
                     _ = shutdown.cancelled() => return SessionEnd::Stop,
                     sent = events.send(event) => {
@@ -572,6 +588,22 @@ impl SlackChannel {
         let ws = self.open_socket().await?;
         info!(channel = %self.name, "Slack socket connected");
         Ok(self.session(ws, &bot_user_id, sink, shutdown, seen).await)
+    }
+
+    async fn fetch_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let info = self
+            .call_form("users.info", &[("user", user_id.to_string())])
+            .await?;
+        let profile = info.get("user").and_then(|user| user.get("profile"));
+        Ok(["display_name", "real_name"]
+            .iter()
+            .find_map(|key| {
+                profile
+                    .and_then(|p| p.get(*key))
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .map(str::to_string))
     }
 
     /// Hold the Socket Mode connection (acknowledging every envelope,
@@ -844,20 +876,15 @@ impl Channel for SlackChannel {
         }
     }
 
+    fn strips_latex(&self) -> bool {
+        self.strip_latex
+    }
+
+    /// Cached; the name comes from `users.info`.
     async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
-        let info = self
-            .call_form("users.info", &[("user", user_id.to_string())])
-            .await?;
-        let profile = info.get("user").and_then(|user| user.get("profile"));
-        Ok(["display_name", "real_name"]
-            .iter()
-            .find_map(|key| {
-                profile
-                    .and_then(|p| p.get(*key))
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-            })
-            .map(str::to_string))
+        self.names
+            .lookup(user_id, || self.fetch_name(user_id))
+            .await
     }
 
     async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
