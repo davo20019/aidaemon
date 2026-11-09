@@ -43,15 +43,19 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
     );
     info!("State store initialized ({})", config.state.db_path);
 
-    if let Ok(count) = state.memory().backfill_episode_embeddings().await {
-        if count > 0 {
-            info!(count, "Backfilled missing episode embeddings");
+    // Another memory system leaves the daemon's tables as they are.
+    let own_memory = config.memory.backend == crate::config::MemoryBackend::Daemon;
+    if own_memory {
+        if let Ok(count) = state.memory().backfill_episode_embeddings().await {
+            if count > 0 {
+                info!(count, "Backfilled missing episode embeddings");
+            }
         }
-    }
 
-    if let Ok(count) = state.memory().backfill_fact_embeddings().await {
-        if count > 0 {
-            info!(count, "Backfilled missing fact embeddings");
+        if let Ok(count) = state.memory().backfill_fact_embeddings().await {
+            if count > 0 {
+                info!(count, "Backfilled missing fact embeddings");
+            }
         }
     }
 
@@ -118,60 +122,62 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
                 }
             }
         }
-        match projection_state
-            .memory()
-            .backfill_missing_memory_projections()
-            .await
-        {
-            Ok((facts, episodes, spans, procedures, error_solutions))
-                if facts > 0
-                    || episodes > 0
-                    || spans > 0
-                    || procedures > 0
-                    || error_solutions > 0 =>
-            {
-                tracing::info!(
-                    facts,
-                    episodes,
-                    spans,
-                    procedures,
-                    error_solutions,
-                    "Backfilled canonical memory projections"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, "Canonical memory backfill deferred");
-            }
-        }
-        const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
-        for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
+        if own_memory {
             match projection_state
                 .memory()
-                .backfill_structured_personal_memory()
+                .backfill_missing_memory_projections()
                 .await
             {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(count, "Backfilled safe structured personal memories");
-                    }
-                    break;
-                }
-                Err(error) if attempt < STRUCTURED_BACKFILL_ATTEMPTS => {
+                Ok((facts, episodes, spans, procedures, error_solutions))
+                    if facts > 0
+                        || episodes > 0
+                        || spans > 0
+                        || procedures > 0
+                        || error_solutions > 0 =>
+                {
                     tracing::info!(
-                        %error,
-                        attempt,
-                        "Structured personal-memory backfill busy; retrying"
+                        facts,
+                        episodes,
+                        spans,
+                        procedures,
+                        error_solutions,
+                        "Backfilled canonical memory projections"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
-                        .await;
                 }
+                Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        attempts = STRUCTURED_BACKFILL_ATTEMPTS,
-                        "Structured personal-memory backfill deferred"
-                    );
+                    tracing::warn!(%error, "Canonical memory backfill deferred");
+                }
+            }
+            const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
+            for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
+                match projection_state
+                    .memory()
+                    .backfill_structured_personal_memory()
+                    .await
+                {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count, "Backfilled safe structured personal memories");
+                        }
+                        break;
+                    }
+                    Err(error) if attempt < STRUCTURED_BACKFILL_ATTEMPTS => {
+                        tracing::info!(
+                            %error,
+                            attempt,
+                            "Structured personal-memory backfill busy; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            attempts = STRUCTURED_BACKFILL_ATTEMPTS,
+                            "Structured personal-memory backfill deferred"
+                        );
+                    }
                 }
             }
         }
