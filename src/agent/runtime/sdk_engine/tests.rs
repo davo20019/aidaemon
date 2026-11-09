@@ -3828,6 +3828,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
             session_id: "telegram:synthetic-user-1",
             task_access: None,
             authorized_scopes: &scopes,
+            scopes_are_guess: false,
             known_project_dir: Some(&project_dir),
         },
     ) {
@@ -3860,6 +3861,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
             session_id: "telegram:synthetic-user-1",
             task_access: None,
             authorized_scopes: &scopes,
+            scopes_are_guess: false,
             known_project_dir: Some(&project_dir),
         },
     );
@@ -4539,4 +4541,96 @@ async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     );
     assert_eq!(known.lock().unwrap().as_deref(), Some(project_dir.as_str()));
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A file tool whose manifest names the paths in its arguments.
+struct ScopeFileTool(&'static str);
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for ScopeFileTool {
+    fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
+        use crate::traits::{ToolTargetHint, ToolTargetHintKind};
+        let args: serde_json::Value = serde_json::from_str(arguments).unwrap();
+        let targets = |key: &str| {
+            args[key]
+                .as_str()
+                .and_then(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        crate::traits::ToolCallAccessManifest {
+            read_targets: targets("read"),
+            write_targets: targets("write"),
+            ..Default::default()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for ScopeFileTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "scope test tool"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"name": self.0, "description": "", "parameters": {"type": "object"}})
+    }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        anyhow::bail!("not run")
+    }
+}
+
+fn guessed_scope_check(
+    tool: &'static str,
+    args: serde_json::Value,
+    guess: bool,
+) -> Option<crate::agent::tool_execution::ScopeCheck> {
+    let scopes = vec!["/tmp/synthetic-guess".to_string()];
+    call_scope_check(
+        &ScopeFileTool(tool),
+        &args.to_string(),
+        &CallScopeFacts {
+            session_id: "synthetic-session",
+            task_access: None,
+            authorized_scopes: &scopes,
+            scopes_are_guess: guess,
+            known_project_dir: None,
+        },
+    )
+}
+
+#[test]
+fn a_guessed_scope_never_refuses_the_owners_file_tools() {
+    use serde_json::json;
+    let read = json!({"read": "/tmp/synthetic-real/settings.php"});
+    assert!(guessed_scope_check("read_file", read.clone(), true).is_none());
+    let write = json!({"write": "/tmp/synthetic-real/settings.php"});
+    assert!(guessed_scope_check("write_file", write, true).is_none());
+
+    // The same scope as a real boundary still refuses.
+    assert!(matches!(
+        guessed_scope_check("read_file", read, false),
+        Some(crate::agent::tool_execution::ScopeCheck::Rejected(_))
+    ));
+}
+
+#[test]
+fn a_guessed_scope_keeps_sensitive_paths_and_the_terminal_card() {
+    use crate::agent::tool_execution::ScopeCheck;
+    use serde_json::json;
+    let key = dirs::home_dir()
+        .unwrap()
+        .join(".ssh/synthetic_key")
+        .display()
+        .to_string();
+    assert!(matches!(
+        guessed_scope_check("read_file", json!({"read": key}), true),
+        Some(ScopeCheck::Rejected(_))
+    ));
+    assert!(matches!(
+        guessed_scope_check("terminal", json!({"write": "/tmp/synthetic-real/a"}), true),
+        Some(ScopeCheck::Escalatable { .. })
+    ));
 }

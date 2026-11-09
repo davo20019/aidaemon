@@ -38,6 +38,22 @@ fn owner_fallback_scopes(
     }
 }
 
+/// Whether the turn's scopes are only a guess from conversation text: an
+/// owner's own request, with no workspace grant or bound workspace.
+fn scopes_are_only_a_guess(
+    user_role: crate::types::UserRole,
+    has_workspace_grant: bool,
+    has_task_access: bool,
+    is_goal_run: bool,
+    is_trigger: bool,
+) -> bool {
+    user_role == crate::types::UserRole::Owner
+        && !has_workspace_grant
+        && !has_task_access
+        && !is_goal_run
+        && !is_trigger
+}
+
 /// Keep only the tool definitions the turn's authority admits by name (all
 /// of them when it names no tool set).
 fn retain_authorized_tool_definitions(
@@ -1141,6 +1157,13 @@ impl Agent {
                 project_scope: (!turn_context.allow_multi_project_scope)
                     .then(|| turn_context.primary_project_scope.clone())
                     .flatten(),
+                scopes_are_guess: scopes_are_only_a_guess(
+                    user_role,
+                    channel_ctx.active_workspace_grant(user_role).is_some(),
+                    resolved_authority.task_access.is_some(),
+                    self.goal_id.is_some(),
+                    crate::agent::loop_utils::is_trigger_session(session_id),
+                ),
                 authority: resolved_authority,
                 projected_source_message_ids,
                 projected_source_turn_ids,
@@ -1410,6 +1433,53 @@ mod offered_tool_tests {
     /// The offered list follows the resolved authority's tool set: every
     /// tool when it names none, only the named ones otherwise, none for an
     /// empty set.
+    #[test]
+    fn only_an_owners_unbound_request_has_a_guessed_scope() {
+        use crate::types::UserRole;
+        assert!(scopes_are_only_a_guess(
+            UserRole::Owner,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!scopes_are_only_a_guess(
+            UserRole::Guest,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!scopes_are_only_a_guess(
+            UserRole::Owner,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!scopes_are_only_a_guess(
+            UserRole::Owner,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!scopes_are_only_a_guess(
+            UserRole::Owner,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!scopes_are_only_a_guess(
+            UserRole::Owner,
+            false,
+            false,
+            false,
+            true
+        ));
+    }
+
     #[test]
     fn offered_tools_follow_the_resolved_authority_tool_set() {
         let defs: Vec<Value> = ["http_request", "read_file", "write_file"]

@@ -365,6 +365,9 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// against its `task_access`, else the directories the turn authorizes.
     pub(in crate::agent) authority: crate::agent::authority::ResolvedAuthority,
     pub(in crate::agent) authorized_scopes: Vec<String>,
+    /// `authorized_scopes` comes only from conversation text, for an owner
+    /// who can answer a card: it may not refuse their file tools.
+    pub(in crate::agent) scopes_are_guess: bool,
     /// Persisted message and turn ids whose content reached the projected
     /// prefix, recorded on every model call's telemetry.
     pub(in crate::agent) projected_source_message_ids: Vec<String>,
@@ -456,6 +459,7 @@ pub(super) fn terminal_canonicalizer(
             session_id: &turn.session_id,
             task_access: turn.task_access.as_ref(),
             authorized_scopes: &turn.authorized_scopes,
+            scopes_are_guess: false,
             known_project_dir: known.as_deref(),
         };
         let scope = match tool_calls::call_scope_check(
@@ -663,6 +667,7 @@ pub(in crate::agent) struct TurnScope<'a> {
     origin_request: &'a str,
     origin_trusted: bool,
     authorized_scopes: Vec<String>,
+    scopes_are_guess: bool,
     /// See `SdkTurnSetup::projected_source_message_ids`.
     projected_source_message_ids: Vec<String>,
     projected_source_turn_ids: Vec<String>,
@@ -899,6 +904,7 @@ impl Agent {
             explicit_workspace,
             authority,
             authorized_scopes,
+            scopes_are_guess,
             projected_source_message_ids,
             projected_source_turn_ids,
             defer_on_provider_failure,
@@ -1124,12 +1130,21 @@ impl Agent {
                     judged_terminal_calls.clone(),
                 )
             });
+        let trusted_session = !mandate_run
+            && self
+                .session_trusted(channel_ctx.trusted, Some(task_id.as_str()))
+                .await;
+        // A run nobody is watching cannot answer a card: its guess still binds.
+        let scopes_are_guess = scopes_are_guess && !trusted_session && !mandate_run;
         let rules = super::approvals::AppApprovalRules {
-            trusted_session: !mandate_run
-                && self
-                    .session_trusted(channel_ctx.trusted, Some(task_id.as_str()))
-                    .await,
+            trusted_session,
             mandate_preapproved: mandate_run,
+            guessed_scopes: if scopes_are_guess {
+                authorized_scopes.clone()
+            } else {
+                Vec::new()
+            },
+            known_project_dir: Some(known_project_dir.clone()),
             session_id: session_id.to_string(),
             user_role: Some(user_role),
             channel_visibility: Some(channel_ctx.visibility),
@@ -1402,6 +1417,7 @@ impl Agent {
             origin_request,
             origin_trusted,
             authorized_scopes,
+            scopes_are_guess,
             projected_source_message_ids,
             projected_source_turn_ids,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),

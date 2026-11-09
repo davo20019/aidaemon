@@ -139,7 +139,21 @@ impl ScopeCheck {
 /// Tools that can carry an out-of-scope target to a user approval prompt
 /// instead of failing closed. Only the confined terminal has an approval
 /// ladder that renders the exact capability being requested.
-fn tool_supports_scope_escalation(tool_name: &str) -> bool {
+/// Whether a call names a path the guessed scope still protects: credential
+/// stores and the like stay refused outside it, as they always were.
+pub(in crate::agent) fn names_sensitive_path(
+    manifest: &crate::traits::ToolCallAccessManifest,
+) -> bool {
+    manifest
+        .read_targets
+        .iter()
+        .chain(&manifest.write_targets)
+        .any(|target| {
+            crate::tools::fs_utils::is_sensitive_path(std::path::Path::new(&target.value))
+        })
+}
+
+pub(in crate::agent) fn tool_supports_scope_escalation(tool_name: &str) -> bool {
     tool_name == "terminal"
 }
 

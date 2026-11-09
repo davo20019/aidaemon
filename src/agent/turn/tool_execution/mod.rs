@@ -12,7 +12,8 @@ pub(in crate::agent) use run::{
     mandate_gate_for_tool_call, parse_checklist_from_result, MandateGateDecision,
 };
 pub(in crate::agent) use run_helpers::{
-    access_manifest_scope_check, attenuate_unauthorized_read_roots, ScopeCheck,
+    access_manifest_scope_check, attenuate_unauthorized_read_roots, names_sensitive_path,
+    tool_supports_scope_escalation, ScopeCheck,
 };
 pub(in crate::agent) use run_helpers::{
     accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,

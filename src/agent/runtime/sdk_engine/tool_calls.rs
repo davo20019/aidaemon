@@ -16,6 +16,8 @@ pub(super) struct CallScopeFacts<'a> {
     pub session_id: &'a str,
     pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
     pub authorized_scopes: &'a [String],
+    /// `authorized_scopes` is only the turn's guess from conversation text.
+    pub scopes_are_guess: bool,
     pub known_project_dir: Option<&'a str>,
 }
 
@@ -36,11 +38,21 @@ pub(super) fn call_scope_check(
         .adapter_owned_access_manifest(arguments)
         .adapter_read_targets;
     grant_own_spill_reads(&mut manifest, facts.session_id);
+    // A guess picks where the agent starts; it never refuses the owner. The
+    // kernel's approval rules send writes outside it to a card. The terminal
+    // keeps its own escalation card.
+    let guess_binds = !facts.scopes_are_guess
+        || crate::agent::tool_execution::tool_supports_scope_escalation(tool.name())
+        || crate::agent::tool_execution::names_sensitive_path(&manifest);
     crate::agent::tool_execution::access_manifest_scope_check(
         tool.name(),
         &manifest,
         facts.task_access,
-        facts.authorized_scopes,
+        if guess_binds {
+            facts.authorized_scopes
+        } else {
+            &[]
+        },
         facts.known_project_dir,
     )
 }
@@ -644,6 +656,7 @@ impl Agent {
                 session_id: scope.session_id,
                 task_access: scope.authority.task_access.as_ref(),
                 authorized_scopes: &scope.authorized_scopes,
+                scopes_are_guess: scope.scopes_are_guess,
                 known_project_dir: known.as_deref(),
             },
         )

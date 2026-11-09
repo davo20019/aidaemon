@@ -80,6 +80,12 @@ pub(crate) struct AppApprovalRules {
     pub terminal: Option<TerminalApprovals>,
     /// The turn's tools, whose own approval requests the rules consult.
     pub tools: ApprovalTools,
+    /// The folders the turn guessed from conversation text. A file write
+    /// outside them asks the owner; empty when nobody can answer or a real
+    /// grant bounds the turn.
+    pub guessed_scopes: Vec<String>,
+    /// The turn's project directory, which anchors relative targets.
+    pub known_project_dir: Option<Arc<std::sync::Mutex<Option<String>>>>,
     /// The run's declines as the kernel last showed them to these rules
     /// (`HookContext::declined`, which every judged call refreshes): a
     /// child spawned from this turn starts with them.
@@ -410,6 +416,68 @@ impl AppApprovalRules {
             .is_some_and(|tool| tool.dispatch_facts().keeps_own_grants)
     }
 
+    /// The card for a file write outside the folders the turn guessed. Asks
+    /// nothing for a write the dispatcher refuses anyway, so the owner is
+    /// never asked to approve a call that cannot run.
+    fn write_outside_guess_request(
+        &self,
+        tool: &dyn crate::traits::Tool,
+        arguments: &serde_json::Value,
+    ) -> Option<sdk::OwnerApprovalRequest> {
+        use crate::agent::tool_execution::{access_manifest_scope_check, ScopeCheck};
+        if self.guessed_scopes.is_empty() {
+            return None;
+        }
+        let arguments = arguments.to_string();
+        let mut manifest = crate::traits::prepare_invocation(tool, &arguments)
+            .map(|prepared| prepared.access_manifest)
+            .unwrap_or_else(|_| tool.call_access_manifest(&arguments));
+        manifest.read_targets.clear();
+        if manifest.write_targets.is_empty()
+            || crate::agent::tool_execution::names_sensitive_path(&manifest)
+        {
+            return None;
+        }
+        let known = self
+            .known_project_dir
+            .as_ref()
+            .and_then(|known| known.lock().ok().and_then(|known| known.clone()));
+        let check = |scopes: &[String]| {
+            access_manifest_scope_check(tool.name(), &manifest, None, scopes, known.as_deref())
+        };
+        if check(&[]).is_some()
+            || !matches!(check(&self.guessed_scopes), Some(ScopeCheck::Rejected(_)))
+        {
+            return None;
+        }
+        let paths = manifest
+            .write_targets
+            .iter()
+            .map(|target| target.value.as_str())
+            .collect::<Vec<_>>();
+        let mut folders = paths
+            .iter()
+            .map(|path| {
+                std::path::Path::new(path)
+                    .parent()
+                    .map_or_else(|| (*path).to_string(), |dir| dir.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        folders.sort();
+        folders.dedup();
+        Some(sdk::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: format!(
+                "Write {}? This task looks like it is about {}, and this is outside it.",
+                paths.join(", "),
+                self.guessed_scopes.join(", ")
+            ),
+            subject: format!("write outside guessed project: {}", folders.join(", ")),
+            risk: sdk::ApprovalRisk::Medium,
+            warnings: Vec::new(),
+        })
+    }
+
     /// Judge the call the dispatcher will execute (canonicalized), never
     /// the raw one, and record the judgment for the dispatcher.
     async fn judge_canonical(
@@ -492,13 +560,19 @@ impl ApprovalRules for AppApprovalRules {
         let Some(tool) = self.tools.find(&call.name) else {
             return RuleDecision::Defer;
         };
-        rule_decision(
-            tool.owner_approval_request(
+        let need = tool
+            .owner_approval_request(
                 &crate::traits::ApprovalCall::as_sent(&call.arguments),
                 &self.call_facts(None),
             )
-            .await,
-        )
+            .await;
+        if !matches!(need, crate::traits::OwnerApprovalNeed::Ask(_)) {
+            if let Some(request) = self.write_outside_guess_request(tool.as_ref(), &call.arguments)
+            {
+                return RuleDecision::Ask(request);
+            }
+        }
+        rule_decision(need)
     }
 }
 
@@ -1005,6 +1079,115 @@ mod tests {
         async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
             anyhow::bail!("not run in these tests")
         }
+    }
+
+    /// A file tool that reads and writes the paths its arguments name.
+    struct FileTool;
+
+    #[async_trait]
+    impl crate::traits::ToolSemantics for FileTool {
+        fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
+            use crate::traits::{ToolTargetHint, ToolTargetHintKind};
+            let args: serde_json::Value = serde_json::from_str(arguments).unwrap();
+            let targets = |key: &str| {
+                args[key]
+                    .as_str()
+                    .and_then(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            crate::traits::ToolCallAccessManifest {
+                read_targets: targets("read"),
+                write_targets: targets("write"),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::traits::Tool for FileTool {
+        fn name(&self) -> &str {
+            "file_tool"
+        }
+        fn description(&self) -> &str {
+            "file tool"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"name": "file_tool", "description": "", "parameters": {"type": "object"}})
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            anyhow::bail!("not run in these tests")
+        }
+    }
+
+    fn guessing_rules(scopes: &[&str]) -> AppApprovalRules {
+        AppApprovalRules {
+            tools: ApprovalTools::new([Arc::new(FileTool) as Arc<dyn crate::traits::Tool>]),
+            guessed_scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            ..AppApprovalRules::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_outside_the_guess_asks_and_names_the_path() {
+        let rules = guessing_rules(&["/tmp/synthetic-guess"]);
+        let call = sdk::ToolCall::new(
+            "c1",
+            "file_tool",
+            json!({"write": "/tmp/synthetic-real/app/settings.php"}),
+        );
+        match rules.judge(&hook_ctx(), &call, &tool_info()).await {
+            RuleDecision::Ask(request) => {
+                assert!(request
+                    .summary
+                    .contains("/tmp/synthetic-real/app/settings.php"));
+                assert!(request.summary.contains("/tmp/synthetic-guess"));
+                assert_eq!(
+                    request.subject,
+                    "write outside guessed project: /tmp/synthetic-real/app"
+                );
+            }
+            other => panic!("expected a card, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_writes_outside_the_guess_ask() {
+        let rules = guessing_rules(&["/tmp/synthetic-guess"]);
+        for args in [
+            json!({"write": "/tmp/synthetic-guess/inside.txt"}),
+            json!({"read": "/tmp/synthetic-real/settings.php"}),
+        ] {
+            let call = sdk::ToolCall::new("c1", "file_tool", args.clone());
+            assert!(
+                !matches!(
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                    RuleDecision::Ask(_)
+                ),
+                "{args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_guess_or_a_sensitive_path_sends_no_card() {
+        let write =
+            sdk::ToolCall::new("c1", "file_tool", json!({"write": "/tmp/synthetic-real/a"}));
+        assert!(!matches!(
+            guessing_rules(&[])
+                .judge(&hook_ctx(), &write, &tool_info())
+                .await,
+            RuleDecision::Ask(_)
+        ));
+        let home = dirs::home_dir().unwrap();
+        let sensitive = home.join(".ssh/synthetic_key").display().to_string();
+        let write = sdk::ToolCall::new("c1", "file_tool", json!({"write": sensitive}));
+        assert!(!matches!(
+            guessing_rules(&["/tmp/synthetic-guess"])
+                .judge(&hook_ctx(), &write, &tool_info())
+                .await,
+            RuleDecision::Ask(_)
+        ));
     }
 
     /// `manage_mcp`'s approval judgment without its registry (which needs a
