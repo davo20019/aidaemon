@@ -2,12 +2,12 @@
 //!
 //! This module provides a planning system that:
 //! - Persists multi-step task state to SQLite
-//! - Enables recovery from crashes/restarts mid-task
+//! - Keeps a task's checklist across a restart (the resume itself is built
+//!   from the event log, see `agent/runtime/resume.rs`)
 //! - Provides explicit step-by-step progress tracking
 //! - Supports resume capability for long-running tasks
 
 pub mod detection;
-mod recovery;
 mod store;
 mod tracking;
 

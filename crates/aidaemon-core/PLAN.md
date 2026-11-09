@@ -660,8 +660,11 @@ Independent of the SDK; each is a small PR against `master`.
       them; an allowlist argument policy is 3c.
 - [ ] No default sandbox on Linux (Docker backend is behind an empty,
       off-by-default `execution-docker` feature).
-- [ ] `PlanRecovery::recover_interrupted_plans` (`src/plans/recovery.rs:39`)
-      is only called from tests.
+- [x] `PlanRecovery::recover_interrupted_plans` was only called from tests.
+      Deleted: nothing reads `PlanStatus::Paused`, a resume is built from the
+      event log (`agent/runtime/resume.rs`), and pausing at startup would
+      have frozen a reused checklist, since `sync_active_step` promotes the
+      next step only while the plan is `InProgress`.
 - [x] `is_non_delegable_tool` checked an `mcp__` prefix, but MCP tools are
       named `{server}__{tool}`. Fixed with a typed
       `ToolDispatchFacts::opaque_execution` that MCP tools declare;

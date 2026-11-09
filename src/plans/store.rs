@@ -437,7 +437,7 @@ impl PlanStore {
         Ok(plans)
     }
 
-    /// Get all plans that were in progress (for recovery after restart).
+    /// Get all plans that are in progress.
     pub async fn get_all_in_progress(&self) -> anyhow::Result<Vec<TaskPlan>> {
         let rows = sqlx::query(
             r#"
