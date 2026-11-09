@@ -13,17 +13,33 @@ use crate::traits::{StateStore, Task};
 /// Maximum size of activity log text sent to the extraction prompt.
 const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 
+/// Whether the run a task finished in read untrusted content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTaint {
+    Clean,
+    Tainted,
+}
+
 /// Extract durable knowledge from a completed task's activity log.
 ///
 /// Reads the task's activity records, builds a prompt asking the LLM to extract
 /// facts, procedures, and error solutions, then stores them in the state store.
+/// A tainted run teaches nothing: content someone other than the owner wrote
+/// must not become durable memory, so no model call is made and nothing is
+/// stored.
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     model: String,
     task: Task,
+    taint: RunTaint,
 ) -> anyhow::Result<()> {
+    if taint == RunTaint::Tainted {
+        info!(task_id = %task.id, "Skipping task knowledge extraction: the run read untrusted content");
+        return Ok(());
+    }
+
     // Derive channel provenance from the parent goal (tasks do not carry session_id).
     let goal = state.get_goal(&task.goal_id).await.ok().flatten();
     let derived_channel_id: Option<String> = goal
@@ -202,7 +218,15 @@ mod tests {
         let (gateway, events) = gateway_with(provider_failing("503")).await;
         let (state, store) = stores_with_finished_task("task-1").await;
         let task = state.get_task("task-1").await.unwrap().unwrap();
-        let result = extract_task_knowledge(state.clone(), store, gateway, "m".into(), task).await;
+        let result = extract_task_knowledge(
+            state.clone(),
+            store,
+            gateway,
+            "m".into(),
+            task,
+            RunTaint::Clean,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(count_learned(&state).await, 0);
         assert!(failed_calls(&events, "task_learning").await >= 1);
@@ -217,10 +241,55 @@ mod tests {
         .await;
         let (state, store) = stores_with_finished_task("task-1").await;
         let task = state.get_task("task-1").await.unwrap().unwrap();
-        extract_task_knowledge(state, store, gateway, "m".into(), task)
+        extract_task_knowledge(state, store, gateway, "m".into(), task, RunTaint::Clean)
             .await
             .unwrap();
         assert_eq!(ok_calls(&events, "task_learning").await, 1);
         assert_eq!(failed_calls(&events, "task_learning").await, 0);
+    }
+
+    /// An extraction that teaches one fact and one procedure.
+    const TEACHES_SOMETHING: &str = r#"{
+        "facts": [{"category": "project", "key": "acme_report_build", "value": "The Acme Corp report is built with make report"}],
+        "procedures": [{"name": "build the Acme Corp report", "trigger_pattern": "build report", "steps": ["make report"]}],
+        "error_solutions": []
+    }"#;
+
+    #[tokio::test]
+    async fn a_tainted_run_teaches_nothing_and_makes_no_model_call() {
+        let (gateway, events) = gateway_with(provider_answering(TEACHES_SOMETHING)).await;
+        let (state, store) = stores_with_finished_task("task-1").await;
+        let task = state.get_task("task-1").await.unwrap().unwrap();
+        extract_task_knowledge(
+            state.clone(),
+            store,
+            gateway,
+            "m".into(),
+            task,
+            RunTaint::Tainted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_learned(&state).await, 0);
+        assert_eq!(ok_calls(&events, "task_learning").await, 0);
+        assert_eq!(failed_calls(&events, "task_learning").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_clean_run_still_learns() {
+        let (gateway, _events) = gateway_with(provider_answering(TEACHES_SOMETHING)).await;
+        let (state, store) = stores_with_finished_task("task-1").await;
+        let task = state.get_task("task-1").await.unwrap().unwrap();
+        extract_task_knowledge(
+            state.clone(),
+            store,
+            gateway,
+            "m".into(),
+            task,
+            RunTaint::Clean,
+        )
+        .await
+        .unwrap();
+        assert!(count_learned(&state).await > 0);
     }
 }

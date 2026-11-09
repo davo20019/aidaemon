@@ -28,6 +28,16 @@ fn child_result_trust(
     }
 }
 
+/// Whether a child's run may teach durable memory, from its record of
+/// tainted turns. An unreadable record counts as tainted.
+fn run_taint(read: &anyhow::Result<Vec<String>>) -> crate::memory::task_learning::RunTaint {
+    use crate::memory::task_learning::RunTaint;
+    match read {
+        Ok(turns) if turns.is_empty() => RunTaint::Clean,
+        _ => RunTaint::Tainted,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SpawnChildResult {
     pub response: String,
@@ -2881,6 +2891,12 @@ impl Agent {
                 .await;
         }
 
+        // The child's record of tainted turns, read once: it gates task
+        // learning and sets the trust of the child's result.
+        let child_tainted_turns =
+            crate::agent::untrusted::tainted_turns(self.state.as_ref(), &child_session_for_events)
+                .await;
+
         // Spawn background knowledge extraction for completed executor tasks.
         if !child_is_mandate_execution {
             if let Some(ref task_id) = saved_task_id {
@@ -2891,6 +2907,7 @@ impl Agent {
                             let store = self.memory_store.clone();
                             let side_calls = self.side_calls.clone();
                             let tid = task_id.clone();
+                            let taint = run_taint(&child_tainted_turns);
                             let model = match tokio::time::timeout(
                                 Duration::from_secs(2),
                                 self.fallback_model.read(),
@@ -2914,6 +2931,7 @@ impl Agent {
                                         side_calls,
                                         model,
                                         completed_task,
+                                        taint,
                                     )
                                     .await
                                 {
@@ -2932,8 +2950,7 @@ impl Agent {
 
         let trust = child_result_trust(
             child_read_untrusted.load(std::sync::atomic::Ordering::SeqCst),
-            crate::agent::untrusted::tainted_turns(self.state.as_ref(), &child_session_for_events)
-                .await,
+            child_tainted_turns,
         );
         result.map(|response| SpawnChildResult {
             response,
@@ -3311,6 +3328,20 @@ mod tests {
                 .background_delivery_session("specialist:code:1"),
             "telegram:synthetic-user-1"
         );
+    }
+
+    #[test]
+    fn an_unreadable_taint_record_counts_as_tainted() {
+        use crate::memory::task_learning::RunTaint;
+        assert_eq!(
+            super::run_taint(&Err(anyhow::anyhow!("corrupt"))),
+            RunTaint::Tainted
+        );
+        assert_eq!(
+            super::run_taint(&Ok(vec!["turn-1".to_string()])),
+            RunTaint::Tainted
+        );
+        assert_eq!(super::run_taint(&Ok(Vec::new())), RunTaint::Clean);
     }
 
     #[test]
