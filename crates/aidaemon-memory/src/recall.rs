@@ -44,7 +44,12 @@ impl Recall for MemoryRecall {
             return Vec::new();
         }
         let scope = self.memory.scope_for(session_id);
-        let mut out: Vec<String> = match self.memory.recall_facts(&scope, query, limit).await {
+        let audience = self.memory.audience_for(session_id);
+        let mut out: Vec<String> = match self
+            .memory
+            .recall_facts_for(&scope, query, limit, &audience)
+            .await
+        {
             Ok(facts) => facts
                 .into_iter()
                 .map(|f| {
@@ -63,7 +68,11 @@ impl Recall for MemoryRecall {
         };
         let room = limit.saturating_sub(out.len()).min(self.max_episodes);
         if room > 0 {
-            match self.memory.recall_episodes(&scope, query, room).await {
+            match self
+                .memory
+                .recall_episodes_for(&scope, query, room, &audience)
+                .await
+            {
                 Ok(episodes) => out.extend(episodes.into_iter().map(|e| {
                     format!(
                         "Earlier conversation ({}): {}",

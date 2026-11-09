@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::embed::{cosine, Embedder};
 use crate::error::{MemoryError, Result};
 use crate::extract::{EpisodeSummarizer, FactExtractor};
-use crate::scoring::{HybridScorer, Scorer, ScoringConfig};
+use crate::scoring::{text_similarity, HybridScorer, Scorer, ScoringConfig};
+use crate::sqlite::facts_make_the_same_claim;
 use crate::store::MemoryStore;
 use crate::types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, truncate_chars,
-    DecayReport, Episode, Fact, MemoryStats, NewEpisode, NewFact, Provenance, RetentionConfig,
+    DecayReport, Episode, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig, NewEpisode,
+    NewFact, Provenance, RecallAudience, RecordKind, ReembedCursor, ReembedReport, RetentionConfig,
     ScoredEpisode, ScoredFact, Signals, StoredEmbedding, UpsertOutcome,
 };
 
@@ -23,12 +25,32 @@ use crate::types::{
 /// scope. The default is the identity: one memory per session id.
 pub type ScopeResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// Maps a session id to who that conversation reaches, which decides what
+/// recall may return and how new memories are classified.
+pub type AudienceResolver = Arc<dyn Fn(&str) -> RecallAudience + Send + Sync>;
+
+/// How many candidates to ask a ranking store for when some may be filtered
+/// out afterwards, as a multiple of the limit.
+const FILTERED_SEARCH_OVERFETCH: usize = 4;
+
+/// The most records one [`Memory::reembed_batch`] will embed.
+pub const MAX_REEMBED_BATCH: usize = 256;
+
+/// The strongest query matches whose relations feed the graph signal.
+const MAX_GRAPH_SEEDS: usize = 6;
+
+/// A seed must match the query at least this well (semantic or lexical).
+/// The scorer is not asked, so a custom one sees each candidate once.
+const GRAPH_SEED_MIN_SIGNAL: f32 = 0.3;
+
 struct Inner {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
     scorer: Arc<dyn Scorer>,
     retention: RetentionConfig,
+    merge: MergeConfig,
     scope_resolver: ScopeResolver,
+    audience_resolver: AudienceResolver,
     extractor: Option<Arc<FactExtractor>>,
     summarizer: Option<Arc<EpisodeSummarizer>>,
 }
@@ -47,7 +69,9 @@ pub struct MemoryBuilder {
     embedder: Arc<dyn Embedder>,
     scorer: Arc<dyn Scorer>,
     retention: RetentionConfig,
+    merge: MergeConfig,
     scope_resolver: ScopeResolver,
+    audience_resolver: AudienceResolver,
     extractor: Option<Arc<FactExtractor>>,
     summarizer: Option<Arc<EpisodeSummarizer>>,
 }
@@ -70,10 +94,27 @@ impl MemoryBuilder {
         self
     }
 
+    /// When a new fact merges into a near duplicate under another key.
+    pub fn merge(mut self, merge: MergeConfig) -> Self {
+        self.merge = merge;
+        self
+    }
+
     /// How session ids map to scopes (for example, many sessions of one
     /// user sharing `telegram:synthetic-user-1`).
     pub fn scope_resolver(mut self, f: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
         self.scope_resolver = Arc::new(f);
+        self
+    }
+
+    /// Who each session's conversation reaches. A host with shared channels
+    /// must set this: without it every session counts as the owner in a
+    /// direct conversation, so only the scope separates them.
+    pub fn audience_resolver(
+        mut self,
+        f: impl Fn(&str) -> RecallAudience + Send + Sync + 'static,
+    ) -> Self {
+        self.audience_resolver = Arc::new(f);
         self
     }
 
@@ -97,7 +138,9 @@ impl MemoryBuilder {
                 embedder: self.embedder,
                 scorer: self.scorer,
                 retention: self.retention,
+                merge: self.merge,
                 scope_resolver: self.scope_resolver,
+                audience_resolver: self.audience_resolver,
                 extractor: self.extractor,
                 summarizer: self.summarizer,
             }),
@@ -127,7 +170,9 @@ impl Memory {
             embedder,
             scorer: Arc::new(HybridScorer::default()),
             retention: RetentionConfig::default(),
+            merge: MergeConfig::default(),
             scope_resolver: Arc::new(|session: &str| session.to_string()),
+            audience_resolver: Arc::new(|_: &str| RecallAudience::owner()),
             extractor: None,
             summarizer: None,
         }
@@ -153,6 +198,25 @@ impl Memory {
     /// The scope for a session id.
     pub fn scope_for(&self, session_id: &str) -> String {
         (self.inner.scope_resolver)(session_id)
+    }
+
+    /// Who a session's conversation reaches.
+    pub fn audience_for(&self, session_id: &str) -> RecallAudience {
+        (self.inner.audience_resolver)(session_id)
+    }
+
+    /// Which ids `audience` may see, given the store's answer about their
+    /// access. A failed lookup shows nothing rather than everything.
+    fn visible_ids(
+        access: Result<HashMap<String, FactAccess>>,
+        audience: &RecallAudience,
+    ) -> impl Fn(&str) -> bool {
+        let access = access.unwrap_or_else(|error| {
+            tracing::warn!(%error, "access lookup failed; hiding restricted memories");
+            HashMap::new()
+        });
+        let audience = audience.clone();
+        move |id| audience.may_see(access.get(id))
     }
 
     async fn embed_one(&self, text: &str) -> Option<StoredEmbedding> {
@@ -184,14 +248,101 @@ impl Memory {
         self.remember_at(fact, Utc::now()).await
     }
 
-    /// Normalize, embed and upsert a fact as of `now`. An embedding failure
-    /// stores the fact without a vector (lexical recall still finds it).
+    /// Normalize, embed and upsert a private fact as of `now`. An embedding
+    /// failure stores the fact without a vector (lexical recall still finds
+    /// it).
     pub async fn remember_at(&self, fact: NewFact, now: DateTime<Utc>) -> Result<UpsertOutcome> {
-        let fact = fact.normalized()?;
-        let embedding = self
+        self.write_fact(fact, &FactAccess::private(), now).await
+    }
+
+    /// Store a fact now, stating who may see it.
+    pub async fn remember_with(&self, fact: NewFact, access: &FactAccess) -> Result<UpsertOutcome> {
+        self.write_fact(fact, access, Utc::now()).await
+    }
+
+    async fn write_fact(
+        &self,
+        fact: NewFact,
+        access: &FactAccess,
+        now: DateTime<Utc>,
+    ) -> Result<UpsertOutcome> {
+        let mut fact = fact.normalized()?;
+        let mut embedding = self
             .embed_one(&fact_search_text(&fact.category, &fact.key, &fact.value))
             .await;
-        self.inner.store.upsert_fact(fact, embedding, now).await
+        if let Some(target) = self.near_duplicate(&fact, embedding.as_ref(), access).await {
+            fact.category = target.fact.category;
+            fact.key = target.fact.key;
+            fact.confidence = fact.confidence.max(target.fact.confidence);
+            // The stored vector has to describe the row's final text.
+            embedding = self
+                .embed_one(&fact_search_text(&fact.category, &fact.key, &fact.value))
+                .await;
+        }
+        self.inner
+            .store
+            .upsert_fact_with_access(fact, embedding, access, now)
+            .await
+    }
+
+    /// The active fact `fact` restates under another key, if any. A fact
+    /// whose key is already active is a reinforcement or a correction, which
+    /// the store decides. Only a record with the same access can merge, so a
+    /// write cannot touch, or learn of, a record its audience may not see.
+    async fn near_duplicate(
+        &self,
+        fact: &NewFact,
+        embedding: Option<&StoredEmbedding>,
+        access: &FactAccess,
+    ) -> Option<FactRecord> {
+        let config = self.inner.merge;
+        let store = &self.inner.store;
+        let records = store
+            .active_facts(&fact.scope)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "near-duplicate check skipped"))
+            .ok()?;
+        if records
+            .iter()
+            .any(|r| r.fact.category == fact.category && r.fact.key == fact.key)
+        {
+            return None;
+        }
+        let ids: Vec<String> = records.iter().map(|r| r.fact.id.clone()).collect();
+        let known = store
+            .fact_access(&fact.scope, &ids)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "near-duplicate check skipped"))
+            .ok()?;
+        let text = fact_search_text(&fact.category, &fact.key, &fact.value);
+        let same_claim = |r: &FactRecord| {
+            let (new, old) = (
+                (fact.key.as_str(), fact.value.as_str()),
+                (r.fact.key.as_str(), r.fact.value.as_str()),
+            );
+            facts_make_the_same_claim(&fact.category, new, old)
+                && facts_make_the_same_claim(&r.fact.category, new, old)
+        };
+        records
+            .into_iter()
+            .filter(|r| known.get(&r.fact.id).cloned().unwrap_or_default() == *access)
+            .filter(same_claim)
+            .filter_map(|r| {
+                let (similarity, threshold) = match Self::semantic(embedding, r.embedding.as_ref())
+                {
+                    Some(semantic) => (semantic, config.semantic_threshold),
+                    None => (
+                        text_similarity(&text, &r.fact.search_text()),
+                        config.text_threshold,
+                    ),
+                };
+                (similarity >= threshold).then_some((similarity, r))
+            })
+            .max_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then(a.1.fact.updated_at.cmp(&b.1.fact.updated_at))
+            })
+            .map(|(_, record)| record)
     }
 
     /// Supersede the active fact for this key. History is kept.
@@ -229,14 +380,30 @@ impl Memory {
             .await
     }
 
-    /// The facts most relevant to `query`, best first. Each returned fact's
-    /// recall count is incremented. An empty query returns the most
-    /// recently updated facts.
+    /// The facts most relevant to `query`, best first, as the owner in a
+    /// direct conversation sees them. Each returned fact's recall count is
+    /// incremented. An empty query returns the most recently updated facts.
+    ///
+    /// Use [`Memory::recall_facts_for`] for anything that reaches a channel.
     pub async fn recall_facts(
         &self,
         scope: &str,
         query: &str,
         limit: usize,
+    ) -> Result<Vec<ScoredFact>> {
+        self.recall_facts_for(scope, query, limit, &RecallAudience::owner())
+            .await
+    }
+
+    /// [`Memory::recall_facts`] limited to what `audience` may see. Restricted
+    /// facts are dropped before ranking, so they neither fill the limit nor
+    /// gain recall counts.
+    pub async fn recall_facts_for(
+        &self,
+        scope: &str,
+        query: &str,
+        limit: usize,
+        audience: &RecallAudience,
     ) -> Result<Vec<ScoredFact>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -249,13 +416,31 @@ impl Memory {
             self.embed_one(query).await
         };
 
+        let restricted = !audience.sees_everything();
+        let fetch = if restricted {
+            limit.saturating_mul(FILTERED_SEARCH_OVERFETCH)
+        } else {
+            limit
+        };
         let mut hits = match store
-            .search_facts(scope, query, query_embedding.as_ref(), limit)
+            .search_facts(scope, query, query_embedding.as_ref(), fetch)
             .await?
         {
-            Some(native) => native,
+            Some(mut native) => {
+                if restricted {
+                    let ids: Vec<String> = native.iter().map(|h| h.fact.id.clone()).collect();
+                    let visible = Self::visible_ids(store.fact_access(scope, &ids).await, audience);
+                    native.retain(|h| visible(&h.fact.id));
+                }
+                native
+            }
             None => {
-                let records = store.active_facts(scope).await?;
+                let mut records = store.active_facts(scope).await?;
+                if restricted {
+                    let ids: Vec<String> = records.iter().map(|r| r.fact.id.clone()).collect();
+                    let visible = Self::visible_ids(store.fact_access(scope, &ids).await, audience);
+                    records.retain(|r| visible(&r.fact.id));
+                }
                 if query.trim().is_empty() {
                     let mut facts: Vec<Fact> = records.into_iter().map(|r| r.fact).collect();
                     facts.sort_by_key(|f| std::cmp::Reverse(f.updated_at));
@@ -270,14 +455,46 @@ impl Memory {
                         .collect()
                 } else {
                     let lexical = self.lexical(store.fact_lexical_scores(scope, query).await);
-                    let mut scored: Vec<ScoredFact> = records
-                        .into_iter()
-                        .filter_map(|r| {
+                    let signals: Vec<(Option<f32>, f32)> = records
+                        .iter()
+                        .map(|r| {
                             let semantic =
                                 Self::semantic(query_embedding.as_ref(), r.embedding.as_ref());
                             let lex = lexical.get(&r.fact.id).copied().unwrap_or(0.0);
-                            let score =
-                                self.inner.scorer.score_fact(&r.fact, semantic, lex, now)?;
+                            (semantic, lex)
+                        })
+                        .collect();
+                    let mut seeds: Vec<(f32, String)> = records
+                        .iter()
+                        .zip(&signals)
+                        .map(|(r, &(semantic, lex))| {
+                            (semantic.unwrap_or(0.0).max(lex), r.fact.id.clone())
+                        })
+                        .filter(|(strength, _)| *strength > GRAPH_SEED_MIN_SIGNAL)
+                        .collect();
+                    seeds.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    seeds.truncate(MAX_GRAPH_SEEDS);
+                    let seed_ids: Vec<String> = seeds.into_iter().map(|(_, id)| id).collect();
+                    let graph = if seed_ids.is_empty() {
+                        HashMap::new()
+                    } else {
+                        store
+                            .fact_graph_scores(scope, &seed_ids)
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, "graph lookup failed; ranking without it");
+                                HashMap::new()
+                            })
+                    };
+                    let mut scored: Vec<ScoredFact> = records
+                        .into_iter()
+                        .zip(signals)
+                        .filter_map(|(r, (semantic, lex))| {
+                            let linked = graph.get(&r.fact.id).copied().unwrap_or(0.0);
+                            let score = self
+                                .inner
+                                .scorer
+                                .score_fact_with_graph(&r.fact, semantic, lex, linked, now)?;
                             Some(ScoredFact {
                                 fact: r.fact,
                                 score: score.value,
@@ -317,8 +534,17 @@ impl Memory {
         })
     }
 
-    /// Store an episode now.
+    /// Store a private episode now.
     pub async fn add_episode(&self, episode: NewEpisode) -> Result<Episode> {
+        self.add_episode_with(episode, &FactAccess::private()).await
+    }
+
+    /// Store an episode now, stating who may see it.
+    pub async fn add_episode_with(
+        &self,
+        episode: NewEpisode,
+        access: &FactAccess,
+    ) -> Result<Episode> {
         let mut episode = episode;
         episode.scope = episode.scope.trim().to_string();
         episode.summary = episode.summary.trim().to_string();
@@ -337,17 +563,30 @@ impl Memory {
             .await;
         self.inner
             .store
-            .insert_episode(episode, embedding, Utc::now())
+            .insert_episode_with_access(episode, embedding, access, Utc::now())
             .await
     }
 
-    /// The episodes most relevant to `query`, best first. Recall counts of
-    /// returned episodes are incremented.
+    /// The episodes most relevant to `query`, best first, as the owner in a
+    /// direct conversation sees them. Recall counts of returned episodes are
+    /// incremented.
     pub async fn recall_episodes(
         &self,
         scope: &str,
         query: &str,
         limit: usize,
+    ) -> Result<Vec<ScoredEpisode>> {
+        self.recall_episodes_for(scope, query, limit, &RecallAudience::owner())
+            .await
+    }
+
+    /// [`Memory::recall_episodes`] limited to what `audience` may see.
+    pub async fn recall_episodes_for(
+        &self,
+        scope: &str,
+        query: &str,
+        limit: usize,
+        audience: &RecallAudience,
     ) -> Result<Vec<ScoredEpisode>> {
         if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
@@ -355,16 +594,35 @@ impl Memory {
         let now = Utc::now();
         let store = &self.inner.store;
         let query_embedding = self.embed_one(query).await;
+        let restricted = !audience.sees_everything();
+        let fetch = if restricted {
+            limit.saturating_mul(FILTERED_SEARCH_OVERFETCH)
+        } else {
+            limit
+        };
         let mut hits = match store
-            .search_episodes(scope, query, query_embedding.as_ref(), limit)
+            .search_episodes(scope, query, query_embedding.as_ref(), fetch)
             .await?
         {
-            Some(native) => native,
+            Some(mut native) => {
+                if restricted {
+                    let ids: Vec<String> = native.iter().map(|h| h.episode.id.clone()).collect();
+                    let visible =
+                        Self::visible_ids(store.episode_access(scope, &ids).await, audience);
+                    native.retain(|h| visible(&h.episode.id));
+                }
+                native
+            }
             None => {
                 let lexical = self.lexical(store.episode_lexical_scores(scope, query).await);
-                let mut scored: Vec<ScoredEpisode> = store
-                    .episodes(scope)
-                    .await?
+                let mut records = store.episodes(scope).await?;
+                if restricted {
+                    let ids: Vec<String> = records.iter().map(|r| r.episode.id.clone()).collect();
+                    let visible =
+                        Self::visible_ids(store.episode_access(scope, &ids).await, audience);
+                    records.retain(|r| visible(&r.episode.id));
+                }
+                let mut scored: Vec<ScoredEpisode> = records
                     .into_iter()
                     .filter_map(|r| {
                         let semantic =
@@ -411,6 +669,74 @@ impl Memory {
 
     pub async fn stats(&self) -> Result<MemoryStats> {
         self.inner.store.stats().await
+    }
+
+    /// Give up to `batch_size` records (at most [`MAX_REEMBED_BATCH`]) a
+    /// vector from the current embedder, starting at `cursor` (`None` starts
+    /// a pass). Facts come first, then episodes.
+    ///
+    /// Call it again with [`ReembedReport::next`] until that is `None`. The
+    /// cursor only keeps a pass moving past records that could not be
+    /// updated; records already done stop being stale, so a pass restarted
+    /// from `None` after a crash picks up what is left. An embedder failure
+    /// is an error and changes nothing: retry with the same cursor.
+    pub async fn reembed_batch(
+        &self,
+        batch_size: usize,
+        cursor: Option<&ReembedCursor>,
+    ) -> Result<ReembedReport> {
+        let limit = batch_size.clamp(1, MAX_REEMBED_BATCH);
+        let embedder = &self.inner.embedder;
+        let store = &self.inner.store;
+        let kind = cursor.map_or(RecordKind::Fact, |c| c.kind);
+        let after_id = cursor.and_then(|c| c.after_id.as_deref());
+        let rows = store
+            .stale_embeddings(embedder.model_id(), kind, after_id, limit)
+            .await?;
+        let mut report = ReembedReport {
+            processed: rows.len(),
+            ..ReembedReport::default()
+        };
+        report.next = match rows.last() {
+            Some(last) if rows.len() == limit => Some(ReembedCursor {
+                kind,
+                after_id: Some(last.id.clone()),
+            }),
+            // This kind is exhausted.
+            _ if kind == RecordKind::Fact => Some(ReembedCursor {
+                kind: RecordKind::Episode,
+                after_id: None,
+            }),
+            _ => None,
+        };
+        if rows.is_empty() {
+            return Ok(report);
+        }
+        let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+        let vectors = embedder.embed(&texts).await?;
+        if vectors.len() != rows.len() {
+            return Err(MemoryError::Embedding(format!(
+                "embedder returned {} vectors for {} texts",
+                vectors.len(),
+                rows.len()
+            )));
+        }
+        for (row, vector) in rows.iter().zip(vectors) {
+            if vector.len() != embedder.dimensions() {
+                report.skipped += 1;
+                continue;
+            }
+            let embedding = StoredEmbedding {
+                model: embedder.model_id().to_string(),
+                vector,
+            };
+            if store.replace_embedding(row, embedding).await? {
+                report.updated += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// Extract durable facts from the latest user turn of `messages` and
@@ -466,7 +792,8 @@ impl Memory {
                     excerpt: Some(fact.evidence.unwrap_or_else(|| default_excerpt.clone())),
                 },
             };
-            match self.remember(new).await {
+            let access = self.audience_for(session_id).access_for_writes();
+            match self.remember_with(new, &access).await {
                 Ok(outcome) => report.facts.push(outcome),
                 Err(MemoryError::Invalid(reason)) => {
                     tracing::debug!(%reason, "extracted fact rejected");
@@ -494,14 +821,18 @@ impl Memory {
                 "no EpisodeSummarizer configured",
             ))?;
         let draft = summarizer.summarize(messages, receipts).await?;
+        let access = self.audience_for(session_id).access_for_writes();
         let episode = self
-            .add_episode(NewEpisode {
-                scope: self.scope_for(session_id),
-                session_id: session_id.to_string(),
-                summary: draft.summary,
-                topics: draft.topics,
-                importance: draft.importance,
-            })
+            .add_episode_with(
+                NewEpisode {
+                    scope: self.scope_for(session_id),
+                    session_id: session_id.to_string(),
+                    summary: draft.summary,
+                    topics: draft.topics,
+                    importance: draft.importance,
+                },
+                &access,
+            )
             .await?;
         Ok((episode, draft.usage))
     }

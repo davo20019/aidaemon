@@ -15,7 +15,8 @@ use crate::scoring::tokens;
 pub trait Embedder: Send + Sync {
     /// Stable identifier persisted beside every vector. Changing the model
     /// changes this id, and old vectors are then ignored (lexical recall
-    /// still works) instead of being compared across models.
+    /// still works) instead of being compared across models, until
+    /// [`crate::Memory::reembed_batch`] replaces them.
     fn model_id(&self) -> &str;
 
     /// Length of every returned vector.

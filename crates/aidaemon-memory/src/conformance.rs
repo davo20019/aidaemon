@@ -31,8 +31,8 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::store::MemoryStore;
 use crate::types::{
-    DecayReport, Episode, Fact, NewEpisode, NewFact, RetentionConfig, StoredEmbedding,
-    UpsertOutcome,
+    DecayReport, Episode, Fact, FactAccess, NewEpisode, NewFact, RecordKind, RetentionConfig,
+    StoredEmbedding, UpsertOutcome,
 };
 
 /// Stable names of the checks run by [`check_store`].
@@ -88,6 +88,21 @@ pub mod store_checks {
     /// lowered by one. The report matches what changed, and active facts or
     /// recently recalled rows are never touched.
     pub const DECAY_FOLLOWS_RETENTION: &str = "store.decay_follows_retention";
+    /// `fact_access` / `episode_access` are either empty (the trait default:
+    /// records stay private; noted) or return exactly what was written, for
+    /// the asked scope only. Restating a fact never widens its access, and a
+    /// new version takes the access it was written with.
+    pub const ACCESS_LEVELS_ROUND_TRIP: &str = "store.access_levels_round_trip";
+    /// `fact_graph_scores` is either empty for related facts (the trait
+    /// default: no graph signal; noted) or scores in `(0, 1]`, for active
+    /// facts of the asked scope only, and nothing for unknown seeds.
+    pub const GRAPH_SCORES_CONTRACT: &str = "store.graph_scores_contract";
+    /// `stale_embeddings` is either empty (the trait default: old rows stay
+    /// lexical-only; noted) or lists the active records with no vector or
+    /// another model's, in ascending id order, bounded by the limit, after
+    /// `after_id`. `replace_embedding` stores the vector, leaves `updated_at`
+    /// alone, and returns `false` when the record's model has since changed.
+    pub const EMBEDDING_REFRESH_CONTRACT: &str = "store.embedding_refresh_contract";
 }
 
 /// Run every store check (see [`store_checks`]); each check uses a fresh
@@ -134,6 +149,38 @@ where
             ));
         }
         Err(e) => report.fail(DECAY_FOLLOWS_RETENTION, e),
+    }
+    match access_levels(make().await).await {
+        Ok(true) => report.pass(ACCESS_LEVELS_ROUND_TRIP),
+        Ok(false) => {
+            report.pass(ACCESS_LEVELS_ROUND_TRIP);
+            report.note(format!(
+                "{ACCESS_LEVELS_ROUND_TRIP}: the store keeps no access levels, so its records \
+                 are hidden from shared channels"
+            ));
+        }
+        Err(e) => report.fail(ACCESS_LEVELS_ROUND_TRIP, e),
+    }
+    match graph_scores(make().await).await {
+        Ok(true) => report.pass(GRAPH_SCORES_CONTRACT),
+        Ok(false) => {
+            report.pass(GRAPH_SCORES_CONTRACT);
+            report.note(format!(
+                "{GRAPH_SCORES_CONTRACT}: the store has no graph, so the graph signal stays 0"
+            ));
+        }
+        Err(e) => report.fail(GRAPH_SCORES_CONTRACT, e),
+    }
+    match embedding_refresh(make().await).await {
+        Ok(true) => report.pass(EMBEDDING_REFRESH_CONTRACT),
+        Ok(false) => {
+            report.pass(EMBEDDING_REFRESH_CONTRACT);
+            report.note(format!(
+                "{EMBEDDING_REFRESH_CONTRACT}: the store cannot refresh vectors, so rows from \
+                 an old model stay lexical-only"
+            ));
+        }
+        Err(e) => report.fail(EMBEDDING_REFRESH_CONTRACT, e),
     }
     report
 }
@@ -1022,4 +1069,271 @@ async fn decay_default(store: Arc<dyn MemoryStore>) -> Check<bool> {
     } else {
         Err(problems.join("; "))
     }
+}
+
+/// `Ok(true)` when the store keeps access levels, `Ok(false)` for the trait
+/// default.
+async fn access_levels(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    let shared = FactAccess::channel("conformance-channel");
+    let first = call!(
+        "upsert_fact_with_access",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &FactAccess::global(),
+            at(0)
+        )
+    );
+    let id = first.id().to_string();
+    let ids = [id.clone()];
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    if access.is_empty() {
+        return Ok(false);
+    }
+    ensure(access.get(&id) == Some(&FactAccess::global()), || {
+        format!("expected global access for {id}, got {access:?}")
+    })?;
+    let other = call!("fact_access", store.fact_access(OTHER_SCOPE, &ids));
+    ensure(other.is_empty(), || {
+        format!("fact_access answered for another scope: {other:?}")
+    })?;
+
+    call!(
+        "upsert_fact_with_access (restated, narrower)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &shared,
+            at(10)
+        )
+    );
+    call!(
+        "upsert_fact_with_access (restated, wider)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &FactAccess::global(),
+            at(20)
+        )
+    );
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    ensure(access.get(&id) == Some(&shared), || {
+        format!("restating must keep the narrowest access, got {access:?}")
+    })?;
+
+    let next = call!(
+        "upsert_fact_with_access (new value)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Globex"),
+            None,
+            &FactAccess::global(),
+            at(30)
+        )
+    );
+    let ids = [next.id().to_string()];
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    ensure(access.get(next.id()) == Some(&FactAccess::global()), || {
+        format!("a new version takes the access it was written with, got {access:?}")
+    })?;
+
+    let stored = call!(
+        "insert_episode_with_access",
+        store.insert_episode_with_access(
+            episode(SCOPE, "Reviewed the roadmap", &[]),
+            None,
+            &shared,
+            at(40)
+        )
+    );
+    let ids = [stored.id.clone()];
+    let access = call!("episode_access", store.episode_access(SCOPE, &ids));
+    ensure(access.get(&stored.id) == Some(&shared), || {
+        format!("expected the channel access back for the episode, got {access:?}")
+    })?;
+    let other = call!("episode_access", store.episode_access(OTHER_SCOPE, &ids));
+    ensure(other.is_empty(), || {
+        format!("episode_access answered for another scope: {other:?}")
+    })?;
+    Ok(true)
+}
+
+/// `Ok(true)` when the store relates facts, `Ok(false)` for the trait default.
+async fn graph_scores(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    let seed = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "sister_name", "Alice Rivera"),
+            None,
+            at(0)
+        )
+    );
+    let related = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_employer", "Acme Corp"),
+            None,
+            at(0)
+        )
+    );
+    let replaced = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_city", "Lisbon"),
+            None,
+            at(0)
+        )
+    );
+    call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_city", "Porto"),
+            None,
+            at(10)
+        )
+    );
+    let theirs = call!(
+        "upsert_fact (other scope)",
+        store.upsert_fact(
+            fact(OTHER_SCOPE, "person", "alice_rivera_pet", "Biscuit"),
+            None,
+            at(0)
+        )
+    );
+    let seeds = [seed.id().to_string()];
+    let scores = call!("fact_graph_scores", store.fact_graph_scores(SCOPE, &seeds));
+    if scores.is_empty() {
+        return Ok(false);
+    }
+    ensure(scores.values().all(|s| *s > 0.0 && *s <= 1.0), || {
+        format!("graph scores must be in (0, 1]: {scores:?}")
+    })?;
+    ensure(scores.contains_key(related.id()), || {
+        format!("a fact naming the seed's subject got no score: {scores:?}")
+    })?;
+    ensure(
+        !scores.contains_key(replaced.id()) && !scores.contains_key(theirs.id()),
+        || format!("superseded or other-scope facts got a score: {scores:?}"),
+    )?;
+    let unknown = ["conformance-unknown-id".to_string()];
+    let none = call!(
+        "fact_graph_scores",
+        store.fact_graph_scores(SCOPE, &unknown)
+    );
+    ensure(none.is_empty(), || {
+        format!("an unknown seed produced scores: {none:?}")
+    })?;
+    Ok(true)
+}
+
+fn vector_from(model: &str) -> StoredEmbedding {
+    StoredEmbedding {
+        model: model.to_string(),
+        vector: vec![0.25, 0.5],
+    }
+}
+
+/// `Ok(true)` when the store refreshes vectors, `Ok(false)` for the default.
+async fn embedding_refresh(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    const CURRENT: &str = "conformance-embedder-v2";
+    let upsert = |key: &'static str, embedding: Option<StoredEmbedding>| {
+        let store = store.clone();
+        async move {
+            store
+                .upsert_fact(fact(SCOPE, "note", key, key), embedding, at(0))
+                .await
+        }
+    };
+    let old = call!("upsert_fact", upsert("old", Some(vector_from("v1"))));
+    let none = call!("upsert_fact", upsert("none", None));
+    call!("upsert_fact", upsert("fresh", Some(vector_from(CURRENT))));
+    let replaced = call!("upsert_fact", upsert("gone", Some(vector_from("v1"))));
+    call!(
+        "supersede_fact",
+        store.supersede_fact(SCOPE, "note", "gone", at(1))
+    );
+    let page = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, None, 10)
+    );
+    if page.is_empty() {
+        return Ok(false);
+    }
+    let mut want = vec![old.id().to_string(), none.id().to_string()];
+    want.sort();
+    let got: Vec<String> = page.iter().map(|s| s.id.clone()).collect();
+    ensure(got == want, || {
+        format!("expected the stale active facts {want:?} in id order, got {got:?}")
+    })?;
+    ensure(!got.contains(&replaced.id().to_string()), || {
+        "a superseded fact was listed as stale".into()
+    })?;
+    let first = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, None, 1)
+    );
+    ensure(first.len() == 1 && first[0].id == want[0], || {
+        format!("limit 1 should return only {:?}, got {first:?}", want[0])
+    })?;
+    let rest = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, Some(&want[0]), 10)
+    );
+    ensure(rest.len() == 1 && rest[0].id == want[1], || {
+        format!("after_id should skip to {:?}, got {rest:?}", want[1])
+    })?;
+
+    let target = page
+        .iter()
+        .find(|s| s.id == old.id())
+        .ok_or("the old-model fact was not listed")?;
+    ensure(
+        target.model.as_deref() == Some("v1") && target.text.contains("old"),
+        || format!("the stale row should carry its model and text: {target:?}"),
+    )?;
+    let replaced_now = call!(
+        "replace_embedding",
+        store.replace_embedding(target, vector_from(CURRENT))
+    );
+    ensure(replaced_now, || {
+        "replace_embedding returned false for a stale record".into()
+    })?;
+    let again = call!(
+        "replace_embedding (model has changed)",
+        store.replace_embedding(target, vector_from("conformance-other"))
+    );
+    ensure(!again, || {
+        "replace_embedding overwrote a vector that changed since it was read".into()
+    })?;
+    let records = call!("active_facts", store.active_facts(SCOPE));
+    let record = records
+        .iter()
+        .find(|r| r.fact.id == old.id())
+        .ok_or("the refreshed fact disappeared")?;
+    same_embedding(&record.embedding, &Some(vector_from(CURRENT)))?;
+    ensure(record.fact.updated_at == at(0), || {
+        format!(
+            "replace_embedding moved updated_at to {}",
+            record.fact.updated_at
+        )
+    })?;
+
+    let stored = call!(
+        "insert_episode",
+        store.insert_episode(
+            episode(SCOPE, "Old episode", &["topic"]),
+            Some(vector_from("v1")),
+            at(0)
+        )
+    );
+    let episodes = call!(
+        "stale_embeddings (episodes)",
+        store.stale_embeddings(CURRENT, RecordKind::Episode, None, 10)
+    );
+    ensure(
+        episodes.len() == 1
+            && episodes[0].id == stored.id
+            && episodes[0].kind == RecordKind::Episode,
+        || format!("expected the one stale episode, got {episodes:?}"),
+    )?;
+    Ok(true)
 }

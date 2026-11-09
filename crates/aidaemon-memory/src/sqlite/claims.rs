@@ -1186,7 +1186,7 @@ fn sanitize_fts_query(query: &str) -> Option<String> {
     (!tokens.is_empty()).then(|| tokens.join(" OR "))
 }
 
-fn memory_visible(
+pub(crate) fn memory_visible(
     channels: &dyn ChannelIds,
     privacy: FactPrivacy,
     stored_channel: Option<&str>,

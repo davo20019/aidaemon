@@ -98,7 +98,17 @@ impl Tool for RememberTool {
                 session_id: Some(ctx.session_id.clone()),
                 excerpt: None,
             });
-        match self.memory.remember(fact).await {
+        let audience = self.memory.audience_for(&ctx.session_id);
+        match self
+            .memory
+            .remember_with(fact, &audience.access_for_writes())
+            .await
+        {
+            // The earlier value may be something this audience cannot see.
+            Ok(UpsertOutcome::Superseded { id, .. }) if !audience.sees_everything() => {
+                Ok(ToolOutput::text("Saved to memory.")
+                    .with_details(json!({ "kind": "superseded", "id": id })))
+            }
             Ok(outcome) => {
                 let text = match &outcome {
                     UpsertOutcome::Inserted { .. } => "Saved to memory.".to_string(),
@@ -184,14 +194,15 @@ impl Tool for RecallTool {
             .unwrap_or(5)
             .clamp(1, self.max_limit);
         let scope = resolve(&self.memory, &self.resolver, &ctx.session_id);
+        let audience = self.memory.audience_for(&ctx.session_id);
         let facts = self
             .memory
-            .recall_facts(&scope, query, limit)
+            .recall_facts_for(&scope, query, limit, &audience)
             .await
             .map_err(|e| e.to_string())?;
         let episodes = self
             .memory
-            .recall_episodes(&scope, query, limit.div_ceil(2))
+            .recall_episodes_for(&scope, query, limit.div_ceil(2), &audience)
             .await
             .map_err(|e| e.to_string())?;
         if facts.is_empty() && episodes.is_empty() {

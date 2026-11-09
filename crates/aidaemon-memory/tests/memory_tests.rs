@@ -2,11 +2,15 @@
 
 use std::sync::Arc;
 
+use aidaemon_core::ChannelVisibility;
 use aidaemon_memory::{
-    HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, NewEpisode, NewFact, Provenance,
-    SqliteMemoryStore, UpsertOutcome,
+    Embedder, FactAccess, HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, NewEpisode,
+    NewFact, Provenance, RecallAudience, RecordKind, ScoredFact, SqliteMemoryStore,
+    StoredEmbedding, UpsertOutcome,
 };
 use chrono::{Duration, Utc};
+
+mod common;
 
 const SCOPE: &str = "telegram:synthetic-user-1";
 
@@ -485,4 +489,1227 @@ async fn sqlite_lexical_scores_are_normalized_and_injection_safe() {
         .unwrap();
     assert_eq!(scores.len(), 1);
     assert!(scores.values().all(|s| (0.0..=1.0).contains(s)));
+}
+
+// ---------------------------------------------------------------- Access
+
+fn group(channel: &str) -> RecallAudience {
+    RecallAudience::new(ChannelVisibility::PrivateGroup, Some(channel.into()), true)
+}
+
+fn public(channel: &str) -> RecallAudience {
+    RecallAudience::new(ChannelVisibility::Public, Some(channel.into()), true)
+}
+
+fn episode(summary: &str) -> NewEpisode {
+    NewEpisode {
+        scope: SCOPE.into(),
+        session_id: "telegram:synthetic-session-1".into(),
+        summary: summary.into(),
+        topics: vec![],
+        importance: 0.5,
+    }
+}
+
+#[tokio::test]
+async fn private_records_never_reach_shared_channels() {
+    for (name, memory) in memories().await {
+        memory
+            .remember_with(fact("user", "home_city", "Lisbon"), &FactAccess::private())
+            .await
+            .unwrap();
+        memory
+            .add_episode_with(
+                episode("Talked about moving to Lisbon"),
+                &FactAccess::private(),
+            )
+            .await
+            .unwrap();
+
+        let audiences = [
+            group("c1"),
+            public("c1"),
+            RecallAudience::new(ChannelVisibility::PublicExternal, Some("c1".into()), true),
+            RecallAudience::new(ChannelVisibility::Private, None, false),
+        ];
+        for audience in &audiences {
+            let facts = memory
+                .recall_facts_for(SCOPE, "home city Lisbon", 5, audience)
+                .await
+                .unwrap();
+            assert!(facts.is_empty(), "{name}: {audience:?} saw {facts:?}");
+            let episodes = memory
+                .recall_episodes_for(SCOPE, "moving to Lisbon", 5, audience)
+                .await
+                .unwrap();
+            assert!(episodes.is_empty(), "{name}: {audience:?} saw {episodes:?}");
+        }
+        // The empty-query listing goes through the same filter.
+        let listed = memory
+            .recall_facts_for(SCOPE, "", 5, &group("c1"))
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "{name}: {listed:?}");
+
+        // Hidden recalls left no trace, and the owner still sees everything.
+        let owner = memory
+            .recall_facts(SCOPE, "home city Lisbon", 5)
+            .await
+            .unwrap();
+        assert_eq!(owner.len(), 1, "{name}");
+        assert_eq!(owner[0].fact.recall_count, 1, "{name}");
+        assert_eq!(
+            memory
+                .recall_episodes(SCOPE, "moving to Lisbon", 5)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn channel_records_stay_in_their_channel_and_global_ones_are_shared() {
+    for (name, memory) in memories().await {
+        memory
+            .remember_with(
+                fact("team", "standup_time", "ten thirty"),
+                &FactAccess::channel("c1"),
+            )
+            .await
+            .unwrap();
+        memory
+            .remember_with(fact("team", "office_city", "Porto"), &FactAccess::global())
+            .await
+            .unwrap();
+
+        let keys = |hits: Vec<ScoredFact>| -> Vec<String> {
+            let mut keys: Vec<String> = hits.into_iter().map(|h| h.fact.key).collect();
+            keys.sort();
+            keys
+        };
+        let query = "team standup time office city";
+        let same = memory
+            .recall_facts_for(SCOPE, query, 5, &group("c1"))
+            .await
+            .unwrap();
+        assert_eq!(keys(same), ["office_city", "standup_time"], "{name}");
+        let other = memory
+            .recall_facts_for(SCOPE, query, 5, &group("c2"))
+            .await
+            .unwrap();
+        assert_eq!(keys(other), ["office_city"], "{name}");
+        // Public channels get no general memory (the daemon's rule), only
+        // what was said in that channel.
+        let in_public = memory
+            .recall_facts_for(SCOPE, query, 5, &public("c1"))
+            .await
+            .unwrap();
+        assert_eq!(keys(in_public), ["standup_time"], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn hidden_facts_do_not_use_up_the_limit() {
+    for (name, memory) in memories().await {
+        for i in 0..4 {
+            memory
+                .remember_with(
+                    fact("note", &format!("private_{i}"), "mango harvest"),
+                    &FactAccess::private(),
+                )
+                .await
+                .unwrap();
+        }
+        memory
+            .remember_with(
+                fact("note", "shared", "mango recipe"),
+                &FactAccess::global(),
+            )
+            .await
+            .unwrap();
+        let hits = memory
+            .recall_facts_for(SCOPE, "mango", 1, &group("c1"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{name}");
+        assert_eq!(hits[0].fact.key, "shared", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn memory_written_without_a_level_is_private() {
+    for (name, memory) in memories().await {
+        memory
+            .remember(fact("user", "home_city", "Lisbon"))
+            .await
+            .unwrap();
+        assert!(
+            memory
+                .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restating_in_a_narrower_place_does_not_leave_it_wider() {
+    for (name, memory) in memories().await {
+        memory
+            .remember_with(fact("user", "home_city", "Lisbon"), &FactAccess::global())
+            .await
+            .unwrap();
+        memory
+            .remember_with(fact("user", "home_city", "lisbon"), &FactAccess::private())
+            .await
+            .unwrap();
+        assert!(
+            memory
+                .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{name}: a private restatement narrows the fact"
+        );
+    }
+}
+
+/// A store that keeps no access levels (the trait default) shows its records
+/// to the owner in a direct conversation and hides them everywhere else.
+#[tokio::test]
+async fn a_store_without_access_levels_fails_closed() {
+    let memory = Memory::new(common::VecStore::default(), HashEmbedder::new(512));
+    memory
+        .remember_with(fact("user", "home_city", "Lisbon"), &FactAccess::global())
+        .await
+        .unwrap();
+    memory
+        .add_episode(episode("Moved to Lisbon"))
+        .await
+        .unwrap();
+    assert_eq!(
+        memory
+            .recall_facts(SCOPE, "home city", 5)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(memory
+        .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(memory
+        .recall_episodes_for(SCOPE, "Moved to Lisbon", 5, &group("c1"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The tools and injected recall use the session's audience, and a restricted
+/// writer is not told what it replaced.
+#[tokio::test]
+async fn tools_and_injection_follow_the_session_audience() {
+    use aidaemon_core::{Tool, ToolContext};
+    use aidaemon_memory::{MemoryRecall, RecallTool, RememberTool};
+    use aidaemon_policies::Recall;
+
+    let memory = Memory::builder(
+        Arc::new(InMemoryMemoryStore::new()),
+        Arc::new(HashEmbedder::new(512)),
+    )
+    .scope_resolver(|_| SCOPE.to_string())
+    .audience_resolver(|session| {
+        if session == "owner-dm" {
+            RecallAudience::owner()
+        } else {
+            RecallAudience::new(ChannelVisibility::PrivateGroup, Some("c1".into()), true)
+        }
+    })
+    .build();
+    memory
+        .remember(fact("user", "home_city", "Lisbon"))
+        .await
+        .unwrap();
+
+    let in_group = ToolContext::new("group-session", "call-1");
+    let recalled = RecallTool::new(memory.clone())
+        .call(serde_json::json!({"query": "home city"}), &in_group)
+        .await
+        .unwrap();
+    assert_eq!(recalled.content, "No matching memories.");
+    let snippets = MemoryRecall::new(memory.clone())
+        .recall("group-session", "home city", 5)
+        .await;
+    assert!(snippets.is_empty(), "{snippets:?}");
+    assert_eq!(
+        MemoryRecall::new(memory.clone())
+            .recall("owner-dm", "home city", 5)
+            .await
+            .len(),
+        1
+    );
+
+    // Written in the group: the fact stays in that channel, and the reply
+    // does not repeat the private value it replaced.
+    let saved = RememberTool::new(memory.clone())
+        .call(
+            serde_json::json!({"category": "user", "key": "home_city", "value": "Porto"}),
+            &in_group,
+        )
+        .await
+        .unwrap();
+    assert!(!saved.content.contains("Lisbon"), "{}", saved.content);
+    assert!(!format!("{:?}", saved.details).contains("Lisbon"));
+    let hits = memory
+        .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].fact.value, "Porto");
+    assert!(memory
+        .recall_facts_for(SCOPE, "home city", 5, &group("c2"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_v1_database_upgrades_and_keeps_its_rows() {
+    use aidaemon_memory::{encode_embedding, latest_version, MIGRATIONS};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    // Exactly what a version-1 build left behind.
+    assert_eq!(MIGRATIONS[0].version, 1);
+    sqlx::query(
+        "CREATE TABLE memory_schema_migrations (
+            version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(MIGRATIONS[0].sql)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO memory_schema_migrations VALUES (1, '2026-01-01T00:00:00.000Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let old = "2026-01-01T00:00:00.000000Z";
+    let insert = "INSERT INTO memory_facts (id, scope, category, key, value, confidence,
+        source_excerpt, created_at, updated_at, superseded_at, recall_count, embedding,
+        embedding_model) VALUES (?, ?, 'user', 'home_city', ?, 0.9, 'said so', ?, ?, ?, 3, ?, ?)";
+    let vector = encode_embedding(&[0.5, -0.25]);
+    sqlx::query(insert)
+        .bind("old-fact")
+        .bind(SCOPE)
+        .bind("Porto")
+        .bind(old)
+        .bind(old)
+        .bind(old)
+        .bind(&vector)
+        .bind("old-model")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(insert)
+        .bind("active-fact")
+        .bind(SCOPE)
+        .bind("Lisbon")
+        .bind(old)
+        .bind(old)
+        .bind(None::<String>)
+        .bind(&vector)
+        .bind("old-model")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO memory_facts_fts (fact_id, scope, content) VALUES (?, ?, ?)")
+        .bind("active-fact")
+        .bind(SCOPE)
+        .bind("user home city: Lisbon")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_episodes (id, scope, session_id, summary, topics, importance,
+            created_at) VALUES ('old-episode', ?, 's1', 'Moved to Lisbon', '[\"move\"]', 0.7, ?)",
+    )
+    .bind(SCOPE)
+    .bind(old)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_episodes_fts (episode_id, scope, content)
+         VALUES ('old-episode', ?, 'Moved to Lisbon Topics: move')",
+    )
+    .bind(SCOPE)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = SqliteMemoryStore::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), latest_version());
+    assert!(latest_version() >= 2);
+
+    // Every row and field survived.
+    let active = store.active_facts(SCOPE).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].fact.id, "active-fact");
+    assert_eq!(active[0].fact.value, "Lisbon");
+    assert_eq!(active[0].fact.recall_count, 3);
+    assert_eq!(active[0].embedding.as_ref().unwrap().model, "old-model");
+    assert_eq!(active[0].embedding.as_ref().unwrap().vector, [0.5, -0.25]);
+    let history = store
+        .fact_history(SCOPE, "user", "home_city")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().any(|f| f.superseded_at.is_some()));
+    assert_eq!(store.episodes(SCOPE).await.unwrap().len(), 1);
+
+    // Old rows were never classified, so they read as private.
+    let ids = ["active-fact".to_string()];
+    assert_eq!(
+        store
+            .fact_access(SCOPE, &ids)
+            .await
+            .unwrap()
+            .get("active-fact"),
+        Some(&FactAccess::private())
+    );
+
+    let memory = Memory::new(store, HashEmbedder::new(512));
+    let owner = memory.recall_facts(SCOPE, "home city", 5).await.unwrap();
+    assert_eq!(owner.len(), 1, "the owner keeps seeing old rows");
+    assert_eq!(owner[0].signals.semantic, 0.0, "vectors of another model");
+    assert!(memory
+        .recall_facts_for(SCOPE, "home city", 5, &group("c1"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        memory
+            .recall_episodes(SCOPE, "Moved Lisbon", 5)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // The upgraded store takes new classified writes.
+    memory
+        .remember_with(fact("team", "office_city", "Porto"), &FactAccess::global())
+        .await
+        .unwrap();
+    assert_eq!(
+        memory
+            .recall_facts_for(SCOPE, "office city", 5, &group("c1"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+// ----------------------------------------------------------------- Graph
+
+fn facts_about_alice() -> [NewFact; 3] {
+    [
+        fact("person", "sister_name", "Alice Rivera"),
+        fact("person", "alice_rivera_employer", "Acme Corp"),
+        fact("preference", "coffee_order", "flat white"),
+    ]
+}
+
+#[tokio::test]
+async fn related_facts_get_a_graph_signal() {
+    for (name, memory) in memories().await {
+        for f in facts_about_alice() {
+            memory.remember(f).await.unwrap();
+        }
+        let hits = memory
+            .recall_facts(SCOPE, "name employer order", 5)
+            .await
+            .unwrap();
+        let graph = |key: &str| {
+            hits.iter()
+                .find(|h| h.fact.key == key)
+                .unwrap_or_else(|| panic!("{name}: {key} not recalled: {hits:?}"))
+                .signals
+                .graph
+        };
+        assert!(graph("sister_name") > 0.0, "{name}");
+        assert!(graph("alice_rivera_employer") > 0.0, "{name}");
+        assert_eq!(graph("coffee_order"), 0.0, "{name}: nothing relates to it");
+    }
+}
+
+#[tokio::test]
+async fn the_graph_signal_raises_the_score_but_never_admits_a_fact() {
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let memory = Memory::builder(store.clone(), Arc::new(HashEmbedder::new(512))).build();
+    for f in facts_about_alice() {
+        memory.remember(f).await.unwrap();
+    }
+    memory
+        .remember(fact("person", "alice_rivera_hobby", "pottery"))
+        .await
+        .unwrap();
+    // "pottery" shares no word with the query, and a relation alone does not
+    // make a fact relevant.
+    let hits = memory.recall_facts(SCOPE, "sister name", 5).await.unwrap();
+    assert!(hits.iter().all(|h| h.fact.key != "alice_rivera_hobby"));
+
+    let related = memory
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    let plain_scorer = Memory::builder(
+        Arc::new(common::VecStore::default()),
+        Arc::new(HashEmbedder::new(512)),
+    )
+    .build();
+    for f in facts_about_alice() {
+        plain_scorer.remember(f).await.unwrap();
+    }
+    let without_graph = plain_scorer
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    assert!(without_graph.iter().all(|h| h.signals.graph == 0.0));
+    let score =
+        |hits: &[ScoredFact], key: &str| hits.iter().find(|h| h.fact.key == key).unwrap().score;
+    for key in ["sister_name", "alice_rivera_employer"] {
+        assert!(
+            score(&related, key) > score(&without_graph, key),
+            "{key}: {related:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_store_without_a_graph_scores_exactly_as_before() {
+    let memory = Memory::new(common::VecStore::default(), HashEmbedder::new(512));
+    for f in facts_about_alice() {
+        memory.remember(f).await.unwrap();
+    }
+    let hits = memory
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    assert!(!hits.is_empty());
+    let weights = aidaemon_memory::HybridWeights::default();
+    for hit in &hits {
+        assert_eq!(hit.signals.graph, 0.0);
+        assert_eq!(hit.score, weights.fuse(&hit.signals));
+    }
+}
+
+/// A shared-channel recall takes no signal from a fact it cannot see.
+#[tokio::test]
+async fn hidden_facts_do_not_feed_the_graph_signal() {
+    for (name, memory) in memories().await {
+        memory
+            .remember_with(
+                fact("person", "sister_name", "Alice Rivera"),
+                &FactAccess::private(),
+            )
+            .await
+            .unwrap();
+        memory
+            .remember_with(
+                fact("person", "alice_rivera_employer", "Acme Corp"),
+                &FactAccess::global(),
+            )
+            .await
+            .unwrap();
+        let hits = memory
+            .recall_facts_for(SCOPE, "employer", 5, &group("c1"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{name}");
+        assert_eq!(hits[0].signals.graph, 0.0, "{name}");
+    }
+}
+
+#[test]
+fn graph_links_are_structural() {
+    use aidaemon_memory::related_fact_scores;
+    let now = Utc::now();
+    let row = |id: &str, key: &str, value: &str| aidaemon_memory::Fact {
+        id: id.into(),
+        scope: SCOPE.into(),
+        category: "note".into(),
+        key: key.into(),
+        value: value.into(),
+        confidence: 1.0,
+        source: Provenance::default(),
+        created_at: now,
+        updated_at: now,
+        superseded_at: None,
+        recall_count: 0,
+        last_recalled_at: None,
+    };
+    let facts = vec![
+        row("seed", "acme_corp:office", "Porto"),
+        row("same-namespace", "acme_corp:founder", "Jordan Lee"),
+        row("mentions-namespace", "supplier", "Acme Corp"),
+        row("substring-only", "note", "acme_corporate retreat"),
+        row("unrelated", "fruit", "mango"),
+    ];
+    let scores = related_fact_scores(&facts, &["seed".to_string()]);
+    assert_eq!(scores.get("same-namespace"), Some(&1.0));
+    assert!(scores.get("mentions-namespace").is_some_and(|s| *s < 1.0));
+    assert!(!scores.contains_key("substring-only"), "{scores:?}");
+    assert!(!scores.contains_key("unrelated"), "{scores:?}");
+    assert!(
+        !scores.contains_key("seed"),
+        "a fact does not relate to itself"
+    );
+
+    // A value that half the store shares names nothing in particular.
+    let mut crowded = vec![row("seed", "answer", "yes")];
+    for i in 0..12 {
+        crowded.push(row(&format!("n{i}"), &format!("note_{i}"), "yes"));
+    }
+    assert!(related_fact_scores(&crowded, &["seed".to_string()]).is_empty());
+}
+
+// ------------------------------------------------------- Near duplicates
+
+/// Maps any text containing a marker to that marker's vector, so a test
+/// states how similar two facts are.
+struct ScriptedEmbedder(Vec<(&'static str, Vec<f32>)>);
+
+#[async_trait::async_trait]
+impl Embedder for ScriptedEmbedder {
+    fn model_id(&self) -> &str {
+        "scripted-v1"
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                self.0
+                    .iter()
+                    .find(|(marker, _)| text.contains(marker))
+                    .map_or(vec![1.0, -1.0], |(_, v)| v.clone())
+            })
+            .collect())
+    }
+}
+
+/// `employer` and `workplace` read as one claim; cosine of about 0.995.
+fn scripted() -> Arc<ScriptedEmbedder> {
+    Arc::new(ScriptedEmbedder(vec![
+        ("employer", vec![1.0, 0.0]),
+        ("workplace", vec![1.0, 0.1]),
+        ("distant", vec![1.0, 1.0]),
+    ]))
+}
+
+async fn merge_stores() -> Vec<(&'static str, Arc<dyn MemoryStore>)> {
+    vec![
+        ("in-memory", Arc::new(InMemoryMemoryStore::new())),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+        ("custom", Arc::new(common::VecStore::default())),
+    ]
+}
+
+async fn active_keys(memory: &Memory) -> Vec<String> {
+    let mut keys: Vec<String> = memory
+        .facts(SCOPE)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn a_restatement_under_another_key_reinforces_the_existing_fact() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        let first = memory
+            .remember(fact("work", "employer", "Acme Corp").confidence(0.6))
+            .await
+            .unwrap();
+        let again = memory
+            .remember(fact("work", "workplace", "acme  corp").confidence(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            UpsertOutcome::Reinforced {
+                id: first.id().to_string()
+            },
+            "{name}"
+        );
+        assert_eq!(active_keys(&memory).await, ["employer"], "{name}");
+        let facts = memory.facts(SCOPE).await.unwrap();
+        assert!((facts[0].confidence - 0.9).abs() < 1e-5, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_reworded_near_duplicate_supersedes_and_keeps_history() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        let first = memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        let reworded = memory
+            .remember(fact("work", "workplace", "Acme Corp Lisbon"))
+            .await
+            .unwrap();
+        let UpsertOutcome::Superseded {
+            previous_id,
+            previous_value,
+            ..
+        } = &reworded
+        else {
+            panic!("{name}: expected Superseded, got {reworded:?}");
+        };
+        assert_eq!(previous_id, first.id(), "{name}");
+        assert_eq!(previous_value, "Acme Corp", "{name}");
+        assert_eq!(active_keys(&memory).await, ["employer"], "{name}");
+        let history = memory
+            .fact_history(SCOPE, "work", "employer")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "{name}");
+        assert_eq!(history[0].value, "Acme Corp", "{name}");
+        assert!(history[0].superseded_at.is_some(), "{name}");
+        assert_eq!(history[1].value, "Acme Corp Lisbon", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn without_vectors_normalized_text_finds_the_duplicate() {
+    struct Offline;
+    #[async_trait::async_trait]
+    impl Embedder for Offline {
+        fn model_id(&self) -> &str {
+            "offline"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        async fn embed(&self, _: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+            Err(aidaemon_memory::MemoryError::Embedding("offline".into()))
+        }
+    }
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, Arc::new(Offline)).build();
+        memory
+            .remember(fact("preference", "ui_theme", "Dark Mode"))
+            .await
+            .unwrap();
+        // Same words in another order and case.
+        let again = memory
+            .remember(fact("preference", "theme_ui", "dark mode!"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, UpsertOutcome::Superseded { .. }),
+            "{name}: {again:?}"
+        );
+        assert_eq!(active_keys(&memory).await, ["ui_theme"], "{name}");
+        // Different words stay separate.
+        memory
+            .remember(fact("preference", "editor_font", "Dark Mode"))
+            .await
+            .unwrap();
+        assert_eq!(
+            active_keys(&memory).await,
+            ["editor_font", "ui_theme"],
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn distinct_facts_stay_separate_despite_similar_vectors() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        // Below the threshold.
+        memory
+            .remember(fact("work", "distant_client", "Acme Corp"))
+            .await
+            .unwrap();
+        // Close vectors, different claims: a number differs...
+        memory
+            .remember(fact("work", "employer_badge", "Badge 1001"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("work", "workplace_badge", "Badge 1002"))
+            .await
+            .unwrap();
+        // ...the values share too little...
+        memory
+            .remember(fact("work", "workplace_city", "Lisbon"))
+            .await
+            .unwrap();
+        // ...or the keys are about different people.
+        memory
+            .remember(fact("user", "employer_mother", "Alice Rivera"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("user", "employer_father", "Alice Rivera"))
+            .await
+            .unwrap();
+        assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 7, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn merging_stays_inside_the_scope() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        let other = "telegram:synthetic-user-2";
+        let outcome = memory
+            .remember(NewFact::new(other, "work", "workplace", "Acme Corp"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, UpsertOutcome::Inserted { .. }),
+            "{name}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_merge_threshold_is_configurable() {
+    use aidaemon_memory::MergeConfig;
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted())
+            .merge(MergeConfig {
+                semantic_threshold: 0.999,
+                ..MergeConfig::default()
+            })
+            .build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("work", "workplace", "Acme Corp"))
+            .await
+            .unwrap();
+        assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 2, "{name}");
+    }
+    let memory = Memory::builder(Arc::new(InMemoryMemoryStore::new()), scripted())
+        .merge(MergeConfig::disabled())
+        .build();
+    memory
+        .remember(fact("work", "employer", "Acme Corp"))
+        .await
+        .unwrap();
+    memory
+        .remember(fact("work", "workplace", "Acme Corp"))
+        .await
+        .unwrap();
+    assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 2);
+    // The default sits between the scripted pair's similarity and 1.
+    let default = MergeConfig::default().semantic_threshold;
+    assert!(default > 0.5 && default < 0.995);
+}
+
+#[tokio::test]
+async fn merging_does_not_cross_access_levels() {
+    for (name, store) in [
+        (
+            "in-memory",
+            Arc::new(InMemoryMemoryStore::new()) as Arc<dyn MemoryStore>,
+        ),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+    ] {
+        let memory = Memory::builder(store, scripted()).build();
+        let private = memory
+            .remember_with(
+                fact("work", "employer", "Acme Corp"),
+                &FactAccess::private(),
+            )
+            .await
+            .unwrap();
+        // A shared-channel write of the same claim neither reinforces the
+        // private fact (which would reveal it) nor gets narrowed by it.
+        let shared = memory
+            .remember_with(
+                fact("work", "workplace", "Acme Corp"),
+                &FactAccess::channel("c1"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(shared, UpsertOutcome::Inserted { .. }),
+            "{name}: {shared:?}"
+        );
+        assert_ne!(shared.id(), private.id(), "{name}");
+        assert_eq!(
+            active_keys(&memory).await,
+            ["employer", "workplace"],
+            "{name}"
+        );
+    }
+}
+
+/// Vectors from another model say nothing about similarity, so only the text
+/// decides.
+#[tokio::test]
+async fn near_duplicates_ignore_vectors_from_another_model() {
+    let store = Arc::new(InMemoryMemoryStore::new());
+    store
+        .upsert_fact(
+            NewFact::new(SCOPE, "work", "employer", "Acme Corp")
+                .normalized()
+                .unwrap(),
+            Some(StoredEmbedding {
+                model: "old-model".into(),
+                vector: vec![1.0, 0.0],
+            }),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let memory = Memory::builder(store, scripted()).build();
+    let outcome = memory
+        .remember(fact("work", "workplace", "Acme Corp"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, UpsertOutcome::Inserted { .. }),
+        "{outcome:?}"
+    );
+}
+
+// ------------------------------------------------------------ Re-embedding
+
+/// Records every batch it is given, and can fail on demand or return vectors
+/// of the wrong size for one text.
+#[derive(Default)]
+struct Probe {
+    batches: std::sync::Mutex<Vec<usize>>,
+    fail: std::sync::atomic::AtomicBool,
+    malformed_for: Option<&'static str>,
+}
+
+const NEW_MODEL: &str = "probe-v2";
+
+#[async_trait::async_trait]
+impl Embedder for Probe {
+    fn model_id(&self) -> &str {
+        NEW_MODEL
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(aidaemon_memory::MemoryError::Embedding("down".into()));
+        }
+        self.batches.lock().unwrap().push(texts.len());
+        Ok(texts
+            .iter()
+            .map(|text| match self.malformed_for {
+                Some(marker) if text.contains(marker) => vec![1.0, 0.0, 0.0],
+                _ => vec![1.0, 0.0],
+            })
+            .collect())
+    }
+}
+
+async fn refresh_stores() -> Vec<(&'static str, Arc<dyn MemoryStore>)> {
+    vec![
+        ("in-memory", Arc::new(InMemoryMemoryStore::new())),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+    ]
+}
+
+fn old_vector() -> StoredEmbedding {
+    StoredEmbedding {
+        model: "probe-v1".into(),
+        vector: vec![0.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// Five facts from the old model (one more with no vector, one current) and
+/// two old-model episodes, written straight to the store.
+async fn seed_old_rows(store: &Arc<dyn MemoryStore>) {
+    let now = Utc::now();
+    for i in 0..5 {
+        store
+            .upsert_fact(
+                fact("note", &format!("old_{i}"), &format!("value {i}"))
+                    .normalized()
+                    .unwrap(),
+                Some(old_vector()),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_fact(
+            fact("note", "no_vector", "plain").normalized().unwrap(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            fact("note", "current", "already").normalized().unwrap(),
+            Some(StoredEmbedding {
+                model: NEW_MODEL.into(),
+                vector: vec![0.5, 0.5],
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+    for summary in ["Earlier chat", "Another chat"] {
+        store
+            .insert_episode(episode(summary), Some(old_vector()), now)
+            .await
+            .unwrap();
+    }
+}
+
+async fn stale_count(store: &Arc<dyn MemoryStore>) -> usize {
+    let mut total = 0;
+    for kind in [RecordKind::Fact, RecordKind::Episode] {
+        total += store
+            .stale_embeddings(NEW_MODEL, kind, None, 1000)
+            .await
+            .unwrap()
+            .len();
+    }
+    total
+}
+
+#[tokio::test]
+async fn rows_from_another_model_are_found_and_reembedded_in_bounded_batches() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        assert_eq!(stale_count(&store).await, 8, "{name}");
+        let before: Vec<_> = store.active_facts(SCOPE).await.unwrap();
+
+        let probe = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), probe.clone()).build();
+        let mut cursor = None;
+        let mut updated = 0;
+        loop {
+            let report = memory.reembed_batch(2, cursor.as_ref()).await.unwrap();
+            assert!(report.processed <= 2, "{name}: {report:?}");
+            updated += report.updated;
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(updated, 8, "{name}");
+        assert_eq!(stale_count(&store).await, 0, "{name}");
+        assert!(
+            probe.batches.lock().unwrap().iter().all(|n| *n <= 2),
+            "{name}"
+        );
+
+        for record in store.active_facts(SCOPE).await.unwrap() {
+            let embedding = record.embedding.unwrap();
+            assert_eq!(embedding.model, NEW_MODEL, "{name}");
+            if record.fact.key == "current" {
+                assert_eq!(embedding.vector, [0.5, 0.5], "{name}: left alone");
+            } else {
+                assert_eq!(embedding.vector, [1.0, 0.0], "{name}");
+            }
+            let was = before.iter().find(|r| r.fact.id == record.fact.id).unwrap();
+            assert_eq!(was.fact.updated_at, record.fact.updated_at, "{name}");
+            assert_eq!(was.fact.recall_count, record.fact.recall_count, "{name}");
+        }
+        for record in store.episodes(SCOPE).await.unwrap() {
+            assert_eq!(record.embedding.unwrap().model, NEW_MODEL, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_interrupted_pass_resumes_without_redoing_work() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let first_run = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), first_run).build();
+        let report = memory.reembed_batch(3, None).await.unwrap();
+        assert_eq!(report.updated, 3, "{name}");
+        assert_eq!(stale_count(&store).await, 5, "{name}");
+
+        // A new process that kept no cursor starts over and finds only what
+        // is left.
+        let second_run = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), second_run.clone()).build();
+        let mut cursor = None;
+        loop {
+            let report = memory.reembed_batch(3, cursor.as_ref()).await.unwrap();
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(stale_count(&store).await, 0, "{name}");
+        let embedded: usize = second_run.batches.lock().unwrap().iter().sum();
+        assert_eq!(embedded, 5, "{name}: done rows are not embedded again");
+    }
+}
+
+#[tokio::test]
+async fn an_embedder_failure_loses_nothing_and_can_be_retried() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let probe = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), probe.clone()).build();
+        probe.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(memory.reembed_batch(2, None).await.is_err(), "{name}");
+        assert_eq!(stale_count(&store).await, 8, "{name}");
+        probe.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let report = memory.reembed_batch(2, None).await.unwrap();
+        assert_eq!(report.updated, 2, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_embedded_does_not_stop_the_pass() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let probe = Arc::new(Probe {
+            malformed_for: Some("old 2"),
+            ..Probe::default()
+        });
+        let memory = Memory::builder(store.clone(), probe).build();
+        let mut cursor = None;
+        let (mut updated, mut skipped, mut calls) = (0, 0, 0);
+        loop {
+            let report = memory.reembed_batch(2, cursor.as_ref()).await.unwrap();
+            updated += report.updated;
+            skipped += report.skipped;
+            calls += 1;
+            assert!(calls < 20, "{name}: the pass never ended");
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!((updated, skipped), (7, 1), "{name}");
+        assert_eq!(stale_count(&store).await, 1, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_batch_size_is_clamped_and_a_store_without_support_is_a_noop() {
+    use aidaemon_memory::MAX_REEMBED_BATCH;
+    let store: Arc<dyn MemoryStore> = Arc::new(InMemoryMemoryStore::new());
+    seed_old_rows(&store).await;
+    let memory = Memory::builder(store, Arc::new(Probe::default())).build();
+    assert_eq!(memory.reembed_batch(0, None).await.unwrap().processed, 1);
+    assert_eq!(MAX_REEMBED_BATCH, 256);
+
+    let custom = Memory::new(common::VecStore::default(), Probe::default());
+    custom
+        .remember(fact("note", "kept", "lexical only"))
+        .await
+        .unwrap();
+    let first = custom.reembed_batch(10, None).await.unwrap();
+    assert_eq!(first.updated, 0);
+    let second = custom.reembed_batch(10, first.next.as_ref()).await.unwrap();
+    assert_eq!((second.updated, second.next), (0, None));
+}
+
+/// Mid-migration both models are in the table; only vectors from the current
+/// one are compared with the query.
+#[tokio::test]
+async fn a_half_migrated_store_compares_only_current_vectors() {
+    for (name, store) in refresh_stores().await {
+        let now = Utc::now();
+        let same_length = |model: &str| StoredEmbedding {
+            model: model.into(),
+            vector: vec![1.0, 0.0],
+        };
+        store
+            .upsert_fact(
+                fact("note", "migrated", "shared words")
+                    .normalized()
+                    .unwrap(),
+                Some(same_length(NEW_MODEL)),
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                fact("note", "pending", "shared words")
+                    .normalized()
+                    .unwrap(),
+                Some(same_length("probe-v1")),
+                now,
+            )
+            .await
+            .unwrap();
+        let memory = Memory::builder(store, Arc::new(Probe::default()))
+            .merge(aidaemon_memory::MergeConfig::disabled())
+            .build();
+        let hits = memory.recall_facts(SCOPE, "shared words", 5).await.unwrap();
+        let semantic = |key: &str| {
+            hits.iter()
+                .find(|h| h.fact.key == key)
+                .unwrap_or_else(|| panic!("{name}: {key} missing from {hits:?}"))
+                .signals
+                .semantic
+        };
+        assert!(semantic("migrated") > 0.9, "{name}");
+        assert_eq!(semantic("pending"), 0.0, "{name}");
+    }
 }

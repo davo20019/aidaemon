@@ -20,10 +20,11 @@ pub struct Migration {
 }
 
 /// Every migration this build knows, in order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "facts_episodes_fts",
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "facts_episodes_fts",
+        sql: r#"
 CREATE TABLE memory_facts (
     id                TEXT PRIMARY KEY NOT NULL,
     scope             TEXT NOT NULL,
@@ -82,7 +83,20 @@ CREATE VIRTUAL TABLE memory_episodes_fts USING fts5(
     tokenize = 'unicode61'
 );
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "record_access",
+        // Rows from before this version were never classified, so they read
+        // as private: the owner keeps seeing them and shared channels do not.
+        sql: r#"
+ALTER TABLE memory_facts ADD COLUMN privacy TEXT NOT NULL DEFAULT 'private';
+ALTER TABLE memory_facts ADD COLUMN channel_id TEXT;
+ALTER TABLE memory_episodes ADD COLUMN privacy TEXT NOT NULL DEFAULT 'private';
+ALTER TABLE memory_episodes ADD COLUMN channel_id TEXT;
+"#,
+    },
+];
 
 /// The newest schema version this build understands.
 pub fn latest_version() -> i64 {

@@ -11,14 +11,15 @@ use sqlx::sqlite::{
 };
 use sqlx::{Row, Sqlite, Transaction};
 
-use super::{migrations, MemoryStore};
+use super::{migrations, related_fact_scores, MemoryStore};
 use crate::embed::{decode_embedding, encode_embedding};
 use crate::error::{MemoryError, Result};
 use crate::scoring::{term_overlap, tokens};
 use crate::types::{
     episode_search_text, fact_search_text, new_id, normalize_category, normalize_key, parse_ts,
-    same_value, ts, DecayReport, Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, NewEpisode,
-    NewFact, Provenance, RetentionConfig, StoredEmbedding, UpsertOutcome,
+    same_value, ts, DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats,
+    NewEpisode, NewFact, Provenance, RecordKind, RetentionConfig, StaleEmbedding, StoredEmbedding,
+    UpsertOutcome,
 };
 
 const FACT_COLUMNS: &str = "id, scope, category, key, value, confidence, source_run_id, \
@@ -95,12 +96,13 @@ impl SqliteMemoryStore {
         &self,
         fact: &NewFact,
         embedding: &Option<StoredEmbedding>,
+        access: &FactAccess,
         now: DateTime<Utc>,
     ) -> std::result::Result<UpsertOutcome, sqlx::Error> {
         let now_s = ts(now);
         let mut tx = self.pool.begin().await?;
         let existing = sqlx::query(
-            "SELECT id, value, source_excerpt FROM memory_facts
+            "SELECT id, value, source_excerpt, privacy, channel_id FROM memory_facts
              WHERE scope = ? AND category = ? AND key = ? AND superseded_at IS NULL",
         )
         .bind(&fact.scope)
@@ -115,11 +117,13 @@ impl SqliteMemoryStore {
             let value: String = row.get("value");
             if same_value(&value, &fact.value) {
                 let (blob, model) = embedding_columns(embedding);
+                let narrowed = row_access(&row).narrowest(access);
                 sqlx::query(
                     "UPDATE memory_facts SET updated_at = ?, confidence = MAX(confidence, ?),
                         source_excerpt = COALESCE(source_excerpt, ?),
                         embedding = COALESCE(?, embedding),
-                        embedding_model = COALESCE(?, embedding_model)
+                        embedding_model = COALESCE(?, embedding_model),
+                        privacy = ?, channel_id = ?
                      WHERE id = ?",
                 )
                 .bind(&now_s)
@@ -127,6 +131,8 @@ impl SqliteMemoryStore {
                 .bind(&fact.source.excerpt)
                 .bind(blob)
                 .bind(model)
+                .bind(narrowed.privacy.to_string())
+                .bind(&narrowed.channel_id)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
@@ -150,8 +156,8 @@ impl SqliteMemoryStore {
         sqlx::query(
             "INSERT INTO memory_facts (id, scope, category, key, value, confidence,
                 source_run_id, source_session_id, source_excerpt, created_at, updated_at,
-                embedding, embedding_model)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                embedding, embedding_model, privacy, channel_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&fact.scope)
@@ -166,6 +172,8 @@ impl SqliteMemoryStore {
         .bind(&now_s)
         .bind(blob)
         .bind(model)
+        .bind(access.privacy.to_string())
+        .bind(&access.channel_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("INSERT INTO memory_facts_fts (fact_id, scope, content) VALUES (?, ?, ?)")
@@ -183,6 +191,23 @@ impl SqliteMemoryStore {
                 previous_value,
             },
         })
+    }
+
+    /// Stored access of `scope`'s rows in `table`, for the ids asked about.
+    async fn access_of(
+        &self,
+        table: &str,
+        scope: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, FactAccess>> {
+        let wanted: HashSet<&String> = ids.iter().collect();
+        let sql = format!("SELECT id, privacy, channel_id FROM {table} WHERE scope = ?");
+        let rows = sqlx::query(&sql).bind(scope).fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<String, _>("id"), row_access(row)))
+            .filter(|(id, _)| wanted.contains(id))
+            .collect())
     }
 
     /// BM25 over an FTS table, normalized to 0..=1: word coverage of the
@@ -245,6 +270,10 @@ fn row_embedding(row: &SqliteRow) -> Option<StoredEmbedding> {
         vector: decode_embedding(&blob?)?,
         model: model?,
     })
+}
+
+fn row_access(row: &SqliteRow) -> FactAccess {
+    FactAccess::from_stored(row.get("privacy"), row.get("channel_id"))
 }
 
 fn row_time(row: &SqliteRow, column: &str) -> DateTime<Utc> {
@@ -331,14 +360,33 @@ impl MemoryStore for SqliteMemoryStore {
         embedding: Option<StoredEmbedding>,
         now: DateTime<Utc>,
     ) -> Result<UpsertOutcome> {
-        match self.try_upsert(&fact, &embedding, now).await {
+        self.upsert_fact_with_access(fact, embedding, &FactAccess::default(), now)
+            .await
+    }
+
+    async fn upsert_fact_with_access(
+        &self,
+        fact: NewFact,
+        embedding: Option<StoredEmbedding>,
+        access: &FactAccess,
+        now: DateTime<Utc>,
+    ) -> Result<UpsertOutcome> {
+        match self.try_upsert(&fact, &embedding, access, now).await {
             // A concurrent writer inserted the same key between our read and
             // write; the retry sees its row and reinforces or supersedes it.
             Err(err) if is_unique_violation(&err) => {
-                Ok(self.try_upsert(&fact, &embedding, now).await?)
+                Ok(self.try_upsert(&fact, &embedding, access, now).await?)
             }
             other => Ok(other?),
         }
+    }
+
+    async fn fact_access(
+        &self,
+        scope: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, FactAccess>> {
+        self.access_of("memory_facts", scope, ids).await
     }
 
     async fn supersede_fact(
@@ -382,6 +430,20 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(rows.iter().map(row_to_fact).collect())
     }
 
+    async fn fact_graph_scores(
+        &self,
+        scope: &str,
+        seed_ids: &[String],
+    ) -> Result<HashMap<String, f32>> {
+        let active: Vec<Fact> = self
+            .active_facts(scope)
+            .await?
+            .into_iter()
+            .map(|r| r.fact)
+            .collect();
+        Ok(related_fact_scores(&active, seed_ids))
+    }
+
     async fn fact_history(&self, scope: &str, category: &str, key: &str) -> Result<Vec<Fact>> {
         let sql = format!(
             "SELECT {FACT_COLUMNS} FROM memory_facts
@@ -414,6 +476,17 @@ impl MemoryStore for SqliteMemoryStore {
         embedding: Option<StoredEmbedding>,
         now: DateTime<Utc>,
     ) -> Result<Episode> {
+        self.insert_episode_with_access(episode, embedding, &FactAccess::default(), now)
+            .await
+    }
+
+    async fn insert_episode_with_access(
+        &self,
+        episode: NewEpisode,
+        embedding: Option<StoredEmbedding>,
+        access: &FactAccess,
+        now: DateTime<Utc>,
+    ) -> Result<Episode> {
         let episode = Episode {
             id: new_id(),
             scope: episode.scope,
@@ -431,8 +504,8 @@ impl MemoryStore for SqliteMemoryStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO memory_episodes (id, scope, session_id, summary, topics, importance,
-                created_at, embedding, embedding_model)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                created_at, embedding, embedding_model, privacy, channel_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&episode.id)
         .bind(&episode.scope)
@@ -443,6 +516,8 @@ impl MemoryStore for SqliteMemoryStore {
         .bind(ts(now))
         .bind(blob)
         .bind(model)
+        .bind(access.privacy.to_string())
+        .bind(&access.channel_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -455,6 +530,14 @@ impl MemoryStore for SqliteMemoryStore {
         .await?;
         tx.commit().await?;
         Ok(episode)
+    }
+
+    async fn episode_access(
+        &self,
+        scope: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, FactAccess>> {
+        self.access_of("memory_episodes", scope, ids).await
     }
 
     async fn episodes(&self, scope: &str) -> Result<Vec<EpisodeRecord>> {
@@ -534,6 +617,82 @@ impl MemoryStore for SqliteMemoryStore {
         }
         tx.commit().await?;
         Ok(report)
+    }
+
+    async fn stale_embeddings(
+        &self,
+        model: &str,
+        kind: RecordKind,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StaleEmbedding>> {
+        let (columns, table, active) = match kind {
+            RecordKind::Fact => (
+                "id, category, key, value, embedding_model",
+                "memory_facts",
+                "superseded_at IS NULL AND",
+            ),
+            RecordKind::Episode => (
+                "id, summary, topics, embedding_model",
+                "memory_episodes",
+                "",
+            ),
+        };
+        let sql = format!(
+            "SELECT {columns} FROM {table}
+             WHERE {active} (embedding_model IS NULL OR embedding_model != ?)
+               AND (? IS NULL OR id > ?)
+             ORDER BY id LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(model)
+            .bind(after_id)
+            .bind(after_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| StaleEmbedding {
+                kind,
+                id: row.get("id"),
+                text: match kind {
+                    RecordKind::Fact => {
+                        fact_search_text(row.get("category"), row.get("key"), row.get("value"))
+                    }
+                    RecordKind::Episode => {
+                        let topics: String = row.get("topics");
+                        let topics: Vec<String> = serde_json::from_str(&topics).unwrap_or_default();
+                        episode_search_text(row.get("summary"), &topics)
+                    }
+                },
+                model: row.get("embedding_model"),
+            })
+            .collect())
+    }
+
+    async fn replace_embedding(
+        &self,
+        stale: &StaleEmbedding,
+        embedding: StoredEmbedding,
+    ) -> Result<bool> {
+        let (table, active) = match stale.kind {
+            RecordKind::Fact => ("memory_facts", "AND superseded_at IS NULL"),
+            RecordKind::Episode => ("memory_episodes", ""),
+        };
+        let sql = format!(
+            "UPDATE {table} SET embedding = ?, embedding_model = ?
+             WHERE id = ? AND embedding_model IS ? {active}"
+        );
+        let changed = sqlx::query(&sql)
+            .bind(encode_embedding(&embedding.vector))
+            .bind(&embedding.model)
+            .bind(&stale.id)
+            .bind(&stale.model)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(changed > 0)
     }
 
     async fn stats(&self) -> Result<MemoryStats> {
