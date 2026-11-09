@@ -27,8 +27,8 @@ async fn agent_edits_then_verifies_with_read() {
             "edit_file",
             json!({
                 "path": "greeting.txt",
-                "old_string": "Welcome to Acme Corp.",
-                "new_string": "Welcome to Acme Labs."
+                "old_text": "Welcome to Acme Corp.",
+                "new_text": "Welcome to Acme Labs."
             }),
         )]),
         tool_calls([call("c3", "read_file", json!({"path": "greeting.txt"}))]),
@@ -63,7 +63,6 @@ async fn agent_edits_then_verifies_with_read() {
             ("read_file".to_string(), ReceiptStatus::Succeeded),
         ]
     );
-    assert_eq!(outcome.receipts()[1].details["replacements"], 1);
 
     let tool_results: Vec<&str> = outcome
         .state
@@ -73,7 +72,8 @@ async fn agent_edits_then_verifies_with_read() {
         .map(|m| m.content.as_str())
         .collect();
     assert_eq!(tool_results[0], "greeting.txt:2:Welcome to Acme Corp.");
-    assert!(tool_results[2].contains("     2\tWelcome to Acme Labs."));
+    assert!(tool_results[1].contains("replaced 1 occurrence"));
+    assert!(tool_results[2].contains("2 | Welcome to Acme Labs."));
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("greeting.txt")).unwrap(),

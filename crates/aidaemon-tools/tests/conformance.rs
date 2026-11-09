@@ -27,6 +27,11 @@ fn bundled_tools_pass_the_tool_kit() {
                 tool.as_ref(),
                 ToolKitOptions::default().valid_arguments(json!({"url": "https://example.com/"})),
             ),
+            // The range modes are exclusive (`allOf`), which the kit cannot sample.
+            "read_file" => check_tool_with(
+                tool.as_ref(),
+                ToolKitOptions::default().valid_arguments(json!({"path": "a.txt"})),
+            ),
             _ => check_tool(tool.as_ref()),
         };
         all.merge(report);

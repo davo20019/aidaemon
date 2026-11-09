@@ -243,21 +243,7 @@ pub fn save_tool_observation_image(
 }
 
 /// Infer image MIME from magic bytes when the platform metadata is unreliable.
-pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
-        return Some("image/jpeg");
-    }
-    if bytes.len() >= 8 && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-        return Some("image/png");
-    }
-    if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
-        return Some("image/gif");
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-    None
-}
+pub use aidaemon_tools::sniff_image_mime;
 
 /// Pick filename + MIME for Telegram photos (platform often lacks reliable metadata).
 pub fn telegram_photo_filename_and_mime(bytes: &[u8]) -> (String, String) {

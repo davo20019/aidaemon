@@ -11,11 +11,12 @@ pub mod computer_use;
 pub(crate) mod config_manager;
 mod diagnose;
 pub mod file_delivery;
+/// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
+#[allow(dead_code)]
+mod file_policy;
 mod goal_trace;
 mod health_probe;
 pub mod image_generation;
-/// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
-#[allow(dead_code)]
 pub(crate) mod kernel_tool;
 mod manage_mandates;
 mod manage_memories;

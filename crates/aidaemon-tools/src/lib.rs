@@ -46,6 +46,7 @@ pub mod backend;
 mod checklist;
 mod exec;
 mod fs;
+pub mod outcome;
 pub mod path_class;
 mod search;
 pub mod semantics;
@@ -68,10 +69,16 @@ pub use exec::{
     best_available_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError,
     LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox,
 };
-pub use fs::{EditFile, ReadFile, WriteFile, DEFAULT_READ_LIMIT};
+pub use fs::{
+    format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
+    FilePolicy, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy, WriteFile,
+    MAX_READ_CHARS,
+};
+pub use outcome::OutcomeTool;
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use shell::{Shell, DEFAULT_ENV_ALLOWLIST};
+pub use util::sniff_image_mime;
 pub use web::WebFetch;
 pub use workspace::{PathError, Workspace};
 

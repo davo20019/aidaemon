@@ -961,19 +961,6 @@ pub async fn is_binary_file(path: &Path) -> anyhow::Result<bool> {
     Ok(buf[..n].contains(&0))
 }
 
-/// Format file content with line numbers.
-pub fn format_with_line_numbers(content: &str, start_line: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = start_line + lines.len();
-    let width = total.to_string().len().max(3);
-    lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| format!("{:>width$} | {}", start_line + i + 1, line, width = width))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Output from running a shell command.
 #[derive(Debug)]
 pub struct CommandOutput {
@@ -1122,9 +1109,6 @@ pub fn contains_shell_operator(cmd: &str) -> bool {
     }
     false
 }
-
-/// Output trust of a file read, from the SDK tools crate.
-pub use aidaemon_tools::semantics::file_output_trust;
 
 #[cfg(test)]
 mod tests {
@@ -1427,7 +1411,7 @@ mod tests {
 
     #[test]
     fn test_format_with_line_numbers() {
-        let result = format_with_line_numbers("foo\nbar\nbaz", 0);
+        let result = aidaemon_tools::format_with_line_numbers("foo\nbar\nbaz", 0);
         assert!(result.contains("  1 | foo"));
         assert!(result.contains("  2 | bar"));
         assert!(result.contains("  3 | baz"));
@@ -1435,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_format_with_line_numbers_offset() {
-        let result = format_with_line_numbers("line10\nline11", 9);
+        let result = aidaemon_tools::format_with_line_numbers("line10\nline11", 9);
         assert!(result.contains("10 | line10"));
         assert!(result.contains("11 | line11"));
     }

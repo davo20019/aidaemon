@@ -1,14 +1,11 @@
-//! [`KernelTool`]: a tool written against the SDK (`aidaemon_core::Tool`
-//! plus `aidaemon_tools::ToolSemantics`) as a daemon tool.
+//! [`KernelTool`]: a tool implemented in an SDK crate
+//! ([`aidaemon_tools::OutcomeTool`]) as a daemon tool.
 //!
 //! This is how the daemon uses a tool implemented in an SDK crate, so the
 //! implementation lives once. The adapter only translates the call: every
 //! description of the call (effects, annotations, access, approval, trust,
-//! dispatch facts) is the wrapped tool's own, forwarded unchanged.
-//!
-//! The daemon's call path carries no kernel run, session or cancellation,
-//! so the wrapped tool gets a fresh [`aidaemon_core::ToolContext`]. Wrap
-//! only tools that do not read the session id or the context's extensions.
+//! dispatch facts) is the wrapped tool's own, forwarded unchanged, and the
+//! outcome keeps its typed metadata.
 
 use std::sync::Arc;
 
@@ -18,8 +15,9 @@ use aidaemon_tools::semantics::{
     ToolCallSemantics, ToolCapabilities, ToolDispatchFacts, ToolReceiptKind, ToolRole,
     ToolSemantics, TrustRoots,
 };
+use aidaemon_tools::OutcomeTool;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::types::StatusUpdate;
@@ -27,69 +25,36 @@ use crate::types::StatusUpdate;
 /// An SDK tool offered to the daemon's dispatcher.
 pub struct KernelTool<T> {
     inner: Arc<T>,
-    name: String,
-    description: String,
-    schema: Value,
 }
 
-impl<T> KernelTool<T>
-where
-    T: aidaemon_core::Tool + ToolSemantics + 'static,
-{
-    pub fn new(tool: T) -> Self {
-        let spec = aidaemon_core::Tool::spec(&tool);
+impl<T: OutcomeTool + 'static> KernelTool<T> {
+    pub fn wrap(tool: T) -> Self {
         Self {
-            schema: json!({
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            }),
-            name: spec.name,
-            description: spec.description,
             inner: Arc::new(tool),
         }
-    }
-
-    /// Run the wrapped tool. A result it marks as an error is a failed call.
-    async fn run(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
-        let arguments: Value = if arguments.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(arguments)
-                .map_err(|error| anyhow::anyhow!("Invalid arguments: {error}"))?
-        };
-        let context = aidaemon_core::ToolContext::new("daemon", &self.name);
-        let output = aidaemon_core::Tool::call(self.inner.as_ref(), arguments, &context)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.0))?;
-        if output.is_error {
-            anyhow::bail!(output.content);
-        }
-        let mut outcome = ToolCallOutcome::from_output(output.content);
-        outcome.finish = output.finish;
-        Ok(outcome)
     }
 }
 
 #[async_trait]
-impl<T> crate::traits::Tool for KernelTool<T>
-where
-    T: aidaemon_core::Tool + ToolSemantics + 'static,
-{
+impl<T: OutcomeTool + 'static> crate::traits::Tool for KernelTool<T> {
     fn name(&self) -> &str {
-        &self.name
+        self.inner.name()
     }
 
     fn description(&self) -> &str {
-        &self.description
+        self.inner.description()
     }
 
     fn schema(&self) -> Value {
-        self.schema.clone()
+        self.inner.schema()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self.run(arguments).await?.output)
+        Ok(self
+            .inner
+            .execute(arguments, &ToolCallContext::default())
+            .await?
+            .output)
     }
 
     async fn call_with_status_outcome(
@@ -97,16 +62,24 @@ where
         arguments: &str,
         _status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.run(arguments).await
+        self.inner
+            .execute(arguments, &ToolCallContext::default())
+            .await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        facts: ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.inner.execute(arguments, &facts).await
     }
 }
 
 /// Every method forwards, so the wrapped tool's overrides all apply.
 #[async_trait]
-impl<T> ToolSemantics for KernelTool<T>
-where
-    T: aidaemon_core::Tool + ToolSemantics + 'static,
-{
+impl<T: OutcomeTool + 'static> ToolSemantics for KernelTool<T> {
     fn canonicalize_arguments(
         &self,
         arguments: &str,
@@ -209,29 +182,38 @@ mod tests {
     struct Echo;
 
     #[async_trait]
-    impl aidaemon_core::Tool for Echo {
-        fn spec(&self) -> aidaemon_core::ToolSpec {
-            aidaemon_core::ToolSpec {
-                name: "synthetic_echo".into(),
-                description: "Echo text back.".into(),
-                parameters: json!({
+    impl OutcomeTool for Echo {
+        fn name(&self) -> &str {
+            "synthetic_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echo text back."
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({
+                "name": "synthetic_echo",
+                "description": "Echo text back.",
+                "parameters": {
                     "type": "object",
                     "properties": {"text": {"type": "string"}, "fail": {"type": "boolean"}},
                     "additionalProperties": false
-                }),
-            }
+                }
+            })
         }
 
-        async fn call(
+        async fn execute(
             &self,
-            arguments: Value,
-            _ctx: &aidaemon_core::ToolContext,
-        ) -> aidaemon_core::ToolResult {
+            arguments: &str,
+            _facts: &ToolCallContext,
+        ) -> anyhow::Result<ToolCallOutcome> {
+            let arguments: Value = serde_json::from_str(arguments)?;
             let text = arguments["text"].as_str().unwrap_or_default().to_string();
             if arguments["fail"].as_bool() == Some(true) {
-                return Ok(aidaemon_core::ToolOutput::error(format!("refused: {text}")));
+                anyhow::bail!("refused: {text}");
             }
-            Ok(aidaemon_core::ToolOutput::text(text))
+            Ok(ToolCallOutcome::from_output(text))
         }
     }
 
@@ -258,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_daemon_runs_an_sdk_tool_unchanged() {
-        let tool = KernelTool::new(Echo);
+        let tool = KernelTool::wrap(Echo);
         assert_eq!(tool.name(), "synthetic_echo");
         let schema = tool.schema();
         assert_eq!(schema["name"], "synthetic_echo");
@@ -273,7 +255,7 @@ mod tests {
 
     #[test]
     fn semantics_are_the_wrapped_tools() {
-        let tool = KernelTool::new(Echo);
+        let tool = KernelTool::wrap(Echo);
         assert!(tool.capabilities().read_only);
         assert!(tool.dispatch_facts().always_offered);
         assert_eq!(tool.call_effects("{}"), aidaemon_core::CallEffects::none());
