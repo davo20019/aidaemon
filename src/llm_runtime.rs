@@ -221,8 +221,21 @@ impl LlmRuntimeSnapshot {
         options: &crate::traits::ChatOptions,
         budget: std::time::Duration,
     ) -> JudgmentOutcome {
+        self.ask_for_judgment_through(messages, options, budget, |backend| backend)
+            .await
+    }
+
+    /// [`Self::ask_for_judgment`] with the backend passed through `wrap`
+    /// (the side-call gateway wraps it to record each attempt as it starts).
+    pub(crate) async fn ask_for_judgment_through(
+        &self,
+        messages: &[serde_json::Value],
+        options: &crate::traits::ChatOptions,
+        budget: std::time::Duration,
+        wrap: impl FnOnce(ModelBackend) -> ModelBackend,
+    ) -> JudgmentOutcome {
         use crate::providers::ChatJson;
-        let backend = self.model_routed_backend();
+        let backend = wrap(self.model_routed_backend());
         let models = self.with_failover_models(vec![self.primary_model()]);
         let deadline = std::time::Instant::now() + budget;
         let mut failures = Vec::new();

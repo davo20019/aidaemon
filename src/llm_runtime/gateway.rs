@@ -77,10 +77,41 @@ fn log_attempt(log: &AttemptLog, attempt: Attempt) -> usize {
     attempts.len() - 1
 }
 
-/// A chain step's provider that notes each attempt in the log.
+/// A provider that notes each attempt in the log as it starts and as it
+/// ends: the chain's steps, and the safety judge's backend.
 struct LoggedProvider {
     inner: ModelBackend,
     log: AttemptLog,
+}
+
+impl LoggedProvider {
+    fn start(&self, model: &str) -> (usize, Instant) {
+        let started = Instant::now();
+        let index = log_attempt(
+            &self.log,
+            Attempt {
+                model: model.to_string(),
+                started,
+                finished: None,
+            },
+        );
+        (index, started)
+    }
+}
+
+fn finish(
+    log: &AttemptLog,
+    index: usize,
+    started: Instant,
+    outcome: Result<sdk::ModelResponse, String>,
+) {
+    if let Some(attempt) = log
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(index)
+    {
+        attempt.finished = Some((started.elapsed(), outcome));
+    }
 }
 
 #[async_trait]
@@ -93,31 +124,41 @@ impl sdk::Provider for LoggedProvider {
         &self,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
-        let started = Instant::now();
-        let index = log_attempt(
-            &self.log,
-            Attempt {
-                model: request.model.clone(),
-                started,
-                finished: None,
-            },
-        );
+        let (index, started) = self.start(&request.model);
         let result = self.inner.complete(request).await;
         let outcome = match &result {
             Ok(response) => Ok(response.clone()),
             Err(error) => Err(error.to_string()),
         };
-        if let Some(attempt) = self
-            .log
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_mut(index)
-        {
-            attempt.finished = Some((started.elapsed(), outcome));
-        }
+        finish(&self.log, index, started, outcome);
         result
     }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a sdk::ModelRequest,
+    ) -> futures::stream::BoxStream<'a, Result<sdk::StreamEvent, sdk::ProviderError>> {
+        use futures::StreamExt;
+        let (index, started) = self.start(&request.model);
+        let log = self.log.clone();
+        Box::pin(
+            self.inner
+                .stream(request)
+                .inspect(move |event| match event {
+                    Ok(sdk::StreamEvent::Done(response)) => {
+                        finish(&log, index, started, Ok(response.clone()))
+                    }
+                    Err(error) => finish(&log, index, started, Err(error.to_string())),
+                    Ok(_) => {}
+                }),
+        )
+    }
 }
+
+/// How much longer than the total deadline the safety judge's own budget
+/// runs, so the total deadline always ends a hung judgment first and the
+/// caller gets [`SideCallError::Deadline`], never the judge's own timeout.
+const JUDGE_BUDGET_SLACK: Duration = Duration::from_secs(1);
 
 impl SideCallGateway {
     pub fn new(
@@ -189,8 +230,11 @@ impl SideCallGateway {
     async fn run(
         &self,
         spec: SideCallSpec,
-        request: sdk::ModelRequest,
+        mut request: sdk::ModelRequest,
     ) -> Result<(sdk::ModelResponse, String), SideCallError> {
+        // No side call gets tools, whichever door the request came through.
+        request.tools.clear();
+        request.tool_choice = sdk::ToolChoice::default();
         let log = AttemptLog::default();
         let started = Instant::now();
         let result =
@@ -210,47 +254,35 @@ impl SideCallGateway {
         log: &AttemptLog,
     ) -> Result<(sdk::ModelResponse, String), SideCallError> {
         let snapshot = self.runtime.snapshot();
-        if spec.class == SideCallClass::SafetyJudge {
-            let outcome = snapshot
-                .ask_for_judgment(
-                    &to_chat_messages(&request.messages),
-                    &to_chat_options(request),
-                    spec.deadline,
-                )
-                .await;
-            let last_error = outcome.failures.last().map(|failure| failure.error.clone());
-            for failure in outcome.failures {
-                log_attempt(
-                    log,
-                    Attempt {
-                        model: failure.model,
-                        started: Instant::now(),
-                        finished: Some((failure.elapsed, Err(failure.error))),
-                    },
-                );
-            }
-            let Some(answer) = outcome.answer else {
-                return Err(SideCallError::Provider(
-                    last_error.unwrap_or_else(|| "no model available".to_string()),
-                ));
-            };
-            let response = to_sdk_response(answer.response);
-            log_attempt(
-                log,
-                Attempt {
-                    model: answer.model.clone(),
-                    started: Instant::now(),
-                    finished: Some((answer.elapsed, Ok(response.clone()))),
-                },
-            );
-            return Ok((response, answer.model));
-        }
-        let chain = snapshot.background_chain_through(&request.model, |inner| {
+        let logged = |inner| -> ModelBackend {
             Arc::new(LoggedProvider {
                 inner,
                 log: log.clone(),
             })
-        });
+        };
+        if spec.class == SideCallClass::SafetyJudge {
+            // Each attempt is logged as it starts, so the rows survive the
+            // total deadline cutting the judgment off.
+            let outcome = snapshot
+                .ask_for_judgment_through(
+                    &to_chat_messages(&request.messages),
+                    &to_chat_options(request),
+                    spec.deadline + JUDGE_BUDGET_SLACK,
+                    logged,
+                )
+                .await;
+            let Some(answer) = outcome.answer else {
+                return Err(SideCallError::Provider(
+                    outcome
+                        .failures
+                        .last()
+                        .map(|failure| failure.error.clone())
+                        .unwrap_or_else(|| "no model available".to_string()),
+                ));
+            };
+            return Ok((to_sdk_response(answer.response), answer.model));
+        }
+        let chain = snapshot.background_chain_through(&request.model, logged);
         let response = sdk::Provider::complete(&chain, request)
             .await
             .map_err(|error| SideCallError::Provider(error.to_string()))?;
@@ -400,7 +432,7 @@ pub(crate) mod test_support {
         )
     }
 
-    struct Failing(String);
+    struct Failing(sdk::ProviderError);
 
     #[async_trait]
     impl sdk::Provider for Failing {
@@ -412,13 +444,18 @@ pub(crate) mod test_support {
             &self,
             _: &sdk::ModelRequest,
         ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
-            Err(sdk::ProviderError::Transient(self.0.clone()))
+            Err(self.0.clone())
         }
     }
 
     /// A provider that fails every request with a transient `error`.
     pub(crate) fn provider_failing(error: &str) -> ModelBackend {
-        Arc::new(Failing(error.to_string()))
+        provider_failing_with(sdk::ProviderError::Transient(error.to_string()))
+    }
+
+    /// A provider that fails every request with `error`.
+    pub(crate) fn provider_failing_with(error: sdk::ProviderError) -> ModelBackend {
+        Arc::new(Failing(error))
     }
 
     struct Hanging;
@@ -529,6 +566,27 @@ pub(crate) mod test_support {
             .count()
     }
 
+    /// The models of the failed `llm_call` rows recorded under `purpose`,
+    /// in the order they were written.
+    pub(crate) async fn failed_call_models(events: &EventStore, purpose: &str) -> Vec<String> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM events WHERE event_type = ? \
+             AND json_extract(data, '$.call_purpose') = ? \
+             AND json_extract(data, '$.error') IS NOT NULL ORDER BY id",
+        )
+        .bind(crate::events::EventType::LlmCall.as_str())
+        .bind(purpose)
+        .fetch_all(&events.pool())
+        .await
+        .unwrap();
+        rows.iter()
+            .map(|(data,)| {
+                let data: serde_json::Value = serde_json::from_str(data).unwrap();
+                data["model"].as_str().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
     /// `llm_call` rows recorded under `purpose` that succeeded.
     pub(crate) async fn ok_calls(events: &EventStore, purpose: &str) -> usize {
         count_calls(events, purpose, false).await
@@ -556,6 +614,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::test_support::*;
@@ -661,5 +720,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok_calls(&events, "task_learning").await, 1);
+    }
+
+    /// A safety judge whose primary is rejected and whose failover model
+    /// hangs: the total deadline ends it, and each attempt has its row
+    /// under the model it used.
+    #[tokio::test]
+    async fn a_judge_cut_off_by_the_deadline_records_each_attempt() {
+        let (gateway, events) = gateway_with_targets(vec![
+            provider_failing_with(sdk::ProviderError::Auth("key rejected".into())),
+            provider_hanging(),
+        ])
+        .await;
+        // Virtual time for the wait, real time again for the row writes
+        // (see `a_hanging_provider_ends_at_the_total_deadline`).
+        tokio::time::pause();
+        let deadline = SideCall::CommandRisk.spec().deadline;
+        let started = tokio::time::Instant::now();
+        let messages = user("rm -rf build");
+        let options = Default::default();
+        let (result, ()) = tokio::join!(
+            gateway.ask(SideCall::CommandRisk, &messages, &options, None),
+            async {
+                tokio::time::sleep(deadline).await;
+                tokio::time::resume();
+            }
+        );
+        assert!(
+            matches!(result, Err(SideCallError::Deadline(d)) if d == deadline),
+            "{result:?}"
+        );
+        assert!(started.elapsed() <= deadline + Duration::from_secs(1));
+        assert_eq!(
+            failed_call_models(&events, "terminal_command_risk").await,
+            ["primary-model", "failover-model-1"]
+        );
+        assert_eq!(ok_calls(&events, "terminal_command_risk").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_side_call_never_sends_tools() {
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([])
+                .then_repeat(aidaemon_core::testing::text("fine")),
+        );
+        let (gateway, _events) = gateway_with(scripted.clone()).await;
+        let mut request = request_for("any-model", "hello");
+        request.tools = vec![sdk::ToolSpec {
+            name: "send_probe".to_string(),
+            description: "Sends a message.".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        request.tool_choice = sdk::ToolChoice::Required;
+        gateway
+            .provider(SideCall::TaskLearning)
+            .complete(&request)
+            .await
+            .unwrap();
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::Auto);
     }
 }
