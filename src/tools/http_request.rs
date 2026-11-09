@@ -2296,6 +2296,24 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
         ]
     }
 
+    /// Only the URL leaves on a plain read. Anything else the call adds
+    /// (query parameters, headers, a body) is text the model wrote.
+    fn call_outbound(&self, arguments: &str) -> aidaemon_core::Outbound {
+        const URL_ONLY: &[&str] = &["url", "method", "timeout_secs", "follow_redirects"];
+        let Some(args) = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return aidaemon_core::Outbound::Composed;
+        };
+        match args.get("url").and_then(Value::as_str) {
+            Some(url) if args.keys().all(|key| URL_ONLY.contains(&key.as_str())) => {
+                aidaemon_core::Outbound::Exact(vec![url.to_string()])
+            }
+            _ => aidaemon_core::Outbound::Composed,
+        }
+    }
+
     /// The request's host (`host:port`, the URL's port or else the scheme's
     /// default) and the stored credential profile it uses, after the same
     /// URL canonicalization the request runs with (tool parameters embedded
@@ -4308,6 +4326,7 @@ mod tests {
             annotations: tool.call_annotations_in(&raw, &crate::traits::TrustRoots::new(&[])),
             access: aidaemon_core::AccessManifest::default(),
             effects: tool.call_effects(&raw),
+            outbound: Default::default(),
         };
         let ctx = aidaemon_core::HookContext {
             run_id: aidaemon_core::RunId::new(),

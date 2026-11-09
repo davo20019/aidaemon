@@ -157,6 +157,7 @@ mod tests {
             },
             access: AccessManifest::default(),
             effects,
+            outbound: Default::default(),
         }
     }
 

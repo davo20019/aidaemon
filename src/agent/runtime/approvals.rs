@@ -1056,6 +1056,7 @@ mod tests {
             annotations: sdk::ToolAnnotations::default(),
             access: sdk::AccessManifest::default(),
             effects: sdk::CallEffects::unknown(),
+            outbound: Default::default(),
         }
     }
 

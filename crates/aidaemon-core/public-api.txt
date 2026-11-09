@@ -266,6 +266,10 @@ pub aidaemon_core::ModelErrorDecision::Recover
 pub aidaemon_core::ModelErrorDecision::Recover::response: aidaemon_core::ModelResponse
 pub aidaemon_core::ModelErrorDecision::Retry
 pub aidaemon_core::ModelErrorDecision::Retry::after: core::time::Duration
+pub enum aidaemon_core::Outbound
+pub aidaemon_core::Outbound::Composed
+pub aidaemon_core::Outbound::Exact(alloc::vec::Vec<alloc::string::String>)
+pub aidaemon_core::Outbound::Nothing
 pub enum aidaemon_core::ProviderError
 pub aidaemon_core::ProviderError::Auth(alloc::string::String)
 pub aidaemon_core::ProviderError::Billing
@@ -586,6 +590,7 @@ pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolA
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
+pub fn aidaemon_core::FnTool<F, Fut>::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::FnTool<F, Fut>::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::FnTool<F, Fut>::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::FnTool<F, Fut>::timeout(&self) -> core::option::Option<core::time::Duration>
@@ -873,6 +878,7 @@ pub struct aidaemon_core::ToolInfo
 pub aidaemon_core::ToolInfo::access: aidaemon_core::AccessManifest
 pub aidaemon_core::ToolInfo::annotations: aidaemon_core::ToolAnnotations
 pub aidaemon_core::ToolInfo::effects: aidaemon_core::CallEffects
+pub aidaemon_core::ToolInfo::outbound: aidaemon_core::Outbound
 pub struct aidaemon_core::ToolOutput
 pub aidaemon_core::ToolOutput::content: alloc::string::String
 pub aidaemon_core::ToolOutput::details: serde_json::value::Value
@@ -1055,6 +1061,7 @@ pub fn aidaemon_core::Tool::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::Tool::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
+pub fn aidaemon_core::Tool::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::Tool::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::Tool::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::Tool::timeout(&self) -> core::option::Option<core::time::Duration>
@@ -1065,6 +1072,7 @@ pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolA
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
+pub fn aidaemon_core::FnTool<F, Fut>::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::FnTool<F, Fut>::source_trust(&self, &serde_json::value::Value) -> aidaemon_core::SourceTrust
 pub fn aidaemon_core::FnTool<F, Fut>::spec(&self) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::FnTool<F, Fut>::timeout(&self) -> core::option::Option<core::time::Duration>

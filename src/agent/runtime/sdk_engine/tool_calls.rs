@@ -744,6 +744,7 @@ impl Agent {
                 &crate::traits::TrustRoots::new(&scope.trust_roots),
             )
             .egress
+                || tool.call_outbound(arguments) != sdk::Outbound::Nothing
         });
         if !egress {
             return;

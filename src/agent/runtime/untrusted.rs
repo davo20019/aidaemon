@@ -43,6 +43,8 @@ pub(in crate::agent) struct TaintFacts<'a> {
     pub tainted_turns: Option<&'a [String]>,
     /// The parent turn was tainted.
     pub inherited: bool,
+    /// The session's summary folded in a turn that read untrusted content.
+    pub summary_tainted: bool,
 }
 
 /// Whether the turn starts as if it had already read untrusted content:
@@ -59,6 +61,7 @@ pub(in crate::agent) fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
             .any(|turn| tainted.contains(turn)),
     };
     facts.inherited
+        || facts.summary_tainted
         || facts.user_role != UserRole::Owner
         || matches!(
             facts.visibility,
@@ -660,6 +663,7 @@ mod tests {
             projected_turn_ids: projected,
             tainted_turns: tainted,
             inherited: false,
+            summary_tainted: false,
         }
     }
 
@@ -667,6 +671,10 @@ mod tests {
     fn starts_tainted_facts() {
         let none: Vec<String> = Vec::new();
         let clean = owner_private(&none, Some(&none));
+        assert!(starts_tainted(&TaintFacts {
+            summary_tainted: true,
+            ..owner_private(&none, Some(&none))
+        }));
         assert!(!starts_tainted(&clean), "a private owner turn starts clean");
         assert!(starts_tainted(&TaintFacts {
             user_role: UserRole::Guest,

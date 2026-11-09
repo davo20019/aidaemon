@@ -159,6 +159,10 @@ impl<T: OutcomeTool + 'static> ToolSemantics for KernelTool<T> {
         self.inner.call_effects(arguments)
     }
 
+    fn call_outbound(&self, arguments: &str) -> aidaemon_core::Outbound {
+        self.inner.call_outbound(arguments)
+    }
+
     fn call_annotations_in(
         &self,
         arguments: &str,

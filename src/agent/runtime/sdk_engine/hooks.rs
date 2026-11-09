@@ -429,6 +429,10 @@ impl sdk::Tool for BridgedTool {
         )
     }
 
+    fn outbound(&self, arguments: &Value) -> sdk::Outbound {
+        self.tool.call_outbound(&arguments.to_string())
+    }
+
     /// The daemon tool's own declaration for the arguments it will be
     /// dispatched with (after its argument canonicalization).
     fn effects(&self, arguments: &Value) -> sdk::CallEffects {

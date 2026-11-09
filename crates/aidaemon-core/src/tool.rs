@@ -113,6 +113,23 @@ pub struct ToolInfo {
     pub access: AccessManifest,
     /// What this call does, from [`Tool::effects`].
     pub effects: CallEffects,
+    /// What a read carries out of the machine, from [`Tool::outbound`].
+    pub outbound: Outbound,
+}
+
+/// What a call carries out of the machine, for a call that only reads. A
+/// fetch changes nothing, yet its URL can carry private data to whoever runs
+/// the server, so it counts once the run has read untrusted content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Outbound {
+    /// Nothing leaves.
+    #[default]
+    Nothing,
+    /// Exactly these strings leave. A string already present word for word
+    /// in what the user or a tool said holds no data the run composed.
+    Exact(Vec<String>),
+    /// Text the model composed, such as a search query.
+    Composed,
 }
 
 /// Typed application values a tool can read from its [`ToolContext`],
@@ -394,6 +411,12 @@ pub trait Tool: Send + Sync {
     /// with [`ToolOutput::with_trust`].
     fn source_trust(&self, _arguments: &Value) -> SourceTrust {
         SourceTrust::Untrusted
+    }
+
+    /// What this call carries out of the machine if it only reads. The
+    /// default says nothing does.
+    fn outbound(&self, _arguments: &Value) -> Outbound {
+        Outbound::Nothing
     }
 
     /// Deterministic argument checks run before any policy or I/O. The

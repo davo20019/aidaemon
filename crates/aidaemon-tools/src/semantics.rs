@@ -2193,6 +2193,11 @@ pub trait ToolSemantics: Send + Sync {
         Vec::new()
     }
 
+    /// What this call carries out of the machine if it only reads.
+    fn call_outbound(&self, _arguments: &str) -> aidaemon_core::Outbound {
+        aidaemon_core::Outbound::Nothing
+    }
+
     /// The typed effects of this exact call (effect class and normalized
     /// target), which the kernel checks against the owner's declines and
     /// hands the approval and egress policies. Build keys only with the

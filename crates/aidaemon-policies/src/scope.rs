@@ -255,6 +255,7 @@ mod tests {
                 ..AccessManifest::default()
             },
             effects: aidaemon_core::CallEffects::unknown(),
+            outbound: Default::default(),
         }
     }
 

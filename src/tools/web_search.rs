@@ -748,6 +748,11 @@ impl crate::traits::ToolSemantics for WebSearchTool {
         }
     }
 
+    /// The query is text the model wrote.
+    fn call_outbound(&self, _arguments: &str) -> aidaemon_core::Outbound {
+        aidaemon_core::Outbound::Composed
+    }
+
     /// The query goes to every configured backend's host, so the egress
     /// policy scans it and a declined host binds the search.
     fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {

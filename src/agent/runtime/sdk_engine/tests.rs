@@ -905,6 +905,7 @@ fn bridged_tool_exposes_effects_to_kernel() {
         annotations: bridged.annotations_for(&arguments),
         access: bridged.access(&arguments),
         effects: bridged.effects(&arguments),
+        outbound: Default::default(),
     };
     assert_eq!(info.effects, probe.call_effects(&arguments.to_string()));
     assert!(info.effects.complete);
@@ -1173,6 +1174,7 @@ async fn same_tool_limit_hook_denies_a_long_identical_streak() {
         annotations: sdk::ToolAnnotations::WRITE,
         access: Default::default(),
         effects: sdk::CallEffects::unknown(),
+        outbound: Default::default(),
     };
     let hook = aidaemon_policies::SameToolStreakGuard {
         read_only_tools: Default::default(),
@@ -3818,6 +3820,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
         annotations: sdk::ToolAnnotations::default(),
         access: sdk::AccessManifest::default(),
         effects: sdk::CallEffects::unknown(),
+        outbound: Default::default(),
     };
     let decision = rules.judge(&ctx, &call, &info).await;
     let RuleDecision::Ask(request) = decision else {
@@ -3973,6 +3976,7 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
         annotations: sdk::ToolAnnotations::default(),
         access: sdk::AccessManifest::default(),
         effects: sdk::CallEffects::unknown(),
+        outbound: Default::default(),
     };
     let decision = rules.judge(&ctx, &call, &info).await;
     let RuleDecision::Ask(request) = &decision else {
@@ -4067,6 +4071,7 @@ fn unknown_effects_info() -> sdk::ToolInfo {
         annotations: sdk::ToolAnnotations::default(),
         access: sdk::AccessManifest::default(),
         effects: sdk::CallEffects::unknown(),
+        outbound: Default::default(),
     }
 }
 

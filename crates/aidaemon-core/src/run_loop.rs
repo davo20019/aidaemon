@@ -596,6 +596,7 @@ impl<'a> Driver<'a> {
                 annotations,
                 access: tool.access(&call.arguments),
                 effects: tool.effects(&call.arguments),
+                outbound: tool.outbound(&call.arguments),
             };
 
             // Hooks must see the results of earlier calls in this batch (a

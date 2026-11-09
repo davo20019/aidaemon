@@ -353,6 +353,7 @@ mod annotation_tests {
                 annotations,
                 access: aidaemon_core::AccessManifest::default(),
                 effects: tool.call_effects("{}"),
+                outbound: Default::default(),
             };
             let call = aidaemon_core::ToolCall::new("c1", "synthetic_tool", serde_json::json!({}));
             let read_only =

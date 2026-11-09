@@ -992,6 +992,10 @@ impl Tool for WebFetch {
         }
     }
 
+    fn outbound(&self, arguments: &Value) -> aidaemon_core::Outbound {
+        outbound_of_url(arguments)
+    }
+
     /// The host contacted. An unparsable URL is refused by `validate` before
     /// any policy runs; its effects are unknown.
     fn effects(&self, arguments: &Value) -> CallEffects {
@@ -1128,7 +1132,21 @@ impl Tool for WebFetch {
     }
 }
 
+/// A fetch sends its URL and nothing else.
+fn outbound_of_url(arguments: &Value) -> aidaemon_core::Outbound {
+    match arguments.get("url").and_then(Value::as_str) {
+        Some(url) => aidaemon_core::Outbound::Exact(vec![url.to_string()]),
+        None => aidaemon_core::Outbound::Composed,
+    }
+}
+
 impl crate::semantics::ToolSemantics for WebFetch {
+    fn call_outbound(&self, arguments: &str) -> aidaemon_core::Outbound {
+        serde_json::from_str::<Value>(arguments).map_or(aidaemon_core::Outbound::Composed, |args| {
+            outbound_of_url(&args)
+        })
+    }
+
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
             always_offered: true,

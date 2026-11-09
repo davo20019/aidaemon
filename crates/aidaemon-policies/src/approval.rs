@@ -436,6 +436,7 @@ mod tests {
                 ..AccessManifest::default()
             },
             effects: aidaemon_core::CallEffects::unknown(),
+            outbound: Default::default(),
         }
     }
 
@@ -565,6 +566,7 @@ mod rules_tests {
             annotations: SEND,
             access: AccessManifest::default(),
             effects,
+            outbound: Default::default(),
         }
     }
 
@@ -782,6 +784,7 @@ mod rules_tests {
             },
             access: AccessManifest::default(),
             effects: CallEffects::unknown(),
+            outbound: Default::default(),
         };
         assert_eq!(
             never
@@ -800,6 +803,7 @@ mod rules_tests {
             annotations: ToolAnnotations::WRITE,
             access: AccessManifest::default(),
             effects: CallEffects::unknown(),
+            outbound: Default::default(),
         };
         let allowed = ApprovalPolicy::new(ApprovalMode::Never)
             .allow_tool("terminal")
@@ -829,6 +833,7 @@ mod rules_tests {
             annotations: ToolAnnotations::READ_ONLY,
             access: AccessManifest::default(),
             effects: CallEffects::unknown(),
+            outbound: Default::default(),
         };
         assert_eq!(
             allowed
@@ -867,6 +872,7 @@ mod rules_tests {
                 ..AccessManifest::default()
             },
             effects: CallEffects::unknown(),
+            outbound: Default::default(),
         };
         let run = ToolCall::new("c1", "shell", json!({}));
         let blocked = policy
@@ -892,6 +898,7 @@ mod rules_tests {
             annotations: ToolAnnotations::DESTRUCTIVE,
             access: AccessManifest::default(),
             effects: CallEffects::unknown(),
+            outbound: Default::default(),
         };
         let decision = policy.decide("delete_file", &d);
         assert_eq!(owner_request(&decision).risk, ApprovalRisk::Critical);

@@ -1322,6 +1322,13 @@ impl Agent {
                 warn!(session_id, %error, "Could not read tainted turns; the turn starts tainted");
             })
             .ok();
+        // `/clear` deletes the summary, and the taint goes with it.
+        let summary_tainted = conversation_summary.is_some()
+            && crate::agent::conversation_compaction::summary_is_tainted(
+                self.state.as_ref(),
+                session_id,
+            )
+            .await;
         let starts_tainted =
             crate::agent::untrusted::starts_tainted(&crate::agent::untrusted::TaintFacts {
                 user_role,
@@ -1329,6 +1336,7 @@ impl Agent {
                 session_id,
                 projected_turn_ids: &projected_source_turn_ids,
                 tainted_turns: tainted_turns.as_deref(),
+                summary_tainted,
                 inherited: self
                     .inherited_authority
                     .as_ref()
