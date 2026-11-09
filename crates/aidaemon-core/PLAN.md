@@ -115,8 +115,14 @@ measurement gate: keep each one only if N-of-M runs show a gain.
 - [x] Port the daemon's memory (`aidaemon-memory`): facts with supersession,
       episodes, hybrid scoring, decay/retention, fastembed behind a feature,
       model-driven extraction; store/embedder/scorer are swappable traits.
-- [ ] Memory gaps: graph signal (weight kept, always 0), near-duplicate
-      merging, privacy/channel scoping, re-embedding after a model change.
+- [x] Memory gaps in the scope-keyed store (`MemoryStore`, schema v2): graph
+      signal from key-namespace and co-mention links (orders relevant facts,
+      never admits one; facts only), near-duplicate merging through the
+      existing key (`MergeConfig`), privacy/channel scoping
+      (`Memory::recall_facts_for`, `RecallAudience`; a host with shared
+      channels must set `audience_resolver`, because `MemoryTurn` carries no
+      visibility), re-embedding in resumable batches
+      (`Memory::reembed_batch`; nothing schedules it yet).
 
 ### Phase 6: the rest of the framework (done, with gaps)
 Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
