@@ -294,11 +294,7 @@ impl ExecutionGraph {
             .collect()
     }
 
-    pub fn invalidate(
-        &mut self,
-        invalidator_id: &str,
-        target_id: &str,
-    ) -> Result<(), String> {
+    pub fn invalidate(&mut self, invalidator_id: &str, target_id: &str) -> Result<(), String> {
         self.add_edge(
             invalidator_id,
             target_id,

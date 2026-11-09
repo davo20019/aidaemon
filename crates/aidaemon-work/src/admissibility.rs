@@ -15,7 +15,7 @@ use crate::traits::MandateMutationQuotaBlockReason;
 
 /// The state inputs that decide outcome admissibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutcomeState {
+pub struct OutcomeState {
     /// Credible measurements stayed flat across the configured no-progress
     /// window, counted once per measurement cadence.
     pub stagnant: bool,
@@ -27,7 +27,7 @@ pub(crate) struct OutcomeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AdmissibleOutcomes {
+pub struct AdmissibleOutcomes {
     pub act: bool,
     pub wait: bool,
     pub ask: bool,
@@ -37,7 +37,7 @@ pub(crate) struct AdmissibleOutcomes {
 impl AdmissibleOutcomes {
     /// Human-and-model readable list for refusal messages, so a rejected
     /// decision always names what is still possible instead of a dead end.
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if self.act {
             parts.push("ACT (a mutation slot is free)");
@@ -57,7 +57,7 @@ impl AdmissibleOutcomes {
     }
 }
 
-pub(crate) fn admissible_outcomes(state: &OutcomeState) -> AdmissibleOutcomes {
+pub fn admissible_outcomes(state: &OutcomeState) -> AdmissibleOutcomes {
     let quota_temporarily_blocked = matches!(
         state.quota_block,
         Some(

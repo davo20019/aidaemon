@@ -10,14 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::TaskKernelOperationClaim;
 use super::{
     AssistantResponseData, AssistantResponseDisposition, Event, EventType, ExecutorExpectationItem,
     ExecutorExpectationsDeclaredData, ResponseDeliveryData, ResponseDeliveryState,
     TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData, TaskStatus, ToolCallData,
     ToolResultData,
 };
-use super::TaskKernelOperationClaim;
-use aidaemon_tools::LexicalPaths;
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
     RequestObservationTarget, RequestReceiptPredicate, RequestResponseContract,
@@ -25,6 +24,7 @@ use crate::traits::{
     ToolObservationEvidence, ToolOutcomeStatus, ToolSemanticFacet, ToolTargetHint,
     ToolTargetHintKind,
 };
+use aidaemon_tools::LexicalPaths;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2356,14 +2356,14 @@ fn executor_item_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Event, ExecutorExpectationItem, ExecutorExpectationsDeclaredData, TaskContractCompiledData,
-        ToolOutcomeEvidenceSource, ToolReceiptV1,
-    };
     use crate::traits::{
         EvidenceAuthority, EvidencePurpose, RequestCompletionContract, RequestEvidenceRequirement,
         RequestedOutcomeCondition, ToolCallEffect, ToolCallSemantics, ToolEvidenceCapability,
         ToolInvocationStage, ToolReceiptKind, ToolResultProvenance, ToolSemanticScope,
+    };
+    use crate::{
+        Event, ExecutorExpectationItem, ExecutorExpectationsDeclaredData, TaskContractCompiledData,
+        ToolOutcomeEvidenceSource, ToolReceiptV1,
     };
     use serde_json::json;
 

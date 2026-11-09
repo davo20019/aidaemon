@@ -7,12 +7,21 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
-use crate::traits::{
-    ConversationSummary, Goal, GoalSchedule, GoalTokenBudgetStatus, Message, ScheduledRunState,
-    Task, TaskActivity, TokenUsage, TokenUsageRecord,
-};
+#[cfg(test)]
+use crate::traits::Task;
+use crate::traits::{ConversationSummary, Message, TokenUsage, TokenUsageRecord};
 
 use crate::memory::embeddings::EmbeddingService;
+
+impl aidaemon_work::sqlite::WorkDatabase for SqliteStateStore {
+    fn work_pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    fn redact_secrets(&self, text: &str) -> String {
+        crate::tools::sanitize::redact_secrets(text)
+    }
+}
 
 /// Set restrictive file permissions (0600) on the database and WAL files.
 fn set_db_file_permissions(db_path: &str) {
@@ -147,7 +156,7 @@ impl SqliteStateStore {
 
         migrations::migrate_state(&pool).await?;
         crate::nodes::store::migrate(&pool).await?;
-        mandates::enforce_mandate_invariants_on_startup(&pool).await?;
+        aidaemon_work::sqlite::enforce_mandate_invariants_on_startup(&pool).await?;
 
         let pool_for_memory = pool.clone();
         Ok(Self {
@@ -271,20 +280,16 @@ mod dialogue_state;
 mod dynamic_bots;
 mod dynamic_cli_agents;
 mod dynamic_mcp;
-mod goals;
 mod health_checks;
 pub(crate) mod history_search;
-mod mandates;
 mod messages;
 pub(crate) mod migrations;
-mod notifications;
 mod oauth;
 mod prompt_snapshots;
 mod session_channels;
 mod settings;
 mod skills;
 mod token_usage;
-mod work;
 
 #[cfg(test)]
 mod memory_store_tests;
@@ -293,8 +298,8 @@ mod tests;
 
 #[cfg(test)]
 mod turn_id_hydration_tests {
-    use crate::events::EventStoreForTests as _;
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::events::{Event, EventStore, EventType};
     use crate::traits::MessageStore;
 

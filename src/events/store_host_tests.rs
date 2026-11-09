@@ -15,11 +15,7 @@ async fn setup_store() -> (EventStore, tempfile::NamedTempFile) {
     (store, db_file)
 }
 
-async fn append_tool_result(
-    store: &EventStore,
-    session_id: &str,
-    fixture: ToolResultFixture<'_>,
-) {
+async fn append_tool_result(store: &EventStore, session_id: &str, fixture: ToolResultFixture<'_>) {
     let mut payload = json!({
         "tool_call_id": format!(
             "tc-{}-{}",

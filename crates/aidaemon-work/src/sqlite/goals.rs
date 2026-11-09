@@ -2,7 +2,7 @@ use super::*;
 use crate::traits::{GoalNotificationStore, GoalStore, WorkCoordinationStore};
 
 #[async_trait]
-impl crate::traits::GoalStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::GoalStore for S {
     async fn create_goal(&self, goal: &Goal) -> anyhow::Result<()> {
         // Enforce hard cap of 10 active evergreen goals (orchestration only).
         if goal.domain == "orchestration" && goal.goal_type == "continuous" {
@@ -57,7 +57,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .bind(goal.source_episode_id)
         .bind(goal.legacy_int_id)
         .bind(&goal.session_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
 
         if goal.domain == "orchestration" {
@@ -68,7 +68,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
             )
             .bind(&goal.id)
             .bind(&goal.session_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
 
             if goal.goal_type == "finite" && matches!(goal.status.as_str(), "active" | "pending") {
@@ -87,7 +87,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              FROM goals WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
 
         Ok(row.map(|r| {
@@ -163,7 +163,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .bind(goal.source_episode_id)
         .bind(goal.legacy_int_id)
         .bind(&goal.id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
 
         // If a goal is terminal, purge schedules so they don't linger as dead rows.
@@ -174,7 +174,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
         {
             sqlx::query("DELETE FROM goal_schedules WHERE goal_id = ?")
                 .bind(&goal.id)
-                .execute(&self.pool)
+                .execute(self.work_pool())
                 .await?;
         }
 
@@ -191,7 +191,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              WHERE domain = 'orchestration' AND status IN ('active', 'pending')
              ORDER BY created_at DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -246,7 +246,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -294,7 +294,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
 
         if let Some(note) = progress_note {
             let row = sqlx::query(
@@ -357,7 +357,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              ORDER BY created_at DESC",
         )
         .bind(session_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -408,7 +408,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              ORDER BY created_at DESC",
         )
         .bind(session_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -455,7 +455,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
              WHERE id = ? AND domain = 'orchestration' AND status = 'pending_confirmation'",
         )
         .bind(goal_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
 
         let Some(row) = goal_row else {
@@ -481,7 +481,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
         )
         .bind(&now)
         .bind(goal_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
 
         let activated = result.rows_affected() > 0;
@@ -498,7 +498,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
 }
 
 #[async_trait]
-impl crate::traits::TaskStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::TaskStore for S {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
         let dependency_ids = task.dependency_ids().map_err(anyhow::Error::msg)?;
         let goal_run = match self.get_current_goal_run(&task.goal_id).await? {
@@ -532,7 +532,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO tasks (id, goal_id, goal_run_id, description, status, priority, task_order,
              parallel_group, depends_on, agent_id, context, result, error, blocker,
@@ -582,7 +582,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
              FROM tasks WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
 
         Ok(row.map(|r| Task {
@@ -622,7 +622,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE tasks SET description = ?, status = ?, priority = ?, task_order = ?,
              parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
@@ -707,7 +707,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
              ORDER BY task_order ASC",
         )
         .bind(goal_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -742,7 +742,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
              WHERE goal_id = ? AND status IN ('completed', 'skipped')",
         )
         .bind(goal_id)
-        .fetch_one(&self.pool)
+        .fetch_one(self.work_pool())
         .await?;
         Ok(row.get::<i64, _>("cnt"))
     }
@@ -759,11 +759,11 @@ impl crate::traits::TaskStore for SqliteStateStore {
         let redacted_args = activity
             .tool_args
             .as_deref()
-            .map(crate::tools::sanitize::redact_secrets);
+            .map(|text| self.redact_secrets(text));
         let redacted_result = activity
             .result
             .as_deref()
-            .map(crate::tools::sanitize::redact_secrets);
+            .map(|text| self.redact_secrets(text));
 
         sqlx::query(
             "INSERT INTO task_activity (task_id, activity_type, tool_name, tool_args,
@@ -778,7 +778,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(activity.success.map(|b| b as i32))
         .bind(activity.tokens_used)
         .bind(&activity.created_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -791,7 +791,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
              ORDER BY created_at ASC",
         )
         .bind(task_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -812,7 +812,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
 }
 
 #[async_trait]
-impl crate::traits::GoalScheduleStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
     async fn create_goal_schedule(&self, schedule: &GoalSchedule) -> anyhow::Result<()> {
         if schedule.tz != "local" {
             anyhow::bail!(
@@ -824,7 +824,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
         // Safety: schedules only apply to orchestration goals.
         let domain_row = sqlx::query("SELECT domain FROM goals WHERE id = ?")
             .bind(&schedule.goal_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.work_pool())
             .await?;
         if let Some(row) = domain_row {
             let domain: String = row.get("domain");
@@ -854,7 +854,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
         .bind(&schedule.next_run_at)
         .bind(&schedule.created_at)
         .bind(&schedule.updated_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -865,7 +865,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
              FROM goal_schedules WHERE id = ?",
         )
         .bind(schedule_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
 
         Ok(row.map(|r| GoalSchedule {
@@ -892,7 +892,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
              ORDER BY next_run_at ASC",
         )
         .bind(goal_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -931,7 +931,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
         )
         .bind(&now)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -979,7 +979,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
         .bind(&schedule.next_run_at)
         .bind(&now)
         .bind(&schedule.id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -987,7 +987,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
     async fn delete_goal_schedule(&self, schedule_id: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM goal_schedules WHERE id = ?")
             .bind(schedule_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -998,7 +998,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
     ) -> anyhow::Result<u64> {
         let now = chrono::Utc::now().to_rfc3339();
         let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
 
         // If we're cancelling stale pending confirmations, remove their schedules
         // so they don't appear as "scheduled" (zombie schedules).
@@ -1057,7 +1057,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
                )
              ORDER BY created_at DESC"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(goal_from_list_row).collect())
     }
@@ -1073,7 +1073,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
                AND NOT EXISTS (SELECT 1 FROM mandates m WHERE m.goal_id = goals.id)
              ORDER BY created_at DESC"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(goal_from_list_row).collect())
     }
@@ -1117,7 +1117,7 @@ fn goal_from_list_row(r: &sqlx::sqlite::SqliteRow) -> Goal {
 }
 
 #[async_trait]
-impl crate::traits::GoalBudgetStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::GoalBudgetStore for S {
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE goals
@@ -1126,7 +1126,7 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
                AND status = 'active'
                AND tokens_used_day <> date('now')",
         )
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected())
     }
@@ -1146,7 +1146,7 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
         .bind(budget_daily)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(goal_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -1156,7 +1156,7 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
         goal_id: &str,
         delta_tokens: i64,
     ) -> anyhow::Result<Option<GoalTokenBudgetStatus>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let today = chrono::Utc::now().date_naive().to_string();
 
         // Lazy daily reset keyed by UTC day anchor.
@@ -1203,7 +1203,7 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
 }
 
 #[async_trait]
-impl crate::traits::ScheduledRunStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::ScheduledRunStore for S {
     async fn upsert_scheduled_run_state(&self, state: &ScheduledRunState) -> anyhow::Result<()> {
         let health_json = serde_json::to_string(&state.health)?;
         sqlx::query(
@@ -1229,7 +1229,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
         .bind(health_json)
         .bind(&state.created_at)
         .bind(&state.updated_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -1245,7 +1245,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
              WHERE goal_id = ?",
         )
         .bind(goal_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
 
         Ok(row.map(|r| ScheduledRunState {
@@ -1275,7 +1275,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
              FROM scheduled_recovery_state WHERE goal_id = ?",
         )
         .bind(goal_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         row.map(scheduled_recovery_state_from_row).transpose()
     }
@@ -1304,7 +1304,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
         )
         .bind(i64::from(max_attempts))
         .bind(cooldown_secs)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         rows.into_iter()
             .map(scheduled_recovery_state_from_row)
@@ -1320,7 +1320,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
         )
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(goal_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -1328,14 +1328,14 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
     async fn delete_scheduled_run_state(&self, goal_id: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM scheduled_run_state WHERE goal_id = ?")
             .bind(goal_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(result.rows_affected() > 0)
     }
 }
 
 #[async_trait]
-impl crate::traits::TaskDispatchStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::TaskDispatchStore for S {
     async fn get_pending_tasks_by_priority(&self, limit: i64) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
             "SELECT t.id, t.goal_id, t.description, t.status, t.priority, t.task_order,
@@ -1362,7 +1362,7 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -1417,7 +1417,7 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              ORDER BY started_at ASC",
         )
         .bind(timeout_secs)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -1457,7 +1457,7 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              ORDER BY completed_at DESC",
         )
         .bind(since)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -1493,20 +1493,20 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              WHERE id = ? AND status IN ('running', 'claimed')",
         )
         .bind(task_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() > 0)
     }
 }
 
 #[async_trait]
-impl crate::traits::GoalNotificationStore for SqliteStateStore {
+impl<S: WorkDatabase> crate::traits::GoalNotificationStore for S {
     async fn count_active_evergreen_goals(&self) -> anyhow::Result<i64> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM goals
              WHERE domain = 'orchestration' AND goal_type = 'continuous' AND status = 'active'",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(self.work_pool())
         .await?;
         Ok(row.get::<i64, _>("cnt"))
     }
@@ -1524,7 +1524,7 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
                AND goal_type = 'finite'
                AND notification_attempts < 3",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
 
         Ok(rows
@@ -1569,7 +1569,7 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
         sqlx::query("UPDATE goals SET notified_at = ? WHERE id = ?")
             .bind(&now)
             .bind(goal_id)
-            .execute(&self.pool)
+            .execute(self.work_pool())
             .await?;
         Ok(())
     }
@@ -1598,7 +1598,7 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
         .bind(&now)
         .bind(&now)
         .bind(&cutoff)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
 
         Ok(result.rows_affected())

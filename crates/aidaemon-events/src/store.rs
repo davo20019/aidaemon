@@ -17,8 +17,8 @@ use super::{
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, RunAggregate,
     TaskContractCompiledData, TaskEndData, TaskStatus, ToolCallData, ToolResultData,
 };
-use aidaemon_tools::LexicalPaths;
 use crate::traits::{Message, TokenUsage};
+use aidaemon_tools::LexicalPaths;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedResponseRef {
@@ -1334,9 +1334,7 @@ impl EventStore {
         let Some(event_id) = event_id else {
             return Ok(None);
         };
-        self.host
-            .project_memory_span(&self.pool, event_id)
-            .await?;
+        self.host.project_memory_span(&self.pool, event_id).await?;
         let projected = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ? AND deleted_at IS NULL",
         )
@@ -2664,9 +2662,7 @@ impl EventStore {
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
                 crate::TaskOutcome::Succeeded
             }
-            (TaskStatus::Completed | TaskStatus::Interrupted, _) => {
-                crate::TaskOutcome::Partial
-            }
+            (TaskStatus::Completed | TaskStatus::Interrupted, _) => crate::TaskOutcome::Partial,
             (TaskStatus::Failed, _) => crate::TaskOutcome::Failed,
         };
         let efficiency = Some(
@@ -2690,9 +2686,7 @@ impl EventStore {
             receipt_refs: self.task_completion_proof_references(&task_id).await?,
             closed_at: Utc::now().to_rfc3339(),
             proof_basis: match terminal_decision {
-                super::RunTerminalDecision::Succeeded => {
-                    Some(crate::TaskProofBasis::Contract)
-                }
+                super::RunTerminalDecision::Succeeded => Some(crate::TaskProofBasis::Contract),
                 super::RunTerminalDecision::SucceededByEvidence => {
                     Some(crate::TaskProofBasis::Evidence)
                 }
@@ -3343,10 +3337,7 @@ impl EventStore {
     /// when a supervisor has already dropped that agent future.  Keeping this
     /// projection in the event store makes cancellation/crash terminalization
     /// observable instead of silently omitting failed-call cost.
-    pub async fn task_efficiency_data(
-        &self,
-        task_id: &str,
-    ) -> Option<crate::TaskEfficiencyData> {
+    pub async fn task_efficiency_data(&self, task_id: &str) -> Option<crate::TaskEfficiencyData> {
         let summary = self.get_task_llm_stats(task_id).await.ok()?;
         if summary.total_calls == 0 {
             return None;
@@ -5974,8 +5965,10 @@ mod tests {
     async fn policy_metric_history_keeps_only_latest_cumulative_snapshot_per_boot() {
         let (store, _db_file) = setup_store().await;
         for (boot_id, samples) in [("boot-a", 1_u64), ("boot-b", 4), ("boot-a", 7)] {
-            let mut metrics = crate::PolicyMetricsData::default();
-            metrics.tool_exposure_samples = samples;
+            let metrics = crate::PolicyMetricsData {
+                tool_exposure_samples: samples,
+                ..Default::default()
+            };
             append_event_at(
                 &store,
                 "synthetic-policy-session",

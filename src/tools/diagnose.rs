@@ -1997,8 +1997,8 @@ impl crate::traits::ToolSemantics for DiagnoseTool {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::EventStoreForTests as _;
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::testing::CallWithFacts;
     use chrono::{Duration, Utc};
 

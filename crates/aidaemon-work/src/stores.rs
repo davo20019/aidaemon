@@ -32,7 +32,10 @@ pub trait GoalStore: Send + Sync {
     }
 
     /// Get active personal goals (tracked, never dispatched).
-    async fn get_active_personal_goals(&self, _limit: i64) -> anyhow::Result<Vec<crate::traits::Goal>> {
+    async fn get_active_personal_goals(
+        &self,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<crate::traits::Goal>> {
         Ok(vec![])
     }
 
@@ -48,7 +51,10 @@ pub trait GoalStore: Send + Sync {
 
     /// Get orchestration goals for a specific session.
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_goals_for_session(&self, _session_id: &str) -> anyhow::Result<Vec<crate::traits::Goal>> {
+    async fn get_goals_for_session(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Vec<crate::traits::Goal>> {
         Ok(vec![])
     }
 
@@ -85,7 +91,10 @@ pub trait MandateStore: Send + Sync {
         Ok(None)
     }
 
-    async fn get_mandate_for_goal(&self, _goal_id: &str) -> anyhow::Result<Option<crate::traits::Mandate>> {
+    async fn get_mandate_for_goal(
+        &self,
+        _goal_id: &str,
+    ) -> anyhow::Result<Option<crate::traits::Mandate>> {
         Ok(None)
     }
 
@@ -479,7 +488,10 @@ pub trait TaskStore: Send + Sync {
 
     /// Log an activity entry for a task.
     #[allow(dead_code)] // Used in Phase 2
-    async fn log_task_activity(&self, _activity: &crate::traits::TaskActivity) -> anyhow::Result<()> {
+    async fn log_task_activity(
+        &self,
+        _activity: &crate::traits::TaskActivity,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -497,7 +509,10 @@ pub trait TaskStore: Send + Sync {
 #[async_trait]
 pub trait GoalScheduleStore: Send + Sync {
     /// Create a new schedule for a goal.
-    async fn create_goal_schedule(&self, _schedule: &crate::traits::GoalSchedule) -> anyhow::Result<()> {
+    async fn create_goal_schedule(
+        &self,
+        _schedule: &crate::traits::GoalSchedule,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -526,7 +541,10 @@ pub trait GoalScheduleStore: Send + Sync {
     }
 
     /// Update a schedule (full replacement).
-    async fn update_goal_schedule(&self, _schedule: &crate::traits::GoalSchedule) -> anyhow::Result<()> {
+    async fn update_goal_schedule(
+        &self,
+        _schedule: &crate::traits::GoalSchedule,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -641,18 +659,27 @@ pub trait ScheduledRunStore: Send + Sync {
 #[async_trait]
 pub trait TaskDispatchStore: Send + Sync {
     /// Get pending tasks ordered by priority, filtering out those with unmet dependencies.
-    async fn get_pending_tasks_by_priority(&self, _limit: i64) -> anyhow::Result<Vec<crate::traits::Task>> {
+    async fn get_pending_tasks_by_priority(
+        &self,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<crate::traits::Task>> {
         Ok(vec![])
     }
 
     /// Get tasks stuck in running/claimed state longer than timeout_secs.
-    async fn get_stuck_tasks(&self, _timeout_secs: i64) -> anyhow::Result<Vec<crate::traits::Task>> {
+    async fn get_stuck_tasks(
+        &self,
+        _timeout_secs: i64,
+    ) -> anyhow::Result<Vec<crate::traits::Task>> {
         Ok(vec![])
     }
 
     /// Get tasks completed after a given timestamp.
     #[allow(dead_code)]
-    async fn get_recently_completed_tasks(&self, _since: &str) -> anyhow::Result<Vec<crate::traits::Task>> {
+    async fn get_recently_completed_tasks(
+        &self,
+        _since: &str,
+    ) -> anyhow::Result<Vec<crate::traits::Task>> {
         Ok(vec![])
     }
 
@@ -700,7 +727,10 @@ pub trait WorkCoordinationStore: Send + Sync {
         anyhow::bail!("goal runs are not supported by this store")
     }
 
-    async fn get_current_goal_run(&self, _goal_id: &str) -> anyhow::Result<Option<crate::traits::GoalRun>> {
+    async fn get_current_goal_run(
+        &self,
+        _goal_id: &str,
+    ) -> anyhow::Result<Option<crate::traits::GoalRun>> {
         Ok(None)
     }
 
@@ -717,7 +747,10 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(None)
     }
 
-    async fn get_tasks_for_goal_run(&self, _run_id: &str) -> anyhow::Result<Vec<crate::traits::Task>> {
+    async fn get_tasks_for_goal_run(
+        &self,
+        _run_id: &str,
+    ) -> anyhow::Result<Vec<crate::traits::Task>> {
         Ok(vec![])
     }
 
@@ -788,7 +821,10 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(false)
     }
 
-    async fn append_task_journal(&self, _entry: &crate::traits::TaskJournalEntry) -> anyhow::Result<()> {
+    async fn append_task_journal(
+        &self,
+        _entry: &crate::traits::TaskJournalEntry,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -828,7 +864,10 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(false)
     }
 
-    async fn upsert_worker_profile(&self, _profile: &crate::traits::WorkerProfile) -> anyhow::Result<()> {
+    async fn upsert_worker_profile(
+        &self,
+        _profile: &crate::traits::WorkerProfile,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -868,11 +907,17 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok("shared".to_string())
     }
 
-    async fn create_task_workspace(&self, _workspace: &crate::traits::TaskWorkspace) -> anyhow::Result<()> {
+    async fn create_task_workspace(
+        &self,
+        _workspace: &crate::traits::TaskWorkspace,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn update_task_workspace(&self, _workspace: &crate::traits::TaskWorkspace) -> anyhow::Result<()> {
+    async fn update_task_workspace(
+        &self,
+        _workspace: &crate::traits::TaskWorkspace,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -943,7 +988,10 @@ pub trait GoalNotificationStore: Send + Sync {
 #[async_trait]
 pub trait NotificationStore: Send + Sync {
     /// Record a background sub-agent that has started.
-    async fn record_background_spawn(&self, _spawn: &crate::traits::BackgroundSpawn) -> anyhow::Result<()> {
+    async fn record_background_spawn(
+        &self,
+        _spawn: &crate::traits::BackgroundSpawn,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -966,7 +1014,10 @@ pub trait NotificationStore: Send + Sync {
     }
 
     /// Enqueue a notification for delivery.
-    async fn enqueue_notification(&self, _entry: &crate::traits::NotificationEntry) -> anyhow::Result<()> {
+    async fn enqueue_notification(
+        &self,
+        _entry: &crate::traits::NotificationEntry,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

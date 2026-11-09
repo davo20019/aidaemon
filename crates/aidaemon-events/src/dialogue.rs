@@ -612,9 +612,7 @@ impl DialogueState {
     /// Project the persisted dialogue lifecycle into the shared obligation
     /// graph. Relationships come exclusively from stable IDs and typed status;
     /// no response wording participates in whether work remains open.
-    pub fn obligation_graph(
-        &self,
-    ) -> Result<crate::execution_graph::ExecutionGraph, String> {
+    pub fn obligation_graph(&self) -> Result<crate::execution_graph::ExecutionGraph, String> {
         use crate::execution_graph::{
             ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
         };

@@ -233,10 +233,7 @@ pub trait TokenUsageStore: Send + Sync {
     }
 
     /// Get token usage records since a given datetime string (ISO 8601).
-    async fn get_token_usage_since(
-        &self,
-        _since: &str,
-    ) -> anyhow::Result<Vec<TokenUsageRecord>> {
+    async fn get_token_usage_since(&self, _since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
         Ok(vec![]) // default no-op
     }
 

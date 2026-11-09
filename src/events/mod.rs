@@ -32,9 +32,10 @@ pub(crate) use aidaemon_events::store::GeneratedResponseRef;
 pub(crate) use aidaemon_events::store::{capture_generated_responses, CapturedGeneratedResponse};
 #[allow(unused_imports)]
 pub use aidaemon_events::store::{
-    ContinuationToolEvidence, EventEmitter, EventHost, EventStore, LlmStats, PolicyGraduationReport,
-    ProviderReadiness, SessionWriteDrift, TaskLlmSummary, TaskReceiptClosure, TaskWindowStats,
-    ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
+    ContinuationToolEvidence, EventEmitter, EventHost, EventStore, LlmStats,
+    PolicyGraduationReport, ProviderReadiness, SessionWriteDrift, TaskLlmSummary,
+    TaskReceiptClosure, TaskWindowStats, ToolStats, WriteConsistencyGateStatus,
+    WriteConsistencyReport, WriteConsistencyThresholds,
 };
 #[allow(unused_imports)]
 pub use aidaemon_events::terminal_state::TerminalState;
@@ -61,8 +62,12 @@ impl EventHost for DaemonEventHost {
         pool: &sqlx::SqlitePool,
         event_id: i64,
     ) -> anyhow::Result<()> {
-        aidaemon_memory::sqlite::project_event_span(pool, &crate::memory::DaemonChannelIds, event_id)
-            .await?;
+        aidaemon_memory::sqlite::project_event_span(
+            pool,
+            &crate::memory::DaemonChannelIds,
+            event_id,
+        )
+        .await?;
         Ok(())
     }
 

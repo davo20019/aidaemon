@@ -1715,8 +1715,8 @@ get_app_state below. Call get_app_state to re-read the current screen if you nee
 
 #[cfg(test)]
 mod tests {
-    use crate::events::EventStoreForTests as _;
     use super::*;
+    use crate::events::EventStoreForTests as _;
 
     #[test]
     fn projection_ids_are_extracted_and_removed_before_provider_dispatch() {

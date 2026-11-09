@@ -508,8 +508,8 @@ impl crate::traits::ToolSemantics for SendFileTool {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::EventStoreForTests as _;
     use super::*;
+    use crate::events::EventStoreForTests as _;
     use crate::events::{ResourceProvenance, ResourceRegisteredData};
     use crate::testing::CallWithFacts;
     use crate::tools::file_delivery::is_recoverable_source;

@@ -12,7 +12,6 @@ mod people;
 mod tools;
 mod trigger_event;
 
-pub use channels::{ChannelCapabilities, HubChannel};
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,
@@ -29,21 +28,18 @@ pub use aidaemon_events::dialogue::{
     RequestVerificationTarget, RequestVerificationTargetKind, RequestedOutcomeCondition,
     UserRequestBinding, UserTurnKind, UserTurnSummary,
 };
-pub use dynamic::{
-    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
-    OAuthConnection, PendingOAuthFlow, SkillDraft,
+pub use aidaemon_events::provider::{
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };
+#[allow(unused_imports)]
 pub(crate) use aidaemon_work::goals::{task_execution_graph, ExpiredAttemptRecovery};
+#[allow(unused_imports)]
 pub use aidaemon_work::goals::{
     BackgroundSpawn, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact,
     NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
     ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
     TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
     WorkerProfile, DEFAULT_PROJECT_ID,
-};
-pub use history::{
-    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
-    ProjectionStats, RecentToolTurn, TaskBookends,
 };
 #[allow(unused_imports)]
 pub use aidaemon_work::mandates::{
@@ -62,6 +58,15 @@ pub use aidaemon_work::mandates::{
     MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
     SAFE_FALLBACK_WAIT_RATIONALE,
 };
+pub use channels::{ChannelCapabilities, HubChannel};
+pub use dynamic::{
+    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
+    OAuthConnection, PendingOAuthFlow, SkillDraft,
+};
+pub use history::{
+    HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,
+    ProjectionStats, RecentToolTurn, TaskBookends,
+};
 #[allow(unused_imports)]
 pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, ExtractedMemoryEntity,
@@ -70,9 +75,6 @@ pub use memory::{
     PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
-pub use aidaemon_events::provider::{
-    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
-};
 pub(crate) use tools::NothingSentError;
 #[cfg(test)]
 pub use tools::ToolCalls;

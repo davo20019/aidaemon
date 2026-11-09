@@ -24,12 +24,14 @@ use crate::tools::process_control::{
     configure_command_for_process_group, send_sigkill, send_sigterm, terminate_process_tree,
 };
 
+use aidaemon_tools::backend::{
+    normalize_lexically, normalize_local_lexically, normalize_posix_absolute,
+};
 pub use aidaemon_tools::{
     shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
     CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
     SpawnedProcess, WriteMode,
 };
-use aidaemon_tools::backend::{normalize_lexically, normalize_local_lexically, normalize_posix_absolute};
 
 pub type SharedExecutionBackend = Arc<dyn ExecutionBackend>;
 

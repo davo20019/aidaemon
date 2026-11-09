@@ -45,7 +45,7 @@ const MUTATION_EFFECTS: [(&str, ToolMutationEffects); 11] = [
 
 /// Stable, non-sensitive reason code for a rejected mandate action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MandateAuthorityDenial {
+pub enum MandateAuthorityDenial {
     InvalidMandate,
     InvalidAuthority,
     MandateInactive,
@@ -70,7 +70,7 @@ pub(crate) enum MandateAuthorityDenial {
 }
 
 impl MandateAuthorityDenial {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidMandate => "invalid_mandate",
             Self::InvalidAuthority => "invalid_authority",
@@ -98,14 +98,14 @@ impl MandateAuthorityDenial {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MandateAuthorityDecision {
+pub enum MandateAuthorityDecision {
     Allow(MandateAuthorityGrant),
     Deny(MandateAuthorityDenial),
 }
 
 impl MandateAuthorityDecision {
     #[cfg(test)]
-    pub(crate) fn grant(&self) -> Option<&MandateAuthorityGrant> {
+    pub fn grant(&self) -> Option<&MandateAuthorityGrant> {
         match self {
             Self::Allow(grant) => Some(grant),
             Self::Deny(_) => None,
@@ -127,7 +127,7 @@ struct CanonicalTarget {
 /// `action_attempts` field is the current per-cycle mutation-budget input. An
 /// execution integration must still reserve the attempt atomically before it
 /// issues the returned grant to a mutating call.
-pub(crate) fn authorize_mandate_action(
+pub fn authorize_mandate_action(
     mandate: &Mandate,
     decision_cycle: &MandateDecisionCycle,
     tool_name: &str,
@@ -267,7 +267,7 @@ pub(crate) fn authorize_mandate_action(
 /// receive a reusable grant. They still require an exact allowed tool, valid
 /// typed semantics, and any applicable target prefix so an output mandate
 /// cannot roam across unrelated owner data during deliberation.
-pub(crate) fn authorize_mandate_observation(
+pub fn authorize_mandate_observation(
     mandate: &Mandate,
     tool_name: &str,
     arguments_json: &str,
@@ -395,7 +395,7 @@ fn validate_current_context(
 /// reconstructs the pre-reservation count, and recomputes the exact expected
 /// grant. It compares the complete grant, including its mandate/cycle binding,
 /// digest, and budget classification.
-pub(crate) fn validate_mandate_grant(
+pub fn validate_mandate_grant(
     mandate: &Mandate,
     decision_cycle: &MandateDecisionCycle,
     tool_name: &str,
@@ -622,7 +622,7 @@ fn operation_scope_matches(
 /// Match a content-free external signal to an already-confirmed observation
 /// tuple. This is a wake optimization only: the subsequent review still has
 /// to pass the ordinary mandate gate for every observation and mutation.
-pub(crate) fn mandate_accepts_wake_signal(mandate: &Mandate, signal: &MandateWakeSignal) -> bool {
+pub fn mandate_accepts_wake_signal(mandate: &Mandate, signal: &MandateWakeSignal) -> bool {
     if !mandate.autonomy_mode.is_autopilot()
         || !mandate.is_active()
         || !mandate.authority.allow_observations
@@ -660,14 +660,14 @@ pub(crate) fn mandate_accepts_wake_signal(mandate: &Mandate, signal: &MandateWak
 /// already allows; otherwise every review records an unreadable measurement
 /// and the control loop can never close. `metric_source:` identities are
 /// opaque resource names and are checked by the adapter that reads them.
-pub(crate) fn validate_objective_measurement_source(mandate: &Mandate) -> Result<(), String> {
+pub fn validate_objective_measurement_source(mandate: &Mandate) -> Result<(), String> {
     match mandate.objective_control.as_ref() {
         Some(control) => measurement_source_is_authorized(&mandate.authority, control),
         None => Ok(()),
     }
 }
 
-pub(crate) fn measurement_source_is_authorized(
+pub fn measurement_source_is_authorized(
     authority: &crate::traits::MandateAuthority,
     control: &crate::traits::MandateObjectiveControl,
 ) -> Result<(), String> {
@@ -710,9 +710,9 @@ pub(crate) fn measurement_source_is_authorized(
 /// Derive the content-safe audit fields persisted with a mutation reservation.
 /// This runs only after the exact semantics passed authority evaluation. URL
 /// query strings and unrecognized resource identifiers are never persisted.
-pub(crate) type MandateMutationAuditScope = (Vec<String>, Vec<MandateMutationTarget>, Vec<String>);
+pub type MandateMutationAuditScope = (Vec<String>, Vec<MandateMutationTarget>, Vec<String>);
 
-pub(crate) fn mutation_audit_scope(
+pub fn mutation_audit_scope(
     semantics: &ToolCallSemantics,
 ) -> Result<MandateMutationAuditScope, MandateAuthorityDenial> {
     if !call_mutates(semantics)? {

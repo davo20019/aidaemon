@@ -3,18 +3,18 @@
 //! Sits on a host's SQLite pool the way `aidaemon-store-sqlite` and
 //! `aidaemon_memory::sqlite` do, and owns the `events` table contract.
 
+pub mod context;
 pub mod conversation;
+pub mod conversation_turn;
 pub mod dialogue;
 pub mod execution_graph;
 pub mod mandate_grant;
-pub mod provider;
-pub mod session;
-pub mod context;
-pub mod conversation_turn;
 pub mod model_call_telemetry;
 pub mod payloads;
+pub mod provider;
 pub mod run_aggregate;
 pub mod schema;
+pub mod session;
 pub mod store;
 pub mod terminal_state;
 pub mod text;
@@ -36,6 +36,10 @@ pub use model_call_telemetry::{
     record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use payloads::*;
+pub use run_aggregate::{
+    CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
+    RunTerminalDecision, TaskKernelAdmission, OWNER_APPROVAL_DECLINED,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use store::GeneratedResponseRef;
 pub use store::{
@@ -45,10 +49,6 @@ pub use store::{
     WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
 };
 pub use terminal_state::TerminalState;
-pub use run_aggregate::{
-    CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
-    RunTerminalDecision, TaskKernelAdmission, OWNER_APPROVAL_DECLINED,
-};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -318,6 +318,7 @@ impl EventType {
 
     /// Parse from string (database storage)
     #[allow(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }
@@ -387,6 +388,7 @@ impl TaskOutcome {
         (*self).into()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }
@@ -402,6 +404,7 @@ impl TaskStatus {
         (*self).into()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }

@@ -1671,10 +1671,7 @@ impl ToolCallData {
     /// Admission compares every claim field atomically. Keeping that projection
     /// in one constructor prevents dispatched and pre-dispatch-rejected paths
     /// from drifting on idempotency, lineage, ownership, or cardinality.
-    pub fn with_task_kernel_claim(
-        mut self,
-        claim: &TaskKernelOperationClaim,
-    ) -> Self {
+    pub fn with_task_kernel_claim(mut self, claim: &TaskKernelOperationClaim) -> Self {
         self.tool_call_id = claim.operation_id.clone();
         self.name = claim.tool_name.clone();
         self.idempotency_key = claim.idempotency_key.clone();

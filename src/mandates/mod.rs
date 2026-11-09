@@ -1,22 +1,15 @@
 //! Owner-authorized autonomous mandate policy.
 
-pub(crate) mod admissibility;
-pub(crate) mod authority;
 pub(crate) mod history;
+
+#[allow(unused_imports)]
+pub use aidaemon_work::MANDATE_PROTOCOL_TOOLS;
+#[allow(unused_imports)]
+pub(crate) use aidaemon_work::{admissibility, authority};
 
 use serde_json::Value;
 
 use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
-
-/// The mandate protocol's own control tools. Their receipts record
-/// bookkeeping, never an observation of the world, so they are never cited as
-/// decision or measurement evidence.
-pub const MANDATE_PROTOCOL_TOOLS: &[&str] = &[
-    "manage_mandates",
-    "manage_goal_tasks",
-    "track_requirements",
-    "report_blocker",
-];
 
 /// Whether the tool named `tool_name` is on the list a mandate never
 /// delegates. Where the tool itself is at hand, use [`is_non_delegable`],

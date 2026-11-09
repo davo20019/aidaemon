@@ -2,9 +2,9 @@ use async_trait::async_trait;
 
 pub use aidaemon_events::provider::TokenUsageStore;
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
+pub use aidaemon_tools::services::{OAuthGatewayStore, OAuthStore, SettingsStore};
 #[allow(unused_imports)]
 pub use aidaemon_work::stores::*;
-pub use aidaemon_tools::services::{OAuthGatewayStore, OAuthStore, SettingsStore};
 
 /// Session message storage and context retrieval.
 #[async_trait]
@@ -83,7 +83,6 @@ pub trait DialogueStateStore: Send + Sync {
     #[allow(dead_code)]
     async fn delete_dialogue_state(&self, session_id: &str) -> anyhow::Result<()>;
 }
-
 
 /// Learning storage lives in the SDK memory crate.
 pub use aidaemon_memory::LearningStore;

@@ -94,14 +94,12 @@ fn task_from_row(row: &sqlx::sqlite::SqliteRow) -> Task {
     }
 }
 
-async fn insert_journal(
+async fn insert_journal<S: WorkDatabase>(
+    db: &S,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     entry: &TaskJournalEntry,
 ) -> anyhow::Result<()> {
-    let payload = entry
-        .payload
-        .as_deref()
-        .map(crate::tools::sanitize::redact_secrets);
+    let payload = entry.payload.as_deref().map(|text| db.redact_secrets(text));
     sqlx::query(
         "INSERT INTO task_journal
             (id, project_id, goal_id, goal_run_id, task_id, attempt_id,
@@ -118,7 +116,7 @@ async fn insert_journal(
     .bind(&entry.actor_type)
     .bind(&entry.actor_id)
     .bind(&entry.source_channel)
-    .bind(crate::tools::sanitize::redact_secrets(&entry.body))
+    .bind(db.redact_secrets(&entry.body))
     .bind(payload)
     .bind(&entry.created_at)
     .execute(&mut **tx)
@@ -165,7 +163,7 @@ async fn close_pending_task_escalations(
 }
 
 #[async_trait]
-impl WorkCoordinationStore for SqliteStateStore {
+impl<S: WorkDatabase> WorkCoordinationStore for S {
     async fn create_work_project(
         &self,
         name: &str,
@@ -194,7 +192,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(&project.description)
         .bind(&project.created_at)
         .bind(&project.updated_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(project)
     }
@@ -204,7 +202,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             "SELECT id, name, description, created_at, updated_at
              FROM work_projects ORDER BY name COLLATE NOCASE",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows
             .iter()
@@ -223,7 +221,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             "SELECT project_id FROM session_work_projects WHERE session_id = ?",
         )
         .bind(session_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(project.unwrap_or_else(|| DEFAULT_PROJECT_ID.to_string()))
     }
@@ -236,7 +234,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         let exists =
             sqlx::query_scalar::<_, i64>("SELECT 1 FROM work_projects WHERE id = ? LIMIT 1")
                 .bind(project_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.work_pool())
                 .await?
                 .is_some();
         if !exists {
@@ -250,7 +248,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .bind(session_id)
         .bind(project_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(true)
     }
@@ -269,7 +267,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             ),
             "unsupported goal run trigger type"
         );
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let project_id = sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM goals
              WHERE id = ? AND domain = 'orchestration'",
@@ -363,7 +361,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY julianday(started_at) DESC, id DESC LIMIT 1",
         )
         .bind(goal_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.as_ref().map(goal_run_from_row))
     }
@@ -376,7 +374,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY julianday(started_at) DESC, id DESC",
         )
         .bind(goal_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(goal_run_from_row).collect())
     }
@@ -391,7 +389,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              WHERE t.id = ?",
         )
         .bind(task_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.as_ref().map(goal_run_from_row))
     }
@@ -405,7 +403,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY task_order ASC, julianday(created_at) ASC, id ASC",
         )
         .bind(run_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(task_from_row).collect())
     }
@@ -431,7 +429,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         // writer commits between the read and the write. Take the write lock
         // up front so lifecycle reconciliation waits instead of failing with
         // "database is locked" (same shape as the claim/bind fixes).
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let run = sqlx::query(
             "SELECT gr.goal_id, gr.status AS prior_status, gr.trigger_type, gr.root_task_id,
                     g.goal_type, g.session_id,
@@ -792,7 +790,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         let lease_secs = normalized_lease_secs(lease_secs);
         let now = chrono::Utc::now();
         let expires = now + chrono::Duration::seconds(lease_secs);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT t.goal_id, t.goal_run_id, t.worker_profile_id, g.project_id
              FROM tasks t JOIN goals g ON g.id = t.goal_id
@@ -932,7 +930,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             &format!("Claimed by worker profile {}", profile_id),
         )
         .with_task(Some(task_id), Some(&attempt.id));
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(Some(attempt))
     }
@@ -948,7 +946,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              WHERE t.id = ? AND a.status IN ('claimed', 'running')",
         )
         .bind(task_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.as_ref().map(task_attempt_from_row))
     }
@@ -965,7 +963,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         // lose a race to another WAL writer, and fail on promotion with
         // SQLITE_BUSY_SNAPSHOT (extended code 517). Reserve the writer slot
         // before reading so the snapshot can always be committed.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT a.worker_profile_id, g.project_id
              FROM task_attempts a
@@ -1080,7 +1078,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(lease_secs)
         .bind(attempt_id)
         .bind(lease_token)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1102,7 +1100,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         // deferred transaction can read a valid lease, lose a race to another
         // WAL writer, and then fail promotion with SQLITE_BUSY_SNAPSHOT. That
         // previously stranded freshly dispatched work in `claimed` state.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT a.task_id, a.goal_run_id, a.status AS attempt_status,
                     t.goal_id, g.project_id
@@ -1226,20 +1224,20 @@ impl WorkCoordinationStore for SqliteStateStore {
             .bind(&handoff.id)
             .bind(&handoff.task_id)
             .bind(&handoff.attempt_id)
-            .bind(crate::tools::sanitize::redact_secrets(&handoff.summary))
+            .bind(self.redact_secrets(&handoff.summary))
             .bind(artifacts)
             .bind(verification)
             .bind(
                 handoff
                     .remaining_risk
                     .as_deref()
-                    .map(crate::tools::sanitize::redact_secrets),
+                    .map(|text| self.redact_secrets(text)),
             )
             .bind(
                 handoff
                     .next_step
                     .as_deref()
-                    .map(crate::tools::sanitize::redact_secrets),
+                    .map(|text| self.redact_secrets(text)),
             )
             .bind(&handoff.created_at)
             .execute(&mut *tx)
@@ -1269,7 +1267,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             body,
         )
         .with_task(Some(&task_id), Some(attempt_id));
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1282,13 +1280,13 @@ impl WorkCoordinationStore for SqliteStateStore {
                AND datetime(lease_expires_at) > datetime('now')",
         )
         .bind(run_id)
-        .fetch_one(&self.pool)
+        .fetch_one(self.work_pool())
         .await?;
         Ok(live > 0)
     }
 
     async fn recover_expired_task_attempts(&self) -> anyhow::Result<Vec<String>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.task_id, a.goal_run_id,
                     t.goal_id, g.project_id, t.idempotent, t.retry_count,
@@ -1397,15 +1395,15 @@ impl WorkCoordinationStore for SqliteStateStore {
                 body,
             )
             .with_task(Some(&task_id), Some(&attempt_id));
-            insert_journal(&mut tx, &journal).await?;
+            insert_journal(self, &mut tx, &journal).await?;
         }
         tx.commit().await?;
         Ok(affected)
     }
 
     async fn append_task_journal(&self, entry: &TaskJournalEntry) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        insert_journal(&mut tx, entry).await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
+        insert_journal(self, &mut tx, entry).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1423,7 +1421,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .bind(task_id)
         .bind(limit.clamp(1, 200))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows
             .iter()
@@ -1453,7 +1451,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(!resolution.trim().is_empty(), "resolution cannot be empty");
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1507,7 +1505,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .with_task(Some(task_id), attempt_id.as_deref())
         .with_source_channel(source_channel);
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1518,7 +1516,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1557,7 +1555,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .with_task(Some(task_id), None)
         .with_source_channel(source_channel);
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1568,7 +1566,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1614,7 +1612,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .with_task(Some(task_id), attempt_id.as_deref())
         .with_source_channel(source_channel);
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1663,7 +1661,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(profile.enabled as i64)
         .bind(&profile.created_at)
         .bind(&profile.updated_at)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -1676,7 +1674,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              FROM worker_profiles WHERE id = ?",
         )
         .bind(profile_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.as_ref().map(worker_profile_from_row))
     }
@@ -1694,7 +1692,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY name COLLATE NOCASE",
         )
         .bind(project_id.unwrap_or(DEFAULT_PROJECT_ID))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows.iter().map(worker_profile_from_row).collect())
     }
@@ -1706,7 +1704,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1751,7 +1749,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .with_task(Some(task_id), None)
         .with_source_channel(source_channel);
-        insert_journal(&mut tx, &journal).await?;
+        insert_journal(self, &mut tx, &journal).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1773,7 +1771,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         )
         .bind(policy)
         .bind(task_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1792,13 +1790,13 @@ impl WorkCoordinationStore for SqliteStateStore {
              WHERE t.id = ?",
         )
         .bind(task_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?
         .unwrap_or_else(|| "shared".to_string()))
     }
 
     async fn create_task_workspace(&self, workspace: &TaskWorkspace) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO task_workspaces
                 (id, task_id, attempt_id, backend_id, policy, root_path,
@@ -1844,7 +1842,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(&workspace.id)
         .bind(&workspace.task_id)
         .bind(&workspace.attempt_id)
-        .execute(&self.pool)
+        .execute(self.work_pool())
         .await?;
         Ok(())
     }
@@ -1857,7 +1855,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY julianday(created_at) DESC, id DESC LIMIT 1",
         )
         .bind(task_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.map(|row| TaskWorkspace {
             id: row.get("id"),
@@ -1883,7 +1881,7 @@ impl WorkCoordinationStore for SqliteStateStore {
              ORDER BY julianday(created_at) DESC, id DESC LIMIT 1",
         )
         .bind(task_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.work_pool())
         .await?;
         Ok(row.map(|row| {
             let artifacts = row
@@ -1987,7 +1985,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(project_id)
         .bind(include_terminal)
         .bind(limit.clamp(1, 200))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows
             .iter()
@@ -2079,7 +2077,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(lane)
         .bind(lane)
         .bind(limit.clamp(1, 500))
-        .fetch_all(&self.pool)
+        .fetch_all(self.work_pool())
         .await?;
         Ok(rows
             .iter()
@@ -2106,21 +2104,13 @@ impl WorkCoordinationStore for SqliteStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::store_prelude::*;
+    use crate::traits::*;
     use crate::traits::{Goal, GoalSchedule, Task};
     use std::sync::Arc;
 
-    async fn test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
+    async fn test_store() -> (SqliteWorkStore, tempfile::NamedTempFile) {
         let database = tempfile::NamedTempFile::new().unwrap();
-        let store = SqliteStateStore::new(
-            database.path().to_str().unwrap(),
-            100,
-            None,
-            Arc::new(EmbeddingService::new().unwrap()),
-        )
-        .await
-        .unwrap();
+        let store = open_for_tests(database.path().to_str().unwrap()).await;
         (store, database)
     }
 
@@ -3081,7 +3071,7 @@ mod tests {
                 "task_id": recovery_task.id,
                 "tool_call_id": proof_receipt_id,
                 "receipt": {
-                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "schema_version": aidaemon_events::ToolReceiptV1::SCHEMA_VERSION,
                     "outcome_status": "succeeded",
                     "outcome_evidence": "structured_metadata"
                 }
@@ -3246,7 +3236,7 @@ mod tests {
                 "task_id": uuid::Uuid::new_v4().to_string(),
                 "tool_call_id": proof_receipt_id,
                 "receipt": {
-                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "schema_version": aidaemon_events::ToolReceiptV1::SCHEMA_VERSION,
                     "outcome_status": "succeeded",
                     "outcome_evidence": "tool_reported"
                 }
