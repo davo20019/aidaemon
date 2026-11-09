@@ -143,7 +143,6 @@ const VERIFIER_PURPOSE: &str = "untrusted_call_verifier";
 const VERIFIER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The proposed call's arguments are capped at this many characters.
 const VERIFIER_ARGUMENT_CHARS: usize = 4000;
-const VERIFIER_MAX_OUTPUT_TOKENS: u32 = 400;
 /// A value longer than this may be cut; shorter ones always reach the
 /// verifier whole.
 const VERIFIER_SHORT_VALUE_CHARS: usize = 200;
@@ -313,6 +312,21 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
     }
 }
 
+/// No output cap: thinking counts against it on models that think, and a cut
+/// reply fails closed as a false refusal. `VERIFIER_TIMEOUT` bounds the call.
+fn verifier_options() -> ChatOptions {
+    ChatOptions {
+        response_mode: ResponseMode::JsonSchema {
+            name: VERIFIER_PURPOSE.to_string(),
+            schema: verifier_schema(),
+            strict: true,
+        },
+        reasoning_effort_override: Some("low".to_string()),
+        single_attempt_fail_closed: true,
+        ..ChatOptions::default()
+    }
+}
+
 /// Ask a clean model whether performing exactly this call is consistent with
 /// and needed for the owner's request. One tool-less call on the primary
 /// model, moving to the failover providers only while the provider cannot
@@ -332,17 +346,7 @@ pub(in crate::agent) async fn verify_untrusted_call(
 ) -> VerifierVerdict {
     let messages = verifier_messages(origin_request, origin_trusted, tool, description, arguments);
     let snapshot = runtime.snapshot();
-    let options = ChatOptions {
-        response_mode: ResponseMode::JsonSchema {
-            name: VERIFIER_PURPOSE.to_string(),
-            schema: verifier_schema(),
-            strict: true,
-        },
-        max_tokens_override: Some(VERIFIER_MAX_OUTPUT_TOKENS),
-        reasoning_effort_override: Some("low".to_string()),
-        single_attempt_fail_closed: true,
-        ..ChatOptions::default()
-    };
+    let options = verifier_options();
     let outcome = tokio::select! {
         outcome = snapshot.ask_for_judgment(&messages, &options, VERIFIER_TIMEOUT) => outcome,
         _ = cancel.cancelled() => {
@@ -624,6 +628,11 @@ mod tests {
                 reason: "cancelled".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn verifier_sets_no_output_cap() {
+        assert_eq!(verifier_options().max_tokens_override, None);
     }
 
     fn owner_private<'a>(projected: &'a [String], tainted: Option<&'a [String]>) -> TaintFacts<'a> {

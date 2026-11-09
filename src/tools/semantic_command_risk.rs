@@ -21,7 +21,6 @@ use crate::traits::{ChatOptions, StateStore};
 use crate::types::RiskLevel;
 
 pub(crate) const ASSESSMENT_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_OUTPUT_TOKENS: u32 = 320;
 const MAX_REFERENCED_FILES: usize = 3;
 const MAX_REFERENCED_FILE_CHARS: usize = 8_000;
 
@@ -345,7 +344,6 @@ pub(crate) async fn assess_command(
             schema: assessment_schema(),
             strict: true,
         },
-        max_tokens_override: Some(MAX_OUTPUT_TOKENS),
         reasoning_effort_override: Some("low".to_string()),
         single_attempt_fail_closed: true,
         ..ChatOptions::default()
