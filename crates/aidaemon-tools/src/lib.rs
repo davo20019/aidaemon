@@ -49,11 +49,12 @@ mod fs;
 pub mod outcome;
 pub mod path_class;
 mod search;
+mod search_files;
 pub mod semantics;
 pub mod services;
 mod shell;
 mod util;
-mod web;
+pub mod web;
 mod workspace;
 
 #[cfg(test)]
@@ -72,11 +73,12 @@ pub use exec::{
 pub use fs::{
     format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
     FilePolicy, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy, WriteFile,
-    MAX_READ_CHARS,
+    DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
 };
 pub use outcome::OutcomeTool;
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
+pub use search_files::SearchFiles;
 pub use shell::{Shell, DEFAULT_ENV_ALLOWLIST};
 pub use util::sniff_image_mime;
 pub use web::WebFetch;

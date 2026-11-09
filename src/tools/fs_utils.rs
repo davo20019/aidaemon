@@ -6,30 +6,8 @@ use std::time::Duration;
 use crate::execution::{BackendKind, BackendPath, ExecutionBackend, ExecutionRequest};
 use once_cell::sync::Lazy;
 
-/// Directories to skip during recursive file walks.
-pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".tox",
-    ".mypy_cache",
-    ".pytest_cache",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".cache",
-    ".parcel-cache",
-    "coverage",
-    ".turbo",
-    ".gradle",
-    ".idea",
-    ".vs",
-];
+/// Directories to skip during recursive file walks (from the SDK tools crate).
+pub use aidaemon_tools::DEFAULT_IGNORE_DIRS;
 
 /// Path classification lives in the SDK tools crate.
 use aidaemon_tools::path_class::same_file;

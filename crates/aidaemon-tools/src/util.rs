@@ -31,6 +31,15 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> (String, bool) {
     }
 }
 
+/// Truncate to at most `max` characters including a trailing `...`.
+pub(crate) fn truncate_str(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(3)).collect();
+    format!("{kept}...")
+}
+
 /// The MIME type of an image, from its magic bytes.
 pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {

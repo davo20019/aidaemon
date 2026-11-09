@@ -25,6 +25,31 @@ pub use read::{render_read_file_output, render_read_file_output_within, ReadFile
 pub use workspace_backend::WorkspaceBackend;
 pub use write::WriteFile;
 
+/// Directories to skip during recursive file walks.
+pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".cache",
+    ".parcel-cache",
+    "coverage",
+    ".turbo",
+    ".gradle",
+    ".idea",
+    ".vs",
+];
+
 pub(crate) type SharedBackend = Arc<dyn ExecutionBackend>;
 
 /// A tool's model-facing descriptions, for an application that words them
