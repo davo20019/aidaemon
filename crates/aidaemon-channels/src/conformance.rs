@@ -275,7 +275,11 @@ pub async fn check_channel(
         });
         report.record(PARENT_LINK_FORWARDED, result);
     } else {
-        vacuous(&mut report, PARENT_LINK_FORWARDED, "the harness sends no replies");
+        vacuous(
+            &mut report,
+            PARENT_LINK_FORWARDED,
+            "the harness sends no replies",
+        );
     }
 
     for (check, addressed, marker) in [
@@ -372,7 +376,11 @@ pub async fn check_channel(
             ),
         }
     } else {
-        vacuous(&mut report, EDIT_TRUNCATES_LONG_TEXT, "channel has no edits");
+        vacuous(
+            &mut report,
+            EDIT_TRUNCATES_LONG_TEXT,
+            "channel has no edits",
+        );
     }
 
     let prompt = ApprovalPrompt {
@@ -402,7 +410,11 @@ pub async fn check_channel(
         report.note(format!(
             "{BUTTON_PRESS_ROUND_TRIP}: channel has no buttons; check is vacuous"
         ));
-        vacuous(&mut report, ANSWER_MESSAGE_REMOVES_BUTTONS, "channel has no buttons");
+        vacuous(
+            &mut report,
+            ANSWER_MESSAGE_REMOVES_BUTTONS,
+            "channel has no buttons",
+        );
     } else if !ask_ok {
         report.fail(BUTTON_PRESS_ROUND_TRIP, "skipped: ask failed");
         report.fail(ANSWER_MESSAGE_REMOVES_BUTTONS, "skipped: ask failed");

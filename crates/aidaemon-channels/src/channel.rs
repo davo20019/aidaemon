@@ -535,3 +535,151 @@ pub trait Channel: Send + Sync {
             .map(|_| ())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mime_type_outranks_the_name() {
+        assert_eq!(Attachment::new("a.png", "s").kind, AttachmentKind::Image);
+        assert_eq!(Attachment::new("a.MP3", "s").kind, AttachmentKind::Audio);
+        assert_eq!(Attachment::new("a.mov", "s").kind, AttachmentKind::Video);
+        assert_eq!(Attachment::new("a.pdf", "s").kind, AttachmentKind::File);
+        assert_eq!(Attachment::new("noext", "s").kind, AttachmentKind::File);
+        let relabelled = Attachment::new("a.png", "s").with_mime_type(Some("text/plain".into()));
+        assert_eq!(relabelled.kind, AttachmentKind::File);
+        let unlabelled = Attachment::new("a.png", "s").with_mime_type(None);
+        assert_eq!(unlabelled.kind, AttachmentKind::Image);
+    }
+
+    #[test]
+    fn older_or_newer_json_still_reads() {
+        // Written before `kind` and the links existed.
+        let old: InboundMessage = serde_json::from_value(serde_json::json!({
+            "conversation": {"id": "c", "kind": "direct"},
+            "sender": {"id": "synthetic-user-1"},
+            "message_id": "m1",
+            "text": "hi",
+            "attachments": [{"name": "a.bin", "source": "s"}],
+            "addressed": true,
+        }))
+        .unwrap();
+        assert_eq!(old.attachments[0].kind, AttachmentKind::File);
+        assert_eq!(old.parent_message_id, None);
+        assert_eq!(old.thread_id, None);
+        // A kind this version has never heard of.
+        let unknown: Attachment = serde_json::from_value(
+            serde_json::json!({"name": "a", "source": "s", "kind": "hologram"}),
+        )
+        .unwrap();
+        assert_eq!(unknown.kind, AttachmentKind::File);
+        // An unset link is not written out.
+        let written = serde_json::to_value(&old).unwrap();
+        assert!(written.get("parent_message_id").is_none());
+    }
+
+    struct Bare;
+
+    #[async_trait]
+    impl Channel for Bare {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn run(
+            &self,
+            _events: mpsc::Sender<ChannelEvent>,
+            _shutdown: CancellationToken,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            conversation: &Conversation,
+            _message: &OutboundMessage,
+        ) -> Result<MessageRef, ChannelError> {
+            Ok(MessageRef {
+                conversation_id: conversation.id.clone(),
+                message_id: "1".into(),
+            })
+        }
+    }
+
+    /// Overrides only the old method, the way an older adapter would.
+    struct OldAdapter(Vec<u8>);
+
+    #[async_trait]
+    impl Channel for OldAdapter {
+        fn name(&self) -> &str {
+            "old"
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn run(
+            &self,
+            _events: mpsc::Sender<ChannelEvent>,
+            _shutdown: CancellationToken,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            conversation: &Conversation,
+            _message: &OutboundMessage,
+        ) -> Result<MessageRef, ChannelError> {
+            Ok(MessageRef {
+                conversation_id: conversation.id.clone(),
+                message_id: "1".into(),
+            })
+        }
+        async fn download(&self, _attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_defaults_are_safe() {
+        let attachment = Attachment::new("a", "s");
+        assert!(matches!(
+            Bare.download(&attachment).await,
+            Err(ChannelError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Bare.download_limited(&attachment, 10).await,
+            Err(ChannelError::Unsupported(_))
+        ));
+        let message = MessageRef {
+            conversation_id: "c".into(),
+            message_id: "m".into(),
+        };
+        assert!(Bare.remove_buttons(&message).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_older_adapter_is_held_to_the_limit() {
+        let adapter = OldAdapter(vec![0; 11]);
+        let attachment = Attachment::new("a", "s");
+        assert_eq!(
+            adapter
+                .download_limited(&attachment, 11)
+                .await
+                .unwrap()
+                .len(),
+            11
+        );
+        assert!(matches!(
+            adapter.download_limited(&attachment, 10).await,
+            Err(ChannelError::TooLarge { limit_bytes: 10 })
+        ));
+        // A declared size over the limit is refused without fetching.
+        let declared = attachment.with_size_bytes(Some(99));
+        assert!(matches!(
+            OldAdapter(Vec::new()).download_limited(&declared, 10).await,
+            Err(ChannelError::TooLarge { .. })
+        ));
+    }
+}

@@ -205,6 +205,13 @@ pub fn truncate_for_edit(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_edit_is_cut_at_the_end_and_marked() {
+        assert_eq!(truncate_for_edit("short", 5), "short");
+        assert_eq!(truncate_for_edit("toolong", 5), "tool\u{2026}");
+        assert_eq!(truncate_for_edit("😀😀😀", 2), "😀\u{2026}");
+    }
+
     fn len(s: &str) -> usize {
         s.chars().count()
     }
