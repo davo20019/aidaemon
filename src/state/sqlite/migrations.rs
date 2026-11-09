@@ -1355,7 +1355,7 @@ mod schema_golden_tests {
         let database = tempfile::NamedTempFile::new().unwrap();
         let pool = open(database.path()).await;
         migrate_state(&pool).await.unwrap();
-        assert_matches_golden("new_database.txt", &dump(&pool).await);
+        assert_matches_golden("new_database.golden", &dump(&pool).await);
     }
 
     #[tokio::test]
@@ -1366,7 +1366,7 @@ mod schema_golden_tests {
         migrate_state(&pool).await.unwrap();
         // Memory's triggers are rebuilt on every start, so this differs from a
         // new database only by their position.
-        assert_matches_golden("current_database.txt", &dump(&pool).await);
+        assert_matches_golden("current_database.golden", &dump(&pool).await);
     }
 
     #[tokio::test]
@@ -1385,7 +1385,7 @@ mod schema_golden_tests {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
         migrate_state(&pool).await.unwrap();
-        assert_matches_golden("old_goal_database.txt", &dump(&pool).await);
+        assert_matches_golden("old_goal_database.golden", &dump(&pool).await);
         let imported: String =
             sqlx::query_scalar("SELECT description FROM goals WHERE legacy_int_id = 7")
                 .fetch_one(&pool)
