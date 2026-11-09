@@ -256,6 +256,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     )
     .await;
 
+    // Background sub-agents do not survive a restart: tell their chats. Done
+    // before channels start, so nothing running now can be mistaken for lost.
+    crate::tools::spawn::report_interrupted_background_children(
+        &(state.clone() as Arc<dyn crate::traits::StateStore>),
+    )
+    .await;
+
     // 9c. Heartbeat coordinator (replaces individual background task loops)
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
     let startup_runtime::HeartbeatSetup {

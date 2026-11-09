@@ -72,6 +72,22 @@ impl ChildAgentRuntime for Agent {
         })
     }
 
+    async fn background_cancel_token(
+        &self,
+        id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        match self.goal_token_registry.as_ref() {
+            Some(registry) => Some(registry.register(id).await),
+            None => None,
+        }
+    }
+
+    async fn release_background_cancel_token(&self, id: &str) {
+        if let Some(registry) = self.goal_token_registry.as_ref() {
+            registry.remove(id).await;
+        }
+    }
+
     /// A child answers to the chat its chain started from; its own session
     /// has no chat to deliver to.
     fn background_delivery_session(&self, call_session: &str) -> String {

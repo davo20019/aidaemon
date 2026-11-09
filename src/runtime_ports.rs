@@ -150,6 +150,17 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
 
     async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun>;
 
+    /// A token that stops the background child `id` when the owner cancels.
+    async fn background_cancel_token(
+        &self,
+        _id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        None
+    }
+
+    /// Forget the token of a background child that has ended.
+    async fn release_background_cancel_token(&self, _id: &str) {}
+
     /// The session a background child's result belongs to, given the session
     /// of the call that spawned it.
     fn background_delivery_session(&self, call_session: &str) -> String {

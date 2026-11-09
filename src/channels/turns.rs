@@ -476,15 +476,15 @@ fn cancel_reply(
             ));
         }
         if !cancelled_goals.is_empty() {
-            reply.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
+            reply.push_str(&format!(" (+{} more cancelled)", cancelled_goals.len()));
         }
         return reply;
     }
     match cancelled_goals {
         [] => "No running task to cancel.".to_string(),
-        [goal] => format!("⏹️ Cancelled goal: {goal}"),
+        [goal] => format!("⏹️ Cancelled: {goal}"),
         goals => format!(
-            "⏹️ Cancelled {} goals:\n{}",
+            "⏹️ Cancelled {} items:\n{}",
             goals.len(),
             goals
                 .iter()
@@ -830,11 +830,11 @@ mod tests {
         assert_eq!(cancel_reply(&[], 0, &[]), "No running task to cancel.");
         assert_eq!(
             cancel_reply(&[(1, "deploy".into())], 2, &["blog".into()]),
-            "⏹️ Cancelled: deploy (2 queued request(s) will continue in order) (+1 goal(s) cancelled)"
+            "⏹️ Cancelled: deploy (2 queued request(s) will continue in order) (+1 more cancelled)"
         );
         assert_eq!(
             cancel_reply(&[], 0, &["a".into(), "b".into()]),
-            "⏹️ Cancelled 2 goals:\n- a\n- b"
+            "⏹️ Cancelled 2 items:\n- a\n- b"
         );
     }
 }

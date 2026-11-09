@@ -1047,7 +1047,29 @@ impl Agent {
         &self,
         session_id: &str,
     ) -> Vec<String> {
-        self.cancel_session_finite_goals(session_id).await
+        let mut cancelled = self.cancel_session_finite_goals(session_id).await;
+        cancelled.extend(self.cancel_session_background_spawns(session_id).await);
+        cancelled
+    }
+
+    /// Stop the session's background sub-agents; returns what was stopped.
+    async fn cancel_session_background_spawns(&self, session_id: &str) -> Vec<String> {
+        let Some(registry) = self.goal_token_registry.as_ref() else {
+            return Vec::new();
+        };
+        let spawns = self
+            .state
+            .background_spawns_for_session(session_id)
+            .await
+            .unwrap_or_default();
+        let mut cancelled = Vec::new();
+        for spawn in spawns {
+            if registry.cancel(&spawn.id).await {
+                let mission: String = spawn.mission.chars().take(80).collect();
+                cancelled.push(format!("background task: {mission}"));
+            }
+        }
+        cancelled
     }
 
     async fn cancel_session_finite_goals(&self, session_id: &str) -> Vec<String> {

@@ -3348,6 +3348,19 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query(statement).execute(pool).await?;
     }
 
+    // Background sub-agents still running. In-memory work does not survive a
+    // restart; this is how the owner hears that it was lost.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS background_spawns (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            mission TEXT NOT NULL,
+            started_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Normalize task dependency edges. `tasks.depends_on` remains as a JSON
     // compatibility projection, while schedulers and claims use this table as
     // their authoritative graph. The join skips invalid legacy references so

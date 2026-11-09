@@ -1,5 +1,14 @@
 use super::*;
 
+fn background_spawn_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::traits::BackgroundSpawn {
+    crate::traits::BackgroundSpawn {
+        id: row.get("id"),
+        session_id: row.get("session_id"),
+        mission: row.get("mission"),
+        started_at: row.get("started_at"),
+    }
+}
+
 /// Insert the content-free terminal notice for one mandate run on the same
 /// SQLite connection/transaction as its proof-state transition.
 ///
@@ -91,6 +100,54 @@ pub(super) async fn enqueue_mandate_run_notification_on_connection(
 
 #[async_trait]
 impl crate::traits::NotificationStore for SqliteStateStore {
+    async fn record_background_spawn(
+        &self,
+        spawn: &crate::traits::BackgroundSpawn,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO background_spawns (id, session_id, mission, started_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&spawn.id)
+        .bind(&spawn.session_id)
+        .bind(&spawn.mission)
+        .bind(&spawn.started_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn finish_background_spawn(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM background_spawns WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn background_spawns_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<crate::traits::BackgroundSpawn>> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, mission, started_at FROM background_spawns
+             WHERE session_id = ? ORDER BY started_at",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(background_spawn_from_row).collect())
+    }
+
+    async fn take_background_spawns(&self) -> anyhow::Result<Vec<crate::traits::BackgroundSpawn>> {
+        let rows = sqlx::query(
+            "DELETE FROM background_spawns RETURNING id, session_id, mission, started_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(background_spawn_from_row).collect())
+    }
+
     async fn enqueue_notification(
         &self,
         entry: &crate::traits::NotificationEntry,

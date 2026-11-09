@@ -1372,6 +1372,29 @@ pub trait HealthCheckStore: Send + Sync {
 /// Notification delivery queue persistence.
 #[async_trait]
 pub trait NotificationStore: Send + Sync {
+    /// Record a background sub-agent that has started.
+    async fn record_background_spawn(&self, _spawn: &super::BackgroundSpawn) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Forget a background sub-agent that has ended.
+    async fn finish_background_spawn(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The background sub-agents running for a session.
+    async fn background_spawns_for_session(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Vec<super::BackgroundSpawn>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove and return every recorded background sub-agent.
+    async fn take_background_spawns(&self) -> anyhow::Result<Vec<super::BackgroundSpawn>> {
+        Ok(Vec::new())
+    }
+
     /// Enqueue a notification for delivery.
     async fn enqueue_notification(&self, _entry: &super::NotificationEntry) -> anyhow::Result<()> {
         Ok(())

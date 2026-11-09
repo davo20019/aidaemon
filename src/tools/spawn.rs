@@ -277,6 +277,38 @@ fn format_background_completion(
     }
 }
 
+/// How much of a mission a background record keeps.
+const BACKGROUND_MISSION_CHARS: usize = 200;
+
+/// Tell each chat which of its background sub-agents the last shutdown lost.
+pub(crate) async fn report_interrupted_background_children(state: &Arc<dyn StateStore>) {
+    let spawns = match state.take_background_spawns().await {
+        Ok(spawns) => spawns,
+        Err(error) => {
+            warn!(%error, "Could not read interrupted background sub-agents");
+            return;
+        }
+    };
+    for spawn in spawns {
+        let message = format!(
+            "\u{26a0}\u{fe0f} A background task was interrupted by a restart and did not finish.\n\
+             Mission: {}\n\n\
+             It may have done part of the work. Check before running it again.",
+            spawn.mission
+        );
+        enqueue_background_notification(
+            Some(state),
+            "global",
+            &spawn.session_id,
+            "failed",
+            &message,
+            "interrupted background sub-agent notifier",
+            true,
+        )
+        .await;
+    }
+}
+
 /// Queue a background job's notification for later delivery.
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_background_notification(
@@ -365,7 +397,7 @@ impl Tool for SpawnAgentTool {
          `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
          benefits from a fresh context window, or can run in parallel with other work. Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
-         The sub-agent starts with a fresh context and the same tools, so reference files by path and \
+         The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist cannot delegate further), so reference files by path and \
          do not paste prior tool output."
     }
 
@@ -378,7 +410,8 @@ impl Tool for SpawnAgentTool {
                 artifact_writer, comms_draft, ...), benefits from a fresh context window, or can run in \
                 parallel with other work. Do NOT delegate trivial one-shot reads (a single read_file, a \
                 single web_search) — handle those directly. The sub-agent starts with a fresh context and \
-                the same tools, so reference files by path and do not paste prior tool output.",
+                the same tools unless its specialist narrows them (a named specialist cannot delegate \
+                further), so reference files by path and do not paste prior tool output.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -632,6 +665,20 @@ impl Tool for SpawnAgentTool {
         let notify_goal_id = goal_id_ref.clone().unwrap_or_else(|| "global".to_string());
         let notify_status_tx = status_tx.clone();
 
+        let background_id = format!("background_spawn:{}", uuid::Uuid::new_v4());
+        if let Some(state) = state.as_ref() {
+            let record = crate::traits::BackgroundSpawn {
+                id: background_id.clone(),
+                session_id: session_id.clone(),
+                mission: mission.chars().take(BACKGROUND_MISSION_CHARS).collect(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(error) = state.record_background_spawn(&record).await {
+                warn!(%error, "Could not record a background sub-agent");
+            }
+        }
+        let cancel_token = agent.background_cancel_token(&background_id).await;
+
         tokio::spawn(async move {
             // The slot stays taken until this child has finished.
             let _family_permit = family_permit;
@@ -639,34 +686,50 @@ impl Tool for SpawnAgentTool {
             let mut progress_interval =
                 tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
             progress_interval.tick().await; // consume immediate tick
-            let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
-                mission: mission.clone(),
-                task: task.clone(),
-                status_tx: status_tx.clone(),
-                channel_ctx,
-                user_role,
-                child_role,
-                goal_id: goal_id_ref.clone(),
-                task_id: task_id_ref.clone(),
-                project_scope: project_scope.clone(),
-                specialist: args.specialist.clone(),
-                approval_session_id: Some(session_id.clone()),
-                parent_authority: parent_authority.clone(),
-                time_limit,
-            }),);
-            let result: anyhow::Result<ChildAgentRun> = loop {
-                tokio::select! {
-                    res = &mut result_fut => break res,
-                    _ = progress_interval.tick() => {
-                        let elapsed_secs = started_at.elapsed().as_secs();
-                        if let Some(ref tx) = notify_status_tx {
-                            let _ = tx.try_send(StatusUpdate::ToolProgress {
-                                name: "spawn_agent".to_string(),
-                                chunk: format!(
-                                    "Background sub-agent still running ({}s): {}",
-                                    elapsed_secs, mission
-                                ),
-                            });
+            let mut cancelled_by_owner = false;
+            // Scoped so that leaving it drops the child's future, which stops
+            // the child.
+            let result: anyhow::Result<ChildAgentRun> = {
+                let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
+                    mission: mission.clone(),
+                    task: task.clone(),
+                    status_tx: status_tx.clone(),
+                    channel_ctx,
+                    user_role,
+                    child_role,
+                    goal_id: goal_id_ref.clone(),
+                    task_id: task_id_ref.clone(),
+                    project_scope: project_scope.clone(),
+                    specialist: args.specialist.clone(),
+                    approval_session_id: Some(session_id.clone()),
+                    parent_authority: parent_authority.clone(),
+                    time_limit,
+                }),);
+                let owner_cancelled = async {
+                    match cancel_token.as_ref() {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(owner_cancelled);
+                loop {
+                    tokio::select! {
+                        res = &mut result_fut => break res,
+                        _ = &mut owner_cancelled => {
+                            cancelled_by_owner = true;
+                            break Err(anyhow::anyhow!("cancelled by the owner"));
+                        }
+                        _ = progress_interval.tick() => {
+                            let elapsed_secs = started_at.elapsed().as_secs();
+                            if let Some(ref tx) = notify_status_tx {
+                                let _ = tx.try_send(StatusUpdate::ToolProgress {
+                                    name: "spawn_agent".to_string(),
+                                    chunk: format!(
+                                        "Background sub-agent still running ({}s): {}",
+                                        elapsed_secs, mission
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -687,6 +750,14 @@ impl Tool for SpawnAgentTool {
                 Err(_) => SourceTrust::Untrusted,
             };
             let (notification_type, message) = match result {
+                _ if cancelled_by_owner => (
+                    "failed",
+                    format!(
+                        "\u{23f9}\u{fe0f} Background task cancelled\nMission: {}\n\n\
+                         It may have done part of the work.",
+                        mission
+                    ),
+                ),
                 Ok(run) => format_background_completion(
                     &mission,
                     &run.response,
@@ -785,6 +856,13 @@ impl Tool for SpawnAgentTool {
                 )
                 .await;
             }
+
+            if let Some(state) = state.as_ref() {
+                if let Err(error) = state.finish_background_spawn(&background_id).await {
+                    warn!(%error, "Could not clear a background sub-agent's record");
+                }
+            }
+            agent.release_background_cancel_token(&background_id).await;
 
             if let Some(task_id) = executor_task_id_for_bg {
                 executor_task_runs.lock().await.remove(&task_id);
@@ -1314,6 +1392,7 @@ mod child_runtime_tests {
         delay: Duration,
         tasks: StdMutex<Vec<String>>,
         failure: StdMutex<Option<anyhow::Error>>,
+        cancel: tokio_util::sync::CancellationToken,
     }
 
     impl ScriptedChild {
@@ -1323,6 +1402,7 @@ mod child_runtime_tests {
                 delay,
                 tasks: StdMutex::new(Vec::new()),
                 failure: StdMutex::new(None),
+                cancel: tokio_util::sync::CancellationToken::new(),
             })
         }
     }
@@ -1359,6 +1439,12 @@ mod child_runtime_tests {
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
             })
+        }
+        async fn background_cancel_token(
+            &self,
+            _id: &str,
+        ) -> Option<tokio_util::sync::CancellationToken> {
+            Some(self.cancel.clone())
         }
         async fn salvage_executor_task_outcome(
             &self,
@@ -1500,6 +1586,94 @@ mod child_runtime_tests {
         let refused = usize::from(first.is_err()) + usize::from(second.is_err());
         assert_eq!(refused, 1);
         assert_eq!(child.tasks.lock().unwrap().len(), 1);
+    }
+
+    async fn wait_for_notification(store: &SqliteStateStore) -> crate::traits::NotificationEntry {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = store.get_pending_notifications(10).await.unwrap();
+                if let Some(entry) = pending.into_iter().next() {
+                    return entry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a notification arrives")
+    }
+
+    #[tokio::test]
+    async fn a_background_child_is_on_record_only_while_it_runs() {
+        let child = ScriptedChild::new("done", Duration::from_millis(400));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let running = store
+            .background_spawns_for_session("telegram:synthetic-user-1")
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].mission, "Report");
+
+        wait_for_notification(&store).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store
+                .background_spawns_for_session("telegram:synthetic-user-1")
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the record is cleared");
+    }
+
+    #[tokio::test]
+    async fn the_owner_can_cancel_a_background_child() {
+        let child = ScriptedChild::new("never delivered", Duration::from_secs(600));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        child.cancel.cancel();
+
+        let entry = wait_for_notification(&store).await;
+        assert!(entry.message.contains("cancelled"), "{}", entry.message);
+        assert!(!entry.message.contains("never delivered"));
+    }
+
+    #[tokio::test]
+    async fn a_restart_tells_each_chat_what_it_lost() {
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        state
+            .record_background_spawn(&crate::traits::BackgroundSpawn {
+                id: "background_spawn:1".to_string(),
+                session_id: "telegram:synthetic-user-1".to_string(),
+                mission: "Publish the synthetic report".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        report_interrupted_background_children(&state).await;
+
+        let entry = wait_for_notification(&store).await;
+        assert_eq!(entry.session_id, "telegram:synthetic-user-1");
+        assert!(entry.message.contains("interrupted by a restart"));
+        assert!(entry.message.contains("Publish the synthetic report"));
+        assert!(store.take_background_spawns().await.unwrap().is_empty());
     }
 
     /// A task that merely starts like a delay reaches the child at once and

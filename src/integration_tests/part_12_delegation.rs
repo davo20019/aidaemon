@@ -992,3 +992,37 @@ async fn test_child_tokens_count_against_the_requests_tree() {
         .unwrap();
     assert!(family.tokens().load(std::sync::atomic::Ordering::Relaxed) > 0);
 }
+
+/// The owner's cancel reaches a session's background sub-agents.
+#[tokio::test]
+async fn test_cancel_stops_a_sessions_background_children() {
+    use crate::runtime_ports::ChildAgentRuntime;
+    let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), Vec::new())
+        .await
+        .unwrap();
+    let agent = Arc::new(harness.agent);
+    harness
+        .state
+        .record_background_spawn(&crate::traits::BackgroundSpawn {
+            id: "background_spawn:1".to_string(),
+            session_id: "telegram:synthetic-user-1".to_string(),
+            mission: "Publish the synthetic report".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .await
+        .unwrap();
+    let token = agent
+        .background_cancel_token("background_spawn:1")
+        .await
+        .expect("the agent can cancel background work");
+
+    let cancelled = agent
+        .cancel_active_finite_work_for_session("telegram:synthetic-user-1")
+        .await;
+
+    assert!(token.is_cancelled());
+    assert_eq!(
+        cancelled,
+        vec!["background task: Publish the synthetic report".to_string()]
+    );
+}

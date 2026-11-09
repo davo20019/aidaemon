@@ -40,11 +40,11 @@ pub use dynamic::{
 };
 pub(crate) use goals::{task_execution_graph, ExpiredAttemptRecovery};
 pub use goals::{
-    Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact, NotificationEntry,
-    ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState, ScheduledRunHealth,
-    ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff,
-    TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
-    DEFAULT_PROJECT_ID,
+    BackgroundSpawn, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact,
+    NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
+    ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
+    TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
+    WorkerProfile, DEFAULT_PROJECT_ID,
 };
 pub use history::{
     HistoryCoverage, HistoryMessage, HistoryScope, HistorySearchStore, HistoryToolActivity,

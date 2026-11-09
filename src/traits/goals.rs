@@ -744,6 +744,16 @@ pub struct TaskActivity {
 /// Notifications are queued in SQLite when the originating channel is unavailable.
 /// Retention depends on priority: status updates expire after 24 hours,
 /// critical notifications persist indefinitely until delivered.
+/// A background sub-agent still running, recorded so a restart can say it
+/// was lost and a cancel can find it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackgroundSpawn {
+    pub id: String,
+    pub session_id: String,
+    pub mission: String,
+    pub started_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationEntry {
     pub id: String,
