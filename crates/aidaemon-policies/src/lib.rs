@@ -69,7 +69,8 @@ pub use otel::{otlp_provider, OtelSink};
 pub use redact::{secret_patterns, Redactor};
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{
-    catastrophic_reason, command_segments, credential_path_segment, irreversible_delete_reason,
+    catastrophic_reason, command_segments, contains_shell_operator, credential_path_segment,
+    irreversible_delete_reason,
 };
 pub use tracing_sink::TracingSink;
 pub use untrusted::{wrap_untrusted, UntrustedOutput, UNTRUSTED_PREFIX, UNTRUSTED_SUFFIX};

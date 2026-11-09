@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use aidaemon_policies::contains_shell_operator;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -943,46 +944,6 @@ pub struct TerminalTool {
     command_risk_runtime: OnceLock<SharedLlmRuntime>,
     /// How long the semantic assessment may take before it fails closed.
     assessment_timeout: Duration,
-}
-
-/// Check if a command string contains shell operators.
-/// Used for prefix matching - we don't allow prefix matches for commands with operators
-/// since "cargo" shouldn't match "cargo test | bash".
-fn contains_shell_operator(cmd: &str) -> bool {
-    // Must be quote-aware: operators inside single/double quotes are not shell operators
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < len {
-        let b = bytes[i];
-        match b {
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                i += 1;
-            }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                i += 1;
-            }
-            b'\\' if (in_double || in_single) && i + 1 < len => {
-                i += 2; // skip escaped char
-            }
-            _ if in_single || in_double => {
-                i += 1; // inside quotes, skip
-            }
-            b';' | b'|' | b'`' | b'\n' => return true,
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
-            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            b'>' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            b'<' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    false
 }
 
 /// Split a chained command into individual segments by pipe, semicolon, &&, ||.
@@ -11390,43 +11351,6 @@ mod tests {
         assert!(!outcome.metadata.completion_notifications_enabled);
     }
 
-    // ── contains_shell_operator tests ──
-
-    #[test]
-    fn test_shell_operator_semicolon() {
-        assert!(contains_shell_operator("ls; rm -rf"));
-    }
-
-    #[test]
-    fn test_shell_operator_pipe() {
-        assert!(contains_shell_operator("cat file | grep pattern"));
-    }
-
-    #[test]
-    fn test_shell_operator_backtick() {
-        assert!(contains_shell_operator("echo `whoami`"));
-    }
-
-    #[test]
-    fn test_shell_operator_and() {
-        assert!(contains_shell_operator("cmd1 && cmd2"));
-    }
-
-    #[test]
-    fn test_shell_operator_subshell() {
-        assert!(contains_shell_operator("echo $(whoami)"));
-    }
-
-    #[test]
-    fn test_no_shell_operator_clean() {
-        assert!(!contains_shell_operator("cargo build --release"));
-    }
-
-    #[test]
-    fn test_no_shell_operator_flags() {
-        assert!(!contains_shell_operator("ls -la /tmp"));
-    }
-
     #[test]
     fn test_detect_unscoped_recursive_grep_broad_path() {
         let detected = detect_unscoped_recursive_grep(r#"grep -rc "async fn" ."#);
@@ -13286,32 +13210,6 @@ mod tests {
         // Real pipe outside quotes should split
         let segs = split_command_segments("ls -la | grep test");
         assert_eq!(segs, vec!["ls -la", "grep test"]);
-    }
-
-    #[test]
-    fn test_contains_shell_operator_respects_quotes() {
-        // Semicolon inside double quotes — not a shell operator
-        assert!(!contains_shell_operator(
-            r#"python3 -c "import os; print(1)""#
-        ));
-
-        // Semicolon inside single quotes — not a shell operator
-        assert!(!contains_shell_operator("python3 -c 'x=1; y=2'"));
-
-        // Real semicolon outside quotes — IS a shell operator
-        assert!(contains_shell_operator("echo hello; echo world"));
-
-        // && outside quotes
-        assert!(contains_shell_operator("cd /tmp && ls"));
-
-        // && inside quotes — not a shell operator
-        assert!(!contains_shell_operator(r#"echo "a && b""#));
-
-        // Pipe inside quotes — not a shell operator
-        assert!(!contains_shell_operator(r#"echo "hello | world""#));
-
-        // Real pipe
-        assert!(contains_shell_operator("ls | grep test"));
     }
 
     async fn make_tool_with_no_perm_prefixes() -> TerminalTool {

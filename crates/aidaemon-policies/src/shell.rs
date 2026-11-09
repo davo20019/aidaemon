@@ -551,6 +551,50 @@ pub(crate) fn segment_matches_prefix(segment: &[String], prefix: &[String]) -> b
         })
 }
 
+/// Check if a command string contains shell operators.
+/// Used for prefix matching - we don't allow prefix matches for commands with operators
+/// since "cargo" shouldn't match "cargo test | bash".
+///
+/// Everything inside quotes is skipped, including `$(...)` and backticks in
+/// double quotes, which a shell still runs. Do not use this to decide that a
+/// command is safe to run unreviewed.
+pub fn contains_shell_operator(cmd: &str) -> bool {
+    // Must be quote-aware: operators inside single/double quotes are not shell operators
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < len {
+        let b = bytes[i];
+        match b {
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'\\' if (in_double || in_single) && i + 1 < len => {
+                i += 2; // skip escaped char
+            }
+            _ if in_single || in_double => {
+                i += 1; // inside quotes, skip
+            }
+            b';' | b'|' | b'`' | b'\n' => return true,
+            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
+            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            b'>' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            b'<' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +771,66 @@ mod tests {
         assert!(segment_matches_prefix(&seg, &["git".into(), "push".into()]));
         assert!(!segment_matches_prefix(&seg, &["git".into(), "pu".into()]));
         assert!(!segment_matches_prefix(&seg, &[]));
+    }
+
+    #[test]
+    fn test_shell_operator_semicolon() {
+        assert!(contains_shell_operator("ls; rm -rf"));
+    }
+
+    #[test]
+    fn test_shell_operator_pipe() {
+        assert!(contains_shell_operator("cat file | grep pattern"));
+    }
+
+    #[test]
+    fn test_shell_operator_backtick() {
+        assert!(contains_shell_operator("echo `whoami`"));
+    }
+
+    #[test]
+    fn test_shell_operator_and() {
+        assert!(contains_shell_operator("cmd1 && cmd2"));
+    }
+
+    #[test]
+    fn test_shell_operator_subshell() {
+        assert!(contains_shell_operator("echo $(whoami)"));
+    }
+
+    #[test]
+    fn test_no_shell_operator_clean() {
+        assert!(!contains_shell_operator("cargo build --release"));
+    }
+
+    #[test]
+    fn test_no_shell_operator_flags() {
+        assert!(!contains_shell_operator("ls -la /tmp"));
+    }
+
+    #[test]
+    fn test_contains_shell_operator_respects_quotes() {
+        // Semicolon inside double quotes — not a shell operator
+        assert!(!contains_shell_operator(
+            r#"python3 -c "import os; print(1)""#
+        ));
+
+        // Semicolon inside single quotes — not a shell operator
+        assert!(!contains_shell_operator("python3 -c 'x=1; y=2'"));
+
+        // Real semicolon outside quotes — IS a shell operator
+        assert!(contains_shell_operator("echo hello; echo world"));
+
+        // && outside quotes
+        assert!(contains_shell_operator("cd /tmp && ls"));
+
+        // && inside quotes — not a shell operator
+        assert!(!contains_shell_operator(r#"echo "a && b""#));
+
+        // Pipe inside quotes — not a shell operator
+        assert!(!contains_shell_operator(r#"echo "hello | world""#));
+
+        // Real pipe
+        assert!(contains_shell_operator("ls | grep test"));
     }
 }

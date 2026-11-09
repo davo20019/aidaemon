@@ -276,7 +276,7 @@ impl RunCommandTool {
         let trimmed = command.trim();
 
         // Reject shell operators
-        if fs_utils::contains_shell_operator(trimmed) {
+        if fs_utils::mentions_shell_operator(trimmed) {
             return Ok(routing_rejection(
                 "Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands.".to_string(),
                 "terminal",
@@ -789,6 +789,16 @@ mod tests {
     #[tokio::test]
     async fn test_run_shell_operator_rejected() {
         let args = json!({"command": "ls | grep foo"}).to_string();
+        let out = RunCommandTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        assert!(out.contains("Shell operators"));
+    }
+
+    #[tokio::test]
+    async fn test_run_quoted_command_substitution_rejected() {
+        let args = json!({"command": r#"ls "$(id)""#}).to_string();
         let out = RunCommandTool::new(crate::execution::active_execution_backend())
             .call(&args)
             .await
