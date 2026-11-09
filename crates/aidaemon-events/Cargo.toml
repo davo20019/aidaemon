@@ -1,0 +1,32 @@
+[package]
+name = "aidaemon-events"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "aidaemon SDK: the immutable event store, its payloads and the run aggregate (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[features]
+# Test-only behaviour that dependents' test builds need, as `cfg(test)` cannot
+# reach across a crate boundary.
+testing = []
+
+[dependencies]
+aidaemon-policies = { path = "../aidaemon-policies" }
+aidaemon-tools = { path = "../aidaemon-tools" }
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -619,6 +619,14 @@ Order:
           as a table of its own.
         All of this keeps table names, columns and rows as they are, so
         existing databases upgrade with no conversion.
+      - Store move, map (2026-11-09). The owner decided to move the goals and
+        mandates slice and the concrete `EventStore` into crates even without
+        a second consumer; the notes above record the case against. Layout:
+        `aidaemon-events` (event store, payloads, run aggregate and the
+        contract types they use) below `aidaemon-work` (goals, mandates,
+        tasks, work, notifications), because the payloads carry only a
+        mandate grant while the work stores and their tests need the receipt
+        types and `EventStore`. Neither crate depends on the root crate.
       - Channels map (2026-11-07). Update: the daemon's Telegram, Slack and
         Discord bots now run on the SDK channel adapters, and on the daemon's
         own turn runner (`src/channels/turns.rs`, `57788a2`, `fda3475`,
