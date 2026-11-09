@@ -247,7 +247,7 @@ async fn verify_encrypted_database(
             "Database integrity check found corruption limited to replaceable search indexes; rebuilding them"
         );
         if repairable.memory {
-            crate::state::sqlite::migrations::rebuild_memory_fts_projections(&pool).await?;
+            aidaemon_memory::sqlite::rebuild_memory_fts_projections(&pool).await?;
         }
         if repairable.history {
             crate::state::sqlite::history_search::reset_fts_projection(&pool).await?;

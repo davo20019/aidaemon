@@ -27,6 +27,7 @@ mod facts;
 mod learning;
 mod people;
 mod rows;
+mod schema;
 mod structured;
 
 pub use claims::{project_event_span, MemoryClaimRecord};
@@ -34,6 +35,7 @@ pub use facts::{
     build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
     is_owner_authored_fact_source,
 };
+pub use schema::{migrate, rebuild_memory_fts_projections};
 
 /// Dimension of the vectors in databases written so far (AllMiniLM-L6-v2).
 const EMBEDDING_DIM: usize = 384;
@@ -126,7 +128,7 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    /// Memory over `pool`, which must already hold the memory tables.
+    /// Memory over `pool`, whose tables [`migrate`] has created.
     pub fn new(pool: SqlitePool, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             pool,
