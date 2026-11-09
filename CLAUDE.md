@@ -398,6 +398,19 @@ effects (or `unknown()`).
   judgment is refused ("requires approval through the agent kernel").
 - A run in which the owner declined something never ends `Succeeded`.
 
+## Side Call Rule
+
+A model call outside the agent loop is a side call. Declare it as a
+`SideCall` in `src/llm_runtime/side_calls.rs` (purpose, class, model, total
+deadline, failure policy) and make it through `SideCallGateway`
+(`src/llm_runtime/gateway.rs`): `ask` for a prompt you own, `provider` for
+library code that takes a provider. Do not hold a raw provider or record a
+call by hand anywhere else; `llm_runtime::door_tests` fails if you do.
+
+A safety judge refuses on any failure. A memory job skips, and never writes
+from a tainted run. A side call has no tools; work that needs tools or a
+second pass is a kernel agent, not a side call.
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the
