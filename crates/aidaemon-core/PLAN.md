@@ -185,12 +185,11 @@ adapters, tested against local mock servers.
 
 ### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
 
-Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5 and 8.7b done; 8.3 mostly done; 8.4
-steps 1-9 of 10; 8.6 done except a child's model tier and recording its
+Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5 and 8.7b done; 8.3 mostly done; 8.4's
+ten steps done; 8.6 done except a child's model tier and recording its
 resolved authority; 8.7's memory port done except the live comparison; 8.8
 providers, MCP and channels done, the store mapped (what has a second consumer
-is already in crates). The rest of 8.4 and 8.9 move working code between crates
-and wait for a second user of the SDK.
+is already in crates). 8.9 is in progress.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -289,7 +288,12 @@ Order:
         kernel `Tool`);
       - about 45 readers of the global `active_execution_backend()`
         outside `src/tools` (one backend per process, so plumbing it is
-        cleanup, not a behavior change);
+        cleanup, not a behavior change). Checked 2026-11-09: not mechanical.
+        Most sit in plain text and path helpers (`project_scope`,
+        `token_looks_like_filesystem_path` with 10 callers) and in
+        `events::run_aggregate::hint_matches_target`, so a backend argument
+        spreads through code that holds none, and `src/tools` still reads the
+        global about 270 times, nearly all from tests, so it stays either way;
       - the goals/mandates store slice and the concrete `EventStore` (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
       daemon tool can wrap today's thin crate tools without behavior
@@ -327,7 +331,20 @@ Order:
       and kept its same-host redirect limit; the daemon follows public
       redirects. `track_requirements` stays in the daemon: it feeds the
       receipts ledger, and the crate's `Checklist` is an in-memory list.
-      Left: step 10, and passing `PathClassifier` instead of the static.
+      Done 2026-11-09: step 10 and the `PathClassifier` static. The
+      terminal's quote-aware `contains_shell_operator` moved unchanged to
+      `aidaemon_policies::shell`. `run_command` deliberately stays off it,
+      on `fs_utils::mentions_shell_operator`: it runs what passes through a
+      shell after only a prefix check, and the quote-aware scan skips
+      `$(...)` and backticks in double quotes, so switching it would let
+      `ls "$(id)"` run. One scan for both needs a scan that treats double
+      quotes the way a shell does, which changes what both tools accept.
+      The daemon's classifier is now a `DaemonPaths` value built once in
+      `run()` and passed through `Agent` to the file tools, the scope
+      checks, the approval rules and Slack.
+      Left: nothing from the ten steps. Moving the tools onto the kernel
+      `Tool` (deleting the daemon `Tool` and `BridgedTool`) is not one of
+      them; it is tracked under 8.3.
 - [x] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
