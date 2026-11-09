@@ -2,12 +2,11 @@
 //! loop. Each call has one spec saying which model it uses, how long it may
 //! take, what happens when it fails, and the purpose string its telemetry is
 //! recorded under.
-// Consumers land in the following commits.
-#![allow(dead_code)]
 
 use std::time::Duration;
 
 /// A model call made outside the agent loop.
+#[allow(dead_code)] // variants used from Task 3 (the last in Task 6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SideCall {
     /// Checks a proposed egress call against the original request after the
@@ -84,6 +83,7 @@ pub enum OnFailure {
 #[derive(Debug, Clone, Copy)]
 pub struct SideCallSpec {
     /// The call this spec describes.
+    #[allow(dead_code)] // read only by the registry tests so far
     pub call: SideCall,
     /// The purpose string its telemetry is recorded under.
     pub purpose: &'static str,
@@ -94,11 +94,13 @@ pub struct SideCallSpec {
     /// How long it may take before it counts as failed.
     pub deadline: Duration,
     /// What happens when it fails.
+    #[allow(dead_code)] // read only by the registry tests so far
     pub on_failure: OnFailure,
 }
 
 impl SideCall {
     /// Every side call, in registry order.
+    #[allow(dead_code)] // read only by the registry tests so far
     pub const ALL: [SideCall; 12] = [
         SideCall::UntrustedVerifier,
         SideCall::CommandRisk,

@@ -948,6 +948,11 @@ async fn setup_test_agent_internal(
     let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1101,6 +1106,11 @@ pub async fn setup_test_agent_with_models_and_policy(
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1202,6 +1212,11 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1503,6 +1518,11 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     let mut agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -1663,6 +1683,11 @@ pub async fn setup_live_agent(
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store: event_store.clone(),

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::events::{Consolidator, EventStore, Pruner};
+use crate::llm_runtime::gateway::SideCallGateway;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::manager::MemoryManager;
@@ -25,6 +26,7 @@ pub fn build_memory_pipeline(
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
     llm_runtime: SharedLlmRuntime,
+    side_calls: SideCallGateway,
     embedding_service: Arc<EmbeddingService>,
 ) -> MemoryPipelineBundle {
     let consolidator = Arc::new(
@@ -37,6 +39,7 @@ pub fn build_memory_pipeline(
             Some(embedding_service.clone()),
         )
         .with_state(state.clone())
+        .with_side_calls(side_calls.clone())
         .with_learning_evidence_gate(config.policy.learning_evidence_gate_enforce),
     );
 
@@ -58,6 +61,7 @@ pub fn build_memory_pipeline(
         )
         .with_event_store(event_store)
         .with_state(state)
+        .with_side_calls(side_calls)
         .with_memory(memory_store),
     );
 

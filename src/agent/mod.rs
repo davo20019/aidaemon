@@ -301,6 +301,8 @@ pub(crate) struct MandateExecutionFence {
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
+    /// The gateway for model calls made outside the agent loop.
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
     state: Arc<dyn StateStore>,
     memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<EventStore>,

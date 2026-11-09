@@ -90,6 +90,12 @@ pub async fn run(
         failover_targets,
     )
     .with_models(models);
+    // The one door for model calls made outside the agent loop.
+    let side_calls = crate::llm_runtime::gateway::SideCallGateway::new(
+        llm_runtime.clone(),
+        state.clone(),
+        event_store.clone(),
+    );
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,
@@ -103,6 +109,7 @@ pub async fn run(
         event_store.clone(),
         plan_store.clone(),
         llm_runtime.clone(),
+        side_calls.clone(),
         embedding_service.clone(),
     );
 
@@ -141,6 +148,7 @@ pub async fn run(
             pool: pool.clone(),
             event_store: event_store.clone(),
             llm_runtime: llm_runtime.clone(),
+            side_calls: side_calls.clone(),
             health_store: health_store.clone(),
             approval_capacity: queue_policy.approval_capacity,
             media_capacity: queue_policy.media_capacity,
@@ -212,6 +220,7 @@ pub async fn run(
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: memory_store.clone(),
             llm_runtime: llm_runtime.clone(),
+            side_calls: side_calls.clone(),
             state: state.clone(),
             event_store: event_store.clone(),
             tools,
@@ -325,6 +334,7 @@ pub async fn run(
             inbox_dir: inbox_dir.clone(),
             skills_dir: skills_dir.clone(),
             llm_runtime: llm_runtime.clone(),
+            side_calls,
             oauth_gateway: oauth_gateway.clone(),
             watchdog_stale_threshold_secs,
             goal_token_registry: goal_token_registry.clone(),

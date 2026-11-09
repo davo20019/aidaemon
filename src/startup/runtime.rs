@@ -59,6 +59,7 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) inbox_dir: String,
     pub(crate) skills_dir: Option<std::path::PathBuf>,
     pub(crate) llm_runtime: SharedLlmRuntime,
+    pub(crate) side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
     pub(crate) watchdog_stale_threshold_secs: u64,
     pub(crate) goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
@@ -83,6 +84,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         inbox_dir,
         skills_dir,
         llm_runtime,
+        side_calls,
         oauth_gateway,
         watchdog_stale_threshold_secs,
         goal_token_registry,
@@ -316,6 +318,7 @@ pub(crate) async fn init_heartbeat_coordinator(
                 state.clone(),
                 event_store.clone(),
                 llm_runtime.clone(),
+                side_calls.clone(),
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));

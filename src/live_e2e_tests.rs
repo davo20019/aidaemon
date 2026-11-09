@@ -112,6 +112,11 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
@@ -294,6 +299,11 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let agent = Agent::new(crate::agent::AgentConstruction {
         dependencies: crate::agent::AgentRuntimeDependencies {
             memory_store: state.memory_stores(),
+            side_calls: crate::llm_runtime::gateway::SideCallGateway::new(
+                llm_runtime.clone(),
+                state.clone(),
+                event_store.clone(),
+            ),
             llm_runtime,
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,

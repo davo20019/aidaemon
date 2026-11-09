@@ -942,6 +942,9 @@ pub struct TerminalTool {
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
     command_risk_runtime: OnceLock<SharedLlmRuntime>,
+    /// The gateway the semantic risk assessment calls the model through.
+    #[allow(dead_code)] // used from Task 3
+    side_calls: OnceLock<crate::llm_runtime::gateway::SideCallGateway>,
     /// How long the semantic assessment may take before it fails closed.
     assessment_timeout: Duration,
 }
@@ -3438,6 +3441,7 @@ impl TerminalTool {
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
             command_risk_runtime: OnceLock::new(),
+            side_calls: OnceLock::new(),
             assessment_timeout: super::semantic_command_risk::ASSESSMENT_TIMEOUT,
         }
     }
@@ -3483,6 +3487,14 @@ impl TerminalTool {
         assert!(
             self.command_risk_runtime.set(runtime).is_ok(),
             "TerminalTool::set_command_risk_runtime called more than once"
+        );
+    }
+
+    /// The gateway the semantic risk assessment calls the model through.
+    pub fn set_side_calls(&self, side_calls: crate::llm_runtime::gateway::SideCallGateway) {
+        assert!(
+            self.side_calls.set(side_calls).is_ok(),
+            "TerminalTool::set_side_calls called more than once"
         );
     }
 

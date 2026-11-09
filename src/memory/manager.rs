@@ -20,6 +20,8 @@ pub struct MemoryManager {
     consolidator: Option<Arc<Consolidator>>,
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
+    #[allow(dead_code)] // used from Task 5
+    side_calls: Option<crate::llm_runtime::gateway::SideCallGateway>,
     memory: Option<Arc<dyn aidaemon_memory::stores::MemoryStores>>,
 }
 
@@ -40,6 +42,7 @@ impl MemoryManager {
             consolidator,
             event_store: None,
             state: None,
+            side_calls: None,
             memory: None,
         }
     }
@@ -53,6 +56,15 @@ impl MemoryManager {
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
         self.history = EventHistory::new(self.pool.clone(), Some(state.clone()));
         self.state = Some(state);
+        self
+    }
+
+    /// Set the gateway the background jobs' model calls go through.
+    pub fn with_side_calls(
+        mut self,
+        side_calls: crate::llm_runtime::gateway::SideCallGateway,
+    ) -> Self {
+        self.side_calls = Some(side_calls);
         self
     }
 

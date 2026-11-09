@@ -78,6 +78,7 @@ pub struct ToolSetupDependencies {
     pub pool: SqlitePool,
     pub event_store: Arc<EventStore>,
     pub llm_runtime: SharedLlmRuntime,
+    pub side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub approval_capacity: usize,
     pub media_capacity: usize,
@@ -101,6 +102,7 @@ pub async fn setup_tools(
         pool,
         event_store,
         llm_runtime,
+        side_calls,
         health_store,
         approval_capacity,
         media_capacity,
@@ -128,6 +130,7 @@ pub async fn setup_tools(
 
     if let Some(terminal) = &terminal_tool {
         terminal.set_command_risk_runtime(llm_runtime.clone());
+        terminal.set_side_calls(side_calls);
     }
 
     let OptionalToolsOutcome {

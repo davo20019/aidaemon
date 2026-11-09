@@ -129,6 +129,8 @@ pub struct SkillPromoter {
     state: Arc<dyn StateStore>,
     event_store: Arc<crate::events::EventStore>,
     llm_runtime: SharedLlmRuntime,
+    #[allow(dead_code)] // used from Task 6
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
     skills_dir: PathBuf,
     evidence_gate_enforce: bool,
 }
@@ -138,6 +140,7 @@ impl SkillPromoter {
         state: Arc<dyn StateStore>,
         event_store: Arc<crate::events::EventStore>,
         llm_runtime: SharedLlmRuntime,
+        side_calls: crate::llm_runtime::gateway::SideCallGateway,
         skills_dir: PathBuf,
         evidence_gate_enforce: bool,
     ) -> Self {
@@ -145,6 +148,7 @@ impl SkillPromoter {
             state,
             event_store,
             llm_runtime,
+            side_calls,
             skills_dir,
             evidence_gate_enforce,
         }

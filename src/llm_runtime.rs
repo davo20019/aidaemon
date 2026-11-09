@@ -4,6 +4,7 @@ use crate::config::{ModelsConfig, ProviderKind};
 use crate::providers::sdk_backed::ModelList;
 use crate::router::Router;
 
+pub mod gateway;
 pub mod side_calls;
 
 /// A model backend: any SDK provider.
@@ -152,6 +153,16 @@ impl LlmRuntimeSnapshot {
     /// `first_model` (usually a primary-provider model such as a cheaper
     /// tier) is tried first; the primary provider's other models follow.
     pub(crate) fn background_chain(&self, first_model: &str) -> aidaemon_core::Failover {
+        self.background_chain_through(first_model, |provider| provider)
+    }
+
+    /// [`Self::background_chain`] with every step's provider passed through
+    /// `wrap` (the side-call gateway wraps them to record each attempt).
+    pub(crate) fn background_chain_through(
+        &self,
+        first_model: &str,
+        wrap: impl Fn(ModelBackend) -> ModelBackend,
+    ) -> aidaemon_core::Failover {
         use aidaemon_core::FailoverStep;
         let mut primary_models = vec![first_model.to_string()];
         primary_models.extend(
@@ -164,11 +175,11 @@ impl LlmRuntimeSnapshot {
         );
         let mut steps: Vec<FailoverStep> = primary_models
             .into_iter()
-            .map(|model| FailoverStep::from_arc(self.provider.clone()).model(model))
+            .map(|model| FailoverStep::from_arc(wrap(self.provider.clone())).model(model))
             .collect();
         for target in &self.failover_targets {
             for model in target.models_cheap_first() {
-                steps.push(FailoverStep::from_arc(target.provider()).model(model));
+                steps.push(FailoverStep::from_arc(wrap(target.provider())).model(model));
             }
         }
         aidaemon_core::Failover::new(steps)

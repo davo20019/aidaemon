@@ -71,6 +71,8 @@ pub struct Consolidator {
     llm_runtime: Option<SharedLlmRuntime>,
     embedding_service: Option<Arc<EmbeddingService>>,
     state: Option<Arc<dyn crate::traits::StateStore>>,
+    #[allow(dead_code)] // used from Task 5
+    side_calls: Option<crate::llm_runtime::gateway::SideCallGateway>,
     learning_evidence_gate_enforce: bool,
 }
 
@@ -91,6 +93,7 @@ impl Consolidator {
             llm_runtime,
             embedding_service,
             state: None,
+            side_calls: None,
             learning_evidence_gate_enforce: false,
         }
     }
@@ -98,6 +101,15 @@ impl Consolidator {
     /// Set the state store for token usage tracking.
     pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Set the gateway its model calls go through.
+    pub fn with_side_calls(
+        mut self,
+        side_calls: crate::llm_runtime::gateway::SideCallGateway,
+    ) -> Self {
+        self.side_calls = Some(side_calls);
         self
     }
 

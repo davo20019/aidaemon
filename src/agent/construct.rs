@@ -16,6 +16,7 @@ use crate::config::{
 };
 use crate::events::EventStore;
 use crate::goal_tokens::GoalTokenRegistry;
+use crate::llm_runtime::gateway::SideCallGateway;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::runtime_ports::OutboundRouter;
@@ -33,6 +34,7 @@ use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
 /// contract. Agent policy and per-instance configuration remain separate data.
 pub(crate) struct AgentRuntimeDependencies {
     pub llm_runtime: SharedLlmRuntime,
+    pub side_calls: SideCallGateway,
     pub state: Arc<dyn StateStore>,
     pub memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pub event_store: Arc<EventStore>,
@@ -121,6 +123,7 @@ impl Agent {
             dependencies:
                 AgentRuntimeDependencies {
                     llm_runtime,
+                    side_calls,
                     state,
                     memory_store,
                     event_store,
@@ -206,6 +209,7 @@ impl Agent {
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
+            side_calls,
             state,
             memory_store,
             event_store,
@@ -410,6 +414,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::agent) fn with_depth(
         llm_runtime: SharedLlmRuntime,
+        side_calls: SideCallGateway,
         state: Arc<dyn StateStore>,
         memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
         event_store: Arc<EventStore>,
@@ -473,6 +478,7 @@ impl Agent {
         let memory: Arc<dyn super::memory_plugin::MemoryPlugin> = Arc::new(daemon_memory);
         Self {
             llm_runtime,
+            side_calls,
             state,
             memory_store,
             event_store,

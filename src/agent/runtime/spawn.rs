@@ -1625,6 +1625,7 @@ impl Agent {
         #[allow(unused_mut)]
         let mut child = Agent::with_depth(
             self.llm_runtime.clone(),
+            self.side_calls.clone(),
             self.state.clone(),
             self.memory_store.clone(),
             self.event_store.clone(),
