@@ -328,8 +328,9 @@ proposed call finds them consistent. Owner level `unrestricted` records these
 calls instead of checking them.
 
 - Source trust is typed per adapter: each tool declares `output_trust` from
-  its capabilities and arguments. `sanitize.rs::is_trusted_tool` only decides
-  wrapping, never trust.
+  its capabilities and arguments. The result boundary
+  (`tool_result_fit.rs`) sanitizes and wraps from that trust, once, for both
+  the model's view and the stored history.
 - Egress is the `ToolAnnotations.egress` bit, derived per call from typed
   mutation effects (`call_annotations`).
 - A turn starts tainted from explicit facts only (`starts_tainted`): role,

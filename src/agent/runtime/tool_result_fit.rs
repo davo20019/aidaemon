@@ -21,6 +21,8 @@ pub(crate) struct FitScope<'a> {
     pub emitter: &'a EventEmitter,
     /// Mandate runs never spill: their workers have no follow-up read path.
     pub mandate_execution: bool,
+    /// Who authored what this exact call returned.
+    pub trust: aidaemon_core::SourceTrust,
 }
 
 impl Agent {
@@ -43,19 +45,15 @@ impl Agent {
                 ),
             );
         }
-        // Untrusted output (web, MCP, terminal, channel history...) is
-        // sanitized and wrapped so the model treats it as data, not
-        // instructions. Errors come from the daemon itself.
-        let result_text = if result_is_err {
-            result_text
-        } else if !crate::tools::sanitize::is_trusted_tool(scope.tool_name) {
-            let body = if result_metadata.untrusted_verbatim {
-                result_text
-            } else {
-                crate::tools::sanitize::sanitize_external_content(&result_text)
-            };
-            crate::tools::sanitize::wrap_untrusted_output(scope.tool_name, &body)
-        } else if scope.tool_name == "terminal" {
+        // This is the one place a tool result is marked as data: it feeds
+        // both the model's view and the stored history. Untrusted output is
+        // sanitized and wrapped from the call's typed trust. Errors come from
+        // the daemon itself. Capping comes first, so a cut result is still
+        // one intact block.
+        let untrusted = !result_is_err && scope.trust == aidaemon_core::SourceTrust::Untrusted;
+        let result_text = if untrusted && !result_metadata.untrusted_verbatim {
+            crate::tools::sanitize::sanitize_external_content(&result_text)
+        } else if !untrusted && !result_is_err && scope.tool_name == "terminal" {
             crate::tools::sanitize::strip_internal_control_markers(&result_text)
         } else {
             result_text
@@ -63,6 +61,11 @@ impl Agent {
         let result_text = self
             .cap_tool_result(scope, result_text, result_is_err, result_metadata)
             .await;
+        let result_text = if untrusted {
+            crate::tools::sanitize::wrap_untrusted_output(scope.tool_name, &result_text)
+        } else {
+            result_text
+        };
         if let Some(provenance) = result_metadata.result_provenance.as_mut() {
             if provenance.model_view_completeness
                 != crate::traits::ToolResultCompleteness::Truncated

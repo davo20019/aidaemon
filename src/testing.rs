@@ -1279,6 +1279,7 @@ pub struct MockTool {
     return_metadata: crate::traits::ToolCallMetadata,
     return_finish: Option<aidaemon_core::Finish>,
     dispatch_facts: crate::traits::ToolDispatchFacts,
+    output_trust: aidaemon_core::SourceTrust,
 }
 
 #[allow(dead_code)]
@@ -1293,7 +1294,15 @@ impl MockTool {
             return_metadata: Default::default(),
             return_finish: None,
             dispatch_facts: Default::default(),
+            output_trust: aidaemon_core::SourceTrust::Trusted,
         }
+    }
+
+    /// Its output is written by someone other than the owner, as a real web
+    /// or channel tool declares.
+    pub fn untrusted(mut self) -> Self {
+        self.output_trust = aidaemon_core::SourceTrust::Untrusted;
+        self
     }
 
     /// State these dispatch facts, as the real tool of this name does.
@@ -1365,6 +1374,14 @@ impl Tool for MockTool {
 }
 
 impl crate::traits::ToolSemantics for MockTool {
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        self.output_trust
+    }
+
     fn tool_role(&self) -> ToolRole {
         self.role
     }

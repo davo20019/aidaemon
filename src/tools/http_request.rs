@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::warn;
 
 use crate::config::HttpAuthProfile;
-use crate::tools::sanitize::{sanitize_external_content, wrap_untrusted_output};
+use crate::tools::sanitize::sanitize_external_content;
 use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::traits::{
     AuthorizationPreflightRecord, AuthorizationPreflightStatus, Tool, ToolCallContext,
@@ -1997,12 +1997,7 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
         result.push('\n');
         result.push_str(&sanitized_body);
 
-        // Wrap as untrusted external data
-        Ok((
-            wrap_untrusted_output("http_request", &result),
-            captured_status,
-            truncation,
-        ))
+        Ok((result, captured_status, truncation))
     }
 }
 

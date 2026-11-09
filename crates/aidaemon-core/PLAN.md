@@ -336,9 +336,16 @@ Order:
       `workspace_root`. It sees through launchers and subshells and also
       covers `rm -r`, `xargs rm` and `find -exec rm`, which all escaped
       before and ran unasked in scheduled sessions.
-      The in-tool approvals are done (8.1). Left: scope, sensitive paths,
-      SSRF and output wrapping as hooks over effects, and an allowlist for
-      `cli_agent` arguments.
+      Done 2026-11-08: one output-wrapping layer. The result boundary
+      (`tool_result_fit`) sanitizes and wraps from the call's typed trust,
+      after capping, for the model's view and the stored history alike. It
+      replaces the tool-name list and `http_request`'s own wrapper; the
+      kernel's `UntrustedHook` no longer re-marks daemon output. Text that
+      never passes through a tool result (the `cli_agent` continuity message)
+      still wraps where it is written.
+      The in-tool approvals are done (8.1). Scope is judged by `DispatchGate`
+      already. Left: sensitive paths and SSRF as hooks over effects, and an
+      allowlist for `cli_agent` arguments.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
       `AgentBuilder`. Done 2026-11-07: declines move both ways between
       parent and child runs. `c98314c`: kernel `SharedDeclines`, attached

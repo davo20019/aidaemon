@@ -1207,7 +1207,9 @@ impl Agent {
             egress,
             untrusted: sdk::UntrustedHook::new(
                 crate::agent::untrusted::untrusted_mode(authority.owner_level),
-                aidaemon_policies::wrap_untrusted,
+                // The result boundary (`tool_result_fit`) already marked it,
+                // for the stored history as well as the model.
+                |_tool: &str, content: &str| content.to_string(),
             ),
             approval,
             text_only: TextOnlyNext {

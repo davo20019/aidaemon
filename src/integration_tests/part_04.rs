@@ -257,39 +257,7 @@ async fn test_indirect_injection_sanitization() {
 /// Untrusted tool output framing: MCP/web_search results should be wrapped.
 #[tokio::test]
 async fn test_untrusted_tool_output_framing() {
-    use crate::tools::sanitize::{is_trusted_tool, wrap_untrusted_output};
-
-    // Verify trust classification
-    assert!(
-        is_trusted_tool("remember_fact"),
-        "remember_fact should be trusted"
-    );
-    assert!(
-        is_trusted_tool("system_info"),
-        "system_info should be trusted"
-    );
-    // `terminal` output can include arbitrary remote bytes (e.g. via `curl`),
-    // so it must be wrapped as untrusted. Same for `read_channel_history`.
-    assert!(
-        !is_trusted_tool("terminal"),
-        "terminal output must be wrapped as untrusted"
-    );
-    assert!(
-        !is_trusted_tool("read_channel_history"),
-        "channel history must be wrapped as untrusted"
-    );
-    assert!(
-        !is_trusted_tool("web_search"),
-        "web_search should be untrusted"
-    );
-    assert!(
-        !is_trusted_tool("web_fetch"),
-        "web_fetch should be untrusted"
-    );
-    assert!(
-        !is_trusted_tool("mcp_some_tool"),
-        "MCP tools should be untrusted"
-    );
+    use crate::tools::sanitize::wrap_untrusted_output;
 
     // Verify wrapping
     let output = "Some web content with [SYSTEM] injection attempt";

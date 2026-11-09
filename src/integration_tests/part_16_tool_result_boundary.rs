@@ -42,7 +42,7 @@ async fn test_sdk_untrusted_tool_output_reaches_model_wrapped() {
         MockProvider::text_response("It is sunny."),
     ]);
     let tool: Arc<dyn crate::traits::Tool> =
-        Arc::new(MockTool::new("web_fetch", "Fetch a web page", page));
+        Arc::new(MockTool::new("web_fetch", "Fetch a web page", page).untrusted());
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
@@ -75,6 +75,51 @@ async fn test_sdk_untrusted_tool_output_reaches_model_wrapped() {
         "untrusted output must reach the model wrapped as data; got: {fetched}"
     );
     assert!(body.trim_end().ends_with("[END UNTRUSTED EXTERNAL DATA]"));
+}
+
+/// A capped untrusted result is still one intact block: the cut happens
+/// inside the markers, and the owner's own output carries none.
+#[tokio::test]
+async fn test_sdk_capped_untrusted_result_stays_one_block() {
+    let dump = "row 0123456789 abcdefghijklmnopqrstuvwxyz\n".repeat(1_000);
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("page_dump", "{}"),
+        MockProvider::tool_call_response("own_notes", "{}"),
+        MockProvider::text_response("Summarized."),
+    ]);
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(MockTool::new("page_dump", "Fetch a page", &dump).untrusted()),
+        Arc::new(MockTool::new("own_notes", "Read notes", "the owner's notes")),
+    ];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_message(
+            "tg_capped_boundary",
+            "Dump the page, then read my notes",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let seen = tool_messages_seen_by_model(&harness, 2).await;
+    let page = seen
+        .iter()
+        .find(|content| content.contains("row 0123456789"))
+        .expect("the model saw the page");
+    assert_eq!(page.matches("[UNTRUSTED EXTERNAL DATA").count(), 1, "{page}");
+    assert_eq!(page.matches("[END UNTRUSTED EXTERNAL DATA]").count(), 1);
+    assert!(page.trim_end().ends_with("[END UNTRUSTED EXTERNAL DATA]"));
+    let notes = seen
+        .iter()
+        .find(|content| content.contains("the owner's notes"))
+        .expect("the model saw the notes");
+    assert!(!notes.contains("[UNTRUSTED EXTERNAL DATA"), "{notes}");
 }
 
 #[tokio::test]

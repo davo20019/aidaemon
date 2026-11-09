@@ -625,6 +625,30 @@ impl Agent {
 
     /// The dispatch facts of the tool this turn runs under `name` (nothing
     /// special for an unknown tool).
+    /// Who authored what this call returned: only executed calls carry the
+    /// tool's own class (or what the tool reported for this exact output);
+    /// every other output is the daemon's.
+    fn call_output_trust(
+        &self,
+        scope: &TurnScope<'_>,
+        name: &str,
+        arguments: &str,
+        metadata: Option<&crate::traits::ToolCallMetadata>,
+    ) -> sdk::SourceTrust {
+        let reported = metadata.and_then(|metadata| metadata.output_trust);
+        self.turn_tool(scope, name)
+            .map(|tool| {
+                reported.unwrap_or_else(|| {
+                    tool.output_trust(
+                        arguments,
+                        &crate::traits::TrustRoots::new(&scope.trust_roots)
+                            .with_cwd(Some(&scope.cwd)),
+                    )
+                })
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn turn_tool_facts(
         &self,
         scope: &TurnScope<'_>,
@@ -884,6 +908,12 @@ impl Agent {
                             model: scope.model,
                             emitter: scope.emitter,
                             mandate_execution: self.mandate_execution.is_some(),
+                            trust: self.call_output_trust(
+                                scope,
+                                &request.name,
+                                arguments,
+                                Some(&outcome.metadata),
+                            ),
                         },
                         outcome.output.clone(),
                         false,
@@ -1079,6 +1109,7 @@ impl Agent {
                             model: scope.model,
                             emitter: scope.emitter,
                             mandate_execution: self.mandate_execution.is_some(),
+                            trust: aidaemon_core::SourceTrust::Trusted,
                         },
                         error_text.clone(),
                         true,
@@ -1252,22 +1283,7 @@ impl Agent {
             duration_ms,
             "SDK engine tool call"
         );
-        // Who authored what this call returned: only executed calls carry
-        // the tool's own class (or what the tool reported for this exact
-        // output); every other output is the daemon's.
-        let reported = metadata.as_ref().and_then(|metadata| metadata.output_trust);
-        let trust = self
-            .turn_tool(scope, &request.name)
-            .map(|tool| {
-                reported.unwrap_or_else(|| {
-                    tool.output_trust(
-                        arguments,
-                        &crate::traits::TrustRoots::new(&scope.trust_roots)
-                            .with_cwd(Some(&scope.cwd)),
-                    )
-                })
-            })
-            .unwrap_or_default();
+        let trust = self.call_output_trust(scope, &request.name, arguments, metadata.as_ref());
         // The first untrusted read records the turn as tainted at once, so a
         // run that never finishes still taints later turns that see it.
         if trust == sdk::SourceTrust::Untrusted {

@@ -114,6 +114,25 @@ impl crate::traits::ToolSemantics for GitInfoTool {
             high_impact_write: false,
         }
     }
+
+    /// Commit messages and diffs are written by whoever wrote the repository.
+    /// With no `path` the call reads the working directory.
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let path = match args.as_ref().map(|args| args.get("path")) {
+            Some(None) | Some(Some(Value::Null)) => Some("."),
+            Some(Some(value)) => value.as_str(),
+            None => None,
+        };
+        match path {
+            Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        }
+    }
 }
 
 fn capitalize(s: &str) -> String {
@@ -281,5 +300,30 @@ mod tests {
         assert_eq!(capitalize("status"), "Status");
         assert_eq!(capitalize("log"), "Log");
         assert_eq!(capitalize(""), "");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use crate::traits::ToolSemantics;
+
+    #[test]
+    fn a_repository_outside_the_trusted_roots_is_untrusted() {
+        let tool = GitInfoTool::new(crate::execution::active_execution_backend());
+        let root = std::env::temp_dir().join("aidaemon-synthetic-root");
+        let root = root.to_string_lossy().into_owned();
+        let grants = [root.clone()];
+        let roots = crate::traits::TrustRoots::new(&grants);
+        let inside = serde_json::json!({"path": format!("{root}/repo")}).to_string();
+        assert_eq!(
+            tool.output_trust(&inside, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        let outside = serde_json::json!({"path": "/synthetic/other/repo"}).to_string();
+        assert_eq!(
+            tool.output_trust(&outside, &roots),
+            aidaemon_core::SourceTrust::Untrusted
+        );
     }
 }

@@ -650,41 +650,6 @@ pub fn user_facing_tool_activity(
     (label, cleaned)
 }
 
-/// Check if a tool's output should be treated as untrusted.
-///
-/// Tools listed here have outputs that are wholly under our own control or
-/// that come from sources we trust to not contain prompt injection. Their
-/// output is fed back to the LLM WITHOUT the untrusted-content wrapper.
-///
-/// Important: `terminal` and `read_channel_history` are intentionally NOT on
-/// this list. `terminal` can fetch arbitrary remote text (e.g. `curl`), and
-/// `read_channel_history` returns messages authored by other users. Both
-/// contain untrusted bytes that must be wrapped before reaching the model.
-pub fn is_trusted_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "remember_fact"
-            | "system_info"
-            | "manage_memories"
-            | "scheduled_goal_runs"
-            | "goal_trace"
-            | "tool_trace"
-            | "self_diagnose"
-            | "share_memory"
-            | "manage_goals"
-            | "use_skill"
-            | "manage_skills"
-            | "manage_api"
-            | "spawn_agent"
-            | "plan_manager"
-            | "scheduler"
-            | "config_manager"
-            | "send_file"
-            | "health_probe"
-            | "skill_resources"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,31 +1031,6 @@ mod tests {
         for (kind, _) in aidaemon_policies::secret_patterns() {
             assert_ne!(secret_label(kind), "Secret", "{kind}");
         }
-    }
-
-    #[test]
-    fn test_trusted_tools() {
-        assert!(is_trusted_tool("remember_fact"));
-        assert!(is_trusted_tool("system_info"));
-        assert!(!is_trusted_tool("web_search"));
-        assert!(!is_trusted_tool("web_fetch"));
-        assert!(!is_trusted_tool("mcp_some_tool"));
-    }
-
-    /// Regression: `terminal` output can contain arbitrary remote bytes
-    /// (e.g. via `curl`) and `read_channel_history` returns messages from
-    /// other (non-owner) users. Both must be treated as untrusted so their
-    /// content is wrapped before reaching the model.
-    #[test]
-    fn test_terminal_and_channel_history_are_untrusted() {
-        assert!(
-            !is_trusted_tool("terminal"),
-            "terminal output must be wrapped as untrusted"
-        );
-        assert!(
-            !is_trusted_tool("read_channel_history"),
-            "channel history must be wrapped as untrusted"
-        );
     }
 
     // ── strip_diagnostic_blocks tests ────────────────────────────────
