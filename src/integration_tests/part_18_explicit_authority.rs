@@ -537,6 +537,64 @@ impl crate::traits::ToolSemantics for OfferedSpawnAgent {
     }
 }
 
+/// A parent can give its child fewer tools than it has itself: the child's
+/// call to any other tool is refused, and nothing is written.
+#[tokio::test]
+async fn a_child_described_narrower_cannot_use_other_tools() {
+    let dir = authority_test_dir();
+    let target = dir.join("narrow-child.txt");
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "spawn_agent",
+            &json!({
+                "mission": "Inspect only",
+                "task": "Look at the note file.",
+                "tools": ["read_file"],
+            })
+            .to_string(),
+        ),
+        MockProvider::tool_call_response(
+            "write_file",
+            &json!({"path": target, "content": "child"}).to_string(),
+        ),
+        MockProvider::text_response("Child could not write."),
+        MockProvider::text_response("Parent done."),
+    ]);
+    let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(4000, 60));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())),
+        Arc::new(crate::tools::WriteFileTool::new(crate::execution::active_execution_backend())),
+        Arc::new(OfferedSpawnAgent(spawn_tool.clone())),
+    ];
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+    let provider = Arc::clone(&harness.provider);
+    let agent = Arc::new(harness.agent);
+    let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
+    spawn_tool.set_agent(Arc::downgrade(&runtime));
+
+    agent
+        .handle_message(
+            "tg_authority_narrow_child",
+            "Have a specialist inspect the note file.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(!target.exists(), "the narrowed child must not write");
+    let log = provider.call_log.lock().await;
+    let refused = log.iter().flat_map(|call| call.messages.iter()).any(|m| {
+        m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("unknown tool `write_file`"))
+    });
+    assert!(refused, "the child must be told the tool is not available to it");
+}
+
 /// A read-only parent cannot get a write done through a child: `spawn_agent`
 /// is itself a mutation, so the authority gate refuses the delegation before
 /// any child exists. (That a child is never wider than its parent is pinned

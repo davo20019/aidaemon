@@ -372,8 +372,11 @@ Order:
       `Succeeded`). `fd163cd`: each daemon turn attaches one, a child turn
       takes its parent's through `InheritedAuthority::shared_declines`, a
       root turn or root goal dispatch starts its own; a run recovered after
-      a restart shares none. Remaining: children assembled through
-      `AgentBuilder`.
+      a restart shares none. Done 2026-11-08: `spawn_agent` takes `tools`
+      and `access`, applied with `Authority::narrow`, so a parent can describe
+      a child narrower than itself and never wider. Children already run
+      on the kernel through `AgentBuilder`. Not done: choosing a child's
+      model tier, and recording the resolved child authority as an event.
 - [ ] 8.7 Authority Phase 4 (end check, typed final outcome, budgets) and
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the

@@ -375,6 +375,44 @@ struct SpawnArgs {
     /// through `spawn_child`; Task 12 wires it into kind resolution.
     #[serde(default)]
     specialist: Option<String>,
+    /// Only these tools. The child is refused any other.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    /// `read_only` keeps the child from changing anything.
+    #[serde(default)]
+    access: Option<ChildAccess>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChildAccess {
+    ReadOnly,
+    Write,
+}
+
+/// The authority the caller asked for its child, if it asked for one.
+fn requested_child_authority(args: &SpawnArgs) -> anyhow::Result<Option<aidaemon_core::Authority>> {
+    if args.tools.is_none() && args.access.is_none() {
+        return Ok(None);
+    }
+    let tools = args.tools.as_ref().map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+    anyhow::ensure!(
+        tools.as_ref().is_none_or(|names| !names.is_empty()),
+        "`tools` must name at least one tool"
+    );
+    Ok(Some(aidaemon_core::Authority {
+        level: match args.access {
+            Some(ChildAccess::ReadOnly) => aidaemon_core::AccessLevel::ReadOnly,
+            _ => aidaemon_core::AccessLevel::Write,
+        },
+        tools,
+    }))
 }
 
 /// The child's channel context: the parent call's visibility and trust,
@@ -464,6 +502,17 @@ impl Tool for SpawnAgentTool {
                             "generic"
                         ],
                         "description": self.build_specialist_arg_description()
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Optional: the only tools this child may use. Any other call is refused, and it can never gain a tool you lack."
+                    },
+                    "access": {
+                        "type": "string",
+                        "enum": ["read_only", "write"],
+                        "description": "Optional: read_only stops the child changing anything. It can never exceed your own access."
                     }
                 },
                 "required": ["mission", "task"],
@@ -504,6 +553,13 @@ impl Tool for SpawnAgentTool {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
+        // A child can be made narrower than its parent and never wider.
+        if let Some(requested) = requested_child_authority(&args)? {
+            let parent = parent_authority.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("A child's tools and access can only be set inside a turn")
+            })?;
+            parent.authority = parent.authority.narrow(&requested);
+        }
         let agent = self.get_agent()?;
 
         info!(
@@ -1166,6 +1222,58 @@ mod tests {
         let json = r#"{"mission": "test", "task": "do stuff", "background": true}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
+    }
+
+    fn spawn_args(extra: serde_json::Value) -> SpawnArgs {
+        let mut args = serde_json::json!({"mission": "m", "task": "t"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(args).unwrap()
+    }
+
+    #[test]
+    fn a_child_is_narrowed_only_when_asked() {
+        assert!(
+            requested_child_authority(&spawn_args(serde_json::json!({})))
+                .unwrap()
+                .is_none()
+        );
+
+        let requested =
+            requested_child_authority(&spawn_args(serde_json::json!({"access": "read_only"})))
+                .unwrap()
+                .unwrap();
+        assert_eq!(requested.level, aidaemon_core::AccessLevel::ReadOnly);
+        assert_eq!(requested.tools, None);
+
+        let requested = requested_child_authority(&spawn_args(
+            serde_json::json!({"tools": ["read_file", " search_files "]}),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(requested.level, aidaemon_core::AccessLevel::Write);
+        assert_eq!(
+            requested.tools.unwrap().into_iter().collect::<Vec<_>>(),
+            ["read_file", "search_files"]
+        );
+
+        assert!(
+            requested_child_authority(&spawn_args(serde_json::json!({"tools": [" "]}))).is_err()
+        );
+    }
+
+    #[test]
+    fn asking_for_more_than_the_parent_has_gives_nothing_extra() {
+        let parent = aidaemon_core::Authority::read_only();
+        let requested =
+            requested_child_authority(&spawn_args(serde_json::json!({"access": "write"})))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            parent.narrow(&requested).level,
+            aidaemon_core::AccessLevel::ReadOnly
+        );
     }
 
     /// The parent turn's authority reaches spawn_agent only through the
