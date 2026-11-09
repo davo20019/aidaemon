@@ -26,9 +26,12 @@ mod rest;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aidaemon_channels::download::DownloadClient;
+use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
     CommandInvocation, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
+    DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -80,6 +83,7 @@ impl DiscordChannel {
                 http: reqwest::Client::new(),
                 api_base: DEFAULT_API_BASE.to_string(),
                 token: bot_token.into(),
+                files: DownloadClient::default(),
             },
             gateway_url: Mutex::new(None),
             intents: intents::DEFAULT,
@@ -134,6 +138,14 @@ impl DiscordChannel {
     /// Use a preconfigured HTTP client (proxies, timeouts, test setups).
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.rest.http = client;
+        self
+    }
+
+    /// HTTP settings (proxies, custom TLS roots, ...) for file downloads.
+    /// A builder rather than a client, because the adapter must control how
+    /// redirects are followed.
+    pub fn with_download_client(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.rest.files = DownloadClient::from_builder(builder);
         self
     }
 
@@ -344,11 +356,10 @@ impl Channel for DiscordChannel {
     }
 
     /// Replaces the content and removes any buttons (so an answered
-    /// approval prompt cannot be pressed again). Text over 2000 characters
-    /// is truncated.
+    /// approval prompt cannot be pressed again).
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {
         let body = json!({
-            "content": format::truncate_chars(text, self.max_message_len),
+            "content": truncate_for_edit(text, self.max_message_len),
             "allowed_mentions": {"parse": []},
             "components": [],
         });
@@ -374,6 +385,20 @@ impl Channel for DiscordChannel {
         let mut body = message_body(&last, None);
         body["components"] = components;
         self.post_message(channel_id, &body).await
+    }
+
+    async fn remove_buttons(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        self.rest
+            .request(
+                Method::PATCH,
+                &format!(
+                    "/channels/{}/messages/{}",
+                    message.conversation_id, message.message_id
+                ),
+                Some(&json!({ "components": [] })),
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn typing(&self, conversation: &Conversation) -> Result<(), ChannelError> {
@@ -444,7 +469,21 @@ impl Channel for DiscordChannel {
     }
 
     async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
-        self.rest.download(&attachment.source).await
+        self.download_limited(attachment, DEFAULT_MAX_DOWNLOAD_BYTES)
+            .await
+    }
+
+    async fn download_limited(
+        &self,
+        attachment: &Attachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ChannelError> {
+        if attachment.size_bytes.is_some_and(|size| size > max_bytes) {
+            return Err(ChannelError::TooLarge {
+                limit_bytes: max_bytes,
+            });
+        }
+        self.rest.download(&attachment.source, max_bytes).await
     }
 
     async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {

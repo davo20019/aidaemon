@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use common::{channel, MockHttp, BOT_ID, CHANNEL_ID, GUILD_ID};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -231,17 +231,23 @@ impl ChannelHarness for DiscordHarness {
             .find(|c| c.id == choice_id)
             .expect("choice exists")
             .label;
-        let custom_id = self
+        // The mock's id for a response is its position among the requests.
+        let (custom_id, message_id) = self
             .http
             .requests()
             .iter()
+            .enumerate()
             .rev()
-            .filter_map(|r| r.body["components"].as_array().cloned())
-            .flatten()
-            .filter_map(|row| row["components"].as_array().cloned())
-            .flatten()
-            .find(|button| button["label"] == json!(label))
-            .and_then(|button| button["custom_id"].as_str().map(str::to_string))
+            .find_map(|(position, r)| {
+                let button = r.body["components"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|row| row["components"].as_array().cloned())
+                    .flatten()
+                    .find(|button| button["label"] == json!(label))?;
+                let id = 100000000000001001u64 + position as u64;
+                Some((button["custom_id"].clone(), id.to_string()))
+            })
             .expect("the prompt's button was sent");
         let id = self.snowflake();
         self.dispatch(
@@ -250,6 +256,7 @@ impl ChannelHarness for DiscordHarness {
                 "id": id, "type": 3, "token": "synthetic-interaction-token",
                 "application_id": BOT_ID, "channel_id": prompt.conversation.id,
                 "user": alice(),
+                "message": {"id": message_id, "channel_id": prompt.conversation.id},
                 "data": {"custom_id": custom_id, "component_type": 2}
             }),
         );
@@ -263,6 +270,42 @@ impl ChannelHarness for DiscordHarness {
             .map(|r| r.body["content"].as_str().unwrap_or_default().to_string())
             .collect()
     }
+
+    async fn edited_messages(&self) -> Option<Vec<String>> {
+        Some(
+            self.http
+                .requests()
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .map(|r| r.body["content"].as_str().unwrap_or_default().to_string())
+                .collect(),
+        )
+    }
+
+    async fn inject_reply_message(&self, text: &str, parent_message_id: &str) -> bool {
+        let id = self.snowflake();
+        self.dispatch(
+            "MESSAGE_CREATE",
+            json!({"id": id, "type": 19, "channel_id": DM_CHANNEL, "content": text,
+                   "author": alice(), "mentions": [],
+                   "message_reference": {"message_id": parent_message_id}}),
+        );
+        true
+    }
+
+    /// The kit fetches it twice; the responses are scripted for that.
+    async fn downloadable_attachment(&self) -> Option<(Attachment, Vec<u8>)> {
+        let body = json!("synthetic attachment");
+        self.http.push(200, body.clone());
+        self.http.push(200, body.clone());
+        Some((
+            Attachment::new(
+                "conf.bin",
+                format!("{}/attachments/conf.bin", self.http.base),
+            ),
+            body.to_string().into_bytes(),
+        ))
+    }
 }
 
 #[tokio::test]
@@ -275,6 +318,6 @@ async fn discord_channel_conforms() {
     let discord = Arc::new(channel(&harness.http).with_gateway_url(harness.gateway.url.clone()));
     let report = check_channel(discord, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 12, "{report}");
+    assert_eq!(report.passed.len(), 17, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

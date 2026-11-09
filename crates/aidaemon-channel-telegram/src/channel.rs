@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use aidaemon_channels::download::{DownloadClient, DownloadRequest};
+use aidaemon_channels::split::TRUNCATION_MARK;
 use aidaemon_channels::{
     ApprovalAnswer, ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError,
     ChannelEvent, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
@@ -53,6 +55,7 @@ pub struct TelegramChannel {
     poll_timeout_secs: u64,
     configured_username: Option<String>,
     client: Option<reqwest::Client>,
+    download_client: DownloadClient,
     backoff_initial: Duration,
     backoff_max: Duration,
     state: Arc<Shared>,
@@ -99,6 +102,7 @@ impl TelegramChannel {
             poll_timeout_secs: 30,
             configured_username: None,
             client: None,
+            download_client: DownloadClient::default(),
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Shared::default()),
@@ -181,6 +185,14 @@ impl TelegramChannel {
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
         self.reset_api();
+        self
+    }
+
+    /// HTTP settings (proxies, custom TLS roots, ...) for file downloads,
+    /// whose URLs hold the token. A builder rather than a client, because
+    /// the adapter must control how redirects are followed.
+    pub fn download_client(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.download_client = DownloadClient::from_builder(builder);
         self
     }
 
@@ -494,12 +506,14 @@ impl TelegramChannel {
             };
             let conversation =
                 conversation_for_chat(&msg.chat, msg.is_topic_message, msg.message_thread_id);
-            let event = ChannelEvent::Approval(ApprovalAnswer {
-                prompt_id,
-                choice_id,
-                sender,
-                conversation,
-            });
+            let message = MessageRef {
+                conversation_id: conversation.id.clone(),
+                message_id: msg.message_id.to_string(),
+            };
+            let event = ChannelEvent::Approval(
+                ApprovalAnswer::new(prompt_id, choice_id, sender, conversation)
+                    .with_message(message),
+            );
             return events.send(event).await.is_ok();
         }
         true
@@ -591,6 +605,40 @@ impl TelegramChannel {
     }
 }
 
+/// A [`MessageRef`] as Telegram's `(chat_id, message_id)`.
+fn message_target(message: &MessageRef) -> Result<(i64, i64), ChannelError> {
+    let (chat_id, _) = parse_conversation_id(&message.conversation_id).ok_or_else(|| {
+        ChannelError::Other(format!(
+            "invalid telegram conversation id: {}",
+            message.conversation_id
+        ))
+    })?;
+    let message_id = message.message_id.parse().map_err(|_| {
+        ChannelError::Other(format!(
+            "invalid telegram message id: {}",
+            message.message_id
+        ))
+    })?;
+    Ok((chat_id, message_id))
+}
+
+/// `html` as the one message an edit may be: over `max_len` it keeps what
+/// fits at a safe boundary and ends with the truncation mark.
+fn html_for_edit(html: &str, max_len: usize) -> String {
+    let mut chunks = split_html(html, max_len);
+    if chunks.len() > 1 {
+        chunks = split_html(html, max_len.saturating_sub(1));
+        if let Some(first) = chunks.first_mut() {
+            first.push(TRUNCATION_MARK);
+        }
+    }
+    chunks
+        .into_iter()
+        .next()
+        .filter(|chunk| !chunk.is_empty())
+        .unwrap_or_else(|| "\u{2063}".to_string())
+}
+
 fn retry_wait(e: &ApiError, backoff: Duration) -> Duration {
     match e {
         ApiError::Api {
@@ -651,24 +699,10 @@ impl Channel for TelegramChannel {
         .await
     }
 
+    /// Sent without `reply_markup`, which is what removes the buttons.
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {
-        let (chat_id, _) = parse_conversation_id(&message.conversation_id).ok_or_else(|| {
-            ChannelError::Other(format!(
-                "invalid telegram conversation id: {}",
-                message.conversation_id
-            ))
-        })?;
-        let message_id: i64 = message.message_id.parse().map_err(|_| {
-            ChannelError::Other(format!(
-                "invalid telegram message id: {}",
-                message.message_id
-            ))
-        })?;
-        // An edit replaces one message, so keep only what fits.
-        let html = split_html(&markdown_to_html(text), self.max_message_len)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "\u{2063}".to_string());
+        let (chat_id, message_id) = message_target(message)?;
+        let html = html_for_edit(&markdown_to_html(text), self.max_message_len);
         let mut body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -721,6 +755,20 @@ impl Channel for TelegramChannel {
             .await
     }
 
+    /// `editMessageReplyMarkup` without a markup clears the keyboard.
+    async fn remove_buttons(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        let (chat_id, message_id) = message_target(message)?;
+        let body = json!({ "chat_id": chat_id, "message_id": message_id });
+        match self
+            .call_with_retry::<Value>("editMessageReplyMarkup", &body)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_modified() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn typing(&self, conversation: &Conversation) -> Result<(), ChannelError> {
         let Some((chat_id, thread_id)) = parse_conversation_id(&conversation.id) else {
             return Ok(());
@@ -736,18 +784,7 @@ impl Channel for TelegramChannel {
     }
 
     async fn delete(&self, message: &MessageRef) -> Result<(), ChannelError> {
-        let (chat_id, _) = parse_conversation_id(&message.conversation_id).ok_or_else(|| {
-            ChannelError::Other(format!(
-                "invalid telegram conversation id: {}",
-                message.conversation_id
-            ))
-        })?;
-        let message_id: i64 = message.message_id.parse().map_err(|_| {
-            ChannelError::Other(format!(
-                "invalid telegram message id: {}",
-                message.message_id
-            ))
-        })?;
+        let (chat_id, message_id) = message_target(message)?;
         self.call_with_retry::<Value>(
             "deleteMessage",
             &json!({ "chat_id": chat_id, "message_id": message_id }),
@@ -810,17 +847,26 @@ impl Channel for TelegramChannel {
         })
     }
 
-    /// `source` is a Telegram file id: resolved with `getFile`, then
-    /// fetched from the file endpoint.
     async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
-        if attachment
-            .size_bytes
-            .is_some_and(|size| size > MAX_DOWNLOAD_BYTES)
-        {
-            return Err(ChannelError::Other(format!(
-                "telegram bots cannot download files over {MAX_DOWNLOAD_BYTES} bytes"
-            )));
+        self.download_limited(attachment, MAX_DOWNLOAD_BYTES).await
+    }
+
+    /// `source` is a Telegram file id: resolved with `getFile`, then
+    /// fetched from the file endpoint, whose URL holds the token, so only
+    /// the Bot API's own origin is ever contacted. Never more than
+    /// [`MAX_DOWNLOAD_BYTES`], the most the Bot API serves.
+    async fn download_limited(
+        &self,
+        attachment: &Attachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let limit = max_bytes.min(MAX_DOWNLOAD_BYTES);
+        if attachment.size_bytes.is_some_and(|size| size > limit) {
+            return Err(ChannelError::TooLarge { limit_bytes: limit });
         }
+        let origin = reqwest::Url::parse(&self.api_base)
+            .map_err(|_| ChannelError::Other("telegram: invalid API base".into()))?
+            .origin();
         let file: Value = self
             .call_with_retry("getFile", &json!({ "file_id": attachment.source }))
             .await?;
@@ -828,10 +874,19 @@ impl Channel for TelegramChannel {
             .get("file_path")
             .and_then(Value::as_str)
             .ok_or_else(|| ChannelError::Other("telegram getFile: no file_path".into()))?;
-        self.api()
-            .download(path, FILE_TIMEOUT)
-            .await
-            .map_err(Into::into)
+        let url = self.api().file_url(path);
+        let downloaded = self
+            .download_client
+            .fetch(DownloadRequest {
+                url: &url,
+                bearer_token: None,
+                allowed: &|target| target.origin() == origin,
+                max_bytes: limit,
+                timeout: FILE_TIMEOUT,
+                user_agent: None,
+            })
+            .await?;
+        Ok(downloaded.bytes)
     }
 
     /// A private chat with the bot carries the person's name (`getChat` on

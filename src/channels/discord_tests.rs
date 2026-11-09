@@ -184,21 +184,19 @@ async fn channel(
 }
 
 fn direct_message(from: u64, text: &str) -> ChannelEvent {
-    ChannelEvent::Message(InboundMessage {
-        conversation: Conversation {
+    ChannelEvent::Message(InboundMessage::new(
+        Conversation {
             id: "100000000000000700".to_string(),
             kind: ConversationKind::Direct,
         },
-        sender: Sender {
+        Sender {
             id: from.to_string(),
             display_name: Some("Alice Rivera".to_string()),
             is_bot: false,
         },
-        message_id: format!("m-{from}-{text}"),
-        text: text.to_string(),
-        attachments: Vec::new(),
-        addressed: true,
-    })
+        format!("m-{from}-{text}"),
+        text,
+    ))
 }
 
 #[tokio::test]
@@ -323,19 +321,19 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
 
     // Someone who is not authorized cannot answer it.
     let press = |from: u64| {
-        ChannelEvent::Approval(ApprovalAnswer {
-            prompt_id: prompt_id.clone(),
-            choice_id: "once".to_string(),
-            sender: Sender {
+        ChannelEvent::Approval(ApprovalAnswer::new(
+            prompt_id.clone(),
+            "once",
+            Sender {
                 id: from.to_string(),
                 display_name: None,
                 is_bot: false,
             },
-            conversation: Conversation {
+            Conversation {
                 id: "100000000000000700".to_string(),
                 kind: ConversationKind::Direct,
             },
-        })
+        ))
     };
     channel.handle_event(press(STRANGER)).await;
     assert!(!asked.is_finished());

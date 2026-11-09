@@ -2010,12 +2010,11 @@ impl TelegramChannel {
 
         let bytes = self
             .sdk_transport()
-            .download(&aidaemon_channels::Attachment {
-                name: filename.clone(),
-                mime_type: Some(mime_type.clone()),
-                size_bytes: file.file_size,
-                source: file.file_id.clone(),
-            })
+            .download(
+                &aidaemon_channels::Attachment::new(filename.clone(), file.file_id.clone())
+                    .with_mime_type(Some(mime_type.clone()))
+                    .with_size_bytes(file.file_size),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to download file from Telegram: {e}"))?;
         if bytes.len() as u64 > max_bytes {

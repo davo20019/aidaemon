@@ -9,7 +9,7 @@ homepage = "https://aidaemon.ai/"
 publish = false
 
 [dependencies]
-aidaemon-channels = { path = "../aidaemon-channels" }
+aidaemon-channels = { path = "../aidaemon-channels", features = ["http"] }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

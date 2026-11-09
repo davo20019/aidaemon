@@ -25,13 +25,16 @@
 mod events;
 pub mod format;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use aidaemon_channels::download::{DownloadClient, DownloadRequest};
+use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
     CommandInvocation, Conversation, MessageRef, OutboundFile, OutboundMessage,
+    DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -60,6 +63,9 @@ const BUTTON_LABEL_LIMIT: usize = 75;
 const BUTTON_VALUE_LIMIT: usize = 2000;
 const MAX_BUTTONS: usize = 25;
 const MAX_RETRY_WAIT_SECS: u64 = 30;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Pressed prompts whose text is kept for [`Channel::remove_buttons`].
+const PRESSED_PROMPTS_KEPT: usize = 256;
 /// Slack pings Socket Mode clients regularly; silence this long means the
 /// connection is dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -86,6 +92,7 @@ pub struct SlackChannel {
     reconnect_initial: Duration,
     reconnect_max: Duration,
     http: reqwest::Client,
+    download_client: DownloadClient,
     bot_user_id: Mutex<Option<String>>,
     /// Longest chunk sent, at most [`SECTION_TEXT_LIMIT`].
     max_message_len: usize,
@@ -94,6 +101,9 @@ pub struct SlackChannel {
     last_inbound: Mutex<HashMap<String, (String, String)>>,
     /// Messages wearing the typing reaction, by conversation.
     reacting: Mutex<HashMap<String, (String, String)>>,
+    /// `(ts, text)` of recently pressed prompts. `chat.update` needs the
+    /// text to remove a message's buttons, and a press carries it.
+    pressed_prompts: Mutex<VecDeque<(String, String)>>,
 }
 
 impl std::fmt::Debug for SlackChannel {
@@ -163,10 +173,12 @@ impl SlackChannel {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            download_client: DownloadClient::default(),
             bot_user_id: Mutex::new(None),
             max_message_len: SECTION_TEXT_LIMIT,
             last_inbound: Mutex::new(HashMap::new()),
             reacting: Mutex::new(HashMap::new()),
+            pressed_prompts: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -213,6 +225,14 @@ impl SlackChannel {
     /// proxy in tests).
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
+        self
+    }
+
+    /// HTTP settings (proxies, custom TLS roots, ...) for file downloads,
+    /// which carry the bot token. A builder rather than a client, because
+    /// the adapter must control how redirects are followed.
+    pub fn with_download_client(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.download_client = DownloadClient::from_builder(builder);
         self
     }
 
@@ -273,9 +293,10 @@ impl SlackChannel {
     /// Whether `url` is Slack's own (or this channel's configured API
     /// host): the bot token and command answers go nowhere else.
     fn slack_url(&self, url: &str) -> bool {
-        let Ok(parsed) = reqwest::Url::parse(url) else {
-            return false;
-        };
+        reqwest::Url::parse(url).is_ok_and(|parsed| self.slack_host(&parsed))
+    }
+
+    fn slack_host(&self, parsed: &reqwest::Url) -> bool {
         let Some(host) = parsed.host_str() else {
             return false;
         };
@@ -507,7 +528,11 @@ impl SlackChannel {
                     };
                     map_events_api(payload, &ctx, seen)
                 }
-                Some("interactive") => map_interactive(payload),
+                Some("interactive") => {
+                    let event = map_interactive(payload);
+                    self.remember_pressed(payload, &event);
+                    event
+                }
                 Some("slash_commands") => map_slash_command(payload),
                 other => {
                     debug!(envelope_type = ?other, "ignoring Slack envelope");
@@ -602,6 +627,28 @@ impl SlackChannel {
         }
     }
 
+    /// Keep a pressed prompt's text until its buttons are removed.
+    fn remember_pressed(&self, payload: &Value, event: &Option<ChannelEvent>) {
+        let Some(ChannelEvent::Approval(answer)) = event else {
+            return;
+        };
+        let (Some(message), Some(text)) = (
+            answer.message.as_ref(),
+            payload
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        if let Ok(mut pressed) = self.pressed_prompts.lock() {
+            if pressed.len() >= PRESSED_PROMPTS_KEPT {
+                pressed.pop_front();
+            }
+            pressed.push_back((message.message_id.clone(), text.to_string()));
+        }
+    }
+
     fn section(text: &str) -> Value {
         json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })
     }
@@ -669,7 +716,7 @@ impl Channel for SlackChannel {
 
     async fn edit(&self, message: &MessageRef, text: &str) -> Result<(), ChannelError> {
         let (channel, _) = split_conversation_id(&message.conversation_id);
-        let mrkdwn = truncate_chars(&markdown_to_mrkdwn(text), SECTION_TEXT_LIMIT);
+        let mrkdwn = truncate_for_edit(&markdown_to_mrkdwn(text), self.max_message_len);
         let body = json!({
             "channel": channel,
             "ts": message.message_id,
@@ -735,6 +782,31 @@ impl Channel for SlackChannel {
             conversation_id: prompt.conversation.id.clone(),
             message_id: ts.to_string(),
         })
+    }
+
+    /// `chat.update` with only the prompt's text. Works on a prompt whose
+    /// button was pressed since this process started; others are refused,
+    /// as Slack cannot drop buttons without being sent the text again.
+    async fn remove_buttons(&self, message: &MessageRef) -> Result<(), ChannelError> {
+        let text = self.pressed_prompts.lock().ok().and_then(|mut pressed| {
+            let at = pressed
+                .iter()
+                .position(|(ts, _)| *ts == message.message_id)?;
+            pressed.remove(at).map(|(_, text)| text)
+        });
+        let Some(text) = text else {
+            return Err(ChannelError::Other(
+                "slack: this prompt's text is not known".into(),
+            ));
+        };
+        let (channel, _) = split_conversation_id(&message.conversation_id);
+        let body = json!({
+            "channel": channel,
+            "ts": message.message_id,
+            "text": text,
+            "blocks": [Self::section(&text)],
+        });
+        self.post_bot("chat.update", &body).await.map(|_| ())
     }
 
     /// Slack has no typing indicator for bots: the person's latest message
@@ -861,31 +933,46 @@ impl Channel for SlackChannel {
         })
     }
 
-    /// Slack file URLs need the bot token; it is only sent to Slack hosts.
     async fn download(&self, attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
-        if !self.slack_url(&attachment.source) {
-            return Err(ChannelError::Other(
-                "slack: attachment URL is not a Slack host".into(),
+        self.download_limited(attachment, DEFAULT_MAX_DOWNLOAD_BYTES)
+            .await
+    }
+
+    /// Slack file URLs need the bot token; it is only sent to Slack hosts,
+    /// on the first request and on any redirect.
+    async fn download_limited(
+        &self,
+        attachment: &Attachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ChannelError> {
+        if attachment.size_bytes.is_some_and(|size| size > max_bytes) {
+            return Err(ChannelError::TooLarge {
+                limit_bytes: max_bytes,
+            });
+        }
+        let downloaded = self
+            .download_client
+            .fetch(DownloadRequest {
+                url: &attachment.source,
+                bearer_token: Some(&self.bot_token),
+                allowed: &|target| self.slack_host(target),
+                max_bytes,
+                timeout: DOWNLOAD_TIMEOUT,
+                user_agent: None,
+            })
+            .await?;
+        // Without the `files:read` scope Slack answers 200 with its sign-in
+        // page, which must not pass for the file.
+        let is_html = |mime: &str| mime.trim_start().starts_with("text/html");
+        if downloaded.content_type.as_deref().is_some_and(is_html)
+            && !attachment.mime_type.as_deref().is_some_and(is_html)
+        {
+            return Err(ChannelError::Auth(
+                "slack served a sign-in page instead of the file; the bot needs files:read"
+                    .to_string(),
             ));
         }
-        let response = self
-            .http
-            .get(&attachment.source)
-            .bearer_auth(&self.bot_token)
-            .send()
-            .await
-            .map_err(|e| ChannelError::Transport(format!("file download: {e}")))?;
-        if !response.status().is_success() {
-            return Err(ChannelError::Other(format!(
-                "file download: HTTP {}",
-                response.status()
-            )));
-        }
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| ChannelError::Transport(format!("file download: {e}")))
+        Ok(downloaded.bytes)
     }
 
     /// Slack's slash commands are declared in the app manifest; there is

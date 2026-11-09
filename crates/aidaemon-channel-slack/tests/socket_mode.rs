@@ -463,3 +463,48 @@ async fn run_envelopes_hands_over_each_envelope_as_sent() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_pressed_prompt_can_lose_its_buttons_and_keep_its_text() {
+    let value = json!({ "p": "prompt-7", "c": "deny" }).to_string();
+    let socket = MockSocket::start(vec![vec![
+        hello(),
+        json!({
+            "envelope_id": "env-1",
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "U000ALICE", "name": "alice" },
+                "channel": { "id": "C000SYNTH" },
+                "message": { "ts": "1700000000.000200", "text": "Run the *deploy*?" },
+                "actions": [{ "action_id": "aidaemon_approval_1", "value": value }]
+            }
+        }),
+    ]])
+    .await;
+    let api = standard_api(socket.url.clone()).await;
+    let slack = std::sync::Arc::new(channel(&api));
+    let (tx, mut rx) = mpsc::channel(8);
+    let shutdown = CancellationToken::new();
+    let run = {
+        let (slack, shutdown) = (slack.clone(), shutdown.clone());
+        tokio::spawn(async move { slack.run(tx, shutdown).await })
+    };
+    let ChannelEvent::Approval(answer) = next_event(&mut rx).await else {
+        panic!("expected an approval");
+    };
+    let pressed = answer.message.expect("the press names its message");
+    assert_eq!(pressed.message_id, "1700000000.000200");
+
+    slack.remove_buttons(&pressed).await.unwrap();
+    let calls = api.calls("chat.update");
+    assert_eq!(calls.len(), 1);
+    let body = calls[0].json();
+    assert_eq!(body["ts"], json!("1700000000.000200"));
+    assert_eq!(body["text"], json!("Run the *deploy*?"));
+    assert_eq!(body["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(body["blocks"][0]["type"], json!("section"));
+
+    shutdown.cancel();
+    run.await.unwrap().unwrap();
+}

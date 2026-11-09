@@ -41,8 +41,58 @@ pub struct Sender {
     pub is_bot: bool,
 }
 
+/// Largest download [`Channel::download`] accepts unless an adapter documents
+/// a smaller platform limit. Use [`Channel::download_limited`] for your own.
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// What an [`Attachment`] holds, as far as the platform says.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    Audio,
+    Video,
+    /// Anything else, including a kind this version does not know.
+    #[default]
+    #[serde(other)]
+    File,
+}
+
+impl AttachmentKind {
+    /// The kind a MIME type declares (`image/png` is [`Self::Image`]).
+    pub fn from_mime(mime: &str) -> Self {
+        let top = mime.split('/').next().unwrap_or("").trim();
+        if top.eq_ignore_ascii_case("image") {
+            Self::Image
+        } else if top.eq_ignore_ascii_case("audio") {
+            Self::Audio
+        } else if top.eq_ignore_ascii_case("video") {
+            Self::Video
+        } else {
+            Self::File
+        }
+    }
+
+    /// The kind a file name's extension suggests, for platforms that do not
+    /// always report a MIME type.
+    fn from_name(name: &str) -> Self {
+        let extension = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+        match extension.to_ascii_lowercase().as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" => Self::Image,
+            "mp3" | "ogg" | "oga" | "wav" | "flac" | "m4a" | "aac" => Self::Audio,
+            "mp4" | "mov" | "webm" | "mkv" => Self::Video,
+            _ => Self::File,
+        }
+    }
+}
+
 /// A file or image attached to an inbound message. Adapters fill what the
-/// platform provides; the bytes are fetched lazily by the app if needed.
+/// platform provides; the bytes are fetched lazily with [`Channel::download`].
+///
+/// Built with [`Attachment::new`] and the `with_` methods, so a new field
+/// does not break adapters written against an older version.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,
@@ -52,8 +102,53 @@ pub struct Attachment {
     pub size_bytes: Option<u64>,
     /// Platform URL or file id to download from.
     pub source: String,
+    /// What it holds. The platform's word: check the bytes before relying
+    /// on it.
+    #[serde(default)]
+    pub kind: AttachmentKind,
 }
 
+impl Attachment {
+    /// An attachment named `name`, fetched from `source`. Its kind comes
+    /// from the name's extension until [`Self::with_mime_type`] or
+    /// [`Self::with_kind`] says better.
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        let name = name.into();
+        let kind = AttachmentKind::from_name(&name);
+        Self {
+            name,
+            mime_type: None,
+            size_bytes: None,
+            source: source.into(),
+            kind,
+        }
+    }
+
+    /// Set the MIME type (when known); its kind replaces the one guessed
+    /// from the name.
+    pub fn with_mime_type(mut self, mime_type: Option<String>) -> Self {
+        if let Some(mime) = mime_type.as_deref() {
+            self.kind = AttachmentKind::from_mime(mime);
+        }
+        self.mime_type = mime_type;
+        self
+    }
+
+    pub fn with_size_bytes(mut self, size_bytes: Option<u64>) -> Self {
+        self.size_bytes = size_bytes;
+        self
+    }
+
+    /// Set the kind directly, for a platform that says what it is.
+    pub fn with_kind(mut self, kind: AttachmentKind) -> Self {
+        self.kind = kind;
+        self
+    }
+}
+
+/// Built with [`InboundMessage::new`] and the `with_` methods, so a new field
+/// does not break adapters written against an older version.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundMessage {
     pub conversation: Conversation,
@@ -66,6 +161,60 @@ pub struct InboundMessage {
     /// The bot was addressed explicitly (mention, reply to the bot, or a
     /// slash command). Always true in direct conversations.
     pub addressed: bool,
+    /// Platform id of the message this one answers: a reply's target, or
+    /// the root of the Slack thread it sits in. `None` for a message that
+    /// answers nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    /// The platform's thread this message is in (Telegram forum topic id,
+    /// Slack `thread_ts`, Discord thread channel id). `None` outside a
+    /// thread, including a top-level Slack message the bot will answer in a
+    /// new thread (that thread is only its [`Conversation`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+impl InboundMessage {
+    /// A message with no attachments and no parent. `addressed` starts true
+    /// in a direct conversation and false anywhere else.
+    pub fn new(
+        conversation: Conversation,
+        sender: Sender,
+        message_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        let addressed = conversation.kind == ConversationKind::Direct;
+        Self {
+            conversation,
+            sender,
+            message_id: message_id.into(),
+            text: text.into(),
+            attachments: Vec::new(),
+            addressed,
+            parent_message_id: None,
+            thread_id: None,
+        }
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    pub fn with_addressed(mut self, addressed: bool) -> Self {
+        self.addressed = addressed;
+        self
+    }
+
+    pub fn with_parent_message_id(mut self, parent: Option<String>) -> Self {
+        self.parent_message_id = parent;
+        self
+    }
+
+    pub fn with_thread_id(mut self, thread: Option<String>) -> Self {
+        self.thread_id = thread;
+        self
+    }
 }
 
 /// A message to send. `text` is Markdown; adapters convert it to the
@@ -113,12 +262,45 @@ pub struct ApprovalPrompt {
 }
 
 /// A button press (or the text-command fallback) answering a prompt.
+///
+/// Built with [`ApprovalAnswer::new`], so a new field does not break adapters
+/// written against an older version.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalAnswer {
     pub prompt_id: String,
     pub choice_id: String,
     pub sender: Sender,
     pub conversation: Conversation,
+    /// The message whose button was pressed, so its buttons can be removed
+    /// with [`Channel::remove_buttons`] even when the prompt is no longer
+    /// known (it expired, or the process restarted). `None` when the
+    /// platform did not say, or the answer was typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageRef>,
+}
+
+impl ApprovalAnswer {
+    pub fn new(
+        prompt_id: impl Into<String>,
+        choice_id: impl Into<String>,
+        sender: Sender,
+        conversation: Conversation,
+    ) -> Self {
+        Self {
+            prompt_id: prompt_id.into(),
+            choice_id: choice_id.into(),
+            sender,
+            conversation,
+            message: None,
+        }
+    }
+
+    /// Record the message whose button was pressed.
+    pub fn with_message(mut self, message: MessageRef) -> Self {
+        self.message = Some(message);
+        self
+    }
 }
 
 /// A command the app offers in the platform's own command menu (Discord and
@@ -186,7 +368,8 @@ pub struct ChannelCapabilities {
     pub threads: bool,
     /// [`Channel::delete`] works.
     pub delete_messages: bool,
-    /// [`Channel::send_file`] and [`Channel::download`] work.
+    /// [`Channel::send_file`], [`Channel::download`] and
+    /// [`Channel::download_limited`] work.
     pub files: bool,
     /// The platform has a command menu ([`Channel::register_commands`]).
     pub commands: bool,
@@ -209,6 +392,7 @@ impl Default for ChannelCapabilities {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
     #[error("not supported by this channel: {0}")]
@@ -219,6 +403,9 @@ pub enum ChannelError {
     Auth(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// A download was over the size it was allowed.
+    #[error("file is over the {limit_bytes} byte limit")]
+    TooLarge { limit_bytes: u64 },
     #[error("{0}")]
     Other(String),
 }
@@ -249,7 +436,12 @@ pub trait Channel: Send + Sync {
         message: &OutboundMessage,
     ) -> Result<MessageRef, ChannelError>;
 
-    /// Replace the text of a message the bot sent.
+    /// Replace the text of a message the bot sent, and remove any buttons
+    /// on it. An edit always stays one message: text too long for the
+    /// platform is cut at the end and marked with
+    /// [`crate::split::TRUNCATION_MARK`] (see
+    /// [`crate::split::truncate_for_edit`]), never split into further
+    /// messages and never an error.
     async fn edit(&self, _message: &MessageRef, _text: &str) -> Result<(), ChannelError> {
         Err(ChannelError::Unsupported("edit"))
     }
@@ -259,6 +451,12 @@ pub trait Channel: Send + Sync {
     /// `/approve <id>` / `/deny <id>` commands.
     async fn ask(&self, _prompt: &ApprovalPrompt) -> Result<MessageRef, ChannelError> {
         Err(ChannelError::Unsupported("buttons"))
+    }
+
+    /// Remove the buttons from a message, leaving its text. Best effort:
+    /// the default does nothing, for channels without buttons.
+    async fn remove_buttons(&self, _message: &MessageRef) -> Result<(), ChannelError> {
+        Ok(())
     }
 
     /// Show a "typing" indicator. Best effort.
@@ -280,9 +478,36 @@ pub trait Channel: Send + Sync {
         Err(ChannelError::Unsupported("files"))
     }
 
-    /// Fetch the bytes of an inbound attachment.
+    /// Fetch the bytes of an inbound attachment, up to the adapter's
+    /// platform limit or else [`DEFAULT_MAX_DOWNLOAD_BYTES`]. An adapter
+    /// keeps its token to the platform's own hosts and out of its errors
+    /// and logs.
     async fn download(&self, _attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
         Err(ChannelError::Unsupported("files"))
+    }
+
+    /// [`Self::download`], refused with [`ChannelError::TooLarge`] over
+    /// `max_bytes`.
+    ///
+    /// The default holds any adapter to the limit, but learns the true size
+    /// only after [`Self::download`] returns. An adapter that can stop
+    /// reading part way through should override it.
+    async fn download_limited(
+        &self,
+        attachment: &Attachment,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let too_large = ChannelError::TooLarge {
+            limit_bytes: max_bytes,
+        };
+        if attachment.size_bytes.is_some_and(|size| size > max_bytes) {
+            return Err(too_large);
+        }
+        let bytes = self.download(attachment).await?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(too_large);
+        }
+        Ok(bytes)
     }
 
     /// Offer `commands` in the platform's command menu, replacing what was
@@ -308,5 +533,153 @@ pub trait Channel: Send + Sync {
         self.send(&command.conversation, &OutboundMessage::text(text))
             .await
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mime_type_outranks_the_name() {
+        assert_eq!(Attachment::new("a.png", "s").kind, AttachmentKind::Image);
+        assert_eq!(Attachment::new("a.MP3", "s").kind, AttachmentKind::Audio);
+        assert_eq!(Attachment::new("a.mov", "s").kind, AttachmentKind::Video);
+        assert_eq!(Attachment::new("a.pdf", "s").kind, AttachmentKind::File);
+        assert_eq!(Attachment::new("noext", "s").kind, AttachmentKind::File);
+        let relabelled = Attachment::new("a.png", "s").with_mime_type(Some("text/plain".into()));
+        assert_eq!(relabelled.kind, AttachmentKind::File);
+        let unlabelled = Attachment::new("a.png", "s").with_mime_type(None);
+        assert_eq!(unlabelled.kind, AttachmentKind::Image);
+    }
+
+    #[test]
+    fn older_or_newer_json_still_reads() {
+        // Written before `kind` and the links existed.
+        let old: InboundMessage = serde_json::from_value(serde_json::json!({
+            "conversation": {"id": "c", "kind": "direct"},
+            "sender": {"id": "synthetic-user-1"},
+            "message_id": "m1",
+            "text": "hi",
+            "attachments": [{"name": "a.bin", "source": "s"}],
+            "addressed": true,
+        }))
+        .unwrap();
+        assert_eq!(old.attachments[0].kind, AttachmentKind::File);
+        assert_eq!(old.parent_message_id, None);
+        assert_eq!(old.thread_id, None);
+        // A kind this version has never heard of.
+        let unknown: Attachment = serde_json::from_value(
+            serde_json::json!({"name": "a", "source": "s", "kind": "hologram"}),
+        )
+        .unwrap();
+        assert_eq!(unknown.kind, AttachmentKind::File);
+        // An unset link is not written out.
+        let written = serde_json::to_value(&old).unwrap();
+        assert!(written.get("parent_message_id").is_none());
+    }
+
+    struct Bare;
+
+    #[async_trait]
+    impl Channel for Bare {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn run(
+            &self,
+            _events: mpsc::Sender<ChannelEvent>,
+            _shutdown: CancellationToken,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            conversation: &Conversation,
+            _message: &OutboundMessage,
+        ) -> Result<MessageRef, ChannelError> {
+            Ok(MessageRef {
+                conversation_id: conversation.id.clone(),
+                message_id: "1".into(),
+            })
+        }
+    }
+
+    /// Overrides only the old method, the way an older adapter would.
+    struct OldAdapter(Vec<u8>);
+
+    #[async_trait]
+    impl Channel for OldAdapter {
+        fn name(&self) -> &str {
+            "old"
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn run(
+            &self,
+            _events: mpsc::Sender<ChannelEvent>,
+            _shutdown: CancellationToken,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            conversation: &Conversation,
+            _message: &OutboundMessage,
+        ) -> Result<MessageRef, ChannelError> {
+            Ok(MessageRef {
+                conversation_id: conversation.id.clone(),
+                message_id: "1".into(),
+            })
+        }
+        async fn download(&self, _attachment: &Attachment) -> Result<Vec<u8>, ChannelError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_defaults_are_safe() {
+        let attachment = Attachment::new("a", "s");
+        assert!(matches!(
+            Bare.download(&attachment).await,
+            Err(ChannelError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Bare.download_limited(&attachment, 10).await,
+            Err(ChannelError::Unsupported(_))
+        ));
+        let message = MessageRef {
+            conversation_id: "c".into(),
+            message_id: "m".into(),
+        };
+        assert!(Bare.remove_buttons(&message).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_older_adapter_is_held_to_the_limit() {
+        let adapter = OldAdapter(vec![0; 11]);
+        let attachment = Attachment::new("a", "s");
+        assert_eq!(
+            adapter
+                .download_limited(&attachment, 11)
+                .await
+                .unwrap()
+                .len(),
+            11
+        );
+        assert!(matches!(
+            adapter.download_limited(&attachment, 10).await,
+            Err(ChannelError::TooLarge { limit_bytes: 10 })
+        ));
+        // A declared size over the limit is refused without fetching.
+        let declared = attachment.with_size_bytes(Some(99));
+        assert!(matches!(
+            OldAdapter(Vec::new()).download_limited(&declared, 10).await,
+            Err(ChannelError::TooLarge { .. })
+        ));
     }
 }

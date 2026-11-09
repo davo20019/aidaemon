@@ -7,13 +7,15 @@ use std::time::Duration;
 use aidaemon_channels::testing::{direct, group, message, TestChannel};
 use aidaemon_channels::ChannelEvent;
 use aidaemon_channels::{
-    AccessPolicy, ApprovalStore, ChannelError, ChannelRunner, EventRouter, MemoryApprovalStore,
-    MemorySessionIndex, RunnerBuildError, RunnerConfig, SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
+    AccessPolicy, ApprovalAnswer, ApprovalStore, Attachment, ChannelError, ChannelRunner,
+    EventRouter, MemoryApprovalStore, MemorySessionIndex, RunnerBuildError, RunnerConfig,
+    SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
 };
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider, StreamingProvider};
 use aidaemon_core::{
-    Agent, FnTool, Hook, HookContext, MemoryStore, ModelRequest, ModelResponse, Provider,
-    ProviderError, Role, RunStore, ToolAnnotations, ToolCall, ToolDecision, ToolInfo, ToolOutput,
+    Agent, FnTool, Hook, HookContext, Image, MemoryStore, ModelRequest, ModelResponse, Provider,
+    ProviderError, Role, RunStore, SourceTrust, ToolAnnotations, ToolCall, ToolDecision, ToolInfo,
+    ToolOutput, UntrustedHook, UntrustedMode,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -115,6 +117,25 @@ fn slow_tool() -> impl aidaemon_core::Tool {
     )
 }
 
+/// A tool that sends something out of the workspace.
+fn notify_tool(count: Arc<AtomicUsize>) -> impl aidaemon_core::Tool {
+    FnTool::new(
+        spec("notify", "Send a notification", &[]),
+        ToolAnnotations {
+            egress: true,
+            ..ToolAnnotations::WRITE
+        },
+        move |_args| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutput::text("notified"))
+            }
+        },
+    )
+    .with_trust(SourceTrust::Trusted)
+}
+
 struct Setup {
     provider: Arc<dyn Provider>,
     channel: Arc<TestChannel>,
@@ -123,6 +144,8 @@ struct Setup {
     store: Option<(Arc<MemoryStore>, Arc<MemorySessionIndex>)>,
     approvals: Option<Arc<MemoryApprovalStore>>,
     deploys: Arc<AtomicUsize>,
+    notifies: Arc<AtomicUsize>,
+    enforce_untrusted: bool,
 }
 
 impl Setup {
@@ -137,7 +160,15 @@ impl Setup {
             store: None,
             approvals: None,
             deploys: Arc::new(AtomicUsize::new(0)),
+            notifies: Arc::new(AtomicUsize::new(0)),
+            enforce_untrusted: false,
         }
+    }
+
+    /// Run with the real untrusted-content rule.
+    fn enforce_untrusted(mut self) -> Self {
+        self.enforce_untrusted = true;
+        self
     }
 
     fn channel(mut self, channel: TestChannel) -> Self {
@@ -152,17 +183,22 @@ impl Setup {
 
     fn start(self) -> Running {
         let router = EventRouter::new();
-        let agent = Agent::builder("assistant")
+        let mut agent = Agent::builder("assistant")
             .allow_unguarded()
             .provider(self.provider.clone())
             .model("synthetic-model")
             .instructions("You help Alice Rivera.")
             .tool(deploy_tool(self.deploys.clone()))
+            .tool(notify_tool(self.notifies.clone()))
             .tool(slow_tool())
             .hook(AskBeforeDeploy)
-            .event_sink(router.clone())
-            .build()
-            .expect("agent builds");
+            .event_sink(router.clone());
+        if self.enforce_untrusted {
+            agent = agent.hook(UntrustedHook::new(UntrustedMode::Enforce, |_, content| {
+                content.to_string()
+            }));
+        }
+        let agent = agent.build().expect("agent builds");
         let mut builder = ChannelRunner::builder(agent)
             .channel(self.channel.clone())
             .access(self.policy)
@@ -185,6 +221,7 @@ impl Setup {
         Running {
             channel: self.channel,
             deploys: self.deploys,
+            notifies: self.notifies,
             shutdown,
             handle,
         }
@@ -194,6 +231,7 @@ impl Setup {
 struct Running {
     channel: Arc<TestChannel>,
     deploys: Arc<AtomicUsize>,
+    notifies: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -1037,4 +1075,376 @@ fn builder_rejects_bad_setups() {
         err,
         Some(aidaemon_channels::RunnerBuildError::DuplicateChannel(_))
     ));
+}
+
+// ---------- attachments ----------
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nsynthetic-image-bytes";
+
+fn with_file(attachment: Attachment, sender: &str, text: &str) -> ChannelEvent {
+    let mut inbound = message(direct("chat-1"), sender, text);
+    inbound.attachments = vec![attachment];
+    ChannelEvent::Message(inbound)
+}
+
+fn png_attachment() -> Attachment {
+    Attachment::new("photo.png", "src-1").with_mime_type(Some("image/png".to_string()))
+}
+
+fn files_channel() -> TestChannel {
+    TestChannel::new("telegram").with_files(true)
+}
+
+/// The last user message the model received.
+fn last_user_message(provider: &ScriptedProvider) -> aidaemon_core::Message {
+    let requests = provider.requests();
+    let request = requests.last().expect("the model was called");
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .expect("a user message")
+        .clone()
+}
+
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "runner-{label}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
+#[tokio::test]
+async fn an_image_reaches_the_model_as_an_image() {
+    let provider = scripted(vec![text("A photo.")]);
+    let channel = files_channel();
+    channel.add_file("src-1", PNG);
+    let run = Setup::new(provider.clone()).channel(channel).start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "what is this?"));
+    assert!(run.wait_text("chat-1", "A photo.").await);
+    let user = last_user_message(&provider);
+    assert_eq!(user.images.len(), 1);
+    let Image::Base64 { media_type, data } = &user.images[0] else {
+        panic!("expected inline bytes: {:?}", user.images[0]);
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(
+        data,
+        &aidaemon_channels_test_base64(PNG),
+        "the bytes as downloaded"
+    );
+    assert!(user.content.starts_with("what is this?\n\n"));
+    assert!(user.content.contains("`photo.png`"));
+    assert!(user.content.contains("included as an image"));
+    run.stop().await;
+}
+
+/// Standard base64, written out so the test does not share the runner's code.
+fn aidaemon_channels_test_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for group in bytes.chunks(3) {
+        let n = group
+            .iter()
+            .fold(0u32, |n, byte| (n << 8) | u32::from(*byte))
+            << (8 * (3 - group.len()));
+        for i in 0..4 {
+            if i <= group.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_image_label_on_other_bytes_is_not_passed_as_an_image() {
+    let provider = scripted(vec![text("Done.")]);
+    let channel = files_channel();
+    channel.add_file("src-1", b"<svg xmlns='x'/>".to_vec());
+    let run = Setup::new(provider.clone()).channel(channel).start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "look"));
+    assert!(run.wait_text("chat-1", "Done.").await);
+    let user = last_user_message(&provider);
+    assert!(user.images.is_empty());
+    assert!(user.content.contains("not a supported image"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn the_owners_file_is_saved_and_its_path_given() {
+    let dir = temp_dir("saved");
+    let provider = scripted(vec![text("Read it.")]);
+    let channel = files_channel();
+    channel.add_file("src-2", b"report body".to_vec());
+    let save_dir = dir.clone();
+    let run = Setup::new(provider.clone())
+        .channel(channel)
+        .config(move |c| c.attachments.save_dir = Some(save_dir))
+        .start();
+    let attachment = Attachment::new("../../report.pdf", "src-2")
+        .with_mime_type(Some("application/pdf".to_string()));
+    run.channel.inject(with_file(attachment, OWNER, ""));
+    assert!(run.wait_text("chat-1", "Read it.").await);
+    let user = last_user_message(&provider);
+    assert!(user.images.is_empty());
+    let (_, after) = user.content.split_once("saved at ").expect("a path");
+    let path = std::path::Path::new(after.lines().next().unwrap());
+    assert!(path.starts_with(dir.join("telegram_chat-1")), "{path:?}");
+    assert!(path.to_str().unwrap().ends_with("_report.pdf"), "{path:?}");
+    assert_eq!(std::fs::read(path).unwrap(), b"report body");
+    run.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn another_senders_file_is_named_but_not_saved() {
+    let dir = temp_dir("not-saved");
+    let provider = scripted(vec![text("Noted.")]);
+    let channel = files_channel();
+    channel.add_file("src-2", b"report body".to_vec());
+    let save_dir = dir.clone();
+    let run = Setup::new(provider.clone())
+        .channel(channel)
+        .config(move |c| c.attachments.save_dir = Some(save_dir))
+        .start();
+    run.channel.inject(with_file(
+        Attachment::new("report.pdf", "src-2"),
+        FRIEND,
+        "from a friend",
+    ));
+    assert!(run.wait_text("chat-1", "Noted.").await);
+    let user = last_user_message(&provider);
+    assert!(user.content.contains("`report.pdf`"));
+    assert!(user.content.contains("not loaded"));
+    assert!(!user.content.contains("saved at"));
+    assert!(run.channel.downloads().is_empty());
+    assert!(!dir.exists());
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn without_the_files_capability_attachments_are_only_named() {
+    let provider = scripted(vec![text("Noted.")]);
+    let run = Setup::new(provider.clone()).start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "see this"));
+    assert!(run.wait_text("chat-1", "Noted.").await);
+    let user = last_user_message(&provider);
+    assert!(user.images.is_empty());
+    assert!(user.content.contains("`photo.png`"));
+    assert!(user.content.contains("not loaded"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_oversized_attachment_is_named_and_never_fetched() {
+    let provider = scripted(vec![text("Too big.")]);
+    let run = Setup::new(provider.clone())
+        .channel(files_channel())
+        .config(|c| c.attachments.max_image_bytes = 10)
+        .start();
+    run.channel.inject(with_file(
+        png_attachment().with_size_bytes(Some(11)),
+        OWNER,
+        "big",
+    ));
+    assert!(run.wait_text("chat-1", "Too big.").await);
+    let user = last_user_message(&provider);
+    assert!(user.images.is_empty());
+    assert!(user.content.contains("over the size limit"));
+    assert!(run.channel.downloads().is_empty());
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn attachments_past_the_per_message_limit_are_only_named() {
+    let provider = scripted(vec![text("Two files.")]);
+    let channel = files_channel();
+    channel.add_file("src-1", PNG);
+    channel.add_file("src-3", PNG);
+    let run = Setup::new(provider.clone())
+        .channel(channel)
+        .config(|c| c.attachments.max_per_message = 1)
+        .start();
+    let mut inbound = message(direct("chat-1"), OWNER, "two");
+    inbound.attachments = vec![png_attachment(), Attachment::new("second.png", "src-3")];
+    run.channel.inject_message(inbound);
+    assert!(run.wait_text("chat-1", "Two files.").await);
+    assert_eq!(last_user_message(&provider).images.len(), 1);
+    assert_eq!(run.channel.downloads(), vec!["src-1"]);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_download_still_runs_and_keeps_its_reason_out_of_the_prompt() {
+    let provider = scripted(vec![text("Could not see it.")]);
+    // No file registered, so the download fails.
+    let run = Setup::new(provider.clone())
+        .channel(files_channel())
+        .start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "look"));
+    assert!(run.wait_text("chat-1", "Could not see it.").await);
+    let user = last_user_message(&provider);
+    assert!(user.content.contains("the download failed"));
+    assert!(!user.content.contains("no such test file"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn egress_after_a_loaded_attachment_is_interrupted() {
+    let provider = scripted(vec![
+        tool_calls([call("n1", "notify", json!({}))]),
+        text("Unreachable."),
+    ]);
+    let channel = files_channel();
+    channel.add_file("src-1", PNG);
+    let run = Setup::new(provider)
+        .channel(channel)
+        .enforce_untrusted()
+        .start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "send this on"));
+    assert!(run.wait_text("chat-1", "/approve ").await);
+    assert_eq!(run.notifies.load(Ordering::SeqCst), 0);
+    run.stop().await;
+}
+
+/// The image stays in the transcript, so the session's next run is no cleaner.
+#[tokio::test]
+async fn a_later_run_in_the_session_still_counts_as_tainted() {
+    let provider = scripted(vec![
+        text("A photo."),
+        tool_calls([call("n1", "notify", json!({}))]),
+        text("Unreachable."),
+    ]);
+    let channel = files_channel();
+    channel.add_file("src-1", PNG);
+    let run = Setup::new(provider)
+        .channel(channel)
+        .enforce_untrusted()
+        .start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "what is this?"));
+    assert!(run.wait_text("chat-1", "A photo.").await);
+    run.say("chat-1", "now notify someone");
+    assert!(run.wait_text("chat-1", "/approve ").await);
+    assert_eq!(run.notifies.load(Ordering::SeqCst), 0);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_message_with_no_loaded_content_leaves_egress_alone() {
+    let provider = scripted(vec![
+        tool_calls([call("n1", "notify", json!({}))]),
+        text("Sent."),
+    ]);
+    // Named only: nothing the sender wrote inside a file reached the model.
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram"))
+        .enforce_untrusted()
+        .start();
+    run.channel
+        .inject(with_file(png_attachment(), OWNER, "notify them"));
+    assert!(run.wait_text("chat-1", "Sent.").await);
+    assert_eq!(run.notifies.load(Ordering::SeqCst), 1);
+    run.stop().await;
+}
+
+// ---------- removing buttons ----------
+
+fn press_on(run: &Running, prompt_id: &str, sender: &str, message_id: &str) {
+    run.channel.inject(ChannelEvent::Approval(
+        ApprovalAnswer::new(
+            prompt_id,
+            DENY_CHOICE,
+            aidaemon_channels::testing::sender(sender),
+            direct("chat-1"),
+        )
+        .with_message(aidaemon_channels::MessageRef {
+            conversation_id: "chat-1".to_string(),
+            message_id: message_id.to_string(),
+        }),
+    ));
+}
+
+#[tokio::test]
+async fn a_stale_button_is_removed_when_pressed() {
+    let provider = scripted(vec![]);
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_buttons(true))
+        .start();
+    press_on(&run, "gone-prompt", OWNER, "m-old");
+    assert!(run.wait_text("chat-1", "is not pending here").await);
+    let removed = run.channel.removed_buttons();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].message_id, "m-old");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn someone_who_may_not_approve_cannot_remove_buttons() {
+    let provider = scripted(vec![]);
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_buttons(true))
+        .start();
+    press_on(&run, "gone-prompt", STRANGER, "m-old");
+    run.say("chat-1", "/status");
+    assert!(run.wait_text("chat-1", "Idle").await);
+    assert!(run.channel.removed_buttons().is_empty());
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn on_a_channel_without_edits_an_answer_removes_the_buttons() {
+    let provider = deploy_script("Okay, I will not deploy.");
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_buttons(true))
+        .start();
+    run.say("chat-1", "deploy please");
+    assert!(run.channel.wait_for(WAIT, |c| c.prompts().len() == 1).await);
+    let prompt = run.channel.prompts().remove(0);
+    let shown = run.channel.prompt_ref(&prompt.id).expect("asked");
+    run.channel
+        .press(&prompt.id, DENY_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "Okay, I will not deploy.").await);
+    assert_eq!(run.channel.removed_buttons(), vec![shown]);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn the_verdict_survives_a_prompt_too_long_to_fit() {
+    let provider = scripted(vec![
+        tool_calls([call("d1", "deploy", json!({"target": "x".repeat(600)}))]),
+        text("Deployed."),
+    ]);
+    let run = Setup::new(provider)
+        .channel(
+            TestChannel::new("telegram")
+                .with_buttons(true)
+                .with_edits(true)
+                .with_max_len(300),
+        )
+        .start();
+    run.say("chat-1", "deploy please");
+    assert!(run.channel.wait_for(WAIT, |c| c.prompts().len() == 1).await);
+    let prompt = run.channel.prompts().remove(0);
+    run.channel
+        .press(&prompt.id, APPROVE_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "Deployed.").await);
+    let edits = run.channel.edits();
+    let marked = edits
+        .iter()
+        .find(|e| e.text.contains("**Approved**"))
+        .expect("the verdict is shown");
+    assert!(marked.text.chars().count() <= 300);
+    assert!(marked.text.ends_with("**Approved**"));
+    run.stop().await;
 }

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use aidaemon_channels::{
     ApprovalAnswer, Attachment, CommandInvocation, Conversation, ConversationKind, InboundMessage,
-    Sender,
+    MessageRef, Sender,
 };
 use serde_json::Value;
 
@@ -12,8 +12,9 @@ use serde_json::Value;
 pub const CUSTOM_ID_MAX: usize = 100;
 const CUSTOM_ID_PREFIX: &str = "aid1:";
 
-/// Message types that carry user text: DEFAULT (0) and REPLY (19).
-const USER_MESSAGE_TYPES: [u64; 2] = [0, 19];
+const REPLY_MESSAGE_TYPE: u64 = 19;
+/// Message types that carry user text: DEFAULT (0) and REPLY.
+const USER_MESSAGE_TYPES: [u64; 2] = [0, REPLY_MESSAGE_TYPE];
 
 /// Channel types that are threads (announcement, public, private).
 pub const THREAD_CHANNEL_TYPES: [u64; 3] = [10, 11, 12];
@@ -140,28 +141,39 @@ pub fn map_message(
         .map(|list| {
             list.iter()
                 .filter_map(|a| {
-                    Some(Attachment {
-                        name: str_field(a, "filename")?.to_string(),
-                        mime_type: str_field(a, "content_type").map(str::to_string),
-                        size_bytes: a.get("size").and_then(Value::as_u64),
-                        source: str_field(a, "url")?.to_string(),
-                    })
+                    Some(
+                        Attachment::new(str_field(a, "filename")?, str_field(a, "url")?)
+                            .with_mime_type(str_field(a, "content_type").map(str::to_string))
+                            .with_size_bytes(a.get("size").and_then(Value::as_u64)),
+                    )
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    Some(InboundMessage {
-        conversation: Conversation {
-            id: channel_id.to_string(),
-            kind,
-        },
-        sender,
-        message_id,
-        text: strip_bot_mentions(str_field(d, "content").unwrap_or(""), bot_id),
-        attachments,
-        addressed,
-    })
+    // Only a reply answers something; other references are forwards and
+    // crossposts.
+    let parent = (msg_type == REPLY_MESSAGE_TYPE)
+        .then(|| {
+            d.get("message_reference")
+                .and_then(|r| str_field(r, "message_id"))
+                .or_else(|| d.get("referenced_message").and_then(|r| str_field(r, "id")))
+        })
+        .flatten()
+        .map(str::to_string);
+    let thread = (kind == ConversationKind::Thread).then(|| channel_id.to_string());
+    let conversation = Conversation {
+        id: channel_id.to_string(),
+        kind,
+    };
+    let text = strip_bot_mentions(str_field(d, "content").unwrap_or(""), bot_id);
+    Some(
+        InboundMessage::new(conversation, sender, message_id, text)
+            .with_attachments(attachments)
+            .with_addressed(addressed)
+            .with_parent_message_id(parent)
+            .with_thread_id(thread),
+    )
 }
 
 /// The conversation an interaction happened in.
@@ -237,12 +249,17 @@ pub fn map_interaction(d: &Value, threads: &HashSet<String>) -> Option<ApprovalA
         .and_then(|m| m.get("user"))
         .or_else(|| d.get("user"))?;
     let sender = sender_from(user, member)?;
-    Some(ApprovalAnswer {
-        prompt_id,
-        choice_id,
-        sender,
-        conversation: interaction_conversation(d, threads)?,
-    })
+    let conversation = interaction_conversation(d, threads)?;
+    let pressed = d
+        .get("message")
+        .and_then(|m| str_field(m, "id"))
+        .map(|message_id| MessageRef {
+            conversation_id: conversation.id.clone(),
+            message_id: message_id.to_string(),
+        });
+    let mut answer = ApprovalAnswer::new(prompt_id, choice_id, sender, conversation);
+    answer.message = pressed;
+    Some(answer)
 }
 
 #[cfg(test)]
@@ -322,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_names_its_parent_and_a_thread_is_its_channel() {
+        let mut d = guild_msg("and then?");
+        d["type"] = json!(19);
+        d["message_reference"] = json!({"message_id": "100000000000000099"});
+        let mut threads = HashSet::new();
+        threads.insert("100000000000000200".to_string());
+        let m = map_message(&d, Some(BOT), &threads).unwrap();
+        assert_eq!(m.parent_message_id.as_deref(), Some("100000000000000099"));
+        assert_eq!(m.thread_id.as_deref(), Some("100000000000000200"));
+
+        let plain = map_message(&guild_msg("hello"), Some(BOT), &HashSet::new()).unwrap();
+        assert_eq!(plain.parent_message_id, None);
+        assert_eq!(plain.thread_id, None);
+
+        // A default message that references another (a forward) replies to nothing.
+        let mut forward = guild_msg("fwd");
+        forward["message_reference"] = json!({"message_id": "100000000000000099", "type": 1});
+        let m = map_message(&forward, Some(BOT), &HashSet::new()).unwrap();
+        assert_eq!(m.parent_message_id, None);
+    }
+
+    #[test]
     fn bot_authors_and_self_are_skipped() {
         let mut d = guild_msg("beep");
         d["author"] = json!({"id": "100000000000000005", "bot": true});
@@ -373,12 +412,11 @@ mod tests {
         let m = map_message(&d, Some(BOT), &HashSet::new()).unwrap();
         assert_eq!(
             m.attachments,
-            vec![Attachment {
-                name: "report.pdf".into(),
-                mime_type: Some("application/pdf".into()),
-                size_bytes: Some(2048),
-                source: "https://cdn.example.invalid/report.pdf".into(),
-            }]
+            vec![
+                Attachment::new("report.pdf", "https://cdn.example.invalid/report.pdf")
+                    .with_mime_type(Some("application/pdf".into()))
+                    .with_size_bytes(Some(2048))
+            ]
         );
     }
 
@@ -410,5 +448,17 @@ mod tests {
         assert_eq!(a.choice_id, "deny");
         assert_eq!(a.sender.display_name.as_deref(), Some("Ali"));
         assert_eq!(a.conversation.kind, ConversationKind::Group);
+        assert_eq!(a.message, None, "this payload names no message");
+
+        let mut d = d;
+        d["message"] = json!({"id": "100000000000000700"});
+        let a = map_interaction(&d, &HashSet::new()).unwrap();
+        assert_eq!(
+            a.message,
+            Some(MessageRef {
+                conversation_id: "100000000000000200".to_string(),
+                message_id: "100000000000000700".to_string(),
+            })
+        );
     }
 }

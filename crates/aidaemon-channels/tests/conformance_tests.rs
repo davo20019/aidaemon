@@ -21,6 +21,7 @@ async fn test_channel_with_every_capability_conforms() {
             .with_edits(true)
             .with_buttons(true)
             .with_typing(true)
+            .with_files(true)
             .with_max_len(500),
     );
     let harness = TestChannelHarness::new(channel.clone());
@@ -39,7 +40,8 @@ async fn test_channel_without_optional_capabilities_conforms() {
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
     assert!(report.passed_check(channel_checks::BUTTON_PRESS_ROUND_TRIP));
-    assert_eq!(report.notes.len(), 1, "{report}");
+    // Buttons (2), long edits and download limits have nothing to test.
+    assert_eq!(report.notes.len(), 4, "{report}");
 }
 
 /// A channel that lies about its capabilities and ignores shutdown: the
@@ -108,6 +110,7 @@ async fn misbehaving_channel_fails_with_every_reason() {
     for check in [
         channel_checks::NAME_NON_EMPTY,
         channel_checks::EDIT_MATCHES_CAPABILITY,
+        channel_checks::EDIT_TRUNCATES_LONG_TEXT,
         channel_checks::SHUTDOWN_STOPS_RUN,
     ] {
         assert!(report.failure(check).is_some(), "{check}: {report}");
@@ -115,5 +118,5 @@ async fn misbehaving_channel_fails_with_every_reason() {
     // Everything else still ran and passed.
     assert!(report.passed_check(channel_checks::DIRECT_MESSAGE_FORWARDED));
     assert!(report.passed_check(channel_checks::RECEIVER_DROP_STOPS_RUN));
-    assert_eq!(report.failed.len(), 3, "{report}");
+    assert_eq!(report.failed.len(), 4, "{report}");
 }

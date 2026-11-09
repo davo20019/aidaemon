@@ -28,6 +28,15 @@ A channel only moves messages. Access control, sessions, queueing,
 streaming and approvals are handled by `ChannelRunner`, so every channel
 behaves the same way.
 
+Build inbound values with their constructors (`InboundMessage::new`,
+`Attachment::new`, `ApprovalAnswer::new`): those structs are `#[non_exhaustive]`
+so a new field does not break your adapter. `edit` has one rule for text too
+long for the platform: stay one message, cut at the end, finish with
+`split::TRUNCATION_MARK`. Override `download_limited` when your platform
+lets you stop reading part way through; the `http` feature has a bounded
+downloader (`aidaemon_channels::download`) that keeps a token on your
+platform's own hosts.
+
 ```rust
 use aidaemon_channels::{
     Channel, ChannelCapabilities, ChannelError, ChannelEvent, Conversation, MessageRef,

@@ -140,32 +140,9 @@ impl BotApi {
         self.finish(request).await
     }
 
-    /// Download a file by the `file_path` that `getFile` returned.
-    pub(crate) async fn download(
-        &self,
-        file_path: &str,
-        timeout: Duration,
-    ) -> Result<Vec<u8>, ApiError> {
-        let url = format!("{}/{}", self.file_base, file_path.trim_start_matches('/'));
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport(redact(&e.without_url().to_string())))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ApiError::Api {
-                code: status.as_u16(),
-                description: "file download failed".to_string(),
-                retry_after: None,
-            });
-        }
-        resp.bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| ApiError::Transport(redact(&e.without_url().to_string())))
+    /// Where a `file_path` from `getFile` is fetched. Holds the token.
+    pub(crate) fn file_url(&self, file_path: &str) -> String {
+        format!("{}/{}", self.file_base, file_path.trim_start_matches('/'))
     }
 
     async fn finish<T: DeserializeOwned>(

@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 
 use aidaemon_channels::{
     ApprovalAnswer, Attachment, ChannelEvent, Conversation, ConversationKind, InboundMessage,
-    Sender,
+    MessageRef, Sender,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,15 +152,14 @@ fn attachments(event: &Value) -> Vec<Attachment> {
                 .iter()
                 .filter_map(|file| {
                     let source = str_field(file, "url_private")?;
-                    Some(Attachment {
-                        name: str_field(file, "name")
-                            .or_else(|| str_field(file, "title"))
-                            .unwrap_or("file")
-                            .to_string(),
-                        mime_type: str_field(file, "mimetype").map(str::to_string),
-                        size_bytes: file.get("size").and_then(Value::as_u64),
-                        source: source.to_string(),
-                    })
+                    let name = str_field(file, "name")
+                        .or_else(|| str_field(file, "title"))
+                        .unwrap_or("file");
+                    Some(
+                        Attachment::new(name, source)
+                            .with_mime_type(str_field(file, "mimetype").map(str::to_string))
+                            .with_size_bytes(file.get("size").and_then(Value::as_u64)),
+                    )
                 })
                 .collect()
         })
@@ -230,18 +229,21 @@ pub(crate) fn map_events_api(
             .map(str::to_string)
     });
 
-    Some(ChannelEvent::Message(InboundMessage {
-        conversation,
-        sender: Sender {
-            id: user.to_string(),
-            display_name,
-            is_bot: false,
-        },
-        message_id: ts.to_string(),
-        text,
-        attachments: files,
-        addressed,
-    }))
+    let sender = Sender {
+        id: user.to_string(),
+        display_name,
+        is_bot: false,
+    };
+    // A thread's root reports its own ts as `thread_ts`: it is in the thread
+    // but answers nothing.
+    let parent = thread_ts.filter(|root| *root != ts).map(str::to_string);
+    Some(ChannelEvent::Message(
+        InboundMessage::new(conversation, sender, ts, text)
+            .with_attachments(files)
+            .with_addressed(addressed)
+            .with_parent_message_id(parent)
+            .with_thread_id(thread_ts.map(str::to_string)),
+    ))
 }
 
 /// Map an `interactive` payload. Only `block_actions` on approval buttons
@@ -274,18 +276,25 @@ pub(crate) fn map_interactive(payload: &Value) -> Option<ChannelEvent> {
         })?;
 
     let is_dm = channel.starts_with('D');
-    Some(ChannelEvent::Approval(ApprovalAnswer {
-        prompt_id: value.prompt_id,
-        choice_id: value.choice_id,
-        sender: Sender {
-            id: user_id.to_string(),
-            display_name: str_field(user, "name")
-                .or_else(|| str_field(user, "username"))
-                .map(str::to_string),
-            is_bot: false,
-        },
-        conversation: conversation_for(channel, is_dm, thread_ts, None),
-    }))
+    let conversation = conversation_for(channel, is_dm, thread_ts, None);
+    let pressed = payload
+        .get("message")
+        .and_then(|m| str_field(m, "ts"))
+        .or_else(|| container.and_then(|c| str_field(c, "message_ts")))
+        .map(|ts| MessageRef {
+            conversation_id: conversation.id.clone(),
+            message_id: ts.to_string(),
+        });
+    let sender = Sender {
+        id: user_id.to_string(),
+        display_name: str_field(user, "name")
+            .or_else(|| str_field(user, "username"))
+            .map(str::to_string),
+        is_bot: false,
+    };
+    let mut answer = ApprovalAnswer::new(value.prompt_id, value.choice_id, sender, conversation);
+    answer.message = pressed;
+    Some(ChannelEvent::Approval(answer))
 }
 
 /// Map a `slash_commands` envelope payload. The handle is the command's
@@ -429,6 +438,37 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_reply_links_to_its_root_and_the_root_only_to_its_thread() {
+        let reply = msg(map_events_api(
+            &message(json!({ "thread_ts": "1699999999.000001" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(
+            reply.parent_message_id.as_deref(),
+            Some("1699999999.000001")
+        );
+        assert_eq!(reply.thread_id.as_deref(), Some("1699999999.000001"));
+
+        let root = msg(map_events_api(
+            &message(json!({ "thread_ts": "1700000000.000100" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(root.parent_message_id, None);
+        assert_eq!(root.thread_id.as_deref(), Some("1700000000.000100"));
+
+        // Answered in a new thread, but not in one yet.
+        let top_level = msg(map_events_api(
+            &message(json!({ "text": "<@U000BOT> hi" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(top_level.conversation.kind, ConversationKind::Thread);
+        assert_eq!(top_level.thread_id, None);
+    }
+
+    #[test]
     fn dm_is_direct_and_addressed() {
         let m = msg(map_events_api(
             &message(json!({ "channel": "D000SYNTH", "channel_type": "im" })),
@@ -492,6 +532,10 @@ mod tests {
         assert_eq!(m.attachments.len(), 1);
         assert_eq!(m.attachments[0].name, "report.pdf");
         assert_eq!(m.attachments[0].size_bytes, Some(1234));
+        assert_eq!(
+            m.attachments[0].kind,
+            aidaemon_channels::AttachmentKind::File
+        );
         assert!(m.attachments[0]
             .source
             .starts_with("https://files.slack.com/"));
@@ -518,6 +562,9 @@ mod tests {
                 assert_eq!(a.sender.id, "U000ALICE");
                 assert_eq!(a.conversation.kind, ConversationKind::Thread);
                 assert_eq!(a.conversation.id, "C000SYNTH:1700000000.000100");
+                let pressed = a.message.expect("the press names its message");
+                assert_eq!(pressed.message_id, "1700000000.000200");
+                assert_eq!(pressed.conversation_id, "C000SYNTH:1700000000.000100");
             }
             other => panic!("expected approval, got {other:?}"),
         }

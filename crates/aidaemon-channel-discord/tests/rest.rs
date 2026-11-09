@@ -312,12 +312,13 @@ async fn download_fetches_the_attachment() {
     http.push(200, json!("synthetic attachment bytes"));
     let ch = channel(&http);
     let bytes = ch
-        .download(&aidaemon_channels::Attachment {
-            name: "notes.txt".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            size_bytes: None,
-            source: format!("{}/attachments/1/2/notes.txt", http.base),
-        })
+        .download(
+            &aidaemon_channels::Attachment::new(
+                "notes.txt",
+                format!("{}/attachments/1/2/notes.txt", http.base),
+            )
+            .with_mime_type(Some("text/plain".to_string())),
+        )
         .await
         .unwrap();
     assert_eq!(bytes, b"\"synthetic attachment bytes\"");
@@ -374,4 +375,70 @@ async fn open_direct_creates_the_dm_channel() {
     let reqs = http.requests();
     assert_eq!(reqs[0].path, "/users/@me/channels");
     assert_eq!(reqs[0].body, json!({"recipient_id": "100000000000000001"}));
+}
+
+#[tokio::test]
+async fn a_file_off_discord_is_not_fetched() {
+    let http = MockHttp::start().await;
+    let err = channel(&http)
+        .download(&aidaemon_channels::Attachment::new(
+            "notes.txt",
+            "https://files.example.test/notes.txt",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)), "{err}");
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_download_stops_at_the_limit() {
+    let http = MockHttp::start().await;
+    http.push(200, json!("0123456789"));
+    let err = channel(&http)
+        .download_limited(
+            &aidaemon_channels::Attachment::new(
+                "notes.txt",
+                format!("{}/attachments/1/2/notes.txt", http.base),
+            ),
+            4,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChannelError::TooLarge { limit_bytes: 4 }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_download_sends_no_token() {
+    let http = MockHttp::start().await;
+    http.push(200, json!("bytes"));
+    channel(&http)
+        .download(&aidaemon_channels::Attachment::new(
+            "notes.txt",
+            format!("{}/attachments/1/2/notes.txt", http.base),
+        ))
+        .await
+        .unwrap();
+    assert!(!http.requests()[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn remove_buttons_patches_only_the_components() {
+    let http = MockHttp::start().await;
+    let target = MessageRef {
+        conversation_id: CHANNEL_ID.to_string(),
+        message_id: "100000000000000800".to_string(),
+    };
+    channel(&http).remove_buttons(&target).await.unwrap();
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PATCH");
+    assert_eq!(
+        requests[0].path,
+        format!("/channels/{CHANNEL_ID}/messages/100000000000000800")
+    );
+    assert_eq!(requests[0].body, json!({ "components": [] }));
 }

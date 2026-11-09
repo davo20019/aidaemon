@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aidaemon_channel_slack::SlackChannel;
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use support::{MockApi, Response, APP_TOKEN, BOT_TOKEN, BOT_USER};
@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 const DM: &str = "D000SYNTH";
 const GROUP: &str = "C000SYNTH";
 const ALICE: &str = "U000ALICE";
+const FILE_BODY: &str = "synthetic attachment";
 
 /// Frames waiting for the adapter, delivered so that none can be lost when
 /// it reconnects. A new connection takes over at once (the previous one
@@ -155,6 +156,7 @@ impl SlackHarness {
                 "ok": true, "user_id": BOT_USER, "team_id": "T000SYNTH", "user": "aidaemon"
             })),
             "apps.connections.open" => Response::json(json!({ "ok": true, "url": socket_url })),
+            "conf.bin" => Response::json(json!(FILE_BODY)),
             _ => Response::json(json!({ "ok": true, "ts": format!("1700000001.{prior:06}") })),
         })
         .await;
@@ -218,16 +220,22 @@ impl ChannelHarness for SlackHarness {
             .find(|c| c.id == choice_id)
             .expect("choice exists")
             .label;
-        let button = self
+        // The mock's `ts` for a post is its position among the posts.
+        let (button, ts) = self
             .api
             .calls("chat.postMessage")
             .iter()
+            .enumerate()
             .rev()
-            .filter_map(|req| req.json()["blocks"].as_array().cloned())
-            .flatten()
-            .filter_map(|block| block["elements"].as_array().cloned())
-            .flatten()
-            .find(|el| el["text"]["text"] == json!(label))
+            .find_map(|(position, req)| {
+                let button = req.json()["blocks"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|block| block["elements"].as_array().cloned())
+                    .flatten()
+                    .find(|el| el["text"]["text"] == json!(label))?;
+                Some((button, format!("1700000001.{position:06}")))
+            })
             .expect("the prompt's button was posted");
         let n = self.next();
         self.socket.inbox.push(json!({
@@ -237,7 +245,7 @@ impl ChannelHarness for SlackHarness {
                     "type": "block_actions",
                     "user": { "id": ALICE, "name": "alice" },
                     "channel": { "id": prompt.conversation.id },
-                    "message": { "ts": "1700000001.000000" },
+                    "message": { "ts": ts, "text": prompt.text },
                     "actions": [{ "action_id": button["action_id"], "value": button["value"] }]
                 }
         }));
@@ -250,6 +258,32 @@ impl ChannelHarness for SlackHarness {
             .map(|req| req.json()["text"].as_str().unwrap_or_default().to_string())
             .collect()
     }
+
+    async fn edited_messages(&self) -> Option<Vec<String>> {
+        Some(
+            self.api
+                .calls("chat.update")
+                .iter()
+                .map(|req| req.json()["text"].as_str().unwrap_or_default().to_string())
+                .collect(),
+        )
+    }
+
+    async fn inject_reply_message(&self, text: &str, parent_message_id: &str) -> bool {
+        let ts = format!("1700000000.{:06}", self.next());
+        self.inject_event(json!({
+            "type": "message", "user": ALICE, "channel": DM, "channel_type": "im",
+            "ts": ts, "thread_ts": parent_message_id, "text": text
+        }));
+        true
+    }
+
+    async fn downloadable_attachment(&self) -> Option<(Attachment, Vec<u8>)> {
+        Some((
+            Attachment::new("conf.bin", format!("{}/files/conf.bin", self.api.base)),
+            serde_json::to_vec(FILE_BODY).unwrap(),
+        ))
+    }
 }
 
 #[tokio::test]
@@ -258,10 +292,11 @@ async fn slack_channel_conforms() {
     let channel = Arc::new(
         SlackChannel::new(BOT_TOKEN, APP_TOKEN)
             .with_api_base(&harness.api.base)
+            .with_download_client(reqwest::Client::builder().no_proxy())
             .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50)),
     );
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 12, "{report}");
+    assert_eq!(report.passed.len(), 17, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

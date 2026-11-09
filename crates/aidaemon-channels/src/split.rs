@@ -184,9 +184,33 @@ fn fence_open_before(src: &str, pos: usize) -> Option<String> {
     open
 }
 
+/// Marks text that [`crate::Channel::edit`] cut to fit.
+pub const TRUNCATION_MARK: char = '\u{2026}';
+
+/// `text` as one message of at most `max_chars`: over the limit it is cut at
+/// the end and finished with [`TRUNCATION_MARK`]. This is the rule every
+/// [`crate::Channel::edit`] follows; an adapter that counts differently
+/// (Telegram's UTF-16 units over HTML) applies the same rule to its own
+/// measure.
+pub fn truncate_for_edit(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push(TRUNCATION_MARK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_is_cut_at_the_end_and_marked() {
+        assert_eq!(truncate_for_edit("short", 5), "short");
+        assert_eq!(truncate_for_edit("toolong", 5), "tool\u{2026}");
+        assert_eq!(truncate_for_edit("😀😀😀", 2), "😀\u{2026}");
+    }
 
     fn len(s: &str) -> usize {
         s.chars().count()
