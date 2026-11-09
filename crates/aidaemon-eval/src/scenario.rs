@@ -225,6 +225,9 @@ pub struct Expect {
     /// Case-insensitive substrings the final text must contain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub final_text_contains: Vec<String>,
+    /// Case-sensitive substrings the final text must contain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_text_contains_exact: Vec<String>,
     /// Case-insensitive substrings the final text must not contain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub final_text_not_contains: Vec<String>,

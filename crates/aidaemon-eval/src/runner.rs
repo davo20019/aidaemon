@@ -352,6 +352,14 @@ pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<S
             ));
         }
     }
+    for needle in &expect.final_text_contains_exact {
+        if !text.contains(needle.as_str()) {
+            failures.push(format!(
+                "final_text_contains_exact: missing `{needle}` ({})",
+                shown()
+            ));
+        }
+    }
     for needle in &expect.final_text_not_contains {
         if lower.contains(&needle.to_lowercase()) {
             failures.push(format!(

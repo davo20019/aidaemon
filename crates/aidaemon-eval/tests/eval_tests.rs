@@ -807,3 +807,23 @@ expect:
         result.failures
     );
 }
+
+#[tokio::test]
+async fn final_text_contains_is_loose_and_the_exact_form_is_not() {
+    let check = |needle: &str| {
+        scenario(&format!(
+            "name: exact\ninput: hi\nexpect:\n  final_text_contains_exact: [{needle}]\n"
+        ))
+    };
+    let subject = Canned(canned_trajectory());
+    assert!(check("Acme Corp").run_on(&subject, 0).await.passed);
+    let result = check("acme corp").run_on(&subject, 0).await;
+    assert!(
+        has_failure(&result, "final_text_contains_exact"),
+        "{:?}",
+        result.failures
+    );
+
+    let loose = scenario("name: loose\ninput: hi\nexpect:\n  final_text_contains: [acme corp]\n");
+    assert!(loose.run_on(&subject, 0).await.passed);
+}
