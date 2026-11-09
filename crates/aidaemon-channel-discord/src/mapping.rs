@@ -339,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_names_its_parent_and_a_thread_is_its_channel() {
+        let mut d = guild_msg("and then?");
+        d["type"] = json!(19);
+        d["message_reference"] = json!({"message_id": "100000000000000099"});
+        let mut threads = HashSet::new();
+        threads.insert("100000000000000200".to_string());
+        let m = map_message(&d, Some(BOT), &threads).unwrap();
+        assert_eq!(m.parent_message_id.as_deref(), Some("100000000000000099"));
+        assert_eq!(m.thread_id.as_deref(), Some("100000000000000200"));
+
+        let plain = map_message(&guild_msg("hello"), Some(BOT), &HashSet::new()).unwrap();
+        assert_eq!(plain.parent_message_id, None);
+        assert_eq!(plain.thread_id, None);
+
+        // A default message that references another (a forward) replies to nothing.
+        let mut forward = guild_msg("fwd");
+        forward["message_reference"] = json!({"message_id": "100000000000000099", "type": 1});
+        let m = map_message(&forward, Some(BOT), &HashSet::new()).unwrap();
+        assert_eq!(m.parent_message_id, None);
+    }
+
+    #[test]
     fn bot_authors_and_self_are_skipped() {
         let mut d = guild_msg("beep");
         d["author"] = json!({"id": "100000000000000005", "bot": true});
@@ -426,5 +448,17 @@ mod tests {
         assert_eq!(a.choice_id, "deny");
         assert_eq!(a.sender.display_name.as_deref(), Some("Ali"));
         assert_eq!(a.conversation.kind, ConversationKind::Group);
+        assert_eq!(a.message, None, "this payload names no message");
+
+        let mut d = d;
+        d["message"] = json!({"id": "100000000000000700"});
+        let a = map_interaction(&d, &HashSet::new()).unwrap();
+        assert_eq!(
+            a.message,
+            Some(MessageRef {
+                conversation_id: "100000000000000200".to_string(),
+                message_id: "100000000000000700".to_string(),
+            })
+        );
     }
 }

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{Attachment, ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use common::{channel, MockHttp, BOT_ID, CHANNEL_ID, GUILD_ID};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -299,7 +299,10 @@ impl ChannelHarness for DiscordHarness {
         self.http.push(200, body.clone());
         self.http.push(200, body.clone());
         Some((
-            Attachment::new("conf.bin", format!("{}/attachments/conf.bin", self.http.base)),
+            Attachment::new(
+                "conf.bin",
+                format!("{}/attachments/conf.bin", self.http.base),
+            ),
             body.to_string().into_bytes(),
         ))
     }
