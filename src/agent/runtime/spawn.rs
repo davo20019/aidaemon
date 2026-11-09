@@ -1656,6 +1656,7 @@ impl Agent {
             self.context_window_config.clone(),
             self.policy_config.clone(),
             self.path_aliases.clone(),
+            self.inbox_dir.clone(),
             inherited_project_scope,
             approval_session_id,
             root_tools,

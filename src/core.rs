@@ -199,6 +199,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         context_window_config: config.state.context_window.clone(),
         policy_config: config.policy.clone(),
         path_aliases: config.path_aliases.clone(),
+        inbox_dir: Some(std::path::PathBuf::from(
+            shellexpand::tilde(&config.files.inbox_dir).to_string(),
+        )),
         inherited_project_scope: None,
         specialists,
         // Pin the interactive generation loop to the configured slot only when

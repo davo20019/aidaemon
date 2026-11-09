@@ -372,6 +372,8 @@ pub struct Agent {
     policy_config: PolicyConfig,
     /// Configured path alias roots (for example, `projects/...`).
     path_aliases: PathAliasConfig,
+    /// Where received attachments are saved: daemon storage, never a project.
+    inbox_dir: Option<std::path::PathBuf>,
     /// Parent scope carried into spawned child agents.
     inherited_project_scope: Option<String>,
     /// Human-facing session that owns approvals for this internal child.

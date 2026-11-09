@@ -478,6 +478,16 @@ fn scope_looks_like_project_root(scope: &str) -> bool {
     crate::tools::fs_utils::find_nearest_project_root(&path).is_some_and(|root| root == path)
 }
 
+/// Drop scopes inside the attachment inbox. The notice for a received file
+/// names its saved path, so carried-over text would otherwise make daemon
+/// storage the task's project and confine the turn to it.
+pub(super) fn drop_inbox_scopes(scopes: &mut Vec<String>, inbox: Option<&Path>) {
+    let Some(inbox) = inbox else {
+        return;
+    };
+    scopes.retain(|scope| !Path::new(scope).starts_with(inbox));
+}
+
 pub(super) fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
     scopes
         .iter()

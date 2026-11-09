@@ -738,6 +738,9 @@ pub async fn fake_mcp_registry(state: Arc<SqliteStateStore>) -> crate::mcp::McpR
     registry
 }
 
+/// The attachment inbox of the agent [`setup_test_agent`] builds.
+pub const TEST_INBOX_DIR: &str = "/tmp/aidaemon-test-attachments";
+
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
 }
@@ -974,6 +977,7 @@ async fn setup_test_agent_internal(
         },
         policy_config: policy_config.unwrap_or_else(test_policy_config),
         path_aliases: crate::config::PathAliasConfig::default(),
+        inbox_dir: Some(std::path::PathBuf::from(TEST_INBOX_DIR)),
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         interactive_slot: None,
@@ -1125,6 +1129,7 @@ pub async fn setup_test_agent_with_models_and_policy(
         },
         policy_config,
         path_aliases: crate::config::PathAliasConfig::default(),
+        inbox_dir: None,
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         interactive_slot: None,
@@ -1224,6 +1229,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         },
         policy_config: crate::testing::test_policy_config(),
         path_aliases: crate::config::PathAliasConfig::default(),
+        inbox_dir: None,
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         interactive_slot: None,
@@ -1511,6 +1517,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         },
         policy_config: crate::testing::test_policy_config(),
         path_aliases: crate::config::PathAliasConfig::default(),
+        inbox_dir: None,
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         interactive_slot: None,
@@ -1666,6 +1673,7 @@ pub async fn setup_live_agent(
         context_window_config: crate::config::ContextWindowConfig::default(),
         policy_config: crate::config::PolicyConfig::default(),
         path_aliases: crate::config::PathAliasConfig::default(),
+        inbox_dir: None,
         inherited_project_scope: None,
         specialists: Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         interactive_slot: None,

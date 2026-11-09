@@ -15,9 +15,9 @@ use super::followup::{
     FollowupMode, TurnContextReason,
 };
 use super::project_scope::{
-    choose_primary_project_scope, extract_explicit_path_scopes_from_text_anchored,
-    extract_project_scopes_from_history_anchored, resolve_primary_project_scope,
-    unify_current_turn_scopes,
+    choose_primary_project_scope, drop_inbox_scopes,
+    extract_explicit_path_scopes_from_text_anchored, extract_project_scopes_from_history_anchored,
+    resolve_primary_project_scope, unify_current_turn_scopes,
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
@@ -494,7 +494,7 @@ impl Agent {
         // acknowledgement/command phrase list. New requests must name their
         // scope structurally or receive a grounded semantic project reference.
         let allow_scope_carryover = internal_continuation || followup_mode != FollowupMode::NewTask;
-        let project_scopes = extract_project_scopes_from_history_anchored(
+        let mut project_scopes = extract_project_scopes_from_history_anchored(
             &history,
             intent_scope_text,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
@@ -502,6 +502,7 @@ impl Agent {
             &self.path_aliases.projects,
             workspace_anchor,
         );
+        drop_inbox_scopes(&mut project_scopes, self.inbox_dir.as_deref());
         // A carried-over turn that names no path inherits the scope of the
         // request it continues before any older history. Whole-history
         // extraction prefers whichever scope looks like a project root, so an
@@ -525,6 +526,7 @@ impl Agent {
                 );
             }
         }
+        drop_inbox_scopes(&mut antecedent_project_scopes, self.inbox_dir.as_deref());
         let allow_multi_project_scope = current_project_scopes.len() > 1;
         // For current-turn scopes, unify all explicitly mentioned paths into a
         // single scope that encompasses them all.  When the user mentions paths
@@ -1772,6 +1774,97 @@ mod tests {
             .is_empty());
         assert!(turn_context.goal_user_text.contains(original));
         assert!(turn_context.goal_user_text.contains("workspace-gca"));
+    }
+
+    async fn turn_context_after_request(antecedent: &str, current: &str) -> TurnContext {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{
+            DialogueState, DialogueStateStore, MessageStore, UserTurnKind, UserTurnSummary,
+        };
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        for (id, role, text) in [
+            ("m0", "user", antecedent),
+            ("m1", "assistant", "Looked into it."),
+            ("m-current", "user", current),
+        ] {
+            harness
+                .state
+                .append_message(&Message {
+                    content: Some(text.to_string()),
+                    ..Message::new_runtime(id, "test-session", role)
+                })
+                .await
+                .expect("append history");
+        }
+        let mut state = DialogueState::new("test-session");
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "m-current".to_string(),
+            kind: UserTurnKind::Followup,
+            text: current.to_string(),
+        });
+        harness
+            .state
+            .upsert_dialogue_state(&state)
+            .await
+            .expect("persist dialogue state");
+        harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", current)
+            .await
+    }
+
+    /// The saved path in a received-file notice is daemon storage. A follow-up
+    /// must not confine itself there, however it is worded.
+    #[tokio::test]
+    async fn a_received_file_path_never_becomes_the_followup_scope() {
+        let inbox = crate::testing::TEST_INBOX_DIR;
+        std::fs::create_dir_all(inbox).unwrap();
+        let antecedent = format!(
+            "[File received: photo.jpg (29 KB, image/jpeg)\nSaved to: {inbox}/photo.jpg]\nWhy did this fail?"
+        );
+        for current in ["Yes, you are approved", "go ahead and fix it"] {
+            let turn_context = turn_context_after_request(&antecedent, current).await;
+            assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
+            assert_eq!(turn_context.primary_project_scope, None, "{current}");
+            assert!(
+                turn_context.authorized_project_scopes.is_empty(),
+                "{current}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_path_beside_a_received_file_still_carries_over() {
+        let inbox = crate::testing::TEST_INBOX_DIR;
+        std::fs::create_dir_all(inbox).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let project_path = project.path().to_string_lossy().to_string();
+        let antecedent = format!(
+            "[File received: photo.jpg (29 KB, image/jpeg)\nSaved to: {inbox}/photo.jpg]\nFix this in {project_path}"
+        );
+        let turn_context = turn_context_after_request(&antecedent, "Yes, go ahead").await;
+        assert_eq!(
+            turn_context.primary_project_scope.as_deref(),
+            Some(project_path.as_str())
+        );
+    }
+
+    #[test]
+    fn inbox_scopes_drop_and_others_stay() {
+        let inbox = std::path::Path::new("/tmp/synthetic-inbox");
+        let mut scopes = vec![
+            "/tmp/synthetic-inbox".to_string(),
+            "/tmp/synthetic-inbox/sub".to_string(),
+            "/tmp/synthetic-inbox-sibling".to_string(),
+            "/tmp/project".to_string(),
+        ];
+        drop_inbox_scopes(&mut scopes, Some(inbox));
+        assert_eq!(scopes, ["/tmp/synthetic-inbox-sibling", "/tmp/project"]);
+        drop_inbox_scopes(&mut scopes, None);
+        assert_eq!(scopes.len(), 2);
     }
 
     #[tokio::test]
