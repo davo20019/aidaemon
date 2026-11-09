@@ -1,0 +1,25 @@
+name: complex_goal_routing
+description: Multi-step request enters orchestrator loop (may fall through to LLM)
+input: Refactor the auth module, add tests, and deploy to staging
+setup:
+  session_id: eval_complex_01
+  orchestrator: true
+script:
+  # The model declares the work on its own checklist; only that declaration
+  # lets the ledger demand it.
+  - tool_calls:
+      - name: track_requirements
+        arguments: '{"items":[{"text":"Refactor and test the auth module","status":"pending","mutation_effects":["local_source_write"]},{"text":"Deploy to staging","status":"pending","mutation_effects":["remote_deploy"]}]}'
+  - text: "This requires three phases: inspect the auth module, refactor and test it, then deploy the verified result to staging."
+  # No-tool reply: the ledger demands the open checklist once while no receipt
+  # lands, then the run stops with its declared work still open.
+  - text: "No work was executed. I cannot report a refactor, tests, or deployment as completed."
+expect:
+  ext:
+    llm_calls_min: 3
+    llm_calls_max: 4
+    # The checklist declaration is the only call: nothing was executed.
+    tool_calls_max: 1
+    # The declared mutation/deploy items produced no effect receipt: a run that
+    # ends with its own checklist open is partial, never succeeded.
+    outcome: partial

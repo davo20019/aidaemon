@@ -1,0 +1,21 @@
+name: system_status_tool_loop
+description: Status check uses system_info tool then completes
+input: Check my system status
+setup:
+  session_id: eval_status_01
+  orchestrator: true
+script:
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - text: System inspected.
+expect:
+  proposed:
+    tools_used:
+      - system_info
+  ext:
+    llm_calls_min: 1
+    tool_calls_min: 1
+    outcome: succeeded
+    contract_fulfillment_min: 0.5
+    overall_min: 0.5

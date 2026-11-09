@@ -1,0 +1,17 @@
+name: cancel_active_goals
+description: Bootstrap stop command cancels seeded active goals without LLM
+input: cancel
+setup:
+  session_id: eval_cancel_01
+  orchestrator: true
+  seed:
+    goals:
+      - description: Daily health check
+        status: active
+expect:
+  final_text_contains_exact:
+    - cancelled goal
+  ext:
+    direct_return: true
+    llm_calls_max: 0
+    outcome: succeeded

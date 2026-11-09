@@ -76,6 +76,7 @@ dependencies = [
  "aidaemon-channel-telegram",
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-eval",
  "aidaemon-mcp",
  "aidaemon-memory",
  "aidaemon-node-protocol",

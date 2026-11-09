@@ -168,6 +168,7 @@ strip = true
 [dev-dependencies]
 aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
 aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] }
+aidaemon-eval = { path = "crates/aidaemon-eval" }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

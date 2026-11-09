@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{DecisionPointData, Event, EventType, HarnessEvalSnapshot, TaskEndData};
+use crate::events::{
+    DecisionPointData, Event, EventType, HarnessEvalSnapshot, TaskEndData, ToolReceiptV1,
+};
 
 fn default_owner() -> String {
     "owner".to_string()
@@ -44,14 +46,14 @@ pub struct HarnessEvalFixture {
     pub seed: FixtureSeed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureSeed {
     #[serde(default)]
     pub goals: Vec<SeedGoal>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedGoal {
     pub description: String,
@@ -163,6 +165,8 @@ pub struct HarnessEvalRunResult {
     pub tool_names: Vec<String>,
     /// Tools whose result receipt reports `ToolInvocationStage::Dispatched`.
     pub dispatched_tool_names: Vec<String>,
+    /// Every tool result in order, with its receipt when it has one.
+    pub tool_results: Vec<(String, Option<ToolReceiptV1>)>,
     pub decision_types: Vec<String>,
 }
 
@@ -247,6 +251,7 @@ pub fn collect_run_result(
     }
 
     let mut dispatched_tool_names = Vec::new();
+    let mut tool_results = Vec::new();
     for event in task_events(EventType::ToolResult) {
         let data = event
             .parse_data::<crate::events::ToolResultData>()
@@ -254,8 +259,9 @@ pub fn collect_run_result(
         if data.receipt.as_ref().is_some_and(|receipt| {
             receipt.invocation_stage == crate::traits::ToolInvocationStage::Dispatched
         }) {
-            dispatched_tool_names.push(data.name);
+            dispatched_tool_names.push(data.name.clone());
         }
+        tool_results.push((data.name, data.receipt));
     }
 
     let mut decision_types = Vec::new();
@@ -274,6 +280,7 @@ pub fn collect_run_result(
         execution_llm_calls,
         tool_names,
         dispatched_tool_names,
+        tool_results,
         decision_types,
     })
 }

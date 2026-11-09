@@ -1,0 +1,13 @@
+name: scheduled_missing_timing_model_directed
+description: The model decides whether missing schedule details require clarification
+input: monitor my account and post 3 times per day
+setup:
+  session_id: eval_missing_timing_01
+  orchestrator: true
+script:
+  - text: What time should I run the first post each day?
+expect:
+  ext:
+    orchestration_route: default_continue
+    direct_return: false
+    llm_calls_min: 1
