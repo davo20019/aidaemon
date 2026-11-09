@@ -426,6 +426,19 @@ fn compile_glob(glob: &str) -> anyhow::Result<GlobMatcher> {
 /// tool watchdog kills the call.
 const MAX_WALK_MILLIS: u128 = 15_000;
 
+/// Run one filesystem call inside the walk's time budget. `None`: the budget
+/// ran out first. A directory can hang (a stalled mount, an OS permission
+/// prompt), and the check between entries never runs while it does.
+async fn within_budget<T>(
+    started: std::time::Instant,
+    call: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let budget = std::time::Duration::from_millis(MAX_WALK_MILLIS as u64);
+    tokio::time::timeout(budget.saturating_sub(started.elapsed()), call)
+        .await
+        .ok()
+}
+
 /// Breadth-first, budgeted directory walk.
 ///
 /// BFS matters: a file in a shallow user directory (~/Downloads/x.pdf) is
@@ -456,7 +469,11 @@ async fn walk_dir(
             return;
         }
 
-        let entries = match backend.read_dir(&dir).await {
+        let Some(listed) = within_budget(started, backend.read_dir(&dir)).await else {
+            stats.truncated = true;
+            return;
+        };
+        let entries = match listed {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -520,7 +537,11 @@ async fn walk_dir(
                     stats.oversized_files_skipped += 1;
                     continue;
                 }
-                if let Ok(bytes) = backend.read(&path).await {
+                let Some(read) = within_budget(started, backend.read(&path)).await else {
+                    stats.truncated = true;
+                    return;
+                };
+                if let Ok(bytes) = read {
                     let content = String::from_utf8_lossy(&bytes);
                     let mut matches = Vec::new();
                     for (i, line) in content.lines().enumerate() {
@@ -550,6 +571,15 @@ async fn walk_dir(
 mod tests {
     use super::*;
     use crate::fs::{WorkspaceBackend, WorkspaceFilePolicy};
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_never_answers_ends_with_the_budget() {
+        let started = std::time::Instant::now();
+        let hung = within_budget(started, std::future::pending::<()>()).await;
+        assert!(hung.is_none());
+        let answered = within_budget(started, std::future::ready(7)).await;
+        assert_eq!(answered, Some(7));
+    }
 
     fn parts(path: &std::path::Path) -> (SharedBackend, WorkspaceFilePolicy) {
         let workspace = Workspace::new(path).unwrap();
