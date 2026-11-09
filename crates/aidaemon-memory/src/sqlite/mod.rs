@@ -39,6 +39,7 @@ pub use facts::{
     build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
     is_owner_authored_fact_source,
 };
+pub(crate) use facts::{facts_make_the_same_claim, FACT_RESTATEMENT_MIN_SIMILARITY};
 pub use retention::{MemoryRetention, MemoryRetentionPolicy, MemoryRetentionStats};
 pub use schema::{migrate, rebuild_memory_fts_projections};
 

@@ -312,6 +312,18 @@ pub fn term_overlap(query: &str, text: &str) -> f32 {
     query.intersection(&text).count() as f32 / query.len() as f32
 }
 
+/// Distinct words two texts share over the words they have between them
+/// (0.0-1.0), stopwords removed.
+pub fn text_similarity(a: &str, b: &str) -> f32 {
+    let a: HashSet<String> = tokens(a).into_iter().collect();
+    let b: HashSet<String> = tokens(b).into_iter().collect();
+    let total = a.union(&b).count();
+    if total == 0 {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f32 / total as f32
+}
+
 /// A conversation turn's importance (0.1-1.0) from structure only: its role
 /// (system prompts are not memories; tool output counts less than what the
 /// user says) and its length. Nothing is inferred from the words used;

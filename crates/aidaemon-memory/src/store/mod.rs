@@ -94,6 +94,10 @@ fn names_subject_of(fact: &Fact, other: &Fact) -> bool {
 /// engine) overrides [`MemoryStore::search_facts`] /
 /// [`MemoryStore::search_episodes`] and the [`crate::Scorer`] is bypassed.
 ///
+/// Near-duplicate merging needs nothing from a store: [`crate::Memory`] finds
+/// the duplicate and writes through [`MemoryStore::upsert_fact_with_access`]
+/// on the existing key, which keeps history by the rules above.
+///
 /// Access levels are optional too. A store that keeps the default
 /// [`MemoryStore::fact_access`] cannot say who may see a record, so
 /// [`crate::Memory`] shows its records only to the owner in a direct

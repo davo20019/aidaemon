@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{MemoryError, Result};
 use crate::records::FactPrivacy;
-use crate::sqlite::{memory_visible, ExactChannelIds};
+use crate::sqlite::{memory_visible, ExactChannelIds, FACT_RESTATEMENT_MIN_SIMILARITY};
 
 /// Longest fact value accepted, in characters.
 pub const MAX_FACT_VALUE_CHARS: usize = 4_000;
@@ -254,6 +254,36 @@ pub struct NewEpisode {
 pub struct StoredEmbedding {
     pub model: String,
     pub vector: Vec<f32>,
+}
+
+/// When a new fact counts as a near duplicate of an active one under another
+/// key. A threshold above 1.0 never matches; see [`MergeConfig::disabled`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MergeConfig {
+    /// Minimum cosine similarity when both sides have vectors from the same
+    /// model. Defaults to the daemon's restatement threshold.
+    pub semantic_threshold: f32,
+    /// Minimum share of words in common when they do not.
+    pub text_threshold: f32,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            semantic_threshold: FACT_RESTATEMENT_MIN_SIMILARITY,
+            text_threshold: 0.9,
+        }
+    }
+}
+
+impl MergeConfig {
+    /// Never merge across keys.
+    pub fn disabled() -> Self {
+        Self {
+            semantic_threshold: 2.0,
+            text_threshold: 2.0,
+        }
+    }
 }
 
 /// A fact as a store hands it back, with its embedding if it has one.

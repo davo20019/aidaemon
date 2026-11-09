@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use aidaemon_core::ChannelVisibility;
 use aidaemon_memory::{
-    FactAccess, HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, NewEpisode, NewFact,
-    Provenance, RecallAudience, ScoredFact, SqliteMemoryStore, UpsertOutcome,
+    Embedder, FactAccess, HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, NewEpisode,
+    NewFact, Provenance, RecallAudience, ScoredFact, SqliteMemoryStore, StoredEmbedding,
+    UpsertOutcome,
 };
 use chrono::{Duration, Utc};
 
@@ -1092,4 +1093,334 @@ fn graph_links_are_structural() {
         crowded.push(row(&format!("n{i}"), &format!("note_{i}"), "yes"));
     }
     assert!(related_fact_scores(&crowded, &["seed".to_string()]).is_empty());
+}
+
+// ------------------------------------------------------- Near duplicates
+
+/// Maps any text containing a marker to that marker's vector, so a test
+/// states how similar two facts are.
+struct ScriptedEmbedder(Vec<(&'static str, Vec<f32>)>);
+
+#[async_trait::async_trait]
+impl Embedder for ScriptedEmbedder {
+    fn model_id(&self) -> &str {
+        "scripted-v1"
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                self.0
+                    .iter()
+                    .find(|(marker, _)| text.contains(marker))
+                    .map_or(vec![1.0, -1.0], |(_, v)| v.clone())
+            })
+            .collect())
+    }
+}
+
+/// `employer` and `workplace` read as one claim; cosine of about 0.995.
+fn scripted() -> Arc<ScriptedEmbedder> {
+    Arc::new(ScriptedEmbedder(vec![
+        ("employer", vec![1.0, 0.0]),
+        ("workplace", vec![1.0, 0.1]),
+        ("distant", vec![1.0, 1.0]),
+    ]))
+}
+
+async fn merge_stores() -> Vec<(&'static str, Arc<dyn MemoryStore>)> {
+    vec![
+        ("in-memory", Arc::new(InMemoryMemoryStore::new())),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+        ("custom", Arc::new(common::VecStore::default())),
+    ]
+}
+
+async fn active_keys(memory: &Memory) -> Vec<String> {
+    let mut keys: Vec<String> = memory
+        .facts(SCOPE)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn a_restatement_under_another_key_reinforces_the_existing_fact() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        let first = memory
+            .remember(fact("work", "employer", "Acme Corp").confidence(0.6))
+            .await
+            .unwrap();
+        let again = memory
+            .remember(fact("work", "workplace", "acme  corp").confidence(0.9))
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            UpsertOutcome::Reinforced {
+                id: first.id().to_string()
+            },
+            "{name}"
+        );
+        assert_eq!(active_keys(&memory).await, ["employer"], "{name}");
+        let facts = memory.facts(SCOPE).await.unwrap();
+        assert!((facts[0].confidence - 0.9).abs() < 1e-5, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_reworded_near_duplicate_supersedes_and_keeps_history() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        let first = memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        let reworded = memory
+            .remember(fact("work", "workplace", "Acme Corp Lisbon"))
+            .await
+            .unwrap();
+        let UpsertOutcome::Superseded {
+            previous_id,
+            previous_value,
+            ..
+        } = &reworded
+        else {
+            panic!("{name}: expected Superseded, got {reworded:?}");
+        };
+        assert_eq!(previous_id, first.id(), "{name}");
+        assert_eq!(previous_value, "Acme Corp", "{name}");
+        assert_eq!(active_keys(&memory).await, ["employer"], "{name}");
+        let history = memory
+            .fact_history(SCOPE, "work", "employer")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "{name}");
+        assert_eq!(history[0].value, "Acme Corp", "{name}");
+        assert!(history[0].superseded_at.is_some(), "{name}");
+        assert_eq!(history[1].value, "Acme Corp Lisbon", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn without_vectors_normalized_text_finds_the_duplicate() {
+    struct Offline;
+    #[async_trait::async_trait]
+    impl Embedder for Offline {
+        fn model_id(&self) -> &str {
+            "offline"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        async fn embed(&self, _: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+            Err(aidaemon_memory::MemoryError::Embedding("offline".into()))
+        }
+    }
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, Arc::new(Offline)).build();
+        memory
+            .remember(fact("preference", "ui_theme", "Dark Mode"))
+            .await
+            .unwrap();
+        // Same words in another order and case.
+        let again = memory
+            .remember(fact("preference", "theme_ui", "dark mode!"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, UpsertOutcome::Superseded { .. }),
+            "{name}: {again:?}"
+        );
+        assert_eq!(active_keys(&memory).await, ["ui_theme"], "{name}");
+        // Different words stay separate.
+        memory
+            .remember(fact("preference", "editor_font", "Dark Mode"))
+            .await
+            .unwrap();
+        assert_eq!(
+            active_keys(&memory).await,
+            ["editor_font", "ui_theme"],
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn distinct_facts_stay_separate_despite_similar_vectors() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        // Below the threshold.
+        memory
+            .remember(fact("work", "distant_client", "Acme Corp"))
+            .await
+            .unwrap();
+        // Close vectors, different claims: a number differs...
+        memory
+            .remember(fact("work", "employer_badge", "Badge 1001"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("work", "workplace_badge", "Badge 1002"))
+            .await
+            .unwrap();
+        // ...the values share too little...
+        memory
+            .remember(fact("work", "workplace_city", "Lisbon"))
+            .await
+            .unwrap();
+        // ...or the keys are about different people.
+        memory
+            .remember(fact("user", "employer_mother", "Alice Rivera"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("user", "employer_father", "Alice Rivera"))
+            .await
+            .unwrap();
+        assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 7, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn merging_stays_inside_the_scope() {
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted()).build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        let other = "telegram:synthetic-user-2";
+        let outcome = memory
+            .remember(NewFact::new(other, "work", "workplace", "Acme Corp"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, UpsertOutcome::Inserted { .. }),
+            "{name}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_merge_threshold_is_configurable() {
+    use aidaemon_memory::MergeConfig;
+    for (name, store) in merge_stores().await {
+        let memory = Memory::builder(store, scripted())
+            .merge(MergeConfig {
+                semantic_threshold: 0.999,
+                ..MergeConfig::default()
+            })
+            .build();
+        memory
+            .remember(fact("work", "employer", "Acme Corp"))
+            .await
+            .unwrap();
+        memory
+            .remember(fact("work", "workplace", "Acme Corp"))
+            .await
+            .unwrap();
+        assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 2, "{name}");
+    }
+    let memory = Memory::builder(Arc::new(InMemoryMemoryStore::new()), scripted())
+        .merge(MergeConfig::disabled())
+        .build();
+    memory
+        .remember(fact("work", "employer", "Acme Corp"))
+        .await
+        .unwrap();
+    memory
+        .remember(fact("work", "workplace", "Acme Corp"))
+        .await
+        .unwrap();
+    assert_eq!(memory.facts(SCOPE).await.unwrap().len(), 2);
+    // The default sits between the scripted pair's similarity and 1.
+    let default = MergeConfig::default().semantic_threshold;
+    assert!(default > 0.5 && default < 0.995);
+}
+
+#[tokio::test]
+async fn merging_does_not_cross_access_levels() {
+    for (name, store) in [
+        (
+            "in-memory",
+            Arc::new(InMemoryMemoryStore::new()) as Arc<dyn MemoryStore>,
+        ),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+    ] {
+        let memory = Memory::builder(store, scripted()).build();
+        let private = memory
+            .remember_with(
+                fact("work", "employer", "Acme Corp"),
+                &FactAccess::private(),
+            )
+            .await
+            .unwrap();
+        // A shared-channel write of the same claim neither reinforces the
+        // private fact (which would reveal it) nor gets narrowed by it.
+        let shared = memory
+            .remember_with(
+                fact("work", "workplace", "Acme Corp"),
+                &FactAccess::channel("c1"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(shared, UpsertOutcome::Inserted { .. }),
+            "{name}: {shared:?}"
+        );
+        assert_ne!(shared.id(), private.id(), "{name}");
+        assert_eq!(
+            active_keys(&memory).await,
+            ["employer", "workplace"],
+            "{name}"
+        );
+    }
+}
+
+/// Vectors from another model say nothing about similarity, so only the text
+/// decides.
+#[tokio::test]
+async fn near_duplicates_ignore_vectors_from_another_model() {
+    let store = Arc::new(InMemoryMemoryStore::new());
+    store
+        .upsert_fact(
+            NewFact::new(SCOPE, "work", "employer", "Acme Corp")
+                .normalized()
+                .unwrap(),
+            Some(StoredEmbedding {
+                model: "old-model".into(),
+                vector: vec![1.0, 0.0],
+            }),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let memory = Memory::builder(store, scripted()).build();
+    let outcome = memory
+        .remember(fact("work", "workplace", "Acme Corp"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, UpsertOutcome::Inserted { .. }),
+        "{outcome:?}"
+    );
 }

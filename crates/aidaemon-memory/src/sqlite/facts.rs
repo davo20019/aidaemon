@@ -243,12 +243,21 @@ fn values_make_the_same_claim(a: &str, b: &str) -> bool {
 /// Whether two active facts in one category are the same knowledge.
 pub fn facts_are_restatements(
     category: &str,
-    (key_a, value_a): (&str, &str),
-    (key_b, value_b): (&str, &str),
+    a: (&str, &str),
+    b: (&str, &str),
     similarity: f32,
 ) -> bool {
-    if similarity < FACT_RESTATEMENT_MIN_SIMILARITY || !values_make_the_same_claim(value_a, value_b)
-    {
+    similarity >= FACT_RESTATEMENT_MIN_SIMILARITY && facts_make_the_same_claim(category, a, b)
+}
+
+/// The similarity-independent half of [`facts_are_restatements`]: similar
+/// text still has to carry one claim about one thing.
+pub(crate) fn facts_make_the_same_claim(
+    category: &str,
+    (key_a, value_a): (&str, &str),
+    (key_b, value_b): (&str, &str),
+) -> bool {
+    if !values_make_the_same_claim(value_a, value_b) {
         return false;
     }
     if !fact_category_is_personal(category) {

@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::embed::{cosine, Embedder};
 use crate::error::{MemoryError, Result};
 use crate::extract::{EpisodeSummarizer, FactExtractor};
-use crate::scoring::{HybridScorer, Scorer, ScoringConfig};
+use crate::scoring::{text_similarity, HybridScorer, Scorer, ScoringConfig};
+use crate::sqlite::facts_make_the_same_claim;
 use crate::store::MemoryStore;
 use crate::types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, truncate_chars,
-    DecayReport, Episode, Fact, FactAccess, MemoryStats, NewEpisode, NewFact, Provenance,
-    RecallAudience, RetentionConfig, ScoredEpisode, ScoredFact, Signals, StoredEmbedding,
-    UpsertOutcome,
+    DecayReport, Episode, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig, NewEpisode,
+    NewFact, Provenance, RecallAudience, RetentionConfig, ScoredEpisode, ScoredFact, Signals,
+    StoredEmbedding, UpsertOutcome,
 };
 
 /// Maps a session id (from `ToolContext` / `HookContext`) to a memory
@@ -44,6 +45,7 @@ struct Inner {
     embedder: Arc<dyn Embedder>,
     scorer: Arc<dyn Scorer>,
     retention: RetentionConfig,
+    merge: MergeConfig,
     scope_resolver: ScopeResolver,
     audience_resolver: AudienceResolver,
     extractor: Option<Arc<FactExtractor>>,
@@ -64,6 +66,7 @@ pub struct MemoryBuilder {
     embedder: Arc<dyn Embedder>,
     scorer: Arc<dyn Scorer>,
     retention: RetentionConfig,
+    merge: MergeConfig,
     scope_resolver: ScopeResolver,
     audience_resolver: AudienceResolver,
     extractor: Option<Arc<FactExtractor>>,
@@ -85,6 +88,12 @@ impl MemoryBuilder {
 
     pub fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// When a new fact merges into a near duplicate under another key.
+    pub fn merge(mut self, merge: MergeConfig) -> Self {
+        self.merge = merge;
         self
     }
 
@@ -126,6 +135,7 @@ impl MemoryBuilder {
                 embedder: self.embedder,
                 scorer: self.scorer,
                 retention: self.retention,
+                merge: self.merge,
                 scope_resolver: self.scope_resolver,
                 audience_resolver: self.audience_resolver,
                 extractor: self.extractor,
@@ -157,6 +167,7 @@ impl Memory {
             embedder,
             scorer: Arc::new(HybridScorer::default()),
             retention: RetentionConfig::default(),
+            merge: MergeConfig::default(),
             scope_resolver: Arc::new(|session: &str| session.to_string()),
             audience_resolver: Arc::new(|_: &str| RecallAudience::owner()),
             extractor: None,
@@ -252,14 +263,83 @@ impl Memory {
         access: &FactAccess,
         now: DateTime<Utc>,
     ) -> Result<UpsertOutcome> {
-        let fact = fact.normalized()?;
-        let embedding = self
+        let mut fact = fact.normalized()?;
+        let mut embedding = self
             .embed_one(&fact_search_text(&fact.category, &fact.key, &fact.value))
             .await;
+        if let Some(target) = self.near_duplicate(&fact, embedding.as_ref(), access).await {
+            fact.category = target.fact.category;
+            fact.key = target.fact.key;
+            fact.confidence = fact.confidence.max(target.fact.confidence);
+            // The stored vector has to describe the row's final text.
+            embedding = self
+                .embed_one(&fact_search_text(&fact.category, &fact.key, &fact.value))
+                .await;
+        }
         self.inner
             .store
             .upsert_fact_with_access(fact, embedding, access, now)
             .await
+    }
+
+    /// The active fact `fact` restates under another key, if any. A fact
+    /// whose key is already active is a reinforcement or a correction, which
+    /// the store decides. Only a record with the same access can merge, so a
+    /// write cannot touch, or learn of, a record its audience may not see.
+    async fn near_duplicate(
+        &self,
+        fact: &NewFact,
+        embedding: Option<&StoredEmbedding>,
+        access: &FactAccess,
+    ) -> Option<FactRecord> {
+        let config = self.inner.merge;
+        let store = &self.inner.store;
+        let records = store
+            .active_facts(&fact.scope)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "near-duplicate check skipped"))
+            .ok()?;
+        if records
+            .iter()
+            .any(|r| r.fact.category == fact.category && r.fact.key == fact.key)
+        {
+            return None;
+        }
+        let ids: Vec<String> = records.iter().map(|r| r.fact.id.clone()).collect();
+        let known = store
+            .fact_access(&fact.scope, &ids)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "near-duplicate check skipped"))
+            .ok()?;
+        let text = fact_search_text(&fact.category, &fact.key, &fact.value);
+        let same_claim = |r: &FactRecord| {
+            let (new, old) = (
+                (fact.key.as_str(), fact.value.as_str()),
+                (r.fact.key.as_str(), r.fact.value.as_str()),
+            );
+            facts_make_the_same_claim(&fact.category, new, old)
+                && facts_make_the_same_claim(&r.fact.category, new, old)
+        };
+        records
+            .into_iter()
+            .filter(|r| known.get(&r.fact.id).cloned().unwrap_or_default() == *access)
+            .filter(same_claim)
+            .filter_map(|r| {
+                let (similarity, threshold) = match Self::semantic(embedding, r.embedding.as_ref())
+                {
+                    Some(semantic) => (semantic, config.semantic_threshold),
+                    None => (
+                        text_similarity(&text, &r.fact.search_text()),
+                        config.text_threshold,
+                    ),
+                };
+                (similarity >= threshold).then_some((similarity, r))
+            })
+            .max_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then(a.1.fact.updated_at.cmp(&b.1.fact.updated_at))
+            })
+            .map(|(_, record)| record)
     }
 
     /// Supersede the active fact for this key. History is kept.
