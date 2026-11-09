@@ -36,10 +36,14 @@
 //!
 //! ## Synchronous mode and approvals
 //!
-//! A child that pauses on a `before_tool` interrupt cannot be resumed from
-//! inside the parent's tool call, so an `Interrupted` child is reported as an
-//! error. Give children tools their policies allow without asking, or run an
-//! approval-requiring agent as its own top-level run.
+//! A child that pauses on a `before_tool` interrupt is settled inside the
+//! parent's tool call by the resolver given to
+//! [`AgentTool::interrupt_resolver`], and keeps going. The parent's tool call
+//! stays open meanwhile, so `Limits::tool_timeout` on the parent bounds the
+//! wait, and a cancelled parent stops waiting. With no resolver, or when it
+//! leaves the interruption unsettled, the child is reported as an error. The
+//! parent itself never pauses for its child, so an answer cannot arrive after
+//! a restart.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,9 +51,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{
-    Agent, AgentBuilder, AuthorityHook, BuildError, FinishOutcome, Hook, HookContext, Limits,
-    Message, ModelRequest, Role, RunOutcome, RunState, RunStatus, Tool, ToolAnnotations,
-    ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
+    Agent, AgentBuilder, AuthorityHook, BuildError, CancellationToken, FinishOutcome, Hook,
+    HookContext, InterruptResolver, Interruption, Limits, Message, ModelRequest, Resolution, Role,
+    RunOutcome, RunState, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput,
+    ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -167,6 +172,7 @@ pub struct AgentTool {
     max_result_chars: usize,
     annotations: ToolAnnotations,
     max_depth: usize,
+    resolver: Option<Arc<dyn InterruptResolver>>,
 }
 
 /// Alias matching the name used in the design notes.
@@ -205,6 +211,7 @@ impl AgentTool {
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
             annotations: ToolAnnotations::WRITE,
             max_depth: DEFAULT_MAX_DEPTH,
+            resolver: None,
         }
     }
 
@@ -263,6 +270,14 @@ impl AgentTool {
     /// is 1). Calls that would exceed it are refused.
     pub fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = depth;
+        self
+    }
+
+    /// Settle the child's interruptions with `resolver` instead of ending
+    /// the delegation with an error. It sees the child's state, whose
+    /// `session_id` and `parent_run` name where the child came from.
+    pub fn interrupt_resolver(mut self, resolver: Arc<dyn InterruptResolver>) -> Self {
+        self.resolver = Some(resolver);
         self
     }
 
@@ -403,10 +418,19 @@ impl Tool for AgentTool {
         if let Some(declines) = &ctx.declines {
             state = state.share_declines(declines.clone());
         }
-        let outcome = agent
-            .run_from(state, ctx.cancel.clone())
-            .await
-            .map_err(|e| ToolError(format!("sub-agent `{}` could not run: {e}", self.name)))?;
+        let outcome = match &self.resolver {
+            Some(resolver) => {
+                let resolver = UntilCancelled {
+                    inner: resolver.as_ref(),
+                    cancel: ctx.cancel.clone(),
+                };
+                agent
+                    .run_resolving(state, ctx.cancel.clone(), &resolver)
+                    .await
+            }
+            None => agent.run_from(state, ctx.cancel.clone()).await,
+        }
+        .map_err(|e| ToolError(format!("sub-agent `{}` could not run: {e}", self.name)))?;
 
         let details = self.details(&outcome, &session);
         let usage = outcome.usage();
@@ -456,6 +480,14 @@ impl Tool for AgentTool {
                     }
                 }
             }
+            RunStatus::Interrupted { interruption } if self.resolver.is_some() => {
+                ToolOutput::error(format!(
+                    "sub-agent `{}` paused waiting for approval of `{}` ({}) and it was not \
+                     settled, so the call did not run. Do it yourself (your own approval policy \
+                     applies) or ask the user.",
+                    self.name, interruption.call.name, interruption.reason
+                ))
+            }
             RunStatus::Interrupted { interruption } => ToolOutput::error(format!(
                 "sub-agent `{}` paused waiting for approval of `{}` ({}). Sub-agents that need \
                  approval are not supported in synchronous agent-as-tool mode, so the call did \
@@ -476,6 +508,22 @@ impl Tool for AgentTool {
             }
         };
         Ok(output.with_details(details).with_usage(usage))
+    }
+}
+
+/// Stops waiting for an answer once the parent is cancelled.
+struct UntilCancelled<'a> {
+    inner: &'a dyn InterruptResolver,
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl InterruptResolver for UntilCancelled<'_> {
+    async fn resolve(&self, state: &RunState, interruption: &Interruption) -> Option<Resolution> {
+        self.cancel
+            .run_until_cancelled(self.inner.resolve(state, interruption))
+            .await
+            .flatten()
     }
 }
 

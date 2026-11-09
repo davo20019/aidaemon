@@ -6,9 +6,9 @@ use std::time::Duration;
 use aidaemon_agents::{AgentExt, AgentTool, ChildBudget, TranscriptTap};
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
-    Agent, AgentBuilder, CancellationToken, FnTool, Hook, HookContext, ReceiptStatus, Role,
-    RunStatus, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput,
-    ToolResult, ToolSpec,
+    Agent, AgentBuilder, CancellationToken, FnTool, Hook, HookContext, InterruptResolver,
+    Interruption, ReceiptStatus, Resolution, Role, RunState, RunStatus, Tool, ToolAnnotations,
+    ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -299,6 +299,156 @@ async fn interrupted_child_explains_sync_mode_limitation() {
     assert_eq!(receipt.status, ReceiptStatus::Failed);
     assert!(seen.contains("not supported in synchronous"), "{seen}");
     assert!(seen.contains("`echo`"), "{seen}");
+}
+
+/// Answers every interruption the same way, and records whose it was.
+struct Answers {
+    answer: Option<Resolution>,
+    sessions: Mutex<Vec<String>>,
+}
+
+impl Answers {
+    fn new(answer: Option<Resolution>) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            sessions: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl InterruptResolver for Answers {
+    async fn resolve(&self, state: &RunState, _: &Interruption) -> Option<Resolution> {
+        self.sessions.lock().unwrap().push(state.session_id.clone());
+        self.answer.clone()
+    }
+}
+
+/// A child that asks before `echo`, then replies; and how often `echo` ran.
+fn asking_child(reply: &str) -> (AgentTool, Arc<ScriptedProvider>, Arc<Mutex<u32>>) {
+    let runs = Arc::new(Mutex::new(0));
+    let counted = {
+        let runs = runs.clone();
+        FnTool::new(
+            spec("echo", "Echo the text back", &["text"]),
+            ToolAnnotations::READ_ONLY,
+            move |_args: Value| {
+                let runs = runs.clone();
+                async move {
+                    *runs.lock().unwrap() += 1;
+                    Ok(ToolOutput::text("echoed"))
+                }
+            },
+        )
+    };
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("k", "echo", json!({"text": "a"}))]),
+        text(reply),
+    ]));
+    let tool = AgentTool::from_builder(
+        child_builder(provider.clone()).tool(counted).hook(AskFirst),
+        ChildBudget::default(),
+    )
+    .unwrap();
+    (tool, provider, runs)
+}
+
+#[tokio::test]
+async fn an_approved_child_keeps_going_inside_the_parents_call() {
+    let (tool, _, runs) = asking_child("Echo finished for Alice Rivera.");
+    let answers = Answers::new(Some(Resolution::Approve));
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "do it")]),
+        text("handled"),
+    ]));
+    let out = parent(
+        parent_provider.clone(),
+        tool.name("research").interrupt_resolver(answers.clone()),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Succeeded);
+    assert_eq!(*runs.lock().unwrap(), 1);
+    assert!(tool_message(&parent_provider, "c1").contains("Echo finished for Alice Rivera."));
+    assert_eq!(*answers.sessions.lock().unwrap(), vec!["s/sub/c1"]);
+}
+
+#[tokio::test]
+async fn a_denied_child_is_told_and_its_call_does_not_run() {
+    let (tool, child_provider, runs) = asking_child("I did not echo.");
+    let answers = Answers::new(Some(Resolution::Deny {
+        reason: "Jordan Lee said no".into(),
+    }));
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "do it")]),
+        text("handled"),
+    ]));
+    let out = parent(
+        parent_provider.clone(),
+        tool.name("research").interrupt_resolver(answers),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+
+    assert!(out.is_completed());
+    assert_eq!(*runs.lock().unwrap(), 0);
+    assert!(tool_message(&child_provider, "k").contains("Jordan Lee said no"));
+    assert!(tool_message(&parent_provider, "c1").contains("I did not echo."));
+}
+
+#[tokio::test]
+async fn a_child_left_unsettled_is_an_error_and_its_call_does_not_run() {
+    let (tool, _, runs) = asking_child("never");
+    let (seen, receipt) = run_failing_child(tool.interrupt_resolver(Answers::new(None))).await;
+    assert_eq!(receipt.status, ReceiptStatus::Failed);
+    assert!(seen.contains("it was not settled"), "{seen}");
+    assert!(seen.contains("`echo`"), "{seen}");
+    assert_eq!(*runs.lock().unwrap(), 0);
+}
+
+/// Never answers.
+struct NeverAnswers;
+
+#[async_trait]
+impl InterruptResolver for NeverAnswers {
+    async fn resolve(&self, _: &RunState, _: &Interruption) -> Option<Resolution> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_parent_stops_waiting_for_an_answer() {
+    let (tool, _, runs) = asking_child("never");
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "do it")]),
+        text("unused"),
+    ]));
+    let agent = parent(
+        parent_provider,
+        tool.name("research")
+            .interrupt_resolver(Arc::new(NeverAnswers)),
+    );
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { agent.run_with_cancel("s", "go", cancel).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+    let out = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the parent stops")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Cancelled),
+        "{:?}",
+        out.status
+    );
+    assert_eq!(*runs.lock().unwrap(), 0);
 }
 
 #[tokio::test]

@@ -115,8 +115,12 @@ measurement gate: keep each one only if N-of-M runs show a gain.
 
 ### Phase 6: the rest of the framework (done, with gaps)
 Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
-- [ ] Async approval inside sub-agents (a child that interrupts currently
-      returns an error to its parent).
+- [x] Approval inside sub-agents: `AgentTool::interrupt_resolver` settles a
+      child's interruption inside the parent's tool call, and the child keeps
+      going. Without a resolver a child that interrupts is still an error.
+- [ ] Durable parent pause for a child's approval (the parent's tool call
+      stays open, so an answer cannot arrive after a restart). Needs the
+      child's `RunState` nested in the parent's `Pending`, a schema change.
 - [x] Images in messages and tool results (`Image`; Anthropic, OpenAI-compatible, MCP).
 - [ ] Reasoning content in messages.
 - [ ] Publish plan: versions, `publish = true`, crates.io names.
