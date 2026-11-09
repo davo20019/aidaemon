@@ -1543,6 +1543,7 @@ impl Agent {
             sdk_agent.run_resolving(state, cancel, &resolver).await
         };
         tokio::pin!(run);
+        let end_if_dropped = recovery::EndIfDropped::new(self.run_store.clone(), run_id);
         let mut in_flight = FuturesUnordered::new();
         // Ledger writes for kernel notices run apart from the run's own calls:
         // they are finished after the run ends, never dropped mid-write.
@@ -1579,6 +1580,7 @@ impl Agent {
                 _ = tick.tick() => touch_heartbeat(&heartbeat),
             }
         };
+        end_if_dropped.disarm();
         // The run is over: record the notices still queued and finish every
         // ledger write before the task end is computed and appended.
         while let Ok(notice) = refusals_rx.try_recv() {
@@ -1636,7 +1638,11 @@ impl Agent {
                     let failure = anyhow::Error::new(failure);
                     if let Some(attempt) = self
                         .defer_request_for_provider_recovery(
-                            session_id, user_text, user_role, &failure,
+                            session_id,
+                            user_text,
+                            user_role,
+                            &channel_ctx,
+                            &failure,
                         )
                         .await
                     {

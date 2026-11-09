@@ -365,7 +365,7 @@ impl HeartbeatCoordinator {
                     .await
                     .ok()
                     .flatten()
-                    .filter(|run| run.trigger_type == "mandate" && run.status == "running")
+                    .filter(mandate_run_may_dispatch_root)
                     .and_then(|run| run.root_task_id)
             } else {
                 None
@@ -820,5 +820,31 @@ impl HeartbeatCoordinator {
             }
         }
         successful_task_ids
+    }
+}
+
+/// A mandate run whose root may be dispatched. `pending` counts: when the
+/// immediate claim finds no free slot, the run stays pending and this is the
+/// only path that can still start it.
+fn mandate_run_may_dispatch_root(run: &crate::traits::GoalRun) -> bool {
+    run.trigger_type == "mandate" && matches!(run.status.as_str(), "pending" | "running")
+}
+
+#[cfg(test)]
+mod mandate_dispatch_tests {
+    use super::*;
+
+    fn run(trigger: &str, status: &str) -> crate::traits::GoalRun {
+        let mut run = crate::traits::GoalRun::new("goal", "project", trigger);
+        run.status = status.to_string();
+        run
+    }
+
+    #[test]
+    fn a_review_whose_first_claim_failed_can_still_start() {
+        assert!(mandate_run_may_dispatch_root(&run("mandate", "pending")));
+        assert!(mandate_run_may_dispatch_root(&run("mandate", "running")));
+        assert!(!mandate_run_may_dispatch_root(&run("mandate", "blocked")));
+        assert!(!mandate_run_may_dispatch_root(&run("scheduled", "pending")));
     }
 }

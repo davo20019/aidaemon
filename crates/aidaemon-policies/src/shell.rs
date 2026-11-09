@@ -22,8 +22,12 @@ fn collect_segments(command: &str, depth: usize, out: &mut Vec<Vec<String>>) {
         if stripped.is_empty() {
             continue;
         }
+        if depth < 4 && basename(&stripped[0]) == "eval" {
+            collect_segments(&stripped[1..].join(" "), depth + 1, out);
+            continue;
+        }
         if depth < 4 && is_shell(&stripped[0]) {
-            if let Some(pos) = stripped.iter().position(|t| t == "-c") {
+            if let Some(pos) = stripped.iter().position(|t| runs_a_string(t)) {
                 if let Some(inner) = stripped.get(pos + 1) {
                     collect_segments(inner, depth + 1, out);
                     continue;
@@ -32,6 +36,11 @@ fn collect_segments(command: &str, depth: usize, out: &mut Vec<Vec<String>>) {
         }
         out.push(stripped);
     }
+}
+
+/// A shell option that runs its argument: `-c`, or a cluster such as `-lc`.
+fn runs_a_string(token: &str) -> bool {
+    token.starts_with('-') && !token.starts_with("--") && token.contains('c')
 }
 
 fn is_shell(program: &str) -> bool {
@@ -131,33 +140,81 @@ fn strip_launchers(tokens: &[String]) -> Vec<String> {
         }
         match basename(token) {
             "sudo" | "doas" => {
-                i += 1;
-                while i < tokens.len() && tokens[i].starts_with('-') {
-                    let takes_value = matches!(
-                        tokens[i].as_str(),
-                        "-u" | "-g" | "-C" | "-h" | "-p" | "-U" | "-r" | "-t"
-                    );
-                    i += if takes_value { 2 } else { 1 };
-                }
+                i = skip_options(
+                    tokens,
+                    i + 1,
+                    &[
+                        "-u",
+                        "-g",
+                        "-C",
+                        "-h",
+                        "-p",
+                        "-U",
+                        "-r",
+                        "-t",
+                        "--user",
+                        "--group",
+                        "--close-from",
+                        "--host",
+                        "--prompt",
+                        "--other-user",
+                        "--role",
+                        "--type",
+                        "--chdir",
+                        "--chroot",
+                    ],
+                );
             }
             "env" => {
-                i += 1;
-                while i < tokens.len() && (tokens[i].starts_with('-') || is_assignment(&tokens[i]))
-                {
+                i = skip_options(
+                    tokens,
+                    i + 1,
+                    &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+                );
+                while i < tokens.len() && is_assignment(&tokens[i]) {
                     i += 1;
                 }
             }
-            "nohup" | "command" | "exec" | "time" | "builtin" => i += 1,
-            "nice" | "ionice" => {
+            "timeout" => {
+                i = skip_options(tokens, i + 1, &["-s", "--signal", "-k", "--kill-after"]);
+                // The duration.
                 i += 1;
-                while i < tokens.len() && tokens[i].starts_with('-') {
-                    i += if tokens[i] == "-n" { 2 } else { 1 };
-                }
             }
+            "nice" | "ionice" => {
+                i = skip_options(
+                    tokens,
+                    i + 1,
+                    &[
+                        "-n",
+                        "--adjustment",
+                        "-c",
+                        "--class",
+                        "--classdata",
+                        "-p",
+                        "-P",
+                        "-u",
+                    ],
+                );
+            }
+            "stdbuf" => i = skip_options(tokens, i + 1, &["-i", "-o", "-e"]),
+            "nohup" | "command" | "exec" | "time" | "builtin" | "setsid" | "unbuffer" => i += 1,
             _ => break,
         }
     }
     tokens[i.min(tokens.len())..].to_vec()
+}
+
+/// The index of the first token after a launcher's options, stepping over
+/// the values of `with_value` options.
+fn skip_options(tokens: &[String], mut i: usize, with_value: &[&str]) -> usize {
+    while i < tokens.len() && tokens[i].starts_with('-') {
+        i += if with_value.contains(&tokens[i].as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    i
 }
 
 fn is_assignment(token: &str) -> bool {
@@ -503,6 +560,41 @@ mod tests {
     }
 
     const WORKSPACE: &str = "/Users/alice/projects/acme";
+
+    #[test]
+    fn launchers_do_not_hide_a_catastrophic_command() {
+        for command in [
+            "bash -lc 'rm -rf ~'",
+            "zsh -ic 'rm -rf /'",
+            "timeout 5 rm -rf ~",
+            "timeout -s KILL 5 rm -rf ~",
+            "env -u FOO rm -rf ~",
+            "env -C /tmp rm -rf ~",
+            "sudo --user root rm -rf ~",
+            "sudo -u root rm -rf ~",
+            "eval \"rm -rf ~\"",
+            "stdbuf -o L rm -rf ~",
+            "setsid rm -rf ~",
+        ] {
+            assert!(catastrophic_reason(command).is_some(), "{command}");
+            assert!(
+                irreversible_delete_reason(command, WORKSPACE).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_launched_command_is_left_alone() {
+        for command in [
+            "timeout 5 ls",
+            "bash -lc 'ls -la'",
+            "env FOO=1 git status",
+            "nice -n 5 cargo build",
+        ] {
+            assert!(catastrophic_reason(command).is_none(), "{command}");
+        }
+    }
 
     fn blocked(command: &str) -> bool {
         irreversible_delete_reason(command, WORKSPACE).is_some()

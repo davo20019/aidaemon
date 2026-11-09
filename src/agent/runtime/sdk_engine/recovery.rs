@@ -12,6 +12,9 @@
 //! from the daemon's own projection, as every turn is, so nothing is
 //! duplicated.
 
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use aidaemon_core as sdk;
 use aidaemon_store_sqlite::SqliteStore;
 use tokio_util::sync::CancellationToken;
@@ -29,27 +32,90 @@ pub(super) fn not_done_note(not_done: &[String]) -> Option<String> {
     ))
 }
 
+/// Runs whose turn was dropped (a cancel, the inactivity watchdog) and whose
+/// end is still being written to the journal.
+static ENDING: LazyLock<Mutex<HashSet<sdk::RunId>>> = LazyLock::new(Mutex::default);
+
+fn is_ending(run_id: sdk::RunId) -> bool {
+    ENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&run_id)
+}
+
+/// Ends the run in the journal if its turn is dropped before the run returns.
+/// A dropped turn was stopped on purpose, so the next message must not resume
+/// it. A process crash runs no destructor and is still recovered.
+pub(super) struct EndIfDropped {
+    store: Option<Arc<SqliteStore>>,
+    run_id: sdk::RunId,
+}
+
+impl EndIfDropped {
+    pub(super) fn new(store: Option<Arc<SqliteStore>>, run_id: sdk::RunId) -> Self {
+        Self { store, run_id }
+    }
+
+    /// The run returned on its own.
+    pub(super) fn disarm(mut self) {
+        self.store = None;
+    }
+}
+
+impl Drop for EndIfDropped {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let run_id = self.run_id;
+        ENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id);
+        runtime.spawn(async move {
+            let ended = sdk::Event::Finished {
+                status: sdk::RunStatus::Cancelled,
+                usage: sdk::Usage::default(),
+                turns: 0,
+            };
+            if let Err(error) = store.append(run_id, &ended).await {
+                warn!(%run_id, %error, "Could not record the end of a stopped run");
+            }
+            ENDING
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&run_id);
+        });
+    }
+}
+
 /// The session's most recent run, when it is unfinished.
 pub(super) async fn stranded_run(
     store: Option<&SqliteStore>,
     session_id: &str,
 ) -> Option<sdk::RunState> {
     let store = store?;
-    match store.latest_state_for_session(session_id).await {
-        Ok(Some(state)) if state.pending.is_some() => Some(state),
-        // The kernel now clears `in_flight` when a run ends; a row written
-        // before that still has it, and restarting it would undo a cancel.
-        Ok(Some(state)) if state.in_flight.is_some() => match store.run_ended(state.run_id).await {
-            Ok(false) => Some(state),
-            Ok(true) => None,
-            Err(error) => {
-                warn!(session_id, %error, "Could not read how the session's last run ended; leaving it alone");
-                None
-            }
-        },
-        Ok(_) => None,
+    let state = match store.latest_state_for_session(session_id).await {
+        Ok(Some(state)) if state.pending.is_some() || state.in_flight.is_some() => state,
+        Ok(_) => return None,
         Err(error) => {
             warn!(session_id, %error, "Could not read the session's last run; nothing is recovered");
+            return None;
+        }
+    };
+    if is_ending(state.run_id) {
+        return None;
+    }
+    // The kernel clears `in_flight` when a run ends; a row written before
+    // that still has it, and restarting it would undo a cancel.
+    match store.run_ended(state.run_id).await {
+        Ok(false) => Some(state),
+        Ok(true) => None,
+        Err(error) => {
+            warn!(session_id, %error, "Could not read how the session's last run ended; leaving it");
             None
         }
     }
@@ -101,4 +167,40 @@ pub(super) async fn settle(
             .await?;
     }
     Ok(Some(outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_turn_that_was_stopped_is_not_resumed_by_the_next_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let session = "telegram:synthetic-user-1";
+        let mut state = sdk::RunState::new("aidaemon", session, "A long request.");
+        state.in_flight = Some(Default::default());
+        store.upsert_state(&state).await.unwrap();
+        assert!(stranded_run(Some(&store), session).await.is_some());
+
+        drop(EndIfDropped::new(Some(store.clone()), state.run_id));
+        assert!(
+            stranded_run(Some(&store), session).await.is_none(),
+            "stopped at once, before the journal write lands"
+        );
+
+        while is_ending(state.run_id) {
+            tokio::task::yield_now().await;
+        }
+        assert!(store.run_ended(state.run_id).await.unwrap());
+        assert!(stranded_run(Some(&store), session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_returned_is_not_ended_again() {
+        let store = Arc::new(SqliteStore::open_in_memory().await.unwrap());
+        let state = sdk::RunState::new("aidaemon", "s", "Hello.");
+        EndIfDropped::new(Some(store.clone()), state.run_id).disarm();
+        tokio::task::yield_now().await;
+        assert!(!store.run_ended(state.run_id).await.unwrap());
+    }
 }

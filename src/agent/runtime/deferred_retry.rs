@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::UserRole;
+use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 const SETTING_KEY: &str = "deferred_provider_retries";
 /// Attempts before the request is abandoned (initial failure counts as 0).
@@ -39,9 +39,65 @@ pub(crate) struct DeferredRequest {
     /// otherwise the growing delay applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// Where the request was made. A re-run answers in that same place, so
+    /// it keeps that place's privacy rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<DeferredChannel>,
+}
+
+/// The parts of a channel a re-run needs. A workspace grant is not kept: it
+/// expires, and the re-run simply goes without one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DeferredChannel {
+    visibility: String,
+    platform: String,
+    channel_name: Option<String>,
+    channel_id: Option<String>,
+    workspace_id: Option<String>,
+    sender_name: Option<String>,
+    sender_id: Option<String>,
+}
+
+impl DeferredChannel {
+    fn of(context: &ChannelContext) -> Self {
+        Self {
+            visibility: context.visibility.to_string(),
+            platform: context.platform.clone(),
+            channel_name: context.channel_name.clone(),
+            channel_id: context.channel_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            sender_name: context.sender_name.clone(),
+            sender_id: context.sender_id.clone(),
+        }
+    }
+
+    fn context(&self) -> ChannelContext {
+        let mut context = ChannelContext::internal();
+        context.visibility = ChannelVisibility::from_str_lossy(&self.visibility);
+        context.platform = self.platform.clone();
+        context.channel_name = self.channel_name.clone();
+        context.channel_id = self.channel_id.clone();
+        context.workspace_id = self.workspace_id.clone();
+        context.sender_name = self.sender_name.clone();
+        context.sender_id = self.sender_id.clone();
+        context
+    }
 }
 
 impl DeferredRequest {
+    /// The channel to re-run in. A record saved before channels were kept
+    /// is treated as public, the most restrictive reading.
+    fn channel_context(&self) -> ChannelContext {
+        self.channel.as_ref().map_or_else(
+            || {
+                let mut context = ChannelContext::internal();
+                context.visibility = ChannelVisibility::Public;
+                context
+            },
+            DeferredChannel::context,
+        )
+    }
+
     fn role(&self) -> UserRole {
         match self.user_role.as_str() {
             "owner" => UserRole::Owner,
@@ -177,6 +233,7 @@ impl crate::agent::Agent {
         session_id: &str,
         user_text: &str,
         user_role: UserRole,
+        channel_ctx: &ChannelContext,
         error: &anyhow::Error,
     ) -> Option<u16> {
         let failure_kind = is_deferrable_provider_failure(error)?;
@@ -204,6 +261,7 @@ impl crate::agent::Agent {
             attempts,
             failure_kind: failure_kind.to_string(),
             not_before: not_before(error),
+            channel: Some(DeferredChannel::of(channel_ctx)),
         });
         while requests.len() > MAX_QUEUE {
             requests.remove(0);
@@ -248,7 +306,7 @@ impl crate::agent::Agent {
                 user_text: request.user_text.clone(),
                 status_tx: None,
                 user_role: request.role(),
-                channel_ctx: crate::types::ChannelContext::internal(),
+                channel_ctx: request.channel_context(),
                 heartbeat: None,
                 parent_task_id: None,
                 parent_tool_call_id: None,
@@ -351,6 +409,7 @@ mod tests {
             attempts: 0,
             failure_kind: "server_error".to_string(),
             not_before: None,
+            channel: None,
         };
         assert_eq!(request.delay_secs(), 120);
         assert!(!request.due(base + chrono::Duration::seconds(60)));
@@ -360,6 +419,41 @@ mod tests {
         assert!(!request.due(base + chrono::Duration::seconds(1000)));
         assert!(request.due(base + chrono::Duration::seconds(1080)));
         assert_eq!(request.role(), UserRole::Owner);
+    }
+
+    #[test]
+    fn a_re_run_keeps_the_channel_it_came_from() {
+        let mut group = ChannelContext::internal();
+        group.visibility = ChannelVisibility::PublicExternal;
+        group.platform = "slack".to_string();
+        group.channel_id = Some("slack:synthetic-room".to_string());
+        group.sender_id = Some("slack:synthetic-user-1".to_string());
+
+        let stored = serde_json::to_string(&DeferredChannel::of(&group)).unwrap();
+        let context = serde_json::from_str::<DeferredChannel>(&stored)
+            .unwrap()
+            .context();
+
+        assert_eq!(context.visibility, ChannelVisibility::PublicExternal);
+        assert_eq!(context.channel_id, group.channel_id);
+        assert_eq!(context.sender_id, group.sender_id);
+    }
+
+    #[test]
+    fn a_record_without_a_channel_is_treated_as_public() {
+        let request: DeferredRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "synthetic",
+            "user_text": "hello",
+            "user_role": "owner",
+            "failed_at": "2026-01-01T00:00:00Z",
+            "attempts": 0,
+            "failure_kind": "outage",
+        }))
+        .unwrap();
+        assert_eq!(
+            request.channel_context().visibility,
+            ChannelVisibility::Public
+        );
     }
 
     #[test]

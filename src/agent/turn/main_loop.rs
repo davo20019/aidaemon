@@ -533,6 +533,7 @@ impl Agent {
         // instrumented loop owns the working copies below.
         let unhandled_error_emitter = emitter.clone();
         let unhandled_error_task_id = task_id.clone();
+        let deferral_channel = channel_ctx.clone();
         let loop_result = tracing::Instrument::instrument(async move {
         // System directives for the run's first model call.
         let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
@@ -1322,8 +1323,14 @@ impl Agent {
             let deferred = if internal_continuation && continuation_parent_task_id.is_some() {
                 None
             } else {
-                self.defer_request_for_provider_recovery(session_id, user_text, user_role, &error)
-                    .await
+                self.defer_request_for_provider_recovery(
+                    session_id,
+                    user_text,
+                    user_role,
+                    &deferral_channel,
+                    &error,
+                )
+                .await
             };
             let reply = match deferred {
                 Some(attempt) => crate::agent::deferred_retry::deferral_notice(attempt, &error),

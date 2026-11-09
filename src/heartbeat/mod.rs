@@ -453,6 +453,7 @@ pub struct HeartbeatJob {
 pub struct HeartbeatCoordinator {
     jobs: Vec<HeartbeatJob>,
     services: Vec<Arc<dyn Service>>,
+    deferred_retry_running: Arc<AtomicBool>,
     state: Arc<dyn StateStore>,
     max_concurrent: usize,
     tick_interval: Duration,
@@ -599,6 +600,7 @@ impl HeartbeatCoordinator {
         Self {
             jobs: Vec::new(),
             services: Vec::new(),
+            deferred_retry_running: Arc::new(AtomicBool::new(false)),
             state,
             max_concurrent,
             tick_interval: Duration::from_secs(tick_interval_secs),
@@ -916,10 +918,18 @@ impl HeartbeatCoordinator {
 
         // Phase 6: Re-run user requests that failed only because the model
         // provider was unavailable before any tool work committed.
+        // Each is a whole agent turn, so they run beside the cycle: schedules,
+        // mandates and stuck-task checks must not wait for them.
         if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
-            let dispatched = agent.retry_deferred_provider_requests().await;
-            if dispatched > 0 {
-                info!(dispatched, "Re-ran requests deferred by a provider outage");
+            if !self.deferred_retry_running.swap(true, Ordering::AcqRel) {
+                let running = self.deferred_retry_running.clone();
+                tokio::spawn(async move {
+                    let dispatched = agent.retry_deferred_provider_requests().await;
+                    running.store(false, Ordering::Release);
+                    if dispatched > 0 {
+                        info!(dispatched, "Re-ran requests deferred by a provider outage");
+                    }
+                });
             }
         }
 
