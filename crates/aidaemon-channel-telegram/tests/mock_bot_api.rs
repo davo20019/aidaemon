@@ -161,6 +161,7 @@ fn channel(base: &str) -> TelegramChannel {
         .poll_timeout_secs(1)
         .retry_backoff(Duration::from_millis(10), Duration::from_millis(50))
         .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .download_client(reqwest::Client::builder().no_proxy())
 }
 
 struct Running {
@@ -918,12 +919,11 @@ async fn a_picture_is_sent_as_a_photo() {
 async fn download_resolves_the_file_id_then_fetches_it() {
     let (mock, base) = start_mock().await;
     let bytes = channel(&base)
-        .download(&aidaemon_channels::Attachment {
-            name: "notes.txt".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            size_bytes: Some(20),
-            source: "synthetic-file".to_string(),
-        })
+        .download(
+            &aidaemon_channels::Attachment::new("notes.txt", "synthetic-file")
+                .with_mime_type(Some("text/plain".to_string()))
+                .with_size_bytes(Some(20)),
+        )
         .await
         .unwrap();
     assert_eq!(bytes, b"synthetic file bytes");
@@ -935,15 +935,13 @@ async fn download_resolves_the_file_id_then_fetches_it() {
 
     // Over the Bot API's download limit: refused without a call.
     let err = channel(&base)
-        .download(&aidaemon_channels::Attachment {
-            name: "big.bin".to_string(),
-            mime_type: None,
-            size_bytes: Some(aidaemon_channel_telegram::MAX_DOWNLOAD_BYTES + 1),
-            source: "synthetic-big".to_string(),
-        })
+        .download(
+            &aidaemon_channels::Attachment::new("big.bin", "synthetic-big")
+                .with_size_bytes(Some(aidaemon_channel_telegram::MAX_DOWNLOAD_BYTES + 1)),
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, ChannelError::Other(_)));
+    assert!(matches!(err, ChannelError::TooLarge { .. }));
     assert_eq!(mock.calls("getFile").len(), 1);
 }
 

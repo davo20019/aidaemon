@@ -1,6 +1,8 @@
 //! Translation of Telegram updates into channel events.
 
-use aidaemon_channels::{Attachment, Conversation, ConversationKind, InboundMessage, Sender};
+use aidaemon_channels::{
+    Attachment, AttachmentKind, Conversation, ConversationKind, InboundMessage, Sender,
+};
 
 use crate::api::{Chat, Message, MessageEntity, User};
 
@@ -168,14 +170,25 @@ pub(crate) fn map_message(msg: &Message, bot: &BotIdentity) -> Option<InboundMes
 
     let text = cut_spans(raw_text, &mut cuts);
 
-    Some(InboundMessage {
-        conversation,
-        sender,
-        message_id: msg.message_id.to_string(),
-        text,
-        attachments,
-        addressed,
-    })
+    // A forum topic's service message is not something this one answers.
+    let parent = msg
+        .reply_to_message
+        .as_ref()
+        .filter(|reply| reply.forum_topic_created.is_none())
+        .map(|reply| reply.message_id.to_string());
+    let thread = msg
+        .is_topic_message
+        .then_some(msg.message_thread_id)
+        .flatten()
+        .map(|thread| thread.to_string());
+
+    Some(
+        InboundMessage::new(conversation, sender, msg.message_id.to_string(), text)
+            .with_attachments(attachments)
+            .with_addressed(addressed)
+            .with_parent_message_id(parent)
+            .with_thread_id(thread),
+    )
 }
 
 fn cut_spans(text: &str, cuts: &mut [(usize, usize)]) -> String {
@@ -213,20 +226,36 @@ fn attachments_for(msg: &Message) -> Vec<Attachment> {
         } else {
             &photo.file_unique_id
         };
-        out.push(Attachment {
-            name: format!("photo_{id}.jpg"),
-            mime_type: Some("image/jpeg".to_string()),
-            size_bytes: photo.file_size,
-            source: photo.file_id.clone(),
-        });
+        out.push(
+            Attachment::new(format!("photo_{id}.jpg"), photo.file_id.clone())
+                .with_mime_type(Some("image/jpeg".to_string()))
+                .with_size_bytes(photo.file_size)
+                .with_kind(AttachmentKind::Image),
+        );
     }
+    // A document says what it is by its MIME type; the others by their field.
     let files = [
-        (&msg.document, "document", None),
-        (&msg.audio, "audio", Some("audio/mpeg")),
-        (&msg.voice, "voice", Some("audio/ogg")),
-        (&msg.video, "video", Some("video/mp4")),
+        (&msg.document, "document", None, None),
+        (
+            &msg.audio,
+            "audio",
+            Some("audio/mpeg"),
+            Some(AttachmentKind::Audio),
+        ),
+        (
+            &msg.voice,
+            "voice",
+            Some("audio/ogg"),
+            Some(AttachmentKind::Audio),
+        ),
+        (
+            &msg.video,
+            "video",
+            Some("video/mp4"),
+            Some(AttachmentKind::Video),
+        ),
     ];
-    for (file, kind, default_mime) in files {
+    for (file, kind, default_mime, typed) in files {
         let Some(file) = file else { continue };
         let name = file.file_name.clone().unwrap_or_else(|| {
             let id = if file.file_unique_id.is_empty() {
@@ -236,15 +265,17 @@ fn attachments_for(msg: &Message) -> Vec<Attachment> {
             };
             format!("{kind}_{id}")
         });
-        out.push(Attachment {
-            name,
-            mime_type: file
-                .mime_type
-                .clone()
-                .or_else(|| default_mime.map(str::to_string)),
-            size_bytes: file.file_size,
-            source: file.file_id.clone(),
-        });
+        let mime_type = file
+            .mime_type
+            .clone()
+            .or_else(|| default_mime.map(str::to_string));
+        let mut attachment = Attachment::new(name, file.file_id.clone())
+            .with_mime_type(mime_type)
+            .with_size_bytes(file.file_size);
+        if let Some(typed) = typed {
+            attachment = attachment.with_kind(typed);
+        }
+        out.push(attachment);
     }
     out
 }

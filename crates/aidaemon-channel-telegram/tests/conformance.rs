@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aidaemon_channel_telegram::TelegramChannel;
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{Attachment, ApprovalPrompt, Conversation, ConversationKind};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
@@ -20,6 +20,7 @@ const TOKEN: &str = "000000:SYNTHETIC";
 const BOT_USERNAME: &str = "synthetic_helper_bot";
 const DM_CHAT: i64 = 100000001;
 const GROUP_CHAT: i64 = -1000000000001;
+const FILE_BODY: &str = "synthetic attachment";
 
 /// Bot API mock: `getUpdates` hands out whatever was injected (or idles for
 /// 50 ms), `sendMessage` is recorded and gets a fresh message id.
@@ -27,10 +28,14 @@ const GROUP_CHAT: i64 = -1000000000001;
 struct Mock {
     pending: Mutex<VecDeque<Value>>,
     sent: Mutex<Vec<Value>>,
+    edits: Mutex<Vec<Value>>,
     next_id: AtomicI64,
 }
 
 async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl IntoResponse {
+    if uri.path().starts_with(&format!("/file/bot{TOKEN}/")) {
+        return (StatusCode::OK, Json(json!(FILE_BODY)));
+    }
     let Some(method) = uri.path().strip_prefix(&format!("/bot{TOKEN}/")) else {
         return (
             StatusCode::NOT_FOUND,
@@ -50,9 +55,17 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl I
             json!(updates)
         }
         "sendMessage" => {
-            mock.sent.lock().unwrap().push(body);
-            json!({ "message_id": 5000 + mock.next_id.fetch_add(1, Ordering::SeqCst) })
+            let id = 5000 + mock.next_id.fetch_add(1, Ordering::SeqCst);
+            let mut recorded = body;
+            recorded["sent_as"] = json!(id);
+            mock.sent.lock().unwrap().push(recorded);
+            json!({ "message_id": id })
         }
+        "editMessageText" => {
+            mock.edits.lock().unwrap().push(body);
+            json!(true)
+        }
+        "getFile" => json!({ "file_id": "synthetic-file", "file_path": "documents/conf.bin" }),
         _ => json!(true),
     };
     (
@@ -139,24 +152,27 @@ impl ChannelHarness for TelegramHarness {
             .find(|c| c.id == choice_id)
             .expect("choice exists")
             .label;
-        let data = self
+        let (data, message_id) = self
             .mock
             .sent
             .lock()
             .unwrap()
             .iter()
             .rev()
-            .filter_map(|body| body["reply_markup"]["inline_keyboard"].as_array().cloned())
-            .flatten()
-            .flat_map(|row| row.as_array().cloned().unwrap_or_default())
-            .find(|button| button["text"] == json!(label))
-            .and_then(|button| button["callback_data"].as_str().map(str::to_string))
+            .find_map(|body| {
+                let button = body["reply_markup"]["inline_keyboard"]
+                    .as_array()?
+                    .iter()
+                    .flat_map(|row| row.as_array().cloned().unwrap_or_default())
+                    .find(|button| button["text"] == json!(label))?;
+                Some((button["callback_data"].clone(), body["sent_as"].clone()))
+            })
             .expect("the prompt's button was sent");
         self.push("callback_query", |id| {
             json!({
                 "id": format!("cbq-{id}"),
                 "from": alice(),
-                "message": { "message_id": 4999, "date": 1700000000, "chat": dm_chat() },
+                "message": { "message_id": message_id, "date": 1700000000, "chat": dm_chat() },
                 "data": data,
             })
         });
@@ -171,6 +187,34 @@ impl ChannelHarness for TelegramHarness {
             .map(|body| body["text"].as_str().unwrap_or_default().to_string())
             .collect()
     }
+
+    async fn edited_messages(&self) -> Option<Vec<String>> {
+        let edits = self.mock.edits.lock().unwrap();
+        Some(
+            edits
+                .iter()
+                .map(|body| body["text"].as_str().unwrap_or_default().to_string())
+                .collect(),
+        )
+    }
+
+    async fn inject_reply_message(&self, text: &str, parent_message_id: &str) -> bool {
+        let parent: i64 = parent_message_id.parse().expect("telegram ids are numbers");
+        self.push("message", |id| {
+            json!({
+                "message_id": id, "date": 1700000000, "chat": dm_chat(), "from": alice(), "text": text,
+                "reply_to_message": { "message_id": parent, "date": 1700000000, "chat": dm_chat() },
+            })
+        });
+        true
+    }
+
+    async fn downloadable_attachment(&self) -> Option<(Attachment, Vec<u8>)> {
+        Some((
+            Attachment::new("conf.bin", "synthetic-file"),
+            serde_json::to_vec(FILE_BODY).unwrap(),
+        ))
+    }
 }
 
 #[tokio::test]
@@ -181,10 +225,11 @@ async fn telegram_channel_conforms() {
             .api_base(base)
             .poll_timeout_secs(1)
             .retry_backoff(Duration::from_millis(10), Duration::from_millis(50))
-            .http_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+            .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .download_client(reqwest::Client::builder().no_proxy()),
     );
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 12, "{report}");
+    assert_eq!(report.passed.len(), 17, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

@@ -17,6 +17,9 @@ mod approvals;
 pub mod channel;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+#[cfg(feature = "http")]
+pub mod download;
+mod inbound_files;
 pub mod latex;
 pub mod policy;
 mod render;
@@ -30,15 +33,16 @@ pub mod testing;
 
 pub use approvals::{ApprovalStore, MemoryApprovalStore, StoredApproval};
 pub use channel::{
-    ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, Channel, ChannelCapabilities,
-    ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind,
-    InboundMessage, MessageRef, OutboundFile, OutboundMessage, Sender,
+    ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, AttachmentKind, Channel,
+    ChannelCapabilities, ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation,
+    ConversationKind, InboundMessage, MessageRef, OutboundFile, OutboundMessage, Sender,
+    DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 pub use policy::{AccessPolicy, Admission, SenderRole, DEFAULT_REFUSAL};
 pub use router::EventRouter;
 pub use runner::{
-    ChannelRunner, ChannelRunnerBuilder, RunnerBuildError, RunnerConfig, APPROVE_CHOICE,
-    DENY_CHOICE,
+    AttachmentConfig, ChannelRunner, ChannelRunnerBuilder, RunnerBuildError, RunnerConfig,
+    APPROVE_CHOICE, DENY_CHOICE,
 };
 pub use session::{session_id, MemorySessionIndex, SessionIndex};
 pub use split::split_message;

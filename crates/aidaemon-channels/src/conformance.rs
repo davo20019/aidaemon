@@ -36,9 +36,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::channel::{
-    ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Channel, ChannelError, ChannelEvent,
-    Conversation, ConversationKind, InboundMessage, OutboundMessage,
+    ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, Channel, ChannelError,
+    ChannelEvent, Conversation, ConversationKind, InboundMessage, OutboundMessage,
 };
+use crate::split::TRUNCATION_MARK;
 use crate::testing::{sender, TestChannel};
 
 /// How long the kit waits for an injected event to arrive, and for `run` to
@@ -85,6 +86,29 @@ pub mod channel_checks {
     /// receiver is dropped and another platform event arrives (adapters may
     /// notice earlier, but must notice by the next forward).
     pub const RECEIVER_DROP_STOPS_RUN: &str = "channel.receiver_drop_stops_run";
+    /// A message that replies to another arrives with that message's id in
+    /// `parent_message_id`. Vacuous (passes with a note) when the harness
+    /// does not implement `inject_reply_message`.
+    pub const PARENT_LINK_FORWARDED: &str = "channel.parent_link_forwarded";
+    /// `edit` with text three times `max_message_len` long succeeds, sends
+    /// no new message, and leaves one message of at most `max_message_len`
+    /// characters that is the start of the text followed by the truncation
+    /// mark. Without `edit_messages`, vacuous. When the harness does not
+    /// implement `edited_messages`, only success and "no new message" are
+    /// checked.
+    pub const EDIT_TRUNCATES_LONG_TEXT: &str = "channel.edit_truncates_long_text";
+    /// When a button press names its message (`ApprovalAnswer::message`),
+    /// that is the ref `ask` returned and `remove_buttons` accepts it.
+    /// Vacuous without buttons, or for a platform that does not name it.
+    pub const ANSWER_MESSAGE_REMOVES_BUTTONS: &str = "channel.answer_message_removes_buttons";
+    /// `download` returns `ChannelError::Unsupported` when
+    /// `capabilities().files` is false. Otherwise it returns the bytes of
+    /// the harness's attachment; vacuous when the harness has none.
+    pub const DOWNLOAD_MATCHES_CAPABILITY: &str = "channel.download_matches_capability";
+    /// `download_limited` with a limit one byte under the file's size
+    /// returns `ChannelError::TooLarge`, also when the attachment declares
+    /// no size. Vacuous without `files` or without a harness attachment.
+    pub const DOWNLOAD_ENFORCES_LIMIT: &str = "channel.download_enforces_limit";
 }
 
 /// Drives the platform side of an adapter under test: injects inbound
@@ -117,6 +141,26 @@ pub trait ChannelHarness: Send + Sync {
     /// Text of every message the adapter sent to the platform, in order,
     /// as raw platform payload (after Markdown conversion and splitting).
     async fn sent_messages(&self) -> Vec<String>;
+
+    /// Text of every edit the adapter made, in order, as raw platform
+    /// payload. `None` (the default) when the mock does not record them.
+    async fn edited_messages(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Deliver a direct message with this text that replies to
+    /// `parent_message_id`, the platform's way. Returns whether it did; the
+    /// default delivers nothing.
+    async fn inject_reply_message(&self, _text: &str, _parent_message_id: &str) -> bool {
+        false
+    }
+
+    /// An attachment the adapter can fetch at least twice, with the bytes
+    /// it holds (not empty). `None` (the default) when the mock serves no
+    /// files.
+    async fn downloadable_attachment(&self) -> Option<(Attachment, Vec<u8>)> {
+        None
+    }
 }
 
 /// Run every channel check (see [`channel_checks`]). `run` is started twice
@@ -212,6 +256,28 @@ pub async fn check_channel(
         },
     );
 
+    let parent_id = first
+        .as_ref()
+        .map_or_else(|_| "1".to_string(), |m| m.message_id.clone());
+    if harness
+        .inject_reply_message("conformance probe reply", &parent_id)
+        .await
+    {
+        let result = session.next_message("probe reply").await.and_then(|m| {
+            if m.parent_message_id.as_deref() == Some(parent_id.as_str()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "parent_message_id is {:?}, expected {parent_id:?}",
+                    m.parent_message_id
+                ))
+            }
+        });
+        report.record(PARENT_LINK_FORWARDED, result);
+    } else {
+        vacuous(&mut report, PARENT_LINK_FORWARDED, "the harness sends no replies");
+    }
+
     for (check, addressed, marker) in [
         (UNADDRESSED_GROUP_MESSAGE, false, "group-plain"),
         (ADDRESSED_GROUP_MESSAGE, true, "group-addressed"),
@@ -295,6 +361,20 @@ pub async fn check_channel(
     };
     report.record(EDIT_MATCHES_CAPABILITY, edit);
 
+    if caps.edit_messages {
+        let result = check_long_edit(channel.as_ref(), harness, &conversation, &long, max).await;
+        match result {
+            LongEdit::Checked(result) => report.record(EDIT_TRUNCATES_LONG_TEXT, result),
+            LongEdit::Unobserved => vacuous(
+                &mut report,
+                EDIT_TRUNCATES_LONG_TEXT,
+                "the harness does not record edits, so only success was checked",
+            ),
+        }
+    } else {
+        vacuous(&mut report, EDIT_TRUNCATES_LONG_TEXT, "channel has no edits");
+    }
+
     let prompt = ApprovalPrompt {
         id: "conformance-prompt-1".to_string(),
         conversation: conversation.clone(),
@@ -311,6 +391,7 @@ pub async fn check_channel(
         ],
     };
     let asked = channel.ask(&prompt).await;
+    let asked_ref = asked.as_ref().ok().cloned();
     let ask_ok = asked.is_ok();
     report.record(
         ASK_MATCHES_CAPABILITY,
@@ -321,19 +402,50 @@ pub async fn check_channel(
         report.note(format!(
             "{BUTTON_PRESS_ROUND_TRIP}: channel has no buttons; check is vacuous"
         ));
+        vacuous(&mut report, ANSWER_MESSAGE_REMOVES_BUTTONS, "channel has no buttons");
     } else if !ask_ok {
         report.fail(BUTTON_PRESS_ROUND_TRIP, "skipped: ask failed");
+        report.fail(ANSWER_MESSAGE_REMOVES_BUTTONS, "skipped: ask failed");
     } else {
         harness.press_button(&prompt, "deny").await;
-        let result = session.next_approval(&prompt.id).await.and_then(|a| {
-            if a.choice_id == "deny" {
-                Ok(())
-            } else {
-                Err(format!("choice id is {:?}, expected \"deny\"", a.choice_id))
+        let answer = session.next_approval(&prompt.id).await;
+        report.record(
+            BUTTON_PRESS_ROUND_TRIP,
+            answer.as_ref().map_err(Clone::clone).and_then(|a| {
+                if a.choice_id == "deny" {
+                    Ok(())
+                } else {
+                    Err(format!("choice id is {:?}, expected \"deny\"", a.choice_id))
+                }
+            }),
+        );
+        match answer {
+            Err(e) => report.fail(ANSWER_MESSAGE_REMOVES_BUTTONS, format!("skipped: {e}")),
+            Ok(ApprovalAnswer { message: None, .. }) => vacuous(
+                &mut report,
+                ANSWER_MESSAGE_REMOVES_BUTTONS,
+                "the press does not name its message",
+            ),
+            Ok(ApprovalAnswer {
+                message: Some(message),
+                ..
+            }) => {
+                let result = if asked_ref.as_ref() != Some(&message) {
+                    Err(format!(
+                        "the press names {message:?}, but ask returned {asked_ref:?}"
+                    ))
+                } else {
+                    channel
+                        .remove_buttons(&message)
+                        .await
+                        .map_err(|e| format!("remove_buttons failed: {e}"))
+                };
+                report.record(ANSWER_MESSAGE_REMOVES_BUTTONS, result);
             }
-        });
-        report.record(BUTTON_PRESS_ROUND_TRIP, result);
+        }
     }
+
+    check_download(&mut report, channel.as_ref(), harness, caps.files).await;
 
     session.shutdown.cancel();
     report.record(SHUTDOWN_STOPS_RUN, session.join().await);
@@ -357,6 +469,119 @@ pub async fn check_channel(
     report.record(RECEIVER_DROP_STOPS_RUN, result);
 
     report
+}
+
+/// Record `check` as passed with a note saying why it proved nothing.
+fn vacuous(report: &mut ConformanceReport, check: &str, why: &str) {
+    report.pass(check);
+    report.note(format!("{check}: {why}; check is vacuous"));
+}
+
+enum LongEdit {
+    Checked(Result<(), String>),
+    /// The edit succeeded, but the harness cannot show what it became.
+    Unobserved,
+}
+
+/// `channel_checks::EDIT_TRUNCATES_LONG_TEXT`.
+async fn check_long_edit(
+    channel: &dyn Channel,
+    harness: &dyn ChannelHarness,
+    conversation: &Conversation,
+    long: &str,
+    max: usize,
+) -> LongEdit {
+    let target = match channel
+        .send(
+            conversation,
+            &OutboundMessage::text("conformance probe long edit target"),
+        )
+        .await
+    {
+        Ok(target) => target,
+        Err(e) => return LongEdit::Checked(Err(format!("send before edit failed: {e}"))),
+    };
+    let before = harness.sent_messages().await.len();
+    if let Err(e) = channel.edit(&target, long).await {
+        return LongEdit::Checked(Err(format!("edit of long text failed: {e}")));
+    }
+    let after = harness.sent_messages().await.len();
+    if after != before {
+        return LongEdit::Checked(Err(format!(
+            "edit sent {} new message(s)",
+            after.saturating_sub(before)
+        )));
+    }
+    let Some(edits) = harness.edited_messages().await else {
+        return LongEdit::Unobserved;
+    };
+    let Some(edit) = edits.last() else {
+        return LongEdit::Checked(Err("the harness saw no edit".to_string()));
+    };
+    let mut problems = Vec::new();
+    let len = edit.chars().count();
+    if len > max {
+        problems.push(format!("the edit has {len} chars > max_message_len {max}"));
+    }
+    let kept = edit.strip_suffix(TRUNCATION_MARK);
+    if kept.is_none() {
+        problems.push("the edit does not end with the truncation mark".to_string());
+    }
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    if !compact(long).starts_with(&compact(kept.unwrap_or(edit))) {
+        problems.push("the edit is not the start of the text".to_string());
+    }
+    LongEdit::Checked(joined(problems))
+}
+
+/// `channel_checks::DOWNLOAD_MATCHES_CAPABILITY` and `DOWNLOAD_ENFORCES_LIMIT`.
+async fn check_download(
+    report: &mut ConformanceReport,
+    channel: &dyn Channel,
+    harness: &dyn ChannelHarness,
+    files: bool,
+) {
+    use channel_checks::*;
+
+    if !files {
+        let probe = Attachment::new("conformance.bin", "conformance-source");
+        let result = channel.download(&probe).await.map(|_| ());
+        report.record(
+            DOWNLOAD_MATCHES_CAPABILITY,
+            capability_result("download", false, result),
+        );
+        vacuous(report, DOWNLOAD_ENFORCES_LIMIT, "channel has no files");
+        return;
+    }
+    let Some((mut attachment, expected)) = harness.downloadable_attachment().await else {
+        for check in [DOWNLOAD_MATCHES_CAPABILITY, DOWNLOAD_ENFORCES_LIMIT] {
+            vacuous(report, check, "the harness serves no file");
+        }
+        return;
+    };
+    report.record(
+        DOWNLOAD_MATCHES_CAPABILITY,
+        match channel.download(&attachment).await {
+            Ok(bytes) if bytes == expected => Ok(()),
+            Ok(bytes) => Err(format!(
+                "got {} bytes that differ from the {} expected",
+                bytes.len(),
+                expected.len()
+            )),
+            Err(e) => Err(format!("download is advertised but failed: {e}")),
+        },
+    );
+    // The adapter must find out for itself, so it is told no size.
+    attachment.size_bytes = None;
+    let limit = (expected.len() as u64).saturating_sub(1);
+    report.record(
+        DOWNLOAD_ENFORCES_LIMIT,
+        match channel.download_limited(&attachment, limit).await {
+            Err(ChannelError::TooLarge { .. }) => Ok(()),
+            Err(e) => Err(format!("expected TooLarge, got: {e}")),
+            Ok(bytes) => Err(format!("{} bytes passed a limit of {limit}", bytes.len())),
+        },
+    );
 }
 
 struct Session {
@@ -529,12 +754,35 @@ impl ChannelHarness for TestChannelHarness {
     }
 
     async fn press_button(&self, prompt: &ApprovalPrompt, choice_id: &str) {
-        self.channel.inject(ChannelEvent::Approval(ApprovalAnswer {
-            prompt_id: prompt.id.clone(),
-            choice_id: choice_id.to_string(),
-            sender: sender(&self.sender_id),
-            conversation: prompt.conversation.clone(),
-        }));
+        let mut answer = ApprovalAnswer::new(
+            prompt.id.clone(),
+            choice_id,
+            sender(&self.sender_id),
+            prompt.conversation.clone(),
+        );
+        answer.message = self.channel.prompt_ref(&prompt.id);
+        self.channel.inject(ChannelEvent::Approval(answer));
+    }
+
+    async fn edited_messages(&self) -> Option<Vec<String>> {
+        Some(self.channel.edits().into_iter().map(|e| e.text).collect())
+    }
+
+    async fn inject_reply_message(&self, text: &str, parent_message_id: &str) -> bool {
+        let mut message =
+            crate::testing::message(self.direct_conversation(), &self.sender_id, text);
+        message.parent_message_id = Some(parent_message_id.to_string());
+        self.channel.inject_message(message);
+        true
+    }
+
+    async fn downloadable_attachment(&self) -> Option<(Attachment, Vec<u8>)> {
+        let bytes = b"synthetic attachment".to_vec();
+        self.channel.add_file("conformance-source", bytes.clone());
+        Some((
+            Attachment::new("conformance.bin", "conformance-source"),
+            bytes,
+        ))
     }
 
     async fn sent_messages(&self) -> Vec<String> {

@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 
 use aidaemon_channels::{
     ApprovalAnswer, Attachment, ChannelEvent, Conversation, ConversationKind, InboundMessage,
-    Sender,
+    MessageRef, Sender,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,15 +152,14 @@ fn attachments(event: &Value) -> Vec<Attachment> {
                 .iter()
                 .filter_map(|file| {
                     let source = str_field(file, "url_private")?;
-                    Some(Attachment {
-                        name: str_field(file, "name")
-                            .or_else(|| str_field(file, "title"))
-                            .unwrap_or("file")
-                            .to_string(),
-                        mime_type: str_field(file, "mimetype").map(str::to_string),
-                        size_bytes: file.get("size").and_then(Value::as_u64),
-                        source: source.to_string(),
-                    })
+                    let name = str_field(file, "name")
+                        .or_else(|| str_field(file, "title"))
+                        .unwrap_or("file");
+                    Some(
+                        Attachment::new(name, source)
+                            .with_mime_type(str_field(file, "mimetype").map(str::to_string))
+                            .with_size_bytes(file.get("size").and_then(Value::as_u64)),
+                    )
                 })
                 .collect()
         })
@@ -230,18 +229,21 @@ pub(crate) fn map_events_api(
             .map(str::to_string)
     });
 
-    Some(ChannelEvent::Message(InboundMessage {
-        conversation,
-        sender: Sender {
-            id: user.to_string(),
-            display_name,
-            is_bot: false,
-        },
-        message_id: ts.to_string(),
-        text,
-        attachments: files,
-        addressed,
-    }))
+    let sender = Sender {
+        id: user.to_string(),
+        display_name,
+        is_bot: false,
+    };
+    // A thread's root reports its own ts as `thread_ts`: it is in the thread
+    // but answers nothing.
+    let parent = thread_ts.filter(|root| *root != ts).map(str::to_string);
+    Some(ChannelEvent::Message(
+        InboundMessage::new(conversation, sender, ts, text)
+            .with_attachments(files)
+            .with_addressed(addressed)
+            .with_parent_message_id(parent)
+            .with_thread_id(thread_ts.map(str::to_string)),
+    ))
 }
 
 /// Map an `interactive` payload. Only `block_actions` on approval buttons
@@ -274,18 +276,25 @@ pub(crate) fn map_interactive(payload: &Value) -> Option<ChannelEvent> {
         })?;
 
     let is_dm = channel.starts_with('D');
-    Some(ChannelEvent::Approval(ApprovalAnswer {
-        prompt_id: value.prompt_id,
-        choice_id: value.choice_id,
-        sender: Sender {
-            id: user_id.to_string(),
-            display_name: str_field(user, "name")
-                .or_else(|| str_field(user, "username"))
-                .map(str::to_string),
-            is_bot: false,
-        },
-        conversation: conversation_for(channel, is_dm, thread_ts, None),
-    }))
+    let conversation = conversation_for(channel, is_dm, thread_ts, None);
+    let pressed = payload
+        .get("message")
+        .and_then(|m| str_field(m, "ts"))
+        .or_else(|| container.and_then(|c| str_field(c, "message_ts")))
+        .map(|ts| MessageRef {
+            conversation_id: conversation.id.clone(),
+            message_id: ts.to_string(),
+        });
+    let sender = Sender {
+        id: user_id.to_string(),
+        display_name: str_field(user, "name")
+            .or_else(|| str_field(user, "username"))
+            .map(str::to_string),
+        is_bot: false,
+    };
+    let mut answer = ApprovalAnswer::new(value.prompt_id, value.choice_id, sender, conversation);
+    answer.message = pressed;
+    Some(ChannelEvent::Approval(answer))
 }
 
 /// Map a `slash_commands` envelope payload. The handle is the command's

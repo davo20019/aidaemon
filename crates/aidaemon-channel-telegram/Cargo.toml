@@ -13,7 +13,7 @@ publish = false
 webhook = ["dep:axum", "dep:rand", "tokio/net"]
 
 [dependencies]
-aidaemon-channels = { path = "../aidaemon-channels" }
+aidaemon-channels = { path = "../aidaemon-channels", features = ["http"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 rand = { version = "0.8", optional = true }
 async-trait = "0.1"

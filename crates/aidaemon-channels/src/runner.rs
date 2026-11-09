@@ -7,6 +7,17 @@
 //! interrupted runs, and the `/stop`, `/new`, `/status`, `/approve <id>` and
 //! `/deny <id>` commands.
 //!
+//! # Attachments
+//!
+//! On a channel with the `files` capability, an inbound image reaches the
+//! agent as an image, checked by its bytes. Anything else from the owner is
+//! saved under [`AttachmentConfig::save_dir`], when one is set, and the agent
+//! is told the path. Whatever cannot be loaded is still named in the message
+//! with the reason. A file's author is unknown even when the owner sent it,
+//! so a run that received loaded content starts as having read untrusted
+//! content ([`RunState::with_untrusted_context`]), and that stays true for
+//! the session's later runs until `/new`.
+//!
 //! # Wiring
 //!
 //! ```ignore
@@ -43,12 +54,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aidaemon_core::{
-    Agent, CoreError, Event, Resolution, Role, RunId, RunOutcome, RunState, RunStatus, RunStore,
+    Agent, CoreError, Event, Image, Message, Resolution, Role, RunId, RunOutcome, RunState,
+    RunStatus, RunStore,
 };
+use base64::Engine as _;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -56,10 +70,11 @@ use tokio_util::task::TaskTracker;
 
 use crate::approvals::{ApprovalStore, StoredApproval};
 use crate::channel::{
-    ApprovalChoice, ApprovalPrompt, Channel, ChannelError, ChannelEvent, Conversation,
-    ConversationKind, InboundMessage, MessageRef, OutboundMessage,
+    ApprovalChoice, ApprovalPrompt, Attachment, AttachmentKind, Channel, ChannelError,
+    ChannelEvent, Conversation, ConversationKind, InboundMessage, MessageRef, OutboundMessage,
 };
-use crate::policy::{AccessPolicy, Admission};
+use crate::inbound_files::{list_line, save_attachment, sniff_image, ATTACHMENTS_HEADING};
+use crate::policy::{AccessPolicy, Admission, SenderRole};
 use crate::render::{self, Progress};
 use crate::router::EventRouter;
 use crate::session::{session_id, MemorySessionIndex, SessionIndex};
@@ -69,6 +84,41 @@ use crate::split::split_message;
 pub const APPROVE_CHOICE: &str = "approve";
 /// Choice id of the "Deny" button.
 pub const DENY_CHOICE: &str = "deny";
+
+/// What the runner loads from inbound attachments. `Default` gives the
+/// documented defaults.
+#[derive(Debug, Clone)]
+pub struct AttachmentConfig {
+    /// Attachments loaded per message; the rest are only named. 0 loads
+    /// none. Default 8.
+    pub max_per_message: usize,
+    /// Largest image passed to the model. Default 5 MiB, which every
+    /// provider accepts.
+    pub max_image_bytes: u64,
+    /// Largest file saved under [`Self::save_dir`]. Default 20 MiB.
+    pub max_file_bytes: u64,
+    /// How long one download may take. Default 60 s.
+    pub download_timeout: Duration,
+    /// Where the owner's non-image files are saved (one private folder per
+    /// session, files readable only by this user), and the agent told the
+    /// path. Keep it outside the workspaces the agent trusts, so a tool that
+    /// reads a saved file reports it as untrusted. Without one, and for
+    /// senders other than the owner, such files are only named. Default
+    /// none.
+    pub save_dir: Option<PathBuf>,
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self {
+            max_per_message: 8,
+            max_image_bytes: 5 * 1024 * 1024,
+            max_file_bytes: 20 * 1024 * 1024,
+            download_timeout: Duration::from_secs(60),
+            save_dir: None,
+        }
+    }
+}
 
 /// Tunables. `Default` gives the documented defaults.
 #[derive(Debug, Clone)]
@@ -93,6 +143,8 @@ pub struct RunnerConfig {
     pub event_buffer: usize,
     /// How long [`ChannelRunner::run`] waits for in-flight work at shutdown.
     pub shutdown_grace: Duration,
+    /// What is loaded from inbound attachments.
+    pub attachments: AttachmentConfig,
 }
 
 impl Default for RunnerConfig {
@@ -108,6 +160,7 @@ impl Default for RunnerConfig {
             max_restart_backoff: Duration::from_secs(60),
             event_buffer: 256,
             shutdown_grace: Duration::from_secs(5),
+            attachments: AttachmentConfig::default(),
         }
     }
 }
@@ -308,6 +361,10 @@ enum Job {
     Message {
         origin: Origin,
         text: String,
+        /// Loaded when the job runs, so a download never holds up the
+        /// channel's other events (`/stop` above all).
+        attachments: Vec<Attachment>,
+        role: SenderRole,
     },
     Resume {
         origin: Origin,
@@ -351,6 +408,14 @@ impl Default for Slot {
             generation: 0,
         }
     }
+}
+
+/// What became of one inbound attachment.
+enum Loaded {
+    Image(Image),
+    Saved(PathBuf),
+    /// Named in the message only, with this status.
+    Listed(&'static str),
 }
 
 struct PendingApproval {
@@ -523,6 +588,8 @@ impl Inner {
                     message_id: String::new(),
                     attachments: Vec::new(),
                     addressed: true,
+                    parent_message_id: None,
+                    thread_id: None,
                 };
                 self.handle_message(channel, message).await;
             }
@@ -540,8 +607,14 @@ impl Inner {
                     conversation: answer.conversation,
                     reply_to: None,
                 };
-                self.answer(origin, &answer.sender.id, Some(answer.prompt_id), approve)
-                    .await;
+                self.answer(
+                    origin,
+                    &answer.sender.id,
+                    Some(answer.prompt_id),
+                    approve,
+                    answer.message,
+                )
+                .await;
             }
         }
     }
@@ -554,7 +627,7 @@ impl Inner {
                 .then(|| message.message_id.clone()),
             conversation: message.conversation.clone(),
         };
-        match self.policy.admit(&name, &message) {
+        let role = match self.policy.admit(&name, &message) {
             Admission::Ignore => return,
             Admission::Refuse => {
                 tracing::info!(channel = %name, sender = %message.sender.id, "refused unknown sender");
@@ -563,22 +636,32 @@ impl Inner {
                 }
                 return;
             }
-            Admission::Accept(_) => {}
-        }
+            Admission::Accept(role) => role,
+        };
         let session = session_id(&name, &message.conversation.id);
         match parse_command(&message.text) {
             Some(Command::Stop) => self.stop(&session, &origin).await,
             Some(Command::New) => self.reset(&session, &origin).await,
             Some(Command::Status) => self.status(&session, &origin).await,
             Some(Command::Approve(id)) => {
-                self.answer(origin, &message.sender.id, id, true).await;
+                self.answer(origin, &message.sender.id, id, true, None)
+                    .await;
             }
             Some(Command::Deny(id)) => {
-                self.answer(origin, &message.sender.id, id, false).await;
+                self.answer(origin, &message.sender.id, id, false, None)
+                    .await;
             }
             None => {
-                let text = with_attachments(&message);
-                self.submit(session, Job::Message { origin, text }).await;
+                self.submit(
+                    session,
+                    Job::Message {
+                        origin,
+                        text: message.text,
+                        attachments: message.attachments,
+                        role,
+                    },
+                )
+                .await;
             }
         }
     }
@@ -727,30 +810,30 @@ impl Inner {
         let generation = self.generation(session);
         let agent = self.agent.clone();
         let (origin, outcome, base) = match job {
-            Job::Message { origin, text } => {
-                let previous = self.continuation(session).await;
-                match previous {
-                    Some(state) => {
-                        let state = state.with_user_message(text);
-                        let base = state.messages.len();
-                        let run_id = state.run_id;
-                        let run = {
-                            let cancel = cancel.clone();
-                            async move { agent.run_from(state, cancel).await }
-                        };
-                        let outcome = self.drive(session, &origin, Some(run_id), run).await;
-                        (origin, outcome, base)
-                    }
-                    None => {
-                        let session_owned = session.to_string();
-                        let run = {
-                            let cancel = cancel.clone();
-                            async move { agent.run_with_cancel(&session_owned, &text, cancel).await }
-                        };
-                        let outcome = self.drive(session, &origin, None, run).await;
-                        (origin, outcome, 1)
-                    }
+            Job::Message {
+                origin,
+                text,
+                attachments,
+                role,
+            } => {
+                let (message, untrusted) = self
+                    .input_message(session, &origin, text, &attachments, role, &cancel)
+                    .await;
+                let mut state = match self.continuation(session).await {
+                    Some(state) => state.with_user_message(message),
+                    None => RunState::new(self.agent.id(), session, message),
+                };
+                if untrusted {
+                    state = state.with_untrusted_context();
                 }
+                let base = state.messages.len();
+                let run_id = state.run_id;
+                let run = {
+                    let cancel = cancel.clone();
+                    async move { agent.run_from(state, cancel).await }
+                };
+                let outcome = self.drive(session, &origin, Some(run_id), run).await;
+                (origin, outcome, base)
             }
             Job::Resume {
                 origin,
@@ -827,6 +910,127 @@ impl Inner {
                 }
                 self.reply(&origin, &text).await;
                 None
+            }
+        }
+    }
+
+    /// The user message for a job, and whether it carries content someone
+    /// else may have written.
+    async fn input_message(
+        &self,
+        session: &str,
+        origin: &Origin,
+        text: String,
+        attachments: &[Attachment],
+        role: SenderRole,
+        cancel: &CancellationToken,
+    ) -> (Message, bool) {
+        if attachments.is_empty() {
+            return (Message::user(text), false);
+        }
+        let channel = self.channels[origin.channel].clone();
+        let caps = channel.capabilities();
+        if caps.typing_indicator {
+            let _ = channel.typing(&origin.conversation).await;
+        }
+        let mut images = Vec::new();
+        let mut untrusted = false;
+        let mut body = text;
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(ATTACHMENTS_HEADING);
+        for (index, attachment) in attachments.iter().enumerate() {
+            let loaded = if caps.files && index < self.config.attachments.max_per_message {
+                self.load_attachment(session, channel.as_ref(), attachment, role, cancel)
+                    .await
+            } else {
+                Loaded::Listed("not loaded")
+            };
+            let saved_note;
+            let status = match loaded {
+                Loaded::Image(image) => {
+                    images.push(image);
+                    untrusted = true;
+                    "included as an image"
+                }
+                Loaded::Saved(path) => {
+                    untrusted = true;
+                    saved_note = format!("saved at {}", path.display());
+                    saved_note.as_str()
+                }
+                Loaded::Listed(reason) => reason,
+            };
+            body.push('\n');
+            body.push_str(&list_line(attachment, status));
+        }
+        (Message::user(body).with_images(images), untrusted)
+    }
+
+    /// Fetch one attachment and turn it into something the agent can use.
+    async fn load_attachment(
+        &self,
+        session: &str,
+        channel: &dyn Channel,
+        attachment: &Attachment,
+        role: SenderRole,
+        cancel: &CancellationToken,
+    ) -> Loaded {
+        let config = &self.config.attachments;
+        let save_dir = config
+            .save_dir
+            .as_ref()
+            .filter(|_| role == SenderRole::Owner);
+        let wants_image = attachment.kind == AttachmentKind::Image;
+        if !wants_image && save_dir.is_none() {
+            return Loaded::Listed("not loaded");
+        }
+        let limit = if save_dir.is_some() {
+            config.max_file_bytes
+        } else {
+            config.max_image_bytes
+        };
+        let download = tokio::time::timeout(
+            config.download_timeout,
+            channel.download_limited(attachment, limit),
+        );
+        let bytes = tokio::select! {
+            _ = cancel.cancelled() => return Loaded::Listed("not loaded (the run was stopped)"),
+            result = download => match result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(ChannelError::TooLarge { .. })) => {
+                    return Loaded::Listed("not loaded (over the size limit)")
+                }
+                Ok(Err(err)) => {
+                    // The reason stays in the log: it is the platform's text.
+                    tracing::warn!(channel = channel.name(), error = %err, "attachment download failed");
+                    return Loaded::Listed("not loaded (the download failed)");
+                }
+                Err(_) => return Loaded::Listed("not loaded (the download timed out)"),
+            },
+        };
+        if wants_image && bytes.len() as u64 <= config.max_image_bytes {
+            if let Some(media_type) = sniff_image(&bytes) {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                return Loaded::Image(Image::base64(media_type, data));
+            }
+        }
+        let Some(dir) = save_dir.cloned() else {
+            return Loaded::Listed("not loaded (not a supported image)");
+        };
+        let (session, name) = (session.to_string(), attachment.name.clone());
+        let saved =
+            tokio::task::spawn_blocking(move || save_attachment(&dir, &session, &name, &bytes))
+                .await;
+        match saved {
+            Ok(Ok(path)) => Loaded::Saved(path),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "could not save an attachment");
+                Loaded::Listed("not loaded (it could not be saved)")
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "saving an attachment failed");
+                Loaded::Listed("not loaded (it could not be saved)")
             }
         }
     }
@@ -1035,7 +1239,7 @@ impl Inner {
                 .remove(&prompt_id);
             if let Some(pending) = expired {
                 inner.forget_approval(&prompt_id).await;
-                inner.mark_prompt(&pending, "Expired (denied)").await;
+                inner.mark_prompt(&pending, "Expired (denied)", None).await;
                 inner
                     .say(
                         &pending.origin,
@@ -1157,15 +1361,43 @@ impl Inner {
         restored
     }
 
-    /// Edit the prompt message to show how it was settled.
-    async fn mark_prompt(&self, pending: &PendingApproval, verdict: &str) {
+    /// Show on the prompt how it was settled, which also removes its
+    /// buttons. `pressed` is the message a button press came from; it is the
+    /// way to the prompt when its own ref was never recorded (an answer
+    /// that raced `ask`, or a restart before it was saved).
+    async fn mark_prompt(
+        &self,
+        pending: &PendingApproval,
+        verdict: &str,
+        pressed: Option<&MessageRef>,
+    ) {
         let channel = &self.channels[pending.origin.channel];
-        if !channel.capabilities().edit_messages {
+        let caps = channel.capabilities();
+        let Some(target) = pending.prompt_ref.as_ref().or(pressed) else {
             return;
+        };
+        if caps.edit_messages {
+            // Room for the verdict first, since an edit keeps only what fits.
+            let room = caps
+                .max_message_len
+                .saturating_sub(verdict.chars().count() + 6);
+            let text = format!(
+                "{}\n\n**{verdict}**",
+                render::truncate_chars(&pending.prompt_text, room)
+            );
+            match channel.edit(target, &text).await {
+                Ok(()) => return,
+                Err(err) => tracing::debug!(error = %err, "could not mark the prompt"),
+            }
         }
-        if let Some(r) = &pending.prompt_ref {
-            let text = format!("{}\n\n**{verdict}**", pending.prompt_text);
-            let _ = channel.edit(r, &text).await;
+        if caps.buttons {
+            self.remove_buttons(pending.origin.channel, target).await;
+        }
+    }
+
+    async fn remove_buttons(&self, channel: usize, message: &MessageRef) {
+        if let Err(err) = self.channels[channel].remove_buttons(message).await {
+            tracing::debug!(error = %err, "could not remove the buttons");
         }
     }
 
@@ -1207,6 +1439,7 @@ impl Inner {
         sender_id: &str,
         prompt_id: Option<String>,
         approve: bool,
+        pressed: Option<MessageRef>,
     ) {
         let name = self.channel_name(origin.channel).to_string();
         if !self.policy.may_approve(&name, sender_id) {
@@ -1243,13 +1476,21 @@ impl Inner {
                         .to_string()
                 }
             };
+            // A button that can no longer do anything should not stay.
+            if let Some(message) = &pressed {
+                self.remove_buttons(origin.channel, message).await;
+            }
             self.say(&origin, &notice).await;
             return;
         };
         tracing::info!(session = %session, prompt = %id, approve, "approval settled");
         self.forget_approval(&id).await;
-        self.mark_prompt(&pending, if approve { "Approved" } else { "Denied" })
-            .await;
+        self.mark_prompt(
+            &pending,
+            if approve { "Approved" } else { "Denied" },
+            pressed.as_ref(),
+        )
+        .await;
         let resolution = if approve {
             Resolution::Approve
         } else {
@@ -1309,7 +1550,7 @@ impl Inner {
                         .await;
                 }
                 self.forget_approval(&pending.prompt_id).await;
-                self.mark_prompt(&pending, "Stopped").await;
+                self.mark_prompt(&pending, "Stopped", None).await;
                 self.resume(
                     *pending,
                     Resolution::Deny {
@@ -1347,7 +1588,7 @@ impl Inner {
         };
         if let Some(pending) = dropped_approval {
             self.forget_approval(&pending.prompt_id).await;
-            self.mark_prompt(&pending, "Cancelled").await;
+            self.mark_prompt(&pending, "Cancelled", None).await;
         }
         self.index.clear(session).await;
         self.say(origin, "Started a new conversation.").await;
@@ -1380,22 +1621,6 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
-}
-
-/// The message text plus a short list of attachments the agent cannot see.
-fn with_attachments(message: &InboundMessage) -> String {
-    if message.attachments.is_empty() {
-        return message.text.clone();
-    }
-    let mut text = message.text.clone();
-    text.push_str("\n\nAttachments:");
-    for a in &message.attachments {
-        text.push_str(&format!("\n- {}", a.name));
-        if let Some(mime) = &a.mime_type {
-            text.push_str(&format!(" ({mime})"));
-        }
-    }
-    text
 }
 
 /// The last assistant text produced by this run (messages from `base` on).

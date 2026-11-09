@@ -2,13 +2,19 @@
 
 use std::time::Duration;
 
+use aidaemon_channels::download::{DownloadClient, DownloadRequest};
 use aidaemon_channels::ChannelError;
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
 
 /// Longest `retry_after` honoured internally; longer waits surface as
 /// [`ChannelError::RateLimited`] right away.
 const MAX_INTERNAL_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Domains Discord serves attachments from.
+const DISCORD_FILE_DOMAINS: [&str; 3] = ["discord.com", "discordapp.com", "discordapp.net"];
 
 const USER_AGENT: &str = concat!(
     "DiscordBot (https://github.com/davo20019/aidaemon, ",
@@ -21,6 +27,8 @@ pub(crate) struct Rest {
     pub(crate) http: reqwest::Client,
     pub(crate) api_base: String,
     pub(crate) token: String,
+    /// Follows no redirect without checking it first.
+    pub(crate) files: DownloadClient,
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap, body: &Value) -> Option<f64> {
@@ -77,25 +85,41 @@ impl Rest {
         .await
     }
 
-    /// Fetch a file from Discord's CDN (attachment URLs need no token).
-    pub(crate) async fn download(&self, url: &str) -> Result<Vec<u8>, ChannelError> {
-        let resp = self
-            .http
-            .get(url)
-            .header("User-Agent", USER_AGENT)
-            .send()
+    /// Whether `url` is one of Discord's file hosts (or the configured API
+    /// host). The gateway names these URLs, but a file is only ever fetched
+    /// from Discord.
+    fn discord_host(&self, url: &Url) -> bool {
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let on_discord = url.scheme() == "https"
+            && DISCORD_FILE_DOMAINS
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+        let configured = Url::parse(&self.api_base)
+            .ok()
+            .and_then(|base| base.host_str().map(str::to_string));
+        on_discord || configured.as_deref() == Some(host)
+    }
+
+    /// Fetch a file from Discord's CDN. Attachment URLs need no token, and
+    /// none is sent.
+    pub(crate) async fn download(
+        &self,
+        url: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ChannelError> {
+        self.files
+            .fetch(DownloadRequest {
+                url,
+                bearer_token: None,
+                allowed: &|target| self.discord_host(target),
+                max_bytes,
+                timeout: DOWNLOAD_TIMEOUT,
+                user_agent: Some(USER_AGENT),
+            })
             .await
-            .map_err(|e| ChannelError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ChannelError::Other(format!(
-                "discord: attachment download failed: {status}"
-            )));
-        }
-        resp.bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| ChannelError::Transport(e.to_string()))
+            .map(|downloaded| downloaded.bytes)
     }
 
     /// Send a request built by `body` (called again on the one retry).

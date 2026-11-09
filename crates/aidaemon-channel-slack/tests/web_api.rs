@@ -343,12 +343,10 @@ async fn download_sends_the_bot_token_only_to_slack_hosts() {
     let slack = channel(&api);
     let host = api.base.trim_end_matches("/api").to_string();
     let bytes = slack
-        .download(&aidaemon_channels::Attachment {
-            name: "notes.txt".into(),
-            mime_type: None,
-            size_bytes: None,
-            source: format!("{host}/files-pri/T000SYNTH-F000SYNTH/notes.txt"),
-        })
+        .download(&aidaemon_channels::Attachment::new(
+            "notes.txt",
+            format!("{host}/files-pri/T000SYNTH-F000SYNTH/notes.txt"),
+        ))
         .await
         .unwrap();
     assert_eq!(bytes, b"\"synthetic bytes\"");
@@ -358,12 +356,10 @@ async fn download_sends_the_bot_token_only_to_slack_hosts() {
     );
 
     let err = slack
-        .download(&aidaemon_channels::Attachment {
-            name: "notes.txt".into(),
-            mime_type: None,
-            size_bytes: None,
-            source: "https://files.example.test/notes.txt".into(),
-        })
+        .download(&aidaemon_channels::Attachment::new(
+            "notes.txt",
+            "https://files.example.test/notes.txt",
+        ))
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::Other(_)));

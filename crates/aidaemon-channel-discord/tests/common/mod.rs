@@ -243,5 +243,6 @@ pub fn channel(http: &MockHttp) -> DiscordChannel {
     DiscordChannel::new(TOKEN)
         .with_api_base(http.base.clone())
         .with_http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_download_client(reqwest::Client::builder().no_proxy())
         .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
 }

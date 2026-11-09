@@ -312,12 +312,13 @@ async fn download_fetches_the_attachment() {
     http.push(200, json!("synthetic attachment bytes"));
     let ch = channel(&http);
     let bytes = ch
-        .download(&aidaemon_channels::Attachment {
-            name: "notes.txt".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            size_bytes: None,
-            source: format!("{}/attachments/1/2/notes.txt", http.base),
-        })
+        .download(
+            &aidaemon_channels::Attachment::new(
+                "notes.txt",
+                format!("{}/attachments/1/2/notes.txt", http.base),
+            )
+            .with_mime_type(Some("text/plain".to_string())),
+        )
         .await
         .unwrap();
     assert_eq!(bytes, b"\"synthetic attachment bytes\"");
