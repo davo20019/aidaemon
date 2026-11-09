@@ -25,6 +25,8 @@
 //! script:                                # optional; omit for live runs
 //!   - tool_calls:
 //!       - { name: get_weather, arguments: { city: Springfield } }
+//!       # Arguments may also be a JSON string, as a provider sends them:
+//!       # - { name: get_weather, arguments: '{"city":"Springfield"}' }
 //!   - text: It is sunny and 21C in Springfield.
 //! expect:
 //!   status: completed
@@ -84,7 +86,7 @@ pub mod examples;
 pub use report::{compare, Comparison, ComparisonRow, FailureCount, Report, ScenarioReport};
 pub use runner::{check_expectations, AgentFactory, CaseResult, FactoryError, FnFactory};
 pub use scenario::{
-    status_name, EvalError, Expect, ExpectedStatus, Scenario, ScenarioLimits, ScriptedCall,
-    ScriptedReply, ScriptedUsage,
+    status_name, EvalError, Expect, ExpectedStatus, Scenario, ScenarioLimits, ScriptedArguments,
+    ScriptedCall, ScriptedReply, ScriptedUsage,
 };
 pub use suite::Suite;

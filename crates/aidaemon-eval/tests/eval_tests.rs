@@ -88,6 +88,33 @@ expect:
 }
 
 #[test]
+fn script_arguments_are_a_string_or_an_object() {
+    let s = scenario(
+        r#"
+name: args
+input: hi
+script:
+  - tool_calls:
+      - { name: a, arguments: { path: x } }
+      - { name: b, arguments: '{"path":"y"}' }
+      - { name: c, arguments: 'not json' }
+      - { name: d }
+"#,
+    );
+    let calls = &s.scripted_responses()[0].tool_calls;
+    assert_eq!(calls[0].arguments["path"], "x");
+    assert_eq!(calls[1].arguments["path"], "y");
+    assert_eq!(calls[2].arguments, serde_json::json!("not json"));
+    assert_eq!(calls[3].arguments, serde_json::json!({}));
+
+    let replies = s.script.unwrap();
+    let raw = replies[0].tool_calls.as_ref().unwrap();
+    assert_eq!(raw[0].arguments.to_json_string(), r#"{"path":"x"}"#);
+    assert_eq!(raw[1].arguments.to_json_string(), r#"{"path":"y"}"#);
+    assert_eq!(raw[2].arguments.to_json_string(), "not json");
+}
+
+#[test]
 fn unknown_fields_are_rejected_everywhere() {
     let cases = [
         ("top level", "name: a\ninput: b\nexpekt: {}\n"),

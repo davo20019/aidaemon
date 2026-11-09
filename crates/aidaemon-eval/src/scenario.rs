@@ -90,8 +90,52 @@ pub struct ScriptedCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub name: String,
-    #[serde(default = "empty_object")]
-    pub arguments: Value,
+    #[serde(default)]
+    pub arguments: ScriptedArguments,
+}
+
+/// A scripted call's arguments: a JSON document in a string, as a provider
+/// sends them, or a YAML object.
+///
+/// A string that is not valid JSON is kept as it is, so a script can show the
+/// loop what a model that emits broken arguments looks like.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptedArguments {
+    Text(String),
+    Object(Value),
+}
+
+impl Default for ScriptedArguments {
+    fn default() -> Self {
+        Self::Object(empty_object())
+    }
+}
+
+impl From<Value> for ScriptedArguments {
+    fn from(value: Value) -> Self {
+        Self::Object(value)
+    }
+}
+
+impl ScriptedArguments {
+    /// The arguments as JSON: a parsed string, or the object itself.
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Text(raw) => {
+                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+            }
+            Self::Object(value) => value.clone(),
+        }
+    }
+
+    /// The arguments as the JSON string a provider would have sent.
+    pub fn to_json_string(&self) -> String {
+        match self {
+            Self::Text(raw) => raw.clone(),
+            Self::Object(value) => value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +358,7 @@ impl ScriptedReply {
                         .clone()
                         .unwrap_or_else(|| format!("call_{reply_number}_{i}")),
                     call.name.clone(),
-                    call.arguments.clone(),
+                    call.arguments.to_value(),
                 )
             })
             .collect();
