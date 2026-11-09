@@ -2250,6 +2250,7 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
+            network_reach: crate::traits::NetworkReach::PublicAndLoopback,
             ..Default::default()
         }
     }

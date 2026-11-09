@@ -99,6 +99,7 @@ pub(super) enum HookSlot {
     Cutoff,
     Retry,
     Memory,
+    Network,
     Egress,
     Untrusted,
     Approval,
@@ -125,6 +126,7 @@ pub(super) struct TurnHooks {
     pub(super) cutoff: CutoffAdjust,
     pub(super) retry: ModelRetry,
     pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
+    pub(super) network: aidaemon_tools::NetworkGuard,
     pub(super) egress: aidaemon_policies::EgressGuard,
     pub(super) untrusted: sdk::UntrustedHook,
     pub(super) approval: aidaemon_policies::ApprovalPolicy,
@@ -146,6 +148,7 @@ impl TurnHooks {
             (HookSlot::Retry, Arc::new(self.retry)),
         ];
         chain.extend(self.memory.into_iter().map(|hook| (HookSlot::Memory, hook)));
+        chain.push((HookSlot::Network, Arc::new(self.network)));
         chain.push((HookSlot::Egress, Arc::new(self.egress)));
         chain.push((HookSlot::Untrusted, Arc::new(self.untrusted)));
         chain.push((HookSlot::Approval, Arc::new(self.approval)));

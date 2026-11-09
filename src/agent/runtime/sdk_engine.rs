@@ -1185,6 +1185,10 @@ impl Agent {
         for tool in self.tools.iter() {
             turn_tools.insert(tool.name().to_string(), tool.clone());
         }
+        let network = turn_tools.iter().fold(
+            aidaemon_tools::NetworkGuard::new(),
+            |guard, (name, tool)| guard.reach(name.clone(), tool.dispatch_facts().network_reach),
+        );
         let hooks = TurnHooks {
             canonical: tool_calls::CanonicalCallHook {
                 tools: Arc::new(turn_tools),
@@ -1204,6 +1208,7 @@ impl Agent {
                 calls: calls_tx.clone(),
             },
             memory: memory_hooks,
+            network,
             egress,
             untrusted: sdk::UntrustedHook::new(
                 crate::agent::untrusted::untrusted_mode(authority.owner_level),

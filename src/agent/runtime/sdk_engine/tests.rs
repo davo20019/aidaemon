@@ -3658,6 +3658,7 @@ fn hook_order_is_pinned() {
             calls: calls.clone(),
         },
         memory: vec![Arc::new(NoopMemoryHook)],
+        network: aidaemon_tools::NetworkGuard::new(),
         egress: aidaemon_policies::EgressGuard::new(),
         untrusted: sdk::UntrustedHook::new(
             sdk::UntrustedMode::Enforce,
@@ -3700,6 +3701,7 @@ fn hook_order_is_pinned() {
             HookSlot::Cutoff,
             HookSlot::Retry,
             HookSlot::Memory,
+            HookSlot::Network,
             HookSlot::Egress,
             HookSlot::Untrusted,
             HookSlot::Approval,

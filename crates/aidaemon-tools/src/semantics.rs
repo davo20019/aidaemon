@@ -107,6 +107,8 @@ pub struct ToolDispatchFacts {
     pub records_launch_trust: bool,
     /// Which goal facts the call receives.
     pub goal_context: GoalContext,
+    /// Which addresses a call may name, judged by `web::NetworkGuard`.
+    pub network_reach: NetworkReach,
     /// The dispatcher takes a file checkpoint before the call runs, so its
     /// writes can be rolled back.
     pub checkpoints_writes: bool,
@@ -116,6 +118,19 @@ pub struct ToolDispatchFacts {
     /// The status line summarizes a finished call from its arguments, not
     /// its result (memory and people edits, whose result text is terse).
     pub status_from_arguments: bool,
+}
+
+/// Which addresses a tool's egress may name. Cloud metadata endpoints are
+/// refused for every tool, whatever this says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NetworkReach {
+    /// Anything else, as a shell reaches the owner's own network.
+    #[default]
+    Any,
+    /// Public hosts and this computer.
+    PublicAndLoopback,
+    /// Public hosts only.
+    PublicOnly,
 }
 
 /// Which goal facts a call receives (see

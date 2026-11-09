@@ -1657,6 +1657,21 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
             segment_effects(&strip_redirections(tokens), cwd, &mut out);
         }
     }
+    // A launcher hides its program from the walk above (`sudo curl`,
+    // `bash -c '...'`). What such a command contacts is still declared.
+    let executed = executed_text(&command.replace("\\\n", " "));
+    for tokens in expanded_commands(&executed) {
+        let mut inner = ShellAnalysis {
+            keys: Vec::new(),
+            complete: true,
+        };
+        segment_effects(&tokens, cwd, &mut inner);
+        for key in inner.keys {
+            if key.class == EffectClass::Egress {
+                out.add(key);
+            }
+        }
+    }
     out
 }
 

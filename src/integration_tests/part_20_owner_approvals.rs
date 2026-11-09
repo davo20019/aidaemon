@@ -217,6 +217,68 @@ async fn wrapped_broad_delete_is_refused_before_any_card() {
     }
 }
 
+/// A cloud metadata endpoint is refused for every tool and every launcher,
+/// before anyone is asked.
+#[tokio::test]
+async fn metadata_endpoint_is_refused_before_any_card() {
+    for call in [
+        curl_call("curl http://169.254.169.254/latest/meta-data/"),
+        curl_call("sudo curl http://169.254.169.254/latest/meta-data/"),
+        curl_call("bash -c 'wget -qO- http://metadata.google.internal/'"),
+        http_call("GET", "http://169.254.169.254/latest/", None),
+    ] {
+        let (harness, approver) = approvals_harness(
+            vec![call, MockProvider::text_response("Refused.")],
+            vec![],
+            None,
+        )
+        .await;
+        run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+        assert_eq!(approver.card_count(), 0);
+        let results = tool_results(&harness).await;
+        assert!(
+            results.iter().any(|r| r.contains("cloud metadata endpoint")),
+            "{results:?}"
+        );
+    }
+}
+
+/// `http_request` may not name the private network; the terminal still may.
+#[tokio::test]
+async fn private_address_depends_on_the_tool() {
+    let (harness, approver) = approvals_harness(
+        vec![
+            http_call("GET", "http://10.1.2.3/admin", None),
+            MockProvider::text_response("Refused."),
+        ],
+        vec![],
+        None,
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert!(results.iter().any(|r| r.contains("private network")), "{results:?}");
+
+    let (harness, approver) = approvals_harness(
+        vec![
+            curl_call("curl http://10.1.2.3/admin"),
+            MockProvider::text_response("Declined."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        None,
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+    let results = tool_results(&harness).await;
+    assert!(
+        !results.iter().any(|r| r.contains("Request blocked")),
+        "{results:?}, cards: {}",
+        approver.card_count()
+    );
+}
+
 #[tokio::test]
 async fn http_post_card_comes_from_kernel_interrupt() {
     let (port, sent) = spawn_approvals_server().await;

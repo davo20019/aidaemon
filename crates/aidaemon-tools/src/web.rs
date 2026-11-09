@@ -6,6 +6,7 @@
 //! the only host contacted; [`WebFetch::follow_public_redirects`] allows
 //! other public hosts.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::OnceLock;
@@ -18,15 +19,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use aidaemon_core::{
-    AccessManifest, CallEffects, EffectKey, Tool, ToolAnnotations, ToolContext, ToolOutput,
-    ToolResult,
+    AccessManifest, CallEffects, EffectClass, EffectKey, Hook, HookContext, Tool, ToolAnnotations,
+    ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult,
 };
 
 use crate::fs::ToolText;
 use crate::outcome::{spec_of, OutcomeTool};
 use crate::semantics::{
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolTargetHintKind, ToolVerificationMode,
+    NetworkReach, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::util::{fail, parse_args, truncate_chars};
 
@@ -495,6 +496,111 @@ fn resolves_only_to_loopback(url: &str) -> bool {
         Err(_) => host
             .parse::<IpAddr>()
             .is_ok_and(|ip| classify_blocked_ip(ip) == Some(BlockedHostClass::Loopback)),
+    }
+}
+
+/// Whether `host` is a cloud metadata endpoint: by name, by address, or by
+/// what it resolves to. Narrower than [`BlockedHostClass::LinkLocalMetadata`],
+/// which also covers ordinary `*.internal` names.
+fn is_metadata_endpoint(host: &str, port: u16) -> bool {
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(name.as_str(), "metadata.google.internal" | "metadata.goog") {
+        return true;
+    }
+    let is_metadata_ip = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.octets()[..2] == [169, 254],
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.octets()[..2] == [169, 254])
+        }
+    };
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return is_metadata_ip(ip);
+    }
+    (name.as_str(), port)
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|addr| is_metadata_ip(addr.ip())))
+}
+
+/// Why a call to `target` (`host:port`) is refused under `reach`. Names only
+/// the class of address, never the target.
+fn network_refusal(reach: NetworkReach, target: &str) -> Option<&'static str> {
+    let (host, port) = target.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if is_metadata_endpoint(host, port) {
+        return Some("cloud metadata endpoint");
+    }
+    if reach == NetworkReach::Any {
+        return None;
+    }
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let class = classify_blocked_host(&format!("http://{authority}/"))?;
+    (reach == NetworkReach::PublicOnly || class != BlockedHostClass::Loopback)
+        .then(|| class.label())
+}
+
+/// Refuses calls whose declared egress names an address the tool may not
+/// reach, before anyone is asked. It sees the first request of a call: a
+/// redirect exists only once that request runs, so the tools recheck each
+/// hop themselves.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkGuard {
+    reach: HashMap<String, NetworkReach>,
+}
+
+impl NetworkGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// State how far `tool` may reach. A tool not named reaches
+    /// [`NetworkReach::Any`].
+    pub fn reach(mut self, tool: impl Into<String>, reach: NetworkReach) -> Self {
+        self.reach.insert(tool.into(), reach);
+        self
+    }
+}
+
+#[async_trait]
+impl Hook for NetworkGuard {
+    async fn before_tool(
+        &self,
+        _ctx: &HookContext<'_>,
+        call: &ToolCall,
+        tool: &ToolInfo,
+    ) -> ToolDecision {
+        let reach = self.reach.get(&call.name).copied().unwrap_or_default();
+        let targets: Vec<String> = tool
+            .effects
+            .keys
+            .iter()
+            .filter(|key| key.class == EffectClass::Egress)
+            .map(|key| key.target.clone())
+            .collect();
+        if targets.is_empty() {
+            return ToolDecision::Allow;
+        }
+        // Classifying can resolve a name.
+        let refusal = tokio::task::spawn_blocking(move || {
+            targets
+                .iter()
+                .find_map(|target| network_refusal(reach, target))
+        })
+        .await
+        .unwrap_or(Some("address that could not be checked"));
+        match refusal {
+            Some(label) => ToolDecision::Deny {
+                reason: format!("Request blocked: target is a {label}"),
+            },
+            None => ToolDecision::Allow,
+        }
     }
 }
 
@@ -1001,6 +1107,7 @@ impl crate::semantics::ToolSemantics for WebFetch {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
             always_offered: true,
+            network_reach: crate::semantics::NetworkReach::PublicOnly,
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
             ..Default::default()
         }
@@ -1406,6 +1513,52 @@ mod tests {
         };
         let stopped = tool.execute(&arguments, &facts).await.unwrap();
         assert!(stopped.output.contains("HTTP 302"), "{}", stopped.output);
+    }
+
+    #[test]
+    fn metadata_endpoints_are_refused_for_every_reach() {
+        for target in [
+            "169.254.169.254:80",
+            "metadata.google.internal:80",
+            "metadata.goog:443",
+            "fe80::1:80",
+            "fd00:ec2::254:80",
+        ] {
+            for reach in [
+                NetworkReach::Any,
+                NetworkReach::PublicAndLoopback,
+                NetworkReach::PublicOnly,
+            ] {
+                assert!(
+                    network_refusal(reach, target).is_some(),
+                    "{target} {reach:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reach_decides_private_and_loopback() {
+        use NetworkReach::*;
+        // A shell still reaches the owner's own network and internal names.
+        for target in ["10.0.0.5:22", "localhost:3000", "db.internal:5432"] {
+            assert_eq!(network_refusal(Any, target), None, "{target}");
+        }
+        assert_eq!(network_refusal(PublicAndLoopback, "localhost:3000"), None);
+        assert_eq!(
+            network_refusal(PublicAndLoopback, "shop.localhost:80"),
+            None
+        );
+        assert!(network_refusal(PublicAndLoopback, "10.0.0.5:80").is_some());
+        assert!(network_refusal(PublicOnly, "localhost:3000").is_some());
+        assert!(network_refusal(PublicOnly, "::1:80").is_some());
+        assert_eq!(network_refusal(PublicOnly, "8.8.8.8:443"), None);
+    }
+
+    #[test]
+    fn a_refusal_names_the_class_not_the_target() {
+        let label = network_refusal(NetworkReach::PublicOnly, "10.1.2.3:8443").unwrap();
+        assert!(!label.contains("10.1.2.3"));
     }
 
     #[test]

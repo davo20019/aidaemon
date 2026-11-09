@@ -81,7 +81,7 @@ pub use search::{Glob, Grep};
 pub use search_files::SearchFiles;
 pub use shell::{Shell, DEFAULT_ENV_ALLOWLIST};
 pub use util::sniff_image_mime;
-pub use web::WebFetch;
+pub use web::{NetworkGuard, WebFetch};
 pub use workspace::{PathError, Workspace};
 
 /// The standard set: `read_file`, `write_file`, `edit_file`, `glob`, `grep`,

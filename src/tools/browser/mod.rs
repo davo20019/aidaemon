@@ -2403,6 +2403,7 @@ impl crate::traits::ToolSemantics for BrowserTool {
             // The owner's answers are kept per call and per session by the
             // tool (`record_owner_answer`), never as kernel session grants.
             keeps_own_grants: true,
+            network_reach: crate::traits::NetworkReach::PublicAndLoopback,
             ..Default::default()
         }
     }
