@@ -91,6 +91,13 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> axum::
             raw: String::new(),
             at: Instant::now(),
         });
+        if file.starts_with("redirect/") {
+            return (
+                StatusCode::FOUND,
+                [("location", "http://files.example.test/stolen")],
+            )
+                .into_response();
+        }
         return (StatusCode::OK, "synthetic file bytes").into_response();
     }
     json_handler(mock, path, body).await.into_response()
@@ -487,6 +494,7 @@ async fn callback_query_becomes_approval_and_is_answered() {
             assert_eq!(answer.choice_id, "deny");
             assert_eq!(answer.sender.id, "100000002");
             assert_eq!(answer.conversation, thread);
+            assert_eq!(answer.message.as_ref(), Some(&sent));
         }
         other => panic!("expected approval, got {other:?}"),
     }
@@ -1112,4 +1120,125 @@ async fn run_updates_hands_over_each_update_as_sent() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_download_stops_at_the_limit_even_with_no_declared_size() {
+    let (_mock, base) = start_mock().await;
+    let err = channel(&base)
+        .download_limited(
+            &aidaemon_channels::Attachment::new("notes.txt", "synthetic-file"),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChannelError::TooLarge { limit_bytes: 5 }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_limit_above_the_bot_apis_is_held_to_the_bot_apis() {
+    let (mock, base) = start_mock().await;
+    let limit = aidaemon_channel_telegram::MAX_DOWNLOAD_BYTES;
+    let err = channel(&base)
+        .download_limited(
+            &aidaemon_channels::Attachment::new("big.bin", "synthetic-big")
+                .with_size_bytes(Some(limit + 1)),
+            limit * 10,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChannelError::TooLarge { limit_bytes } if limit_bytes == limit));
+    assert!(mock.calls("getFile").is_empty());
+}
+
+#[tokio::test]
+async fn a_redirect_off_the_bot_api_is_refused_and_the_token_stays_out_of_the_error() {
+    let (mock, base) = start_mock().await;
+    mock.script_ok(
+        "getFile",
+        json!({ "file_id": "f", "file_path": "redirect/notes.txt" }),
+    );
+    let err = channel(&base)
+        .download(&aidaemon_channels::Attachment::new("notes.txt", "f"))
+        .await
+        .unwrap_err();
+    assert_eq!(mock.calls("file:redirect/notes.txt").len(), 1);
+    let shown = format!("{err} {err:?}");
+    assert!(shown.contains("refused"), "{shown}");
+    assert!(!shown.contains(TOKEN), "{shown}");
+    assert!(!shown.contains("example.test"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_failed_file_fetch_does_not_show_the_token() {
+    // Bound, then released: the file endpoint does not answer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let err = channel(&dead)
+        .download(&aidaemon_channels::Attachment::new("notes.txt", "f"))
+        .await
+        .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains(TOKEN), "{shown}");
+}
+
+#[tokio::test]
+async fn remove_buttons_clears_the_keyboard_only() {
+    let (mock, base) = start_mock().await;
+    let target = MessageRef {
+        conversation_id: GROUP_CHAT.to_string(),
+        message_id: "77".to_string(),
+    };
+    channel(&base).remove_buttons(&target).await.unwrap();
+    let calls = mock.calls("editMessageReplyMarkup");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].body,
+        json!({ "chat_id": GROUP_CHAT, "message_id": 77 })
+    );
+
+    // Already gone is a success.
+    mock.script(
+        "editMessageReplyMarkup",
+        400,
+        json!({ "ok": false, "error_code": 400, "description": "Bad Request: message is not modified" }),
+    );
+    channel(&base).remove_buttons(&target).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_long_edit_stays_one_message_with_valid_markup() {
+    let (mock, base) = start_mock().await;
+    let target = MessageRef {
+        conversation_id: DM_CHAT.to_string(),
+        message_id: "77".to_string(),
+    };
+    let long = format!("**{}**", "word ".repeat(2000));
+    channel(&base).edit(&target, &long).await.unwrap();
+    let calls = mock.calls("editMessageText");
+    assert_eq!(calls.len(), 1);
+    assert!(mock.calls("sendMessage").is_empty());
+    let sent = calls[0].body["text"].as_str().unwrap();
+    assert!(sent.encode_utf16().count() <= 4096);
+    assert!(sent.ends_with('\u{2026}'), "{}", &sent[sent.len() - 16..]);
+    assert_eq!(sent.matches("<b>").count(), sent.matches("</b>").count());
+    assert!(calls[0].body.get("reply_markup").is_none());
+}
+
+#[tokio::test]
+async fn a_short_edit_is_not_marked() {
+    let (mock, base) = start_mock().await;
+    let target = MessageRef {
+        conversation_id: DM_CHAT.to_string(),
+        message_id: "77".to_string(),
+    };
+    channel(&base).edit(&target, "short").await.unwrap();
+    assert_eq!(
+        mock.calls("editMessageText")[0].body["text"],
+        json!("short")
+    );
 }

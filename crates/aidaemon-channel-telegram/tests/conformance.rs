@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aidaemon_channel_telegram::TelegramChannel;
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{Attachment, ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};

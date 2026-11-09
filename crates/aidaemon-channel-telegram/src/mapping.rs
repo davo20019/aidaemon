@@ -284,6 +284,74 @@ fn attachments_for(msg: &Message) -> Vec<Attachment> {
 mod tests {
     use super::*;
 
+    fn parsed(extra: serde_json::Value) -> Message {
+        let mut message = serde_json::json!({
+            "message_id": 10,
+            "chat": { "id": -1000000000001i64, "type": "supergroup" },
+            "from": { "id": 100000001, "first_name": "Alice" },
+            "text": "hello",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            message[key] = value.clone();
+        }
+        serde_json::from_value(message).unwrap()
+    }
+
+    fn bot() -> BotIdentity {
+        BotIdentity {
+            id: Some(900000001),
+            username: "synthetic_helper_bot".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_reply_names_its_parent() {
+        let chat = serde_json::json!({ "id": -1000000000001i64, "type": "supergroup" });
+        let message = parsed(serde_json::json!({
+            "reply_to_message": { "message_id": 9, "chat": chat },
+        }));
+        let inbound = map_message(&message, &bot()).unwrap();
+        assert_eq!(inbound.parent_message_id.as_deref(), Some("9"));
+        assert_eq!(inbound.thread_id, None);
+    }
+
+    #[test]
+    fn a_topics_service_message_is_no_parent_but_the_topic_is_the_thread() {
+        let chat = serde_json::json!({ "id": -1000000000001i64, "type": "supergroup" });
+        let message = parsed(serde_json::json!({
+            "is_topic_message": true,
+            "message_thread_id": 42,
+            "reply_to_message": { "message_id": 42, "chat": chat, "forum_topic_created": {} },
+        }));
+        let inbound = map_message(&message, &bot()).unwrap();
+        assert_eq!(inbound.parent_message_id, None);
+        assert_eq!(inbound.thread_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn attachments_are_typed() {
+        let file = |name: &str, mime: &str| serde_json::json!({ "file_id": "f", "file_name": name, "mime_type": mime });
+        let message = parsed(serde_json::json!({
+            "photo": [{ "file_id": "p", "width": 10, "height": 10 }],
+            "document": file("a.pdf", "application/pdf"),
+            "voice": { "file_id": "v" },
+            "video": file("clip.bin", "application/octet-stream"),
+        }));
+        let kinds: Vec<AttachmentKind> = attachments_for(&message)
+            .iter()
+            .map(|attachment| attachment.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AttachmentKind::Image,
+                AttachmentKind::File,
+                AttachmentKind::Audio,
+                AttachmentKind::Video
+            ]
+        );
+    }
+
     #[test]
     fn utf16_spans() {
         let text = "😀 @bot hi";
