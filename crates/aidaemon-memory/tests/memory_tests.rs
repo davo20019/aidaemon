@@ -5,8 +5,8 @@ use std::sync::Arc;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_memory::{
     Embedder, FactAccess, HashEmbedder, InMemoryMemoryStore, Memory, MemoryStore, NewEpisode,
-    NewFact, Provenance, RecallAudience, ScoredFact, SqliteMemoryStore, StoredEmbedding,
-    UpsertOutcome,
+    NewFact, Provenance, RecallAudience, RecordKind, ScoredFact, SqliteMemoryStore,
+    StoredEmbedding, UpsertOutcome,
 };
 use chrono::{Duration, Utc};
 
@@ -1423,4 +1423,293 @@ async fn near_duplicates_ignore_vectors_from_another_model() {
         matches!(outcome, UpsertOutcome::Inserted { .. }),
         "{outcome:?}"
     );
+}
+
+// ------------------------------------------------------------ Re-embedding
+
+/// Records every batch it is given, and can fail on demand or return vectors
+/// of the wrong size for one text.
+#[derive(Default)]
+struct Probe {
+    batches: std::sync::Mutex<Vec<usize>>,
+    fail: std::sync::atomic::AtomicBool,
+    malformed_for: Option<&'static str>,
+}
+
+const NEW_MODEL: &str = "probe-v2";
+
+#[async_trait::async_trait]
+impl Embedder for Probe {
+    fn model_id(&self) -> &str {
+        NEW_MODEL
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    async fn embed(&self, texts: &[String]) -> aidaemon_memory::Result<Vec<Vec<f32>>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(aidaemon_memory::MemoryError::Embedding("down".into()));
+        }
+        self.batches.lock().unwrap().push(texts.len());
+        Ok(texts
+            .iter()
+            .map(|text| match self.malformed_for {
+                Some(marker) if text.contains(marker) => vec![1.0, 0.0, 0.0],
+                _ => vec![1.0, 0.0],
+            })
+            .collect())
+    }
+}
+
+async fn refresh_stores() -> Vec<(&'static str, Arc<dyn MemoryStore>)> {
+    vec![
+        ("in-memory", Arc::new(InMemoryMemoryStore::new())),
+        (
+            "sqlite",
+            Arc::new(SqliteMemoryStore::open_in_memory().await.unwrap()),
+        ),
+    ]
+}
+
+fn old_vector() -> StoredEmbedding {
+    StoredEmbedding {
+        model: "probe-v1".into(),
+        vector: vec![0.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// Five facts from the old model (one more with no vector, one current) and
+/// two old-model episodes, written straight to the store.
+async fn seed_old_rows(store: &Arc<dyn MemoryStore>) {
+    let now = Utc::now();
+    for i in 0..5 {
+        store
+            .upsert_fact(
+                fact("note", &format!("old_{i}"), &format!("value {i}"))
+                    .normalized()
+                    .unwrap(),
+                Some(old_vector()),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_fact(
+            fact("note", "no_vector", "plain").normalized().unwrap(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            fact("note", "current", "already").normalized().unwrap(),
+            Some(StoredEmbedding {
+                model: NEW_MODEL.into(),
+                vector: vec![0.5, 0.5],
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+    for summary in ["Earlier chat", "Another chat"] {
+        store
+            .insert_episode(episode(summary), Some(old_vector()), now)
+            .await
+            .unwrap();
+    }
+}
+
+async fn stale_count(store: &Arc<dyn MemoryStore>) -> usize {
+    let mut total = 0;
+    for kind in [RecordKind::Fact, RecordKind::Episode] {
+        total += store
+            .stale_embeddings(NEW_MODEL, kind, None, 1000)
+            .await
+            .unwrap()
+            .len();
+    }
+    total
+}
+
+#[tokio::test]
+async fn rows_from_another_model_are_found_and_reembedded_in_bounded_batches() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        assert_eq!(stale_count(&store).await, 8, "{name}");
+        let before: Vec<_> = store.active_facts(SCOPE).await.unwrap();
+
+        let probe = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), probe.clone()).build();
+        let mut cursor = None;
+        let mut updated = 0;
+        loop {
+            let report = memory.reembed_batch(2, cursor.as_ref()).await.unwrap();
+            assert!(report.processed <= 2, "{name}: {report:?}");
+            updated += report.updated;
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(updated, 8, "{name}");
+        assert_eq!(stale_count(&store).await, 0, "{name}");
+        assert!(
+            probe.batches.lock().unwrap().iter().all(|n| *n <= 2),
+            "{name}"
+        );
+
+        for record in store.active_facts(SCOPE).await.unwrap() {
+            let embedding = record.embedding.unwrap();
+            assert_eq!(embedding.model, NEW_MODEL, "{name}");
+            if record.fact.key == "current" {
+                assert_eq!(embedding.vector, [0.5, 0.5], "{name}: left alone");
+            } else {
+                assert_eq!(embedding.vector, [1.0, 0.0], "{name}");
+            }
+            let was = before.iter().find(|r| r.fact.id == record.fact.id).unwrap();
+            assert_eq!(was.fact.updated_at, record.fact.updated_at, "{name}");
+            assert_eq!(was.fact.recall_count, record.fact.recall_count, "{name}");
+        }
+        for record in store.episodes(SCOPE).await.unwrap() {
+            assert_eq!(record.embedding.unwrap().model, NEW_MODEL, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_interrupted_pass_resumes_without_redoing_work() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let first_run = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), first_run).build();
+        let report = memory.reembed_batch(3, None).await.unwrap();
+        assert_eq!(report.updated, 3, "{name}");
+        assert_eq!(stale_count(&store).await, 5, "{name}");
+
+        // A new process that kept no cursor starts over and finds only what
+        // is left.
+        let second_run = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), second_run.clone()).build();
+        let mut cursor = None;
+        loop {
+            let report = memory.reembed_batch(3, cursor.as_ref()).await.unwrap();
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(stale_count(&store).await, 0, "{name}");
+        let embedded: usize = second_run.batches.lock().unwrap().iter().sum();
+        assert_eq!(embedded, 5, "{name}: done rows are not embedded again");
+    }
+}
+
+#[tokio::test]
+async fn an_embedder_failure_loses_nothing_and_can_be_retried() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let probe = Arc::new(Probe::default());
+        let memory = Memory::builder(store.clone(), probe.clone()).build();
+        probe.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(memory.reembed_batch(2, None).await.is_err(), "{name}");
+        assert_eq!(stale_count(&store).await, 8, "{name}");
+        probe.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let report = memory.reembed_batch(2, None).await.unwrap();
+        assert_eq!(report.updated, 2, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_embedded_does_not_stop_the_pass() {
+    for (name, store) in refresh_stores().await {
+        seed_old_rows(&store).await;
+        let probe = Arc::new(Probe {
+            malformed_for: Some("old 2"),
+            ..Probe::default()
+        });
+        let memory = Memory::builder(store.clone(), probe).build();
+        let mut cursor = None;
+        let (mut updated, mut skipped, mut calls) = (0, 0, 0);
+        loop {
+            let report = memory.reembed_batch(2, cursor.as_ref()).await.unwrap();
+            updated += report.updated;
+            skipped += report.skipped;
+            calls += 1;
+            assert!(calls < 20, "{name}: the pass never ended");
+            cursor = report.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!((updated, skipped), (7, 1), "{name}");
+        assert_eq!(stale_count(&store).await, 1, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_batch_size_is_clamped_and_a_store_without_support_is_a_noop() {
+    use aidaemon_memory::MAX_REEMBED_BATCH;
+    let store: Arc<dyn MemoryStore> = Arc::new(InMemoryMemoryStore::new());
+    seed_old_rows(&store).await;
+    let memory = Memory::builder(store, Arc::new(Probe::default())).build();
+    assert_eq!(memory.reembed_batch(0, None).await.unwrap().processed, 1);
+    assert_eq!(MAX_REEMBED_BATCH, 256);
+
+    let custom = Memory::new(common::VecStore::default(), Probe::default());
+    custom
+        .remember(fact("note", "kept", "lexical only"))
+        .await
+        .unwrap();
+    let first = custom.reembed_batch(10, None).await.unwrap();
+    assert_eq!(first.updated, 0);
+    let second = custom.reembed_batch(10, first.next.as_ref()).await.unwrap();
+    assert_eq!((second.updated, second.next), (0, None));
+}
+
+/// Mid-migration both models are in the table; only vectors from the current
+/// one are compared with the query.
+#[tokio::test]
+async fn a_half_migrated_store_compares_only_current_vectors() {
+    for (name, store) in refresh_stores().await {
+        let now = Utc::now();
+        let same_length = |model: &str| StoredEmbedding {
+            model: model.into(),
+            vector: vec![1.0, 0.0],
+        };
+        store
+            .upsert_fact(
+                fact("note", "migrated", "shared words")
+                    .normalized()
+                    .unwrap(),
+                Some(same_length(NEW_MODEL)),
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                fact("note", "pending", "shared words")
+                    .normalized()
+                    .unwrap(),
+                Some(same_length("probe-v1")),
+                now,
+            )
+            .await
+            .unwrap();
+        let memory = Memory::builder(store, Arc::new(Probe::default()))
+            .merge(aidaemon_memory::MergeConfig::disabled())
+            .build();
+        let hits = memory.recall_facts(SCOPE, "shared words", 5).await.unwrap();
+        let semantic = |key: &str| {
+            hits.iter()
+                .find(|h| h.fact.key == key)
+                .unwrap_or_else(|| panic!("{name}: {key} missing from {hits:?}"))
+                .signals
+                .semantic
+        };
+        assert!(semantic("migrated") > 0.9, "{name}");
+        assert_eq!(semantic("pending"), 0.0, "{name}");
+    }
 }

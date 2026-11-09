@@ -18,7 +18,8 @@ use crate::scoring::{term_overlap, tokens};
 use crate::types::{
     episode_search_text, fact_search_text, new_id, normalize_category, normalize_key, parse_ts,
     same_value, ts, DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats,
-    NewEpisode, NewFact, Provenance, RetentionConfig, StoredEmbedding, UpsertOutcome,
+    NewEpisode, NewFact, Provenance, RecordKind, RetentionConfig, StaleEmbedding, StoredEmbedding,
+    UpsertOutcome,
 };
 
 const FACT_COLUMNS: &str = "id, scope, category, key, value, confidence, source_run_id, \
@@ -616,6 +617,82 @@ impl MemoryStore for SqliteMemoryStore {
         }
         tx.commit().await?;
         Ok(report)
+    }
+
+    async fn stale_embeddings(
+        &self,
+        model: &str,
+        kind: RecordKind,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StaleEmbedding>> {
+        let (columns, table, active) = match kind {
+            RecordKind::Fact => (
+                "id, category, key, value, embedding_model",
+                "memory_facts",
+                "superseded_at IS NULL AND",
+            ),
+            RecordKind::Episode => (
+                "id, summary, topics, embedding_model",
+                "memory_episodes",
+                "",
+            ),
+        };
+        let sql = format!(
+            "SELECT {columns} FROM {table}
+             WHERE {active} (embedding_model IS NULL OR embedding_model != ?)
+               AND (? IS NULL OR id > ?)
+             ORDER BY id LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(model)
+            .bind(after_id)
+            .bind(after_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| StaleEmbedding {
+                kind,
+                id: row.get("id"),
+                text: match kind {
+                    RecordKind::Fact => {
+                        fact_search_text(row.get("category"), row.get("key"), row.get("value"))
+                    }
+                    RecordKind::Episode => {
+                        let topics: String = row.get("topics");
+                        let topics: Vec<String> = serde_json::from_str(&topics).unwrap_or_default();
+                        episode_search_text(row.get("summary"), &topics)
+                    }
+                },
+                model: row.get("embedding_model"),
+            })
+            .collect())
+    }
+
+    async fn replace_embedding(
+        &self,
+        stale: &StaleEmbedding,
+        embedding: StoredEmbedding,
+    ) -> Result<bool> {
+        let (table, active) = match stale.kind {
+            RecordKind::Fact => ("memory_facts", "AND superseded_at IS NULL"),
+            RecordKind::Episode => ("memory_episodes", ""),
+        };
+        let sql = format!(
+            "UPDATE {table} SET embedding = ?, embedding_model = ?
+             WHERE id = ? AND embedding_model IS ? {active}"
+        );
+        let changed = sqlx::query(&sql)
+            .bind(encode_embedding(&embedding.vector))
+            .bind(&embedding.model)
+            .bind(&stale.id)
+            .bind(&stale.model)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(changed > 0)
     }
 
     async fn stats(&self) -> Result<MemoryStats> {

@@ -31,8 +31,8 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::store::MemoryStore;
 use crate::types::{
-    DecayReport, Episode, Fact, FactAccess, NewEpisode, NewFact, RetentionConfig, StoredEmbedding,
-    UpsertOutcome,
+    DecayReport, Episode, Fact, FactAccess, NewEpisode, NewFact, RecordKind, RetentionConfig,
+    StoredEmbedding, UpsertOutcome,
 };
 
 /// Stable names of the checks run by [`check_store`].
@@ -97,6 +97,12 @@ pub mod store_checks {
     /// default: no graph signal; noted) or scores in `(0, 1]`, for active
     /// facts of the asked scope only, and nothing for unknown seeds.
     pub const GRAPH_SCORES_CONTRACT: &str = "store.graph_scores_contract";
+    /// `stale_embeddings` is either empty (the trait default: old rows stay
+    /// lexical-only; noted) or lists the active records with no vector or
+    /// another model's, in ascending id order, bounded by the limit, after
+    /// `after_id`. `replace_embedding` stores the vector, leaves `updated_at`
+    /// alone, and returns `false` when the record's model has since changed.
+    pub const EMBEDDING_REFRESH_CONTRACT: &str = "store.embedding_refresh_contract";
 }
 
 /// Run every store check (see [`store_checks`]); each check uses a fresh
@@ -164,6 +170,17 @@ where
             ));
         }
         Err(e) => report.fail(GRAPH_SCORES_CONTRACT, e),
+    }
+    match embedding_refresh(make().await).await {
+        Ok(true) => report.pass(EMBEDDING_REFRESH_CONTRACT),
+        Ok(false) => {
+            report.pass(EMBEDDING_REFRESH_CONTRACT);
+            report.note(format!(
+                "{EMBEDDING_REFRESH_CONTRACT}: the store cannot refresh vectors, so rows from \
+                 an old model stay lexical-only"
+            ));
+        }
+        Err(e) => report.fail(EMBEDDING_REFRESH_CONTRACT, e),
     }
     report
 }
@@ -1205,5 +1222,118 @@ async fn graph_scores(store: Arc<dyn MemoryStore>) -> Check<bool> {
     ensure(none.is_empty(), || {
         format!("an unknown seed produced scores: {none:?}")
     })?;
+    Ok(true)
+}
+
+fn vector_from(model: &str) -> StoredEmbedding {
+    StoredEmbedding {
+        model: model.to_string(),
+        vector: vec![0.25, 0.5],
+    }
+}
+
+/// `Ok(true)` when the store refreshes vectors, `Ok(false)` for the default.
+async fn embedding_refresh(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    const CURRENT: &str = "conformance-embedder-v2";
+    let upsert = |key: &'static str, embedding: Option<StoredEmbedding>| {
+        let store = store.clone();
+        async move {
+            store
+                .upsert_fact(fact(SCOPE, "note", key, key), embedding, at(0))
+                .await
+        }
+    };
+    let old = call!("upsert_fact", upsert("old", Some(vector_from("v1"))));
+    let none = call!("upsert_fact", upsert("none", None));
+    call!("upsert_fact", upsert("fresh", Some(vector_from(CURRENT))));
+    let replaced = call!("upsert_fact", upsert("gone", Some(vector_from("v1"))));
+    call!(
+        "supersede_fact",
+        store.supersede_fact(SCOPE, "note", "gone", at(1))
+    );
+    let page = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, None, 10)
+    );
+    if page.is_empty() {
+        return Ok(false);
+    }
+    let mut want = vec![old.id().to_string(), none.id().to_string()];
+    want.sort();
+    let got: Vec<String> = page.iter().map(|s| s.id.clone()).collect();
+    ensure(got == want, || {
+        format!("expected the stale active facts {want:?} in id order, got {got:?}")
+    })?;
+    ensure(!got.contains(&replaced.id().to_string()), || {
+        "a superseded fact was listed as stale".into()
+    })?;
+    let first = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, None, 1)
+    );
+    ensure(first.len() == 1 && first[0].id == want[0], || {
+        format!("limit 1 should return only {:?}, got {first:?}", want[0])
+    })?;
+    let rest = call!(
+        "stale_embeddings",
+        store.stale_embeddings(CURRENT, RecordKind::Fact, Some(&want[0]), 10)
+    );
+    ensure(rest.len() == 1 && rest[0].id == want[1], || {
+        format!("after_id should skip to {:?}, got {rest:?}", want[1])
+    })?;
+
+    let target = page
+        .iter()
+        .find(|s| s.id == old.id())
+        .ok_or("the old-model fact was not listed")?;
+    ensure(
+        target.model.as_deref() == Some("v1") && target.text.contains("old"),
+        || format!("the stale row should carry its model and text: {target:?}"),
+    )?;
+    let replaced_now = call!(
+        "replace_embedding",
+        store.replace_embedding(target, vector_from(CURRENT))
+    );
+    ensure(replaced_now, || {
+        "replace_embedding returned false for a stale record".into()
+    })?;
+    let again = call!(
+        "replace_embedding (model has changed)",
+        store.replace_embedding(target, vector_from("conformance-other"))
+    );
+    ensure(!again, || {
+        "replace_embedding overwrote a vector that changed since it was read".into()
+    })?;
+    let records = call!("active_facts", store.active_facts(SCOPE));
+    let record = records
+        .iter()
+        .find(|r| r.fact.id == old.id())
+        .ok_or("the refreshed fact disappeared")?;
+    same_embedding(&record.embedding, &Some(vector_from(CURRENT)))?;
+    ensure(record.fact.updated_at == at(0), || {
+        format!(
+            "replace_embedding moved updated_at to {}",
+            record.fact.updated_at
+        )
+    })?;
+
+    let stored = call!(
+        "insert_episode",
+        store.insert_episode(
+            episode(SCOPE, "Old episode", &["topic"]),
+            Some(vector_from("v1")),
+            at(0)
+        )
+    );
+    let episodes = call!(
+        "stale_embeddings (episodes)",
+        store.stale_embeddings(CURRENT, RecordKind::Episode, None, 10)
+    );
+    ensure(
+        episodes.len() == 1
+            && episodes[0].id == stored.id
+            && episodes[0].kind == RecordKind::Episode,
+        || format!("expected the one stale episode, got {episodes:?}"),
+    )?;
     Ok(true)
 }

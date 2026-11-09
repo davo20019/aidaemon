@@ -17,8 +17,8 @@ use crate::store::MemoryStore;
 use crate::types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, truncate_chars,
     DecayReport, Episode, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig, NewEpisode,
-    NewFact, Provenance, RecallAudience, RetentionConfig, ScoredEpisode, ScoredFact, Signals,
-    StoredEmbedding, UpsertOutcome,
+    NewFact, Provenance, RecallAudience, RecordKind, ReembedCursor, ReembedReport, RetentionConfig,
+    ScoredEpisode, ScoredFact, Signals, StoredEmbedding, UpsertOutcome,
 };
 
 /// Maps a session id (from `ToolContext` / `HookContext`) to a memory
@@ -32,6 +32,9 @@ pub type AudienceResolver = Arc<dyn Fn(&str) -> RecallAudience + Send + Sync>;
 /// How many candidates to ask a ranking store for when some may be filtered
 /// out afterwards, as a multiple of the limit.
 const FILTERED_SEARCH_OVERFETCH: usize = 4;
+
+/// The most records one [`Memory::reembed_batch`] will embed.
+pub const MAX_REEMBED_BATCH: usize = 256;
 
 /// The strongest query matches whose relations feed the graph signal.
 const MAX_GRAPH_SEEDS: usize = 6;
@@ -666,6 +669,74 @@ impl Memory {
 
     pub async fn stats(&self) -> Result<MemoryStats> {
         self.inner.store.stats().await
+    }
+
+    /// Give up to `batch_size` records (at most [`MAX_REEMBED_BATCH`]) a
+    /// vector from the current embedder, starting at `cursor` (`None` starts
+    /// a pass). Facts come first, then episodes.
+    ///
+    /// Call it again with [`ReembedReport::next`] until that is `None`. The
+    /// cursor only keeps a pass moving past records that could not be
+    /// updated; records already done stop being stale, so a pass restarted
+    /// from `None` after a crash picks up what is left. An embedder failure
+    /// is an error and changes nothing: retry with the same cursor.
+    pub async fn reembed_batch(
+        &self,
+        batch_size: usize,
+        cursor: Option<&ReembedCursor>,
+    ) -> Result<ReembedReport> {
+        let limit = batch_size.clamp(1, MAX_REEMBED_BATCH);
+        let embedder = &self.inner.embedder;
+        let store = &self.inner.store;
+        let kind = cursor.map_or(RecordKind::Fact, |c| c.kind);
+        let after_id = cursor.and_then(|c| c.after_id.as_deref());
+        let rows = store
+            .stale_embeddings(embedder.model_id(), kind, after_id, limit)
+            .await?;
+        let mut report = ReembedReport {
+            processed: rows.len(),
+            ..ReembedReport::default()
+        };
+        report.next = match rows.last() {
+            Some(last) if rows.len() == limit => Some(ReembedCursor {
+                kind,
+                after_id: Some(last.id.clone()),
+            }),
+            // This kind is exhausted.
+            _ if kind == RecordKind::Fact => Some(ReembedCursor {
+                kind: RecordKind::Episode,
+                after_id: None,
+            }),
+            _ => None,
+        };
+        if rows.is_empty() {
+            return Ok(report);
+        }
+        let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+        let vectors = embedder.embed(&texts).await?;
+        if vectors.len() != rows.len() {
+            return Err(MemoryError::Embedding(format!(
+                "embedder returned {} vectors for {} texts",
+                vectors.len(),
+                rows.len()
+            )));
+        }
+        for (row, vector) in rows.iter().zip(vectors) {
+            if vector.len() != embedder.dimensions() {
+                report.skipped += 1;
+                continue;
+            }
+            let embedding = StoredEmbedding {
+                model: embedder.model_id().to_string(),
+                vector,
+            };
+            if store.replace_embedding(row, embedding).await? {
+                report.updated += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// Extract durable facts from the latest user turn of `messages` and

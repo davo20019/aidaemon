@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
-use aidaemon_core::Agent;
+use aidaemon_core::{Agent, ChannelVisibility};
 use aidaemon_memory::{
     Embedder, Episode, EpisodeRecord, Fact, FactRecord, Memory, MemoryRecall, MemoryStats,
-    MemoryStore, NewEpisode, NewFact, RecallTool, Result, Score, ScoredFact, Scorer, Signals,
-    StoredEmbedding, UpsertOutcome,
+    MemoryStore, NewEpisode, NewFact, RecallAudience, RecallTool, Result, Score, ScoredFact,
+    Scorer, Signals, StoredEmbedding, UpsertOutcome,
 };
 use aidaemon_policies::Recall;
 use async_trait::async_trait;
@@ -221,6 +221,15 @@ async fn native_search_bypasses_the_scorer_and_custom_scorers_apply_otherwise() 
     assert_eq!(values, ["apples", "zucchini"]);
     assert_eq!(hits[0].fact.recall_count, 1);
     assert!(scorer.0.lock().unwrap().is_empty());
+
+    // A ranking store that keeps no access levels cannot vouch for its hits,
+    // so a shared channel gets none of them.
+    let group = RecallAudience::new(ChannelVisibility::PrivateGroup, Some("c1".into()), true);
+    assert!(ranked
+        .recall_facts_for(SCOPE, "anything", 5, &group)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Same scorer on a plain store: it is consulted and drops everything.
     let plain = Memory::builder(

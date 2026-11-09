@@ -286,6 +286,46 @@ impl MergeConfig {
     }
 }
 
+/// Which table of records an embedding refresh is working through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    Fact,
+    Episode,
+}
+
+/// A record whose vector is missing or came from another model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleEmbedding {
+    pub kind: RecordKind,
+    pub id: String,
+    /// The text to embed ([`Fact::search_text`] / [`Episode::search_text`]).
+    pub text: String,
+    /// The model of the vector being replaced; `None` when there is no vector.
+    pub model: Option<String>,
+}
+
+/// Where a re-embedding pass stands. Plain data, so a host can persist it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReembedCursor {
+    pub kind: RecordKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<String>,
+}
+
+/// What one [`crate::Memory::reembed_batch`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReembedReport {
+    /// Stale records looked at.
+    pub processed: usize,
+    pub updated: usize,
+    /// Left as they were: the embedder returned a vector of the wrong size,
+    /// or the record changed since it was read.
+    pub skipped: usize,
+    /// Pass this to the next batch; `None` when the pass is finished.
+    pub next: Option<ReembedCursor>,
+}
+
 /// A fact as a store hands it back, with its embedding if it has one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FactRecord {

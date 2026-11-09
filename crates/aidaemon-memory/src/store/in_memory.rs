@@ -8,8 +8,8 @@ use super::{related_fact_scores, MemoryStore};
 use crate::error::{MemoryError, Result};
 use crate::types::{
     new_id, normalize_category, normalize_key, same_value, DecayReport, Episode, EpisodeRecord,
-    Fact, FactAccess, FactRecord, MemoryStats, NewEpisode, NewFact, RetentionConfig,
-    StoredEmbedding, UpsertOutcome,
+    Fact, FactAccess, FactRecord, MemoryStats, NewEpisode, NewFact, RecordKind, RetentionConfig,
+    StaleEmbedding, StoredEmbedding, UpsertOutcome,
 };
 
 #[derive(Default)]
@@ -345,6 +345,70 @@ impl MemoryStore for InMemoryMemoryStore {
             }
         }
         Ok(report)
+    }
+
+    async fn stale_embeddings(
+        &self,
+        model: &str,
+        kind: RecordKind,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StaleEmbedding>> {
+        let inner = self.lock()?;
+        let describe = |id: &str, text: String, embedding: &Option<StoredEmbedding>| {
+            let current = embedding.as_ref().map(|e| e.model.clone());
+            let stale = current.as_deref() != Some(model) && after_id.is_none_or(|a| id > a);
+            stale.then(|| StaleEmbedding {
+                kind,
+                id: id.to_string(),
+                text,
+                model: current,
+            })
+        };
+        let mut rows: Vec<StaleEmbedding> = match kind {
+            RecordKind::Fact => inner
+                .facts
+                .iter()
+                .filter(|r| r.fact.is_active())
+                .filter_map(|r| describe(&r.fact.id, r.fact.search_text(), &r.embedding))
+                .collect(),
+            RecordKind::Episode => inner
+                .episodes
+                .iter()
+                .filter_map(|r| describe(&r.episode.id, r.episode.search_text(), &r.embedding))
+                .collect(),
+        };
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn replace_embedding(
+        &self,
+        stale: &StaleEmbedding,
+        embedding: StoredEmbedding,
+    ) -> Result<bool> {
+        let mut inner = self.lock()?;
+        let slot = match stale.kind {
+            RecordKind::Fact => inner
+                .facts
+                .iter_mut()
+                .find(|r| r.fact.id == stale.id && r.fact.is_active())
+                .map(|r| &mut r.embedding),
+            RecordKind::Episode => inner
+                .episodes
+                .iter_mut()
+                .find(|r| r.episode.id == stale.id)
+                .map(|r| &mut r.embedding),
+        };
+        let Some(slot) = slot else {
+            return Ok(false);
+        };
+        if slot.as_ref().map(|e| e.model.as_str()) != stale.model.as_deref() {
+            return Ok(false);
+        }
+        *slot = Some(embedding);
+        Ok(true)
     }
 
     async fn stats(&self) -> Result<MemoryStats> {

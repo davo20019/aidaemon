@@ -56,7 +56,10 @@
 //! - [`MemoryStore`]: storage (pgvector, Qdrant, a document DB, ...). Only
 //!   row storage is required; lexical scoring has a default, and overriding
 //!   [`MemoryStore::search_facts`] / [`MemoryStore::search_episodes`] lets a
-//!   backend rank natively and bypass the scorer.
+//!   backend rank natively and bypass the scorer. Access levels, the graph
+//!   signal and vector refresh are optional methods with safe defaults: a
+//!   store without them hides its records from shared channels, scores with
+//!   a graph signal of 0, and keeps old-model rows lexical-only.
 //! - [`Embedder`]: an embedding API or local model ([`HashEmbedder`] for
 //!   tests and offline use, `FastEmbedder` behind the `fastembed` feature).
 //! - [`Scorer`]: ranking ([`HybridScorer`], the daemon's weights, by
@@ -115,7 +118,9 @@ pub use learning::{
     update_communication_profile, verbosity_from_messages, BehaviorPattern, ErrorSolution,
     Expertise, LearningStore, Procedure, UserProfile,
 };
-pub use memory::{AudienceResolver, IngestReport, Memory, MemoryBuilder, ScopeResolver};
+pub use memory::{
+    AudienceResolver, IngestReport, Memory, MemoryBuilder, ScopeResolver, MAX_REEMBED_BATCH,
+};
 pub use recall::MemoryRecall;
 pub use records::FactPrivacy;
 pub use scoring::{
@@ -131,7 +136,8 @@ pub use tools::{RecallTool, RememberTool};
 pub use types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, same_value,
     DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, MergeConfig,
-    NewEpisode, NewFact, Provenance, RecallAudience, RetentionConfig, Score, ScoredEpisode,
-    ScoredFact, Signals, StoredEmbedding, UpsertOutcome, MAX_FACT_VALUE_CHARS,
+    NewEpisode, NewFact, Provenance, RecallAudience, RecordKind, ReembedCursor, ReembedReport,
+    RetentionConfig, Score, ScoredEpisode, ScoredFact, Signals, StaleEmbedding, StoredEmbedding,
+    UpsertOutcome, MAX_FACT_VALUE_CHARS,
 };
 pub use writer::{MemoryWriter, WriterReport};

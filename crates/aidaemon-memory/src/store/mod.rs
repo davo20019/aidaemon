@@ -14,7 +14,8 @@ use crate::neighborhood::{entity_mentioned_as_words, fact_namespace};
 use crate::scoring::term_overlap;
 use crate::types::{
     DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
-    NewFact, RetentionConfig, ScoredEpisode, ScoredFact, StoredEmbedding, UpsertOutcome,
+    NewFact, RecordKind, RetentionConfig, ScoredEpisode, ScoredFact, StaleEmbedding,
+    StoredEmbedding, UpsertOutcome,
 };
 
 pub use in_memory::InMemoryMemoryStore;
@@ -263,6 +264,31 @@ pub trait MemoryStore: Send + Sync {
     /// default does nothing, for stores whose backend handles expiry.
     async fn decay(&self, _now: DateTime<Utc>, _config: &RetentionConfig) -> Result<DecayReport> {
         Ok(DecayReport::default())
+    }
+
+    /// Up to `limit` records of `kind` with no vector or a vector from a
+    /// model other than `model`, in ascending id order after `after_id`.
+    /// Superseded facts are excluded: they are never compared. The default
+    /// finds none, so such a store keeps lexical recall for old rows.
+    async fn stale_embeddings(
+        &self,
+        _model: &str,
+        _kind: RecordKind,
+        _after_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<StaleEmbedding>> {
+        Ok(Vec::new())
+    }
+
+    /// Replace a stale record's vector, only if it still has the model
+    /// `stale` reported; `false` otherwise. Changes nothing else about the
+    /// record: `updated_at` feeds ranking and this is not a new statement.
+    async fn replace_embedding(
+        &self,
+        _stale: &StaleEmbedding,
+        _embedding: StoredEmbedding,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     async fn stats(&self) -> Result<MemoryStats>;
