@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolContext};
-use aidaemon_mcp::{McpError, McpOptions, McpServer};
+use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec};
 use serde_json::{json, Value};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake_mcp_server");
@@ -311,6 +311,68 @@ async fn shutdown_stops_the_server() {
     server.shutdown().await;
     assert!(!server.is_alive());
     assert!(echo.call(json!({"text": "x"}), &ctx()).await.is_err());
+}
+
+#[tokio::test]
+async fn respawn_replaces_the_process_and_keeps_the_spec() {
+    let old = McpServer::connect(
+        McpServerSpec::new("fake", FAKE).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
+    )
+    .await
+    .expect("fake server starts");
+    let old_echo = find(&old, "fake__echo");
+
+    let new = old.respawn().await.expect("respawned");
+    assert!(!old.is_alive());
+    assert!(old_echo.call(json!({"text": "x"}), &ctx()).await.is_err());
+    assert!(new.is_alive());
+    let echoed = find(&new, "fake__echo")
+        .call(json!({"text": "hello"}), &ctx())
+        .await
+        .unwrap();
+    assert!(!echoed.is_error, "{}", echoed.content);
+    let probe = find(&new, "fake__env_probe")
+        .call(json!({}), &ctx())
+        .await
+        .unwrap();
+    assert!(
+        probe.content.contains("synthetic-first"),
+        "{}",
+        probe.content
+    );
+    new.shutdown().await;
+}
+
+#[tokio::test]
+async fn respawn_with_env_swaps_only_the_environment() {
+    let old = McpServer::connect(
+        McpServerSpec::new("fake", FAKE).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
+    )
+    .await
+    .expect("fake server starts");
+    let new = old
+        .respawn_with_env([("FAKE_MCP_TOKEN", "synthetic-second")])
+        .await
+        .expect("respawned");
+    let probe = find(&new, "fake__env_probe")
+        .call(json!({}), &ctx())
+        .await
+        .unwrap();
+    assert!(
+        probe.content.contains("synthetic-second"),
+        "{}",
+        probe.content
+    );
+    assert!(!probe.content.contains("synthetic-first"));
+    new.shutdown().await;
+}
+
+#[test]
+fn a_spec_never_prints_environment_values() {
+    let spec = McpServerSpec::new("fake", FAKE).with_env([("API_KEY", "synthetic-secret")]);
+    let printed = format!("{spec:?}");
+    assert!(printed.contains("API_KEY"), "{printed}");
+    assert!(!printed.contains("synthetic-secret"), "{printed}");
 }
 
 #[tokio::test]

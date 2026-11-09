@@ -1,7 +1,7 @@
 //! Stdio transport: newline-delimited JSON-RPC 2.0 to a child process.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -122,6 +122,70 @@ impl Default for McpOptions {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             annotations: None,
         }
+    }
+}
+
+/// How to start a server: everything [`McpServer::connect`] needs, and what
+/// [`McpServer::respawn`] starts again.
+#[derive(Clone)]
+pub struct McpServerSpec {
+    pub name: String,
+    pub command: OsString,
+    pub args: Vec<OsString>,
+    /// Added to the scrubbed child environment (see [`SAFE_ENV_KEYS`]).
+    pub env: Vec<(OsString, OsString)>,
+    pub options: McpOptions,
+}
+
+impl McpServerSpec {
+    pub fn new(name: impl Into<String>, command: impl Into<OsString>) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            options: McpOptions::default(),
+        }
+    }
+
+    pub fn with_args<I>(mut self, args: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<OsString>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_env<I, K, V>(mut self, env: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.env = env.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        self
+    }
+
+    pub fn with_options(mut self, options: McpOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// Environment values are credentials, so only their names are printed.
+impl std::fmt::Debug for McpServerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerSpec")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("options", &self.options)
+            .finish()
     }
 }
 
@@ -307,6 +371,7 @@ impl Inner {
 pub struct McpServer {
     inner: Arc<Inner>,
     info: Arc<ServerInfo>,
+    spec: Arc<McpServerSpec>,
 }
 
 /// What the server said about itself during the handshake.
@@ -365,9 +430,25 @@ impl McpServer {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        let name = name.into();
-        let mut cmd = Command::new(command);
-        cmd.args(args)
+        Self::connect(
+            McpServerSpec::new(name, command.as_ref())
+                .with_args(args.into_iter().map(|arg| arg.as_ref().to_os_string()))
+                .with_env(
+                    env.into_iter()
+                        .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string())),
+                )
+                .with_options(options),
+        )
+        .await
+    }
+
+    /// Start the server `spec` describes, run the handshake and list its
+    /// tools.
+    pub async fn connect(spec: McpServerSpec) -> Result<Self, McpError> {
+        let name = spec.name.clone();
+        let options = &spec.options;
+        let mut cmd = Command::new(&spec.command);
+        cmd.args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -380,7 +461,7 @@ impl McpServer {
                 }
             }
         }
-        cmd.envs(env);
+        cmd.envs(spec.env.iter().map(|(key, value)| (key, value)));
         if let Some(cwd) = &options.cwd {
             cmd.current_dir(cwd);
         }
@@ -419,15 +500,45 @@ impl McpServer {
             tasks,
         });
 
-        let info = handshake(&inner, &options).await?;
+        let info = handshake(&inner, options).await?;
         Ok(Self {
             inner,
             info: Arc::new(info),
+            spec: Arc::new(spec),
         })
+    }
+
+    /// Stop this server and start it again from the same spec. Tools taken
+    /// from this handle fail afterwards; take new ones from the returned
+    /// server. If the new process does not come up the old one stays
+    /// stopped.
+    pub async fn respawn(&self) -> Result<Self, McpError> {
+        self.respawn_as((*self.spec).clone()).await
+    }
+
+    /// [`McpServer::respawn`] with `env` in place of the spec's environment
+    /// (for credentials that changed since the server started).
+    pub async fn respawn_with_env<I, K, V>(&self, env: I) -> Result<Self, McpError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.respawn_as((*self.spec).clone().with_env(env)).await
+    }
+
+    async fn respawn_as(&self, spec: McpServerSpec) -> Result<Self, McpError> {
+        self.shutdown().await;
+        Self::connect(spec).await
     }
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// How this server was started.
+    pub fn spec(&self) -> &McpServerSpec {
+        &self.spec
     }
 
     pub fn info(&self) -> &ServerInfo {
