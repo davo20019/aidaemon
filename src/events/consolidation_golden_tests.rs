@@ -24,12 +24,6 @@ use crate::testing::MockProvider;
 
 const GOLDEN: &str = include_str!("testdata/consolidation.golden");
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Implementation {
-    Legacy,
-    Current,
-}
-
 /// One pass configuration: with neither model nor embeddings, or with both
 /// and the evidence gate on.
 #[derive(Clone, Copy, Debug)]
@@ -805,7 +799,7 @@ fn result_row(session: &str, result: &ConsolidationResult) -> Vec<Option<String>
 }
 
 /// Consolidate the whole history on a fresh in-memory database.
-async fn run(implementation: Implementation, setup: Setup) -> (Snapshot, Rows) {
+async fn run(setup: Setup) -> Snapshot {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .idle_timeout(None)
@@ -855,12 +849,12 @@ async fn run(implementation: Implementation, setup: Setup) -> (Snapshot, Rows) {
         }
         results.push(result_row(
             session,
-            &consolidate(&consolidator, implementation, session).await,
+            &consolidate(&consolidator, session).await,
         ));
         // Nothing new: the second pass over a session changes no row.
         results.push(result_row(
             session,
-            &consolidate(&consolidator, implementation, session).await,
+            &consolidate(&consolidator, session).await,
         ));
     }
 
@@ -885,28 +879,18 @@ async fn run(implementation: Implementation, setup: Setup) -> (Snapshot, Rows) {
     for session in [MANDATE_SESSION, WORKER_SESSION] {
         results.push(result_row(
             session,
-            &consolidate(&consolidator, implementation, session).await,
+            &consolidate(&consolidator, session).await,
         ));
     }
 
-    let blobs = rows(
-        &pool,
-        "SELECT name, hex(trigger_embedding) FROM procedures ORDER BY name",
-    )
-    .await;
-    (snapshot(&pool, results).await, blobs)
+    snapshot(&pool, results).await
 }
 
-async fn consolidate(
-    consolidator: &Consolidator,
-    implementation: Implementation,
-    session: &str,
-) -> ConsolidationResult {
-    match implementation {
-        Implementation::Legacy => consolidator.consolidate_session_legacy(session).await,
-        Implementation::Current => consolidator.consolidate_session(session).await,
-    }
-    .expect("consolidate session")
+async fn consolidate(consolidator: &Consolidator, session: &str) -> ConsolidationResult {
+    consolidator
+        .consolidate_session(session)
+        .await
+        .expect("consolidate session")
 }
 
 fn golden() -> BTreeMap<String, Snapshot> {
@@ -932,18 +916,15 @@ fn assert_snapshots_equal(left: &Snapshot, right: &Snapshot, context: &str) {
     }
 }
 
-/// Regenerates the golden file from the legacy path. Run with
-/// `UPDATE_CONSOLIDATION_GOLDEN=1` only to record a deliberate change.
+/// Regenerates the golden file. Run with `UPDATE_CONSOLIDATION_GOLDEN=1`
+/// only to record a deliberate change to what consolidation writes.
 async fn update_golden_if_asked() {
     if std::env::var_os("UPDATE_CONSOLIDATION_GOLDEN").is_none() {
         return;
     }
     let mut all = BTreeMap::new();
     for setup in SETUPS {
-        all.insert(
-            setup.name.to_string(),
-            run(Implementation::Legacy, setup).await.0,
-        );
+        all.insert(setup.name.to_string(), run(setup).await);
     }
     std::fs::write(
         concat!(
@@ -956,19 +937,12 @@ async fn update_golden_if_asked() {
 }
 
 #[tokio::test]
-async fn the_new_path_writes_the_rows_the_old_path_wrote() {
+async fn consolidation_writes_the_recorded_rows() {
     update_golden_if_asked().await;
     let golden = golden();
     for setup in SETUPS {
-        let (old, old_blobs) = run(Implementation::Legacy, setup).await;
-        let (new, new_blobs) = run(Implementation::Current, setup).await;
-        assert_snapshots_equal(&old, &new, &format!("{}: old vs new", setup.name));
-        assert_eq!(old_blobs, new_blobs, "{}: trigger embeddings", setup.name);
-        assert_snapshots_equal(
-            &old,
-            &golden[setup.name],
-            &format!("{}: golden", setup.name),
-        );
+        let rows = run(setup).await;
+        assert_snapshots_equal(&rows, &golden[setup.name], setup.name);
     }
 }
 
@@ -976,7 +950,7 @@ async fn the_new_path_writes_the_rows_the_old_path_wrote() {
 #[tokio::test]
 async fn the_scenario_reaches_every_path() {
     for setup in SETUPS {
-        let (snapshot, _) = run(Implementation::Current, setup).await;
+        let snapshot = run(setup).await;
         let table = |name: &str| &snapshot[name];
         let has = |rows: &Rows, text: &str| {
             rows.iter()

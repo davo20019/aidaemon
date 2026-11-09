@@ -489,13 +489,8 @@ fn trace_events(events: &[Event]) -> Vec<TraceEvent> {
 }
 
 #[cfg(test)]
-#[path = "consolidation_legacy.rs"]
-#[allow(clippy::all)]
-mod legacy;
-
-#[cfg(test)]
-#[path = "consolidation_parity_tests.rs"]
-mod parity_tests;
+#[path = "consolidation_golden_tests.rs"]
+mod golden_tests;
 
 #[cfg(test)]
 mod tests {
