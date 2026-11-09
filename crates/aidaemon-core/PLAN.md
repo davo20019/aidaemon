@@ -138,11 +138,16 @@ adapters, tested against local mock servers.
 - [x] Persist pending approvals: `ApprovalStore` (with `MemoryApprovalStore`,
       the same shape as `SessionIndex`) and `ChannelRunnerBuilder::approval_store`.
       No SQLite implementation yet, and the daemon does not use `ChannelRunner`.
-- [ ] Attachment download helpers (Slack `url_private` needs the bot token;
-      Telegram needs `getFile`); attachments reach the agent as names only.
-- [ ] Contract follow-ups from the adapters: `Attachment::kind`, a message
-      ref on `ApprovalAnswer` so buttons can be removed, parent/thread link on
-      `InboundMessage`, clearer `edit` semantics for over-long text.
+- [x] Attachment download helpers: `Channel::download_limited`, a shared
+      bounded downloader (feature `http`) that keeps a token on the platform's
+      own hosts, used by Telegram, Slack and Discord. `ChannelRunner` passes
+      images as images and the owner's other files as a saved path
+      (`AttachmentConfig`); a run that received them counts as having read
+      untrusted content. The daemon still uses its own turn path.
+- [x] Contract follow-ups from the adapters: typed `Attachment::kind`,
+      `ApprovalAnswer::message` with `Channel::remove_buttons`,
+      `InboundMessage::parent_message_id` and `thread_id`, and one `edit` rule
+      for over-long text (one message, cut at the end, marked).
 - [ ] Not ported: LaTeX stripping, display-name lookup, slash commands,
       Discord sharding/compression.
 
