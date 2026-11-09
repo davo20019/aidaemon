@@ -187,6 +187,12 @@ pub struct Message {
     /// on a hook's system note. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<MessageOrigin>,
+    /// The model's visible reasoning for this `Role::Assistant` turn, kept
+    /// for the transcript. Providers do not send it back: what a provider
+    /// must replay (Anthropic's signed thinking) rides on
+    /// [`ToolCall::provider_data`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -236,6 +242,7 @@ impl Message {
             audio: Vec::new(),
             is_error: false,
             origin: None,
+            reasoning: None,
         }
     }
 
@@ -249,6 +256,7 @@ impl Message {
             audio: Vec::new(),
             is_error: false,
             origin: None,
+            reasoning: None,
         }
     }
 
@@ -265,6 +273,11 @@ impl Message {
     }
 
     /// Mark a tool result as an error.
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
+
     pub fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = is_error;
         self
@@ -280,6 +293,7 @@ impl Message {
             audio: Vec::new(),
             is_error: false,
             origin: None,
+            reasoning: None,
         }
     }
 }

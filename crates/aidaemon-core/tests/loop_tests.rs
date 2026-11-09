@@ -2316,3 +2316,48 @@ async fn rewritten_egress_sees_queued_untrusted_reads() {
     assert_eq!(out.receipts()[1].status, ReceiptStatus::Denied);
     assert_eq!(out.receipts()[1].reason.as_deref(), Some("tainted egress"));
 }
+
+#[tokio::test]
+async fn reasoning_stays_on_the_assistant_message_and_survives_a_save() {
+    let provider = Arc::new(ScriptedProvider::new([
+        aidaemon_core::ModelResponse {
+            tool_calls: vec![call("c1", "echo", json!({"text": "a"}))],
+            reasoning: Some("Alice Rivera wants an echo first.".into()),
+            ..Default::default()
+        },
+        text("Done."),
+    ]));
+    let agent = Agent::builder("assistant")
+        .allow_unguarded()
+        .model("test-model")
+        .provider(provider)
+        .tool(echo_tool())
+        .build()
+        .unwrap();
+    let out = agent.run("s", "go").await.unwrap();
+
+    let assistants: Vec<&Message> = out
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .collect();
+    assert_eq!(
+        assistants[0].reasoning.as_deref(),
+        Some("Alice Rivera wants an echo first.")
+    );
+    assert_eq!(assistants[1].reasoning, None);
+
+    let saved = serde_json::to_string(&out.state).unwrap();
+    let restored: RunState = serde_json::from_str(&saved).unwrap();
+    assert_eq!(restored.messages, out.state.messages);
+}
+
+#[test]
+fn a_message_saved_before_reasoning_existed_still_reads() {
+    let old: Message = serde_json::from_value(json!({"role": "assistant", "content": "Hello."}))
+        .expect("old message reads");
+    assert_eq!(old.reasoning, None);
+    let saved = serde_json::to_value(Message::assistant("Hello.", vec![])).unwrap();
+    assert!(saved.get("reasoning").is_none(), "{saved}");
+}

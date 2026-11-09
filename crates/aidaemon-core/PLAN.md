@@ -122,7 +122,9 @@ Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
       stays open, so an answer cannot arrive after a restart). Needs the
       child's `RunState` nested in the parent's `Pending`, a schema change.
 - [x] Images in messages and tool results (`Image`; Anthropic, OpenAI-compatible, MCP).
-- [ ] Reasoning content in messages.
+- [x] Reasoning content in messages: `Message::reasoning` keeps each model
+      turn's visible reasoning in the transcript; the OpenAI-compatible
+      provider now reads it too. It is not sent back to providers.
 - [ ] Publish plan: versions, `publish = true`, crates.io names.
 
 ### Phase 6b: channels (done, with gaps)

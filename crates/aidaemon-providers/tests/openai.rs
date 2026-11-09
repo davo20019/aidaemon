@@ -202,6 +202,34 @@ async fn streamed_text_deltas_reassemble() {
 }
 
 #[tokio::test]
+async fn streamed_reasoning_is_read_from_either_field_and_not_sent_back() {
+    let stream = data_events(&[
+        json!({"choices": [{"index": 0, "delta": {"reasoning_content": "Check "}}]}),
+        json!({"choices": [{"index": 0, "delta": {"reasoning": "the file."}}]}),
+        json!({"choices": [{"index": 0, "delta": {"content": "Done."}, "finish_reason": "stop"}]}),
+    ]);
+    let stream = format!("{stream}data: [DONE]\n\n");
+    let server = MockServer::start(vec![MockResponse::sse(stream, 64)]).await;
+    let req = request(vec![Message::user("hi")]);
+    let response = provider(&server).complete(&req).await.expect("complete");
+    assert_eq!(response.text, "Done.");
+    assert_eq!(response.reasoning.as_deref(), Some("Check the file."));
+
+    let server = MockServer::start(vec![MockResponse::sse(text_stream(&["ok"]), 64)]).await;
+    let req = request(vec![
+        Message::user("hi"),
+        Message::assistant("Done.", vec![]).with_reasoning(Some("Private.".into())),
+        Message::user("next"),
+    ]);
+    provider(&server).complete(&req).await.expect("complete");
+    let body = &server.requests()[0].body;
+    assert_eq!(
+        body["messages"][1],
+        json!({"role": "assistant", "content": "Done."})
+    );
+}
+
+#[tokio::test]
 async fn streamed_tool_calls_reassemble_across_fragments() {
     let events = vec![
         json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": null, "tool_calls": [

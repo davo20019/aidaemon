@@ -641,6 +641,7 @@ pub aidaemon_core::Message::content: alloc::string::String
 pub aidaemon_core::Message::images: alloc::vec::Vec<aidaemon_core::Image>
 pub aidaemon_core::Message::is_error: bool
 pub aidaemon_core::Message::origin: core::option::Option<aidaemon_core::MessageOrigin>
+pub aidaemon_core::Message::reasoning: core::option::Option<alloc::string::String>
 pub aidaemon_core::Message::role: aidaemon_core::Role
 pub aidaemon_core::Message::tool_call_id: core::option::Option<alloc::string::String>
 pub aidaemon_core::Message::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
@@ -656,6 +657,7 @@ pub fn aidaemon_core::Message::user(impl core::convert::Into<alloc::string::Stri
 pub fn aidaemon_core::Message::with_audio(self, impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::Audio>) -> Self
 pub fn aidaemon_core::Message::with_error(self, bool) -> Self
 pub fn aidaemon_core::Message::with_images(self, impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::Image>) -> Self
+pub fn aidaemon_core::Message::with_reasoning(self, core::option::Option<alloc::string::String>) -> Self
 impl core::convert::From<&alloc::string::String> for aidaemon_core::Message
 pub fn aidaemon_core::Message::from(&alloc::string::String) -> Self
 impl core::convert::From<&str> for aidaemon_core::Message

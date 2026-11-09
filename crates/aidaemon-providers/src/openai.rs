@@ -319,6 +319,7 @@ struct PartialCall {
 #[derive(Debug, Default)]
 struct ChatDecoder {
     text: String,
+    reasoning: String,
     calls: BTreeMap<usize, PartialCall>,
     usage: Usage,
     finished: bool,
@@ -420,6 +421,14 @@ impl SseDecoder for ChatDecoder {
                         deltas.push(text.to_string());
                     }
                 }
+                // DeepSeek and Moonshot send `reasoning_content`, OpenRouter
+                // sends `reasoning`.
+                let thought = ["reasoning_content", "reasoning"]
+                    .iter()
+                    .find_map(|field| delta.get(*field).and_then(Value::as_str));
+                if let Some(thought) = thought {
+                    self.reasoning.push_str(thought);
+                }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for (position, call) in calls.iter().enumerate() {
                         self.tool_delta(position, call);
@@ -451,6 +460,7 @@ impl SseDecoder for ChatDecoder {
             text: std::mem::take(&mut self.text),
             tool_calls,
             usage: self.usage,
+            reasoning: (!self.reasoning.is_empty()).then(|| std::mem::take(&mut self.reasoning)),
             ..Default::default()
         })
     }

@@ -342,9 +342,10 @@ impl<'a> Driver<'a> {
                 // Without the calls: a call with no result is a request
                 // providers refuse, and these will never run.
                 if !response.text.is_empty() {
-                    self.state
-                        .messages
-                        .push(Message::assistant(response.text, Vec::new()));
+                    self.state.messages.push(
+                        Message::assistant(response.text, Vec::new())
+                            .with_reasoning(response.reasoning),
+                    );
                 }
                 self.state
                     .messages
@@ -352,9 +353,10 @@ impl<'a> Driver<'a> {
                 self.checkpoint().await?;
                 continue;
             }
-            self.state
-                .messages
-                .push(Message::assistant(response.text.clone(), calls.clone()));
+            self.state.messages.push(
+                Message::assistant(response.text.clone(), calls.clone())
+                    .with_reasoning(response.reasoning.clone()),
+            );
 
             // 4a. No tool calls: the model thinks it is done. Ask stop hooks.
             if calls.is_empty() {
