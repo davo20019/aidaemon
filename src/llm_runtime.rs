@@ -4,6 +4,8 @@ use crate::config::{ModelsConfig, ProviderKind};
 use crate::providers::sdk_backed::ModelList;
 use crate::router::Router;
 
+pub mod side_calls;
+
 /// A model backend: any SDK provider.
 pub type ModelBackend = Arc<dyn aidaemon_core::Provider>;
 
