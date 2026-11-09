@@ -325,14 +325,13 @@ Order:
         in `facts.extensions`. `aidaemon_tools::KernelAdapter` makes any
         `OutcomeTool` a kernel `Tool`, and the daemon supplies only its
         `OutcomeRunner` (the turn's dispatcher);
-      - about 45 readers of the global `active_execution_backend()`
-        outside `src/tools` (one backend per process, so plumbing it is
-        cleanup, not a behavior change). Checked 2026-11-09: not mechanical.
-        Most sit in plain text and path helpers (`project_scope`,
-        `token_looks_like_filesystem_path` with 10 callers) and in
-        `events::run_aggregate::hint_matches_target`, so a backend argument
-        spreads through code that holds none, and `src/tools` still reads the
-        global about 270 times, nearly all from tests, so it stays either way;
+      - Done 2026-11-09: production code no longer reads a process-wide
+        execution backend. `core::run` builds it once and passes it on, and
+        `Agent` holds it; text and path helpers take `&dyn ExecutionBackend`.
+        The run ledger holds only `LexicalPaths` (flavor, workspace root,
+        home), given to `EventStore` at construction.
+        `active_execution_backend()` is `#[cfg(test)]`: the default local
+        backend for tests that construct a tool directly;
       - the goals/mandates store slice and the concrete `EventStore` (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
       daemon tool can wrap today's thin crate tools without behavior
