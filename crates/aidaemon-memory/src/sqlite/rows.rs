@@ -6,25 +6,9 @@ impl SqliteMemory {
             .topics
             .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default());
-        let bounds = sqlx::query(
-            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
-             FROM events WHERE session_id = ?
-               AND event_type IN ('user_message','assistant_response')
-               AND created_at >= ? AND created_at <= ?",
-        )
-        .bind(&episode.session_id)
-        .bind(episode.start_time.to_rfc3339())
-        .bind(episode.end_time.to_rfc3339())
-        .fetch_optional(&self.pool)
-        .await?;
-        let start_event_id = bounds
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("start_event_id").ok())
-            .flatten();
-        let end_event_id = bounds
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
-            .flatten();
+        let (start_event_id, end_event_id) = self
+            .message_event_bounds(&episode.session_id, episode.start_time, episode.end_time)
+            .await?;
         let channel_id = episode
             .channel_id
             .clone()

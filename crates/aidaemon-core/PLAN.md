@@ -185,11 +185,12 @@ adapters, tested against local mock servers.
 
 ### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
 
-Status: 8.1, 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-9 of 10; 8.8
-providers done and MCP transport moved, channels on the SDK adapters; 8.5-8.7,
-8.7b and 8.9 open (8.6's declines between parent and child runs are done).
-Next: 8.5, which closes safety gaps. The rest of 8.4, 8.8 (MCP and store) and
-8.9 move working code between crates and wait for a second user of the SDK.
+Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5 and 8.7b done; 8.3 mostly done; 8.4
+steps 1-9 of 10; 8.6 done except a child's model tier and recording its
+resolved authority; 8.7's memory port done except the live comparison; 8.8
+providers done, MCP transport moved, channels on the SDK adapters. The rest of
+8.4, 8.8 (MCP and store) and 8.9 move working code between crates and wait for
+a second user of the SDK.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -424,8 +425,9 @@ Order:
         3. Done 2026-11-09 (`159bee6`, `643a42d`): the SQLite stores are
            `aidaemon_memory::sqlite::SqliteMemory`, and the crate creates
            and upgrades the memory tables (`sqlite::migrate`). The state
-           store forwards the memory traits to it. Still open: the memory
-           half of retention as a store method.
+           store forwards the memory traits to it. Retention's memory half
+           is `sqlite::MemoryRetention` and stops under another system. The
+           store runs without any host tables.
         4. Owner ruling (2026-11-09): people must be able to update and keep
            their data, and memory must stay replaceable by other open source
            systems. So:

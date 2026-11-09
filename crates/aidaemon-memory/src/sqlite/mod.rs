@@ -27,6 +27,7 @@ mod export;
 mod facts;
 mod learning;
 mod people;
+mod retention;
 mod rows;
 mod schema;
 mod structured;
@@ -37,6 +38,7 @@ pub use facts::{
     build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
     is_owner_authored_fact_source,
 };
+pub use retention::{MemoryRetention, MemoryRetentionPolicy, MemoryRetentionStats};
 pub use schema::{migrate, rebuild_memory_fts_projections};
 
 /// Dimension of the vectors in databases written so far (AllMiniLM-L6-v2).
@@ -161,6 +163,36 @@ impl SqliteMemory {
     pub fn with_error_cleaner(mut self, clean: fn(&str) -> String) -> Self {
         self.clean_error_text = clean;
         self
+    }
+
+    /// The first and last message events a span of a session covers, when
+    /// the host keeps an `events` table in this database. Without one an
+    /// episode simply has no bounds.
+    async fn message_event_bounds(
+        &self,
+        session_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+        let row = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events WHERE session_id = ?
+               AND event_type IN ('user_message', 'assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(session_id)
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await;
+        match row {
+            Ok(row) => Ok((
+                row.try_get("start_event_id").unwrap_or(None),
+                row.try_get("end_event_id").unwrap_or(None),
+            )),
+            Err(error) if error.to_string().contains("no such table") => Ok((None, None)),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The pool the store works on.

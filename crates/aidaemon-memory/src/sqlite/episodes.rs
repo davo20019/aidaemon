@@ -10,20 +10,9 @@ impl EpisodeStore for SqliteMemory {
         &self,
         episode: &crate::episodes::SessionEpisode,
     ) -> anyhow::Result<i64> {
-        let bounds = sqlx::query(
-            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
-             FROM events
-             WHERE session_id = ?
-               AND event_type IN ('user_message', 'assistant_response')
-               AND created_at >= ? AND created_at <= ?",
-        )
-        .bind(&episode.session_id)
-        .bind(episode.start_time.to_rfc3339())
-        .bind(episode.end_time.to_rfc3339())
-        .fetch_one(&self.pool)
-        .await?;
-        let start_event_id: Option<i64> = bounds.try_get("start_event_id").unwrap_or(None);
-        let end_event_id: Option<i64> = bounds.try_get("end_event_id").unwrap_or(None);
+        let (start_event_id, end_event_id) = self
+            .message_event_bounds(&episode.session_id, episode.start_time, episode.end_time)
+            .await?;
         let topics_json = serde_json::to_string(&episode.topics).ok();
         let result = sqlx::query(
             "INSERT INTO episodes

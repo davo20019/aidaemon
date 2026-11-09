@@ -278,6 +278,11 @@ pub(crate) async fn init_heartbeat_coordinator(
                 async move {
                     let retention_manager =
                         crate::memory::retention::RetentionManager::new(pool, cfg);
+                    let retention_manager = if own_memory {
+                        retention_manager
+                    } else {
+                        retention_manager.without_memory()
+                    };
                     info!("Running retention cleanup");
                     match retention_manager.run_all().await {
                         Ok(stats) => {

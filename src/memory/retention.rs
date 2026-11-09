@@ -50,11 +50,23 @@ impl RetentionStats {
 pub struct RetentionManager {
     pool: SqlitePool,
     config: RetentionConfig,
+    own_memory: bool,
 }
 
 impl RetentionManager {
     pub fn new(pool: SqlitePool, config: RetentionConfig) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            own_memory: true,
+        }
+    }
+
+    /// Leave the daemon's memory tables alone: another memory system is
+    /// active, and the owner may switch back to these.
+    pub fn without_memory(mut self) -> Self {
+        self.own_memory = false;
+        self
     }
 
     /// Run all retention cleanups. Each is independent; one failure doesn't block others.
@@ -70,11 +82,6 @@ impl RetentionManager {
             Err(e) => warn!("Retention: diagnostic events cleanup failed: {}", e),
         }
 
-        match self.cleanup_superseded_facts().await {
-            Ok(n) => stats.facts_deleted = n,
-            Err(e) => warn!("Retention: facts cleanup failed: {}", e),
-        }
-
         match self.cleanup_token_usage().await {
             Ok((agg, del)) => {
                 stats.token_usage_aggregated = agg;
@@ -83,37 +90,36 @@ impl RetentionManager {
             Err(e) => warn!("Retention: token_usage cleanup failed: {}", e),
         }
 
-        match self.cleanup_episodes().await {
-            Ok(n) => stats.episodes_deleted = n,
-            Err(e) => warn!("Retention: episodes cleanup failed: {}", e),
-        }
-
-        match self.cleanup_behavior_patterns().await {
-            Ok(n) => stats.behavior_patterns_deleted = n,
-            Err(e) => warn!("Retention: behavior_patterns cleanup failed: {}", e),
-        }
-
         match self.cleanup_goals().await {
             Ok(n) => stats.goals_deleted = n,
             Err(e) => warn!("Retention: goals cleanup failed: {}", e),
         }
 
-        match self.cleanup_procedures().await {
-            Ok(n) => stats.procedures_deleted = n,
-            Err(e) => warn!("Retention: procedures cleanup failed: {}", e),
-        }
-
-        match self.cleanup_error_solutions().await {
-            Ok(n) => stats.error_solutions_deleted = n,
-            Err(e) => warn!("Retention: error_solutions cleanup failed: {}", e),
-        }
-
-        match self.cleanup_derived_memory().await {
-            Ok(n) => stats.derived_memory_deleted = n,
-            Err(e) => warn!("Retention: derived memory cleanup failed: {}", e),
+        if self.own_memory {
+            let memory = self.memory().run_all().await;
+            stats.facts_deleted = memory.facts_deleted;
+            stats.episodes_deleted = memory.episodes_deleted;
+            stats.behavior_patterns_deleted = memory.behavior_patterns_deleted;
+            stats.procedures_deleted = memory.procedures_deleted;
+            stats.error_solutions_deleted = memory.error_solutions_deleted;
+            stats.derived_memory_deleted = memory.derived_memory_deleted;
         }
 
         Ok(stats)
+    }
+
+    /// The memory half of retention, on the daemon's own tables.
+    fn memory(&self) -> aidaemon_memory::sqlite::MemoryRetention {
+        aidaemon_memory::sqlite::MemoryRetention::new(
+            self.pool.clone(),
+            aidaemon_memory::sqlite::MemoryRetentionPolicy {
+                superseded_facts_days: self.config.superseded_facts_days,
+                episodes_days: self.config.episodes_days,
+                behavior_patterns_days: self.config.behavior_patterns_days,
+                procedures_days: self.config.procedures_days,
+                error_solutions_days: self.config.error_solutions_days,
+            },
+        )
     }
 
     /// Delete the canonical history-bearing task envelope and exact messages.
@@ -192,27 +198,6 @@ impl RetentionManager {
         Ok(deleted)
     }
 
-    /// Delete old superseded fact versions.
-    /// Safety: only deletes facts that have been superseded (replaced by newer version).
-    async fn cleanup_superseded_facts(&self) -> anyhow::Result<u64> {
-        if self.config.superseded_facts_days == 0 {
-            return Ok(0);
-        }
-        let cutoff =
-            (Utc::now() - Duration::days(self.config.superseded_facts_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM facts WHERE id IN (
-                SELECT id FROM facts
-                WHERE superseded_at IS NOT NULL AND superseded_at < ?
-                LIMIT 500
-            )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// Aggregate raw token_usage into daily summaries, then delete raw records.
     /// Safety: aggregation happens before deletion.
     async fn cleanup_token_usage(&self) -> anyhow::Result<(u64, u64)> {
@@ -251,47 +236,6 @@ impl RetentionManager {
         Ok((aggregated, deleted))
     }
 
-    /// Delete episodes with recall_count=0 older than cutoff.
-    /// Safety: preserves episodes that have been recalled (referenced).
-    async fn cleanup_episodes(&self) -> anyhow::Result<u64> {
-        if self.config.episodes_days == 0 {
-            return Ok(0);
-        }
-        let cutoff = (Utc::now() - Duration::days(self.config.episodes_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM episodes WHERE id IN (
-                SELECT id FROM episodes
-                WHERE recall_count = 0 AND created_at < ?
-                LIMIT 500
-            )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Delete behavior patterns at confidence floor that haven't been seen recently.
-    /// Safety: only deletes already-decayed patterns (confidence <= 0.1).
-    async fn cleanup_behavior_patterns(&self) -> anyhow::Result<u64> {
-        if self.config.behavior_patterns_days == 0 {
-            return Ok(0);
-        }
-        let cutoff =
-            (Utc::now() - Duration::days(self.config.behavior_patterns_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM behavior_patterns WHERE id IN (
-                SELECT id FROM behavior_patterns
-                WHERE confidence <= 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)
-                LIMIT 500
-            )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// Delete completed/abandoned goals older than cutoff.
     /// Safety: never deletes active goals.
     async fn cleanup_goals(&self) -> anyhow::Result<u64> {
@@ -310,157 +254,6 @@ impl RetentionManager {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
-    }
-
-    /// Delete zero-success procedures older than cutoff.
-    /// Safety: preserves any procedure that has succeeded at least once.
-    async fn cleanup_procedures(&self) -> anyhow::Result<u64> {
-        if self.config.procedures_days == 0 {
-            return Ok(0);
-        }
-        let cutoff = (Utc::now() - Duration::days(self.config.procedures_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM procedures WHERE id IN (
-                SELECT id FROM procedures
-                WHERE success_count = 0 AND (last_used_at IS NULL OR last_used_at < ?)
-                LIMIT 500
-            )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Delete net-negative error solutions older than cutoff.
-    /// Safety: preserves solutions where success_count >= failure_count.
-    async fn cleanup_error_solutions(&self) -> anyhow::Result<u64> {
-        if self.config.error_solutions_days == 0 {
-            return Ok(0);
-        }
-        let cutoff =
-            (Utc::now() - Duration::days(self.config.error_solutions_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM error_solutions WHERE id IN (
-                SELECT id FROM error_solutions
-                WHERE failure_count > success_count AND (last_used_at IS NULL OR last_used_at < ?)
-                LIMIT 500
-            )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Remove projections whose authoritative source no longer exists. Derived
-    /// rows are disposable and must not outlive an explicit source deletion.
-    async fn cleanup_derived_memory(&self) -> anyhow::Result<u64> {
-        let has_tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_claims'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        if has_tables == 0 {
-            return Ok(0);
-        }
-
-        let mut deleted = 0;
-        deleted += sqlx::query(
-            "DELETE FROM memory_edges
-             WHERE source_claim_id IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM memory_claims c WHERE c.id = source_claim_id)",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_edges
-             WHERE source_claim_id IN (
-                 SELECT c.id FROM memory_claims c
-                 WHERE c.source_fact_id IS NOT NULL
-                   AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = c.source_fact_id)
-             )",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_embeddings
-             WHERE (owner_type = 'claim' AND NOT EXISTS (
-                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
-                OR (owner_type = 'span' AND NOT EXISTS (
-                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))
-                OR (owner_type = 'procedure' AND NOT EXISTS (
-                       SELECT 1 FROM procedures p WHERE CAST(p.id AS TEXT) = owner_id))
-                OR (owner_type = 'error_solution' AND NOT EXISTS (
-                       SELECT 1 FROM error_solutions e WHERE CAST(e.id AS TEXT) = owner_id))
-                OR (stale_at IS NOT NULL AND stale_at < datetime('now', '-30 days'))",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_claims
-             WHERE source_fact_id IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = source_fact_id)",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_spans
-             WHERE ((source_event_id IS NOT NULL AND NOT EXISTS (
-                       SELECT 1 FROM events e WHERE e.id = source_event_id))
-                OR (source_episode_id IS NOT NULL AND NOT EXISTS (
-                       SELECT 1 FROM episodes ep WHERE ep.id = source_episode_id)))
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
-               )",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_embeddings
-             WHERE (owner_type = 'claim' AND NOT EXISTS (
-                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
-                OR (owner_type = 'span' AND NOT EXISTS (
-                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        deleted += sqlx::query(
-            "DELETE FROM memory_entities
-             WHERE canonical_name != 'owner'
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_edges edge
-                   WHERE edge.source_entity_id = memory_entities.id
-                      OR edge.target_entity_id = memory_entities.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_aliases alias
-                   WHERE alias.entity_id = memory_entities.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_entity_facts fact
-                   WHERE fact.subject_entity_id = memory_entities.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_relationships relationship
-                   WHERE relationship.source_entity_id = memory_entities.id
-                      OR relationship.target_entity_id = memory_entities.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_write_audit audit
-                   WHERE audit.entity_id = memory_entities.id
-               )",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(deleted)
     }
 }
 
@@ -749,7 +542,7 @@ mod tests {
             .bind(&now).bind(&now).execute(&pool).await.unwrap();
 
         let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
-        let deleted = mgr.cleanup_superseded_facts().await.unwrap();
+        let deleted = mgr.memory().cleanup_superseded_facts().await.unwrap();
         assert_eq!(deleted, 1);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM facts")
@@ -799,7 +592,7 @@ mod tests {
             .bind(old_date).execute(&pool).await.unwrap();
 
         let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
-        let deleted = mgr.cleanup_episodes().await.unwrap();
+        let deleted = mgr.memory().cleanup_episodes().await.unwrap();
         assert_eq!(deleted, 1);
 
         let count: (i64,) =
@@ -867,7 +660,7 @@ mod tests {
             .bind(old_date).bind(old_date).execute(&pool).await.unwrap();
 
         let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
-        let deleted = mgr.cleanup_procedures().await.unwrap();
+        let deleted = mgr.memory().cleanup_procedures().await.unwrap();
         assert_eq!(deleted, 1);
 
         let count: (i64,) =
@@ -904,7 +697,7 @@ mod tests {
             .unwrap();
 
         let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
-        assert!(manager.cleanup_derived_memory().await.unwrap() > 0);
+        assert!(manager.memory().cleanup_derived_memory().await.unwrap() > 0);
         let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_claims")
             .fetch_one(&pool)
             .await
@@ -952,7 +745,7 @@ mod tests {
         .unwrap();
 
         let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
-        manager.cleanup_derived_memory().await.unwrap();
+        manager.memory().cleanup_derived_memory().await.unwrap();
 
         let remaining: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM memory_entities WHERE id = ?")

@@ -715,3 +715,59 @@ async fn a_memory_without_an_extractor_says_it_cannot_learn_from_history() {
         .unwrap();
     assert_eq!(outcome, HistoryIntake::NotSupported);
 }
+
+/// The SQLite store runs without any host tables around it.
+#[tokio::test]
+async fn sqlite_memory_runs_in_a_database_of_its_own() {
+    use aidaemon_memory::records::{Episode, FactPrivacy};
+    use aidaemon_memory::sqlite::{migrate, SqliteMemory};
+    use aidaemon_memory::stores::FactStore;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(SqliteConnectOptions::new().filename(file.path()))
+        .await
+        .unwrap();
+    migrate(&pool).await.unwrap();
+    let memory = SqliteMemory::new(pool, Arc::new(HashEmbedder::default()));
+
+    memory
+        .upsert_fact(
+            "user",
+            "employer",
+            "Acme Corp",
+            "agent",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        memory.get_facts(Some("user")).await.unwrap()[0].value,
+        "Acme Corp"
+    );
+
+    let now = chrono::Utc::now();
+    let id = memory
+        .insert_episode(&Episode {
+            id: 0,
+            session_id: "synthetic-session".to_string(),
+            summary: "Planned the Acme launch.".to_string(),
+            topics: None,
+            emotional_tone: None,
+            outcome: None,
+            importance: 0.5,
+            recall_count: 0,
+            last_recalled_at: None,
+            message_count: 2,
+            start_time: now,
+            end_time: now,
+            created_at: now,
+            channel_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(id > 0);
+}
