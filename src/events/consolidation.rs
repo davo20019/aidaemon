@@ -1,26 +1,30 @@
-//! Event consolidation system.
+//! Event consolidation: the daemon's side of learning from finished work.
 //!
-//! Consolidation extracts learnings from raw events and stores them
-//! in long-term memory (procedures, error-solutions, expertise, behavior
-//! patterns, episodes).
-//! After consolidation, events can be pruned to manage storage.
+//! The daemon decides which of a session's events may teach anything
+//! (isolated sessions and suppressed tasks may not), writes the rest as the
+//! memory crate's task trace, and hands it to the crate's learner. After
+//! that the events are marked, so retention can remove them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use aidaemon_memory::stores::MemoryStores;
+use aidaemon_memory::trajectory::{
+    CompletedPlan, DecisionDetails, DecisionPoint, ProcedureEnhancer, TaskEnding, TaskLearner,
+    TraceEvent,
+};
 use chrono::{Duration, Utc};
-use sqlx::Row;
 use tracing::{info, warn};
 
 use super::{
     DecisionPointData, ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData,
+    UserMessageData,
 };
 use super::{Event, EventStore, EventType, TaskOutcome};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
-use crate::traits::{ErrorSolution, Procedure};
-use aidaemon_memory::encode_embedding;
+use crate::traits::MessageAnnotation;
 
 /// Statistics from a consolidation run
 #[derive(Debug, Default)]
@@ -50,14 +54,6 @@ impl ConsolidationResult {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FailurePatternObservation {
-    trigger_context: String,
-    action: String,
-    description: String,
-    confidence: f32,
-}
-
 /// Statistics from daily consolidation
 #[derive(Debug, Default)]
 pub struct DailyConsolidationStats {
@@ -71,10 +67,10 @@ pub struct Consolidator {
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
     pool: sqlx::SqlitePool,
+    memory: Arc<dyn MemoryStores>,
     llm_runtime: Option<SharedLlmRuntime>,
     embedding_service: Option<Arc<EmbeddingService>>,
     state: Option<Arc<dyn crate::traits::StateStore>>,
-    memory: Option<Arc<dyn aidaemon_memory::stores::MemoryStores>>,
     learning_evidence_gate_enforce: bool,
 }
 
@@ -83,6 +79,7 @@ impl Consolidator {
         event_store: Arc<EventStore>,
         plan_store: Arc<PlanStore>,
         pool: sqlx::SqlitePool,
+        memory: Arc<dyn MemoryStores>,
         llm_runtime: Option<SharedLlmRuntime>,
         embedding_service: Option<Arc<EmbeddingService>>,
     ) -> Self {
@@ -90,10 +87,10 @@ impl Consolidator {
             event_store,
             plan_store,
             pool,
+            memory,
             llm_runtime,
             embedding_service,
             state: None,
-            memory: None,
             learning_evidence_gate_enforce: false,
         }
     }
@@ -101,12 +98,6 @@ impl Consolidator {
     /// Set the state store for token usage tracking.
     pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
         self.state = Some(state);
-        self
-    }
-
-    /// Set the memory the consolidator's lessons are written to.
-    pub fn with_memory(mut self, memory: Arc<dyn aidaemon_memory::stores::MemoryStores>) -> Self {
-        self.memory = Some(memory);
         self
     }
 
@@ -159,7 +150,6 @@ impl Consolidator {
         // capability policy suppresses automatic memory. Canonical events stay
         // available for history/audit; they are merely retired from learning.
         let all_events = self.event_store.query_unconsolidated(session_id).await?;
-
         let suppressed_task_ids: std::collections::HashSet<String> = sqlx::query_scalar(
             "SELECT DISTINCT task_id FROM events
              WHERE session_id = ? AND event_type = 'memory_policy_compiled'
@@ -214,116 +204,22 @@ impl Consolidator {
             });
         }
 
-        let mut result = ConsolidationResult {
-            events_processed: events.len() + suppressed_events.len(),
-            events_consolidated: suppressed_events.len(),
-            ..Default::default()
-        };
+        let plans = self.completed_plans(session_id, &suppressed_task_ids).await;
+        let report = self.learner().learn(&trace_events(&events), &plans).await;
 
-        // 1. Extract and save procedures from successful task sequences
-        let procedures = self.extract_procedures(&events).await;
-        for proc in procedures {
-            if self.learning_evidence_gate_enforce
-                && !aidaemon_memory::trajectory::meets_evidence_gate(&proc)
-            {
-                info!(
-                    trigger = %proc.trigger_pattern,
-                    steps = proc.steps.len(),
-                    "Skipping procedure without sufficient evidence"
-                );
-                continue;
-            }
-            if let Err(e) = self.save_procedure(&proc).await {
-                warn!("Failed to save procedure: {}", e);
-            } else {
-                self.generate_trigger_embedding(&proc).await;
-                result.procedures_created += 1;
-            }
-        }
-
-        // 1b. Extract procedures from completed plans (higher quality than event-based)
-        let since = Utc::now() - Duration::hours(24);
-        if let Ok(completed_plans) = self.plan_store.get_completed_since(session_id, since).await {
-            for plan in completed_plans {
-                if plan
-                    .task_id
-                    .as_ref()
-                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
-                {
-                    continue;
-                }
-                let steps: Vec<String> = plan
-                    .steps
-                    .iter()
-                    .filter(|s| s.status == StepStatus::Completed)
-                    .map(|s| s.description.clone())
-                    .collect();
-                if steps.len() >= 2 {
-                    // Deduplication check for plan-based procedures
-                    if self.is_duplicate_procedure(&plan.description).await {
-                        continue;
-                    }
-                    let Some(proc) = aidaemon_memory::trajectory::procedure_from_plan(
-                        &plan.id,
-                        &plan.description,
-                        steps,
-                    ) else {
-                        continue;
-                    };
-                    let final_proc = self.enhanced(proc, &plan.description).await;
-                    if self.learning_evidence_gate_enforce
-                        && !aidaemon_memory::trajectory::meets_evidence_gate(&final_proc)
-                    {
-                        info!(
-                            trigger = %final_proc.trigger_pattern,
-                            "Skipping plan-based procedure without evidence"
-                        );
-                        continue;
-                    }
-
-                    if let Err(e) = self.save_procedure(&final_proc).await {
-                        warn!("Failed to save plan-based procedure: {}", e);
-                    } else {
-                        self.generate_trigger_embedding(&final_proc).await;
-                        result.procedures_created += 1;
-                    }
-                }
-            }
-        }
-
-        // 2. Extract and save error-solution pairs
-        let error_solutions = self.extract_error_solutions(&events).await;
-        for es in error_solutions {
-            if let Err(e) = self.save_error_solution(&es).await {
-                warn!("Failed to save error solution: {}", e);
-            } else {
-                result.error_solutions_created += 1;
-            }
-        }
-
-        // 3. Update expertise from task outcomes
-        let expertise_updates = self.extract_expertise_updates(&events).await;
-        for (domain, success) in expertise_updates {
-            if let Err(e) = self.update_expertise(&domain, success).await {
-                warn!("Failed to update expertise: {}", e);
-            } else {
-                result.expertise_updated += 1;
-            }
-        }
-
-        // 4. Mine warning/error decision points into durable failure patterns
-        result.behavior_patterns_recorded =
-            self.extract_failure_patterns_from_decisions(&events).await;
-
-        // 4.5. Extract and stamp fact provenance
-        self.extract_and_stamp_fact_provenance(&events).await;
-
-        // 5. Mark events as consolidated
         // Note: Episode creation is handled exclusively by MemoryManager (LLM-quality episodes)
         let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         self.event_store.mark_consolidated(&event_ids).await?;
-        result.events_consolidated = result.events_consolidated.saturating_add(event_ids.len());
 
+        let result = ConsolidationResult {
+            events_processed: events.len() + suppressed_events.len(),
+            events_consolidated: suppressed_events.len() + event_ids.len(),
+            procedures_created: report.procedures,
+            error_solutions_created: report.error_solutions,
+            expertise_updated: report.expertise_updates,
+            behavior_patterns_recorded: report.failure_patterns,
+            ..Default::default()
+        };
         info!(
             session_id,
             events = result.events_consolidated,
@@ -336,389 +232,63 @@ impl Consolidator {
         Ok(result)
     }
 
-    async fn extract_and_stamp_fact_provenance(&self, events: &[Event]) {
-        let mut last_user_message = None;
-        let mut last_msg_time = None;
-
-        for event in events {
-            if event.event_type == crate::events::EventType::UserMessage {
-                if let Ok(data) = event.parse_data::<super::UserMessageData>() {
-                    if data
-                        .annotations
-                        .contains(&crate::traits::MessageAnnotation::InternalContinuation)
-                    {
-                        continue;
-                    }
-                    last_user_message = Some(data.content);
-                    last_msg_time = Some(event.created_at);
-                }
-            } else if event.event_type == crate::events::EventType::ToolCall
-                && event.tool_name.as_deref() == Some("remember_fact")
-            {
-                if let Ok(data) = event.parse_data::<super::ToolCallData>() {
-                    if let Ok(args) = serde_json::from_value::<serde_json::Value>(data.arguments) {
-                        let mut entries = Vec::new();
-
-                        if let Some(facts_arr) = args.get("facts").and_then(|v| v.as_array()) {
-                            for f in facts_arr {
-                                if let (Some(c), Some(k), Some(v)) = (
-                                    f.get("category").and_then(|val| val.as_str()),
-                                    f.get("key").and_then(|val| val.as_str()),
-                                    f.get("value").and_then(|val| val.as_str()),
-                                ) {
-                                    entries.push((c.to_string(), k.to_string(), v.to_string()));
-                                }
-                            }
-                        } else if let (Some(c), Some(k), Some(v)) = (
-                            args.get("category").and_then(|val| val.as_str()),
-                            args.get("key").and_then(|val| val.as_str()),
-                            args.get("value").and_then(|val| val.as_str()),
-                        ) {
-                            entries.push((c.to_string(), k.to_string(), v.to_string()));
-                        }
-
-                        for (category, key, value) in entries {
-                            let mut source = "derived";
-                            let mut source_excerpt = None;
-                            let mut first_seen_at = None;
-
-                            if let Some(msg) = &last_user_message {
-                                let lower_msg = msg.to_lowercase();
-                                let lower_val = value.to_lowercase();
-                                if lower_val.len() > 3 && lower_msg.contains(&lower_val) {
-                                    source = "user_stated";
-                                }
-                                source_excerpt = Some(crate::utils::truncate_str(msg, 200));
-                                first_seen_at = last_msg_time;
-                            }
-
-                            let first_seen_str = first_seen_at.map(|dt| dt.to_rfc3339());
-                            let _ = sqlx::query(
-                                "UPDATE facts
-                                 SET source = ?, first_seen_at = ?, source_excerpt = ?
-                                 WHERE category = ? AND key = ? AND superseded_at IS NULL",
-                            )
-                            .bind(source)
-                            .bind(&first_seen_str)
-                            .bind(&source_excerpt)
-                            .bind(&category)
-                            .bind(&key)
-                            .execute(&self.pool)
-                            .await;
-                        }
-                    }
-                }
-            }
+    /// The memory crate's learner, with the daemon's embeddings and its
+    /// current model (whose calls are accounted to this session's budget).
+    fn learner(&self) -> TaskLearner {
+        let mut learner = TaskLearner::new(self.memory.clone())
+            .with_evidence_gate(self.learning_evidence_gate_enforce);
+        if let Some(embeddings) = &self.embedding_service {
+            learner = learner.with_embedder(embeddings.clone());
         }
-    }
-
-    // =========================================================================
-    // Extraction Methods
-    // =========================================================================
-
-    /// Procedures from successful task sequences (the SDK memory crate's
-    /// extraction over this session's trace), deduplicated against stored
-    /// triggers and enhanced by the model when available.
-    pub async fn extract_procedures(&self, events: &[Event]) -> Vec<Procedure> {
-        let trace = trace_events(events);
-        let mut procedures = Vec::new();
-        for candidate in aidaemon_memory::trajectory::procedure_candidates(&trace) {
-            if self.is_duplicate_procedure(&candidate.description).await {
-                continue;
-            }
-            let procedure = aidaemon_memory::trajectory::procedure_from_task(&candidate);
-            procedures.push(self.enhanced(procedure, &candidate.description).await);
+        if let Some(runtime) = &self.llm_runtime {
+            let snapshot = runtime.snapshot();
+            let model = snapshot.primary_model();
+            let provider: Arc<dyn aidaemon_core::Provider> = match &self.state {
+                Some(state) => Arc::new(crate::agent::AccountedProvider {
+                    inner: snapshot.provider(),
+                    accounting: crate::agent::ModelCallAccounting {
+                        state: state.clone(),
+                        event_store: self.event_store.clone(),
+                        purpose: "consolidation",
+                    },
+                }),
+                None => snapshot.provider(),
+            };
+            learner = learner.with_enhancer(ProcedureEnhancer::new(provider, model));
         }
-        procedures
+        learner
     }
 
-    /// Error-solution pairs from recovered errors.
-    pub async fn extract_error_solutions(&self, events: &[Event]) -> Vec<ErrorSolution> {
-        aidaemon_memory::trajectory::error_solutions(&trace_events(events))
-    }
-
-    /// Expertise observations from task outcomes.
-    pub async fn extract_expertise_updates(&self, events: &[Event]) -> Vec<(String, bool)> {
-        aidaemon_memory::trajectory::expertise_updates(&trace_events(events))
-    }
-
-    /// Mine operational warning/error decision points into durable failure patterns.
-    async fn extract_failure_patterns_from_decisions(&self, events: &[Event]) -> usize {
-        let Some(memory) = self.memory.as_ref() else {
-            return 0;
+    /// The session's plans finished in the last day, without suppressed
+    /// tasks' ones. A lookup failure means no plans, not a failed pass.
+    async fn completed_plans(
+        &self,
+        session_id: &str,
+        suppressed_task_ids: &HashSet<String>,
+    ) -> Vec<CompletedPlan> {
+        let since = Utc::now() - Duration::hours(24);
+        let Ok(plans) = self.plan_store.get_completed_since(session_id, since).await else {
+            return Vec::new();
         };
-
-        let mut task_events: HashMap<String, Vec<&Event>> = HashMap::new();
-        for event in events {
-            if let Some(task_id) = &event.task_id {
-                task_events.entry(task_id.clone()).or_default().push(event);
-            }
-        }
-
-        let mut recorded = 0usize;
-
-        for task_evts in task_events.into_values() {
-            let task_outcome = task_evts
-                .iter()
-                .rev()
-                .find(|event| event.event_type == EventType::TaskEnd)
-                .and_then(|event| event.parse_data::<TaskEndData>().ok())
-                .map(|data| data.effective_outcome());
-            let mut seen_for_task: HashSet<(String, String)> = HashSet::new();
-
-            for (idx, event) in task_evts.iter().enumerate() {
-                if event.event_type != EventType::DecisionPoint {
-                    continue;
-                }
-
-                let Ok(decision) = event.parse_data::<DecisionPointData>() else {
-                    continue;
-                };
-                if !decision.severity.is_warning_or_higher() {
-                    continue;
-                }
-
-                let recovery_tool = next_successful_tool_after(&task_evts, idx);
-                let Some(pattern) = build_failure_pattern_observation(
-                    &decision,
-                    task_outcome,
-                    recovery_tool.as_deref(),
-                ) else {
-                    continue;
-                };
-
-                let dedup_key = (pattern.trigger_context.clone(), pattern.action.clone());
-                if !seen_for_task.insert(dedup_key) {
-                    continue;
-                }
-
-                match memory
-                    .record_behavior_pattern(
-                        "failure",
-                        &pattern.description,
-                        Some(&pattern.trigger_context),
-                        Some(&pattern.action),
-                        pattern.confidence,
-                        1,
-                    )
-                    .await
-                {
-                    Ok(()) => recorded += 1,
-                    Err(e) => warn!(
-                        trigger_context = %pattern.trigger_context,
-                        action = %pattern.action,
-                        error = %e,
-                        "Failed to record failure pattern from decision point"
-                    ),
-                }
-            }
-        }
-
-        recorded
-    }
-
-    // =========================================================================
-    // LLM Enhancement Methods
-    // =========================================================================
-
-    /// Check if a semantically similar procedure already exists.
-    async fn is_duplicate_procedure(&self, description: &str) -> bool {
-        let Some(ref emb_service) = self.embedding_service else {
-            return false;
-        };
-        let new_emb = match emb_service.embed(description.to_string()).await {
-            Ok(emb) => emb,
-            Err(_) => return false,
-        };
-
-        let rows = match sqlx::query(
-            "SELECT name, trigger_embedding FROM procedures WHERE trigger_embedding IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(_) => return false,
-        };
-
-        let existing: Vec<Vec<f32>> = rows
-            .iter()
-            .filter_map(|row| row.get::<Option<Vec<u8>>, _>("trigger_embedding"))
-            .filter_map(|blob| aidaemon_memory::decode_embedding_with_dim(&blob, 384).ok())
-            .collect();
-        aidaemon_memory::trajectory::duplicates_existing_trigger(&new_emb, &existing)
-    }
-
-    /// `procedure` rewritten by the model into a reusable one (the SDK
-    /// memory crate's [`ProcedureEnhancer`]), or unchanged when there is no
-    /// model or it declines.
-    ///
-    /// [`ProcedureEnhancer`]: aidaemon_memory::trajectory::ProcedureEnhancer
-    async fn enhanced(&self, procedure: Procedure, task_description: &str) -> Procedure {
-        let Some(runtime) = self.llm_runtime.as_ref() else {
-            return procedure;
-        };
-        let snapshot = runtime.snapshot();
-        let model = snapshot.primary_model();
-        let provider: Arc<dyn aidaemon_core::Provider> = match &self.state {
-            Some(state) => Arc::new(crate::agent::AccountedProvider {
-                inner: snapshot.provider(),
-                accounting: crate::agent::ModelCallAccounting {
-                    state: state.clone(),
-                    event_store: self.event_store.clone(),
-                    purpose: "consolidation",
-                },
-            }),
-            None => snapshot.provider(),
-        };
-        aidaemon_memory::trajectory::ProcedureEnhancer::new(provider, model)
-            .enhance(&procedure, task_description)
-            .await
-            .unwrap_or(procedure)
-    }
-
-    /// Generate and store a trigger embedding for a procedure.
-    async fn generate_trigger_embedding(&self, proc: &Procedure) {
-        let Some(ref embedding_service) = self.embedding_service else {
-            return;
-        };
-        if let Ok(embedding) = embedding_service.embed(proc.trigger_pattern.clone()).await {
-            let blob = encode_embedding(&embedding);
-            let _ = sqlx::query("UPDATE procedures SET trigger_embedding = ? WHERE name = ?")
-                .bind(blob)
-                .bind(&proc.name)
-                .execute(&self.pool)
-                .await;
-        }
-    }
-
-    // =========================================================================
-    // Storage Methods
-    // =========================================================================
-
-    pub async fn save_procedure(&self, proc: &Procedure) -> anyhow::Result<()> {
-        let steps_json = serde_json::to_string(&proc.steps)?;
-        let now = Utc::now().to_rfc3339();
-
-        // Try to update existing or insert new
-        sqlx::query(
-            r#"
-            INSERT INTO procedures (name, trigger_pattern, steps, success_count, failure_count,
-                                    avg_duration_secs, last_used_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                success_count = success_count + 1,
-                last_used_at = excluded.last_used_at,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(&proc.name)
-        .bind(&proc.trigger_pattern)
-        .bind(&steps_json)
-        .bind(proc.success_count)
-        .bind(proc.failure_count)
-        .bind(proc.avg_duration_secs)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn save_error_solution(&self, es: &ErrorSolution) -> anyhow::Result<()> {
-        let steps_json = es
-            .solution_steps
-            .as_ref()
-            .map(|s| serde_json::to_string(s).unwrap_or_default());
-        let domain = es.domain.clone().unwrap_or_default();
-        let now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            r#"
-            INSERT INTO error_solutions (error_pattern, domain, solution_summary, solution_steps,
-                                         success_count, failure_count, last_used_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(error_pattern, domain, solution_summary) DO UPDATE SET
-                solution_steps = COALESCE(excluded.solution_steps, error_solutions.solution_steps),
-                success_count = error_solutions.success_count + excluded.success_count,
-                failure_count = error_solutions.failure_count + excluded.failure_count,
-                last_used_at = excluded.last_used_at
-            "#,
-        )
-        .bind(&es.error_pattern)
-        .bind(&domain)
-        .bind(&es.solution_summary)
-        .bind(&steps_json)
-        .bind(es.success_count)
-        .bind(es.failure_count)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn update_expertise(&self, domain: &str, success: bool) -> anyhow::Result<()> {
-        let now = Utc::now().to_rfc3339();
-
-        // Try to update existing
-        let result = if success {
-            sqlx::query(
-                r#"
-                UPDATE expertise
-                SET tasks_attempted = tasks_attempted + 1,
-                    tasks_succeeded = tasks_succeeded + 1,
-                    last_task_at = ?,
-                    updated_at = ?
-                WHERE domain = ?
-                "#,
-            )
-            .bind(&now)
-            .bind(&now)
-            .bind(domain)
-            .execute(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                UPDATE expertise
-                SET tasks_attempted = tasks_attempted + 1,
-                    tasks_failed = tasks_failed + 1,
-                    last_task_at = ?,
-                    updated_at = ?
-                WHERE domain = ?
-                "#,
-            )
-            .bind(&now)
-            .bind(&now)
-            .bind(domain)
-            .execute(&self.pool)
-            .await?
-        };
-
-        // If no rows updated, insert new
-        if result.rows_affected() == 0 {
-            sqlx::query(
-                r#"
-                INSERT INTO expertise (domain, tasks_attempted, tasks_succeeded, tasks_failed,
-                                       current_level, confidence_score, last_task_at, created_at, updated_at)
-                VALUES (?, 1, ?, ?, 'novice', 0.1, ?, ?, ?)
-                "#
-            )
-            .bind(domain)
-            .bind(if success { 1 } else { 0 })
-            .bind(if success { 0 } else { 1 })
-            .bind(&now)
-            .bind(&now)
-            .bind(&now)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(())
+        plans
+            .into_iter()
+            .filter(|plan| {
+                !plan
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| suppressed_task_ids.contains(task_id))
+            })
+            .map(|plan| CompletedPlan {
+                completed_steps: plan
+                    .steps
+                    .iter()
+                    .filter(|step| step.status == StepStatus::Completed)
+                    .map(|step| step.description.clone())
+                    .collect(),
+                id: plan.id,
+                description: plan.description,
+            })
+            .collect()
     }
 }
 
@@ -799,397 +369,39 @@ pub struct PruneStats {
     pub consolidation_errors: usize,
 }
 
-// Helper functions
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let target = max_len.saturating_sub(3);
-        let safe_end = s
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|&i| i <= target)
-            .last()
-            .unwrap_or(0);
-        format!("{}...", &s[..safe_end])
+fn task_ending(outcome: TaskOutcome) -> TaskEnding {
+    match outcome {
+        TaskOutcome::Succeeded => TaskEnding::Succeeded,
+        TaskOutcome::Partial => TaskEnding::Partial,
+        TaskOutcome::Failed => TaskEnding::Failed,
     }
 }
 
-fn next_successful_tool_after(task_events: &[&Event], start_idx: usize) -> Option<String> {
-    task_events.iter().skip(start_idx + 1).find_map(|event| {
-        if event.event_type != EventType::ToolResult {
-            return None;
+/// How each task's last end event says it ended; `None` when that event
+/// cannot be read. Only events indexed under the task count.
+fn last_task_endings(events: &[Event]) -> HashMap<&str, Option<TaskEnding>> {
+    let mut endings = HashMap::new();
+    for event in events {
+        if event.event_type != EventType::TaskEnd {
+            continue;
         }
-        let data = event.parse_data::<ToolResultData>().ok()?;
-        data.succeeded().then_some(data.name)
-    })
-}
-
-fn build_failure_pattern_observation(
-    decision: &DecisionPointData,
-    task_outcome: Option<TaskOutcome>,
-    recovery_tool: Option<&str>,
-) -> Option<FailurePatternObservation> {
-    let code = decision
-        .code
-        .as_deref()
-        .unwrap_or(decision.decision_type.as_str());
-    let metadata = &decision.metadata;
-    let recovery_suffix = recovery_tool
-        .map(|tool| format!(" Previous successful recoveries switched to {}.", tool))
-        .unwrap_or_default();
-    let with_confidence = |base: f32| failure_pattern_confidence(base, task_outcome, recovery_tool);
-
-    match code {
-        "repetitive_call_detection" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            let count = metadata.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let action_kind = metadata
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("redirect");
-            let action = if action_kind == "hard_stop" {
-                "stop_retrying_identical_calls"
-            } else {
-                "pivot_to_alternate_tool_or_strategy"
-            };
-            let description = if count > 0 {
-                format!(
-                    "After {} repeated calls to {}, stop retrying the same operation and pivot to a different tool or summarize the blocker.{}",
-                    count, tool, recovery_suffix
-                )
-            } else {
-                format!(
-                    "Repeated calls to {} tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner.{}",
-                    tool, recovery_suffix
-                )
-            };
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tool),
-                action: action.to_string(),
-                description,
-                confidence: with_confidence(if action_kind == "hard_stop" { 0.74 } else { 0.62 }),
-            })
+        if let Some(task_id) = &event.task_id {
+            let ending = event
+                .parse_data::<TaskEndData>()
+                .ok()
+                .map(|data| task_ending(data.effective_outcome()));
+            endings.insert(task_id.as_str(), ending);
         }
-        "consecutive_same_tool_detection" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            let consecutive_count = metadata
-                .get("consecutive_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let unique_args = metadata
-                .get("unique_args")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let is_diverse = metadata
-                .get("is_diverse")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let description = if is_diverse {
-                format!(
-                    "Even varied {} calls can become a loop after {} consecutive uses; switch tools or summarize progress before continuing.{}",
-                    tool, consecutive_count, recovery_suffix
-                )
-            } else {
-                format!(
-                    "Long {} streaks with only {} distinct argument sets usually indicate a loop; change tools or adjust strategy before continuing.{}",
-                    tool, unique_args, recovery_suffix
-                )
-            };
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tool),
-                action: "switch_tools_before_long_streaks".to_string(),
-                description,
-                confidence: with_confidence(if is_diverse { 0.54 } else { 0.68 }),
-            })
-        }
-        "alternating_pattern_detection" => {
-            let mut tools: Vec<String> = metadata
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if tools.is_empty() {
-                tools.push("unknown_pair".to_string());
-            }
-            tools.sort();
-            let tool_pair = tools.join(" <-> ");
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tools.join("+")),
-                action: "break_alternating_tool_loops".to_string(),
-                description: format!(
-                    "Alternating between {} with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them.{}",
-                    tool_pair, recovery_suffix
-                ),
-                confidence: with_confidence(0.72),
-            })
-        }
-        "tool_budget_block" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            let semantic_failures = metadata
-                .get("prior_semantic_failures")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let prior_calls = metadata
-                .get("prior_calls")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let description = if semantic_failures > 0 {
-                format!(
-                    "Once {} has repeated the same semantic failure {} times, stop retrying it and switch strategy earlier.{}",
-                    tool, semantic_failures, recovery_suffix
-                )
-            } else {
-                format!(
-                    "After {} repeated {} calls without enough progress, stop retrying the blocked tool and switch strategy earlier.{}",
-                    prior_calls, tool, recovery_suffix
-                )
-            };
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tool),
-                action: "stop_retrying_blocked_tool".to_string(),
-                description,
-                confidence: with_confidence(if semantic_failures > 0 { 0.74 } else { 0.68 }),
-            })
-        }
-        "missing_pre_execution_evidence" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            let evidence_kind = metadata
-                .get("required_evidence_kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("direct evidence");
-            let target = metadata
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("current target");
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}:{}", code, tool, evidence_kind),
-                action: "gather_direct_evidence_before_mutation".to_string(),
-                description: format!(
-                    "Before using {}, gather {} for {} instead of mutating from memory or inference alone.{}",
-                    tool, evidence_kind, target, recovery_suffix
-                ),
-                confidence: with_confidence(0.82),
-            })
-        }
-        "plan_rejected" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "replan_first_risky_step_before_execution".to_string(),
-            description: format!(
-                "When the structured first-step plan is rejected, revise the target or first action before executing again.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.74),
-        }),
-        "critique_rejected" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "address_critique_before_retry".to_string(),
-            description: format!(
-                "If the critique pass rejects the first risky action, fix the missing evidence or target assumptions before retrying.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.76),
-        }),
-        "target_scope_violation" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tool),
-                action: "confirm_target_scope_before_mutation".to_string(),
-                description: format!(
-                    "If {} attempts to act outside the compiled target scope, stop and confirm the correct repo/file target before retrying.{}",
-                    tool, recovery_suffix
-                ),
-                confidence: with_confidence(0.86),
-            })
-        }
-        "tool_contract_violation" => {
-            let tool = metadata
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, tool),
-                action: "fix_tool_arguments_before_retry".to_string(),
-                description: format!(
-                    "Deterministic argument-contract failures on {} should be corrected locally before retrying the step.{}",
-                    tool, recovery_suffix
-                ),
-                confidence: with_confidence(0.72),
-            })
-        }
-        "contradictory_file_evidence" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "recheck_conflicting_state_before_completion".to_string(),
-            description: format!(
-                "When file evidence contradicts itself, re-read the target before claiming completion instead of trusting stale state.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.80),
-        }),
-        "verification_pending" | "verification_unavailable_in_phase" => {
-            Some(FailurePatternObservation {
-                trigger_context: code.to_string(),
-                action: "run_verification_before_claiming_success".to_string(),
-                description: format!(
-                    "Do not claim success while verification is pending; either run the check or surface a precise partial result.{}",
-                    recovery_suffix
-                ),
-                confidence: with_confidence(0.82),
-            })
-        }
-        "validation_budget_exhausted" | "execution_budget_exhausted" => {
-            Some(FailurePatternObservation {
-                trigger_context: code.to_string(),
-                action: "reduce_scope_when_budget_exhausts".to_string(),
-                description: format!(
-                    "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.{}",
-                    recovery_suffix
-                ),
-                confidence: with_confidence(0.70),
-            })
-        }
-        "pre_tool_deferral_stall" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "ask_clarifying_question_or_take_next_tool_step".to_string(),
-            description: format!(
-                "Repeatedly deferring before taking any tool step leads to failure; ask one concrete clarification question or take the next tool action earlier.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.72),
-        }),
-        "stall" => {
-            let stall_mode = metadata
-                .get("stall_mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("generic");
-            Some(FailurePatternObservation {
-                trigger_context: format!("{}:{}", code, stall_mode),
-                action: "summarize_progress_or_change_strategy".to_string(),
-                description: format!(
-                    "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.{}",
-                    recovery_suffix
-                ),
-                confidence: with_confidence(0.76),
-            })
-        }
-        "hard_iteration_cap" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "finish_before_hard_iteration_cap".to_string(),
-            description: format!(
-                "As the hard iteration cap approaches, stop repeating work and return the best partial answer or next concrete step earlier.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.60),
-        }),
-        "task_timeout" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "checkpoint_and_reduce_scope_before_timeout".to_string(),
-            description: format!(
-                "Long-running tasks that approach the timeout should checkpoint progress and reduce scope earlier instead of continuing the same loop.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.64),
-        }),
-        "task_token_budget" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "reduce_token_spend_and_checkpoint".to_string(),
-            description: format!(
-                "When task token spend stays high, reduce scope, checkpoint findings, or stop earlier instead of consuming the full task budget.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.68),
-        }),
-        "scheduled_run_budget" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "checkpoint_scheduled_run_before_budget_exhaustion".to_string(),
-            description: format!(
-                "Scheduled runs should bail out once progress slows; checkpoint the current state instead of burning the full per-run token budget.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.70),
-        }),
-        "goal_daily_token_budget" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "checkpoint_goal_work_before_daily_budget_exhaustion".to_string(),
-            description: format!(
-                "For recurring goal work, avoid spending the full daily budget in one pass; checkpoint progress and defer the rest earlier.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.70),
-        }),
-        "daily_token_budget" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "checkpoint_before_daily_budget_exhaustion".to_string(),
-            description: format!(
-                "When the session is nearing the daily token budget, checkpoint useful progress and stop earlier instead of exhausting the remaining budget.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.70),
-        }),
-        "task_token_budget_warning" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "reduce_token_spend_before_budget_warning".to_string(),
-            description: format!(
-                "High token-spend phases should trigger earlier summarization or scope reduction before the task budget is exhausted.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.45),
-        }),
-        "soft_iteration_warning" => Some(FailurePatternObservation {
-            trigger_context: code.to_string(),
-            action: "adjust_strategy_before_soft_iteration_warning".to_string(),
-            description: format!(
-                "When the soft iteration warning appears, summarize progress or change strategy instead of continuing the same loop.{}",
-                recovery_suffix
-            ),
-            confidence: with_confidence(0.45),
-        }),
-        _ => None,
     }
-}
-
-fn failure_pattern_confidence(
-    base: f32,
-    task_outcome: Option<TaskOutcome>,
-    recovery_tool: Option<&str>,
-) -> f32 {
-    let outcome_bonus = match task_outcome {
-        Some(TaskOutcome::Failed) => 0.08,
-        Some(TaskOutcome::Partial) => 0.04,
-        Some(TaskOutcome::Succeeded) => 0.0,
-        None => 0.0,
-    };
-    let recovery_bonus = if recovery_tool.is_some() { 0.03 } else { 0.0 };
-    (base + outcome_bonus + recovery_bonus).clamp(0.1, 0.96)
+    endings
 }
 
 /// This session's events as the SDK memory crate's task trace. Error
 /// messages lose the daemon's own scaffolding lines (untrusted-data
 /// envelopes, truncation notices), which would otherwise make unrelated
 /// errors share a pattern.
-fn trace_events(events: &[Event]) -> Vec<aidaemon_memory::trajectory::TraceEvent> {
-    use aidaemon_memory::trajectory::{TaskEnding, TraceEvent};
+fn trace_events(events: &[Event]) -> Vec<TraceEvent> {
+    let endings = last_task_endings(events);
     events
         .iter()
         .filter_map(|event| match event.event_type {
@@ -1202,8 +414,12 @@ fn trace_events(events: &[Event]) -> Vec<aidaemon_memory::trajectory::TraceEvent
             }
             EventType::ToolCall => {
                 let data = event.parse_data::<ToolCallData>().ok()?;
+                // A row missing its indexed tool name is an old partial
+                // record: its name counts, its arguments are not offered.
+                let whole = event.tool_name.as_deref() == Some(data.name.as_str());
                 Some(TraceEvent::ToolCalled {
                     task_id: event.task_id.clone(),
+                    arguments: whole.then_some(data.arguments),
                     name: data.name,
                     summary: data.summary,
                 })
@@ -1239,18 +455,47 @@ fn trace_events(events: &[Event]) -> Vec<aidaemon_memory::trajectory::TraceEvent
                     .or_else(|| (!data.task_id.is_empty()).then(|| data.task_id.clone()))?;
                 Some(TraceEvent::TaskEnded {
                     task_id,
-                    outcome: match data.effective_outcome() {
-                        TaskOutcome::Succeeded => TaskEnding::Succeeded,
-                        TaskOutcome::Partial => TaskEnding::Partial,
-                        TaskOutcome::Failed => TaskEnding::Failed,
-                    },
+                    outcome: task_ending(data.effective_outcome()),
                     duration_secs: data.duration_secs as f64,
                 })
+            }
+            EventType::UserMessage => {
+                let data = event.parse_data::<UserMessageData>().ok()?;
+                (!data
+                    .annotations
+                    .contains(&MessageAnnotation::InternalContinuation))
+                .then_some(TraceEvent::UserMessage {
+                    content: data.content,
+                    at: event.created_at,
+                })
+            }
+            EventType::DecisionPoint => {
+                let task_id = event.task_id.clone()?;
+                let data = event.parse_data::<DecisionPointData>().ok()?;
+                let task_ending = endings.get(task_id.as_str()).copied().flatten();
+                Some(TraceEvent::DecisionPoint(DecisionPoint {
+                    task_id,
+                    code: data
+                        .code
+                        .unwrap_or_else(|| data.decision_type.as_str().to_string()),
+                    warning: data.severity.is_warning_or_higher(),
+                    details: DecisionDetails::from_metadata(&data.metadata),
+                    task_ending,
+                }))
             }
             _ => None,
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "consolidation_legacy.rs"]
+#[allow(clippy::all)]
+mod legacy;
+
+#[cfg(test)]
+#[path = "consolidation_parity_tests.rs"]
+mod parity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1265,24 +510,6 @@ mod tests {
     use crate::traits::StateStore;
     use serde_json::json;
     use std::sync::Arc;
-
-    // ── truncate tests ──
-
-    #[test]
-    fn test_truncate_short_string() {
-        let result = truncate("hello", 10);
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_string() {
-        let result = truncate("hello world, this is a long string", 10);
-        // max_len=10, saturating_sub(3)=7, so first 7 chars + "..."
-        assert_eq!(result, "hello w...");
-        assert_eq!(result.len(), 10);
-    }
-
-    // ── calculate_importance tests ──
 
     async fn setup_consolidator_test() -> (
         Arc<SqliteStateStore>,
@@ -1300,10 +527,15 @@ mod tests {
         );
         let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
         let plan_store = Arc::new(PlanStore::new(state.pool()).await.expect("plan store"));
-        let consolidator =
-            Consolidator::new(event_store.clone(), plan_store, state.pool(), None, None)
-                .with_state(state.clone() as Arc<dyn StateStore>)
-                .with_memory(state.memory_stores());
+        let consolidator = Consolidator::new(
+            event_store.clone(),
+            plan_store,
+            state.pool(),
+            state.memory_stores(),
+            None,
+            None,
+        )
+        .with_state(state.clone() as Arc<dyn StateStore>);
         (state, event_store, consolidator, db_file)
     }
 
@@ -1419,11 +651,11 @@ mod tests {
                 event_store.clone(),
                 plan_store,
                 state.pool(),
+                state.memory_stores(),
                 Some(runtime),
                 None,
             )
-            .with_state(state.clone() as Arc<dyn StateStore>)
-            .with_memory(state.memory_stores()),
+            .with_state(state.clone() as Arc<dyn StateStore>),
         );
         sqlx::query(
             "INSERT INTO events (session_id, event_type, data, created_at)
@@ -1482,11 +714,11 @@ mod tests {
                 event_store.clone(),
                 plan_store,
                 state.pool(),
+                state.memory_stores(),
                 Some(runtime),
                 None,
             )
-            .with_state(state.clone() as Arc<dyn StateStore>)
-            .with_memory(state.memory_stores()),
+            .with_state(state.clone() as Arc<dyn StateStore>),
         );
 
         // Deliberately use an owner-looking session ID for the mandate: the

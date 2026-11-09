@@ -32,11 +32,11 @@ pub fn build_memory_pipeline(
             event_store.clone(),
             plan_store,
             pool.clone(),
+            memory_store.clone(),
             Some(llm_runtime.clone()),
             Some(embedding_service.clone()),
         )
         .with_state(state.clone())
-        .with_memory(memory_store.clone())
         .with_learning_evidence_gate(config.policy.learning_evidence_gate_enforce),
     );
 
