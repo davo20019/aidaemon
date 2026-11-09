@@ -112,6 +112,227 @@ impl LearningStore for SqliteMemory {
             .await
             .map_err(store_error)
     }
+
+    async fn record_procedure_observation(&self, procedure: &Procedure) -> MemoryResult<()> {
+        self.observe_procedure(procedure).await.map_err(store_error)
+    }
+
+    async fn record_error_solution_observation(
+        &self,
+        solution: &ErrorSolution,
+    ) -> MemoryResult<()> {
+        self.observe_error_solution(solution)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn record_task_outcome(&self, domain: &str, success: bool) -> MemoryResult<()> {
+        self.observe_task_outcome(domain, success)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn procedure_trigger_embeddings(&self) -> MemoryResult<Vec<Vec<f32>>> {
+        let blobs: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT trigger_embedding FROM procedures WHERE trigger_embedding IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| store_error(error.into()))?;
+        Ok(blobs
+            .iter()
+            .filter_map(|blob| decode_embedding(blob).ok())
+            .collect())
+    }
+
+    async fn set_procedure_trigger_embedding(
+        &self,
+        name: &str,
+        embedding: &[f32],
+    ) -> MemoryResult<()> {
+        sqlx::query("UPDATE procedures SET trigger_embedding = ? WHERE name = ?")
+            .bind(encode_embedding(embedding))
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| store_error(error.into()))?;
+        Ok(())
+    }
+
+    async fn procedures_missing_embedding(&self, limit: usize) -> MemoryResult<Vec<(i64, String)>> {
+        sqlx::query_as(
+            "SELECT id, trigger_pattern FROM procedures p
+             WHERE trigger_pattern IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_embeddings me
+                   WHERE me.owner_type = 'procedure' AND me.owner_id = CAST(p.id AS TEXT)
+                     AND me.embedding_purpose = 'trigger' AND me.embedding_model = ?
+                     AND me.stale_at IS NULL
+               )
+             LIMIT ?",
+        )
+        .bind(self.embedding_service.model_id())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| store_error(error.into()))
+    }
+
+    async fn save_procedure_embedding(
+        &self,
+        id: i64,
+        trigger: &str,
+        embedding: Vec<f32>,
+    ) -> MemoryResult<()> {
+        let _ = sqlx::query("UPDATE procedures SET trigger_embedding = ? WHERE id = ?")
+            .bind(encode_embedding(&embedding))
+            .bind(id)
+            .execute(&self.pool)
+            .await;
+        self.upsert_owner_embedding("procedure", id, "trigger", trigger, embedding)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn error_solutions_missing_embedding(
+        &self,
+        limit: usize,
+    ) -> MemoryResult<Vec<(i64, String)>> {
+        sqlx::query_as(
+            "SELECT id, error_pattern FROM error_solutions e
+             WHERE error_pattern IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_embeddings me
+                   WHERE me.owner_type = 'error_solution' AND me.owner_id = CAST(e.id AS TEXT)
+                     AND me.embedding_purpose = 'error' AND me.embedding_model = ?
+                     AND me.stale_at IS NULL
+               )
+             LIMIT ?",
+        )
+        .bind(self.embedding_service.model_id())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| store_error(error.into()))
+    }
+
+    async fn save_error_solution_embedding(
+        &self,
+        id: i64,
+        pattern: &str,
+        embedding: Vec<f32>,
+    ) -> MemoryResult<()> {
+        let _ = sqlx::query("UPDATE error_solutions SET error_embedding = ? WHERE id = ?")
+            .bind(encode_embedding(&embedding))
+            .bind(id)
+            .execute(&self.pool)
+            .await;
+        self.upsert_owner_embedding("error_solution", id, "error", pattern, embedding)
+            .await
+            .map_err(store_error)
+    }
+}
+
+/// What finished tasks taught, written the way the event consolidation
+/// always has, so existing rows keep their meaning.
+impl SqliteMemory {
+    async fn observe_procedure(&self, procedure: &Procedure) -> anyhow::Result<()> {
+        let steps_json = serde_json::to_string(&procedure.steps)?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO procedures (name, trigger_pattern, steps, success_count, failure_count,
+                                    avg_duration_secs, last_used_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                success_count = success_count + 1,
+                last_used_at = excluded.last_used_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&procedure.name)
+        .bind(&procedure.trigger_pattern)
+        .bind(&steps_json)
+        .bind(procedure.success_count)
+        .bind(procedure.failure_count)
+        .bind(procedure.avg_duration_secs)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn observe_error_solution(&self, solution: &ErrorSolution) -> anyhow::Result<()> {
+        let steps_json = solution
+            .solution_steps
+            .as_ref()
+            .map(|steps| serde_json::to_string(steps).unwrap_or_default());
+        let domain = solution.domain.clone().unwrap_or_default();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO error_solutions (error_pattern, domain, solution_summary, solution_steps,
+                                         success_count, failure_count, last_used_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(error_pattern, domain, solution_summary) DO UPDATE SET
+                solution_steps = COALESCE(excluded.solution_steps, error_solutions.solution_steps),
+                success_count = error_solutions.success_count + excluded.success_count,
+                failure_count = error_solutions.failure_count + excluded.failure_count,
+                last_used_at = excluded.last_used_at
+            "#,
+        )
+        .bind(&solution.error_pattern)
+        .bind(&domain)
+        .bind(&solution.solution_summary)
+        .bind(&steps_json)
+        .bind(solution.success_count)
+        .bind(solution.failure_count)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn observe_task_outcome(&self, domain: &str, success: bool) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let outcome_column = if success {
+            "tasks_succeeded"
+        } else {
+            "tasks_failed"
+        };
+        let updated = sqlx::query(&format!(
+            "UPDATE expertise
+             SET tasks_attempted = tasks_attempted + 1,
+                 {outcome_column} = {outcome_column} + 1,
+                 last_task_at = ?,
+                 updated_at = ?
+             WHERE domain = ?"
+        ))
+        .bind(&now)
+        .bind(&now)
+        .bind(domain)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO expertise (domain, tasks_attempted, tasks_succeeded, tasks_failed,
+                                        current_level, confidence_score, last_task_at, created_at, updated_at)
+                 VALUES (?, 1, ?, ?, 'novice', 0.1, ?, ?, ?)",
+            )
+            .bind(domain)
+            .bind(i32::from(success))
+            .bind(i32::from(!success))
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 /// Fading of unrecalled facts, episodes and behavior patterns.

@@ -1882,7 +1882,6 @@ async fn test_fresh_db_migration() {
 /// Verify message importance does not depend on matching keywords.
 #[tokio::test]
 async fn test_message_scoring_keywords() {
-    use crate::memory::scoring::score_message;
     use crate::traits::Message;
 
     let mut msg = Message {
@@ -1898,10 +1897,10 @@ async fn test_message_scoring_keywords() {
         ..Message::runtime_defaults()
     };
 
-    let with_keywords = score_message(&msg);
+    let with_keywords = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
 
     msg.content = Some("I just walked around the block for some exercise".into());
-    let casual = score_message(&msg);
+    let casual = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
 
     // Importance reads structure, not wording: two user messages of the
     // same length class score the same whatever words they use.

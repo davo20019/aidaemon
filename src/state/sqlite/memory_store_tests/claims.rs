@@ -1,9 +1,9 @@
 use super::*;
-use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::traits::FactStore;
 use crate::traits::{ExtractedMemoryEntity, ExtractedMemoryGraph, ExtractedMemoryRelationship};
 use aidaemon_memory::embedding_index::*;
+use aidaemon_memory::encode_embedding;
 use aidaemon_memory::stores::MemoryGraphStore;
 use std::sync::Arc;
 
@@ -471,7 +471,7 @@ async fn exact_index_filters_and_ranks_thousands_of_vectors() {
     let hits = SqliteEmbeddingIndex::new(store.pool.clone())
         .search(
             &[1.0, 0.0],
-            &crate::memory::embedding_index::EmbeddingSearchFilter {
+            &EmbeddingSearchFilter {
                 owner_types: vec!["claim".to_string()],
                 purpose: Some("recall".to_string()),
                 model: Some(EMBEDDING_MODEL_ID.to_string()),

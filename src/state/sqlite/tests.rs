@@ -161,7 +161,7 @@ async fn episode_search_finds_older_than_500_without_counting_a_recall() {
         .embed(query.to_string())
         .await
         .unwrap();
-    let blob = crate::memory::binary::encode_embedding(&embedding);
+    let blob = aidaemon_memory::encode_embedding(&embedding);
     let old = (chrono::Utc::now() - chrono::Duration::days(3_000)).to_rfc3339();
     let matching_id = sqlx::query(
         "INSERT INTO episodes
@@ -5108,7 +5108,7 @@ async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
         .bind(&now)
         .bind(&now)
         .bind(recall)
-        .bind(crate::memory::binary::encode_embedding(&vector))
+        .bind(aidaemon_memory::encode_embedding(&vector))
         .execute(&store.pool)
         .await
         .unwrap();

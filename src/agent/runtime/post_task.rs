@@ -39,7 +39,7 @@ pub(super) async fn process_learning(
     state: &Arc<dyn aidaemon_memory::stores::MemoryStores>,
     ctx: LearningContext,
 ) -> anyhow::Result<()> {
-    use crate::memory::{expertise, procedures};
+    use crate::memory::procedures;
 
     if !ctx.memory_persistence_allowed {
         return Ok(());
@@ -61,7 +61,7 @@ pub(super) async fn process_learning(
     };
 
     // 1. Update expertise for detected domains
-    let domains = expertise::detect_domains(&ctx.intent_domains);
+    let domains = aidaemon_memory::detect_domains(&ctx.intent_domains);
     for domain in &domains {
         let error = if !task_success {
             ctx.errors.first().map(|(e, _)| e.as_str())

@@ -623,7 +623,7 @@ pub(in crate::agent) async fn run_bootstrap(
     // the same text is sent twice or arrives out of order.
     let user_msg = Message {
         content: Some(user_text.to_string()),
-        importance: 0.5, // Will be updated by score_message below
+        importance: 0.5, // Will be updated from turn_importance below
         turn_id: Some(user_msg_id.clone()),
         attachments: ctx.attachments.to_vec(),
         annotations: ctx
@@ -634,7 +634,7 @@ pub(in crate::agent) async fn run_bootstrap(
         ..Message::new_runtime(user_msg_id.clone(), session_id, "user")
     };
     // Calculate heuristic score immediately
-    let score = crate::memory::scoring::score_message(&user_msg);
+    let score = aidaemon_memory::turn_importance(&user_msg.role, user_msg.content.as_deref());
     let mut user_msg = user_msg;
     user_msg.importance = score;
 

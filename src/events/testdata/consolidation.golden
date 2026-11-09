@@ -1,0 +1,1256 @@
+{
+  "models_and_gate": {
+    "behavior_patterns": [
+      [
+        "failure",
+        "Alternating between edit_file <-> terminal with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them. Previous successful recoveries switched to edit_file.",
+        "alternating_pattern_detection:edit_file+terminal",
+        "break_alternating_tool_loops",
+        "0.77",
+        "2"
+      ],
+      [
+        "failure",
+        "Alternating between unknown_pair with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them. Previous successful recoveries switched to edit_file.",
+        "alternating_pattern_detection:unknown_pair",
+        "break_alternating_tool_loops",
+        "0.849999983310699",
+        "2"
+      ],
+      [
+        "failure",
+        "Even varied browser calls can become a loop after 7 consecutive uses; switch tools or summarize progress before continuing. Previous successful recoveries switched to edit_file.",
+        "consecutive_same_tool_detection:browser",
+        "switch_tools_before_long_streaks",
+        "0.589999992847443",
+        "2"
+      ],
+      [
+        "failure",
+        "Long terminal streaks with only 2 distinct argument sets usually indicate a loop; change tools or adjust strategy before continuing. Previous successful recoveries switched to edit_file.",
+        "consecutive_same_tool_detection:terminal",
+        "switch_tools_before_long_streaks",
+        "0.729999978542328",
+        "2"
+      ],
+      [
+        "failure",
+        "When file evidence contradicts itself, re-read the target before claiming completion instead of trusting stale state.",
+        "contradictory_file_evidence",
+        "recheck_conflicting_state_before_completion",
+        "0.820000011920929",
+        "2"
+      ],
+      [
+        "failure",
+        "If the critique pass rejects the first risky action, fix the missing evidence or target assumptions before retrying. Previous successful recoveries switched to edit_file.",
+        "critique_rejected",
+        "address_critique_before_retry",
+        "0.889999945163727",
+        "2"
+      ],
+      [
+        "failure",
+        "When the session is nearing the daily token budget, checkpoint useful progress and stop earlier instead of exhausting the remaining budget.",
+        "daily_token_budget",
+        "checkpoint_before_daily_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.",
+        "execution_budget_exhausted",
+        "reduce_scope_when_budget_exhausts",
+        "0.760000009536743",
+        "2"
+      ],
+      [
+        "failure",
+        "For recurring goal work, avoid spending the full daily budget in one pass; checkpoint progress and defer the rest earlier.",
+        "goal_daily_token_budget",
+        "checkpoint_goal_work_before_daily_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "As the hard iteration cap approaches, stop repeating work and return the best partial answer or next concrete step earlier.",
+        "hard_iteration_cap",
+        "finish_before_hard_iteration_cap",
+        "0.620000023841858",
+        "2"
+      ],
+      [
+        "failure",
+        "Before using edit_file, gather file_read for src/main.rs instead of mutating from memory or inference alone. Previous successful recoveries switched to edit_file.",
+        "missing_pre_execution_evidence:edit_file:file_read",
+        "gather_direct_evidence_before_mutation",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "Before using unknown_tool, gather direct evidence for current target instead of mutating from memory or inference alone. Previous successful recoveries switched to edit_file.",
+        "missing_pre_execution_evidence:unknown_tool:direct evidence",
+        "gather_direct_evidence_before_mutation",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "When the structured first-step plan is rejected, revise the target or first action before executing again. Previous successful recoveries switched to edit_file.",
+        "plan_rejected",
+        "replan_first_risky_step_before_execution",
+        "0.94",
+        "5"
+      ],
+      [
+        "failure",
+        "Repeatedly deferring before taking any tool step leads to failure; ask one concrete clarification question or take the next tool action earlier.",
+        "pre_tool_deferral_stall",
+        "ask_clarifying_question_or_take_next_tool_step",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "After 2 repeated calls to fallback_tool, stop retrying the same operation and pivot to a different tool or summarize the blocker.",
+        "repetitive_call_detection:fallback_tool",
+        "stop_retrying_identical_calls",
+        "0.760000009536743",
+        "2"
+      ],
+      [
+        "failure",
+        "After 4 repeated calls to terminal, stop retrying the same operation and pivot to a different tool or summarize the blocker. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:terminal",
+        "stop_retrying_identical_calls",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "Repeated calls to unknown_tool tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:unknown_tool",
+        "pivot_to_alternate_tool_or_strategy",
+        "0.669999976158142",
+        "2"
+      ],
+      [
+        "failure",
+        "Repeated calls to web_fetch tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:web_fetch",
+        "pivot_to_alternate_tool_or_strategy",
+        "0.709999997615814",
+        "2"
+      ],
+      [
+        "failure",
+        "Scheduled runs should bail out once progress slows; checkpoint the current state instead of burning the full per-run token budget.",
+        "scheduled_run_budget",
+        "checkpoint_scheduled_run_before_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "When the soft iteration warning appears, summarize progress or change strategy instead of continuing the same loop.",
+        "soft_iteration_warning",
+        "adjust_strategy_before_soft_iteration_warning",
+        "0.549999971389771",
+        "2"
+      ],
+      [
+        "failure",
+        "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.",
+        "stall:generic",
+        "summarize_progress_or_change_strategy",
+        "0.779999990463257",
+        "2"
+      ],
+      [
+        "failure",
+        "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.",
+        "stall:no_new_evidence",
+        "summarize_progress_or_change_strategy",
+        "0.779999990463257",
+        "2"
+      ],
+      [
+        "failure",
+        "If write_file attempts to act outside the compiled target scope, stop and confirm the correct repo/file target before retrying.",
+        "target_scope_violation:write_file",
+        "confirm_target_scope_before_mutation",
+        "0.920000035762787",
+        "2"
+      ],
+      [
+        "failure",
+        "Long-running tasks that approach the timeout should checkpoint progress and reduce scope earlier instead of continuing the same loop.",
+        "task_timeout",
+        "checkpoint_and_reduce_scope_before_timeout",
+        "0.739999969005585",
+        "2"
+      ],
+      [
+        "failure",
+        "When task token spend stays high, reduce scope, checkpoint findings, or stop earlier instead of consuming the full task budget.",
+        "task_token_budget",
+        "reduce_token_spend_and_checkpoint",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "High token-spend phases should trigger earlier summarization or scope reduction before the task budget is exhausted.",
+        "task_token_budget_warning",
+        "reduce_token_spend_before_budget_warning",
+        "0.469999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "Once http_request has repeated the same semantic failure 3 times, stop retrying it and switch strategy earlier. Previous successful recoveries switched to edit_file.",
+        "tool_budget_block:http_request",
+        "stop_retrying_blocked_tool",
+        "0.830000002384186",
+        "2"
+      ],
+      [
+        "failure",
+        "After 9 repeated web_search calls without enough progress, stop retrying the blocked tool and switch strategy earlier. Previous successful recoveries switched to edit_file.",
+        "tool_budget_block:web_search",
+        "stop_retrying_blocked_tool",
+        "0.729999978542328",
+        "2"
+      ],
+      [
+        "failure",
+        "Deterministic argument-contract failures on read_file should be corrected locally before retrying the step.",
+        "tool_contract_violation:read_file",
+        "fix_tool_arguments_before_retry",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.",
+        "validation_budget_exhausted",
+        "reduce_scope_when_budget_exhausts",
+        "0.799999971389771",
+        "2"
+      ],
+      [
+        "failure",
+        "Do not claim success while verification is pending; either run the check or surface a precise partial result.",
+        "verification_pending",
+        "run_verification_before_claiming_success",
+        "0.839999992847443",
+        "2"
+      ],
+      [
+        "failure",
+        "Do not claim success while verification is pending; either run the check or surface a precise partial result.",
+        "verification_unavailable_in_phase",
+        "run_verification_before_claiming_success",
+        "0.839999992847443",
+        "2"
+      ]
+    ],
+    "error_solutions": [
+      [
+        "",
+        "web_fetch",
+        "Used web_search to resolve",
+        "[\"found another way\"]",
+        "0",
+        "0",
+        "1",
+        "0"
+      ],
+      [
+        "connection refused at <path>:<line>",
+        "terminal",
+        "Used run_command to resolve",
+        "[\"database started\"]",
+        "3",
+        "1",
+        "1",
+        "0"
+      ],
+      [
+        "unexpected token in configuration",
+        "",
+        "Used edit_file to resolve",
+        "[\"fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configurati...\"]",
+        "0",
+        "0",
+        "1",
+        "0"
+      ]
+    ],
+    "events": [
+      [
+        "owner-looking-mandate",
+        "1",
+        "6"
+      ],
+      [
+        "owner-round-one",
+        "0",
+        "4"
+      ],
+      [
+        "owner-round-one",
+        "1",
+        "186"
+      ],
+      [
+        "owner-round-two",
+        "0",
+        "4"
+      ],
+      [
+        "owner-round-two",
+        "1",
+        "186"
+      ],
+      [
+        "specialist:executor:worker",
+        "1",
+        "5"
+      ]
+    ],
+    "expertise": [
+      [
+        "browser",
+        "2",
+        "0",
+        "2",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "general",
+        "6",
+        "6",
+        "0",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "git",
+        "12",
+        "10",
+        "2",
+        "competent",
+        "0.7",
+        "[\"merge conflict\"]",
+        "1"
+      ],
+      [
+        "research",
+        "2",
+        "2",
+        "0",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "shell",
+        "4",
+        "2",
+        "2",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ]
+    ],
+    "facts": [
+      [
+        "profile",
+        "no_user",
+        "seeded value",
+        "derived",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "city",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "employer",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "derived_one",
+        "seeded value",
+        "derived",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "short",
+        "seeded value",
+        "derived",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "no_index",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "other_tool",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "after_continuation",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "friend_city",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:11+00:00",
+        "Jordan Lee mudó a Quito. ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñand...",
+        "0"
+      ],
+      [
+        "profile",
+        "untouched",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "superseded",
+        "old value",
+        "agent",
+        null,
+        null,
+        "1"
+      ]
+    ],
+    "memory_embeddings": [],
+    "procedures": [
+      [
+        "already-known",
+        "A trigger memory already holds",
+        "[\"x\",\"y\"]",
+        "1",
+        "0",
+        null,
+        "0",
+        "1"
+      ],
+      [
+        "auto_task-res",
+        "Compare hosting prices for Acme Corp",
+        "[\"web_search: prices\",\"web_fetch: ...\"]",
+        "1",
+        "0",
+        "12.0",
+        "1",
+        "1"
+      ],
+      [
+        "auto_task-ski",
+        "Tidy one specific scratch file",
+        "[\"read_file: scratch\",\"edit_file: tidy\"]",
+        "1",
+        "0",
+        "4.0",
+        "1",
+        "1"
+      ],
+      [
+        "auto_task-suc",
+        "an older trigger",
+        "[\"older step\"]",
+        "6",
+        "2",
+        "9.0",
+        "1",
+        "1"
+      ],
+      [
+        "auto_task-two",
+        "Rotate the staging certificates",
+        "[\"terminal: renew\",\"terminal: reload\"]",
+        "1",
+        "0",
+        "8.0",
+        "1",
+        "1"
+      ],
+      [
+        "plan_plan-one",
+        "Publish the Acme Corp newsletter",
+        "[\"write it\",\"review it\",\"send it\"]",
+        "1",
+        "0",
+        null,
+        "1",
+        "1"
+      ],
+      [
+        "plan_plan-two",
+        "A partly finished migration",
+        "[\"dump\",\"load\"]",
+        "1",
+        "0",
+        null,
+        "1",
+        "1"
+      ],
+      [
+        "tested-release",
+        "when shipping a tested release",
+        "[\"run the tests\",\"commit\"]",
+        "1",
+        "0",
+        "30.0",
+        "1",
+        "1"
+      ]
+    ],
+    "results": [
+      [
+        "owner-round-one",
+        "186",
+        "186",
+        "5",
+        "3",
+        "8",
+        "32",
+        "0"
+      ],
+      [
+        "owner-round-one",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "owner-round-two",
+        "186",
+        "186",
+        "2",
+        "3",
+        "8",
+        "32",
+        "0"
+      ],
+      [
+        "owner-round-two",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "owner-looking-mandate",
+        "6",
+        "6",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "specialist:executor:worker",
+        "5",
+        "5",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ]
+    ]
+  },
+  "plain": {
+    "behavior_patterns": [
+      [
+        "failure",
+        "Alternating between edit_file <-> terminal with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them. Previous successful recoveries switched to edit_file.",
+        "alternating_pattern_detection:edit_file+terminal",
+        "break_alternating_tool_loops",
+        "0.77",
+        "2"
+      ],
+      [
+        "failure",
+        "Alternating between unknown_pair with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them. Previous successful recoveries switched to edit_file.",
+        "alternating_pattern_detection:unknown_pair",
+        "break_alternating_tool_loops",
+        "0.849999983310699",
+        "2"
+      ],
+      [
+        "failure",
+        "Even varied browser calls can become a loop after 7 consecutive uses; switch tools or summarize progress before continuing. Previous successful recoveries switched to edit_file.",
+        "consecutive_same_tool_detection:browser",
+        "switch_tools_before_long_streaks",
+        "0.589999992847443",
+        "2"
+      ],
+      [
+        "failure",
+        "Long terminal streaks with only 2 distinct argument sets usually indicate a loop; change tools or adjust strategy before continuing. Previous successful recoveries switched to edit_file.",
+        "consecutive_same_tool_detection:terminal",
+        "switch_tools_before_long_streaks",
+        "0.729999978542328",
+        "2"
+      ],
+      [
+        "failure",
+        "When file evidence contradicts itself, re-read the target before claiming completion instead of trusting stale state.",
+        "contradictory_file_evidence",
+        "recheck_conflicting_state_before_completion",
+        "0.820000011920929",
+        "2"
+      ],
+      [
+        "failure",
+        "If the critique pass rejects the first risky action, fix the missing evidence or target assumptions before retrying. Previous successful recoveries switched to edit_file.",
+        "critique_rejected",
+        "address_critique_before_retry",
+        "0.889999945163727",
+        "2"
+      ],
+      [
+        "failure",
+        "When the session is nearing the daily token budget, checkpoint useful progress and stop earlier instead of exhausting the remaining budget.",
+        "daily_token_budget",
+        "checkpoint_before_daily_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.",
+        "execution_budget_exhausted",
+        "reduce_scope_when_budget_exhausts",
+        "0.760000009536743",
+        "2"
+      ],
+      [
+        "failure",
+        "For recurring goal work, avoid spending the full daily budget in one pass; checkpoint progress and defer the rest earlier.",
+        "goal_daily_token_budget",
+        "checkpoint_goal_work_before_daily_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "As the hard iteration cap approaches, stop repeating work and return the best partial answer or next concrete step earlier.",
+        "hard_iteration_cap",
+        "finish_before_hard_iteration_cap",
+        "0.620000023841858",
+        "2"
+      ],
+      [
+        "failure",
+        "Before using edit_file, gather file_read for src/main.rs instead of mutating from memory or inference alone. Previous successful recoveries switched to edit_file.",
+        "missing_pre_execution_evidence:edit_file:file_read",
+        "gather_direct_evidence_before_mutation",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "Before using unknown_tool, gather direct evidence for current target instead of mutating from memory or inference alone. Previous successful recoveries switched to edit_file.",
+        "missing_pre_execution_evidence:unknown_tool:direct evidence",
+        "gather_direct_evidence_before_mutation",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "When the structured first-step plan is rejected, revise the target or first action before executing again. Previous successful recoveries switched to edit_file.",
+        "plan_rejected",
+        "replan_first_risky_step_before_execution",
+        "0.94",
+        "5"
+      ],
+      [
+        "failure",
+        "Repeatedly deferring before taking any tool step leads to failure; ask one concrete clarification question or take the next tool action earlier.",
+        "pre_tool_deferral_stall",
+        "ask_clarifying_question_or_take_next_tool_step",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "After 2 repeated calls to fallback_tool, stop retrying the same operation and pivot to a different tool or summarize the blocker.",
+        "repetitive_call_detection:fallback_tool",
+        "stop_retrying_identical_calls",
+        "0.760000009536743",
+        "2"
+      ],
+      [
+        "failure",
+        "After 4 repeated calls to terminal, stop retrying the same operation and pivot to a different tool or summarize the blocker. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:terminal",
+        "stop_retrying_identical_calls",
+        "0.869999964237213",
+        "2"
+      ],
+      [
+        "failure",
+        "Repeated calls to unknown_tool tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:unknown_tool",
+        "pivot_to_alternate_tool_or_strategy",
+        "0.669999976158142",
+        "2"
+      ],
+      [
+        "failure",
+        "Repeated calls to web_fetch tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner. Previous successful recoveries switched to edit_file.",
+        "repetitive_call_detection:web_fetch",
+        "pivot_to_alternate_tool_or_strategy",
+        "0.709999997615814",
+        "2"
+      ],
+      [
+        "failure",
+        "Scheduled runs should bail out once progress slows; checkpoint the current state instead of burning the full per-run token budget.",
+        "scheduled_run_budget",
+        "checkpoint_scheduled_run_before_budget_exhaustion",
+        "0.719999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "When the soft iteration warning appears, summarize progress or change strategy instead of continuing the same loop.",
+        "soft_iteration_warning",
+        "adjust_strategy_before_soft_iteration_warning",
+        "0.549999971389771",
+        "2"
+      ],
+      [
+        "failure",
+        "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.",
+        "stall:generic",
+        "summarize_progress_or_change_strategy",
+        "0.779999990463257",
+        "2"
+      ],
+      [
+        "failure",
+        "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.",
+        "stall:no_new_evidence",
+        "summarize_progress_or_change_strategy",
+        "0.779999990463257",
+        "2"
+      ],
+      [
+        "failure",
+        "If write_file attempts to act outside the compiled target scope, stop and confirm the correct repo/file target before retrying.",
+        "target_scope_violation:write_file",
+        "confirm_target_scope_before_mutation",
+        "0.920000035762787",
+        "2"
+      ],
+      [
+        "failure",
+        "Long-running tasks that approach the timeout should checkpoint progress and reduce scope earlier instead of continuing the same loop.",
+        "task_timeout",
+        "checkpoint_and_reduce_scope_before_timeout",
+        "0.739999969005585",
+        "2"
+      ],
+      [
+        "failure",
+        "When task token spend stays high, reduce scope, checkpoint findings, or stop earlier instead of consuming the full task budget.",
+        "task_token_budget",
+        "reduce_token_spend_and_checkpoint",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "High token-spend phases should trigger earlier summarization or scope reduction before the task budget is exhausted.",
+        "task_token_budget_warning",
+        "reduce_token_spend_before_budget_warning",
+        "0.469999988079071",
+        "2"
+      ],
+      [
+        "failure",
+        "Once http_request has repeated the same semantic failure 3 times, stop retrying it and switch strategy earlier. Previous successful recoveries switched to edit_file.",
+        "tool_budget_block:http_request",
+        "stop_retrying_blocked_tool",
+        "0.830000002384186",
+        "2"
+      ],
+      [
+        "failure",
+        "After 9 repeated web_search calls without enough progress, stop retrying the blocked tool and switch strategy earlier. Previous successful recoveries switched to edit_file.",
+        "tool_budget_block:web_search",
+        "stop_retrying_blocked_tool",
+        "0.729999978542328",
+        "2"
+      ],
+      [
+        "failure",
+        "Deterministic argument-contract failures on read_file should be corrected locally before retrying the step.",
+        "tool_contract_violation:read_file",
+        "fix_tool_arguments_before_retry",
+        "0.74000002861023",
+        "2"
+      ],
+      [
+        "failure",
+        "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.",
+        "validation_budget_exhausted",
+        "reduce_scope_when_budget_exhausts",
+        "0.799999971389771",
+        "2"
+      ],
+      [
+        "failure",
+        "Do not claim success while verification is pending; either run the check or surface a precise partial result.",
+        "verification_pending",
+        "run_verification_before_claiming_success",
+        "0.839999992847443",
+        "2"
+      ],
+      [
+        "failure",
+        "Do not claim success while verification is pending; either run the check or surface a precise partial result.",
+        "verification_unavailable_in_phase",
+        "run_verification_before_claiming_success",
+        "0.839999992847443",
+        "2"
+      ]
+    ],
+    "error_solutions": [
+      [
+        "",
+        "web_fetch",
+        "Used web_search to resolve",
+        "[\"found another way\"]",
+        "0",
+        "0",
+        "1",
+        "0"
+      ],
+      [
+        "connection refused at <path>:<line>",
+        "terminal",
+        "Used run_command to resolve",
+        "[\"database started\"]",
+        "3",
+        "1",
+        "1",
+        "0"
+      ],
+      [
+        "unexpected token in configuration",
+        "",
+        "Used edit_file to resolve",
+        "[\"fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configuration fixed configurati...\"]",
+        "0",
+        "0",
+        "1",
+        "0"
+      ]
+    ],
+    "events": [
+      [
+        "owner-looking-mandate",
+        "1",
+        "6"
+      ],
+      [
+        "owner-round-one",
+        "0",
+        "4"
+      ],
+      [
+        "owner-round-one",
+        "1",
+        "186"
+      ],
+      [
+        "owner-round-two",
+        "0",
+        "4"
+      ],
+      [
+        "owner-round-two",
+        "1",
+        "186"
+      ],
+      [
+        "specialist:executor:worker",
+        "1",
+        "5"
+      ]
+    ],
+    "expertise": [
+      [
+        "browser",
+        "2",
+        "0",
+        "2",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "general",
+        "6",
+        "6",
+        "0",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "git",
+        "12",
+        "10",
+        "2",
+        "competent",
+        "0.7",
+        "[\"merge conflict\"]",
+        "1"
+      ],
+      [
+        "research",
+        "2",
+        "2",
+        "0",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ],
+      [
+        "shell",
+        "4",
+        "2",
+        "2",
+        "novice",
+        "0.1",
+        null,
+        "1"
+      ]
+    ],
+    "facts": [
+      [
+        "profile",
+        "no_user",
+        "seeded value",
+        "derived",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "city",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "employer",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "derived_one",
+        "seeded value",
+        "derived",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "short",
+        "seeded value",
+        "derived",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "no_index",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "other_tool",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "after_continuation",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:01+00:00",
+        "Alice Rivera works at Acme Corp and lives in Lisbon",
+        "0"
+      ],
+      [
+        "profile",
+        "friend_city",
+        "seeded value",
+        "user_stated",
+        "2026-03-01T10:00:11+00:00",
+        "Jordan Lee mudó a Quito. ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñand...",
+        "0"
+      ],
+      [
+        "profile",
+        "untouched",
+        "seeded value",
+        "agent",
+        null,
+        null,
+        "0"
+      ],
+      [
+        "profile",
+        "superseded",
+        "old value",
+        "agent",
+        null,
+        null,
+        "1"
+      ]
+    ],
+    "memory_embeddings": [],
+    "procedures": [
+      [
+        "already-known",
+        "A trigger memory already holds",
+        "[\"x\",\"y\"]",
+        "1",
+        "0",
+        null,
+        "0",
+        "1"
+      ],
+      [
+        "auto_task-dup",
+        "A trigger memory already holds",
+        "[\"read_file: a\",\"edit_file: b\"]",
+        "2",
+        "0",
+        "3.0",
+        "1",
+        "0"
+      ],
+      [
+        "auto_task-res",
+        "Compare hosting prices for Acme Corp",
+        "[\"web_search: prices\",\"web_fetch: ...\"]",
+        "2",
+        "0",
+        "12.0",
+        "1",
+        "0"
+      ],
+      [
+        "auto_task-ski",
+        "Tidy one specific scratch file",
+        "[\"read_file: scratch\",\"edit_file: tidy\"]",
+        "2",
+        "0",
+        "4.0",
+        "1",
+        "0"
+      ],
+      [
+        "auto_task-suc",
+        "an older trigger",
+        "[\"older step\"]",
+        "7",
+        "2",
+        "9.0",
+        "1",
+        "0"
+      ],
+      [
+        "auto_task-two",
+        "Rotate the staging certificates",
+        "[\"terminal: renew\",\"terminal: reload\"]",
+        "2",
+        "0",
+        "8.0",
+        "1",
+        "0"
+      ],
+      [
+        "plan_plan-dup",
+        "Publish the Acme Corp newsletter",
+        "[\"again\",\"and again\"]",
+        "2",
+        "0",
+        null,
+        "1",
+        "0"
+      ],
+      [
+        "plan_plan-one",
+        "Publish the Acme Corp newsletter",
+        "[\"write it\",\"review it\",\"send it\"]",
+        "2",
+        "0",
+        null,
+        "1",
+        "0"
+      ],
+      [
+        "plan_plan-two",
+        "A partly finished migration",
+        "[\"dump\",\"load\"]",
+        "2",
+        "0",
+        null,
+        "1",
+        "0"
+      ]
+    ],
+    "results": [
+      [
+        "owner-round-one",
+        "186",
+        "186",
+        "8",
+        "3",
+        "8",
+        "32",
+        "0"
+      ],
+      [
+        "owner-round-one",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "owner-round-two",
+        "186",
+        "186",
+        "8",
+        "3",
+        "8",
+        "32",
+        "0"
+      ],
+      [
+        "owner-round-two",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "owner-looking-mandate",
+        "6",
+        "6",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      [
+        "specialist:executor:worker",
+        "5",
+        "5",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+      ]
+    ]
+  }
+}

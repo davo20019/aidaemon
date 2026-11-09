@@ -2,6 +2,32 @@ use super::*;
 
 #[async_trait]
 impl EpisodeStore for SqliteMemory {
+    async fn last_episode_bound(&self, session_id: &str) -> anyhow::Result<Option<EpisodeBound>> {
+        let row = sqlx::query(
+            "SELECT end_event_id, end_time FROM episodes
+             WHERE session_id = ?
+             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| EpisodeBound {
+            end_event_id: row.try_get::<Option<i64>, _>("end_event_id").ok().flatten(),
+            end_time: row.try_get::<String, _>("end_time").ok(),
+        }))
+    }
+
+    async fn latest_episode_ends(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT session_id, MAX(end_time) FROM episodes GROUP BY session_id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(session_id, end)| end.map(|end| (session_id, end)))
+            .collect())
+    }
+
     /// Insert the episode with the event span it covers, then embed its
     /// summary and project it into the memory index. Multiple episodes per
     /// session are allowed (mid-session ones for long conversations, then a
@@ -254,5 +280,70 @@ impl EpisodeStore for SqliteMemory {
             .map(|(episode, _)| episode)
             .collect();
         Ok(episodes)
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    async fn memory() -> SqliteMemory {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        SqliteMemory::new(pool, Arc::new(crate::HashEmbedder::new(384)))
+    }
+
+    async fn episode(memory: &SqliteMemory, session: &str, end: &str, end_event: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO episodes (session_id, summary, importance, message_count,
+                                   start_time, end_time, created_at, end_event_id)
+             VALUES (?1, 'summary', 0.5, 5, ?2, ?2, ?2, ?3)",
+        )
+        .bind(session)
+        .bind(end)
+        .bind(end_event)
+        .execute(&memory.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_is_bounded_by_its_last_episode() {
+        let memory = memory().await;
+        assert_eq!(memory.last_episode_bound("s1").await.unwrap(), None);
+        episode(&memory, "s1", "2026-01-02T00:00:00+00:00", None).await;
+        assert_eq!(
+            memory.last_episode_bound("s1").await.unwrap(),
+            Some(EpisodeBound {
+                end_event_id: None,
+                end_time: Some("2026-01-02T00:00:00+00:00".into()),
+            })
+        );
+        // A recorded event bound outranks a later end time without one.
+        episode(&memory, "s1", "2026-01-01T00:00:00+00:00", Some(7)).await;
+        episode(&memory, "s1", "2026-01-03T00:00:00+00:00", None).await;
+        let bound = memory.last_episode_bound("s1").await.unwrap().unwrap();
+        assert_eq!(bound.end_event_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn latest_ends_take_the_newest_per_session() {
+        let memory = memory().await;
+        episode(&memory, "s1", "2026-01-01T00:00:00+00:00", None).await;
+        episode(&memory, "s1", "2026-01-05T00:00:00+00:00", None).await;
+        episode(&memory, "s\"2", "2026-01-02T00:00:00+00:00", None).await;
+        let mut ends = memory.latest_episode_ends().await.unwrap();
+        ends.sort();
+        assert_eq!(
+            ends,
+            [
+                ("s\"2".to_string(), "2026-01-02T00:00:00+00:00".to_string()),
+                ("s1".to_string(), "2026-01-05T00:00:00+00:00".to_string()),
+            ]
+        );
     }
 }

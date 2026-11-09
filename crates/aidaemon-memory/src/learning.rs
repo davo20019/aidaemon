@@ -9,8 +9,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
-use crate::error::Result;
+use crate::embed::Embedder;
+use crate::error::{MemoryError, Result};
 
 /// User communication style preferences.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -182,6 +184,145 @@ pub trait LearningStore: Send + Sync {
     async fn update_error_solution_outcome(&self, _solution_id: i64, _success: bool) -> Result<()> {
         Ok(())
     }
+
+    /// Record a procedure seen in a finished task. Unlike
+    /// [`upsert_procedure`](Self::upsert_procedure), a name already known
+    /// keeps its stored trigger, steps and failure count and gains exactly
+    /// one success, so a later sighting cannot rewrite a definition.
+    async fn record_procedure_observation(&self, procedure: &Procedure) -> Result<()> {
+        self.upsert_procedure(procedure).await.map(|_| ())
+    }
+
+    /// Record an error followed by a recovery. The pair is stored as given
+    /// (no further normalization) and is embedded later, in the background.
+    async fn record_error_solution_observation(&self, solution: &ErrorSolution) -> Result<()> {
+        self.insert_error_solution(solution).await.map(|_| ())
+    }
+
+    /// Count a finished task toward a domain. Unlike
+    /// [`increment_expertise`](Self::increment_expertise), this only moves
+    /// the counters; the level and confidence stay as stored.
+    async fn record_task_outcome(&self, domain: &str, success: bool) -> Result<()> {
+        self.increment_expertise(domain, success, None).await
+    }
+
+    /// The trigger embeddings of the stored procedures, to spot duplicates.
+    async fn procedure_trigger_embeddings(&self) -> Result<Vec<Vec<f32>>> {
+        Ok(vec![])
+    }
+
+    /// Set the trigger embedding of the procedure with this name.
+    async fn set_procedure_trigger_embedding(&self, _name: &str, _embedding: &[f32]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Up to `limit` procedures `(id, trigger)` with no current embedding.
+    async fn procedures_missing_embedding(&self, _limit: usize) -> Result<Vec<(i64, String)>> {
+        Ok(vec![])
+    }
+
+    /// Store a procedure's trigger embedding, computed over `trigger`.
+    async fn save_procedure_embedding(
+        &self,
+        _id: i64,
+        _trigger: &str,
+        _embedding: Vec<f32>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Up to `limit` error solutions `(id, pattern)` with no current embedding.
+    async fn error_solutions_missing_embedding(&self, _limit: usize) -> Result<Vec<(i64, String)>> {
+        Ok(vec![])
+    }
+
+    /// Store an error solution's embedding, computed over `pattern`.
+    async fn save_error_solution_embedding(
+        &self,
+        _id: i64,
+        _pattern: &str,
+        _embedding: Vec<f32>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Embeddings computed per background pass, per kind of row.
+const EMBEDDING_BACKFILL_BATCH: usize = 10;
+
+/// Embed the procedures and error solutions that have no current embedding,
+/// one batch of each. Returns whether there was anything to do.
+pub async fn backfill_learning_embeddings<S>(store: &S, embedder: &dyn Embedder) -> Result<bool>
+where
+    S: LearningStore + ?Sized,
+{
+    let procedures = store
+        .procedures_missing_embedding(EMBEDDING_BACKFILL_BATCH)
+        .await?;
+    if !procedures.is_empty() {
+        info!(
+            "Generating trigger embeddings for {} procedures",
+            procedures.len()
+        );
+    }
+    let mut did_work = !procedures.is_empty();
+    for (id, trigger) in procedures {
+        let trigger = trigger.trim();
+        if trigger.is_empty() {
+            continue;
+        }
+        match embedding_of(embedder, trigger).await {
+            Ok(embedding) => {
+                if let Err(error) = store.save_procedure_embedding(id, trigger, embedding).await {
+                    warn!(procedure_id = id, %error, "Failed to project procedure embedding");
+                }
+            }
+            Err(error) => {
+                warn!(procedure_id = id, %error, "Failed to generate trigger embedding for procedure");
+            }
+        }
+    }
+
+    let solutions = store
+        .error_solutions_missing_embedding(EMBEDDING_BACKFILL_BATCH)
+        .await?;
+    if !solutions.is_empty() {
+        info!(
+            "Generating embeddings for {} error solutions",
+            solutions.len()
+        );
+    }
+    did_work |= !solutions.is_empty();
+    for (id, pattern) in solutions {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        match embedding_of(embedder, pattern).await {
+            Ok(embedding) => {
+                if let Err(error) = store
+                    .save_error_solution_embedding(id, pattern, embedding)
+                    .await
+                {
+                    warn!(error_solution_id = id, %error, "Failed to project error-solution embedding");
+                }
+            }
+            Err(error) => {
+                warn!(error_solution_id = id, %error, "Failed to generate embedding for error solution");
+            }
+        }
+    }
+    Ok(did_work)
+}
+
+/// The embedding of one text.
+pub(crate) async fn embedding_of(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>> {
+    embedder
+        .embed(&[text.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| MemoryError::Embedding("embedder returned no vector".to_string()))
 }
 
 /// Calculate expertise level based on success/failure counts.

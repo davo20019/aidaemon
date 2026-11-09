@@ -470,11 +470,24 @@ Order:
         (heartbeat jobs, idle/long session selection, embedding backfill,
         goal review).
         Remaining, in order:
-        1. A task-trajectory contract (a session's unconsolidated tasks:
-           request, tool calls with results, outcome, errors, decision
-           points, completed plans), close to kernel receipts, and the port
-           of `events/consolidation.rs` (procedures, error solutions,
-           expertise, failure patterns, event episodes, the pruner) onto it.
+        1. Done 2026-11-09: a task-trajectory contract
+           (`aidaemon_memory::trajectory`: `TraceEvent`, typed
+           `DecisionPoint`, `CompletedPlan`) and `TaskLearner`, which takes
+           a trace and writes procedures, error solutions, expertise,
+           failure patterns and fact provenance through the stores.
+           `Consolidator` only filters events (isolated sessions, suppressed
+           tasks), converts them, looks up plans, calls the learner and marks
+           the events; `retire_session` and `Pruner` stay there, because
+           marking events is the host's. There are no event episodes to port:
+           `MemoryManager` makes all of them. The `remember_fact` check moved
+           into the learner, so a replacing system never runs it. All SQL on
+           memory tables left `events/consolidation.rs` and
+           `memory/manager.rs` for `aidaemon_memory::sqlite`, behind store
+           methods with defaults; the re-export shims in `src/memory/` are
+           gone. Parity: `2a590d0` holds both paths and a test that runs them
+           over one synthetic history on separate in-memory databases and
+           compares the rows; `078c4cc` deletes the old path and keeps the
+           expected rows in `src/events/testdata/consolidation.golden`.
         2. (was 3, below)
         3. Done 2026-11-09 (`159bee6`, `643a42d`): the SQLite stores are
            `aidaemon_memory::sqlite::SqliteMemory`, and the crate creates

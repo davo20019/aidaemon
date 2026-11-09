@@ -467,6 +467,29 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
 
 #[async_trait]
 impl FactStore for SqliteMemory {
+    async fn stamp_fact_provenance(
+        &self,
+        category: &str,
+        key: &str,
+        source: &str,
+        first_seen_at: Option<DateTime<Utc>>,
+        source_excerpt: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE facts
+             SET source = ?, first_seen_at = ?, source_excerpt = ?
+             WHERE category = ? AND key = ? AND superseded_at IS NULL",
+        )
+        .bind(source)
+        .bind(first_seen_at.map(|at| at.to_rfc3339()))
+        .bind(source_excerpt)
+        .bind(category)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn reconcile_personal_memory(
         &self,
         write: &crate::records::PersonalMemoryWrite,
