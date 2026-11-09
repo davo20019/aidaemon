@@ -230,9 +230,19 @@ impl SideCallGateway {
         mut request: sdk::ModelRequest,
     ) -> Result<(sdk::ModelResponse, String), SideCallError> {
         // No side call gets tools, whichever door the request came through.
+        // `None`, not the default `Auto`: with no tools, `Auto` lets a
+        // backend add its own (Google turns on search grounding).
         request.tools.clear();
-        request.tool_choice = sdk::ToolChoice::default();
+        request.tool_choice = sdk::ToolChoice::None;
         let log = AttemptLog::default();
+        // A caller that drops this future (its own timeout, a cancelled
+        // `select!` arm) still gets a row for every attempt.
+        let guard = DropRecorder {
+            gateway: self.clone(),
+            spec,
+            log: log.clone(),
+            armed: true,
+        };
         let started = Instant::now();
         let result =
             match tokio::time::timeout(spec.deadline, self.attempt(&spec, &request, &log)).await {
@@ -241,6 +251,7 @@ impl SideCallGateway {
             };
         self.record(&spec, &request.model, &log, &result, started.elapsed())
             .await;
+        guard.disarm();
         result
     }
 
@@ -307,21 +318,37 @@ impl SideCallGateway {
         result: &Result<(sdk::ModelResponse, String), SideCallError>,
         elapsed: Duration,
     ) {
-        let attempts =
-            std::mem::take(&mut *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-        let session = format!("background:{}", spec.purpose);
         let unfinished = match result {
             Err(error @ SideCallError::Deadline(_)) => error.to_string(),
             _ => "abandoned without an answer at its step deadline".to_string(),
         };
-        if attempts.is_empty() {
+        let no_attempts = log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if no_attempts {
             if let Err(error) = result {
-                self.record_failure(&session, spec, model, &error.to_string(), elapsed)
+                self.record_failure(spec, model, &error.to_string(), elapsed)
                     .await;
             }
             return;
         }
-        for attempt in attempts {
+        self.record_attempts(spec, log, &unfinished).await;
+    }
+
+    /// Writes and removes the logged attempts one at a time, so an attempt
+    /// is written once even if the caller drops the call mid-way (the drop
+    /// guard writes what is left).
+    async fn record_attempts(&self, spec: &SideCallSpec, log: &AttemptLog, unfinished: &str) {
+        let session = format!("background:{}", spec.purpose);
+        loop {
+            let attempt = {
+                let mut attempts = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if attempts.is_empty() {
+                    break;
+                }
+                attempts.remove(0)
+            };
             match attempt.finished {
                 Some((elapsed, Ok(response))) => {
                     crate::events::record_background_model_call_telemetry(
@@ -336,15 +363,14 @@ impl SideCallGateway {
                     .await;
                 }
                 Some((elapsed, Err(error))) => {
-                    self.record_failure(&session, spec, &attempt.model, &error, elapsed)
+                    self.record_failure(spec, &attempt.model, &error, elapsed)
                         .await;
                 }
                 None => {
                     self.record_failure(
-                        &session,
                         spec,
                         &attempt.model,
-                        &unfinished,
+                        unfinished,
                         attempt.started.elapsed(),
                     )
                     .await;
@@ -355,7 +381,6 @@ impl SideCallGateway {
 
     async fn record_failure(
         &self,
-        session: &str,
         spec: &SideCallSpec,
         model: &str,
         error: &str,
@@ -365,13 +390,63 @@ impl SideCallGateway {
         crate::events::record_background_model_call_failure(
             self.event_store.clone(),
             self.state.as_ref(),
-            session,
+            &format!("background:{}", spec.purpose),
             spec.purpose,
             model,
             error,
             elapsed,
         )
         .await;
+    }
+}
+
+/// What an attempt that never ended is recorded as when the caller drops
+/// the side call.
+const DROPPED_BY_CALLER: &str = "dropped by the caller before an answer";
+
+/// Records the attempts of a side call whose caller dropped it before the
+/// gateway wrote its rows. Disarmed once the rows are written.
+struct DropRecorder {
+    gateway: SideCallGateway,
+    spec: SideCallSpec,
+    log: AttemptLog,
+    armed: bool,
+}
+
+impl DropRecorder {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DropRecorder {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pending = !self
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if !pending {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                purpose = self.spec.purpose,
+                "side call dropped outside a runtime; its attempts go unrecorded"
+            );
+            return;
+        };
+        let gateway = self.gateway.clone();
+        let spec = self.spec;
+        let log = self.log.clone();
+        handle.spawn(async move {
+            gateway
+                .record_attempts(&spec, &log, DROPPED_BY_CALLER)
+                .await;
+        });
     }
 }
 
@@ -777,6 +852,89 @@ mod tests {
         let seen = scripted.requests();
         assert_eq!(seen.len(), 1);
         assert!(seen[0].tools.is_empty());
-        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::Auto);
+        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::None);
+    }
+
+    /// The judge path sends no tools and `ToolChoice::None` too.
+    #[tokio::test]
+    async fn a_safety_judge_never_sends_tools() {
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([])
+                .then_repeat(aidaemon_core::testing::text("fine")),
+        );
+        let (gateway, _events) = gateway_with(scripted.clone()).await;
+        gateway
+            .ask(
+                SideCall::CommandRisk,
+                &user("rm -rf build"),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::None);
+    }
+
+    /// Waits (real time) until `purpose` has `want` failed rows.
+    async fn wait_for_failed_rows(events: &EventStore, purpose: &str, want: usize) -> usize {
+        for _ in 0..200 {
+            let found = failed_calls(events, purpose).await;
+            if found >= want {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        failed_calls(events, purpose).await
+    }
+
+    /// A caller's own timeout drops the call before the gateway's deadline;
+    /// the open attempt still gets its failed row, written once.
+    #[tokio::test]
+    async fn a_call_dropped_by_its_caller_is_recorded_once() {
+        for call in [SideCall::BackgroundInterpretation, SideCall::CommandRisk] {
+            let (gateway, events) = gateway_with(provider_hanging()).await;
+            let purpose = call.spec().purpose;
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(200),
+                gateway.ask(call, &user("hello"), &Default::default(), None),
+            )
+            .await;
+            assert!(
+                dropped.is_err(),
+                "{purpose}: the caller's timeout fires first"
+            );
+            assert_eq!(
+                wait_for_failed_rows(&events, purpose, 1).await,
+                1,
+                "{purpose}"
+            );
+            // Nothing else lands later.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(failed_calls(&events, purpose).await, 1, "{purpose}");
+            assert_eq!(ok_calls(&events, purpose).await, 0, "{purpose}");
+            let models = failed_call_models(&events, purpose).await;
+            assert_eq!(models, ["primary-model"], "{purpose}");
+        }
+    }
+
+    /// A call that completes writes its one ok row and nothing more.
+    #[tokio::test]
+    async fn a_completed_call_is_not_recorded_again_on_drop() {
+        let (gateway, events) = gateway_with(provider_answering("fine")).await;
+        gateway
+            .ask(
+                SideCall::BackgroundInterpretation,
+                &user("hello"),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(ok_calls(&events, "background_interpretation").await, 1);
+        assert_eq!(failed_calls(&events, "background_interpretation").await, 0);
     }
 }

@@ -500,6 +500,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].max_output_tokens, Some(1024));
         assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::None);
     }
 
     #[tokio::test]
