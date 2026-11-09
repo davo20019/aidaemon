@@ -8,6 +8,7 @@ use aidaemon_channels::testing::{direct, group, message, TestChannel};
 use aidaemon_channels::ChannelEvent;
 use aidaemon_channels::{
     AccessPolicy, ApprovalAnswer, ApprovalStore, Attachment, ChannelError, ChannelRunner,
+    ChannelRunnerBuilder, CommandContext, CommandHandler, CommandInvocation, CommandReply,
     EventRouter, MemoryApprovalStore, MemorySessionIndex, RunnerBuildError, RunnerConfig,
     SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
 };
@@ -146,6 +147,8 @@ struct Setup {
     deploys: Arc<AtomicUsize>,
     notifies: Arc<AtomicUsize>,
     enforce_untrusted: bool,
+    #[allow(clippy::type_complexity)]
+    customize: Option<Box<dyn FnOnce(ChannelRunnerBuilder) -> ChannelRunnerBuilder>>,
 }
 
 impl Setup {
@@ -162,7 +165,16 @@ impl Setup {
             deploys: Arc::new(AtomicUsize::new(0)),
             notifies: Arc::new(AtomicUsize::new(0)),
             enforce_untrusted: false,
+            customize: None,
         }
+    }
+
+    fn with(
+        mut self,
+        customize: impl FnOnce(ChannelRunnerBuilder) -> ChannelRunnerBuilder + 'static,
+    ) -> Self {
+        self.customize = Some(Box::new(customize));
+        self
     }
 
     /// Run with the real untrusted-content rule.
@@ -211,6 +223,9 @@ impl Setup {
         }
         if let Some(approvals) = &self.approvals {
             builder = builder.approval_store(approvals.clone() as Arc<dyn ApprovalStore>);
+        }
+        if let Some(customize) = self.customize {
+            builder = customize(builder);
         }
         let runner = builder.build().expect("runner builds");
         let shutdown = CancellationToken::new();
@@ -283,7 +298,318 @@ fn fallback_id(texts: &[String]) -> Option<String> {
     })
 }
 
+fn agent_for(provider: Arc<dyn Provider>) -> Agent {
+    Agent::builder("assistant")
+        .allow_unguarded()
+        .provider(provider)
+        .model("synthetic-model")
+        .build()
+        .expect("agent builds")
+}
+
+/// A handler that says what it was given.
+async fn echo_context(context: CommandContext) -> CommandReply {
+    CommandReply::text(format!(
+        "{} [{}] from {} as {:?} in {}",
+        context.name, context.args, context.sender.id, context.role, context.session_id
+    ))
+}
+
+struct StructHandler;
+
+#[async_trait]
+impl CommandHandler for StructHandler {
+    async fn handle(&self, _context: CommandContext) -> CommandReply {
+        CommandReply::text("from a struct")
+    }
+}
+
+fn invocation(name: &str, args: &str, sender: &str, conversation: &str) -> ChannelEvent {
+    ChannelEvent::Command(CommandInvocation {
+        conversation: direct(conversation),
+        sender: aidaemon_channels::testing::sender(sender),
+        name: name.to_string(),
+        args: args.to_string(),
+        handle: format!("handle-{name}"),
+    })
+}
+
 // ---------- tests ----------
+
+#[tokio::test]
+async fn latex_in_the_answer_is_rewritten_outside_code() {
+    let provider = scripted(vec![text(r"So $x^2 \times y$ but `$x^2$` stays.")]);
+    let run = Setup::new(provider).start();
+    run.say("chat-tex", "math?");
+    assert!(run.wait_text("chat-tex", "stays").await);
+    assert_eq!(
+        run.channel.sent_texts("chat-tex"),
+        vec!["So x² × y but `$x^2$` stays."]
+    );
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_channel_can_opt_out_of_latex_rewriting() {
+    let provider = scripted(vec![text("So $x^2$ stays.")]);
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_latex_stripping(false))
+        .start();
+    run.say("chat-tex", "math?");
+    assert!(run.wait_text("chat-tex", "stays").await);
+    assert_eq!(run.channel.sent_texts("chat-tex"), vec!["So $x^2$ stays."]);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_display_name_is_never_identity() {
+    let provider = scripted(vec![text("never")]);
+    let run = Setup::new(provider.clone()).start();
+    // The name of an owner, and the owner's id, as somebody else's name.
+    for name in [OWNER, "Alice Rivera (owner)"] {
+        let mut hostile = message(direct("chat-name"), STRANGER, "hello");
+        hostile.sender.display_name = Some(name.to_string());
+        run.channel.inject_message(hostile);
+    }
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| c.sent_texts("chat-name").len() == 2)
+            .await
+    );
+    assert!(provider.requests().is_empty(), "both were refused");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_host_command_runs_after_the_access_check() {
+    let provider = scripted(vec![text("never")]);
+    let run = Setup::new(provider.clone())
+        .with(|builder| builder.command("uptime", "How long the host has been up", echo_context))
+        .start();
+    run.say("chat-cmd", "/UPTIME@my_bot  three days ");
+    assert!(run.wait_text("chat-cmd", "uptime [three days]").await);
+    assert!(run.wait_text("chat-cmd", OWNER).await);
+    assert!(run.wait_text("chat-cmd", "telegram:chat-cmd").await);
+
+    run.channel
+        .inject_message(message(direct("chat-no"), STRANGER, "/uptime"));
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| !c.sent_texts("chat-no").is_empty())
+            .await
+    );
+    assert_eq!(
+        run.channel.sent_texts("chat-no"),
+        vec![aidaemon_channels::DEFAULT_REFUSAL]
+    );
+    assert!(provider.requests().is_empty(), "commands skip the model");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_menu_invocation_is_refused_before_anything_else() {
+    let provider = scripted(vec![text("never")]);
+    let run = Setup::new(provider.clone())
+        .with(|builder| builder.command("uptime", "How long", echo_context))
+        .start();
+    run.channel
+        .inject(invocation("uptime", "", STRANGER, "chat-m1"));
+    run.channel
+        .inject(invocation("new", "", STRANGER, "chat-m2"));
+    run.channel
+        .inject(invocation("whatever", "", STRANGER, "chat-m3"));
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| c.command_answers().len() == 3)
+            .await,
+        "{:?}",
+        run.channel.command_answers()
+    );
+    for (_, answer) in run.channel.command_answers() {
+        assert_eq!(answer, aidaemon_channels::DEFAULT_REFUSAL);
+    }
+    assert!(provider.requests().is_empty());
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_menu_invocation_gets_the_handlers_answer() {
+    let provider = scripted(vec![text("never")]);
+    let run = Setup::new(provider)
+        .with(|builder| {
+            builder
+                .command("uptime", "How long", echo_context)
+                .command("quiet", "Says nothing", |_: CommandContext| async {
+                    CommandReply::Silent
+                })
+                .command("structured", "A struct", StructHandler)
+                .command("broken", "Panics", |_: CommandContext| async {
+                    panic!("synthetic handler failure");
+                    #[allow(unreachable_code)]
+                    CommandReply::Silent
+                })
+        })
+        .start();
+    for (name, args) in [
+        ("uptime", " a b "),
+        ("quiet", ""),
+        ("structured", ""),
+        ("broken", ""),
+    ] {
+        run.channel.inject(invocation(name, args, OWNER, "chat-m"));
+    }
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| c.command_answers().len() == 4)
+            .await
+    );
+    let answers: std::collections::HashMap<_, _> =
+        run.channel.command_answers().into_iter().collect();
+    assert!(answers["handle-uptime"].starts_with("uptime [a b] from"));
+    assert_eq!(answers["handle-quiet"], "Done.");
+    assert_eq!(answers["handle-structured"], "from a struct");
+    assert_eq!(answers["handle-broken"], "That command failed.");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_commands_go_to_the_agent_as_text() {
+    let provider = scripted(vec![text("Noted.")]);
+    let run = Setup::new(provider.clone())
+        .with(|builder| builder.command("uptime", "How long", echo_context))
+        .start();
+    run.say("chat-unknown", "/what is this");
+    assert!(run.wait_text("chat-unknown", "Noted.").await);
+    assert_eq!(user_texts(&provider.requests()[0]), vec!["/what is this"]);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_slow_command_does_not_hold_up_the_channel() {
+    let provider = scripted(vec![text("fast answer")]);
+    let gate = Arc::new(Semaphore::new(0));
+    let held = gate.clone();
+    let run = Setup::new(provider)
+        .with(move |builder| {
+            builder.command("slow", "Waits", move |_: CommandContext| {
+                let held = held.clone();
+                async move {
+                    let _permit = held.acquire().await;
+                    CommandReply::text("slow answer")
+                }
+            })
+        })
+        .start();
+    run.say("chat-slow", "/slow");
+    run.say("chat-slow", "hello");
+    assert!(run.wait_text("chat-slow", "fast answer").await);
+    gate.add_permits(1);
+    assert!(run.wait_text("chat-slow", "slow answer").await);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn the_menu_offers_builtins_and_host_commands() {
+    let provider = scripted(vec![]);
+    let run = Setup::new(provider)
+        .channel(TestChannel::new("telegram").with_commands(true))
+        .with(|builder| builder.command("uptime", "How long", echo_context))
+        .start();
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| c.registered_commands().is_some())
+            .await
+    );
+    let names: Vec<String> = run
+        .channel
+        .registered_commands()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["stop", "new", "status", "approve", "deny", "uptime"],
+        "a channel without buttons answers prompts with commands"
+    );
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn buttons_keep_approve_and_deny_off_the_menu() {
+    let provider = scripted(vec![]);
+    let run = Setup::new(provider)
+        .channel(
+            TestChannel::new("telegram")
+                .with_commands(true)
+                .with_buttons(true),
+        )
+        .start();
+    assert!(
+        run.channel
+            .wait_for(WAIT, |c| c.registered_commands().is_some())
+            .await
+    );
+    let names: Vec<String> = run
+        .channel
+        .registered_commands()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, vec!["stop", "new", "status"]);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_channel_without_a_menu_is_not_asked_to_register() {
+    let provider = scripted(vec![text("hi")]);
+    let run = Setup::new(provider).start();
+    run.say("chat-menu", "hello");
+    assert!(run.wait_text("chat-menu", "hi").await);
+    assert!(run.channel.registered_commands().is_none());
+    run.stop().await;
+}
+
+#[test]
+fn bad_commands_are_refused_at_build() {
+    let build = |name: &str, description: &str| {
+        let provider: Arc<dyn Provider> = scripted(vec![]);
+        ChannelRunner::builder(agent_for(provider))
+            .channel(Arc::new(TestChannel::new("telegram")))
+            .command(name, description, echo_context)
+            .build()
+            .map(|_| ())
+    };
+    assert_eq!(build("uptime", "How long"), Ok(()));
+    for (name, description) in [
+        ("", "Empty name"),
+        ("9lives", "Starts with a digit"),
+        ("Upper", "Upper case"),
+        ("has space", "Space"),
+        ("has-dash", "Dash"),
+        (&"x".repeat(33), "Too long"),
+        ("stop", "Replaces a built-in"),
+        ("approve", "Replaces a built-in the menu may hide"),
+        ("blank", "   "),
+        ("wordy", &"d".repeat(101)),
+    ] {
+        assert!(
+            matches!(
+                build(name, description),
+                Err(RunnerBuildError::InvalidConfig(_))
+            ),
+            "{name:?} {description:?}"
+        );
+    }
+    let provider: Arc<dyn Provider> = scripted(vec![]);
+    let twice = ChannelRunner::builder(agent_for(provider))
+        .channel(Arc::new(TestChannel::new("telegram")))
+        .command("uptime", "One", echo_context)
+        .command("uptime", "Two", echo_context)
+        .build();
+    assert!(matches!(twice, Err(RunnerBuildError::InvalidConfig(_))));
+}
 
 #[tokio::test]
 async fn direct_message_round_trip() {

@@ -22,6 +22,7 @@ async fn test_channel_with_every_capability_conforms() {
             .with_buttons(true)
             .with_typing(true)
             .with_files(true)
+            .with_commands(true)
             .with_max_len(500),
     );
     let harness = TestChannelHarness::new(channel.clone());
@@ -40,8 +41,9 @@ async fn test_channel_without_optional_capabilities_conforms() {
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
     assert!(report.passed_check(channel_checks::BUTTON_PRESS_ROUND_TRIP));
-    // Buttons (2), long edits and download limits have nothing to test.
-    assert_eq!(report.notes.len(), 4, "{report}");
+    // Buttons (2), long edits, download limits and the menu have nothing
+    // to test.
+    assert_eq!(report.notes.len(), 5, "{report}");
 }
 
 /// A channel that lies about its capabilities and ignores shutdown: the

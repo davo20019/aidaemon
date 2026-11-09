@@ -15,12 +15,14 @@
 
 mod approvals;
 pub mod channel;
+pub mod commands;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 #[cfg(feature = "http")]
 pub mod download;
 mod inbound_files;
 pub mod latex;
+pub mod names;
 pub mod policy;
 mod render;
 pub mod router;
@@ -38,6 +40,8 @@ pub use channel::{
     ConversationKind, InboundMessage, MessageRef, OutboundFile, OutboundMessage, Sender,
     DEFAULT_MAX_DOWNLOAD_BYTES,
 };
+pub use commands::{builtin_commands, CommandContext, CommandHandler, CommandReply};
+pub use names::DisplayNameCache;
 pub use policy::{AccessPolicy, Admission, SenderRole, DEFAULT_REFUSAL};
 pub use router::EventRouter;
 pub use runner::{

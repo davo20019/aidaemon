@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::channel::{
     ApprovalAnswer, ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError,
-    ChannelEvent, Conversation, ConversationKind, InboundMessage, MessageRef, OutboundMessage,
-    Sender,
+    ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind, InboundMessage,
+    MessageRef, OutboundMessage, Sender,
 };
 
 /// A message the channel was asked to send.
@@ -51,6 +51,9 @@ pub struct TestChannel {
     downloads: Mutex<Vec<String>>,
     prompt_refs: Mutex<HashMap<String, MessageRef>>,
     removed_buttons: Mutex<Vec<MessageRef>>,
+    strips_latex: bool,
+    registered_commands: Mutex<Option<Vec<CommandSpec>>>,
+    command_answers: Mutex<Vec<(String, String)>>,
 }
 
 impl TestChannel {
@@ -73,6 +76,9 @@ impl TestChannel {
             downloads: Mutex::new(Vec::new()),
             prompt_refs: Mutex::new(HashMap::new()),
             removed_buttons: Mutex::new(Vec::new()),
+            strips_latex: true,
+            registered_commands: Mutex::new(None),
+            command_answers: Mutex::new(Vec::new()),
         }
     }
 
@@ -99,6 +105,28 @@ impl TestChannel {
     pub fn with_files(mut self, on: bool) -> Self {
         self.caps.files = on;
         self
+    }
+
+    /// Advertise a command menu.
+    pub fn with_commands(mut self, on: bool) -> Self {
+        self.caps.commands = on;
+        self
+    }
+
+    /// Whether the runner should rewrite LaTeX for this channel.
+    pub fn with_latex_stripping(mut self, on: bool) -> Self {
+        self.strips_latex = on;
+        self
+    }
+
+    /// The last command menu registered, if any.
+    pub fn registered_commands(&self) -> Option<Vec<CommandSpec>> {
+        self.registered_commands.lock().expect("poisoned").clone()
+    }
+
+    /// `(handle, text)` of every answered command invocation, in order.
+    pub fn command_answers(&self) -> Vec<(String, String)> {
+        self.command_answers.lock().expect("poisoned").clone()
     }
 
     /// Make `source` downloadable as `bytes`.
@@ -375,6 +403,30 @@ impl Channel for TestChannel {
             .get(&attachment.source)
             .cloned()
             .ok_or_else(|| ChannelError::Other("no such test file".into()))
+    }
+
+    fn strips_latex(&self) -> bool {
+        self.strips_latex
+    }
+
+    async fn register_commands(&self, commands: &[CommandSpec]) -> Result<(), ChannelError> {
+        *self.registered_commands.lock().expect("poisoned") = Some(commands.to_vec());
+        Ok(())
+    }
+
+    /// Recorded, and also sent like the default answer.
+    async fn answer_command(
+        &self,
+        command: &CommandInvocation,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        self.command_answers
+            .lock()
+            .expect("poisoned")
+            .push((command.handle.clone(), text.to_string()));
+        self.send(&command.conversation, &OutboundMessage::text(text))
+            .await
+            .map(|_| ())
     }
 
     async fn typing(&self, _conversation: &Conversation) -> Result<(), ChannelError> {

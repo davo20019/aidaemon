@@ -26,6 +26,7 @@ const FILE_BODY: &str = "synthetic attachment";
 /// 50 ms), `sendMessage` is recorded and gets a fresh message id.
 #[derive(Default)]
 struct Mock {
+    commands: Mutex<Vec<String>>,
     pending: Mutex<VecDeque<Value>>,
     sent: Mutex<Vec<Value>>,
     edits: Mutex<Vec<Value>>,
@@ -66,6 +67,16 @@ async fn handler(State(mock): State<Arc<Mock>>, uri: Uri, body: Bytes) -> impl I
             json!(true)
         }
         "getFile" => json!({ "file_id": "synthetic-file", "file_path": "documents/conf.bin" }),
+        "setMyCommands" => {
+            let names = body["commands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["command"].as_str().map(str::to_string))
+                .collect();
+            *mock.commands.lock().unwrap() = names;
+            json!(true)
+        }
         _ => json!(true),
     };
     (
@@ -126,6 +137,19 @@ impl ChannelHarness for TelegramHarness {
         self.push("message", |id| {
             json!({ "message_id": id, "date": 1700000000, "chat": dm_chat(), "from": alice(), "text": text })
         });
+    }
+
+    async fn inject_named_message(&self, text: &str, display_name: &str) -> bool {
+        self.push("message", |id| {
+            let mut from = alice();
+            from["first_name"] = json!(display_name);
+            json!({ "message_id": id, "date": 1700000000, "chat": dm_chat(), "from": from, "text": text })
+        });
+        true
+    }
+
+    async fn registered_commands(&self) -> Option<Vec<String>> {
+        Some(self.mock.commands.lock().unwrap().clone())
     }
 
     async fn inject_group_message(&self, text: &str, addressed: bool) {
@@ -230,6 +254,6 @@ async fn telegram_channel_conforms() {
     );
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 17, "{report}");
+    assert_eq!(report.passed.len(), 20, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

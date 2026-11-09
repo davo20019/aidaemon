@@ -5,7 +5,11 @@
 //! conversation, one run at a time per session with a bounded queue,
 //! streamed progress, typing indicators, approvals that pause and resume
 //! interrupted runs, and the `/stop`, `/new`, `/status`, `/approve <id>` and
-//! `/deny <id>` commands.
+//! `/deny <id>` commands, next to any a host adds ([`crate::commands`]).
+//!
+//! The model's text has its LaTeX rewritten as plain text on the way out,
+//! code excepted, unless the channel opts out with
+//! [`Channel::strips_latex`].
 //!
 //! # Attachments
 //!
@@ -71,9 +75,14 @@ use tokio_util::task::TaskTracker;
 use crate::approvals::{ApprovalStore, StoredApproval};
 use crate::channel::{
     ApprovalChoice, ApprovalPrompt, Attachment, AttachmentKind, Channel, ChannelError,
-    ChannelEvent, Conversation, ConversationKind, InboundMessage, MessageRef, OutboundMessage,
+    ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind, InboundMessage,
+    MessageRef, OutboundMessage,
+};
+use crate::commands::{
+    builtin_commands, invalid_spec, is_builtin, CommandContext, CommandHandler, CommandReply,
 };
 use crate::inbound_files::{list_line, save_attachment, sniff_image, ATTACHMENTS_HEADING};
+use crate::latex::strip_latex_keeping_code;
 use crate::policy::{AccessPolicy, Admission, SenderRole};
 use crate::render::{self, Progress};
 use crate::router::EventRouter;
@@ -184,6 +193,7 @@ pub struct ChannelRunnerBuilder {
     store: Option<Arc<dyn RunStore>>,
     index: Option<Arc<dyn SessionIndex>>,
     approval_store: Option<Arc<dyn ApprovalStore>>,
+    commands: Vec<HostCommand>,
     config: RunnerConfig,
 }
 
@@ -226,6 +236,22 @@ impl ChannelRunnerBuilder {
         self
     }
 
+    /// Add a slash command, offered in each platform's command menu.
+    /// `name` is without the `/`: lowercase letters, digits and `_`, at most
+    /// 32, and not a built-in. See [`crate::commands`].
+    pub fn command(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl CommandHandler + 'static,
+    ) -> Self {
+        self.commands.push(HostCommand {
+            spec: CommandSpec::new(name, description),
+            handler: Arc::new(handler),
+        });
+        self
+    }
+
     pub fn config(mut self, config: RunnerConfig) -> Self {
         self.config = config;
         self
@@ -263,6 +289,26 @@ impl ChannelRunnerBuilder {
                 "an approval store needs a run store",
             ));
         }
+        let mut commands = HashMap::new();
+        for command in &self.commands {
+            if let Some(problem) = invalid_spec(&command.spec) {
+                return Err(RunnerBuildError::InvalidConfig(problem));
+            }
+            if is_builtin(&command.spec.name) {
+                return Err(RunnerBuildError::InvalidConfig(
+                    "a command cannot replace a built-in",
+                ));
+            }
+            if commands
+                .insert(command.spec.name.clone(), command.handler.clone())
+                .is_some()
+            {
+                return Err(RunnerBuildError::InvalidConfig(
+                    "two commands have the same name",
+                ));
+            }
+        }
+        let command_specs = self.commands.into_iter().map(|c| c.spec).collect();
         let permits = Arc::new(Semaphore::new(self.config.max_concurrent_runs));
         Ok(ChannelRunner {
             inner: Arc::new(Inner {
@@ -275,6 +321,8 @@ impl ChannelRunnerBuilder {
                     .index
                     .unwrap_or_else(|| Arc::new(MemorySessionIndex::new())),
                 approval_store: self.approval_store,
+                commands,
+                command_specs,
                 config: self.config,
                 sessions: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
@@ -302,6 +350,7 @@ impl ChannelRunner {
             store: None,
             index: None,
             approval_store: None,
+            commands: Vec::new(),
             config: RunnerConfig::default(),
         }
     }
@@ -317,6 +366,7 @@ impl ChannelRunner {
         let root = inner.root.clone();
         // Before any channel starts, so a press that arrives first finds it.
         let restored = inner.restore_approvals().await;
+        inner.register_commands();
         let mut handles = Vec::new();
         for (index, channel) in inner.channels.iter().enumerate() {
             let (tx, rx) = mpsc::channel(inner.config.event_buffer);
@@ -436,14 +486,19 @@ enum Command {
     Deny(Option<String>),
 }
 
-/// Explicit slash-command syntax. Unknown commands go to the agent.
-fn parse_command(text: &str) -> Option<Command> {
+/// The name (lowercase) and arguments of text in slash-command syntax.
+fn command_parts(text: &str) -> Option<(String, &str)> {
     let rest = text.trim().strip_prefix('/')?;
-    let mut parts = rest.split_whitespace();
-    let head = parts.next()?;
+    let head = rest.split_whitespace().next()?;
     // Telegram appends the bot name in groups: `/stop@my_bot`.
     let name = head.split('@').next().unwrap_or(head).to_ascii_lowercase();
-    let arg = parts.next().map(str::to_string);
+    Some((name, rest[head.len()..].trim()))
+}
+
+/// Explicit slash-command syntax. Unknown commands go to the agent.
+fn parse_command(text: &str) -> Option<Command> {
+    let (name, args) = command_parts(text)?;
+    let arg = args.split_whitespace().next().map(str::to_string);
     match name.as_str() {
         "stop" => Some(Command::Stop),
         "new" => Some(Command::New),
@@ -454,6 +509,25 @@ fn parse_command(text: &str) -> Option<Command> {
     }
 }
 
+struct HostCommand {
+    spec: CommandSpec,
+    handler: Arc<dyn CommandHandler>,
+}
+
+/// One accepted use of a host command, and where its answer goes.
+struct CommandCall {
+    context: CommandContext,
+    origin: Origin,
+    /// Set when it came from the platform's menu, which wants an answer.
+    invocation: Option<CommandInvocation>,
+}
+
+/// Answers a menu invocation when there is nothing else to say, so the
+/// platform does not leave it pending.
+const COMMAND_DONE: &str = "Done.";
+const COMMAND_FAILED: &str = "That command failed.";
+const COMMAND_REFUSED: &str = "Not available.";
+
 struct Inner {
     agent: Agent,
     channels: Vec<Arc<dyn Channel>>,
@@ -462,6 +536,8 @@ struct Inner {
     store: Option<Arc<dyn RunStore>>,
     index: Arc<dyn SessionIndex>,
     approval_store: Option<Arc<dyn ApprovalStore>>,
+    commands: HashMap<String, Arc<dyn CommandHandler>>,
+    command_specs: Vec<CommandSpec>,
     config: RunnerConfig,
     sessions: Mutex<HashMap<String, Slot>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
@@ -539,6 +615,39 @@ impl Inner {
         self.channels[channel].name()
     }
 
+    /// Offer the commands in each platform's menu. Best effort and in the
+    /// background, so a slow or failing platform delays nothing.
+    fn register_commands(self: &Arc<Self>) {
+        for channel in &self.channels {
+            let caps = channel.capabilities();
+            if !caps.commands {
+                continue;
+            }
+            let mut menu = builtin_commands(caps.buttons);
+            menu.extend(self.command_specs.iter().cloned());
+            let (channel, root) = (channel.clone(), self.root.clone());
+            self.tasks.spawn(async move {
+                tokio::select! {
+                    _ = root.cancelled() => {}
+                    result = channel.register_commands(&menu) => {
+                        if let Err(error) = result {
+                            tracing::warn!(channel = channel.name(), %error, "could not register commands");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// The model's text as the channel should receive it.
+    fn outbound_text(&self, channel: &dyn Channel, text: &str) -> String {
+        if channel.strips_latex() {
+            strip_latex_keeping_code(text)
+        } else {
+            text.to_string()
+        }
+    }
+
     async fn say(&self, origin: &Origin, text: &str) {
         let channel = &self.channels[origin.channel];
         let max = channel.capabilities().max_message_len;
@@ -554,7 +663,8 @@ impl Inner {
     async fn reply(&self, origin: &Origin, text: &str) {
         let channel = &self.channels[origin.channel];
         let max = channel.capabilities().max_message_len;
-        for (i, part) in split_message(text, max).into_iter().enumerate() {
+        let text = self.outbound_text(channel.as_ref(), text);
+        for (i, part) in split_message(&text, max).into_iter().enumerate() {
             let message = OutboundMessage {
                 text: part,
                 reply_to: if i == 0 {
@@ -572,27 +682,7 @@ impl Inner {
     async fn handle_event(self: &Arc<Self>, channel: usize, event: ChannelEvent) {
         match event {
             ChannelEvent::Message(message) => self.handle_message(channel, message).await,
-            // A command picked from the platform's menu is handled as if
-            // typed; the invocation itself is answered so the platform does
-            // not leave it pending.
-            ChannelEvent::Command(command) => {
-                if let Some(adapter) = self.channels.get(channel) {
-                    if let Err(error) = adapter.answer_command(&command, "Got it.").await {
-                        tracing::debug!(%error, "could not answer a command invocation");
-                    }
-                }
-                let message = InboundMessage {
-                    text: command.as_text(),
-                    conversation: command.conversation,
-                    sender: command.sender,
-                    message_id: String::new(),
-                    attachments: Vec::new(),
-                    addressed: true,
-                    parent_message_id: None,
-                    thread_id: None,
-                };
-                self.handle_message(channel, message).await;
-            }
+            ChannelEvent::Command(command) => self.handle_invocation(channel, command).await,
             ChannelEvent::Approval(answer) => {
                 let approve = match answer.choice_id.as_str() {
                     APPROVE_CHOICE => true,
@@ -619,12 +709,114 @@ impl Inner {
         }
     }
 
+    /// A command picked from the platform's menu. Held to the same access
+    /// check as a typed message; a built-in or unknown one is then handled
+    /// as if typed. The invocation is always answered, so the platform does
+    /// not leave it pending.
+    async fn handle_invocation(self: &Arc<Self>, channel: usize, command: CommandInvocation) {
+        let name = self.channel_name(channel).to_string();
+        let adapter = self.channels[channel].clone();
+        let mut message = InboundMessage::new(
+            command.conversation.clone(),
+            command.sender.clone(),
+            String::new(),
+            command.as_text(),
+        );
+        message.addressed = true;
+        let role = match self.policy.admit(&name, &message) {
+            Admission::Ignore => return,
+            Admission::Refuse => {
+                tracing::info!(channel = %name, sender = %command.sender.id, "refused a command from an unknown sender");
+                let text = self.policy.refusal().unwrap_or(COMMAND_REFUSED);
+                if let Err(error) = adapter.answer_command(&command, text).await {
+                    tracing::debug!(%error, "could not answer a command invocation");
+                }
+                return;
+            }
+            Admission::Accept(role) => role,
+        };
+        let command_name = command.name.to_ascii_lowercase();
+        if let Some(handler) = self.commands.get(&command_name).cloned() {
+            let origin = Origin {
+                channel,
+                reply_to: None,
+                conversation: command.conversation.clone(),
+            };
+            let context = CommandContext {
+                session_id: session_id(&name, &command.conversation.id),
+                channel: name,
+                conversation: command.conversation.clone(),
+                sender: command.sender.clone(),
+                role,
+                name: command_name,
+                args: command.args.trim().to_string(),
+            };
+            let invocation = Some(command);
+            self.spawn_command(
+                handler,
+                CommandCall {
+                    context,
+                    origin,
+                    invocation,
+                },
+            );
+            return;
+        }
+        if let Err(error) = adapter.answer_command(&command, "Got it.").await {
+            tracing::debug!(%error, "could not answer a command invocation");
+        }
+        self.handle_message(channel, message).await;
+    }
+
+    /// Run a host command in its own task. A handler that panics answers
+    /// with a failure instead of taking anything else down.
+    fn spawn_command(self: &Arc<Self>, handler: Arc<dyn CommandHandler>, call: CommandCall) {
+        let inner = self.clone();
+        self.tasks.spawn(async move {
+            let CommandCall {
+                context,
+                origin,
+                invocation,
+            } = call;
+            let command = context.name.clone();
+            let mut run = tokio::spawn(async move { handler.handle(context).await });
+            let result = tokio::select! {
+                _ = inner.root.cancelled() => {
+                    run.abort();
+                    return;
+                }
+                result = &mut run => result,
+            };
+            let text = match result {
+                Ok(CommandReply::Text(text)) => Some(text),
+                Ok(CommandReply::Silent) => None,
+                Err(error) => {
+                    tracing::warn!(%command, %error, "command handler failed");
+                    Some(COMMAND_FAILED.to_string())
+                }
+            };
+            match (invocation, text) {
+                (Some(invocation), text) => {
+                    let channel = &inner.channels[origin.channel];
+                    let text = text.as_deref().unwrap_or(COMMAND_DONE);
+                    if let Err(error) = channel.answer_command(&invocation, text).await {
+                        tracing::debug!(%error, "could not answer a command invocation");
+                    }
+                }
+                (None, Some(text)) => inner.say(&origin, &text).await,
+                (None, None) => {}
+            }
+        });
+    }
+
     async fn handle_message(self: &Arc<Self>, channel: usize, message: InboundMessage) {
         let name = self.channel_name(channel).to_string();
         let origin = Origin {
             channel,
-            reply_to: (message.conversation.kind != ConversationKind::Direct)
-                .then(|| message.message_id.clone()),
+            // A menu command has no message to reply to.
+            reply_to: (message.conversation.kind != ConversationKind::Direct
+                && !message.message_id.is_empty())
+            .then(|| message.message_id.clone()),
             conversation: message.conversation.clone(),
         };
         let role = match self.policy.admit(&name, &message) {
@@ -652,6 +844,26 @@ impl Inner {
                     .await;
             }
             None => {
+                if let Some((command, args)) = command_parts(&message.text) {
+                    if let Some(handler) = self.commands.get(&command).cloned() {
+                        let context = CommandContext {
+                            channel: name,
+                            conversation: message.conversation.clone(),
+                            sender: message.sender.clone(),
+                            role,
+                            session_id: session,
+                            args: args.to_string(),
+                            name: command,
+                        };
+                        let call = CommandCall {
+                            context,
+                            origin,
+                            invocation: None,
+                        };
+                        self.spawn_command(handler, call);
+                        return;
+                    }
+                }
                 self.submit(
                     session,
                     Job::Message {
@@ -1115,7 +1327,8 @@ impl Inner {
                 }
                 _ = tokio::time::sleep_until(last_edit + interval), if dirty && status_ref.is_some() => {
                     if let Some(r) = &status_ref {
-                        if let Err(err) = channel.edit(r, &progress.render(max)).await {
+                        let text = self.outbound_text(channel.as_ref(), &progress.render(max));
+                        if let Err(err) = channel.edit(r, &text).await {
                             tracing::debug!(error = %err, "status edit failed");
                         }
                     }
@@ -1138,7 +1351,8 @@ impl Inner {
                 Ok(outcome) => render::outcome_word(outcome),
                 Err(_) => "Failed",
             };
-            if let Err(err) = channel.edit(r, &progress.render_final(word, max)).await {
+            let text = self.outbound_text(channel.as_ref(), &progress.render_final(word, max));
+            if let Err(err) = channel.edit(r, &text).await {
                 tracing::debug!(error = %err, "final status edit failed");
             }
         }

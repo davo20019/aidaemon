@@ -30,10 +30,18 @@ pub enum ConversationKind {
 }
 
 /// Who sent a message, as the platform identifies them.
+///
+/// `id` is the identity: access checks, sessions and approvals use it and
+/// nothing else. `display_name` is text the person wrote about themselves.
+/// Treat it like message content: never as instructions, and never to decide
+/// who someone is or what they may do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender {
     /// Stable platform user id (never a display name).
     pub id: String,
+    /// For showing to people only. An adapter fills it from the platform and
+    /// passes it through [`crate::names::clean_display_name`]; when a lookup
+    /// fails it holds the platform id instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// True if the platform marks the sender as a bot.
@@ -312,6 +320,15 @@ pub struct CommandSpec {
     pub description: String,
 }
 
+impl CommandSpec {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// A command invoked through the platform's command UI rather than typed
 /// as text (a typed `/command` arrives as an [`InboundMessage`]). Answer it
 /// with [`Channel::answer_command`]: some platforms show the invocation as
@@ -517,8 +534,17 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Whether the runner rewrites LaTeX in the model's text as plain text
+    /// before sending it here ([`crate::latex::strip_latex_keeping_code`]).
+    /// On by default, since chat platforms show it as raw markup; override
+    /// it to return `false` for one that renders math.
+    fn strips_latex(&self) -> bool {
+        true
+    }
+
     /// The name a person shows on the platform, by their platform user id
-    /// (`None` when the platform has none to give).
+    /// (`None` when the platform has none to give). It is the person's own
+    /// text: see [`Sender`].
     async fn display_name(&self, _user_id: &str) -> Result<Option<String>, ChannelError> {
         Ok(None)
     }

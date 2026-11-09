@@ -17,11 +17,23 @@
 //! [`intents::GUILDS`] intent) and from a `channel_type` field when present;
 //! otherwise guild messages are reported as
 //! [`ConversationKind::Group`](aidaemon_channels::ConversationKind::Group).
+//!
+//! # Sharding and compression
+//!
+//! One connection, with no `shard` field, is the default. A large bot uses
+//! [`DiscordChannel::with_shard_count`] or
+//! [`DiscordChannel::with_recommended_shards`]: one connection per shard,
+//! each with its own session and resume, and identifies paced to the limits
+//! `GET /gateway/bot` reports. With the `zlib` feature,
+//! [`DiscordChannel::with_zlib_compression`] turns on `zlib-stream` transport
+//! compression.
 
 mod format;
 mod gateway;
 mod mapping;
 mod rest;
+#[cfg(feature = "zlib")]
+mod zlib;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,8 +42,8 @@ use aidaemon_channels::download::DownloadClient;
 use aidaemon_channels::split::truncate_for_edit;
 use aidaemon_channels::{
     ApprovalPrompt, Attachment, Channel, ChannelCapabilities, ChannelError, ChannelEvent,
-    CommandInvocation, CommandSpec, Conversation, MessageRef, OutboundFile, OutboundMessage,
-    DEFAULT_MAX_DOWNLOAD_BYTES,
+    CommandInvocation, CommandSpec, Conversation, DisplayNameCache, MessageRef, OutboundFile,
+    OutboundMessage, DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -72,6 +84,12 @@ pub struct DiscordChannel {
     state: Arc<Mutex<gateway::GatewayState>>,
     /// Longest message sent, at most [`MAX_MESSAGE_LEN`].
     max_message_len: usize,
+    strip_latex: bool,
+    names: DisplayNameCache,
+    shards: gateway::ShardMode,
+    identify_interval: Duration,
+    #[cfg(feature = "zlib")]
+    zlib: bool,
 }
 
 impl DiscordChannel {
@@ -91,7 +109,46 @@ impl DiscordChannel {
             backoff_max: Duration::from_secs(60),
             state: Arc::new(Mutex::new(gateway::GatewayState::default())),
             max_message_len: MAX_MESSAGE_LEN,
+            strip_latex: true,
+            names: DisplayNameCache::default(),
+            shards: gateway::ShardMode::Single,
+            identify_interval: Duration::from_secs(5),
+            #[cfg(feature = "zlib")]
+            zlib: false,
         }
+    }
+
+    /// Whether [`aidaemon_channels::ChannelRunner`] rewrites LaTeX in the
+    /// text it sends here as plain text (code excepted). Default on.
+    pub fn with_latex_stripping(mut self, on: bool) -> Self {
+        self.strip_latex = on;
+        self
+    }
+
+    /// Run `count` shards (at least 1), one connection each.
+    pub fn with_shard_count(mut self, count: u32) -> Self {
+        self.shards = gateway::ShardMode::Fixed(count.max(1));
+        self
+    }
+
+    /// Run as many shards as `GET /gateway/bot` recommends when `run` starts.
+    pub fn with_recommended_shards(mut self) -> Self {
+        self.shards = gateway::ShardMode::Recommended;
+        self
+    }
+
+    /// The wait between identifies in one rate-limit bucket. Default 5 s,
+    /// Discord's rule; only a local test server has reason to change it.
+    pub fn with_identify_interval(mut self, interval: Duration) -> Self {
+        self.identify_interval = interval;
+        self
+    }
+
+    /// Ask for `zlib-stream` transport compression. Default off.
+    #[cfg(feature = "zlib")]
+    pub fn with_zlib_compression(mut self, on: bool) -> Self {
+        self.zlib = on;
+        self
     }
 
     /// Split messages at `len` characters (1 to [`MAX_MESSAGE_LEN`]).
@@ -147,6 +204,26 @@ impl DiscordChannel {
     pub fn with_download_client(mut self, builder: reqwest::ClientBuilder) -> Self {
         self.rest.files = DownloadClient::from_builder(builder);
         self
+    }
+
+    /// How many shards the last `run` started with (`None` before one).
+    pub fn shard_count(&self) -> Option<u32> {
+        match self.state.lock().unwrap().shards.len() {
+            0 => None,
+            count => u32::try_from(count).ok(),
+        }
+    }
+
+    pub(crate) async fn fetch_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
+        let user = self
+            .rest
+            .request(Method::GET, &format!("/users/{user_id}"), None)
+            .await?;
+        Ok(["global_name", "username"]
+            .iter()
+            .find_map(|key| user.get(*key).and_then(Value::as_str))
+            .filter(|name| !name.is_empty())
+            .map(str::to_string))
     }
 
     /// The bot's user id, known after the gateway's READY event.
@@ -486,16 +563,15 @@ impl Channel for DiscordChannel {
         self.rest.download(&attachment.source, max_bytes).await
     }
 
+    fn strips_latex(&self) -> bool {
+        self.strip_latex
+    }
+
+    /// Cached; the name comes from `GET /users/{id}`.
     async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
-        let user = self
-            .rest
-            .request(Method::GET, &format!("/users/{user_id}"), None)
-            .await?;
-        Ok(["global_name", "username"]
-            .iter()
-            .find_map(|key| user.get(*key).and_then(Value::as_str))
-            .filter(|name| !name.is_empty())
-            .map(str::to_string))
+        self.names
+            .lookup(user_id, || self.fetch_name(user_id))
+            .await
     }
 
     /// Registered now when the gateway is ready, else on its READY.

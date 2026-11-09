@@ -39,6 +39,85 @@ pub fn strip_latex(text: &str) -> String {
     result
 }
 
+/// [`strip_latex`] for everything except code: fenced blocks and inline
+/// `` `code` `` spans (of any backtick run length) keep every character, so a
+/// shell variable or a formula quoted as code stays exactly as written.
+///
+/// This is the formatter on the outbound path of [`crate::ChannelRunner`];
+/// a channel opts out with [`crate::Channel::strips_latex`].
+///
+/// ```
+/// use aidaemon_channels::latex::strip_latex_keeping_code;
+///
+/// assert_eq!(
+///     strip_latex_keeping_code("$x^2$ but not `$x^2$`"),
+///     "x² but not `$x^2$`"
+/// );
+/// ```
+pub fn strip_latex_keeping_code(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let run = bytes[i..].iter().take_while(|b| **b == b'`').count();
+        // A backslash-escaped backtick opens nothing.
+        if i > 0 && bytes[i - 1] == b'\\' {
+            i += 1;
+            continue;
+        }
+        match code_end(text, i + run, run) {
+            Some(end) => {
+                out.push_str(&strip_latex_outside_code(&text[plain_start..i]));
+                out.push_str(&text[i..end]);
+                i = end;
+                plain_start = end;
+            }
+            None if run >= 3 => {
+                // An unclosed fence: the rest is code.
+                out.push_str(&strip_latex_outside_code(&text[plain_start..i]));
+                out.push_str(&text[i..]);
+                return out;
+            }
+            None => i += run,
+        }
+    }
+    out.push_str(&strip_latex_outside_code(&text[plain_start..]));
+    out
+}
+
+/// Where the code opened by `run` backticks before `from` ends: after a run
+/// of at least as many for a fence, of exactly as many for a span, which
+/// cannot cross a blank line.
+fn code_end(text: &str, from: usize, run: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let fence = run >= 3;
+    let mut i = from;
+    while i < bytes.len() {
+        if !fence && bytes[i] == b'\n' {
+            let next_line = &text[i + 1..];
+            let line_end = next_line.find('\n').unwrap_or(next_line.len());
+            if next_line[..line_end].trim().is_empty() {
+                return None;
+            }
+        }
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let closing = bytes[i..].iter().take_while(|b| **b == b'`').count();
+        i += closing;
+        if closing == run || (fence && closing > run) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 static SQRT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\sqrt\{([^}]*)\}").unwrap());
 static FRAC: LazyLock<Regex> = LazyLock::new(|| {
     // One level of nested braces in each argument.
@@ -156,7 +235,53 @@ fn inline_math_close(chars: &[char], open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_latex;
+    use super::{strip_latex, strip_latex_keeping_code};
+
+    #[test]
+    fn code_keeps_every_character() {
+        for code in [
+            "`$x^2$`",
+            "``a ` $x^2$ b``",
+            "```\n$\\frac{a}{b}$ \\times\n```",
+            "```sh\necho $HOME^2\n```",
+        ] {
+            let text = format!("$y^2$ before {code} after $y^2$");
+            assert_eq!(
+                strip_latex_keeping_code(&text),
+                format!("y² before {code} after y²")
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_code_marks_are_handled_like_markdown() {
+        // A fence never closed runs to the end.
+        assert_eq!(
+            strip_latex_keeping_code("$x^2$\n```\n$y^2$"),
+            "x²\n```\n$y^2$"
+        );
+        // A lone backtick is just a backtick.
+        assert_eq!(strip_latex_keeping_code("a ` $x^2$"), "a ` x²");
+        // A span cannot cross a blank line.
+        assert_eq!(
+            strip_latex_keeping_code("a ` b\n\n$x^2$ ` c"),
+            "a ` b\n\nx² ` c"
+        );
+        // An escaped backtick opens nothing.
+        assert_eq!(strip_latex_keeping_code("\\` $x^2$ `y`"), "\\` x² `y`");
+    }
+
+    #[test]
+    fn plain_text_matches_the_fence_only_formatter() {
+        for text in [
+            "$247 \\times 38$",
+            "Price is $50 and $60",
+            "$$x = \\frac{1}{2}$$",
+            "```\n$x$\n``` and $y$",
+        ] {
+            assert_eq!(strip_latex_keeping_code(text), strip_latex(text));
+        }
+    }
 
     #[test]
     fn inline_math_becomes_plain_text() {

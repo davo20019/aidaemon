@@ -27,8 +27,11 @@ pub fn html_escape(s: &str) -> String {
 /// `[text](url)` links. LaTeX math, which Telegram cannot render, is
 /// rewritten as plain text first ([`aidaemon_channels::latex::strip_latex`]).
 pub fn markdown_to_html(md: &str) -> String {
-    let md = aidaemon_channels::latex::strip_latex(md);
-    let md = md.as_str();
+    render_html(&aidaemon_channels::latex::strip_latex(md))
+}
+
+/// [`markdown_to_html`] with the LaTeX left to the caller.
+pub(crate) fn render_html(md: &str) -> String {
     let mut out = String::with_capacity(md.len() + md.len() / 4);
     let lines: Vec<&str> = md.lines().collect();
     let mut i = 0;

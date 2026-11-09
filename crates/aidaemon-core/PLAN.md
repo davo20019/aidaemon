@@ -165,8 +165,17 @@ adapters, tested against local mock servers.
       `ApprovalAnswer::message` with `Channel::remove_buttons`,
       `InboundMessage::parent_message_id` and `thread_id`, and one `edit` rule
       for over-long text (one message, cut at the end, marked).
-- [ ] Not ported: LaTeX stripping, display-name lookup, slash commands,
-      Discord sharding/compression.
+- [x] LaTeX stripping, display-name lookup, slash commands, Discord
+      sharding/compression. `ChannelRunner` rewrites the model's LaTeX, code
+      excepted, unless `Channel::strips_latex` says no; a direct `send` on
+      Slack or Discord stays verbatim, so the daemon's own paths are
+      unchanged. Names are cleaned and cached per adapter (`DisplayNameCache`)
+      and never decide identity. Hosts add commands with
+      `ChannelRunnerBuilder::command`; the runner sets each platform's menu.
+      Discord takes `with_shard_count` or `with_recommended_shards`, one
+      connection per shard with identify pacing and per-shard resume, and
+      `zlib-stream` behind the optional `zlib` feature (`flate2`). The daemon
+      still uses its own command handling and does not use `ChannelRunner`.
 
 ### Phase 6c: open to contributors
 - [x] Conformance kits for `Tool`, `Provider`, `Channel` and `MemoryStore`;

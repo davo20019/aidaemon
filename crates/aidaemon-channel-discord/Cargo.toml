@@ -8,9 +8,16 @@ repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
 publish = false
 
+[features]
+# zlib-stream transport compression (`DiscordChannel::with_zlib_compression`).
+# tokio-tungstenite has no inflate of its own, so this is the crate's one
+# optional dependency; a build without the feature connects uncompressed.
+zlib = ["dep:flate2"]
+
 [dependencies]
 aidaemon-channels = { path = "../aidaemon-channels", features = ["http"] }
 async-trait = "0.1"
+flate2 = { version = "1", optional = true }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde_json = "1"
@@ -21,4 +28,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+flate2 = "1"
 tokio = { version = "1", features = ["full"] }

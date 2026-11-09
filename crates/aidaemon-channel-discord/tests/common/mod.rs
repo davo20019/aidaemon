@@ -179,6 +179,31 @@ impl MockGateway {
     }
 }
 
+impl MockGateway {
+    /// Like [`Self::accept`], also returning the connection's query string.
+    pub async fn accept_with_query(&self) -> (GwConn, String) {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+
+        let (sock, _) = tokio::time::timeout(Duration::from_secs(5), self.listener.accept())
+            .await
+            .expect("client did not connect")
+            .unwrap();
+        let query = Arc::new(Mutex::new(String::new()));
+        let seen = query.clone();
+        #[allow(clippy::result_large_err)]
+        let callback =
+            move |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                *seen.lock().unwrap() = request.uri().query().unwrap_or("").to_string();
+                Ok(response)
+            };
+        let ws = tokio_tungstenite::accept_hdr_async(sock, callback)
+            .await
+            .unwrap();
+        let query = query.lock().unwrap().clone();
+        (GwConn { ws }, query)
+    }
+}
+
 impl GwConn {
     pub async fn send(&mut self, v: Value) {
         self.ws.send(Message::Text(v.to_string())).await.unwrap();
