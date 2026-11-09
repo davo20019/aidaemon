@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::Resolution;
 use crate::approval::CallEffects;
 use crate::approval::SharedDeclines;
 use crate::authority::Authority;
 use crate::message::Image;
 use crate::outcome::FinishOutcome;
 use crate::provider::{ToolSpec, Usage};
-use crate::state::RunId;
+use crate::state::{RunId, RunState};
 
 /// Who authored the content a tool returned. `Untrusted` is content someone
 /// other than the owner wrote (a web page, an inbound message, a third-party
@@ -288,6 +289,10 @@ pub struct ToolOutput {
     /// End the run after this call's batch (see [`ToolOutput::finish`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<Finish>,
+    /// A paused child run: this call has no result yet, and the run pauses
+    /// with it (see [`ToolOutput::suspended`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended: Option<Box<RunState>>,
 }
 
 impl ToolOutput {
@@ -300,6 +305,7 @@ impl ToolOutput {
             usage: Usage::default(),
             trust: None,
             finish: None,
+            suspended: None,
         }
     }
 
@@ -312,6 +318,19 @@ impl ToolOutput {
             usage: Usage::default(),
             trust: None,
             finish: None,
+            suspended: None,
+        }
+    }
+
+    /// The child this call started is interrupted: pause the calling run
+    /// too, with `child` saved in its [`crate::Pending`]. The answer reaches
+    /// the tool through [`Tool::resume_child`]. Only a tool whose
+    /// [`Tool::suspends`] is true may return this, and `child` must be
+    /// interrupted; anything else is a failed call.
+    pub fn suspended(child: RunState) -> Self {
+        Self {
+            suspended: Some(Box::new(child)),
+            ..Self::text("")
         }
     }
 
@@ -452,6 +471,37 @@ pub trait Tool: Send + Sync {
         } else {
             CallEffects::unknown()
         }
+    }
+
+    /// Whether this tool may answer with [`ToolOutput::suspended`]. A call
+    /// of such a tool always runs alone, because a run pauses on one call at
+    /// a time.
+    fn suspends(&self) -> bool {
+        false
+    }
+
+    /// Continue the child run this tool suspended, with the answer to its
+    /// interruption, and return what [`Tool::call`] would have returned: a
+    /// result, or [`ToolOutput::suspended`] if the child paused again.
+    ///
+    /// `ctx` is that of the delegating run as it is now, so its authority
+    /// and declines are the ones to apply: a resumed child answers to them
+    /// exactly as a child started by [`Tool::call`] does. `child` may come
+    /// from another process.
+    ///
+    /// A crash while this runs leaves the delegating call started with no
+    /// result, the same as a crash during [`Tool::call`]: on recovery it is
+    /// re-run if idempotent and marked indeterminate otherwise.
+    async fn resume_child(
+        &self,
+        _child: RunState,
+        _resolution: Resolution,
+        _ctx: &ToolContext,
+    ) -> ToolResult {
+        Err(ToolError(format!(
+            "`{}` cannot continue a paused run",
+            self.spec().name
+        )))
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult;

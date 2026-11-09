@@ -4434,6 +4434,7 @@ async fn a_new_message_never_gets_the_card_of_a_run_that_was_cut_off() {
         },
         hook_index: None,
         hook_chain: Vec::new(),
+        child: None,
     });
     store.upsert_state(&stranded).await.unwrap();
 
