@@ -37,7 +37,7 @@ mod client;
 mod tool;
 
 pub use client::{
-    McpError, McpOptions, McpServer, McpServerSpec, ServerInfo, PROTOCOL_VERSION, SAFE_ENV_KEYS,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    McpError, McpOptions, McpServer, McpServerSpec, ServerInfo, StderrCallback,
+    MAX_STDERR_LINE_BYTES, PROTOCOL_VERSION, SAFE_ENV_KEYS, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use tool::{map_annotations, normalize_schema, render_result, tool_name, McpTool};

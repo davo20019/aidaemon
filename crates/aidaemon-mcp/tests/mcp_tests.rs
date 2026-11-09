@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolContext};
-use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec};
+use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec, StderrCallback};
 use serde_json::{json, Value};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake_mcp_server");
@@ -373,6 +373,31 @@ fn a_spec_never_prints_environment_values() {
     let printed = format!("{spec:?}");
     assert!(printed.contains("API_KEY"), "{printed}");
     assert!(!printed.contains("synthetic-secret"), "{printed}");
+}
+
+#[tokio::test]
+async fn stderr_callback_gets_whole_lines_and_the_tail_still_works() {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = lines.clone();
+    let server = spawn_with(McpOptions {
+        on_stderr: Some(StderrCallback::new(move |line| {
+            sink.lock().unwrap().push(line.to_string());
+        })),
+        ..Default::default()
+    })
+    .await;
+    assert!(find(&server, "fake__crash")
+        .call(json!({}), &ctx())
+        .await
+        .is_err());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let lines = lines.lock().unwrap().clone();
+    assert!(lines.iter().any(|l| l == "fake-mcp: started"), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l == "fake-mcp: crashing on purpose"),
+        "{lines:?}"
+    );
+    assert!(server.stderr_tail().contains("fake-mcp: started"));
 }
 
 #[tokio::test]

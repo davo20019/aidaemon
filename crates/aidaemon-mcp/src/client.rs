@@ -25,6 +25,8 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound on `tools/list` pages, against servers that loop forever.
 const MAX_LIST_PAGES: usize = 100;
+/// What a [`StderrCallback`] gets of one line at most.
+pub const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 
 /// Variables passed through from the parent environment by default. All
 /// others are stripped so API keys of the host process never reach a server
@@ -108,6 +110,34 @@ pub struct McpOptions {
     /// hints untrusted: set `Some(ToolAnnotations::DESTRUCTIVE)` to judge
     /// every call at its worst whatever the server claims.
     pub annotations: Option<ToolAnnotations>,
+    /// Called with each non-blank line the server writes to stderr, for
+    /// example to log it. [`McpServer::stderr_tail`] works with or without.
+    pub on_stderr: Option<StderrCallback>,
+}
+
+/// Receives a server's stderr one line at a time, lossily decoded, without
+/// the line ending, and cut to [`MAX_STDERR_LINE_BYTES`].
+#[derive(Clone)]
+pub struct StderrCallback(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl StderrCallback {
+    pub fn new(callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn emit(&self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end();
+        if !line.is_empty() {
+            (self.0)(line);
+        }
+    }
+}
+
+impl std::fmt::Debug for StderrCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StderrCallback")
+    }
 }
 
 impl Default for McpOptions {
@@ -121,6 +151,7 @@ impl Default for McpOptions {
             client_name: "aidaemon".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             annotations: None,
+            on_stderr: None,
         }
     }
 }
@@ -488,7 +519,12 @@ impl McpServer {
         let (stderr_done, stderr_closed) = oneshot::channel();
         let tasks = vec![
             tokio::spawn(read_stdout(stdout, shared.clone(), stderr_closed)),
-            tokio::spawn(read_stderr(stderr, shared.clone(), stderr_done)),
+            tokio::spawn(read_stderr(
+                stderr,
+                shared.clone(),
+                options.on_stderr.clone(),
+                stderr_done,
+            )),
         ];
         let inner = Arc::new(Inner {
             name: name.clone(),
@@ -783,17 +819,36 @@ async fn handle_message(shared: &Shared, message: Value) {
 async fn read_stderr<R: AsyncRead + Unpin>(
     mut stderr: R,
     shared: Arc<Shared>,
+    on_stderr: Option<StderrCallback>,
     _done: oneshot::Sender<()>,
 ) {
     let mut chunk = [0u8; 4096];
+    let mut line = Vec::new();
     loop {
         match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                // A last line with no newline (often a crash message).
+                if let Some(callback) = &on_stderr {
+                    callback.emit(&line);
+                }
+                return;
+            }
             Ok(n) => {
-                let mut buf = shared.stderr.lock().expect("stderr poisoned");
-                buf.extend(&chunk[..n]);
-                let excess = buf.len().saturating_sub(shared.stderr_capacity);
-                buf.drain(..excess);
+                {
+                    let mut buf = shared.stderr.lock().expect("stderr poisoned");
+                    buf.extend(&chunk[..n]);
+                    let excess = buf.len().saturating_sub(shared.stderr_capacity);
+                    buf.drain(..excess);
+                }
+                let Some(callback) = &on_stderr else { continue };
+                for &byte in &chunk[..n] {
+                    if byte == b'\n' {
+                        callback.emit(&line);
+                        line.clear();
+                    } else if line.len() < MAX_STDERR_LINE_BYTES {
+                        line.push(byte);
+                    }
+                }
             }
         }
     }
