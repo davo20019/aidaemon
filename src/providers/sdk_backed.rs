@@ -55,17 +55,9 @@ impl ModelList {
 }
 
 /// Chat-completions calls on any SDK provider, for daemon code that builds
-/// chat JSON. Bring it into scope to call `provider.chat(..)`.
+/// chat JSON. Bring it into scope to call `provider.chat_with_options(..)`.
 #[async_trait]
 pub(crate) trait ChatJson {
-    #[cfg(test)]
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse>;
-
     async fn chat_with_options(
         &self,
         model: &str,
@@ -77,16 +69,6 @@ pub(crate) trait ChatJson {
 
 #[async_trait]
 impl<P: sdk::Provider + ?Sized> ChatJson for P {
-    #[cfg(test)]
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        chat_with_options(self, model, messages, tools, &ChatOptions::default()).await
-    }
-
     async fn chat_with_options(
         &self,
         model: &str,

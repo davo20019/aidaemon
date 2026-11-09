@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 /// A model call made outside the agent loop.
-#[allow(dead_code)] // variants used from Task 3 (the last in Task 6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SideCall {
     /// Checks a proposed egress call against the original request after the
@@ -82,9 +81,6 @@ pub enum OnFailure {
 /// How one side call runs.
 #[derive(Debug, Clone, Copy)]
 pub struct SideCallSpec {
-    /// The call this spec describes.
-    #[allow(dead_code)] // read only by the registry tests so far
-    pub call: SideCall,
     /// The purpose string its telemetry is recorded under.
     pub purpose: &'static str,
     /// What its answer is used for.
@@ -93,14 +89,15 @@ pub struct SideCallSpec {
     pub model: ModelChoice,
     /// How long it may take before it counts as failed.
     pub deadline: Duration,
-    /// What happens when it fails.
-    #[allow(dead_code)] // read only by the registry tests so far
+    /// What happens when it fails. Each caller carries the policy out
+    /// itself; the registry tests hold the classes to it.
+    #[cfg(test)]
     pub on_failure: OnFailure,
 }
 
 impl SideCall {
     /// Every side call, in registry order.
-    #[allow(dead_code)] // read only by the registry tests so far
+    #[cfg(test)]
     pub const ALL: [SideCall; 12] = [
         SideCall::UntrustedVerifier,
         SideCall::CommandRisk,
@@ -121,7 +118,7 @@ impl SideCall {
         use ModelChoice::*;
         use OnFailure::*;
         use SideCallClass::*;
-        let (purpose, class, model, secs, on_failure) = match self {
+        let (purpose, class, model, secs, _on_failure) = match self {
             SideCall::UntrustedVerifier => (
                 "untrusted_call_verifier",
                 SafetyJudge,
@@ -160,12 +157,12 @@ impl SideCall {
             SideCall::SkillPromotion => ("skill_promotion", ExecutableProducer, Cheap, 180, Skip),
         };
         SideCallSpec {
-            call: self,
             purpose,
             class,
             model,
             deadline: Duration::from_secs(secs),
-            on_failure,
+            #[cfg(test)]
+            on_failure: _on_failure,
         }
     }
 }
@@ -185,7 +182,6 @@ mod tests {
     fn safety_judges_refuse_and_try_the_strongest_model_first() {
         for call in SideCall::ALL {
             let spec = call.spec();
-            assert_eq!(spec.call, call);
             assert_eq!(
                 spec.class == SideCallClass::SafetyJudge,
                 spec.on_failure == OnFailure::Refuse

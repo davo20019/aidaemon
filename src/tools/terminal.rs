@@ -6001,26 +6001,17 @@ impl TerminalTool {
                                     // continuation path below so response/proof/delivery lineage
                                     // is durable. If this unowned call is unavailable, fall back to the raw
                                     // result so the answer is never lost.
+                                    // The side-call gateway bounds the call by its
+                                    // own deadline and returns `None` when it passes.
                                     let interpreted = match agent_for_notify {
-                                        Some(ref agent) => match tokio::time::timeout(
-                                            BACKGROUND_CONTINUATION_TIMEOUT,
-                                            agent.interpret_background_result(
-                                                &command_for_notify,
-                                                output_trimmed,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(interpreted) => interpreted,
-                                            Err(_) => {
-                                                warn!(
-                                                    pid,
-                                                    session_id = %session_for_notify,
-                                                    "Background-result interpretation timed out; delivering raw result"
-                                                );
-                                                None
-                                            }
-                                        },
+                                        Some(ref agent) => {
+                                            agent
+                                                .interpret_background_result(
+                                                    &command_for_notify,
+                                                    output_trimmed,
+                                                )
+                                                .await
+                                        }
                                         None => None,
                                     };
                                     let message = match interpreted {

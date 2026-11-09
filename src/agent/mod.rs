@@ -21,6 +21,7 @@ use crate::events::{
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind, ProviderRecoveryRoute};
@@ -852,7 +853,7 @@ impl Agent {
         match self
             .side_calls
             .ask(
-                crate::llm_runtime::side_calls::SideCall::BackgroundInterpretation,
+                SideCall::BackgroundInterpretation,
                 &messages,
                 &Default::default(),
                 None,

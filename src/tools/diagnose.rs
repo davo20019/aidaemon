@@ -1865,7 +1865,7 @@ mod tests {
     /// no model backend, so nothing can re-rank or rewrite the deterministic
     /// analysis: its candidates, order and fix steps reach the report as built.
     #[tokio::test]
-    async fn diagnose_makes_no_model_call() {
+    async fn diagnose_reports_the_deterministic_analysis() {
         let tool = setup_tool().await;
         record_failed_task(&tool, "telegram:synthetic-user-1", "task-1").await;
 

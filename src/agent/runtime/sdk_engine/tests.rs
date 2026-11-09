@@ -2968,11 +2968,12 @@ async fn verifier_provider_error_denies_and_the_run_finishes() {
             .any(|result| result.contains("could not verify")),
         "{results:?}"
     );
+    // Side calls record under the gateway's `background:<purpose>` session.
     let failed_verifier_calls = harness
         .agent
         .event_store
         .query_events_by_types(
-            "telegram:synthetic-user-1",
+            "background:untrusted_call_verifier",
             &[crate::events::EventType::LlmCall],
             100,
         )

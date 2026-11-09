@@ -4,6 +4,8 @@ use crate::config::{ModelsConfig, ProviderKind};
 use crate::providers::sdk_backed::ModelList;
 use crate::router::Router;
 
+#[cfg(test)]
+mod door_tests;
 pub mod gateway;
 pub mod side_calls;
 
@@ -88,29 +90,6 @@ fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> 
     models
 }
 
-/// The model that answered a safety judgment.
-pub(crate) struct JudgmentAnswer {
-    pub model: String,
-    pub response: crate::traits::ProviderResponse,
-    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
-    pub elapsed: std::time::Duration,
-}
-
-/// A model that could not answer a safety judgment.
-pub(crate) struct JudgmentFailure {
-    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
-    pub model: String,
-    pub error: String,
-    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
-    pub elapsed: std::time::Duration,
-}
-
-/// What came of asking for a safety judgment.
-pub(crate) struct JudgmentOutcome {
-    pub answer: Option<JudgmentAnswer>,
-    pub failures: Vec<JudgmentFailure>,
-}
-
 #[derive(Clone)]
 pub struct LlmRuntimeSnapshot {
     provider: ModelBackend,
@@ -147,22 +126,14 @@ impl LlmRuntimeSnapshot {
         self.failover_targets.clone()
     }
 
-    /// The chain a background call (memory consolidation, summaries, skill
-    /// promotion) runs on: the primary model, the router's fallbacks, then
-    /// every failover provider's models, under the SDK's default policy, which
-    /// moves on after a used-up quota or an auth failure. Agent turns build
-    /// their own chain with the daemon's recovery policy.
-    ///
-    /// `first_model` (usually a primary-provider model such as a cheaper
-    /// tier) is tried first; the primary provider's other models follow.
-    #[cfg(test)]
-    pub(crate) fn background_chain(&self, first_model: &str) -> aidaemon_core::Failover {
-        self.background_chain_through(first_model, |provider| provider)
-    }
-
-    /// [`Self::background_chain`] with every step's provider passed through
-    /// `wrap` (the side-call gateway wraps them to record each attempt).
-    pub(crate) fn background_chain_through(
+    /// The chain a background side call runs on: `first_model`, the primary
+    /// provider's other models (the router's fallbacks), then every failover
+    /// provider's models, under the SDK's default policy, which moves on after
+    /// a used-up quota or an auth failure. Every step's provider is passed
+    /// through `wrap` (the side-call gateway wraps them to record each
+    /// attempt). Agent turns build their own chain with the daemon's
+    /// recovery policy.
+    pub(in crate::llm_runtime) fn background_chain_through(
         &self,
         first_model: &str,
         wrap: impl Fn(ModelBackend) -> ModelBackend,
@@ -203,7 +174,10 @@ impl LlmRuntimeSnapshot {
     /// `primary_models` followed by every failover provider's models (fast
     /// tier first), for callers that try candidates one by one themselves.
     /// Run them on [`Self::model_routed_backend`].
-    pub(crate) fn with_failover_models(&self, mut primary_models: Vec<String>) -> Vec<String> {
+    pub(in crate::llm_runtime) fn with_failover_models(
+        &self,
+        mut primary_models: Vec<String>,
+    ) -> Vec<String> {
         for target in &self.failover_targets {
             for model in target.models_cheap_first() {
                 if !primary_models.contains(&model) {
@@ -218,52 +192,30 @@ impl LlmRuntimeSnapshot {
     /// primary model and moving to the failover providers only on an
     /// infrastructure failure. A failure tied to this request stops, so the
     /// content being judged cannot pick a different judge. One attempt per
-    /// model; the caller fails closed when no answer comes back.
-    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
-    pub(crate) async fn ask_for_judgment(
-        &self,
-        messages: &[serde_json::Value],
-        options: &crate::traits::ChatOptions,
-        budget: std::time::Duration,
-    ) -> JudgmentOutcome {
-        self.ask_for_judgment_through(messages, options, budget, |backend| backend)
-            .await
-    }
-
-    /// [`Self::ask_for_judgment`] with the backend passed through `wrap`
-    /// (the side-call gateway wraps it to record each attempt as it starts).
-    pub(crate) async fn ask_for_judgment_through(
+    /// model; the caller fails closed on an error, which is the last
+    /// attempt's. The backend is passed through `wrap` (the side-call gateway
+    /// wraps it to record each attempt as it starts).
+    pub(in crate::llm_runtime) async fn ask_for_judgment_through(
         &self,
         messages: &[serde_json::Value],
         options: &crate::traits::ChatOptions,
         budget: std::time::Duration,
         wrap: impl FnOnce(ModelBackend) -> ModelBackend,
-    ) -> JudgmentOutcome {
+    ) -> Result<crate::traits::ProviderResponse, String> {
         use crate::providers::ChatJson;
         let backend = wrap(self.model_routed_backend());
         let models = self.with_failover_models(vec![self.primary_model()]);
         let deadline = std::time::Instant::now() + budget;
-        let mut failures = Vec::new();
+        let mut last_error = "no model available".to_string();
         for model in models {
-            let started = std::time::Instant::now();
-            let remaining = deadline.saturating_duration_since(started);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let attempt = tokio::time::timeout(
                 remaining,
                 backend.chat_with_options(&model, messages, &[], options),
             )
             .await;
-            let elapsed = started.elapsed();
             let (error, try_next) = match attempt {
-                Ok(Ok(response)) => {
-                    return JudgmentOutcome {
-                        answer: Some(JudgmentAnswer {
-                            model,
-                            response,
-                            elapsed,
-                        }),
-                        failures,
-                    };
-                }
+                Ok(Ok(response)) => return Ok(response),
                 Ok(Err(error)) => {
                     let infrastructure = error
                         .downcast_ref::<crate::providers::ProviderError>()
@@ -273,25 +225,18 @@ impl LlmRuntimeSnapshot {
                 Err(_) => (format!("timed out after {}s", budget.as_secs()), false),
             };
             tracing::warn!(%model, %error, "Safety judgment attempt failed");
-            failures.push(JudgmentFailure {
-                model,
-                error,
-                elapsed,
-            });
+            last_error = error;
             if !try_next {
                 break;
             }
         }
-        JudgmentOutcome {
-            answer: None,
-            failures,
-        }
+        Err(last_error)
     }
 
     /// One backend that sends each request to the provider that owns its
     /// model: the primary provider, else the first failover provider listing
     /// it. Unknown models go to the primary.
-    pub(crate) fn model_routed_backend(&self) -> ModelBackend {
+    pub(in crate::llm_runtime) fn model_routed_backend(&self) -> ModelBackend {
         let routes = self
             .failover_targets
             .iter()
@@ -313,20 +258,6 @@ impl LlmRuntimeSnapshot {
             primary_models,
             routes,
         })
-    }
-
-    /// One background call on [`Self::background_chain`], starting at `model`.
-    #[cfg(test)]
-    pub(crate) async fn background_chat(
-        &self,
-        model: &str,
-        messages: &[serde_json::Value],
-        tools: &[serde_json::Value],
-    ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        use crate::providers::sdk_backed::ChatJson;
-        self.background_chain(model)
-            .chat(model, messages, tools)
-            .await
     }
 }
 
@@ -477,7 +408,20 @@ impl aidaemon_core::Provider for ModelRoutedBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ChatJson;
     use aidaemon_core::testing::{text, ScriptedProvider};
+
+    /// One call on the background chain, starting at `model`.
+    async fn background_chat(
+        snapshot: &LlmRuntimeSnapshot,
+        model: &str,
+        messages: &[serde_json::Value],
+    ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        snapshot
+            .background_chain_through(model, |provider| provider)
+            .chat_with_options(model, messages, &[], &Default::default())
+            .await
+    }
 
     /// A background call whose primary provider has used up its quota is
     /// answered by the failover provider, not dropped.
@@ -504,15 +448,13 @@ mod tests {
             )],
         );
 
-        let response = runtime
-            .snapshot()
-            .background_chat(
-                "primary-model",
-                &[serde_json::json!({"role": "user", "content": "hi"})],
-                &[],
-            )
-            .await
-            .expect("the failover provider answers");
+        let response = background_chat(
+            &runtime.snapshot(),
+            "primary-model",
+            &[serde_json::json!({"role": "user", "content": "hi"})],
+        )
+        .await
+        .expect("the failover provider answers");
 
         assert_eq!(response.content.as_deref(), Some("consolidated"));
         assert_eq!(primary.requests().len(), 1);
@@ -570,7 +512,6 @@ mod tests {
     /// failover provider's fast tier first.
     #[tokio::test]
     async fn requests_route_to_the_provider_that_owns_the_model() {
-        use crate::providers::sdk_backed::ChatJson;
         let primary = Arc::new(ScriptedProvider::new([text("from primary")]));
         let failover = Arc::new(ScriptedProvider::new([
             text("from failover"),
@@ -581,15 +522,20 @@ mod tests {
         let backend = snapshot.model_routed_backend();
         let messages = [serde_json::json!({"role": "user", "content": "hi"})];
 
-        let answer = backend.chat("small-claude", &messages, &[]).await.unwrap();
+        let answer = backend
+            .chat_with_options("small-claude", &messages, &[], &Default::default())
+            .await
+            .unwrap();
         assert_eq!(answer.content.as_deref(), Some("from failover"));
-        let answer = backend.chat("strong", &messages, &[]).await.unwrap();
+        let answer = backend
+            .chat_with_options("strong", &messages, &[], &Default::default())
+            .await
+            .unwrap();
         assert_eq!(answer.content.as_deref(), Some("from primary"));
 
         // Primary exhausted (its script is empty): the chain moves to the
         // failover provider, starting at its fast tier.
-        let answer = snapshot
-            .background_chat("cheap", &messages, &[])
+        let answer = background_chat(&snapshot, "cheap", &messages)
             .await
             .unwrap();
         assert_eq!(answer.content.as_deref(), Some("background"));

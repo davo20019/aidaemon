@@ -31,12 +31,6 @@ pub struct SideCallGateway {
 #[derive(Debug, Clone)]
 pub struct SideCallAnswer {
     pub text: String,
-    /// The model that answered.
-    #[allow(dead_code)] // no caller reads it yet; Task 9 removes it if none does
-    pub model: String,
-    /// Time from the request to the answer, across every attempt.
-    #[allow(dead_code)] // no caller reads it yet; Task 9 removes it if none does
-    pub elapsed: Duration,
 }
 
 /// Why a side call has no answer.
@@ -191,15 +185,12 @@ impl SideCallGateway {
             options: options.clone(),
             ..Default::default()
         };
-        let started = Instant::now();
-        let (response, model) = self.run(spec, request).await?;
+        let response = self.run(spec, request).await?;
         if response.text.trim().is_empty() {
             return Err(SideCallError::Empty);
         }
         Ok(SideCallAnswer {
             text: response.text,
-            model,
-            elapsed: started.elapsed(),
         })
     }
 
@@ -223,12 +214,12 @@ impl SideCallGateway {
     }
 
     /// Every attempt of one side call within its total deadline, then one
-    /// row per attempt. Returns the response and the model that gave it.
+    /// row per attempt.
     async fn run(
         &self,
         spec: SideCallSpec,
         mut request: sdk::ModelRequest,
-    ) -> Result<(sdk::ModelResponse, String), SideCallError> {
+    ) -> Result<sdk::ModelResponse, SideCallError> {
         // No side call gets tools, whichever door the request came through.
         // `None`, not the default `Auto`: with no tools, `Auto` lets a
         // backend add its own (Google turns on search grounding).
@@ -260,7 +251,7 @@ impl SideCallGateway {
         spec: &SideCallSpec,
         request: &sdk::ModelRequest,
         log: &AttemptLog,
-    ) -> Result<(sdk::ModelResponse, String), SideCallError> {
+    ) -> Result<sdk::ModelResponse, SideCallError> {
         let snapshot = self.runtime.snapshot();
         let logged = |inner| -> ModelBackend {
             Arc::new(LoggedProvider {
@@ -271,38 +262,21 @@ impl SideCallGateway {
         if spec.class == SideCallClass::SafetyJudge {
             // Each attempt is logged as it starts, so the rows survive the
             // total deadline cutting the judgment off.
-            let outcome = snapshot
+            return snapshot
                 .ask_for_judgment_through(
                     &to_chat_messages(&request.messages),
                     &to_chat_options(request),
                     spec.deadline + JUDGE_BUDGET_SLACK,
                     logged,
                 )
-                .await;
-            let Some(answer) = outcome.answer else {
-                return Err(SideCallError::Provider(
-                    outcome
-                        .failures
-                        .last()
-                        .map(|failure| failure.error.clone())
-                        .unwrap_or_else(|| "no model available".to_string()),
-                ));
-            };
-            return Ok((to_sdk_response(answer.response), answer.model));
+                .await
+                .map(to_sdk_response)
+                .map_err(SideCallError::Provider);
         }
         let chain = snapshot.background_chain_through(&request.model, logged);
-        let response = sdk::Provider::complete(&chain, request)
+        sdk::Provider::complete(&chain, request)
             .await
-            .map_err(|error| SideCallError::Provider(error.to_string()))?;
-        let model = log
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .rev()
-            .find(|attempt| matches!(attempt.finished, Some((_, Ok(_)))))
-            .map(|attempt| attempt.model.clone())
-            .unwrap_or_else(|| request.model.clone());
-        Ok((response, model))
+            .map_err(|error| SideCallError::Provider(error.to_string()))
     }
 
     /// One `llm_call` row per attempt, under the session
@@ -315,7 +289,7 @@ impl SideCallGateway {
         spec: &SideCallSpec,
         model: &str,
         log: &AttemptLog,
-        result: &Result<(sdk::ModelResponse, String), SideCallError>,
+        result: &Result<sdk::ModelResponse, SideCallError>,
         elapsed: Duration,
     ) {
         let unfinished = match result {
@@ -475,7 +449,6 @@ impl sdk::Provider for SideCallProvider {
         self.gateway
             .run(self.spec, request)
             .await
-            .map(|(response, _)| response)
             .map_err(|error| sdk::ProviderError::Other(error.to_string()))
     }
 }

@@ -264,8 +264,8 @@ impl SkillPromoter {
             .await
     }
 
-    /// Use a fast LLM to generate a proper skill markdown from procedure data.
-    /// Returns None if the LLM decides the procedure isn't suitable for a skill.
+    /// Ask the model to write a proper skill markdown from procedure data.
+    /// Returns None if the model decides the procedure isn't suitable for a skill.
     async fn promote_procedure(&self, procedure: &Procedure) -> anyhow::Result<Option<Skill>> {
         let steps_str = procedure
             .steps
