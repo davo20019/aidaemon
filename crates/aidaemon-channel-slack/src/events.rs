@@ -438,6 +438,37 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_reply_links_to_its_root_and_the_root_only_to_its_thread() {
+        let reply = msg(map_events_api(
+            &message(json!({ "thread_ts": "1699999999.000001" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(
+            reply.parent_message_id.as_deref(),
+            Some("1699999999.000001")
+        );
+        assert_eq!(reply.thread_id.as_deref(), Some("1699999999.000001"));
+
+        let root = msg(map_events_api(
+            &message(json!({ "thread_ts": "1700000000.000100" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(root.parent_message_id, None);
+        assert_eq!(root.thread_id.as_deref(), Some("1700000000.000100"));
+
+        // Answered in a new thread, but not in one yet.
+        let top_level = msg(map_events_api(
+            &message(json!({ "text": "<@U000BOT> hi" })),
+            &ctx(true),
+            &mut SeenMessages::default(),
+        ));
+        assert_eq!(top_level.conversation.kind, ConversationKind::Thread);
+        assert_eq!(top_level.thread_id, None);
+    }
+
+    #[test]
     fn dm_is_direct_and_addressed() {
         let m = msg(map_events_api(
             &message(json!({ "channel": "D000SYNTH", "channel_type": "im" })),
@@ -501,6 +532,10 @@ mod tests {
         assert_eq!(m.attachments.len(), 1);
         assert_eq!(m.attachments[0].name, "report.pdf");
         assert_eq!(m.attachments[0].size_bytes, Some(1234));
+        assert_eq!(
+            m.attachments[0].kind,
+            aidaemon_channels::AttachmentKind::File
+        );
         assert!(m.attachments[0]
             .source
             .starts_with("https://files.slack.com/"));
@@ -527,6 +562,9 @@ mod tests {
                 assert_eq!(a.sender.id, "U000ALICE");
                 assert_eq!(a.conversation.kind, ConversationKind::Thread);
                 assert_eq!(a.conversation.id, "C000SYNTH:1700000000.000100");
+                let pressed = a.message.expect("the press names its message");
+                assert_eq!(pressed.message_id, "1700000000.000200");
+                assert_eq!(pressed.conversation_id, "C000SYNTH:1700000000.000100");
             }
             other => panic!("expected approval, got {other:?}"),
         }

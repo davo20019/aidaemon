@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aidaemon_channel_slack::SlackChannel;
 use aidaemon_channels::conformance::{check_channel, ChannelHarness};
-use aidaemon_channels::{Attachment, ApprovalPrompt, Conversation, ConversationKind};
+use aidaemon_channels::{ApprovalPrompt, Attachment, Conversation, ConversationKind};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use support::{MockApi, Response, APP_TOKEN, BOT_TOKEN, BOT_USER};

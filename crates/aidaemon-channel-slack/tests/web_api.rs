@@ -9,7 +9,9 @@ use serde_json::json;
 use support::*;
 
 fn channel(api: &MockApi) -> SlackChannel {
-    SlackChannel::new(BOT_TOKEN, APP_TOKEN).with_api_base(&api.base)
+    SlackChannel::new(BOT_TOKEN, APP_TOKEN)
+        .with_api_base(&api.base)
+        .with_download_client(reqwest::Client::builder().no_proxy())
 }
 
 fn thread() -> Conversation {
@@ -429,4 +431,85 @@ async fn a_shorter_message_length_splits_sooner() {
     for post in posts {
         assert!(post.json()["text"].as_str().unwrap().chars().count() <= 100);
     }
+}
+
+fn file_at(api: &MockApi) -> aidaemon_channels::Attachment {
+    let host = api.base.trim_end_matches("/api");
+    aidaemon_channels::Attachment::new("notes.txt", format!("{host}/files-pri/F000SYNTH/notes.txt"))
+}
+
+#[tokio::test]
+async fn a_redirect_off_slack_is_refused_and_the_token_is_not_followed() {
+    let api = MockApi::start(|_, _| {
+        Response::json(json!({}))
+            .status(302)
+            .header("Location", "https://files.example.test/stolen")
+    })
+    .await;
+    let err = channel(&api).download(&file_at(&api)).await.unwrap_err();
+    assert_eq!(api.requests().len(), 1);
+    let shown = format!("{err} {err:?}");
+    assert!(shown.contains("refused"), "{shown}");
+    assert!(!shown.contains(BOT_TOKEN), "{shown}");
+    assert!(!shown.contains("example.test"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_download_stops_at_the_limit() {
+    let api = MockApi::start(|_, _| Response::json(json!("0123456789"))).await;
+    let err = channel(&api)
+        .download_limited(&file_at(&api), 4)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChannelError::TooLarge { limit_bytes: 4 }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn slacks_sign_in_page_does_not_pass_for_the_file() {
+    let api = MockApi::start(|_, _| {
+        Response::json(json!("<html>sign in</html>"))
+            .header("Content-Type", "text/html; charset=utf-8")
+    })
+    .await;
+    let err = channel(&api).download(&file_at(&api)).await.unwrap_err();
+    assert!(matches!(err, ChannelError::Auth(_)), "{err}");
+    assert!(err.to_string().contains("files:read"), "{err}");
+
+    // A file that really is HTML is fine.
+    let bytes = channel(&api)
+        .download(&file_at(&api).with_mime_type(Some("text/html".to_string())))
+        .await
+        .unwrap();
+    assert!(!bytes.is_empty());
+}
+
+#[tokio::test]
+async fn a_long_edit_fits_the_configured_length_and_is_marked() {
+    let api = ok_api().await;
+    let slack = channel(&api).with_max_message_len(100);
+    let target = MessageRef {
+        conversation_id: "C000SYNTH".into(),
+        message_id: "1700000000.000200".into(),
+    };
+    slack.edit(&target, &"word ".repeat(100)).await.unwrap();
+    let calls = api.calls("chat.update");
+    assert_eq!(calls.len(), 1);
+    let text = calls[0].json()["text"].as_str().unwrap().to_string();
+    assert_eq!(text.chars().count(), 100);
+    assert!(text.ends_with('\u{2026}'));
+}
+
+#[tokio::test]
+async fn remove_buttons_needs_a_prompt_it_saw_pressed() {
+    let api = ok_api().await;
+    let target = MessageRef {
+        conversation_id: "C000SYNTH".into(),
+        message_id: "1700000000.000200".into(),
+    };
+    let err = channel(&api).remove_buttons(&target).await.unwrap_err();
+    assert!(matches!(err, ChannelError::Other(_)), "{err}");
+    assert!(api.calls("chat.update").is_empty());
 }

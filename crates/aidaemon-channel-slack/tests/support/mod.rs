@@ -168,8 +168,18 @@ async fn serve_http(
     };
     let response = handler(&request, prior);
 
+    // A response may set its own type.
+    let default_type = if response
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
     let mut out = format!(
-        "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} MOCK\r\n{default_type}Content-Length: {}\r\nConnection: close\r\n",
         response.status,
         response.body.len()
     );
