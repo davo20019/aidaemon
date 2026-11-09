@@ -339,6 +339,10 @@ calls instead of checking them.
   with `Outbound` (`call_outbound`): a string already present word for word in
   a user message or tool result holds nothing the run composed and passes; any
   other URL or a search query goes to the verifier after an untrusted read.
+- A call the verifier does not pass goes to the owner as a one-time card when
+  the owner wrote the request in a private chat
+  (`refused_check_may_ask_owner`); a decline binds the run through
+  `Resolution::OwnerDeclined`. Every other run keeps the verifier's refusal.
 - Tool output of a tainted turn is left out of conversation summaries, and a
   summary that folded in a tainted turn taints later turns until `/clear` or
   three clean rewrites.

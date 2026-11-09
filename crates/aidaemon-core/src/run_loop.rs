@@ -130,10 +130,12 @@ impl<'a> Driver<'a> {
         interruption: &Interruption,
         resolution: Option<Resolution>,
     ) -> Option<Resolution> {
-        let (InterruptKind::OwnerApproval(request), Some(Resolution::Deny { reason })) =
-            (&interruption.kind, &resolution)
-        else {
-            return resolution;
+        let (request, reason) = match (&interruption.kind, &resolution) {
+            (_, Some(Resolution::OwnerDeclined { request, reason }))
+            | (InterruptKind::OwnerApproval(request), Some(Resolution::Deny { reason })) => {
+                (request, reason)
+            }
+            _ => return resolution,
         };
         // A request without effects is remembered by its exact subject; a
         // blank subject names no call, so it binds nothing.
@@ -666,7 +668,9 @@ impl<'a> Driver<'a> {
                     self.decide(&mut call, &mut info, resume_after.map_or(0, |i| i + 1))
                         .await
                 }
-                Some(Resolution::Deny { reason }) => Verdict::Deny(reason),
+                Some(Resolution::Deny { reason } | Resolution::OwnerDeclined { reason, .. }) => {
+                    Verdict::Deny(reason)
+                }
                 None => self.decide(&mut call, &mut info, 0).await,
             };
             // A rewrite may introduce egress after reads were queued. Let

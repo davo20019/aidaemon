@@ -4735,3 +4735,62 @@ fn a_guessed_scope_keeps_sensitive_paths_and_the_terminal_card() {
         Some(ScopeCheck::Escalatable { .. })
     ));
 }
+
+/// A send the clean check refuses, in the owner's private chat, with the
+/// owner's card answered from `answer`, then one retry of the same send.
+async fn refused_send_put_to_owner(
+    answer: crate::types::ApprovalResponse,
+) -> (
+    crate::testing::TestHarness,
+    Arc<std::sync::atomic::AtomicUsize>,
+    crate::testing::ScriptedApprover,
+) {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let refused = r#"{"consistent":false,"reason":"not requested"}"#;
+    let (harness, sent) = untrusted_harness(vec![
+        MockProvider::tool_call_response("page_probe", PAGE_CALL),
+        MockProvider::tool_call_response("send_probe", SEND_CALL),
+        MockProvider::text_response(refused),
+        MockProvider::tool_call_response("send_probe", SEND_CALL),
+        MockProvider::text_response(refused),
+        MockProvider::text_response("Finished."),
+    ])
+    .await;
+    let (broker, approver) = crate::testing::ScriptedApprover::start(vec![Some(answer), None]);
+    harness.agent.owner_approvals().set_broker(broker);
+    harness
+        .agent
+        .handle_inbound_message(owner_request(
+            "Summarize https://example.invalid/page for me.",
+        ))
+        .await
+        .unwrap();
+    (harness, sent, approver)
+}
+
+#[tokio::test]
+async fn the_owner_can_allow_a_call_the_check_refused() {
+    let (_harness, sent, approver) =
+        refused_send_put_to_owner(crate::types::ApprovalResponse::AllowOnce).await;
+    let cards = approver.cards.lock().unwrap().clone();
+    assert!(!cards.is_empty());
+    assert!(cards[0].command.contains("jordan@example.invalid"));
+    assert!(cards[0].warnings[0].contains("not requested"));
+    assert!(sent.load(Ordering::SeqCst) >= 1, "the owner allowed it");
+}
+
+#[tokio::test]
+async fn the_owners_deny_of_a_refused_check_binds_the_run() {
+    let (harness, sent, approver) =
+        refused_send_put_to_owner(crate::types::ApprovalResponse::Deny).await;
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+    assert_eq!(approver.card_count(), 1, "the retry brings no second card");
+    let results = tool_results_seen(&harness).await;
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains(aidaemon_core::OWNER_DECLINED)),
+        "{results:?}"
+    );
+}

@@ -206,7 +206,7 @@ fn string_lengths(value: &Value, lengths: &mut Vec<usize>) {
     }
 }
 
-fn cap_strings(value: &Value, cap: usize) -> Value {
+pub(in crate::agent) fn cap_strings(value: &Value, cap: usize) -> Value {
     match value {
         Value::String(text) => {
             let length = text.chars().count();
@@ -429,13 +429,13 @@ pub(in crate::agent) struct UntrustedVerifier<'a> {
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
-#[async_trait]
-impl sdk::InterruptResolver for UntrustedVerifier<'_> {
-    async fn resolve(
+impl UntrustedVerifier<'_> {
+    /// The clean check's verdict on an untrusted-egress interruption; `None`
+    /// for any other interruption.
+    pub(in crate::agent) async fn judge(
         &self,
-        _state: &sdk::RunState,
         interruption: &sdk::Interruption,
-    ) -> Option<sdk::Resolution> {
+    ) -> Option<VerifierVerdict> {
         if !sdk::is_untrusted_egress(interruption) {
             return None;
         }
@@ -478,13 +478,34 @@ impl sdk::InterruptResolver for UntrustedVerifier<'_> {
                 }),
             )
             .await;
-        Some(if verdict.consistent {
-            sdk::Resolution::Approve
-        } else {
-            sdk::Resolution::Deny {
-                reason: denial_reason(tool, &verdict),
-            }
-        })
+        Some(verdict)
+    }
+}
+
+/// What a verdict means when nobody else is asked: a consistent call runs as
+/// shown, anything else is refused with the verifier's reason.
+pub(in crate::agent) fn verdict_resolution(
+    tool: &str,
+    verdict: &VerifierVerdict,
+) -> sdk::Resolution {
+    if verdict.consistent {
+        sdk::Resolution::Approve
+    } else {
+        sdk::Resolution::Deny {
+            reason: denial_reason(tool, verdict),
+        }
+    }
+}
+
+#[async_trait]
+impl sdk::InterruptResolver for UntrustedVerifier<'_> {
+    async fn resolve(
+        &self,
+        _state: &sdk::RunState,
+        interruption: &sdk::Interruption,
+    ) -> Option<sdk::Resolution> {
+        let verdict = self.judge(interruption).await?;
+        Some(verdict_resolution(&interruption.call.name, &verdict))
     }
 }
 

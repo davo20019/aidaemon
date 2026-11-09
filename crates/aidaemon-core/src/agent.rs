@@ -37,6 +37,13 @@ pub enum Resolution {
     Approve,
     /// Refuse it. The reason goes back to the model as the tool result.
     Deny { reason: String },
+    /// The owner refused a call that was interrupted for another reason and
+    /// put to them by the resolver. Binds the run exactly as a denied
+    /// [`InterruptKind::OwnerApproval`](crate::InterruptKind) does.
+    OwnerDeclined {
+        request: crate::approval::OwnerApprovalRequest,
+        reason: String,
+    },
 }
 
 #[derive(Clone)]

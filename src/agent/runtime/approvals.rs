@@ -18,7 +18,7 @@ use std::time::Duration;
 use aidaemon_core as sdk;
 use aidaemon_policies::{ApprovalRules, RuleDecision, SessionGrants};
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::agent::untrusted::UntrustedVerifier;
@@ -891,6 +891,55 @@ impl OwnerApprovalResolver<'_> {
         interruption: &sdk::Interruption,
         request: &sdk::OwnerApprovalRequest,
     ) -> sdk::Resolution {
+        let kind = self.rules.card_kind(&interruption.call.name, request);
+        self.ask(run, interruption, request, kind).await
+    }
+
+    /// Put a call the clean check would not pass to the owner, for this one
+    /// call only. The owner's Deny binds the run like any other decline. A
+    /// card nobody answered leaves the check's own refusal standing: no owner
+    /// declined anything.
+    async fn ask_about_refused_call(
+        &self,
+        state: &sdk::RunState,
+        interruption: &sdk::Interruption,
+        verdict: &crate::agent::untrusted::VerifierVerdict,
+    ) -> sdk::Resolution {
+        let call = &interruption.call;
+        let effects = self
+            .rules
+            .tool(&call.name)
+            .map(|tool| tool.call_effects(&call.arguments.to_string()).keys)
+            .unwrap_or_default();
+        let request = refused_call_request(&call.name, &call.arguments, effects, &verdict.reason);
+        // The kernel only stops a retry by its effects; one declared by
+        // subject alone must not bring the same card back.
+        let declined = sdk::EffectKey::named(sdk::EffectClass::Call, &request.subject);
+        if state.declined.contains(&declined) {
+            return sdk::Resolution::OwnerDeclined {
+                request,
+                reason: DECLINED_BY_OWNER.to_string(),
+            };
+        }
+        let kind = crate::types::ApprovalKind::CommandOnce;
+        match self.ask(state.run_id, interruption, &request, kind).await {
+            sdk::Resolution::Deny { reason } if reason == DECLINED_BY_OWNER => {
+                sdk::Resolution::OwnerDeclined { request, reason }
+            }
+            sdk::Resolution::Deny { .. } => {
+                crate::agent::untrusted::verdict_resolution(&call.name, verdict)
+            }
+            other => other,
+        }
+    }
+
+    async fn ask(
+        &self,
+        run: sdk::RunId,
+        interruption: &sdk::Interruption,
+        request: &sdk::OwnerApprovalRequest,
+        kind: crate::types::ApprovalKind,
+    ) -> sdk::Resolution {
         let tool = interruption.call.name.as_str();
         self.record("owner_approval_requested", tool, request, None)
             .await;
@@ -900,7 +949,7 @@ impl OwnerApprovalResolver<'_> {
                 self.card_session,
                 request,
                 self.rules.card_permission_mode(tool),
-                self.rules.card_kind(tool, request),
+                kind,
                 &self.cancel,
             )
             .await
@@ -955,7 +1004,14 @@ impl sdk::InterruptResolver for AbandonedRunResolver<'_, '_> {
         interruption: &sdk::Interruption,
     ) -> Option<sdk::Resolution> {
         let sdk::InterruptKind::OwnerApproval(request) = &interruption.kind else {
-            return sdk::InterruptResolver::resolve(self.turn, state, interruption).await;
+            return match &interruption.kind {
+                // The clean check alone: a card here would be the same
+                // unrelated question.
+                sdk::InterruptKind::Untrusted => {
+                    sdk::InterruptResolver::resolve(&self.turn.untrusted, state, interruption).await
+                }
+                _ => Some(unknown_interrupt_kind(interruption)),
+            };
         };
         self.not_done
             .lock()
@@ -991,10 +1047,64 @@ impl sdk::InterruptResolver for DaemonInterruptResolver<'_> {
                     .await,
             ),
             sdk::InterruptKind::Untrusted => {
-                sdk::InterruptResolver::resolve(&self.untrusted, state, interruption).await
+                let verdict = self.untrusted.judge(interruption).await?;
+                let owner_can_answer =
+                    refused_check_may_ask_owner(&self.owner.rules, self.untrusted.origin_trusted)
+                        && !self.untrusted.cancel.is_cancelled();
+                Some(if verdict.consistent || !owner_can_answer {
+                    crate::agent::untrusted::verdict_resolution(&interruption.call.name, &verdict)
+                } else {
+                    self.owner
+                        .ask_about_refused_call(state, interruption, &verdict)
+                        .await
+                })
             }
             _ => Some(unknown_interrupt_kind(interruption)),
         }
+    }
+}
+
+/// Whether a call the clean check would not pass can go to the owner: only
+/// when the owner wrote the request and is in a private chat to answer.
+/// Scheduled, mandate and triggered runs, and other people's turns, keep the
+/// check's refusal.
+fn refused_check_may_ask_owner(rules: &AppApprovalRules, origin_trusted: bool) -> bool {
+    origin_trusted
+        && rules.user_role == Some(crate::types::UserRole::Owner)
+        && rules.channel_visibility == Some(crate::types::ChannelVisibility::Private)
+        && !rules.trusted_session
+        && !rules.mandate_preapproved
+        && !rules.untrusted_trigger_session
+}
+
+/// How much of a call a card shows, head and tail around a marked cut.
+const REFUSED_CALL_SHOWN_CHARS: usize = 1500;
+const REFUSED_CALL_REASON_CHARS: usize = 400;
+
+/// The card for a call the clean check would not pass. It shows the command
+/// the owner would be allowing, not the model's account of it.
+fn refused_call_request(
+    tool: &str,
+    arguments: &Value,
+    effects: Vec<sdk::EffectKey>,
+    check_reason: &str,
+) -> sdk::OwnerApprovalRequest {
+    let shown = ["command", "script"]
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))
+        .map_or_else(|| arguments.to_string(), str::to_string);
+    let shown = crate::tools::sanitize::redact_secrets(&shown);
+    let shown = crate::agent::untrusted::cap_strings(&Value::from(shown), REFUSED_CALL_SHOWN_CHARS);
+    sdk::OwnerApprovalRequest {
+        effects,
+        summary: format!("{tool}: {}", shown.as_str().unwrap_or_default()),
+        subject: format!("{tool} {arguments}"),
+        risk: sdk::ApprovalRisk::High,
+        warnings: vec![format!(
+            "This run read outside content, and the safety check could not confirm this call \
+             fits your request: {}",
+            crate::utils::truncate_str(check_reason, REFUSED_CALL_REASON_CHARS)
+        )],
     }
 }
 
@@ -1015,6 +1125,81 @@ mod tests {
     use aidaemon_core as sdk;
     use aidaemon_policies::{ApprovalRules, RuleDecision};
     use serde_json::json;
+
+    /// Only the owner's own request in a private chat may reach a card.
+    #[test]
+    fn a_refused_check_reaches_the_owner_only_in_their_private_chat() {
+        use crate::types::{ChannelVisibility, UserRole};
+        let owner_dm = || AppApprovalRules {
+            user_role: Some(UserRole::Owner),
+            channel_visibility: Some(ChannelVisibility::Private),
+            ..Default::default()
+        };
+        assert!(refused_check_may_ask_owner(&owner_dm(), true));
+        assert!(!refused_check_may_ask_owner(&owner_dm(), false));
+        let barred = [
+            AppApprovalRules {
+                user_role: Some(UserRole::Guest),
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                user_role: None,
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                channel_visibility: Some(ChannelVisibility::PrivateGroup),
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                channel_visibility: Some(ChannelVisibility::Internal),
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                channel_visibility: None,
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                trusted_session: true,
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                mandate_preapproved: true,
+                ..owner_dm()
+            },
+            AppApprovalRules {
+                untrusted_trigger_session: true,
+                ..owner_dm()
+            },
+        ];
+        for rules in &barred {
+            assert!(!refused_check_may_ask_owner(rules, true), "{rules:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_call_card_shows_the_command_and_why() {
+        let arguments =
+            json!({"action": "run", "command": "rm -rf synthetic-dir", "network": true});
+        let request = refused_call_request("terminal", &arguments, Vec::new(), "not requested");
+        assert_eq!(request.summary, "terminal: rm -rf synthetic-dir");
+        assert_eq!(request.subject, format!("terminal {arguments}"));
+        assert!(request.warnings[0].contains("not requested"));
+    }
+
+    /// The end of a long command is kept: that is where a payload hides.
+    #[test]
+    fn a_refused_call_card_keeps_both_ends_of_a_long_command() {
+        let command = format!("start {} rm-tail", "x".repeat(5000));
+        let request = refused_call_request(
+            "terminal",
+            &json!({"command": command}),
+            Vec::new(),
+            "not requested",
+        );
+        assert!(request.summary.contains("start"));
+        assert!(request.summary.contains("rm-tail"));
+        assert!(request.summary.contains("chars cut"));
+    }
 
     fn hook_ctx() -> sdk::HookContext<'static> {
         sdk::HookContext {

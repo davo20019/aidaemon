@@ -308,6 +308,9 @@ pub enum aidaemon_core::Resolution
 pub aidaemon_core::Resolution::Approve
 pub aidaemon_core::Resolution::Deny
 pub aidaemon_core::Resolution::Deny::reason: alloc::string::String
+pub aidaemon_core::Resolution::OwnerDeclined
+pub aidaemon_core::Resolution::OwnerDeclined::reason: alloc::string::String
+pub aidaemon_core::Resolution::OwnerDeclined::request: aidaemon_core::OwnerApprovalRequest
 pub enum aidaemon_core::ResponseFormat
 pub aidaemon_core::ResponseFormat::JsonObject
 pub aidaemon_core::ResponseFormat::JsonSchema

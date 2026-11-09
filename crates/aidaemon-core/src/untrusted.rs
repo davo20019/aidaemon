@@ -422,6 +422,35 @@ mod tests {
         assert_eq!(sent.load(Ordering::SeqCst), 0);
     }
 
+    /// The owner answering for a check binds the run like their own card.
+    #[tokio::test]
+    async fn an_owner_declining_a_refused_check_binds_the_run() {
+        let (a, sent) = setup(UntrustedMode::Enforce, egress_script());
+        let key = crate::EffectKey::named(crate::EffectClass::Call, "send");
+        let r = Fixed(Resolution::OwnerDeclined {
+            request: crate::OwnerApprovalRequest {
+                effects: vec![key.clone()],
+                summary: "send".into(),
+                subject: "send".into(),
+                risk: crate::ApprovalRisk::High,
+                warnings: Vec::new(),
+            },
+            reason: "declined by the owner".into(),
+        });
+        let out = a
+            .run_resolving(RunState::new("a", "s", "go"), CancellationToken::new(), &r)
+            .await
+            .unwrap();
+        let send = &out.receipts()[1];
+        assert_eq!(send.status, ReceiptStatus::Denied);
+        assert!(send
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(crate::OWNER_DECLINED)));
+        assert_eq!(out.state.declined, vec![key]);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn run_resolving_approves_and_runs_once() {
         let (a, sent) = setup(UntrustedMode::Enforce, egress_script());
