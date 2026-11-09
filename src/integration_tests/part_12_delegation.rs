@@ -328,7 +328,10 @@ async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
 #[tokio::test]
 async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
     let workspace = tempfile::tempdir().expect("synthetic executor workspace");
-    let workspace_root = workspace.path().canonicalize().expect("canonical workspace");
+    let workspace_root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
     let workspace_path = workspace_root.to_string_lossy().to_string();
     let file_path = workspace_root.join("src/main.rs");
     let final_summary = format!(
@@ -391,7 +394,10 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
         .await
         .unwrap();
 
-    assert!(!response.trim().is_empty(), "executor should return a result");
+    assert!(
+        !response.trim().is_empty(),
+        "executor should return a result"
+    );
 
     let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(updated.status, "completed");
@@ -616,8 +622,7 @@ async fn test_spawn_timeout_salvages_persisted_executor_outcome() {
     harness.state.create_task(&task).await.unwrap();
 
     let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
-    let spawn_tool =
-        crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0);
+    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0);
     let result = crate::traits::Tool::call(
         &spawn_tool,
         &json!({
@@ -680,9 +685,8 @@ async fn test_background_spawn_timeout_salvages_persisted_executor_outcome() {
     harness.state.create_task(&task).await.unwrap();
 
     let runtime: Arc<dyn crate::runtime_ports::ChildAgentRuntime> = agent.clone();
-    let spawn_tool =
-        crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0)
-            .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
+    let spawn_tool = crate::tools::spawn::SpawnAgentTool::new(Arc::downgrade(&runtime), 4000, 0)
+        .with_state(harness.state.clone() as Arc<dyn crate::traits::StateStore>);
     let ack = crate::testing::call_with_facts(
         &spawn_tool,
         &json!({
@@ -843,7 +847,8 @@ async fn test_executor_spawn_persists_needs_approval_blocker_result() {
 }
 
 async fn plain_spawn_call(specialist: Option<&str>) -> (Vec<String>, String) {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response("child finished")]);
+    let provider =
+        MockProvider::with_responses(vec![MockProvider::text_response("child finished")]);
     let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
         .await
         .unwrap();
@@ -892,9 +897,7 @@ async fn test_review_specialist_prompt_reaches_a_plain_spawn() {
     assert!(prompt.contains("You are a Review specialist."));
 }
 
-async fn run_limited_child(
-    provider: MockProvider,
-) -> crate::runtime_ports::ChildTimedOut {
+async fn run_limited_child(provider: MockProvider) -> crate::runtime_ports::ChildTimedOut {
     let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
         .await
         .unwrap();
@@ -917,6 +920,7 @@ async fn run_limited_child(
                 limit: std::time::Duration::from_millis(1_500),
                 detached: false,
             }),
+            None,
         )
         .await
         .expect_err("the child runs past its limit");
@@ -932,11 +936,18 @@ async fn test_child_past_its_limit_reports_the_actions_it_completed() {
             MockProvider::tool_call_response("terminal", r#"{"command":"echo synthetic"}"#),
             MockProvider::text_response("never reached"),
         ],
-        vec![std::time::Duration::ZERO, std::time::Duration::from_secs(30)],
+        vec![
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(30),
+        ],
     ))
     .await;
     assert!(
-        timed_out.report.changed.iter().any(|item| item.starts_with("terminal:")),
+        timed_out
+            .report
+            .changed
+            .iter()
+            .any(|item| item.starts_with("terminal:")),
         "{:?}",
         timed_out.report
     );

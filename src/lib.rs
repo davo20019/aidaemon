@@ -497,7 +497,8 @@ fn handle_memory_export_command(args: &[String], default_config_path: &Path) -> 
             "-h" | "--help" => {
                 println!("Usage: aidaemon memory-export DIR [--config PATH]");
                 println!();
-                println!("Write everything the daemon's own memory holds as Markdown files.");
+                println!("Write what the daemon's own memory holds as Markdown files. Facts you");
+                println!("asked it to forget are left out.");
                 println!("DIR must not exist yet. The files contain personal data and are");
                 println!("readable only by you.");
                 return Ok(());

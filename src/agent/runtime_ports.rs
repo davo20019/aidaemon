@@ -63,6 +63,7 @@ impl ChildAgentRuntime for Agent {
                 request.approval_session_id.as_deref(),
                 request.parent_authority,
                 request.time_limit,
+                request.model_tier,
             )
             .await?;
         Ok(ChildAgentRun {

@@ -1497,6 +1497,12 @@ pub struct SubAgentSpawnData {
     /// Parent task ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// The access level the child actually runs with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_level: Option<String>,
+    /// The only tools the child may use, when it was narrowed to a list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_tools: Option<Vec<String>>,
 }
 
 /// Data for SubAgentComplete event

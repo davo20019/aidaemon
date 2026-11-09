@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -12,12 +13,12 @@ use crate::types::{ChannelContext, UserRole};
 /// are treated as duplicates, even after the original was popped from the queue.
 const DEDUP_WINDOW_SECS: i64 = 120;
 
-/// A task still marked `Running` after this many seconds is treated as leaked:
-/// its channel handler never finalized it (an abnormal turn exit, a dropped
-/// future, or a panic), so without this it would block the session's message
-/// queue forever — every new message stranded behind a phantom "running" task.
-/// Set far above any legitimate task wall-clock (agent turns and `computer_use`
-/// GUI flows are minutes, not hours), so this only ever reaps genuine leaks.
+/// A task still marked `Running` with no sign of life for this many seconds
+/// is treated as leaked: its channel handler never finalized it (an abnormal
+/// turn exit, a dropped future, or a panic), so without this it would block
+/// the session's message queue forever. A task's age says nothing, because a
+/// turn may legitimately run for hours: a live turn's heartbeat ticks every
+/// few seconds, and only a task without one is judged by when it started.
 const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
 
 /// A queued message waiting to be processed.
@@ -122,6 +123,17 @@ struct TaskHandle {
     /// Optional token to cancel the channel's typing indicator for this task.
     /// Set by the channel after task registration; cancelled alongside the task.
     typing_cancel: Option<CancellationToken>,
+    /// Unix seconds of the turn's last sign of life, once it has one.
+    heartbeat: Option<Arc<AtomicU64>>,
+}
+
+impl TaskHandle {
+    fn seconds_since_alive(&self, now: DateTime<Utc>) -> i64 {
+        match &self.heartbeat {
+            Some(heartbeat) => now.timestamp() - heartbeat.load(Ordering::Relaxed) as i64,
+            None => (now - self.entry.started_at).num_seconds(),
+        }
+    }
 }
 
 pub struct TaskRegistry {
@@ -174,6 +186,7 @@ impl TaskRegistry {
             },
             cancel_token: cancel_token.clone(),
             typing_cancel: None,
+            heartbeat: None,
         };
         let mut tasks = self.tasks.write().await;
         tasks.insert(id, handle);
@@ -202,6 +215,14 @@ impl TaskRegistry {
             handle.entry.finished_at = Some(Utc::now());
         }
         Self::cleanup_locked(&mut tasks, self.max_completed);
+    }
+
+    /// Give a running task the heartbeat that shows it is alive.
+    pub async fn set_heartbeat(&self, task_id: u64, heartbeat: Arc<AtomicU64>) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.heartbeat = Some(heartbeat);
+        }
     }
 
     /// Associate a typing indicator cancel token with a running task.
@@ -269,7 +290,7 @@ impl TaskRegistry {
         let mut reaped = Vec::new();
         for handle in tasks.values_mut() {
             let stale = Self::is_active(&handle.entry.status)
-                && (now - handle.entry.started_at).num_seconds() > MAX_RUNNING_TASK_AGE_SECS;
+                && handle.seconds_since_alive(now) > MAX_RUNNING_TASK_AGE_SECS;
             if stale {
                 handle.cancel_token.cancel();
                 if let Some(ref typing) = handle.typing_cancel {
@@ -576,6 +597,28 @@ impl TaskRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_long_turn_with_a_live_heartbeat_is_not_reaped() {
+        let registry = TaskRegistry::new(10);
+        let (live, live_token) = registry.register("live", "long turn").await;
+        let (leaked, leaked_token) = registry.register("leaked", "lost turn").await;
+        let now = Utc::now().timestamp() as u64;
+        registry
+            .set_heartbeat(live, Arc::new(AtomicU64::new(now)))
+            .await;
+        {
+            let mut tasks = registry.tasks.write().await;
+            let long_ago = Utc::now() - chrono::Duration::hours(6);
+            tasks.get_mut(&live).unwrap().entry.started_at = long_ago;
+            tasks.get_mut(&leaked).unwrap().entry.started_at = long_ago;
+        }
+
+        assert!(registry.has_running_task("live").await);
+        assert!(!live_token.is_cancelled());
+        assert!(!registry.has_running_task("leaked").await);
+        assert!(leaked_token.is_cancelled());
+    }
 
     fn queued(text: &str) -> QueuedMessage {
         queued_as(text, "test:user", UserRole::Public)

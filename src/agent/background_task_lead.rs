@@ -529,6 +529,7 @@ async fn execute_auto_dispatch_task(
             Some(&approval_session_id),
             None,
             None,
+            None,
         )
         .await
         .map(|run| run.response);
@@ -1681,6 +1682,7 @@ pub fn spawn_background_task_lead(
                     None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
                     Some(&session_id),
                     dispatch_attempt.clone(),
+                    None,
                     None,
                     None,
                 )
@@ -2884,6 +2886,7 @@ pub fn spawn_background_task_lead(
                                 dispatch_project_scope.as_deref(),
                                 Some("executor"),
                                 Some(&session_id),
+                                None,
                                 None,
                                 None,
                             )

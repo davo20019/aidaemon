@@ -255,6 +255,7 @@ impl TurnRunner {
             let description: String = text.chars().take(80).collect();
             let (task_id, cancel) = registry.register(&session_id, &description).await;
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
+            registry.set_heartbeat(task_id, heartbeat.clone()).await;
             let working = CancellationToken::new();
             if let Ok(mut slot) = indicator.lock() {
                 *slot = working.clone();

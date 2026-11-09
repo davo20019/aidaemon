@@ -696,6 +696,49 @@ async fn a_new_memory_learns_from_retained_conversations_in_their_scopes() {
 }
 
 #[tokio::test]
+async fn every_exchange_of_a_conversation_is_learned_from() {
+    use aidaemon_memory::ScopedMemory;
+    use aidaemon_policies::{MemorySystem, PastRole};
+
+    let provider = Arc::new(ScriptedProvider::new([
+        facts_reply(json!([
+            {"category": "user", "key": "employer", "value": "Acme Corp", "confidence": 0.9}
+        ])),
+        facts_reply(json!([
+            {"category": "user", "key": "city", "value": "Springfield", "confidence": 0.9}
+        ])),
+    ]));
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let system = ScopedMemory::new(
+        Memory::builder(store, Arc::new(HashEmbedder::default()))
+            .extractor(FactExtractor::from_arc(provider, "small")),
+    );
+
+    system
+        .absorb_history(&[
+            past(
+                SESSION,
+                "owner",
+                PastRole::User,
+                "I work at Acme Corp as an engineer",
+            ),
+            past(SESSION, "owner", PastRole::Assistant, "Good to know."),
+            past(
+                SESSION,
+                "owner",
+                PastRole::User,
+                "I also live in Springfield these days",
+            ),
+            past(SESSION, "owner", PastRole::Assistant, "Noted."),
+            past(SESSION, "owner", PastRole::User, "thanks!"),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(system.memory().facts("owner").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn a_memory_without_an_extractor_says_it_cannot_learn_from_history() {
     use aidaemon_memory::ScopedMemory;
     use aidaemon_policies::{HistoryIntake, MemorySystem, PastRole};

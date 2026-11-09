@@ -375,6 +375,9 @@ struct SpawnArgs {
     /// through `spawn_child`; Task 12 wires it into kind resolution.
     #[serde(default)]
     specialist: Option<String>,
+    /// Which model tier the child runs on.
+    #[serde(default)]
+    model_tier: Option<ChildModelTier>,
     /// Only these tools. The child is refused any other.
     #[serde(default)]
     tools: Option<Vec<String>>,
@@ -388,6 +391,24 @@ struct SpawnArgs {
 enum ChildAccess {
     ReadOnly,
     Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChildModelTier {
+    Fast,
+    Primary,
+    Smart,
+}
+
+impl From<ChildModelTier> for crate::router::Tier {
+    fn from(tier: ChildModelTier) -> Self {
+        match tier {
+            ChildModelTier::Fast => Self::Fast,
+            ChildModelTier::Primary => Self::Primary,
+            ChildModelTier::Smart => Self::Smart,
+        }
+    }
 }
 
 /// The authority the caller asked for its child, if it asked for one.
@@ -502,6 +523,11 @@ impl Tool for SpawnAgentTool {
                             "generic"
                         ],
                         "description": self.build_specialist_arg_description()
+                    },
+                    "model_tier": {
+                        "type": "string",
+                        "enum": ["fast", "primary", "smart"],
+                        "description": "Optional: fast for simple lookups, smart for hard reasoning. Omit to use the same model as this agent."
                     },
                     "tools": {
                         "type": "array",
@@ -658,6 +684,7 @@ impl Tool for SpawnAgentTool {
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
                     parent_authority.clone(),
+                    args.model_tier.map(Into::into),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -689,6 +716,7 @@ impl Tool for SpawnAgentTool {
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
                     parent_authority.clone(),
+                    args.model_tier.map(Into::into),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -715,6 +743,7 @@ impl Tool for SpawnAgentTool {
                         args.specialist.as_deref(),
                         approval_session_id.as_deref(),
                         parent_authority.clone(),
+                        args.model_tier.map(Into::into),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -773,6 +802,7 @@ impl Tool for SpawnAgentTool {
                     approval_session_id: Some(session_id.clone()),
                     parent_authority: parent_authority.clone(),
                     time_limit,
+                    model_tier: args.model_tier.map(Into::into),
                 }),);
                 let owner_cancelled = async {
                     match cancel_token.as_ref() {
@@ -1011,6 +1041,7 @@ impl SpawnAgentTool {
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        model_tier: Option<crate::router::Tier>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let result = agent
             .run_child(ChildAgentRequest {
@@ -1027,6 +1058,7 @@ impl SpawnAgentTool {
                 approval_session_id: approval_session_id.map(str::to_string),
                 parent_authority,
                 time_limit: self.time_limit(false),
+                model_tier,
             })
             .await;
 

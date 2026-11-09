@@ -172,10 +172,28 @@ impl MemorySystem for ScopedMemory {
                     PastRole::Assistant => Message::assistant(message.text.clone(), Vec::new()),
                 })
                 .collect();
-            match self.memory.ingest_turn(session, None, &transcript).await {
-                Ok(_) => {}
-                Err(MemoryError::NotConfigured(_)) => return Ok(HistoryIntake::NotSupported),
-                Err(error) => return Err(error.to_string()),
+            // Extraction reads one exchange: the last user message and what
+            // followed it. Hand it each exchange in turn.
+            let starts: Vec<usize> = past
+                .iter()
+                .enumerate()
+                .filter(|(index, message)| *index == 0 || message.role == PastRole::User)
+                .map(|(index, _)| index)
+                .collect();
+            for (position, start) in starts.iter().enumerate() {
+                let end = starts
+                    .get(position + 1)
+                    .copied()
+                    .unwrap_or(transcript.len());
+                match self
+                    .memory
+                    .ingest_turn(session, None, &transcript[*start..end])
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(MemoryError::NotConfigured(_)) => return Ok(HistoryIntake::NotSupported),
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         Ok(HistoryIntake::Absorbed)

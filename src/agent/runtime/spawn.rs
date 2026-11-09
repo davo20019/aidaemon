@@ -1728,6 +1728,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
         .map(|result| result.response)
@@ -1749,6 +1750,7 @@ impl Agent {
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
         time_limit: Option<ChildTimeLimit>,
+        model_tier: Option<crate::router::Tier>,
     ) -> anyhow::Result<SpawnChildResult> {
         self.spawn_child_with_outcome_and_attempt(
             mission,
@@ -1765,6 +1767,7 @@ impl Agent {
             None,
             parent_authority,
             time_limit,
+            model_tier,
         )
         .await
     }
@@ -1789,6 +1792,7 @@ impl Agent {
         bound_task_attempt: Option<crate::traits::TaskAttempt>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
         time_limit: Option<ChildTimeLimit>,
+        model_tier: Option<crate::router::Tier>,
     ) -> anyhow::Result<SpawnChildResult> {
         if self.depth >= self.limits.max_depth {
             anyhow::bail!(
@@ -1878,6 +1882,7 @@ impl Agent {
                             approval_session_id,
                             parent_authority,
                             time_limit,
+                            model_tier,
                         )
                         .await;
                 }
@@ -2103,6 +2108,7 @@ impl Agent {
                             approval_session_id,
                             parent_authority,
                             time_limit,
+                            model_tier,
                         )
                         .await;
                 }
@@ -2190,6 +2196,7 @@ impl Agent {
             approval_session_id,
             parent_authority,
             time_limit,
+            model_tier,
         )
         .await
     }
@@ -2344,6 +2351,7 @@ impl Agent {
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
         time_limit: Option<ChildTimeLimit>,
+        model_tier: Option<crate::router::Tier>,
     ) -> anyhow::Result<SpawnChildResult> {
         // Resolve the immutable mandate fence before any child-setup write or
         // filesystem provisioning. A stale/revoked attempt must fail without
@@ -2523,6 +2531,14 @@ impl Agent {
             }
         }
 
+        // The parent's explicit choice wins over the specialist's default.
+        if let Some(tier) = model_tier {
+            match self.llm_runtime.snapshot().router() {
+                Some(router) => model = router.select(tier).to_string(),
+                None => warn!(%tier, "no model router configured; child keeps the parent's model"),
+            }
+        }
+
         let specialist_source = match effective_specialists.get(specialist_kind).source {
             crate::agent::specialists::SpecialistSource::Bundled => "bundled",
             crate::agent::specialists::SpecialistSource::UserOverride(_) => "user_override",
@@ -2538,25 +2554,6 @@ impl Agent {
             ?role,
             "Spawning sub-agent"
         );
-
-        // Emit SubAgentSpawn event
-        {
-            let emitter =
-                crate::events::EventEmitter::new(self.event_store.clone(), child_session.clone());
-            let _ = emitter
-                .emit(
-                    EventType::SubAgentSpawn,
-                    SubAgentSpawnData {
-                        child_session_id: child_session.clone(),
-                        specialist_kind: Some(specialist_kind.as_str().to_string()),
-                        mission: mission.to_string(),
-                        task: task.chars().take(500).collect(),
-                        depth: child_depth as u32,
-                        parent_task_id: task_id.clone(),
-                    },
-                )
-                .await;
-        }
 
         let start = std::time::Instant::now();
         // Save task_id for post-completion knowledge extraction (Phase 4)
@@ -2607,6 +2604,30 @@ impl Agent {
                 goal_id.as_deref(),
             )
             .await;
+        // Emit SubAgentSpawn event
+        {
+            let emitter =
+                crate::events::EventEmitter::new(self.event_store.clone(), child_session.clone());
+            let _ = emitter
+                .emit(
+                    EventType::SubAgentSpawn,
+                    SubAgentSpawnData {
+                        child_session_id: child_session.clone(),
+                        specialist_kind: Some(specialist_kind.as_str().to_string()),
+                        mission: mission.to_string(),
+                        task: task.chars().take(500).collect(),
+                        depth: child_depth as u32,
+                        parent_task_id: task_id.clone(),
+                        authority_level: Some(format!("{:?}", parent_authority.authority.level)),
+                        authority_tools: parent_authority
+                            .authority
+                            .tools
+                            .as_ref()
+                            .map(|tools| tools.iter().cloned().collect()),
+                    },
+                )
+                .await;
+        }
         // Waiting on the owner never counts against the child, whether or not
         // this call runs inside a turn that already keeps that clock.
         let owner_wait = crate::tools::OwnerWaitClock::current().unwrap_or_default();

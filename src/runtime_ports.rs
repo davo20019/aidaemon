@@ -132,6 +132,7 @@ pub(crate) struct ChildAgentRequest {
     pub parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     /// `None` leaves the child unlimited.
     pub time_limit: Option<ChildTimeLimit>,
+    pub model_tier: Option<crate::router::Tier>,
 }
 
 /// Child-delegation capability required by `spawn_agent`.
