@@ -9,7 +9,7 @@ use aidaemon_core::{Agent, InvocationStage, Provider, ReceiptStatus, RunOutcome}
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::scenario::{status_name, Expect, Scenario};
+use crate::scenario::{status_name, Expect, NoExtension, Scenario};
 
 /// Error type factories may return.
 pub type FactoryError = Box<dyn std::error::Error + Send + Sync>;
@@ -171,15 +171,28 @@ impl Trajectory {
 /// turn loop around the kernel.
 #[async_trait]
 pub trait Subject: Send + Sync {
+    /// The scenario's `setup:` block. Use [`NoExtension`] for none.
+    type Setup: Send + Sync + 'static;
+    /// The scenario's `expect.ext:` block. Use [`NoExtension`] for none.
+    type ExpectExt: Send + Sync + 'static;
     /// What the subject reports beyond the neutral fields.
     type Observed: Send;
 
     /// `run` is the run number within the suite, for per-run session ids.
     async fn run(
         &self,
-        scenario: &Scenario,
+        scenario: &Scenario<Self::Setup, Self::ExpectExt>,
         run: usize,
     ) -> Result<Trajectory<Self::Observed>, FactoryError>;
+
+    /// Check the scenario's `expect.ext:` block. Returns every failure.
+    fn check_ext(
+        &self,
+        _expect: &Self::ExpectExt,
+        _trajectory: &Trajectory<Self::Observed>,
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The [`Subject`] for agents built by an [`AgentFactory`].
@@ -195,6 +208,8 @@ impl<'a> AgentSubject<'a> {
 
 #[async_trait]
 impl Subject for AgentSubject<'_> {
+    type Setup = NoExtension;
+    type ExpectExt = NoExtension;
     type Observed = ();
 
     async fn run(&self, scenario: &Scenario, run: usize) -> Result<Trajectory, FactoryError> {
@@ -240,7 +255,7 @@ impl Subject for AgentSubject<'_> {
 }
 
 impl CaseResult {
-    fn errored(scenario: &Scenario, message: String, elapsed: Duration) -> Self {
+    fn errored<S, X>(scenario: &Scenario<S, X>, message: String, elapsed: Duration) -> Self {
         Self {
             scenario: scenario.name.clone(),
             passed: false,
@@ -260,9 +275,14 @@ impl Scenario {
     pub async fn run(&self, factory: &dyn AgentFactory) -> CaseResult {
         self.run_on(&AgentSubject::new(factory), 0).await
     }
+}
 
+impl<S, X> Scenario<S, X> {
     /// Run once on `subject` and check the expectations.
-    pub async fn run_on<T: Subject>(&self, subject: &T, run: usize) -> CaseResult {
+    pub async fn run_on<T>(&self, subject: &T, run: usize) -> CaseResult
+    where
+        T: Subject<Setup = S, ExpectExt = X>,
+    {
         let started = Instant::now();
         let trajectory = match subject.run(self, run).await {
             Ok(trajectory) => trajectory,
@@ -272,6 +292,9 @@ impl Scenario {
 
         let mut failures = trajectory.run_failures.clone();
         failures.extend(check_trajectory(&self.expect, &trajectory));
+        if let Some(ext) = &self.expect.ext {
+            failures.extend(subject.check_ext(ext, &trajectory));
+        }
 
         CaseResult {
             scenario: self.name.clone(),
@@ -310,7 +333,7 @@ pub fn check_expectations(expect: &Expect, outcome: &RunOutcome) -> Vec<String> 
 
 /// Check every expectation against a trajectory. Returns all failures (empty
 /// means pass).
-pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<String> {
+pub fn check_trajectory<O, X>(expect: &Expect<X>, trajectory: &Trajectory<O>) -> Vec<String> {
     let mut failures = Vec::new();
     let receipts = &trajectory.receipts;
     let tools: Vec<&str> = receipts.iter().map(|r| r.tool.as_str()).collect();

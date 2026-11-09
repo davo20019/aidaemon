@@ -3,29 +3,60 @@
 use std::path::Path;
 
 use futures::stream::{self, StreamExt};
+use serde::de::DeserializeOwned;
 
 use crate::report::Report;
 use crate::runner::{AgentFactory, AgentSubject, CaseResult, Subject};
-use crate::scenario::{load_dir, EvalError, Scenario};
+use crate::scenario::{load_dir, EvalError, NoExtension, Scenario};
 
 /// A set of scenarios run N times each.
 #[derive(Debug, Clone)]
-pub struct Suite {
-    pub scenarios: Vec<Scenario>,
+pub struct Suite<S = NoExtension, X = NoExtension> {
+    pub scenarios: Vec<Scenario<S, X>>,
     parallelism: usize,
 }
 
 impl Suite {
-    pub fn new(scenarios: Vec<Scenario>) -> Self {
+    /// Load every `*.yaml` / `*.yml` file in `dir`, sorted by file name.
+    pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, EvalError> {
+        Self::load_dir(dir)
+    }
+
+    /// Run every scenario `n_runs` times and return raw results, grouped per
+    /// scenario in suite order (runs within a group in run order).
+    pub async fn run_cases(
+        &self,
+        factory: &dyn AgentFactory,
+        n_runs: usize,
+    ) -> Vec<Vec<CaseResult>> {
+        self.run_subject_cases(&AgentSubject::new(factory), n_runs)
+            .await
+    }
+
+    /// Run every scenario `n_runs` times and aggregate into a [`Report`].
+    pub async fn run(&self, factory: &dyn AgentFactory, n_runs: usize) -> Report {
+        self.run_subject(&AgentSubject::new(factory), n_runs).await
+    }
+}
+
+impl<S, X> Suite<S, X>
+where
+    S: DeserializeOwned,
+    X: DeserializeOwned + Default,
+{
+    /// [`Suite::from_dir`] with the subject's `setup:` and `expect.ext:`
+    /// types.
+    pub fn load_dir(dir: impl AsRef<Path>) -> Result<Self, EvalError> {
+        Ok(Self::new(load_dir(dir.as_ref())?))
+    }
+}
+
+impl<S, X> Suite<S, X> {
+    pub fn new(scenarios: Vec<Scenario<S, X>>) -> Self {
         Self {
             scenarios,
             parallelism: 4,
         }
-    }
-
-    /// Load every `*.yaml` / `*.yml` file in `dir`, sorted by file name.
-    pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, EvalError> {
-        Ok(Self::new(load_dir(dir.as_ref())?))
     }
 
     /// Maximum runs in flight at once (default 4, minimum 1). Mind provider
@@ -41,23 +72,11 @@ impl Suite {
         self
     }
 
-    /// Run every scenario `n_runs` times and return raw results, grouped per
-    /// scenario in suite order (runs within a group in run order).
-    pub async fn run_cases(
-        &self,
-        factory: &dyn AgentFactory,
-        n_runs: usize,
-    ) -> Vec<Vec<CaseResult>> {
-        self.run_subject_cases(&AgentSubject::new(factory), n_runs)
-            .await
-    }
-
     /// [`Suite::run_cases`] for any [`Subject`].
-    pub async fn run_subject_cases<T: Subject>(
-        &self,
-        subject: &T,
-        n_runs: usize,
-    ) -> Vec<Vec<CaseResult>> {
+    pub async fn run_subject_cases<T>(&self, subject: &T, n_runs: usize) -> Vec<Vec<CaseResult>>
+    where
+        T: Subject<Setup = S, ExpectExt = X>,
+    {
         let n_runs = n_runs.max(1);
         let jobs = self
             .scenarios
@@ -77,13 +96,11 @@ impl Suite {
         grouped
     }
 
-    /// Run every scenario `n_runs` times and aggregate into a [`Report`].
-    pub async fn run(&self, factory: &dyn AgentFactory, n_runs: usize) -> Report {
-        self.run_subject(&AgentSubject::new(factory), n_runs).await
-    }
-
     /// [`Suite::run`] for any [`Subject`].
-    pub async fn run_subject<T: Subject>(&self, subject: &T, n_runs: usize) -> Report {
+    pub async fn run_subject<T>(&self, subject: &T, n_runs: usize) -> Report
+    where
+        T: Subject<Setup = S, ExpectExt = X>,
+    {
         let grouped = self.run_subject_cases(subject, n_runs).await;
         Report::from_results(&grouped)
     }

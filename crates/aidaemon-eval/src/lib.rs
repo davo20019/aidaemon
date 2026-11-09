@@ -42,7 +42,9 @@
 //! ```
 //!
 //! Unknown fields are rejected everywhere, so a typo fails loudly instead
-//! of silently dropping an assertion.
+//! of silently dropping an assertion. A [`Subject`] can add its own typed
+//! `setup:` block and `expect.ext:` block; load those with
+//! [`Scenario::parse_yaml`] or [`Suite::load_dir`], which name the types.
 //!
 //! ## Running a suite against a live provider
 //!
@@ -93,7 +95,7 @@ pub use runner::{
     FactoryError, FnFactory, Subject, Trajectory,
 };
 pub use scenario::{
-    status_name, EvalError, Expect, ExpectedStatus, Scenario, ScenarioLimits, ScriptedArguments,
-    ScriptedCall, ScriptedReply, ScriptedUsage, ToolLaneExpect,
+    status_name, EvalError, Expect, ExpectedStatus, NoExtension, Scenario, ScenarioLimits,
+    ScriptedArguments, ScriptedCall, ScriptedReply, ScriptedUsage, ToolLaneExpect,
 };
 pub use suite::Suite;

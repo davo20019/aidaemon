@@ -11,6 +11,7 @@ use aidaemon_core::testing::SCRIPTED_USAGE;
 use aidaemon_core::{
     AgentBuilder, Limits, ModelResponse, ReceiptStatus, RunStatus, ToolCall, Usage,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,10 +41,22 @@ pub enum EvalError {
     ReportJson(String),
 }
 
-/// One eval case: an input, optionally a scripted model, and expectations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The `setup:` or `expect.ext:` type of a subject that has none. Only an
+/// empty block parses, so a stray key fails loudly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Scenario {
+pub struct NoExtension {}
+
+/// One eval case: an input, optionally a scripted model, and expectations.
+///
+/// `S` is the subject's `setup:` block and `X` its `expect.ext:` block; see
+/// [`crate::Subject`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    bound(deserialize = "S: Deserialize<'de>, X: Deserialize<'de> + Default")
+)]
+pub struct Scenario<S = NoExtension, X = NoExtension> {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -62,8 +75,11 @@ pub struct Scenario {
     pub script: Option<Vec<ScriptedReply>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ScenarioLimits>,
+    /// Subject-specific state to establish before the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<S>,
     #[serde(default)]
-    pub expect: Expect,
+    pub expect: Expect<X>,
     /// Where the scenario was loaded from, for error messages.
     #[serde(skip)]
     pub source: Option<PathBuf>,
@@ -212,8 +228,11 @@ pub fn status_name(status: &RunStatus) -> &'static str {
 /// `receipt_statuses` to assert what actually happened, and [`Expect::proposed`]
 /// for what the model asked for regardless of any receipt.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Expect {
+#[serde(
+    deny_unknown_fields,
+    bound(deserialize = "X: Deserialize<'de> + Default")
+)]
+pub struct Expect<X = NoExtension> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ExpectedStatus>,
     /// Whether the run's objective was met
@@ -263,6 +282,10 @@ pub struct Expect {
     /// invalid-arguments or indeterminate. Policy denials are allowed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_failed_receipts: bool,
+    /// Subject-specific assertions, checked by
+    /// [`crate::Subject::check_ext`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<X>,
 }
 
 /// Tool assertions on one lane of the trajectory. See [`Expect::proposed`].
@@ -297,12 +320,27 @@ fn empty_object() -> Value {
 impl Scenario {
     /// Parse and validate one scenario. `origin` is used in error messages.
     pub fn from_yaml_str(yaml: &str, origin: impl AsRef<Path>) -> Result<Self, EvalError> {
+        Self::parse_yaml(yaml, origin)
+    }
+
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, EvalError> {
+        Self::parse_file(path)
+    }
+}
+
+impl<S, X> Scenario<S, X>
+where
+    S: DeserializeOwned,
+    X: DeserializeOwned + Default,
+{
+    /// [`Scenario::from_yaml_str`] with the subject's `setup:` and
+    /// `expect.ext:` types.
+    pub fn parse_yaml(yaml: &str, origin: impl AsRef<Path>) -> Result<Self, EvalError> {
         let path = origin.as_ref().to_path_buf();
-        let mut scenario: Scenario =
-            serde_yaml::from_str(yaml).map_err(|err| EvalError::Parse {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
+        let mut scenario: Self = serde_yaml::from_str(yaml).map_err(|err| EvalError::Parse {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
         scenario.source = Some(path.clone());
         scenario
             .validate()
@@ -310,15 +348,19 @@ impl Scenario {
         Ok(scenario)
     }
 
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, EvalError> {
+    /// [`Scenario::from_file`] with the subject's `setup:` and `expect.ext:`
+    /// types.
+    pub fn parse_file(path: impl AsRef<Path>) -> Result<Self, EvalError> {
         let path = path.as_ref();
         let yaml = std::fs::read_to_string(path).map_err(|source| EvalError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_yaml_str(&yaml, path)
+        Self::parse_yaml(&yaml, path)
     }
+}
 
+impl<S, X> Scenario<S, X> {
     /// Structural checks serde cannot express.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
@@ -420,7 +462,11 @@ impl ScriptedReply {
 
 /// Load every `*.yaml` / `*.yml` file in `dir` (not recursive), sorted by
 /// file name. Fails on the first bad file, naming it.
-pub(crate) fn load_dir(dir: &Path) -> Result<Vec<Scenario>, EvalError> {
+pub(crate) fn load_dir<S, X>(dir: &Path) -> Result<Vec<Scenario<S, X>>, EvalError>
+where
+    S: DeserializeOwned,
+    X: DeserializeOwned + Default,
+{
     let entries = std::fs::read_dir(dir).map_err(|source| EvalError::Io {
         path: dir.to_path_buf(),
         source,
@@ -447,9 +493,9 @@ pub(crate) fn load_dir(dir: &Path) -> Result<Vec<Scenario>, EvalError> {
     }
     paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    let mut scenarios: Vec<Scenario> = Vec::with_capacity(paths.len());
+    let mut scenarios: Vec<Scenario<S, X>> = Vec::with_capacity(paths.len());
     for path in paths {
-        let scenario = Scenario::from_file(&path)?;
+        let scenario = Scenario::<S, X>::parse_file(&path)?;
         if let Some(prev) = scenarios.iter().find(|s| s.name == scenario.name) {
             return Err(EvalError::DuplicateName {
                 name: scenario.name,

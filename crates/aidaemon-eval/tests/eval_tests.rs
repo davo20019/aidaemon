@@ -7,8 +7,8 @@ use aidaemon_core::{
 };
 use aidaemon_eval::examples::{example_tools, ExampleFactory};
 use aidaemon_eval::{
-    compare, CallRecord, CaseResult, EvalError, ExpectedStatus, FactoryError, FnFactory, Report,
-    Scenario, Subject, Suite, Trajectory,
+    compare, CallRecord, CaseResult, EvalError, ExpectedStatus, FactoryError, FnFactory,
+    NoExtension, Report, Scenario, Subject, Suite, Trajectory,
 };
 use async_trait::async_trait;
 
@@ -646,6 +646,8 @@ struct Canned(Trajectory);
 
 #[async_trait]
 impl Subject for Canned {
+    type Setup = NoExtension;
+    type ExpectExt = NoExtension;
     type Observed = ();
 
     async fn run(&self, _scenario: &Scenario, _run: usize) -> Result<Trajectory, FactoryError> {
@@ -706,6 +708,8 @@ async fn run_failures_fail_the_case_and_subject_errors_are_reported() {
     struct Broken;
     #[async_trait]
     impl Subject for Broken {
+        type Setup = NoExtension;
+        type ExpectExt = NoExtension;
         type Observed = ();
         async fn run(&self, _: &Scenario, _: usize) -> Result<Trajectory, FactoryError> {
             Err("no database".into())
@@ -826,4 +830,117 @@ async fn final_text_contains_is_loose_and_the_exact_form_is_not() {
 
     let loose = scenario("name: loose\ninput: hi\nexpect:\n  final_text_contains: [acme corp]\n");
     assert!(loose.run_on(&subject, 0).await.passed);
+}
+
+// ---------- typed setup and expect.ext ----------
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketSetup {
+    customer: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketExpect {
+    #[serde(default)]
+    queue_depth: Option<u32>,
+}
+
+type TicketScenario = Scenario<TicketSetup, TicketExpect>;
+
+/// Reads its customer from `setup:` and reports a queue depth as its own
+/// observation.
+struct TicketDesk;
+
+#[async_trait]
+impl Subject for TicketDesk {
+    type Setup = TicketSetup;
+    type ExpectExt = TicketExpect;
+    type Observed = u32;
+
+    async fn run(
+        &self,
+        scenario: &TicketScenario,
+        _run: usize,
+    ) -> Result<Trajectory<u32>, FactoryError> {
+        let customer = &scenario.setup.as_ref().ok_or("no setup")?.customer;
+        Ok(Trajectory {
+            status: "completed".into(),
+            status_detail: String::new(),
+            succeeded: true,
+            unmet: Vec::new(),
+            final_text: Some(format!("Opened a ticket for {customer}")),
+            proposed: Vec::new(),
+            receipts: Vec::new(),
+            turns: 1,
+            billable_tokens: 0,
+            run_failures: Vec::new(),
+            observed: 7,
+        })
+    }
+
+    fn check_ext(&self, expect: &TicketExpect, trajectory: &Trajectory<u32>) -> Vec<String> {
+        match expect.queue_depth {
+            Some(depth) if depth != trajectory.observed => {
+                vec![format!("queue_depth: expected {depth}")]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+const TICKET_YAML: &str = r#"
+name: ticket
+input: Open a ticket.
+setup: { customer: Alice Rivera }
+expect:
+  final_text_contains: [alice rivera]
+  ext: { queue_depth: 7 }
+"#;
+
+#[tokio::test]
+async fn setup_and_expect_ext_are_typed_by_the_subject() {
+    let s = TicketScenario::parse_yaml(TICKET_YAML, "inline.yaml").unwrap();
+    assert_eq!(s.setup.as_ref().unwrap().customer, "Alice Rivera");
+    let result = s.run_on(&TicketDesk, 0).await;
+    assert!(result.passed, "{:?}", result.failures);
+
+    let wrong = TICKET_YAML.replace("queue_depth: 7", "queue_depth: 8");
+    let s = TicketScenario::parse_yaml(&wrong, "inline.yaml").unwrap();
+    let result = s.run_on(&TicketDesk, 0).await;
+    assert_eq!(result.failures, vec!["queue_depth: expected 8"]);
+}
+
+#[test]
+fn typos_in_typed_blocks_fail_at_load() {
+    for typo in [
+        TICKET_YAML.replace("customer:", "custmer:"),
+        TICKET_YAML.replace("queue_depth:", "queue_dpth:"),
+    ] {
+        assert!(
+            matches!(
+                TicketScenario::parse_yaml(&typo, "inline.yaml"),
+                Err(EvalError::Parse { .. })
+            ),
+            "{typo}"
+        );
+    }
+}
+
+#[test]
+fn a_subject_without_extensions_accepts_only_empty_blocks() {
+    let parse = |yaml: &str| Scenario::from_yaml_str(yaml, "inline.yaml");
+    assert!(parse("name: a\ninput: b\nsetup: {}\nexpect:\n  ext: {}\n").is_ok());
+    assert!(parse("name: a\ninput: b\nsetup: { x: 1 }\n").is_err());
+    assert!(parse("name: a\ninput: b\nexpect:\n  ext: { x: 1 }\n").is_err());
+}
+
+#[tokio::test]
+async fn typed_suites_load_a_directory_and_run_on_their_subject() {
+    let dir = scratch_dir("typed-suite");
+    std::fs::write(dir.join("ticket.yaml"), TICKET_YAML).unwrap();
+    let suite = Suite::<TicketSetup, TicketExpect>::load_dir(&dir).unwrap();
+    let report = suite.run_subject(&TicketDesk, 3).await;
+    assert_eq!((report.total_runs, report.total_passes), (3, 3));
 }
