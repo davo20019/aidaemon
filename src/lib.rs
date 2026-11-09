@@ -112,11 +112,6 @@ fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
 }
 
 fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir: &Path) {
-    tools::fs_utils::set_daemon_protected_paths(vec![
-        config_path.to_path_buf(),
-        env_file_path.to_path_buf(),
-        working_dir.join(".env"),
-    ]);
     std::env::set_var(
         RUNTIME_CONFIG_PATH_ENV_KEY,
         config_path.to_string_lossy().to_string(),
@@ -161,6 +156,11 @@ pub fn run() -> anyhow::Result<()> {
     // - Default: .env in the daemon working directory.
     // - Override: AIDAEMON_ENV_FILE=/absolute/path/to/envfile
     export_runtime_context(&config_path, &env_file_path, &working_dir);
+    let daemon_paths = tools::DaemonPaths::new(vec![
+        config_path.clone(),
+        env_file_path.clone(),
+        working_dir.join(".env"),
+    ]);
     load_startup_env_file(&env_file_path);
 
     // Interactive runs log to stderr. Background service logs are written to
@@ -356,7 +356,7 @@ pub fn run() -> anyhow::Result<()> {
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
         .build()?
-        .block_on(crate::core::run(config, config_path))
+        .block_on(crate::core::run(config, config_path, daemon_paths))
 }
 
 fn dashboard_login_url(config_path: &Path) -> anyhow::Result<String> {

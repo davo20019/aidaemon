@@ -230,6 +230,10 @@ impl AgentIngress for Agent {
 
 #[async_trait]
 impl ChannelAgentRuntime for Agent {
+    fn is_sensitive_path(&self, path: &std::path::Path) -> bool {
+        self.daemon_paths.is_sensitive(path)
+    }
+
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

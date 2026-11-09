@@ -681,6 +681,7 @@ mod tests {
                 Some(&access),
                 &[],
                 access.execution_cwd.as_deref(),
+                &crate::tools::DaemonPaths::default(),
             )
         };
         assert!(check(&call(&["/tmp/aidaemon-test/elsewhere/notes.txt"], &[])).is_none());

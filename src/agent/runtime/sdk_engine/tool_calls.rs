@@ -19,6 +19,7 @@ pub(super) struct CallScopeFacts<'a> {
     /// `authorized_scopes` is only the turn's guess from conversation text.
     pub scopes_are_guess: bool,
     pub known_project_dir: Option<&'a str>,
+    pub paths: &'a crate::tools::DaemonPaths,
 }
 
 /// The controller-side filesystem check of one call: protected host data
@@ -43,7 +44,7 @@ pub(super) fn call_scope_check(
     // keeps its own escalation card.
     let guess_binds = !facts.scopes_are_guess
         || crate::agent::tool_execution::tool_supports_scope_escalation(tool.name())
-        || crate::agent::tool_execution::names_sensitive_path(&manifest);
+        || crate::agent::tool_execution::names_sensitive_path(&manifest, facts.paths);
     crate::agent::tool_execution::access_manifest_scope_check(
         tool.name(),
         &manifest,
@@ -54,6 +55,7 @@ pub(super) fn call_scope_check(
             &[]
         },
         facts.known_project_dir,
+        facts.paths,
     )
 }
 
@@ -90,6 +92,7 @@ pub(super) struct CanonFacts<'a> {
     pub known_project_dir: Option<&'a str>,
     pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
     pub authorized_scopes: &'a [String],
+    pub paths: &'a crate::tools::DaemonPaths,
 }
 
 /// THE canonical form of a call, used by both the kernel's terminal
@@ -151,6 +154,7 @@ pub(super) fn canonicalize_call(
             facts.task_access,
             facts.authorized_scopes,
             known.as_deref(),
+            facts.paths,
         );
     }
     call
@@ -216,6 +220,7 @@ pub(super) struct CanonicalCallHook {
     pub(super) task_access: Option<crate::traits::ToolCallAccessManifest>,
     pub(super) authorized_scopes: Vec<String>,
     pub(super) records: CanonicalCalls,
+    pub(super) paths: crate::tools::DaemonPaths,
 }
 
 #[async_trait]
@@ -245,6 +250,7 @@ impl sdk::Hook for CanonicalCallHook {
                 known_project_dir: known.as_deref(),
                 task_access: self.task_access.as_ref(),
                 authorized_scopes: &self.authorized_scopes,
+                paths: &self.paths,
             },
         );
         if recorded.is_none() {
@@ -446,6 +452,7 @@ pub(super) fn canonicalize_dispatched_call(
                     known_project_dir: known.as_deref(),
                     task_access: scope.authority.task_access.as_ref(),
                     authorized_scopes: &scope.authorized_scopes,
+                    paths: scope.daemon_paths,
                 },
             )
         }
@@ -682,6 +689,7 @@ impl Agent {
                 authorized_scopes: &scope.authorized_scopes,
                 scopes_are_guess: scope.scopes_are_guess,
                 known_project_dir: known.as_deref(),
+                paths: &self.daemon_paths,
             },
         )
     }

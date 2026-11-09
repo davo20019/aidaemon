@@ -86,6 +86,8 @@ pub(crate) struct AppApprovalRules {
     pub guessed_scopes: Vec<String>,
     /// The turn's project directory, which anchors relative targets.
     pub known_project_dir: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// How paths are classified for this daemon.
+    pub paths: crate::tools::DaemonPaths,
     /// The run's declines as the kernel last showed them to these rules
     /// (`HookContext::declined`, which every judged call refreshes): a
     /// child spawned from this turn starts with them.
@@ -434,7 +436,7 @@ impl AppApprovalRules {
             .unwrap_or_else(|_| tool.call_access_manifest(&arguments));
         manifest.read_targets.clear();
         if manifest.write_targets.is_empty()
-            || crate::agent::tool_execution::names_sensitive_path(&manifest)
+            || crate::agent::tool_execution::names_sensitive_path(&manifest, &self.paths)
         {
             return None;
         }
@@ -443,7 +445,14 @@ impl AppApprovalRules {
             .as_ref()
             .and_then(|known| known.lock().ok().and_then(|known| known.clone()));
         let check = |scopes: &[String]| {
-            access_manifest_scope_check(tool.name(), &manifest, None, scopes, known.as_deref())
+            access_manifest_scope_check(
+                tool.name(),
+                &manifest,
+                None,
+                scopes,
+                known.as_deref(),
+                &self.paths,
+            )
         };
         if check(&[]).is_some()
             || !matches!(check(&self.guessed_scopes), Some(ScopeCheck::Rejected(_)))

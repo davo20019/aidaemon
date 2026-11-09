@@ -1631,6 +1631,7 @@ impl Agent {
             model,
             system_prompt,
             self.config_path.clone(),
+            self.daemon_paths.clone(),
             self.skills_dir.clone(),
             child_depth,
             self.limits.max_depth,

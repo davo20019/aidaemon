@@ -316,6 +316,8 @@ pub(crate) trait AgentIngress: Send + Sync {
 /// Agent administration surface used by shared channel commands.
 #[async_trait]
 pub(crate) trait ChannelAgentRuntime: AgentIngress {
+    /// Whether the file tools must not write `path` on this daemon.
+    fn is_sensitive_path(&self, path: &std::path::Path) -> bool;
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

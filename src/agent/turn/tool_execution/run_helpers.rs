@@ -54,6 +54,7 @@ pub(in crate::agent) fn attenuate_unauthorized_read_roots(
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
+    paths: &crate::tools::DaemonPaths,
 ) -> Vec<String> {
     let Some(object) = arguments.as_object_mut() else {
         return Vec::new();
@@ -79,8 +80,15 @@ pub(in crate::agent) fn attenuate_unauthorized_read_roots(
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        if access_manifest_scope_violation("terminal", &probe, task, fallback_scopes, execution_cwd)
-            .is_none()
+        if access_manifest_scope_violation(
+            "terminal",
+            &probe,
+            task,
+            fallback_scopes,
+            execution_cwd,
+            paths,
+        )
+        .is_none()
         {
             kept.push(Value::String(value.to_string()));
         } else {
@@ -145,14 +153,13 @@ impl ScopeCheck {
 /// stores and the like stay refused outside it, as they always were.
 pub(in crate::agent) fn names_sensitive_path(
     manifest: &crate::traits::ToolCallAccessManifest,
+    paths: &crate::tools::DaemonPaths,
 ) -> bool {
     manifest
         .read_targets
         .iter()
         .chain(&manifest.write_targets)
-        .any(|target| {
-            crate::tools::fs_utils::is_sensitive_path(std::path::Path::new(&target.value))
-        })
+        .any(|target| paths.is_sensitive(std::path::Path::new(&target.value)))
 }
 
 pub(in crate::agent) fn tool_supports_scope_escalation(tool_name: &str) -> bool {
@@ -165,8 +172,9 @@ pub(super) fn access_manifest_scope_violation(
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
+    paths: &crate::tools::DaemonPaths,
 ) -> Option<String> {
-    access_manifest_scope_check(tool_name, call, task, fallback_scopes, execution_cwd)
+    access_manifest_scope_check(tool_name, call, task, fallback_scopes, execution_cwd, paths)
         .map(|check| check.reason().to_string())
 }
 
@@ -212,6 +220,7 @@ pub(in crate::agent) fn access_manifest_scope_check(
     task: Option<&crate::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
+    paths: &crate::tools::DaemonPaths,
 ) -> Option<ScopeCheck> {
     // Tools resolve relative targets against the execution cwd, so the
     // capability check must compare the same absolute path a directory grant
@@ -394,8 +403,7 @@ pub(in crate::agent) fn access_manifest_scope_check(
     // tool's config directory, a sibling project) is escalated to the tool's
     // approval prompt rather than failed closed. Credential stores and other
     // sensitive paths never escalate: the model cannot ask its way into them.
-    let sensitive =
-        |path: &String| crate::tools::fs_utils::is_sensitive_path(std::path::Path::new(path));
+    let sensitive = |path: &String| paths.is_sensitive(std::path::Path::new(path));
     if tool_supports_scope_escalation(tool_name)
         && !invalid_reads.iter().any(sensitive)
         && !invalid_writes.iter().any(sensitive)
@@ -1890,17 +1898,29 @@ mod tests {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(
-            access_manifest_scope_violation("cli_agent", &valid, Some(&task), &[], None).is_none()
-        );
+        assert!(access_manifest_scope_violation(
+            "cli_agent",
+            &valid,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_none());
 
         let invalid = crate::traits::ToolCallAccessManifest {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/workspace/project")],
             ..valid
         };
-        let violation =
-            access_manifest_scope_violation("cli_agent", &invalid, Some(&task), &[], None)
-                .expect("write must be rejected");
+        let violation = access_manifest_scope_violation(
+            "cli_agent",
+            &invalid,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .expect("write must be rejected");
         assert!(violation.contains("/workspace/project"));
     }
 
@@ -1920,7 +1940,15 @@ mod tests {
             adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
         };
         assert!(
-            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_none(),
+            access_manifest_scope_violation(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                None,
+                &crate::tools::DaemonPaths::default()
+            )
+            .is_none(),
             "adapter-owned runtime reads must be independently grantable"
         );
 
@@ -1928,10 +1956,15 @@ mod tests {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
             ..call
         };
-        assert!(
-            access_manifest_scope_violation("terminal", &undeclared, Some(&task), &[], None)
-                .is_some()
-        );
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &undeclared,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_some());
     }
 
     #[test]
@@ -1942,8 +1975,15 @@ mod tests {
             ..crate::traits::ToolCallAccessManifest::default()
         };
         let call = task.clone();
-        let violation = access_manifest_scope_violation("terminal", &call, Some(&task), &[], None)
-            .expect("host data remains protected independently of task assessment");
+        let violation = access_manifest_scope_violation(
+            "terminal",
+            &call,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .expect("host data remains protected independently of task assessment");
         assert!(violation.contains("protected host-data capability violation"));
 
         let adapter_only = crate::traits::ToolCallAccessManifest {
@@ -1951,7 +1991,15 @@ mod tests {
             ..crate::traits::ToolCallAccessManifest::default()
         };
         assert!(
-            access_manifest_scope_violation("terminal", &adapter_only, None, &[], None).is_none(),
+            access_manifest_scope_violation(
+                "terminal",
+                &adapter_only,
+                None,
+                &[],
+                None,
+                &crate::tools::DaemonPaths::default()
+            )
+            .is_none(),
             "adapter runtime capability is not task data"
         );
     }
@@ -1971,9 +2019,15 @@ mod tests {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/.keep")],
             adapter_read_targets: Vec::new(),
         };
-        assert!(
-            access_manifest_scope_violation("write_file", &call, Some(&task), &[], None).is_none()
-        );
+        assert!(access_manifest_scope_violation(
+            "write_file",
+            &call,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_none());
 
         let read_escape = crate::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/elsewhere/secret")],
@@ -1984,7 +2038,8 @@ mod tests {
             &read_escape,
             Some(&task),
             &[],
-            None
+            None,
+            &crate::tools::DaemonPaths::default()
         )
         .is_some());
     }
@@ -2005,9 +2060,15 @@ mod tests {
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(
-            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_some()
-        );
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &call,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_some());
     }
 
     #[test]
@@ -2024,9 +2085,15 @@ mod tests {
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(
-            access_manifest_scope_violation("terminal", &call, Some(&task), &[], None).is_none()
-        );
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &call,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -2042,7 +2109,15 @@ mod tests {
             adapter_read_targets: Vec::new(),
         };
 
-        assert!(access_manifest_scope_violation("synthetic", &call, None, &[], None).is_none());
+        assert!(access_manifest_scope_violation(
+            "synthetic",
+            &call,
+            None,
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -2061,7 +2136,8 @@ mod tests {
             &call("Cargo.toml"),
             None,
             &scopes,
-            Some(workspace)
+            Some(workspace),
+            &crate::tools::DaemonPaths::default()
         )
         .is_none());
         assert!(access_manifest_scope_violation(
@@ -2069,7 +2145,8 @@ mod tests {
             &call("./src/../Cargo.toml"),
             None,
             &scopes,
-            Some(workspace)
+            Some(workspace),
+            &crate::tools::DaemonPaths::default()
         )
         .is_none());
         // Escapes still resolve outside and are rejected.
@@ -2078,7 +2155,8 @@ mod tests {
             &call("../outside.txt"),
             None,
             &scopes,
-            Some(workspace)
+            Some(workspace),
+            &crate::tools::DaemonPaths::default()
         )
         .is_some());
         // Without a cwd a relative target cannot be proven inside any grant.
@@ -2087,7 +2165,8 @@ mod tests {
             &call("Cargo.toml"),
             None,
             &scopes,
-            None
+            None,
+            &crate::tools::DaemonPaths::default()
         )
         .is_some());
     }
@@ -2114,10 +2193,15 @@ mod tests {
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        assert!(
-            access_manifest_scope_violation("terminal", &read_back, Some(&task), &[], None)
-                .is_none()
-        );
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &read_back,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_none());
         // Explicit read grants do not remove the write-implies-read-back grant.
         let explicit_reads = crate::traits::ToolCallAccessManifest {
             read_targets: vec![ToolTargetHint::new(
@@ -2132,7 +2216,8 @@ mod tests {
             &read_back,
             Some(&explicit_reads),
             &[],
-            None
+            None,
+            &crate::tools::DaemonPaths::default()
         )
         .is_none());
         // The implication is one-way: a read grant never authorizes a write.
@@ -2153,7 +2238,8 @@ mod tests {
             &write_attempt,
             Some(&read_only_task),
             &[],
-            None
+            None,
+            &crate::tools::DaemonPaths::default()
         )
         .is_some());
     }
@@ -2182,7 +2268,8 @@ mod tests {
             &call("/tmp/aidaemon-test/data/avg.txt"),
             Some(&task),
             &[],
-            None
+            None,
+            &crate::tools::DaemonPaths::default()
         )
         .is_none());
         assert!(matches!(
@@ -2191,7 +2278,8 @@ mod tests {
                 &call("/tmp/aidaemon-test/data/other.txt"),
                 Some(&task),
                 &[],
-                None
+                None,
+                &crate::tools::DaemonPaths::default()
             ),
             Some(ScopeCheck::Rejected(_))
         ));
@@ -2220,8 +2308,13 @@ mod tests {
             "read_roots": ["/tmp", "/tmp/synthetic-out"],
             "write_roots": ["/tmp/synthetic-out"],
         });
-        let stripped =
-            attenuate_unauthorized_read_roots(&mut arguments, Some(&task), &[], Some("/tmp"));
+        let stripped = attenuate_unauthorized_read_roots(
+            &mut arguments,
+            Some(&task),
+            &[],
+            Some("/tmp"),
+            &crate::tools::DaemonPaths::default(),
+        );
         // The write root is itself readable (write implies read-back), so only
         // the broader `/tmp` root is stripped.
         assert_eq!(stripped, vec!["/tmp".to_string()]);
@@ -2252,7 +2345,13 @@ mod tests {
             adapter_read_targets: Vec::new(),
         };
         let mut arguments = serde_json::json!({ "read_roots": ["/tmp/synthetic-out", "/etc"] });
-        let stripped = attenuate_unauthorized_read_roots(&mut arguments, Some(&scoped), &[], None);
+        let stripped = attenuate_unauthorized_read_roots(
+            &mut arguments,
+            Some(&scoped),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default(),
+        );
         assert_eq!(stripped, vec!["/etc".to_string()]);
         assert_eq!(
             arguments["read_roots"],
@@ -2261,7 +2360,14 @@ mod tests {
 
         // Without any authority boundary nothing is attenuated.
         let mut arguments = serde_json::json!({ "read_roots": ["/tmp"] });
-        assert!(attenuate_unauthorized_read_roots(&mut arguments, None, &[], None).is_empty());
+        assert!(attenuate_unauthorized_read_roots(
+            &mut arguments,
+            None,
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2355,7 +2461,14 @@ mod scope_escalation_tests {
         let root = "/Users/alice/projects/site";
         let task = task_scope(root);
         let call = call_reading(root, "/Users/alice/Library/Preferences/.wrangler");
-        match access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)) {
+        match access_manifest_scope_check(
+            "terminal",
+            &call,
+            Some(&task),
+            &[],
+            Some(root),
+            &crate::tools::DaemonPaths::default(),
+        ) {
             Some(ScopeCheck::Escalatable { escalation, reason }) => {
                 assert_eq!(
                     escalation.read_paths,
@@ -2368,10 +2481,15 @@ mod scope_escalation_tests {
         }
         // The string-returning wrapper still reports the violation for
         // callers that only need the reason.
-        assert!(
-            access_manifest_scope_violation("terminal", &call, Some(&task), &[], Some(root))
-                .is_some()
-        );
+        assert!(access_manifest_scope_violation(
+            "terminal",
+            &call,
+            Some(&task),
+            &[],
+            Some(root),
+            &crate::tools::DaemonPaths::default()
+        )
+        .is_some());
     }
 
     /// A fresh project under `/tmp/aidaemon-test/<uuid>`, with a sibling.
@@ -2396,7 +2514,14 @@ mod scope_escalation_tests {
             let call = call_reading(&root, &escape);
             assert!(
                 matches!(
-                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+                    access_manifest_scope_check(
+                        "terminal",
+                        &call,
+                        Some(&task),
+                        &[],
+                        Some(&root),
+                        &crate::tools::DaemonPaths::default()
+                    ),
                     Some(ScopeCheck::Escalatable { .. })
                 ),
                 "{escape} must be out of scope"
@@ -2411,7 +2536,14 @@ mod scope_escalation_tests {
         let task = task_scope(&root);
         let call = call_reading(&root, &format!("{root}/a/../b"));
         assert_eq!(
-            access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+            access_manifest_scope_check(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                Some(&root),
+                &crate::tools::DaemonPaths::default()
+            ),
             None
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -2430,7 +2562,14 @@ mod scope_escalation_tests {
             let call = call_reading(&root, &read);
             assert!(
                 matches!(
-                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(&root)),
+                    access_manifest_scope_check(
+                        "terminal",
+                        &call,
+                        Some(&task),
+                        &[],
+                        Some(&root),
+                        &crate::tools::DaemonPaths::default()
+                    ),
                     Some(ScopeCheck::Escalatable { .. })
                 ),
                 "{read} must be out of scope"
@@ -2451,7 +2590,14 @@ mod scope_escalation_tests {
             let call = call_reading(root, secret);
             assert!(
                 matches!(
-                    access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)),
+                    access_manifest_scope_check(
+                        "terminal",
+                        &call,
+                        Some(&task),
+                        &[],
+                        Some(root),
+                        &crate::tools::DaemonPaths::default()
+                    ),
                     Some(ScopeCheck::Rejected(_))
                 ),
                 "{secret} must be rejected, not escalated"
@@ -2465,7 +2611,14 @@ mod scope_escalation_tests {
         let task = task_scope(root);
         let call = call_reading(root, "/Users/alice/Library/Preferences/.wrangler");
         assert!(matches!(
-            access_manifest_scope_check("read_file", &call, Some(&task), &[], Some(root)),
+            access_manifest_scope_check(
+                "read_file",
+                &call,
+                Some(&task),
+                &[],
+                Some(root),
+                &crate::tools::DaemonPaths::default()
+            ),
             Some(ScopeCheck::Rejected(_))
         ));
     }
@@ -2476,7 +2629,14 @@ mod scope_escalation_tests {
         let task = task_scope(root);
         let call = call_reading(root, "/private/etc/hosts");
         assert!(matches!(
-            access_manifest_scope_check("terminal", &call, Some(&task), &[], Some(root)),
+            access_manifest_scope_check(
+                "terminal",
+                &call,
+                Some(&task),
+                &[],
+                Some(root),
+                &crate::tools::DaemonPaths::default()
+            ),
             Some(ScopeCheck::Rejected(_))
         ));
     }

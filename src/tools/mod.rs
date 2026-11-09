@@ -15,8 +15,9 @@ pub mod file_delivery;
 #[allow(dead_code)]
 mod file_policy;
 pub(crate) use file_policy::daemon_file_policy;
+pub use file_policy::DaemonPaths;
 #[cfg(test)]
-pub(crate) use file_policy::guarded_call;
+pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;
 mod health_probe;
 pub mod image_generation;

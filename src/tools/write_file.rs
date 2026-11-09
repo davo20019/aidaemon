@@ -5,22 +5,26 @@
 use aidaemon_tools::ToolText;
 
 #[cfg(test)]
-use super::fs_utils;
-#[cfg(test)]
 use crate::traits::{DurableReplayDecision, Tool};
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::daemon_file_policy;
+use super::file_policy::{daemon_file_policy, DaemonPaths};
 use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
 pub type WriteFileTool = KernelTool<aidaemon_tools::WriteFile>;
 
 impl WriteFileTool {
+    /// Without the daemon's own files protected; production passes them.
+    #[cfg(test)]
     pub fn new(backend: SharedExecutionBackend) -> Self {
+        Self::on_backend(backend, DaemonPaths::default())
+    }
+
+    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
         Self::wrap(
-            aidaemon_tools::WriteFile::on_backend(backend, daemon_file_policy()).with_text(ToolText {
+            aidaemon_tools::WriteFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Write or create a file with given content".to_string(),
                 schema: "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.".to_string(),
             }),
@@ -138,9 +142,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("daemon-config.toml");
         std::fs::write(&config, "[provider]\nname = \"synthetic\"\n").unwrap();
-        let _guard = fs_utils::DaemonPathsGuard::set(vec![config.clone()]);
+        let paths = crate::tools::DaemonPaths::new(vec![config.clone()]);
         let args = json!({"path": config.to_str().unwrap(), "content": "x = 1"}).to_string();
-        let err = crate::tools::guarded_call(
+        let err = crate::tools::guarded_call_protecting(
+            paths,
             &WriteFileTool::new(crate::execution::active_execution_backend()),
             &args,
         )

@@ -91,6 +91,7 @@ pub struct ToolSetupDependencies {
 pub async fn setup_tools(
     config: &AppConfig,
     config_path: &Path,
+    daemon_paths: crate::tools::DaemonPaths,
     dependencies: ToolSetupDependencies,
 ) -> anyhow::Result<ToolSetup> {
     let ToolSetupDependencies {
@@ -114,6 +115,7 @@ pub async fn setup_tools(
     } = build_base_tools(
         config,
         config_path.to_path_buf(),
+        daemon_paths,
         state.clone(),
         memory.clone(),
         pool.clone(),
@@ -619,6 +621,7 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
 pub async fn build_base_tools(
     config: &AppConfig,
     config_path: PathBuf,
+    daemon_paths: crate::tools::DaemonPaths,
     state: Arc<dyn StateStore>,
     memory: ToolMemoryAccess,
     pool: SqlitePool,
@@ -662,6 +665,7 @@ pub async fn build_base_tools(
         let built = build_base_tool(
             spec.id,
             execution_backend.clone(),
+            daemon_paths.clone(),
             config,
             &config_path,
             state.clone(),
@@ -1130,6 +1134,7 @@ async fn register_runtime_tool_by_id(
 async fn build_base_tool(
     tool_id: BaseToolId,
     execution_backend: crate::execution::SharedExecutionBackend,
+    daemon_paths: crate::tools::DaemonPaths,
     config: &AppConfig,
     config_path: &Path,
     state: Arc<dyn StateStore>,
@@ -1245,19 +1250,19 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ReadFile => BuiltBaseTool {
-            tool: Arc::new(ReadFileTool::new(execution_backend)),
+            tool: Arc::new(ReadFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::WriteFile => BuiltBaseTool {
-            tool: Arc::new(WriteFileTool::new(execution_backend)),
+            tool: Arc::new(WriteFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::EditFile => BuiltBaseTool {
-            tool: Arc::new(EditFileTool::new(execution_backend)),
+            tool: Arc::new(EditFileTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::SearchFiles => BuiltBaseTool {
-            tool: Arc::new(SearchFilesTool::new(execution_backend)),
+            tool: Arc::new(SearchFilesTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
         BaseToolId::ProjectInspect => BuiltBaseTool {
@@ -1341,6 +1346,7 @@ mod tests {
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
+            crate::tools::DaemonPaths::default(),
             state.clone(),
             ToolMemoryAccess {
                 store: state.memory_stores(),
@@ -1695,6 +1701,7 @@ mod tests {
         let bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
+            crate::tools::DaemonPaths::default(),
             state.clone(),
             ToolMemoryAccess {
                 store: state.memory_stores(),

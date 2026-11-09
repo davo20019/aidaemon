@@ -94,22 +94,27 @@ async fn call_scoped_builtin_file_tool(
     arguments: &str,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     exec_ctx: crate::traits::ToolCallContext,
+    paths: &crate::tools::DaemonPaths,
 ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
     // Instantiate the daemon's exact built-in implementation. Looking up by
     // name in the general registry would let an injected/custom duplicate tool
     // inherit the collaborator allowlist merely by choosing the same name.
     let tool: Box<dyn crate::traits::Tool> = match name {
-        "read_file" => Box::new(crate::tools::ReadFileTool::new(
+        "read_file" => Box::new(crate::tools::ReadFileTool::on_backend(
             crate::execution::active_execution_backend(),
+            paths.clone(),
         )),
-        "search_files" => Box::new(crate::tools::SearchFilesTool::new(
+        "search_files" => Box::new(crate::tools::SearchFilesTool::on_backend(
             crate::execution::active_execution_backend(),
+            paths.clone(),
         )),
-        "write_file" => Box::new(crate::tools::WriteFileTool::new(
+        "write_file" => Box::new(crate::tools::WriteFileTool::on_backend(
             crate::execution::active_execution_backend(),
+            paths.clone(),
         )),
-        "edit_file" => Box::new(crate::tools::EditFileTool::new(
+        "edit_file" => Box::new(crate::tools::EditFileTool::on_backend(
             crate::execution::active_execution_backend(),
+            paths.clone(),
         )),
         _ => anyhow::bail!("The workspace grant does not allow this tool."),
     };
@@ -179,6 +184,7 @@ async fn scoped_workspace_arguments(
     name: &str,
     arguments: &str,
     grant: &WorkspaceGrant,
+    paths: &crate::tools::DaemonPaths,
 ) -> anyhow::Result<Value> {
     anyhow::ensure!(
         grant.allows_tool(name),
@@ -227,7 +233,7 @@ async fn scoped_workspace_arguments(
         );
     }
     anyhow::ensure!(
-        !crate::tools::fs_utils::is_sensitive_path(&root_path)
+        !paths.is_sensitive(&root_path)
             && crate::tools::fs_utils::find_nearest_project_root(&root_path)
                 .is_some_and(|project| project == root_path),
         "The workspace grant no longer identifies a safe project root."
@@ -244,7 +250,7 @@ async fn scoped_workspace_arguments(
         root_path.join(raw_path)
     };
     anyhow::ensure!(
-        !crate::tools::fs_utils::is_sensitive_path(&requested),
+        !paths.is_sensitive(&requested),
         "Access denied: sensitive files are excluded from workspace grants."
     );
 
@@ -288,7 +294,7 @@ async fn scoped_workspace_arguments(
         "Access denied: path is outside the delegated project"
     );
     anyhow::ensure!(
-        !crate::tools::fs_utils::is_sensitive_path(target_path),
+        !paths.is_sensitive(target_path),
         "Access denied: sensitive files are excluded from workspace grants."
     );
 
@@ -831,7 +837,7 @@ impl Agent {
             .await;
 
         let scoped_args = if let Some(grant) = active_workspace_grant {
-            Some(scoped_workspace_arguments(name, arguments, grant).await?)
+            Some(scoped_workspace_arguments(name, arguments, grant, &self.daemon_paths).await?)
         } else {
             None
         };
@@ -882,6 +888,7 @@ impl Agent {
                 &enriched_args,
                 ctx.status_tx.clone(),
                 exec_ctx,
+                &self.daemon_paths,
             )
             .await
             .map(|outcome| sanitize_workspace_tool_outcome(outcome, grant))
@@ -1155,38 +1162,60 @@ mod scoped_workspace_tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         let grant = grant(root.path());
 
-        let inside = scoped_workspace_arguments("read_file", r#"{"path":"index.html"}"#, &grant)
-            .await
-            .unwrap();
+        let inside = scoped_workspace_arguments(
+            "read_file",
+            r#"{"path":"index.html"}"#,
+            &grant,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::canonicalize(inside["path"].as_str().unwrap()).unwrap(),
             std::fs::canonicalize(root.path().join("index.html")).unwrap()
         );
 
-        let traversal =
-            scoped_workspace_arguments("read_file", r#"{"path":"../outside.txt"}"#, &grant).await;
+        let traversal = scoped_workspace_arguments(
+            "read_file",
+            r#"{"path":"../outside.txt"}"#,
+            &grant,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .await;
         assert!(traversal.is_err());
 
         let absolute_outside = scoped_workspace_arguments(
             "read_file",
             &json!({"path": outside.path()}).to_string(),
             &grant,
+            &crate::tools::DaemonPaths::default(),
         )
         .await;
         assert!(absolute_outside.is_err());
 
-        let sensitive =
-            scoped_workspace_arguments("read_file", r#"{"path":".env.local"}"#, &grant).await;
+        let sensitive = scoped_workspace_arguments(
+            "read_file",
+            r#"{"path":".env.local"}"#,
+            &grant,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .await;
         assert!(sensitive.is_err());
 
-        let dangerous =
-            scoped_workspace_arguments("terminal", r#"{"command":"pwd"}"#, &grant).await;
+        let dangerous = scoped_workspace_arguments(
+            "terminal",
+            r#"{"command":"pwd"}"#,
+            &grant,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .await;
         assert!(dangerous.is_err());
 
         let aliased = scoped_workspace_arguments(
             "read_file",
             r#"{"file_path":"index.html","filename":"../../outside"}"#,
             &grant,
+            &crate::tools::DaemonPaths::default(),
         )
         .await
         .unwrap();
@@ -1207,6 +1236,7 @@ mod scoped_workspace_tests {
             "write_file",
             r#"{"path":"new.txt","content":"ok"}"#,
             &grant,
+            &crate::tools::DaemonPaths::default(),
         )
         .await
         .unwrap();
@@ -1217,6 +1247,7 @@ mod scoped_workspace_tests {
             "write_file",
             r#"{"path":"missing/new.txt","content":"no"}"#,
             &grant,
+            &crate::tools::DaemonPaths::default(),
         )
         .await;
         assert!(missing_parent.is_err());
@@ -1232,8 +1263,13 @@ mod scoped_workspace_tests {
         symlink(outside.path(), root.path().join("link.txt")).unwrap();
         let grant = grant(root.path());
 
-        let result =
-            scoped_workspace_arguments("read_file", r#"{"path":"link.txt"}"#, &grant).await;
+        let result = scoped_workspace_arguments(
+            "read_file",
+            r#"{"path":"link.txt"}"#,
+            &grant,
+            &crate::tools::DaemonPaths::default(),
+        )
+        .await;
         assert!(result.is_err());
     }
 

@@ -8,16 +8,22 @@ use aidaemon_tools::ToolText;
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::daemon_file_policy;
+use super::file_policy::{daemon_file_policy, DaemonPaths};
 use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
 pub type SearchFilesTool = KernelTool<aidaemon_tools::SearchFiles>;
 
 impl SearchFilesTool {
+    /// Without the daemon's own files protected; production passes them.
+    #[cfg(test)]
     pub fn new(backend: SharedExecutionBackend) -> Self {
+        Self::on_backend(backend, DaemonPaths::default())
+    }
+
+    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
         Self::wrap(
-            aidaemon_tools::SearchFiles::on_backend(backend, daemon_file_policy()).with_text(ToolText {
+            aidaemon_tools::SearchFiles::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Search for files by name pattern or content regex".to_string(),
                 schema: "Search for files by name pattern (glob) and/or content (regex). Use this instead of terminal find/grep. Automatically skips .git, node_modules, target, etc.".to_string(),
             }),

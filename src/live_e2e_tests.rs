@@ -121,6 +121,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
             "You are a helpful assistant. Use terminal commands to gather information when asked."
                 .to_string(),
         config_path,
+        daemon_paths: Default::default(),
         skills_dir: skills_dir.path().to_path_buf(),
         max_depth: 3,
         max_iterations: 50,
@@ -299,6 +300,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         model,
         system_prompt: system_prompt.to_string(),
         config_path,
+        daemon_paths: Default::default(),
         skills_dir: skills_dir.path().to_path_buf(),
         max_depth: 3,
         max_iterations: 50,

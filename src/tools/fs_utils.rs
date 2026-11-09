@@ -9,80 +9,6 @@ use once_cell::sync::Lazy;
 /// Directories to skip during recursive file walks (from the SDK tools crate).
 pub use aidaemon_tools::DEFAULT_IGNORE_DIRS;
 
-/// Path classification lives in the SDK tools crate.
-use aidaemon_tools::path_class::same_file;
-use aidaemon_tools::PathClassifier;
-
-/// The daemon's classifier, holding its own config and env files as
-/// protected paths (set at startup).
-static DAEMON_PATHS: std::sync::RwLock<PathClassifier> =
-    std::sync::RwLock::new(PathClassifier::empty());
-
-/// Register the daemon's own config and env files (set at startup). These are
-/// changed only through `manage_config`, never by the file tools.
-pub fn set_daemon_protected_paths(paths: Vec<PathBuf>) {
-    let mut guard = DAEMON_PATHS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = PathClassifier::new(paths);
-}
-
-/// Test helper: protect `paths` as the daemon's own files until dropped.
-#[cfg(test)]
-pub(crate) struct DaemonPathsGuard(
-    Vec<PathBuf>,
-    // Held for the guard's lifetime so parallel tests cannot clobber the
-    // process-wide list.
-    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
-);
-
-#[cfg(test)]
-static DAEMON_PATHS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-impl DaemonPathsGuard {
-    pub(crate) fn set(paths: Vec<PathBuf>) -> Self {
-        let lock = DAEMON_PATHS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = DAEMON_PATHS
-            .read()
-            .map(|g| g.protected_paths().to_vec())
-            .unwrap_or_default();
-        set_daemon_protected_paths(paths);
-        Self(previous, lock)
-    }
-}
-
-#[cfg(test)]
-impl Drop for DaemonPathsGuard {
-    fn drop(&mut self) {
-        // Restore through the raw lock; `self.1` is still held.
-        if let Ok(mut guard) = DAEMON_PATHS.write() {
-            *guard = PathClassifier::new(std::mem::take(&mut self.0));
-        }
-    }
-}
-
-/// Ask the daemon's classifier. A poisoned lock fails closed: the path
-/// counts as protected.
-fn classify(
-    lock: &std::sync::RwLock<PathClassifier>,
-    question: impl FnOnce(&PathClassifier) -> bool,
-) -> bool {
-    lock.read().map_or(true, |classifier| question(&classifier))
-}
-
-/// Env files named by the daemon's own environment variables
-/// (`AIDAEMON_ENV_FILE`, `AIDAEMON_RUNTIME_ENV_FILE`), wherever they live.
-fn is_configured_env_file(path: &Path) -> bool {
-    ["AIDAEMON_ENV_FILE", "AIDAEMON_RUNTIME_ENV_FILE"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .filter(|value| !value.is_empty())
-        .any(|value| same_file(Path::new(&value), path))
-}
-
 /// Files/directories that strongly indicate a project/workspace root.
 pub const PROJECT_ROOT_MARKERS: &[&str] = &[
     ".git",
@@ -852,24 +778,6 @@ pub async fn backup_before_overwrite(
     let _ = backend.copy(path, &backup).await;
 }
 
-/// True for files that hold secrets (keys, credentials, env files, the
-/// daemon's own config). Used by `read_file`.
-pub fn is_secret_path(path: &Path) -> bool {
-    classify(&DAEMON_PATHS, |c| c.is_secret(path)) || is_configured_env_file(path)
-}
-
-/// Like `is_secret_path` but without the `.env.*` / `*.key` name-shape rules,
-/// so a template file is judged by where it lives alone.
-pub fn is_secret_path_ignoring_name_shape(path: &Path) -> bool {
-    classify(&DAEMON_PATHS, |c| c.is_secret_ignoring_name_shape(path))
-        || is_configured_env_file(path)
-}
-
-/// True for paths the file tools must not write.
-pub fn is_sensitive_path(path: &Path) -> bool {
-    classify(&DAEMON_PATHS, |c| c.is_sensitive(path)) || is_configured_env_file(path)
-}
-
 /// Whether a path belongs to the host operating system's protected data
 /// plane rather than task/workspace data. Raw file and terminal tools do not
 /// receive access to these trees even when a semantic assessment repeats the
@@ -1095,21 +1003,6 @@ pub fn mentions_shell_operator(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn poisoned_protected_list_fails_closed() {
-        let list = std::sync::Arc::new(std::sync::RwLock::new(PathClassifier::default()));
-        let l2 = list.clone();
-        let _ = std::thread::spawn(move || {
-            let _g = l2.write().unwrap();
-            panic!("poison");
-        })
-        .join();
-        let anything = Path::new("/synthetic/anything.txt");
-        assert!(classify(&list, |c| c.is_protected(anything)));
-        let healthy = std::sync::RwLock::new(PathClassifier::default());
-        assert!(!classify(&healthy, |c| c.is_protected(anything)));
-    }
-
     use super::*;
     use std::io::Write;
 
@@ -1343,22 +1236,6 @@ mod tests {
             ),
             Some(explicit_new_target)
         );
-    }
-
-    #[test]
-    fn test_is_sensitive_path() {
-        assert!(is_sensitive_path(Path::new("/home/user/.ssh/id_rsa")));
-        assert!(is_sensitive_path(Path::new("/home/user/.env")));
-        assert!(is_sensitive_path(Path::new("/repo/.env.production/value")));
-        assert!(is_sensitive_path(Path::new("/repo/.dev.vars.local")));
-        assert!(is_sensitive_path(Path::new("/repo/.git/config")));
-        assert!(is_sensitive_path(Path::new("/repo/certificates/app.PEM")));
-        assert!(is_sensitive_path(Path::new(
-            "/repo/terraform.tfstate.backup"
-        )));
-        assert!(is_sensitive_path(Path::new("/home/user/.gnupg/key")));
-        assert!(!is_sensitive_path(Path::new("/home/user/code/main.rs")));
-        assert!(!is_sensitive_path(Path::new("/repo/src/environment.rs")));
     }
 
     #[test]

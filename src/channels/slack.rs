@@ -671,7 +671,7 @@ impl SlackChannel {
             );
         }
         anyhow::ensure!(
-            !crate::tools::fs_utils::is_sensitive_path(&project_root),
+            !self.agent.is_sensitive_path(&project_root),
             "A sensitive directory cannot be delegated"
         );
         anyhow::ensure!(

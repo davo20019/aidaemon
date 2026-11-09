@@ -309,6 +309,8 @@ pub struct Agent {
     fallback_model: RwLock<String>,
     system_prompt: String,
     config_path: PathBuf,
+    /// How paths are classified for this daemon (its own files included).
+    daemon_paths: crate::tools::DaemonPaths,
     skills_dir: PathBuf,
     skill_cache: skills::SkillCache,
     /// Current recursion depth (0 = root agent).

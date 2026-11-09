@@ -1102,7 +1102,14 @@ fn scoped_runs_read_their_own_spilled_results_only() {
             ..Default::default()
         };
         grant_own_spill_reads(&mut call, "specialist:research:synthetic-1");
-        access_manifest_scope_check("read_file", &call, Some(&task), &[], None)
+        access_manifest_scope_check(
+            "read_file",
+            &call,
+            Some(&task),
+            &[],
+            None,
+            &crate::tools::DaemonPaths::default(),
+        )
     };
     assert!(check(Some(format!("{own}/web_fetch-1a2b3c4d.txt")), None).is_none());
     assert!(matches!(
@@ -3640,6 +3647,7 @@ fn hook_order_is_pinned() {
     let (calls, _rx) = mpsc::channel(1);
     let hooks = TurnHooks {
         canonical: super::tool_calls::CanonicalCallHook {
+            paths: Default::default(),
             tools: Arc::new(Default::default()),
             known_project_dir: Arc::new(std::sync::Mutex::new(None)),
             workspace_grant: false,
@@ -3659,7 +3667,7 @@ fn hook_order_is_pinned() {
         memory: vec![Arc::new(NoopMemoryHook)],
         protected_paths: aidaemon_tools::ProtectedPathGuard::new(
             crate::execution::active_execution_backend(),
-            crate::tools::daemon_file_policy(),
+            crate::tools::daemon_file_policy(Default::default()),
         ),
         network: aidaemon_tools::NetworkGuard::new(),
         egress: aidaemon_policies::EgressGuard::new(),
@@ -3773,6 +3781,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: known.clone(),
                         session_id: "telegram:synthetic-user-1".to_string(),
@@ -3831,6 +3840,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
         tool.as_ref(),
         &dispatched.call.arguments.to_string(),
         &CallScopeFacts {
+            paths: &crate::tools::DaemonPaths::default(),
             session_id: "telegram:synthetic-user-1",
             task_access: None,
             authorized_scopes: &scopes,
@@ -3864,6 +3874,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
         tool.as_ref(),
         &raw.to_string(),
         &CallScopeFacts {
+            paths: &crate::tools::DaemonPaths::default(),
             session_id: "telegram:synthetic-user-1",
             task_access: None,
             authorized_scopes: &scopes,
@@ -3921,6 +3932,7 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: Arc::new(std::sync::Mutex::new(Some(
                             project_dir.clone(),
@@ -4018,6 +4030,7 @@ async fn judged_terminal_rules(
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: known,
                         session_id: "telegram:synthetic-user-1".to_string(),
@@ -4478,6 +4491,7 @@ async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     let known = Arc::new(std::sync::Mutex::new(Some(project_dir.clone())));
     let records = super::tool_calls::CanonicalCalls::default();
     let hook = super::tool_calls::CanonicalCallHook {
+        paths: Default::default(),
         tools: Arc::new(
             [(tool.name().to_string(), tool.clone())]
                 .into_iter()
@@ -4598,6 +4612,7 @@ fn guessed_scope_check(
         &ScopeFileTool(tool),
         &args.to_string(),
         &CallScopeFacts {
+            paths: &crate::tools::DaemonPaths::default(),
             session_id: "synthetic-session",
             task_access: None,
             authorized_scopes: &scopes,

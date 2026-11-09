@@ -5,22 +5,26 @@
 use aidaemon_tools::ToolText;
 
 #[cfg(test)]
-use super::fs_utils;
-#[cfg(test)]
 use crate::traits::Tool;
 #[cfg(test)]
 use serde_json::json;
 
-use super::file_policy::daemon_file_policy;
+use super::file_policy::{daemon_file_policy, DaemonPaths};
 use super::kernel_tool::KernelTool;
 use crate::execution::SharedExecutionBackend;
 
 pub type EditFileTool = KernelTool<aidaemon_tools::EditFile>;
 
 impl EditFileTool {
+    /// Without the daemon's own files protected; production passes them.
+    #[cfg(test)]
     pub fn new(backend: SharedExecutionBackend) -> Self {
+        Self::on_backend(backend, DaemonPaths::default())
+    }
+
+    pub fn on_backend(backend: SharedExecutionBackend, paths: DaemonPaths) -> Self {
         Self::wrap(
-            aidaemon_tools::EditFile::on_backend(backend, daemon_file_policy()).with_text(ToolText {
+            aidaemon_tools::EditFile::on_backend(backend, daemon_file_policy(paths)).with_text(ToolText {
                 short: "Find and replace text in a file".to_string(),
                 schema: "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous. On not-found/ambiguous text, read_file the same path and retry once before asking the user.".to_string(),
             }),
@@ -216,17 +220,19 @@ mod tests {
         let own = dir.path().join("daemon-config.toml");
         std::fs::write(&project, "mode = \"a\"\n").unwrap();
         std::fs::write(&own, "mode = \"a\"\n").unwrap();
-        let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
+        let paths = crate::tools::DaemonPaths::new(vec![own.clone()]);
         let edit = |p: &std::path::Path| {
             json!({"path": p.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string()
         };
-        crate::tools::guarded_call(
+        crate::tools::guarded_call_protecting(
+            paths.clone(),
             &EditFileTool::new(crate::execution::active_execution_backend()),
             &edit(&project),
         )
         .await
         .unwrap();
-        let err = crate::tools::guarded_call(
+        let err = crate::tools::guarded_call_protecting(
+            paths,
             &EditFileTool::new(crate::execution::active_execution_backend()),
             &edit(&own),
         )

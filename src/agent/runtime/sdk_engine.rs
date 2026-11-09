@@ -411,6 +411,7 @@ pub(super) struct TerminalCanonTurn {
     pub workspace_grant: bool,
     /// How `CanonicalCallHook` canonicalized each call.
     pub(super) records: tool_calls::CanonicalCalls,
+    pub paths: crate::tools::DaemonPaths,
 }
 
 /// How the kernel's terminal rules see a call: in the canonical form the
@@ -447,6 +448,7 @@ pub(super) fn terminal_canonicalizer(
                         known_project_dir: known.as_deref(),
                         task_access: turn.task_access.as_ref(),
                         authorized_scopes: &turn.authorized_scopes,
+                        paths: &turn.paths,
                     },
                 );
                 // `known` as the dispatcher's scope check reads it, after
@@ -461,6 +463,7 @@ pub(super) fn terminal_canonicalizer(
             authorized_scopes: &turn.authorized_scopes,
             scopes_are_guess: false,
             known_project_dir: known.as_deref(),
+            paths: &turn.paths,
         };
         let scope = match tool_calls::call_scope_check(
             turn.tool.as_ref(),
@@ -581,6 +584,7 @@ fn kernel_tool_name(name: &str) -> bool {
 /// Everything a dispatched call needs from the turn.
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
+    daemon_paths: &'a crate::tools::DaemonPaths,
     /// The MCP-registry tools bridged for this turn (daemon tools are
     /// `Agent::tools`); see [`Agent::turn_tool`].
     mcp_tools: Vec<Arc<dyn crate::traits::Tool>>,
@@ -1126,6 +1130,7 @@ impl Agent {
                 let scopes = authorized_scopes.clone();
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        paths: self.daemon_paths.clone(),
                         tool,
                         known_project_dir: known,
                         session_id: session,
@@ -1144,6 +1149,7 @@ impl Agent {
         // A run nobody is watching cannot answer a card: its guess still binds.
         let scopes_are_guess = scopes_are_guess && !trusted_session && !mandate_run;
         let rules = super::approvals::AppApprovalRules {
+            paths: self.daemon_paths.clone(),
             trusted_session,
             mandate_preapproved: mandate_run,
             guessed_scopes: if scopes_are_guess {
@@ -1199,7 +1205,7 @@ impl Agent {
         let protected_paths = turn_tools.iter().fold(
             aidaemon_tools::ProtectedPathGuard::new(
                 crate::execution::active_execution_backend(),
-                crate::tools::daemon_file_policy(),
+                crate::tools::daemon_file_policy(self.daemon_paths.clone()),
             ),
             |guard, (name, tool)| guard.tool(name.clone(), tool.dispatch_facts().file_guard),
         );
@@ -1211,6 +1217,7 @@ impl Agent {
                 task_access: authority.task_access.clone(),
                 authorized_scopes: authorized_scopes.clone(),
                 records: canonical_calls.clone(),
+                paths: self.daemon_paths.clone(),
             },
             authority: authority_hook,
             same_tool: aidaemon_policies::SameToolStreakGuard {
@@ -1407,6 +1414,7 @@ impl Agent {
             crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
                 && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
+            daemon_paths: &self.daemon_paths,
             run_id,
             session_id,
             mcp_tools,

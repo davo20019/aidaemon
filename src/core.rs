@@ -15,7 +15,11 @@ use crate::startup::{
 use crate::tasks::TaskRegistry;
 use crate::triggers::{self, TriggerManager};
 
-pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
+pub async fn run(
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+    daemon_paths: crate::tools::DaemonPaths,
+) -> anyhow::Result<()> {
     let mut config = config;
 
     // Single-instance guard: refuse to start if another daemon already holds the
@@ -110,6 +114,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     } = startup_tools::setup_tools(
         &config,
         &config_path,
+        daemon_paths.clone(),
         startup_tools::ToolSetupDependencies {
             state: state.clone(),
             memory: startup_tools::ToolMemoryAccess {
@@ -197,6 +202,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         model,
         system_prompt: base_system_prompt,
         config_path: config_path.clone(),
+        daemon_paths,
         skills_dir: skills_dir.clone().unwrap_or_default(),
         max_depth: config.subagents.max_depth,
         max_iterations: config.subagents.max_iterations,
