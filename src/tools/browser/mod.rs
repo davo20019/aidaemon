@@ -1189,15 +1189,9 @@ impl BrowserTool {
             .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
         let source = crate::tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
             .map_err(|e| format!("Invalid source_path: {e}"))?;
-        if crate::tools::fs_utils::is_sensitive_path(&source) {
-            return Err("Cannot render a sensitive source path".to_string());
-        }
         let source = source
             .canonicalize()
             .map_err(|e| format!("Could not resolve HTML source: {e}"))?;
-        if crate::tools::fs_utils::is_sensitive_path(&source) {
-            return Err("Cannot render a sensitive source path".to_string());
-        }
         if !source.is_file() {
             return Err("source_path must identify a regular HTML file".to_string());
         }
@@ -2404,8 +2398,15 @@ impl crate::traits::ToolSemantics for BrowserTool {
             // tool (`record_owner_answer`), never as kernel session grants.
             keeps_own_grants: true,
             network_reach: crate::traits::NetworkReach::PublicAndLoopback,
+            file_guard: crate::traits::FileGuard::SensitiveReads,
             ..Default::default()
         }
+    }
+
+    /// `render_pdf` publishes the file it opens. Only the guard is told about
+    /// that source: declaring it as a task read would change the scope check.
+    fn guarded_paths(&self, arguments: &str) -> (Vec<String>, Vec<String>) {
+        (browser_guarded_reads(arguments), Vec::new())
     }
 
     /// A page mutation or `execute_js` asks the owner, judged from the
@@ -2476,6 +2477,20 @@ impl crate::traits::ToolSemantics for BrowserTool {
 /// egress to that page's host, which is tracked per session and not known
 /// from the arguments, so it is undeclared, as is any action that writes or
 /// changes the browser. Actions that only read the open page declare none.
+fn browser_guarded_reads(arguments: &str) -> Vec<String> {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
+    let render = args
+        .get("action")
+        .and_then(Value::as_str)
+        .is_some_and(|action| action.trim().eq_ignore_ascii_case("render_pdf"));
+    args.get("source_path")
+        .and_then(Value::as_str)
+        .filter(|_| render)
+        .map(str::to_string)
+        .into_iter()
+        .collect()
+}
+
 fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
     let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
     let action = args
@@ -2636,6 +2651,17 @@ mod prompt_tests {
             browser_call_semantics(Some("click"), "", "button:nth-of-type(197)", "", "")
                 .observes_state()
         );
+    }
+
+    #[test]
+    fn only_render_pdf_names_a_guarded_read() {
+        let render = r#"{"action":"render_pdf","source_path":"/synthetic/page.html"}"#;
+        assert_eq!(
+            super::browser_guarded_reads(render),
+            ["/synthetic/page.html"]
+        );
+        let other = r#"{"action":"navigate","source_path":"/synthetic/page.html"}"#;
+        assert!(super::browser_guarded_reads(other).is_empty());
     }
 
     #[test]

@@ -471,7 +471,7 @@ impl sdk::Tool for BridgedTool {
         if self.tool.dispatch_facts().file_guard != crate::traits::FileGuard::None {
             let raw = arguments.to_string();
             let canonical = self.tool.canonicalize_arguments(&raw).unwrap_or(raw);
-            let (reads, writes) = crate::tools::file_guard_paths(self.tool.as_ref(), &canonical);
+            let (reads, writes) = self.tool.guarded_paths(&canonical);
             manifest.reads.extend(reads);
             for write in writes {
                 if !manifest.writes.contains(&write) {

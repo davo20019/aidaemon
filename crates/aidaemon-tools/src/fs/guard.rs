@@ -64,6 +64,17 @@ impl ProtectedPathGuard {
                 }
                 None
             }
+            FileGuard::SensitiveReads => {
+                for raw in reads {
+                    if self
+                        .resolved_any(raw, |path| self.policy.is_sensitive(path))
+                        .await
+                    {
+                        return Some(format!("{tool} cannot read sensitive path: {raw}"));
+                    }
+                }
+                None
+            }
             FileGuard::Writes => {
                 for raw in writes {
                     if self

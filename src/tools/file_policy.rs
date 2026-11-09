@@ -63,21 +63,6 @@ pub(crate) fn daemon_file_policy() -> Arc<dyn FilePolicy> {
     Arc::new(DaemonFilePolicy)
 }
 
-/// The paths a call of a file tool reads and writes, as the guard judges them.
-pub(crate) fn file_guard_paths(
-    tool: &dyn crate::traits::Tool,
-    arguments: &str,
-) -> (Vec<String>, Vec<String>) {
-    let manifest = tool.call_access_manifest(arguments);
-    let values = |targets: Vec<crate::traits::ToolTargetHint>| {
-        targets.into_iter().map(|target| target.value).collect()
-    };
-    (
-        values(manifest.read_targets),
-        values(manifest.write_targets),
-    )
-}
-
 /// Run `tool` the way a turn does: the protected-path guard first.
 #[cfg(test)]
 pub(crate) async fn guarded_call(
@@ -89,7 +74,7 @@ pub(crate) async fn guarded_call(
         daemon_file_policy(),
     )
     .tool(tool.name(), tool.dispatch_facts().file_guard);
-    let (reads, writes) = file_guard_paths(tool, arguments);
+    let (reads, writes) = tool.guarded_paths(arguments);
     if let Some(reason) = guard.refusal(tool.name(), &reads, &writes).await {
         anyhow::bail!(reason);
     }

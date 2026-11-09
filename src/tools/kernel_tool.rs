@@ -139,6 +139,10 @@ impl<T: OutcomeTool + 'static> ToolSemantics for KernelTool<T> {
         self.inner.call_access_manifest(arguments)
     }
 
+    fn guarded_paths(&self, arguments: &str) -> (Vec<String>, Vec<String>) {
+        self.inner.guarded_paths(arguments)
+    }
+
     fn adapter_owned_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
         self.inner.adapter_owned_access_manifest(arguments)
     }

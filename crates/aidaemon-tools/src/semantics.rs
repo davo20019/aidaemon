@@ -130,6 +130,9 @@ pub enum FileGuard {
     None,
     /// The paths it reads must not hold secrets.
     Reads,
+    /// The paths it reads must not be sensitive (a superset of secrets, for
+    /// a tool that publishes what it reads).
+    SensitiveReads,
     /// The paths it changes must not be sensitive.
     Writes,
 }
@@ -2149,6 +2152,19 @@ pub trait ToolSemantics: Send + Sync {
     fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
         let semantics = self.call_semantics(arguments);
         default_access_manifest(arguments, &semantics)
+    }
+
+    /// The paths this call reads and writes, as `ProtectedPathGuard` judges
+    /// them. Defaults to the access manifest; a tool overrides it for a path
+    /// that scope checks must not see as a task read.
+    fn guarded_paths(&self, arguments: &str) -> (Vec<String>, Vec<String>) {
+        let manifest = self.call_access_manifest(arguments);
+        let values =
+            |targets: Vec<ToolTargetHint>| targets.into_iter().map(|target| target.value).collect();
+        (
+            values(manifest.read_targets),
+            values(manifest.write_targets),
+        )
     }
 
     /// Capabilities supplied by the adapter rather than requested as task

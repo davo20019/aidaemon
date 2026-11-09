@@ -158,6 +158,25 @@ async fn the_guard_follows_symlinks_to_what_they_name() {
 }
 
 #[tokio::test]
+async fn sensitive_reads_cover_more_than_secrets() {
+    let (dir, workspace) = workspace();
+    let root = workspace.root().to_path_buf();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    let guard = ProtectedPathGuard::for_workspace(workspace).tool(
+        "publisher",
+        aidaemon_tools::semantics::FileGuard::SensitiveReads,
+    );
+    let config = paths(&root.join(".git/config"));
+    assert!(guard.refusal("read_file", &config, &[]).await.is_none());
+    assert!(guard.refusal("publisher", &config, &[]).await.is_some());
+    assert!(guard
+        .refusal("publisher", &paths(&root.join("page.html")), &[])
+        .await
+        .is_none());
+    drop(dir);
+}
+
+#[tokio::test]
 async fn writes_report_no_backup_without_one() {
     let (dir, workspace) = workspace();
     std::fs::write(dir.path().join("a.txt"), "old").unwrap();
