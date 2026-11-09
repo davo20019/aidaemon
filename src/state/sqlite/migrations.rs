@@ -3,6 +3,32 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
+/// The version record that says `_goals_legacy_deprecated` has been imported.
+const LEGACY_GOALS_IMPORTED_VERSION: i64 = 2;
+
+async fn table_exists_in_pool(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?
+    .is_some())
+}
+
+async fn legacy_goals_already_imported(pool: &SqlitePool) -> anyhow::Result<bool> {
+    if !table_exists_in_pool(pool, "state_schema_versions").await? {
+        return Ok(false);
+    }
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM state_schema_versions WHERE version = ?")
+            .bind(LEGACY_GOALS_IMPORTED_VERSION)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
 async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<()> {
     let has_messages = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages' LIMIT 1",
@@ -637,6 +663,9 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let legacy_goals_deprecated_needs_migration = if has_legacy_goals_deprecated {
         if !has_goals || !goals_has_goal_type || !goals_has_legacy_int_id {
             true
+        } else if legacy_goals_already_imported(pool).await? {
+            // Retention may have removed imported goals since. They stay gone.
+            false
         } else {
             sqlx::query_scalar::<_, i64>(
                 "SELECT 1
@@ -2835,6 +2864,10 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // Written last, so a start that failed above records nothing.
     record_state_version(pool, STATE_BASELINE_VERSION, "unversioned_baseline").await?;
+    // The import above has run: anything retention removes later stays removed.
+    if table_exists_in_pool(pool, "_goals_legacy_deprecated").await? {
+        record_state_version(pool, LEGACY_GOALS_IMPORTED_VERSION, "legacy_goals_imported").await?;
+    }
 
     Ok(())
 }
@@ -2867,6 +2900,58 @@ async fn record_state_version(pool: &SqlitePool, version: i64, name: &str) -> an
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod legacy_goal_import_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn goals_retention_removed_are_not_imported_again() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(SqliteConnectOptions::new().filename(database.path()))
+            .await
+            .unwrap();
+        migrate_state(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _goals_legacy_deprecated (
+                id INTEGER PRIMARY KEY, description TEXT NOT NULL, status TEXT,
+                priority TEXT, progress_notes TEXT, source_episode_id INTEGER,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _goals_legacy_deprecated (id, description, status, created_at, updated_at)
+             VALUES (7, 'Plan the Acme launch', 'completed', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let imported = "SELECT COUNT(*) FROM goals WHERE legacy_int_id = 7";
+
+        migrate_state(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(imported).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "imported once");
+
+        sqlx::query("DELETE FROM goals WHERE legacy_int_id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate_state(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(imported).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0, "what retention removed stays removed");
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _goals_legacy_deprecated")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "the recovery copy is untouched");
+    }
 }
 
 #[cfg(test)]
