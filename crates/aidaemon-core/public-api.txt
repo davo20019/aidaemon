@@ -346,6 +346,25 @@ pub enum aidaemon_core::SameToolStreak
 pub aidaemon_core::SameToolStreak::Standard
 pub aidaemon_core::SameToolStreak::Stepwise
 pub aidaemon_core::SameToolStreak::Versatile
+pub enum aidaemon_core::Schedule
+pub aidaemon_core::Schedule::Continuous
+pub aidaemon_core::Schedule::Every(core::time::Duration)
+pub aidaemon_core::Schedule::EveryTick
+pub enum aidaemon_core::ServiceEvent
+pub aidaemon_core::ServiceEvent::Failed
+pub aidaemon_core::ServiceEvent::Failed::error: alloc::string::String
+pub aidaemon_core::ServiceEvent::Failed::failures: u32
+pub aidaemon_core::ServiceEvent::Failed::service: alloc::string::String
+pub aidaemon_core::ServiceEvent::Finished
+pub aidaemon_core::ServiceEvent::Finished::service: alloc::string::String
+pub aidaemon_core::ServiceEvent::Launched
+pub aidaemon_core::ServiceEvent::Launched::service: alloc::string::String
+pub aidaemon_core::ServiceEvent::StartFailed
+pub aidaemon_core::ServiceEvent::StartFailed::error: alloc::string::String
+pub aidaemon_core::ServiceEvent::StartFailed::service: alloc::string::String
+pub aidaemon_core::ServiceEvent::Succeeded
+pub aidaemon_core::ServiceEvent::Succeeded::previous_failures: u32
+pub aidaemon_core::ServiceEvent::Succeeded::service: alloc::string::String
 pub enum aidaemon_core::SourceTrust
 pub aidaemon_core::SourceTrust::Trusted
 pub aidaemon_core::SourceTrust::Untrusted
@@ -548,6 +567,15 @@ pub fn aidaemon_core::Finish::blocked(impl core::convert::Into<alloc::string::St
 pub fn aidaemon_core::Finish::new(aidaemon_core::FinishOutcome, core::option::Option<alloc::string::String>) -> Self
 pub fn aidaemon_core::Finish::partial(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn aidaemon_core::Finish::succeeded(impl core::convert::Into<alloc::string::String>) -> Self
+pub struct aidaemon_core::FnService<F>
+impl<F, Fut> aidaemon_core::FnService<F> where F: core::ops::function::Fn() -> Fut + core::marker::Send + core::marker::Sync + 'static, Fut: core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'static
+pub fn aidaemon_core::FnService<F>::new(impl core::convert::Into<alloc::string::String>, aidaemon_core::Schedule, F) -> Self
+impl<F, Fut> aidaemon_core::Service for aidaemon_core::FnService<F> where F: core::ops::function::Fn() -> Fut + core::marker::Send + core::marker::Sync + 'static, Fut: core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'static
+pub fn aidaemon_core::FnService<F>::name(&self) -> &str
+pub fn aidaemon_core::FnService<F>::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnService<F>::schedule(&self) -> aidaemon_core::Schedule
+pub fn aidaemon_core::FnService<F>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnService<F>::stop<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub struct aidaemon_core::FnTool<F, Fut>
 impl<F, Fut> aidaemon_core::FnTool<F, Fut> where F: core::ops::function::Fn(serde_json::value::Value) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send
 pub fn aidaemon_core::FnTool<F, Fut>::new(aidaemon_core::ToolSpec, aidaemon_core::ToolAnnotations, F) -> Self
@@ -758,6 +786,25 @@ pub fn aidaemon_core::RunState::shared_declines(&self) -> core::option::Option<&
 pub fn aidaemon_core::RunState::with_parent(self, aidaemon_core::RunId) -> Self
 pub fn aidaemon_core::RunState::with_untrusted_context(self) -> Self
 pub fn aidaemon_core::RunState::with_user_message(self, impl core::convert::Into<aidaemon_core::Message>) -> Self
+pub struct aidaemon_core::ServiceContext
+impl aidaemon_core::ServiceContext
+pub fn aidaemon_core::ServiceContext::shutdown(&self) -> &tokio_util::sync::cancellation_token::CancellationToken
+pub struct aidaemon_core::ServiceError(pub alloc::string::String)
+impl aidaemon_core::ServiceError
+pub fn aidaemon_core::ServiceError::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub struct aidaemon_core::ServiceHost
+impl aidaemon_core::ServiceHost
+pub fn aidaemon_core::ServiceHost::gate(self, alloc::sync::Arc<dyn aidaemon_core::ServiceGate>) -> Self
+pub fn aidaemon_core::ServiceHost::grace(self, core::time::Duration) -> Self
+pub fn aidaemon_core::ServiceHost::max_concurrent(self, usize) -> Self
+pub fn aidaemon_core::ServiceHost::new(core::time::Duration) -> Self
+pub fn aidaemon_core::ServiceHost::observer(self, alloc::sync::Arc<dyn aidaemon_core::ServiceObserver>) -> Self
+pub async fn aidaemon_core::ServiceHost::run(self, tokio_util::sync::cancellation_token::CancellationToken)
+pub fn aidaemon_core::ServiceHost::service(self, alloc::sync::Arc<dyn aidaemon_core::Service>) -> Self
+pub fn aidaemon_core::ServiceHost::waker(&self) -> aidaemon_core::ServiceWaker
+pub struct aidaemon_core::ServiceWaker(_)
+impl aidaemon_core::ServiceWaker
+pub fn aidaemon_core::ServiceWaker::wake(&self)
 pub struct aidaemon_core::SharedDeclines(_)
 impl aidaemon_core::SharedDeclines
 pub fn aidaemon_core::SharedDeclines::new() -> Self
@@ -980,6 +1027,22 @@ impl aidaemon_core::RunStore for aidaemon_core::MemoryStore
 pub fn aidaemon_core::MemoryStore::append_event<'life0, 'life1, 'async_trait>(&'life0 self, aidaemon_core::RunId, &'life1 aidaemon_core::Event) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::StoreError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn aidaemon_core::MemoryStore::load_state<'life0, 'async_trait>(&'life0 self, aidaemon_core::RunId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<aidaemon_core::RunState>, aidaemon_core::StoreError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn aidaemon_core::MemoryStore::save_state<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::RunState) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::StoreError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub trait aidaemon_core::Service: core::marker::Send + core::marker::Sync + 'static
+pub fn aidaemon_core::Service::name(&self) -> &str
+pub fn aidaemon_core::Service::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Service::schedule(&self) -> aidaemon_core::Schedule
+pub fn aidaemon_core::Service::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Service::stop<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+impl<F, Fut> aidaemon_core::Service for aidaemon_core::FnService<F> where F: core::ops::function::Fn() -> Fut + core::marker::Send + core::marker::Sync + 'static, Fut: core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'static
+pub fn aidaemon_core::FnService<F>::name(&self) -> &str
+pub fn aidaemon_core::FnService<F>::run<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnService<F>::schedule(&self) -> aidaemon_core::Schedule
+pub fn aidaemon_core::FnService<F>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 aidaemon_core::ServiceContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), aidaemon_core::ServiceError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnService<F>::stop<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub trait aidaemon_core::ServiceGate: core::marker::Send + core::marker::Sync
+pub fn aidaemon_core::ServiceGate::ready<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = bool> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub trait aidaemon_core::ServiceObserver: core::marker::Send + core::marker::Sync
+pub fn aidaemon_core::ServiceObserver::event(&self, aidaemon_core::ServiceEvent)
 pub trait aidaemon_core::StopCondition: core::marker::Send + core::marker::Sync
 pub fn aidaemon_core::StopCondition::check(&self, &aidaemon_core::RunSnapshot) -> core::option::Option<alloc::string::String>
 impl<F> aidaemon_core::StopCondition for F where F: core::ops::function::Fn(&aidaemon_core::RunSnapshot) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync

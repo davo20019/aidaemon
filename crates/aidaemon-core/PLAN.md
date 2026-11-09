@@ -432,12 +432,15 @@ Order:
         Not memory, noted on the way: `memory/context_window.rs` now holds
         only token budgeting, which belongs with the policies crate's
         `ContextWindow`; `memory/skill_promotion.rs` belongs to skills.
-- [ ] 8.7b Services: an SDK extension point for background work. It
-      covers start and stop, scheduled ticks, and every agent run built
-      through `AgentBuilder`, so background runs carry the same safeguards.
-      The daemon's heartbeat, schedules and mandate reviews become
-      services. It comes before 8.8 because channel runners are services
-      too.
+- [x] 8.7b Services: an SDK extension point for background work.
+      Done 2026-11-09: `aidaemon_core::service` (`Service`, `ServiceHost`,
+      `Schedule`). The 20 periodic jobs are `Every` services, the goal cycle
+      (schedules, mandate reviews, stuck tasks, notifications) is one
+      `EveryTick` service because its phases depend on their order, and the
+      channel bots are `Continuous` services. DB health is the host's gate,
+      SIGTERM reaches the graceful path, and `heartbeat.rs` is split by
+      phase. A long agent run is still interrupted by a restart and resumed
+      by startup recovery.
 - [ ] 8.8 Channels, MCP and store, each promoted into its SDK crate.
       Providers are done: every daemon model call runs on an
       `aidaemon-providers` backend and the daemon `ModelProvider` trait is
