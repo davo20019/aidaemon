@@ -28,12 +28,16 @@ fn child_result_trust(
     }
 }
 
-/// Whether a child's run may teach durable memory, from its record of
-/// tainted turns. An unreadable record counts as tainted.
-fn run_taint(read: &anyhow::Result<Vec<String>>) -> crate::memory::task_learning::RunTaint {
+/// Whether a child's run may teach durable memory: tainted when its
+/// in-memory flag says it read untrusted content (a failed record write only
+/// warns) or its record of tainted turns is non-empty or unreadable.
+fn run_taint(
+    read_untrusted: bool,
+    read: &anyhow::Result<Vec<String>>,
+) -> crate::memory::task_learning::RunTaint {
     use crate::memory::task_learning::RunTaint;
     match read {
-        Ok(turns) if turns.is_empty() => RunTaint::Clean,
+        Ok(turns) if turns.is_empty() && !read_untrusted => RunTaint::Clean,
         _ => RunTaint::Tainted,
     }
 }
@@ -2891,8 +2895,10 @@ impl Agent {
                 .await;
         }
 
-        // The child's record of tainted turns, read once: it gates task
-        // learning and sets the trust of the child's result.
+        // The child's taint flag and record of tainted turns, read once: they
+        // gate task learning and set the trust of the child's result.
+        let child_flagged_untrusted =
+            child_read_untrusted.load(std::sync::atomic::Ordering::SeqCst);
         let child_tainted_turns =
             crate::agent::untrusted::tainted_turns(self.state.as_ref(), &child_session_for_events)
                 .await;
@@ -2907,7 +2913,7 @@ impl Agent {
                             let store = self.memory_store.clone();
                             let side_calls = self.side_calls.clone();
                             let tid = task_id.clone();
-                            let taint = run_taint(&child_tainted_turns);
+                            let taint = run_taint(child_flagged_untrusted, &child_tainted_turns);
                             let model = match tokio::time::timeout(
                                 Duration::from_secs(2),
                                 self.fallback_model.read(),
@@ -2948,10 +2954,7 @@ impl Agent {
             }
         }
 
-        let trust = child_result_trust(
-            child_read_untrusted.load(std::sync::atomic::Ordering::SeqCst),
-            child_tainted_turns,
-        );
+        let trust = child_result_trust(child_flagged_untrusted, child_tainted_turns);
         result.map(|response| SpawnChildResult {
             response,
             outcome: child_outcome,
@@ -3334,14 +3337,21 @@ mod tests {
     fn an_unreadable_taint_record_counts_as_tainted() {
         use crate::memory::task_learning::RunTaint;
         assert_eq!(
-            super::run_taint(&Err(anyhow::anyhow!("corrupt"))),
+            super::run_taint(false, &Err(anyhow::anyhow!("corrupt"))),
             RunTaint::Tainted
         );
         assert_eq!(
-            super::run_taint(&Ok(vec!["turn-1".to_string()])),
+            super::run_taint(false, &Ok(vec!["turn-1".to_string()])),
             RunTaint::Tainted
         );
-        assert_eq!(super::run_taint(&Ok(Vec::new())), RunTaint::Clean);
+        assert_eq!(super::run_taint(false, &Ok(Vec::new())), RunTaint::Clean);
+    }
+
+    #[test]
+    fn a_run_flagged_untrusted_counts_as_tainted_even_with_an_empty_record() {
+        use crate::memory::task_learning::RunTaint;
+        assert_eq!(super::run_taint(true, &Ok(Vec::new())), RunTaint::Tainted);
+        assert_eq!(super::run_taint(false, &Ok(Vec::new())), RunTaint::Clean);
     }
 
     #[test]
