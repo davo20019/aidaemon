@@ -2,8 +2,8 @@
 //! `Agent::handle_message` with a strict scripted provider and checks the
 //! daemon's own snapshot assertions.
 
-use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::path::PathBuf;
 
 use aidaemon_core::ReceiptStatus;
 use aidaemon_eval::{CallRecord, FactoryError, Scenario, ScriptedReply, Subject, Trajectory};
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Event, EventStore};
-use crate::harness_eval::fixture::{collect_run_result, FixtureSeed, HarnessEvalRunResult};
+use crate::harness_eval::recorder::{collect_run_result, HarnessEvalRunResult};
 use crate::state::sqlite::SqliteStateStore;
 use crate::testing::{
     setup_test_agent, setup_test_agent_orchestrator, setup_test_agent_with_models, MockProvider,
@@ -22,6 +22,30 @@ use crate::types::{ChannelContext, UserRole};
 
 pub type DaemonScenario = Scenario<DaemonSetup, DaemonExpect>;
 
+/// The suite the daemon's eval run loads.
+pub fn scenarios_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/harness_eval/scenarios")
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioSeed {
+    #[serde(default)]
+    pub goals: Vec<SeedGoal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedGoal {
+    pub description: String,
+    #[serde(default = "default_active_status")]
+    pub status: String,
+}
+
+fn default_active_status() -> String {
+    "active".to_string()
+}
+
 fn default_owner() -> String {
     "owner".to_string()
 }
@@ -30,7 +54,7 @@ fn is_owner(role: &str) -> bool {
     role == "owner"
 }
 
-fn is_empty_seed(seed: &FixtureSeed) -> bool {
+fn is_empty_seed(seed: &ScenarioSeed) -> bool {
     seed.goals.is_empty()
 }
 
@@ -45,7 +69,7 @@ pub struct DaemonSetup {
     /// Defaults to one derived from the scenario name and run number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(default = "default_owner", skip_serializing_if = "is_owner_ref")]
+    #[serde(default = "default_owner", skip_serializing_if = "is_owner")]
     pub user_role: String,
     /// Use the orchestrator-mode test harness (orchestration routing).
     #[serde(default, skip_serializing_if = "is_false")]
@@ -59,11 +83,7 @@ pub struct DaemonSetup {
     pub session_mode: Option<String>,
     /// DB seed data applied before `handle_message`.
     #[serde(default, skip_serializing_if = "is_empty_seed")]
-    pub seed: FixtureSeed,
-}
-
-fn is_owner_ref(role: &String) -> bool {
-    is_owner(role)
+    pub seed: ScenarioSeed,
 }
 
 impl Default for DaemonSetup {
@@ -74,7 +94,7 @@ impl Default for DaemonSetup {
             orchestrator: false,
             routing_models: false,
             session_mode: None,
-            seed: FixtureSeed::default(),
+            seed: ScenarioSeed::default(),
         }
     }
 }
@@ -265,7 +285,7 @@ fn mock_response(reply: &ScriptedReply) -> anyhow::Result<ProviderResponse> {
 async fn apply_seed(
     state: &SqliteStateStore,
     session_id: &str,
-    seed: &FixtureSeed,
+    seed: &ScenarioSeed,
 ) -> anyhow::Result<()> {
     for goal_spec in &seed.goals {
         let mut goal = Goal::new_finite(&goal_spec.description, session_id);
@@ -514,11 +534,329 @@ pub fn check_daemon_expect(expect: &DaemonExpect, result: &HarnessEvalRunResult)
     std::mem::take(f)
 }
 
-/// Tool name counts, for building expectations in tests.
-pub fn count_names(names: &[String]) -> BTreeMap<String, u32> {
-    let mut counts = BTreeMap::new();
-    for name in names {
-        *counts.entry(name.clone()).or_insert(0) += 1;
+#[cfg(test)]
+mod tests {
+    use aidaemon_eval::{check_trajectory, CaseResult, Suite};
+
+    use super::*;
+    use crate::harness_eval::recorder::record_scenario_from_events;
+
+    fn parse(yaml: &str) -> DaemonScenario {
+        DaemonScenario::parse_yaml(yaml, "inline.yaml").unwrap()
     }
-    counts
+
+    async fn run(scenario: &DaemonScenario) -> CaseResult {
+        scenario.run_on(&DaemonSubject, 0).await
+    }
+
+    fn suite() -> Vec<DaemonScenario> {
+        Suite::<DaemonSetup, DaemonExpect>::load_dir(scenarios_dir())
+            .unwrap()
+            .scenarios
+    }
+
+    fn failed(result: &CaseResult, label: &str) -> bool {
+        !result.passed && result.failures.iter().any(|f| f.contains(label))
+    }
+
+    #[tokio::test]
+    async fn harness_eval_scenario_suite() {
+        let scenarios = suite();
+        assert!(
+            scenarios.len() >= 17,
+            "expected at least 17 scenarios, got {}",
+            scenarios.len()
+        );
+        let mut failures = Vec::new();
+        for scenario in &scenarios {
+            let result = run(scenario).await;
+            if !result.passed {
+                failures.push(format!("{}: {:?}", scenario.name, result.failures));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn typos_in_daemon_blocks_fail_at_load() {
+        for yaml in [
+            "name: typo\ninput: Hello\nexpect:\n  ext:\n    tool_calls_mx: 0\n",
+            "name: typo\ninput: Hello\nsetup:\n  session_idd: s1\n",
+            "name: typo\ninput: Hello\nmock_responses:\n  - text: Hi\n",
+        ] {
+            assert!(
+                DaemonScenario::parse_yaml(yaml, "inline.yaml").is_err(),
+                "{yaml}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_eval_checks_false_fallthrough_expectation() {
+        let scenario = parse(
+            "name: false_fallthrough\ninput: Hello\nsetup:\n  session_id: synthetic-fallthrough\nscript:\n  - text: Hello\nexpect:\n  ext:\n    response_fallthrough: false\n",
+        );
+        let mut trajectory = DaemonSubject.run(&scenario, 0).await.unwrap();
+        let ext = scenario.expect.ext.as_ref().unwrap();
+        trajectory
+            .observed
+            .harness_eval
+            .routing
+            .response_fallthrough = false;
+        assert!(DaemonSubject.check_ext(ext, &trajectory).is_empty());
+        trajectory
+            .observed
+            .harness_eval
+            .routing
+            .response_fallthrough = true;
+        assert!(!DaemonSubject.check_ext(ext, &trajectory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_eval_rejects_exhausted_response_script() {
+        let scenario = parse("name: empty_script\ninput: Hello\n");
+        let error = DaemonSubject
+            .run(&scenario, 0)
+            .await
+            .expect_err("unexpected model calls must fail the scenario");
+        assert!(error.to_string().contains("script exhausted"), "{error}");
+    }
+
+    /// The recorder scopes to the right task and user message for every suite
+    /// scenario, writes YAML the eval crate accepts, and rebuilds the exact
+    /// script when no gate intervened. Runs where gates bounce or synthesize
+    /// replies are known to diverge (see `record_scenario_from_events`), so
+    /// they are not asserted here.
+    #[tokio::test]
+    async fn recorder_writes_scenarios_that_load_and_replay() {
+        let session = |s: &DaemonScenario| s.setup.as_ref().unwrap().session_id.clone().unwrap();
+        for scenario in suite() {
+            let (_, events) = run_with_trace(&scenario, 0).await.unwrap();
+            let recorded = record_scenario_from_events(&session(&scenario), &events, None).unwrap();
+            assert_eq!(recorded.input, scenario.input, "{}", scenario.name);
+            let yaml = serde_yaml::to_string(&recorded).unwrap();
+            DaemonScenario::parse_yaml(&yaml, "recorded.yaml").unwrap();
+        }
+        for name in ["mock_tool_then_reply", "mutation_called_once_in_order"] {
+            let path = scenarios_dir().join(format!("{name}.yaml"));
+            let scenario = DaemonScenario::parse_file(&path).unwrap();
+            let (result, events) = run_with_trace(&scenario, 0).await.unwrap();
+            let recorded = record_scenario_from_events(
+                &session(&scenario),
+                &events,
+                Some(&result.task_end.task_id),
+            )
+            .unwrap();
+            let yaml = serde_yaml::to_string(&recorded).unwrap();
+            let mut replay = DaemonScenario::parse_yaml(&yaml, "recorded.yaml").unwrap();
+            assert_eq!(replay.script, scenario.script, "{name}");
+            // The draft's own expectations must hold on the run it was
+            // recorded from (floored scores, receipt-backed counts).
+            let original = scenario.setup.as_ref().unwrap();
+            let setup = replay.setup.as_mut().unwrap();
+            setup.orchestrator = original.orchestrator;
+            setup.routing_models = original.routing_models;
+            let result = run(&replay).await;
+            assert!(result.passed, "{name}: {:?}", result.failures);
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_eval_rejects_unconsumed_response_script() {
+        let scenario = parse(
+            "name: leftover_script\ninput: Hello\nsetup:\n  session_id: synthetic-leftover-script\nscript:\n  - text: Hello.\n  - text: Never requested.\n",
+        );
+        let error = DaemonSubject
+            .run(&scenario, 0)
+            .await
+            .expect_err("a run that stops before its script ends must fail");
+        assert!(error.to_string().contains("1 execution"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn harness_eval_rejects_unknown_user_role() {
+        let scenario = parse(
+            "name: bad_role\ninput: Hello\nsetup:\n  session_id: synthetic-bad-role\n  user_role: gest\nscript:\n  - text: Hello.\n",
+        );
+        let error = DaemonSubject
+            .run(&scenario, 0)
+            .await
+            .expect_err("a typo'd role must not silently run as owner");
+        assert!(error.to_string().contains("gest"), "{error}");
+    }
+
+    const REPEATED_SYSTEM_INFO: &str = r#"
+name: dispatch_counts
+input: Check system info
+setup:
+  session_id: eval_dispatch_counts_01
+script:
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - text: Done.
+"#;
+
+    /// Proposals and dispatches diverge when the loop replays or suppresses a
+    /// repeated call; each expectation must read its own lane.
+    #[tokio::test]
+    async fn harness_eval_dispatch_counts_read_receipts_not_proposals() {
+        let mut scenario = parse(REPEATED_SYSTEM_INFO);
+        scenario
+            .expect
+            .proposed
+            .tool_call_counts
+            .insert("system_info".into(), 2);
+        let trajectory = DaemonSubject.run(&scenario, 0).await.unwrap();
+        assert!(check_trajectory(&scenario.expect, &trajectory).is_empty());
+        let dispatched = &trajectory.observed.dispatched_tool_names;
+        assert!(
+            !dispatched.is_empty() && dispatched.len() <= trajectory.proposed.len(),
+            "dispatches must be a receipt-backed subset of proposals: proposed {:?}, dispatched {dispatched:?}",
+            trajectory.proposed,
+        );
+        scenario
+            .expect
+            .tool_dispatch_counts
+            .insert("system_info".into(), 3);
+        let failures = check_trajectory(&scenario.expect, &trajectory);
+        assert!(failures.iter().any(|f| f.contains("tool_dispatch_counts")));
+    }
+
+    #[tokio::test]
+    async fn harness_eval_collects_calls_before_the_recent_event_window() {
+        use serde_json::json;
+
+        use crate::events::EventType;
+        let session_id = "synthetic-long-trace";
+        let scenario = parse(&format!(
+            "name: long_trace\ninput: Hello\nsetup:\n  session_id: {session_id}\nscript:\n  - text: Hello\n"
+        ));
+        let (baseline, _) = run_with_trace(&scenario, 0).await.unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.path().display()))
+            .await
+            .unwrap();
+        let store = EventStore::new(pool).await.unwrap();
+        let task_id = &baseline.task_end.task_id;
+        for index in 0..2 {
+            store
+                .append(Event::new(
+                    session_id,
+                    EventType::ToolCall,
+                    json!({
+                        "task_id": task_id, "tool_call_id": format!("call-{index}"),
+                        "name": "remember_fact", "arguments": {}
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+        store
+            .append(Event::new(
+                session_id,
+                EventType::LlmCall,
+                json!({"task_id": task_id, "model": "mock-model", "latency_ms": 0}),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..220 {
+            store
+                .append(Event::new(
+                    session_id,
+                    EventType::UserMessage,
+                    json!({
+                        "task_id": task_id, "content": "synthetic progress"
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+        store
+            .append(Event::new(
+                session_id,
+                EventType::TaskEnd,
+                serde_json::to_value(&baseline.task_end).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let result = collect_result(&store, session_id, "Hello").await.unwrap();
+        assert_eq!(result.tool_names, vec!["remember_fact", "remember_fact"]);
+        assert_eq!(result.llm_calls, 1);
+        let trajectory = trajectory_of(result);
+        let mut expect = scenario.expect.clone();
+        expect
+            .proposed
+            .tool_call_counts
+            .insert("remember_fact".into(), 1);
+        assert!(!check_trajectory(&expect, &trajectory).is_empty());
+        expect.proposed.tool_call_counts.clear();
+        expect.proposed.tools_not_used.push("remember_fact".into());
+        assert!(!check_trajectory(&expect, &trajectory).is_empty());
+    }
+
+    const TWO_TOOLS: &str = r#"
+name: order
+input: Check system info then remember it
+setup:
+  session_id: eval_order_01
+script:
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: remember_fact
+        arguments: '{"category":"project","key":"host","value":"synthetic"}'
+  - text: Done.
+"#;
+
+    /// Two distinct tools, asserted in the order they were actually called.
+    #[tokio::test]
+    async fn harness_eval_enforces_tool_order_end_to_end() {
+        let mut scenario = parse(TWO_TOOLS);
+        scenario.expect.proposed.tools_in_order =
+            vec!["system_info".into(), "remember_fact".into()];
+        for tool in ["system_info", "remember_fact"] {
+            scenario
+                .expect
+                .proposed
+                .tool_call_counts
+                .insert(tool.into(), 1);
+        }
+        let result = run(&scenario).await;
+        assert!(result.passed, "{:?}", result.failures);
+    }
+
+    /// Same run, reversed expectation: must be rejected.
+    #[tokio::test]
+    async fn harness_eval_rejects_wrong_tool_order_end_to_end() {
+        let mut scenario = parse(TWO_TOOLS);
+        scenario.expect.proposed.tools_in_order =
+            vec!["remember_fact".into(), "system_info".into()];
+        assert!(failed(&run(&scenario).await, "tools_in_order"));
+    }
+
+    /// The duplicate-side-effect guard: same tool invoked twice, count says once.
+    #[tokio::test]
+    async fn harness_eval_rejects_duplicate_tool_call_end_to_end() {
+        let mut scenario = parse(REPEATED_SYSTEM_INFO);
+        scenario
+            .expect
+            .proposed
+            .tool_call_counts
+            .insert("system_info".into(), 1);
+        assert!(failed(&run(&scenario).await, "tool_call_counts"));
+    }
+
+    #[tokio::test]
+    async fn harness_eval_basic_conversational_scenario() {
+        let scenario = parse(
+            "name: basic_conversational\ninput: Hello there\nsetup:\n  session_id: eval_basic_01\nscript:\n  - text: Hello there.\nexpect:\n  ext:\n    outcome: succeeded\n    llm_calls_min: 1\n",
+        );
+        let result = run(&scenario).await;
+        assert!(result.passed, "{:?}", result.failures);
+    }
 }

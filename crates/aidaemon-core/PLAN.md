@@ -95,9 +95,13 @@ database.
       API keys; `support_triage` is the non-coding check for "any kind of
       agent"). Live tests that exist: `src/integration_tests/live_sdk_turns.rs`
       (six `#[ignore]` tests against the ChatGPT backend).
-- [ ] Old-vs-new comparison: translate the daemon's 16 fixtures in
-      `tests/harness_eval/fixtures/` into `aidaemon-eval` scenarios (or add a
-      `core` engine to `src/harness_eval`) and report both loops side by side.
+- [ ] Old-vs-new comparison: not doable as written, so left unticked. The
+      fixture translation happened (8.9), but "report both loops side by
+      side" cannot: the legacy loop was deleted in 2ae738d. The 8.9
+      differential compared the old and new *checks* on the one remaining
+      loop, which says nothing about whether the SDK loop beats the old one.
+      A real comparison would need the legacy loop built from before 2ae738d,
+      or recorded numbers from it.
 - [ ] Baseline the plain kernel (no policies) so each policy has a number
       to beat.
 
@@ -643,19 +647,22 @@ Order:
         `sendPhoto`) and `download` (which uses the configured API base
         instead of a hardcoded host); `/connect` and `/bots` token checks
         with `getMe`.
-- [ ] 8.9 Eval harness on `aidaemon-eval`. Map (2026-11-07): only the
-      scenario format and the trajectory assertions are duplicated.
-      `src/harness_eval/report.rs` formats live telemetry and is not a
-      duplicate. The crate needs:
-      - a `Subject` seam returning a neutral `Trajectory`;
-      - typed `setup:` and `expect.ext:` blocks;
-      - a proposed-call lane next to the dispatched one;
-      - script arguments as a string or an object.
-      The daemon then keeps a `DaemonSubject`, its snapshot assertions and
-      the recorder. A differential test runs old and new checks over all
-      fixtures before the old checks are deleted. Watch two differences:
-      `response_contains` is case-sensitive in the daemon, and the daemon
-      counts proposals where the crate counts receipts.
+- [x] 8.9 Eval harness on `aidaemon-eval`. The crate gained a `Subject`
+      seam returning a neutral `Trajectory`, typed `setup:` and `expect.ext:`
+      blocks, a proposed-call lane next to the receipts, and script arguments
+      as a string or an object. The daemon keeps `DaemonSubject` and its
+      snapshot assertions (`src/harness_eval/subject.rs`, test-only) and the
+      recorder (`recorder.rs`, used by `db_probe`, so it writes the scenario
+      YAML from its own small structs; a test loads and replays that YAML).
+      `report.rs` formats live telemetry and was never a duplicate. The 17
+      fixtures are now `tests/harness_eval/scenarios/`. The old tool
+      expectations map to `expect.proposed.*`, because the daemon counted
+      proposals, and `response_contains` to `final_text_contains_exact`.
+      Before the old checks were deleted (48bbcb9 has them side by side), a
+      differential judged one run of each fixture with both, on the real
+      expectations and on 880 mutated ones, and agreed on all. Deliberately
+      wrong mappings made it fail. Proposals and receipts match in every
+      fixture, so the lane split rests on a synthetic control run.
 
 ## Parallel track: fixes found in the daemon
 

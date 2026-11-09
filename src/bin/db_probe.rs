@@ -1347,8 +1347,8 @@ async fn record_fixture_from_session(
     output: Option<&str>,
     include_text: bool,
 ) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::fixture::{
-        record_fixture_from_events, recorded_fixtures_dir, RECORDED_FIXTURE_HEADER,
+    use aidaemon::harness_eval::recorder::{
+        record_scenario_from_events, recorded_scenarios_dir, RECORDED_SCENARIO_HEADER,
     };
 
     // Plain SELECT (no EventStore::new, which would run migrations against a
@@ -1387,24 +1387,23 @@ async fn record_fixture_from_session(
         });
     }
 
-    let mut fixture = record_fixture_from_events(session_id, &events, task_id)?;
+    let mut scenario = record_scenario_from_events(session_id, &events, task_id)?;
     if include_text {
-        if let Some(aidaemon::harness_eval::MockResponseSpec::Text { text }) =
-            fixture.mock_responses.last()
-        {
-            fixture.expect.response_contains = vec![text.chars().take(40).collect()];
+        let last_text = scenario.script.last().and_then(|reply| reply.text.clone());
+        if let Some(text) = last_text {
+            scenario.expect.final_text_contains_exact = vec![text.chars().take(40).collect()];
         }
     }
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| recorded_fixtures_dir().join(format!("{}.yaml", fixture.name)));
+        .unwrap_or_else(|| recorded_scenarios_dir().join(format!("{}.yaml", scenario.name)));
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml::to_string(&fixture)?;
-    std::fs::write(&output_path, format!("{RECORDED_FIXTURE_HEADER}{yaml}"))?;
-    println!("Recorded draft fixture -> {}", output_path.display());
+    let yaml = serde_yaml::to_string(&scenario)?;
+    std::fs::write(&output_path, format!("{RECORDED_SCENARIO_HEADER}{yaml}"))?;
+    println!("Recorded draft scenario -> {}", output_path.display());
     println!("Check it against the trace before moving it into the suite.");
     Ok(())
 }
