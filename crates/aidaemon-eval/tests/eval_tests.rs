@@ -7,7 +7,8 @@ use aidaemon_core::{
 };
 use aidaemon_eval::examples::{example_tools, ExampleFactory};
 use aidaemon_eval::{
-    compare, CaseResult, EvalError, ExpectedStatus, FnFactory, Report, Scenario, Suite,
+    compare, CallRecord, CaseResult, EvalError, ExpectedStatus, FactoryError, FnFactory, Report,
+    Scenario, Subject, Suite, Trajectory,
 };
 use async_trait::async_trait;
 
@@ -636,4 +637,80 @@ fn succeeded_is_checked_separately_from_completed() {
     assert!(failures[0].starts_with("succeeded:") && failures[0].contains("email the report"));
     let stopped_unmet = expect("{ status: completed, succeeded: false }");
     assert!(aidaemon_eval::check_expectations(&stopped_unmet, &outcome).is_empty());
+}
+
+// ---------- the Subject seam ----------
+
+/// A subject that is not a kernel agent: it just reports what it did.
+struct Canned(Trajectory);
+
+#[async_trait]
+impl Subject for Canned {
+    type Observed = ();
+
+    async fn run(&self, _scenario: &Scenario, _run: usize) -> Result<Trajectory, FactoryError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn canned_trajectory() -> Trajectory {
+    Trajectory {
+        status: "completed".into(),
+        status_detail: String::new(),
+        succeeded: true,
+        unmet: Vec::new(),
+        final_text: Some("Report for Acme Corp".into()),
+        receipts: vec![CallRecord {
+            tool: "read_file".into(),
+            status: None,
+            dispatched: true,
+        }],
+        turns: 2,
+        billable_tokens: 30,
+        run_failures: Vec::new(),
+        observed: (),
+    }
+}
+
+#[tokio::test]
+async fn any_subject_is_checked_against_the_same_expectations() {
+    let s = scenario(
+        r#"
+name: canned
+input: hi
+expect:
+  status: completed
+  final_text_contains: [acme]
+  tools_used: [read_file]
+  max_turns: 1
+  no_failed_receipts: true
+"#,
+    );
+    let result = s.run_on(&Canned(canned_trajectory()), 0).await;
+    assert_eq!(result.status, "completed");
+    assert_eq!(result.tools, vec!["read_file"]);
+    assert_eq!(result.failures.len(), 1, "{:?}", result.failures);
+    assert!(has_failure(&result, "max_turns"), "{:?}", result.failures);
+}
+
+#[tokio::test]
+async fn run_failures_fail_the_case_and_subject_errors_are_reported() {
+    let s = scenario("name: canned\ninput: hi\n");
+    let mut trajectory = canned_trajectory();
+    trajectory.run_failures.push("script left over".into());
+    let result = s.run_on(&Canned(trajectory), 0).await;
+    assert!(!result.passed);
+    assert_eq!(result.failures, vec!["script left over"]);
+
+    struct Broken;
+    #[async_trait]
+    impl Subject for Broken {
+        type Observed = ();
+        async fn run(&self, _: &Scenario, _: usize) -> Result<Trajectory, FactoryError> {
+            Err("no database".into())
+        }
+    }
+    let result = s.run_on(&Broken, 0).await;
+    assert_eq!(result.status, "error");
+    assert_eq!(result.failures, vec!["no database"]);
 }

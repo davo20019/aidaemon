@@ -9,6 +9,8 @@
 //!   model replies and are deterministic harness tests; unscripted ones run
 //!   against a live provider.
 //! - [`AgentFactory`]: builds the agent under test for each run.
+//! - [`Subject`]: the seam behind it. Anything that can run a scenario and
+//!   report a neutral [`Trajectory`] can be evaluated.
 //! - [`Suite`]: loads a directory of scenarios and runs each N times with
 //!   bounded concurrency, producing a [`Report`] (Markdown or JSON).
 //! - [`compare`]: pass-rate deltas between two reports, for policy on/off or
@@ -84,7 +86,10 @@ mod suite;
 pub mod examples;
 
 pub use report::{compare, Comparison, ComparisonRow, FailureCount, Report, ScenarioReport};
-pub use runner::{check_expectations, AgentFactory, CaseResult, FactoryError, FnFactory};
+pub use runner::{
+    check_expectations, check_trajectory, AgentFactory, AgentSubject, CallRecord, CaseResult,
+    FactoryError, FnFactory, Subject, Trajectory,
+};
 pub use scenario::{
     status_name, EvalError, Expect, ExpectedStatus, Scenario, ScenarioLimits, ScriptedArguments,
     ScriptedCall, ScriptedReply, ScriptedUsage,

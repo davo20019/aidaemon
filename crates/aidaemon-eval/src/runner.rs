@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aidaemon_core::testing::ScriptedProvider;
-use aidaemon_core::{Agent, Provider, ReceiptStatus, RunOutcome};
+use aidaemon_core::{Agent, InvocationStage, Provider, ReceiptStatus, RunOutcome};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::scenario::{status_name, Expect, Scenario};
@@ -90,6 +91,144 @@ pub struct CaseResult {
     pub duration_ms: f64,
 }
 
+/// One tool call that got a receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRecord {
+    pub tool: String,
+    /// `None` when the subject's receipts do not say.
+    pub status: Option<ReceiptStatus>,
+    /// The tool's code was invoked. A call refused or rejected at the
+    /// boundary has a receipt but was not dispatched.
+    pub dispatched: bool,
+}
+
+/// What a run did, in terms any subject can report: the neutral record the
+/// expectations are checked against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trajectory<O = ()> {
+    /// snake_case name of how the run ended. For kernel runs this is one of
+    /// the [`crate::ExpectedStatus`] names.
+    pub status: String,
+    /// More about `status`, shown when an expectation on it fails.
+    pub status_detail: String,
+    /// Whether the run's objective was met.
+    pub succeeded: bool,
+    /// Requirements still open when the run stopped.
+    pub unmet: Vec<String>,
+    pub final_text: Option<String>,
+    /// Every call that got a receipt, in receipt order.
+    pub receipts: Vec<CallRecord>,
+    pub turns: u32,
+    pub billable_tokens: u64,
+    /// Problems with the run itself rather than with the agent's behavior,
+    /// for example a script that was not fully consumed. Any entry fails
+    /// the case.
+    pub run_failures: Vec<String>,
+    /// Whatever else the subject observed, for [`Subject::check_ext`].
+    pub observed: O,
+}
+
+impl Trajectory {
+    /// The trajectory of a finished kernel run.
+    pub fn from_outcome(outcome: &RunOutcome) -> Self {
+        Self {
+            status: status_name(&outcome.status).to_string(),
+            status_detail: format!("{:?}", outcome.status),
+            succeeded: outcome.is_succeeded(),
+            unmet: outcome.unmet().to_vec(),
+            final_text: outcome.final_text.clone(),
+            receipts: outcome
+                .receipts()
+                .iter()
+                .map(|r| CallRecord {
+                    tool: r.tool.clone(),
+                    status: Some(r.status),
+                    dispatched: r.stage == InvocationStage::Dispatched,
+                })
+                .collect(),
+            turns: outcome.turns(),
+            billable_tokens: outcome.usage().billable_tokens(),
+            run_failures: Vec::new(),
+            observed: (),
+        }
+    }
+}
+
+/// The system under test: runs a scenario once and reports a [`Trajectory`].
+///
+/// [`AgentFactory`] covers agents built on the kernel. Implement this
+/// directly for anything else, such as an application that drives its own
+/// turn loop around the kernel.
+#[async_trait]
+pub trait Subject: Send + Sync {
+    /// What the subject reports beyond the neutral fields.
+    type Observed: Send;
+
+    /// `run` is the run number within the suite, for per-run session ids.
+    async fn run(
+        &self,
+        scenario: &Scenario,
+        run: usize,
+    ) -> Result<Trajectory<Self::Observed>, FactoryError>;
+}
+
+/// The [`Subject`] for agents built by an [`AgentFactory`].
+pub struct AgentSubject<'a> {
+    factory: &'a dyn AgentFactory,
+}
+
+impl<'a> AgentSubject<'a> {
+    pub fn new(factory: &'a dyn AgentFactory) -> Self {
+        Self { factory }
+    }
+}
+
+#[async_trait]
+impl Subject for AgentSubject<'_> {
+    type Observed = ();
+
+    async fn run(&self, scenario: &Scenario, run: usize) -> Result<Trajectory, FactoryError> {
+        let script = scenario.script.as_ref().map(|_| {
+            let responses = scenario.scripted_responses();
+            (responses.len(), Arc::new(ScriptedProvider::new(responses)))
+        });
+        let provider: Arc<dyn Provider> = match (&script, self.factory.live_provider(scenario)) {
+            (Some((_, scripted)), _) => scripted.clone(),
+            (None, Some(live)) => live,
+            (None, None) => {
+                return Err(
+                    "scenario has no `script` and the factory supplied no live provider".into(),
+                )
+            }
+        };
+        let agent = self
+            .factory
+            .build(scenario, provider)
+            .map_err(|err| format!("agent factory failed: {err}"))?;
+        let session = format!("eval-{}-{run}", scenario.name);
+        let outcome = agent
+            .run(&session, &scenario.input)
+            .await
+            .map_err(|err| format!("run failed: {err}"))?;
+
+        let mut trajectory = Trajectory::from_outcome(&outcome);
+        if let Some((len, scripted)) = &script {
+            let calls = scripted.requests().len();
+            if calls > *len {
+                trajectory.run_failures.push(format!(
+                    "script ran out: the model was called {calls} times but the script has {len} replies"
+                ));
+            } else if scripted.remaining() > 0 {
+                trajectory.run_failures.push(format!(
+                    "script not fully consumed: {} of {len} replies unused",
+                    scripted.remaining()
+                ));
+            }
+        }
+        Ok(trajectory)
+    }
+}
+
 impl CaseResult {
     fn errored(scenario: &Scenario, message: String, elapsed: Duration) -> Self {
         Self {
@@ -109,119 +248,87 @@ impl CaseResult {
 impl Scenario {
     /// Run once with a session id derived from the scenario name.
     pub async fn run(&self, factory: &dyn AgentFactory) -> CaseResult {
-        self.run_numbered(factory, 0).await
+        self.run_on(&AgentSubject::new(factory), 0).await
     }
 
-    pub(crate) async fn run_numbered(&self, factory: &dyn AgentFactory, run: usize) -> CaseResult {
+    /// Run once on `subject` and check the expectations.
+    pub async fn run_on<T: Subject>(&self, subject: &T, run: usize) -> CaseResult {
         let started = Instant::now();
-        let script = self.script.as_ref().map(|_| {
-            let responses = self.scripted_responses();
-            (responses.len(), Arc::new(ScriptedProvider::new(responses)))
-        });
-        let provider: Arc<dyn Provider> = match (&script, factory.live_provider(self)) {
-            (Some((_, scripted)), _) => scripted.clone(),
-            (None, Some(live)) => live,
-            (None, None) => {
-                return CaseResult::errored(
-                    self,
-                    "scenario has no `script` and the factory supplied no live provider".into(),
-                    started.elapsed(),
-                )
-            }
-        };
-        let agent = match factory.build(self, provider) {
-            Ok(agent) => agent,
-            Err(err) => {
-                return CaseResult::errored(
-                    self,
-                    format!("agent factory failed: {err}"),
-                    started.elapsed(),
-                )
-            }
-        };
-        let session = format!("eval-{}-{run}", self.name);
-        let outcome = match agent.run(&session, &self.input).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return CaseResult::errored(self, format!("run failed: {err}"), started.elapsed())
-            }
+        let trajectory = match subject.run(self, run).await {
+            Ok(trajectory) => trajectory,
+            Err(err) => return CaseResult::errored(self, err.to_string(), started.elapsed()),
         };
         let elapsed = started.elapsed();
 
-        let mut failures = Vec::new();
-        if let Some((len, scripted)) = &script {
-            let calls = scripted.requests().len();
-            if calls > *len {
-                failures.push(format!(
-                    "script ran out: the model was called {calls} times but the script has {len} replies"
-                ));
-            } else if scripted.remaining() > 0 {
-                failures.push(format!(
-                    "script not fully consumed: {} of {len} replies unused",
-                    scripted.remaining()
-                ));
-            }
-        }
-        failures.extend(check_expectations(&self.expect, &outcome));
+        let mut failures = trajectory.run_failures.clone();
+        failures.extend(check_trajectory(&self.expect, &trajectory));
 
         CaseResult {
             scenario: self.name.clone(),
             passed: failures.is_empty(),
             failures,
-            status: status_name(&outcome.status).to_string(),
-            final_text: outcome.final_text.clone(),
-            tools: outcome.receipts().iter().map(|r| r.tool.clone()).collect(),
-            turns: outcome.turns(),
-            billable_tokens: outcome.usage().billable_tokens(),
+            status: trajectory.status,
+            final_text: trajectory.final_text,
+            tools: trajectory.receipts.into_iter().map(|r| r.tool).collect(),
+            turns: trajectory.turns,
+            billable_tokens: trajectory.billable_tokens,
             duration_ms: elapsed.as_secs_f64() * 1000.0,
         }
     }
 }
 
-fn status_str(status: ReceiptStatus) -> String {
-    serde_json::to_value(status)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{status:?}"))
+fn status_str(status: Option<ReceiptStatus>) -> String {
+    match status {
+        Some(status) => serde_json::to_value(status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{status:?}")),
+        None => "unreported".to_string(),
+    }
 }
 
-fn is_failure(status: ReceiptStatus) -> bool {
-    !matches!(status, ReceiptStatus::Succeeded | ReceiptStatus::Denied)
+fn is_failure(status: Option<ReceiptStatus>) -> bool {
+    status.is_some_and(|s| !matches!(s, ReceiptStatus::Succeeded | ReceiptStatus::Denied))
 }
 
-/// Check every expectation against an outcome. Returns all failures (empty
-/// means pass). Public so callers can assert on outcomes they produced
+/// Check every expectation against a kernel outcome. Returns all failures
+/// (empty means pass). Public so callers can assert on outcomes they produced
 /// themselves, for example after a resume.
 pub fn check_expectations(expect: &Expect, outcome: &RunOutcome) -> Vec<String> {
+    check_trajectory(expect, &Trajectory::from_outcome(outcome))
+}
+
+/// Check every expectation against a trajectory. Returns all failures (empty
+/// means pass).
+pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<String> {
     let mut failures = Vec::new();
-    let receipts = outcome.receipts();
+    let receipts = &trajectory.receipts;
     let tools: Vec<&str> = receipts.iter().map(|r| r.tool.as_str()).collect();
-    let actual_status = status_name(&outcome.status);
+    let actual_status = trajectory.status.as_str();
 
     if let Some(expected) = expect.status {
         if expected.as_str() != actual_status {
             failures.push(format!(
-                "status: expected `{}`, got `{actual_status}` ({:?})",
+                "status: expected `{}`, got `{actual_status}` ({})",
                 expected.as_str(),
-                outcome.status
+                trajectory.status_detail
             ));
         }
     }
 
     if let Some(expected) = expect.succeeded {
-        if outcome.is_succeeded() != expected {
+        if trajectory.succeeded != expected {
             failures.push(format!(
                 "succeeded: expected `{expected}`, got `{}` (status {actual_status}, unmet: {:?})",
-                outcome.is_succeeded(),
-                outcome.unmet()
+                trajectory.succeeded, trajectory.unmet
             ));
         }
     }
 
-    let text = outcome.final_text.as_deref().unwrap_or_default();
+    let text = trajectory.final_text.as_deref().unwrap_or_default();
     let lower = text.to_lowercase();
     let shown = || {
-        if outcome.final_text.is_none() {
+        if trajectory.final_text.is_none() {
             "no final text".to_string()
         } else {
             format!("final text: {}", truncate(text, 200))
@@ -293,7 +400,7 @@ pub fn check_expectations(expect: &Expect, outcome: &RunOutcome) -> Vec<String> 
             .filter(|r| &r.tool == tool)
             .map(|r| status_str(r.status))
             .collect();
-        let wanted: Vec<String> = expected.iter().map(|s| status_str(*s)).collect();
+        let wanted: Vec<String> = expected.iter().map(|s| status_str(Some(*s))).collect();
         if actual != wanted {
             failures.push(format!(
                 "receipt_statuses: `{tool}` expected [{}], got [{}]",
@@ -304,15 +411,15 @@ pub fn check_expectations(expect: &Expect, outcome: &RunOutcome) -> Vec<String> 
     }
 
     if let Some(max) = expect.max_turns {
-        if outcome.turns() > max {
+        if trajectory.turns > max {
             failures.push(format!(
                 "max_turns: used {} turns, limit {max}",
-                outcome.turns()
+                trajectory.turns
             ));
         }
     }
     if let Some(max) = expect.max_billable_tokens {
-        let used = outcome.usage().billable_tokens();
+        let used = trajectory.billable_tokens;
         if used > max {
             failures.push(format!(
                 "max_billable_tokens: used {used} billable tokens, limit {max}"

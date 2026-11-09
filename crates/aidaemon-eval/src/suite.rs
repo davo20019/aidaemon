@@ -5,7 +5,7 @@ use std::path::Path;
 use futures::stream::{self, StreamExt};
 
 use crate::report::Report;
-use crate::runner::{AgentFactory, CaseResult};
+use crate::runner::{AgentFactory, AgentSubject, CaseResult, Subject};
 use crate::scenario::{load_dir, EvalError, Scenario};
 
 /// A set of scenarios run N times each.
@@ -48,20 +48,27 @@ impl Suite {
         factory: &dyn AgentFactory,
         n_runs: usize,
     ) -> Vec<Vec<CaseResult>> {
+        self.run_subject_cases(&AgentSubject::new(factory), n_runs)
+            .await
+    }
+
+    /// [`Suite::run_cases`] for any [`Subject`].
+    pub async fn run_subject_cases<T: Subject>(
+        &self,
+        subject: &T,
+        n_runs: usize,
+    ) -> Vec<Vec<CaseResult>> {
         let n_runs = n_runs.max(1);
         let jobs = self
             .scenarios
             .iter()
             .enumerate()
             .flat_map(|(i, s)| (0..n_runs).map(move |run| (i, run, s)));
-        let mut done: Vec<(usize, usize, CaseResult)> =
-            stream::iter(jobs)
-                .map(|(i, run, scenario)| async move {
-                    (i, run, scenario.run_numbered(factory, run).await)
-                })
-                .buffer_unordered(self.parallelism)
-                .collect()
-                .await;
+        let mut done: Vec<(usize, usize, CaseResult)> = stream::iter(jobs)
+            .map(|(i, run, scenario)| async move { (i, run, scenario.run_on(subject, run).await) })
+            .buffer_unordered(self.parallelism)
+            .collect()
+            .await;
         done.sort_by_key(|(i, run, _)| (*i, *run));
         let mut grouped: Vec<Vec<CaseResult>> = vec![Vec::new(); self.scenarios.len()];
         for (i, _, result) in done {
@@ -72,7 +79,12 @@ impl Suite {
 
     /// Run every scenario `n_runs` times and aggregate into a [`Report`].
     pub async fn run(&self, factory: &dyn AgentFactory, n_runs: usize) -> Report {
-        let grouped = self.run_cases(factory, n_runs).await;
+        self.run_subject(&AgentSubject::new(factory), n_runs).await
+    }
+
+    /// [`Suite::run`] for any [`Subject`].
+    pub async fn run_subject<T: Subject>(&self, subject: &T, n_runs: usize) -> Report {
+        let grouped = self.run_subject_cases(subject, n_runs).await;
         Report::from_results(&grouped)
     }
 }
