@@ -184,18 +184,48 @@ pub(crate) async fn memory_parts(plugin: &dyn MemoryPlugin, turn: &MemoryTurn) -
     }
 }
 
+/// The memory system this daemon runs with.
+pub(crate) struct ConfiguredMemory {
+    /// What serves turns; `None` for the daemon's own memory.
+    pub plugin: Option<Arc<dyn MemoryPlugin>>,
+    /// Background work of a replacing system.
+    pub services: Vec<Arc<dyn aidaemon_core::Service>>,
+}
+
+impl ConfiguredMemory {
+    fn daemons_own() -> Self {
+        Self {
+            plugin: None,
+            services: Vec::new(),
+        }
+    }
+
+    #[cfg_attr(not(any(test, feature = "sdk-memory")), allow(dead_code))]
+    pub(crate) fn replaced_by(system: Arc<dyn aidaemon_policies::MemorySystem>) -> Self {
+        Self {
+            services: system.services(),
+            plugin: Some(Arc::new(SystemMemory::new(system))),
+        }
+    }
+
+    /// Whether the daemon's own background memory jobs should run.
+    pub fn own_memory(&self) -> bool {
+        self.plugin.is_none()
+    }
+}
+
 /// The memory plugin `[memory]` selects, or `None` for the daemon's own.
 ///
 /// A backend that cannot start is logged and the daemon's own memory is
 /// used, so a broken memory store never keeps the daemon down.
-pub(crate) async fn configured_plugin(
+pub(crate) async fn configured_memory(
     config: &crate::config::MemoryConfig,
     llm_runtime: &crate::llm_runtime::SharedLlmRuntime,
     state: Arc<dyn StateStore>,
     event_store: Arc<crate::events::EventStore>,
-) -> Option<Arc<dyn MemoryPlugin>> {
+) -> ConfiguredMemory {
     match config.backend {
-        crate::config::MemoryBackend::Daemon => None,
+        crate::config::MemoryBackend::Daemon => ConfiguredMemory::daemons_own(),
         #[cfg(feature = "sdk-memory")]
         crate::config::MemoryBackend::Sdk => {
             let store = match aidaemon_memory::SqliteMemoryStore::open(&config.path).await {
@@ -207,7 +237,7 @@ pub(crate) async fn configured_plugin(
                         "[memory] backend = \"sdk\" could not open its store; \
                          using the daemon's memory"
                     );
-                    return None;
+                    return ConfiguredMemory::daemons_own();
                 }
             };
             let fast_model = llm_runtime
@@ -231,9 +261,7 @@ pub(crate) async fn configured_plugin(
             )
             .extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
-            Some(Arc::new(SystemMemory::new(Arc::new(
-                aidaemon_memory::ScopedMemory::new(builder),
-            ))))
+            ConfiguredMemory::replaced_by(Arc::new(aidaemon_memory::ScopedMemory::new(builder)))
         }
         #[cfg(not(feature = "sdk-memory"))]
         crate::config::MemoryBackend::Sdk => {
@@ -242,7 +270,7 @@ pub(crate) async fn configured_plugin(
                 "[memory] backend = \"sdk\" needs a build with the sdk-memory feature; \
                  using the daemon's memory"
             );
-            None
+            ConfiguredMemory::daemons_own()
         }
     }
 }

@@ -444,9 +444,20 @@ Order:
              `memory/{manager,retention,history_source}.rs` and
              `events/consolidation.rs`. `StateStore` also inherits every
              memory trait. The crate's own SQL reads the host's `events`
-             table in three places. Next: callers hold the memory stores
-             directly, then the tools and background jobs go through the
-             seam, then an export/import so switching backends keeps data.
+             table in three places.
+           - Design: one `MemorySystem` is the unit that gets replaced. It
+             contributes hooks and tools per turn and background `services()`.
+             Conversation history (`search_history`, `events`) stays the
+             host's. Done: `services()`; a replacing system's jobs run in
+             place of the daemon's, and old events still reach retention
+             without being learned from (`Pruner::retire_old_events`).
+             Next, in order: the daemon's own memory becomes a `MemorySystem`
+             that owns `remember_fact`, `share_memory`, `manage_people`, the
+             memory actions of `manage_memories` (split from its goal
+             actions), `recall.rs` and post-task learning; `StateStore` drops
+             the memory traits and the forwards; a test backend proves a turn
+             leaves the SQLite tables untouched; export/import so switching
+             backends keeps data.
         5. Live N-of-M against the current daemon, then delete what is left
            of the old daemon modules.
         Not memory, noted on the way: `memory/context_window.rs` now holds

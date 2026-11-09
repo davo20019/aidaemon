@@ -59,12 +59,30 @@ impl MemoryManager {
         self
     }
 
-    /// Register all memory background jobs with the heartbeat coordinator.
-    /// Methods are public so the heartbeat can call them individually.
+    /// Register the daemon's background jobs. `own_memory` is false when
+    /// another memory system replaced the daemon's: it brings its own jobs,
+    /// and only the goal review, which is not memory, stays.
     pub fn register_heartbeat_jobs(
         self: &Arc<Self>,
         heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
+        own_memory: bool,
     ) {
+        // Goal review (weekly)
+        let mgr = self.clone();
+        heartbeat.register_job(
+            "goal_review",
+            Duration::from_secs(7 * 24 * 3600),
+            move || {
+                let m = mgr.clone();
+                async move { m.review_goals().await }
+            },
+        );
+
+        if !own_memory {
+            info!("Memory background tasks left to the configured memory system");
+            return;
+        }
+
         // Embedding generation (every 5s)
         let mgr = self.clone();
         heartbeat.register_job("embeddings", Duration::from_secs(5), move || {
@@ -89,17 +107,6 @@ impl MemoryManager {
             let m = mgr.clone();
             async move { m.decay_memories().await }
         });
-
-        // Goal review (weekly)
-        let mgr = self.clone();
-        heartbeat.register_job(
-            "goal_review",
-            Duration::from_secs(7 * 24 * 3600),
-            move || {
-                let m = mgr.clone();
-                async move { m.review_goals().await }
-            },
-        );
 
         // Episode creation (every 30 minutes) — idle sessions + long-running active sessions
         let mgr = self.clone();
@@ -1139,6 +1146,47 @@ mod tests {
         )
         .with_state(store.clone());
         (store, provider, manager, db_file)
+    }
+
+    #[tokio::test]
+    async fn a_replacing_memory_system_brings_its_jobs_and_goal_review_stays() {
+        let (store, _provider, manager, _db) = setup_memory_manager_with_responses(vec![]).await;
+        let manager = Arc::new(manager);
+        let coordinator = || {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            crate::heartbeat::HeartbeatCoordinator::new(
+                store.clone() as Arc<dyn StateStore>,
+                60,
+                3,
+                rx,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let mut own = coordinator();
+        manager.register_heartbeat_jobs(&mut own, true);
+        let own = own.scheduled_names();
+        for job in ["goal_review", "consolidation", "episodes", "memory_decay"] {
+            assert!(own.iter().any(|name| name == job), "{job} in {own:?}");
+        }
+
+        let replacement = aidaemon_memory::ScopedMemory::new(aidaemon_memory::Memory::builder(
+            Arc::new(aidaemon_memory::InMemoryMemoryStore::new()),
+            Arc::new(aidaemon_memory::HashEmbedder::default()),
+        ));
+        let memory =
+            crate::agent::memory_plugin::ConfiguredMemory::replaced_by(Arc::new(replacement));
+        assert!(!memory.own_memory());
+        let mut replaced = coordinator();
+        manager.register_heartbeat_jobs(&mut replaced, memory.own_memory());
+        for service in memory.services {
+            replaced.add_service(service);
+        }
+        let mut replaced = replaced.scheduled_names();
+        replaced.sort();
+        assert_eq!(replaced, ["goal_review", "memory_decay"]);
     }
 
     async fn insert_owner_session_events(

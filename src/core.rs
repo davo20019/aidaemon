@@ -228,15 +228,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // Owner-approval cards from the kernel go out on the same channel the
     // tools' cards use.
     agent.owner_approvals().set_broker(approval_tx.clone());
-    if let Some(memory) = crate::agent::memory_plugin::configured_plugin(
+    let memory = crate::agent::memory_plugin::configured_memory(
         &config.memory,
         &llm_runtime,
         state.clone(),
         event_store.clone(),
     )
-    .await
-    {
-        agent.set_memory_plugin(memory);
+    .await;
+    let own_memory = memory.own_memory();
+    let memory_services = memory.services;
+    if let Some(plugin) = memory.plugin {
+        agent.set_memory_plugin(plugin);
     }
     let agent = Arc::new(agent);
 
@@ -279,6 +281,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             event_store: event_store.clone(),
             pruner: pruner.clone(),
             memory_manager: memory_manager.clone(),
+            own_memory,
+            memory_services,
             wake_rx,
             inbox_dir: inbox_dir.clone(),
             skills_dir: skills_dir.clone(),

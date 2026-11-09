@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use aidaemon_core::{FnService, Schedule, Service, ServiceError};
 use aidaemon_policies::{MemoryInjection, MemoryParts, MemorySystem, MemoryTurn};
 use async_trait::async_trait;
 
@@ -35,6 +36,9 @@ pub struct ScopedMemory {
     /// Each session's scope, set when its turn starts.
     scopes: Arc<RwLock<SessionScopes>>,
 }
+
+/// How often recall decay and retention run.
+const DECAY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// Sessions whose scope is kept. Run-end extraction resolves the scope after
 /// the turn, so an entry must outlive its turn; the least recently started
@@ -131,6 +135,24 @@ impl MemorySystem for ScopedMemory {
             }
         }
         parts
+    }
+
+    fn services(&self) -> Vec<Arc<dyn Service>> {
+        let memory = self.memory.clone();
+        vec![Arc::new(FnService::new(
+            "memory_decay",
+            Schedule::Every(DECAY_INTERVAL),
+            move || {
+                let memory = memory.clone();
+                async move {
+                    memory
+                        .decay(chrono::Utc::now())
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| ServiceError::new(error.to_string()))
+                }
+            },
+        ))]
     }
 }
 

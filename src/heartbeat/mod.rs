@@ -452,6 +452,7 @@ pub struct HeartbeatJob {
 /// [`ServiceHost`].
 pub struct HeartbeatCoordinator {
     jobs: Vec<HeartbeatJob>,
+    services: Vec<Arc<dyn Service>>,
     state: Arc<dyn StateStore>,
     max_concurrent: usize,
     tick_interval: Duration,
@@ -597,6 +598,7 @@ impl HeartbeatCoordinator {
     ) -> Self {
         Self {
             jobs: Vec::new(),
+            services: Vec::new(),
             state,
             max_concurrent,
             tick_interval: Duration::from_secs(tick_interval_secs),
@@ -643,6 +645,24 @@ impl HeartbeatCoordinator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn scheduled_names(&self) -> Vec<String> {
+        self.jobs
+            .iter()
+            .map(|job| job.name.clone())
+            .chain(self.services.iter().map(|s| s.name().to_string()))
+            .collect()
+    }
+
+    /// Run `service` alongside the jobs, under the same gate and telemetry.
+    pub fn add_service(&mut self, service: Arc<dyn Service>) {
+        if let (Some(telemetry), Schedule::Every(interval)) = (&self.telemetry, service.schedule())
+        {
+            telemetry.register_job(service.name(), interval);
+        }
+        self.services.push(service);
+    }
+
     /// The host that runs this coordinator's jobs and goal cycle.
     pub(crate) fn into_host(mut self) -> ServiceHost {
         let mut host = ServiceHost::new(self.tick_interval)
@@ -665,6 +685,9 @@ impl HeartbeatCoordinator {
                 async move { run.await.map_err(|e| ServiceError::new(e.to_string())) }
             });
             host = host.service(Arc::new(service));
+        }
+        for service in std::mem::take(&mut self.services) {
+            host = host.service(service);
         }
         // A user message wakes the cycle at once.
         if let Some(mut wake_rx) = self.wake_rx.take() {

@@ -107,6 +107,31 @@ impl Consolidator {
         self
     }
 
+    /// Mark a session's events as handled without learning from them, which
+    /// also makes them eligible for retention.
+    pub async fn retire_session(&self, session_id: &str) -> anyhow::Result<ConsolidationResult> {
+        let event_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM events
+             WHERE session_id = ? AND consolidated_at IS NULL",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if event_ids.is_empty() {
+            return Ok(ConsolidationResult::empty());
+        }
+        self.event_store.mark_consolidated(&event_ids).await?;
+        info!(
+            session_id,
+            events = event_ids.len(),
+            "Marked events consolidated without learning"
+        );
+        Ok(ConsolidationResult {
+            events_processed: event_ids.len(),
+            events_consolidated: event_ids.len(),
+            ..Default::default()
+        })
+    }
     /// Consolidate events for a session into long-term memory
     pub async fn consolidate_session(
         &self,
@@ -119,27 +144,7 @@ impl Consolidator {
         let memory_isolated = super::is_memory_isolated_worker_session(session_id)
             || super::session_has_mandate_execution_provenance(&self.pool, session_id).await?;
         if memory_isolated {
-            let event_ids: Vec<i64> = sqlx::query_scalar(
-                "SELECT id FROM events
-                 WHERE session_id = ? AND consolidated_at IS NULL",
-            )
-            .bind(session_id)
-            .fetch_all(&self.pool)
-            .await?;
-            if event_ids.is_empty() {
-                return Ok(ConsolidationResult::empty());
-            }
-            self.event_store.mark_consolidated(&event_ids).await?;
-            info!(
-                session_id,
-                events = event_ids.len(),
-                "Marked memory-isolated worker events consolidated without learning"
-            );
-            return Ok(ConsolidationResult {
-                events_processed: event_ids.len(),
-                events_consolidated: event_ids.len(),
-                ..Default::default()
-            });
+            return self.retire_session(session_id).await;
         }
 
         // Get unconsolidated events, then remove every task whose durable
@@ -733,6 +738,16 @@ impl Pruner {
     /// Consolidate old events. Deletion is exclusively owned by
     /// `RetentionManager`, including the `messages_days = 0` permanent mode.
     pub async fn prune(&self) -> anyhow::Result<PruneStats> {
+        self.pass(true).await
+    }
+
+    /// Hand old events to retention without learning from them, for when
+    /// another memory system does the learning.
+    pub async fn retire_old_events(&self) -> anyhow::Result<PruneStats> {
+        self.pass(false).await
+    }
+
+    async fn pass(&self, learn: bool) -> anyhow::Result<PruneStats> {
         let cutoff = Utc::now() - Duration::days(self.retention_days as i64);
 
         // First, consolidate any old unconsolidated events
@@ -743,7 +758,12 @@ impl Pruner {
 
         let mut consolidation_errors = 0;
         for session_id in old_sessions {
-            if let Err(e) = self.consolidator.consolidate_session(&session_id).await {
+            let handled = if learn {
+                self.consolidator.consolidate_session(&session_id).await
+            } else {
+                self.consolidator.retire_session(&session_id).await
+            };
+            if let Err(e) = handled {
                 warn!(
                     "Failed to consolidate before prune for {}: {}",
                     session_id, e
@@ -1362,6 +1382,61 @@ mod tests {
             event.created_at = base + Duration::seconds(offset as i64);
             event_store.append(event).await.expect("append old event");
         }
+    }
+
+    /// With another memory system learning, old events must still reach
+    /// retention, which only deletes what consolidation has marked.
+    #[tokio::test]
+    async fn retiring_old_events_marks_them_without_learning() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("db path");
+        let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+        let state = Arc::new(
+            SqliteStateStore::new(db_path, 100, None, embedding_service)
+                .await
+                .expect("state store"),
+        );
+        let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
+        let plan_store = Arc::new(PlanStore::new(state.pool()).await.expect("plan store"));
+        let provider = Arc::new(MockProvider::with_responses(vec![]));
+        let runtime = SharedLlmRuntime::new(
+            provider.clone(),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let consolidator = Arc::new(
+            Consolidator::new(
+                event_store.clone(),
+                plan_store,
+                state.pool(),
+                Some(runtime),
+                None,
+            )
+            .with_state(state.clone() as Arc<dyn StateStore>),
+        );
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('ordinary-owner-session', 'user_message', '{\"content\":\"hello\"}',
+                     '2025-01-01T00:00:00+00:00')",
+        )
+        .execute(&state.pool())
+        .await
+        .expect("old event");
+
+        let stats = Pruner::new(event_store, consolidator, 7)
+            .retire_old_events()
+            .await
+            .expect("retire pass");
+
+        assert_eq!(stats.consolidation_errors, 0);
+        assert_eq!(provider.call_count().await, 0, "nothing is learned");
+        let unmarked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE consolidated_at IS NULL")
+                .fetch_one(&state.pool())
+                .await
+                .expect("count");
+        assert_eq!(unmarked, 0);
     }
 
     #[tokio::test]

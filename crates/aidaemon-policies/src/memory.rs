@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Tool};
+use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Service, Tool};
 use async_trait::async_trait;
 
 use crate::{insert_after_system, last_user_message_index};
@@ -23,6 +23,12 @@ use crate::{insert_after_system, last_user_message_index};
 pub trait MemorySystem: Send + Sync {
     /// The hooks and tools this memory system adds to `turn`.
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
+
+    /// The background work this memory system needs (consolidation, expiry,
+    /// indexing). The host runs these in place of its own memory jobs.
+    fn services(&self) -> Vec<Arc<dyn Service>> {
+        Vec::new()
+    }
 }
 
 /// What a [`MemorySystem`] may do on one turn, as the host decided it.

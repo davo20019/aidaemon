@@ -52,6 +52,8 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) event_store: Arc<crate::events::EventStore>,
     pub(crate) pruner: Arc<crate::events::Pruner>,
     pub(crate) memory_manager: Arc<crate::memory::manager::MemoryManager>,
+    pub(crate) own_memory: bool,
+    pub(crate) memory_services: Vec<Arc<dyn aidaemon_core::Service>>,
     pub(crate) wake_rx: tokio::sync::mpsc::Receiver<()>,
     pub(crate) inbox_dir: String,
     pub(crate) skills_dir: Option<std::path::PathBuf>,
@@ -72,6 +74,8 @@ pub(crate) async fn init_heartbeat_coordinator(
         event_store,
         pruner,
         memory_manager,
+        own_memory,
+        memory_services,
         wake_rx,
         inbox_dir,
         skills_dir,
@@ -99,7 +103,10 @@ pub(crate) async fn init_heartbeat_coordinator(
         heartbeat.set_task_inactivity_timeout(config.daemon.watchdog.task_inactivity_timeout_secs);
 
         // Register memory manager jobs
-        memory_manager.register_heartbeat_jobs(&mut heartbeat);
+        memory_manager.register_heartbeat_jobs(&mut heartbeat, own_memory);
+        for service in memory_services {
+            heartbeat.add_service(service);
+        }
 
         if config.nodes.monitoring.enabled {
             let monitoring = crate::nodes::monitoring::NodeMonitoringService::new(
@@ -176,7 +183,12 @@ pub(crate) async fn init_heartbeat_coordinator(
             let p = pruner_hb.clone();
             async move {
                 info!("Running event pruning");
-                match p.prune().await {
+                let pass = if own_memory {
+                    p.prune().await
+                } else {
+                    p.retire_old_events().await
+                };
+                match pass {
                     Ok(stats) => {
                         info!(
                             deleted = stats.deleted,
