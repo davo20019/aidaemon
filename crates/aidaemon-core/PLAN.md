@@ -333,7 +333,8 @@ Order:
         home), given to `EventStore` at construction.
         `active_execution_backend()` is `#[cfg(test)]`: the default local
         backend for tests that construct a tool directly;
-      - the goals/mandates store slice and the concrete `EventStore` (8.8).
+      - Done 2026-11-09: the goals/mandates store slice and the concrete
+        `EventStore` are in `aidaemon-work` and `aidaemon-events` (8.8).
 - [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
       daemon tool can wrap today's thin crate tools without behavior
       changes. The crate tools implement only the kernel `Tool` and do I/O
@@ -592,41 +593,60 @@ Order:
         Separate fixes, done: `restart` and `enable` ask the owner before
         respawning a stored command; `is_non_delegable_tool` no longer
         relies on an `mcp__` prefix no real name has.
-      - Store map (2026-11-09). The parts with a second consumer are already
-        in crates: the run journal and snapshots (`aidaemon-store-sqlite`,
-        which the daemon opens over its own pool), session erasure
-        (`erase_session_in_tx`) and memory (`aidaemon_memory::sqlite`). Nothing
-        else moves now:
-        - goals, mandates, tasks and work coordination (`goals.rs`,
-          `mandates.rs`, `work.rs`, `notifications.rs`, about 14,200 lines):
-          no crate has these concepts or implements these traits, so a move
-          would only relocate daemon code;
-        - the concrete `EventStore` (6,700 lines): every writer and its
-          payloads are the daemon's. `aidaemon-memory` does read the `events`
-          table, by raw SQL that tolerates its absence, so the shared part is
-          a table contract and not code to move;
-        - `settings` and OAuth: the traits are in `aidaemon-tools`, every
-          user is the daemon;
-        - `conversation_summaries` is the only candidate: the SDK's
-          `SummaryStore` has consumers (`Compactor`, `ConversationCompaction`)
-          and only an in-memory implementation. It does not fit the table:
-          the SDK's `Transcript` source compares
-          `ConversationSummary::fingerprint`, which the table has no column
-          for, so a store over it would discard every SDK summary on load.
-          Adding the column is a schema change on every existing database,
-          and a new versioned migration makes older builds refuse the file
-          (`SchemaTooNew`). Do it when an SDK user needs durable summaries,
-          as a table of its own.
-        All of this keeps table names, columns and rows as they are, so
-        existing databases upgrade with no conversion.
-      - Store move, map (2026-11-09). The owner decided to move the goals and
-        mandates slice and the concrete `EventStore` into crates even without
-        a second consumer; the notes above record the case against. Layout:
-        `aidaemon-events` (event store, payloads, run aggregate and the
-        contract types they use) below `aidaemon-work` (goals, mandates,
-        tasks, work, notifications), because the payloads carry only a
-        mandate grant while the work stores and their tests need the receipt
-        types and `EventStore`. Neither crate depends on the root crate.
+      - Store move, done (2026-11-09). The owner decided to move the goals and
+        mandates slice and the concrete `EventStore` into crates; the case
+        against it was that no second consumer exists yet. Layout, and neither
+        crate depends on the root crate:
+        - `aidaemon-events`: `EventStore`, payloads, the run aggregate,
+          `conversation_turn`, `terminal_state`, `context`,
+          `model_call_telemetry`, the `events` table DDL (`schema`), and the
+          contract types they use (`Message`, the dialogue `Request*` types,
+          `MandateAuthorityGrant`, `ProviderErrorKind`, `TokenUsage` and its
+          store trait, session-id parsing, `execution_graph`).
+        - `aidaemon-work`, above it: goals, mandates, tasks, work coordination
+          and notifications: domain types, store traits, `sqlite::*`, the
+          authority and admissibility rules the store enforces, and `schema`.
+        - `LexicalPaths` moved to `aidaemon-tools`, next to `BackendPath`.
+        `crate::traits`, `crate::events`, `crate::state`, `crate::mandates` and
+        `crate::session` keep their names as re-exports.
+        Seams, so nothing reaches back at the daemon:
+        - `aidaemon_work::sqlite::WorkDatabase` (pool and `redact_secrets`).
+          The store traits are implemented for anything that is one, so
+          `SqliteStateStore` keeps implementing them with no forwarding.
+          `SqliteWorkStore` is the ready-made one.
+        - `aidaemon_events::EventHost`, given to `EventStore::on_paths`:
+          exact-history projection, memory-span projection, error grouping.
+          `DaemonEventHost` in `src/events/mod.rs` is the daemon's.
+        - `is_one_shot_schedule` is a parameter of `migrate_work_tables`.
+        Test-only behaviour that crossed a crate boundary is the `testing`
+        feature (root dev-dependencies only): the `mandate_mutation_spy` name
+        and `RunAggregate::new`. The daemon's tests get `EventStore::new` from
+        `EventStoreForTests`, so they keep the daemon's seams.
+        Migrations: `migrate_state` stays the orchestrator and still runs on
+        every start, because a database gives no way to tell which steps it
+        has seen. It calls `migrate_events`, then the daemon's own tables,
+        `migrate_work_tables`, the daemon's token/summary/snapshot tables,
+        `migrate_work_tail`, then history search: the same statements in the
+        same order, and nothing changes table names, columns, rows or
+        `state_schema_versions`. `src/state/sqlite/schema_golden/` pins a new
+        database, a current one and an old goal database; the files were
+        written from the code before the move.
+        What stayed in the daemon, and why:
+        - `src/events/consolidation.rs`, the host adapter into memory;
+        - `state/sqlite/history_search.rs` and `project_event_span`'s call:
+          the projection tables are the daemon's and memory's, reached through
+          `EventHost`;
+        - `extract_error_pattern`, `redact_secrets`, `cron_utils`: the daemon's
+          own wrappers, patterns and grammar, passed in;
+        - the facade traits in `src/traits/state_store.rs`, and every store
+          outside this slice (messages, dialogue, skills, OAuth, settings);
+        - three tests that exercise the daemon's seams
+          (`src/events/run_aggregate_checklist_tests.rs`,
+          `src/events/store_host_tests.rs`).
+        `conversation_summaries` is unchanged: the SDK's `SummaryStore` compares
+        `ConversationSummary::fingerprint`, which the table has no column for,
+        and adding one is a schema change. Do it when an SDK user needs durable
+        summaries, as a table of its own.
       - Channels map (2026-11-07). Update: the daemon's Telegram, Slack and
         Discord bots now run on the SDK channel adapters, and on the daemon's
         own turn runner (`src/channels/turns.rs`, `57788a2`, `fda3475`,
