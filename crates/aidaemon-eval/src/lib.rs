@@ -37,6 +37,8 @@
 //!   tool_call_counts: { get_weather: 1 }
 //!   receipt_statuses: { get_weather: [succeeded] }
 //!   no_failed_receipts: true
+//!   proposed:                            # same assertions, on model proposals
+//!     tool_call_counts: { get_weather: 1 }
 //! ```
 //!
 //! Unknown fields are rejected everywhere, so a typo fails loudly instead
@@ -92,6 +94,6 @@ pub use runner::{
 };
 pub use scenario::{
     status_name, EvalError, Expect, ExpectedStatus, Scenario, ScenarioLimits, ScriptedArguments,
-    ScriptedCall, ScriptedReply, ScriptedUsage,
+    ScriptedCall, ScriptedReply, ScriptedUsage, ToolLaneExpect,
 };
 pub use suite::Suite;

@@ -209,7 +209,8 @@ pub fn status_name(status: &RunStatus) -> &'static str {
 ///
 /// "Used" means the model proposed the call and the loop recorded a receipt
 /// for it, whatever its status (a denied call is still used). Use
-/// `receipt_statuses` to assert what actually happened.
+/// `receipt_statuses` to assert what actually happened, and [`Expect::proposed`]
+/// for what the model asked for regardless of any receipt.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expect {
@@ -242,6 +243,10 @@ pub struct Expect {
     /// `{delete_file: [denied]}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub receipt_statuses: BTreeMap<String, Vec<ReceiptStatus>>,
+    /// The same assertions on what the model *proposed*, whether or not the
+    /// call ever got a receipt.
+    #[serde(default, skip_serializing_if = "ToolLaneExpect::is_empty")]
+    pub proposed: ToolLaneExpect,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +255,31 @@ pub struct Expect {
     /// invalid-arguments or indeterminate. Policy denials are allowed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_failed_receipts: bool,
+}
+
+/// Tool assertions on one lane of the trajectory. See [`Expect::proposed`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLaneExpect {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_used: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_not_used: Vec<String>,
+    /// Tools that must appear in this relative order (subsequence match).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_in_order: Vec<String>,
+    /// Exact count per tool. Tools not listed are unconstrained.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_call_counts: BTreeMap<String, u32>,
+}
+
+impl ToolLaneExpect {
+    pub fn is_empty(&self) -> bool {
+        self.tools_used.is_empty()
+            && self.tools_not_used.is_empty()
+            && self.tools_in_order.is_empty()
+            && self.tool_call_counts.is_empty()
+    }
 }
 
 fn empty_object() -> Value {

@@ -660,6 +660,7 @@ fn canned_trajectory() -> Trajectory {
         succeeded: true,
         unmet: Vec::new(),
         final_text: Some("Report for Acme Corp".into()),
+        proposed: vec!["read_file".into(), "write_file".into()],
         receipts: vec![CallRecord {
             tool: "read_file".into(),
             status: None,
@@ -713,4 +714,63 @@ async fn run_failures_fail_the_case_and_subject_errors_are_reported() {
     let result = s.run_on(&Broken, 0).await;
     assert_eq!(result.status, "error");
     assert_eq!(result.failures, vec!["no database"]);
+}
+
+#[tokio::test]
+async fn the_proposed_lane_is_read_apart_from_the_receipts() {
+    // `write_file` was proposed and never got a receipt.
+    let s = scenario(
+        r#"
+name: lanes
+input: hi
+expect:
+  tools_not_used: [write_file]
+  proposed:
+    tools_used: [write_file]
+    tools_in_order: [read_file, write_file]
+    tool_call_counts: { read_file: 1, write_file: 1 }
+"#,
+    );
+    let result = s.run_on(&Canned(canned_trajectory()), 0).await;
+    assert!(result.passed, "{:?}", result.failures);
+
+    let s = scenario(
+        r#"
+name: lanes_fail
+input: hi
+expect:
+  tools_used: [write_file]
+  proposed:
+    tools_used: [delete_file]
+    tools_not_used: [write_file]
+    tools_in_order: [write_file, read_file]
+    tool_call_counts: { read_file: 2 }
+"#,
+    );
+    let result = s.run_on(&Canned(canned_trajectory()), 0).await;
+    assert!(has_failure(&result, "tools_used"), "{:?}", result.failures);
+    for lane in [
+        "proposed.tools_used",
+        "proposed.tools_not_used",
+        "proposed.tools_in_order",
+        "proposed.tool_call_counts",
+    ] {
+        assert!(has_failure(&result, lane), "{lane}: {:?}", result.failures);
+    }
+}
+
+#[tokio::test]
+async fn kernel_runs_fill_the_proposed_lane() {
+    let result = run(r#"
+name: proposals
+input: Read it.
+script:
+  - tool_calls: [{ name: read_file, arguments: { path: a } }]
+  - text: Done.
+expect:
+  proposed:
+    tool_call_counts: { read_file: 1 }
+"#)
+    .await;
+    assert!(result.passed, "{:?}", result.failures);
 }

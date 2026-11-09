@@ -116,6 +116,9 @@ pub struct Trajectory<O = ()> {
     /// Requirements still open when the run stopped.
     pub unmet: Vec<String>,
     pub final_text: Option<String>,
+    /// Tool names the model proposed, in order. A subject whose loop suppresses
+    /// or replays calls can have more proposals than receipts.
+    pub proposed: Vec<String>,
     /// Every call that got a receipt, in receipt order.
     pub receipts: Vec<CallRecord>,
     pub turns: u32,
@@ -137,6 +140,13 @@ impl Trajectory {
             succeeded: outcome.is_succeeded(),
             unmet: outcome.unmet().to_vec(),
             final_text: outcome.final_text.clone(),
+            proposed: outcome
+                .state
+                .messages
+                .iter()
+                .flat_map(|message| &message.tool_calls)
+                .map(|call| call.name.clone())
+                .collect(),
             receipts: outcome
                 .receipts()
                 .iter()
@@ -351,48 +361,29 @@ pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<S
         }
     }
 
-    let called = || format!("[{}]", tools.join(", "));
-    for tool in &expect.tools_used {
-        if !tools.contains(&tool.as_str()) {
-            failures.push(format!(
-                "tools_used: `{tool}` was never called (calls: {})",
-                called()
-            ));
-        }
-    }
-    for tool in &expect.tools_not_used {
-        let count = tools.iter().filter(|t| **t == tool).count();
-        if count > 0 {
-            failures.push(format!(
-                "tools_not_used: `{tool}` was called {count} time(s)"
-            ));
-        }
-    }
-
-    if !expect.tools_in_order.is_empty() {
-        let mut want = expect.tools_in_order.iter().peekable();
-        for tool in &tools {
-            if want.peek().is_some_and(|w| w == tool) {
-                want.next();
-            }
-        }
-        if let Some(missing) = want.next() {
-            failures.push(format!(
-                "tools_in_order: expected subsequence [{}], stopped matching at `{missing}` (calls: {})",
-                expect.tools_in_order.join(", "),
-                called()
-            ));
-        }
-    }
-
-    for (tool, expected) in &expect.tool_call_counts {
-        let actual = tools.iter().filter(|t| **t == tool).count();
-        if actual != *expected as usize {
-            failures.push(format!(
-                "tool_call_counts: `{tool}` expected {expected} call(s), got {actual}"
-            ));
-        }
-    }
+    check_tool_lane(
+        &mut failures,
+        "",
+        ToolLaneView {
+            used: &expect.tools_used,
+            not_used: &expect.tools_not_used,
+            in_order: &expect.tools_in_order,
+            counts: &expect.tool_call_counts,
+        },
+        &tools,
+    );
+    let proposed: Vec<&str> = trajectory.proposed.iter().map(String::as_str).collect();
+    check_tool_lane(
+        &mut failures,
+        "proposed.",
+        ToolLaneView {
+            used: &expect.proposed.tools_used,
+            not_used: &expect.proposed.tools_not_used,
+            in_order: &expect.proposed.tools_in_order,
+            counts: &expect.proposed.tool_call_counts,
+        },
+        &proposed,
+    );
 
     for (tool, expected) in &expect.receipt_statuses {
         let actual: Vec<String> = receipts
@@ -446,6 +437,64 @@ pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<S
     }
 
     failures
+}
+
+struct ToolLaneView<'a> {
+    used: &'a [String],
+    not_used: &'a [String],
+    in_order: &'a [String],
+    counts: &'a BTreeMap<String, u32>,
+}
+
+/// Check one lane's tool assertions. `prefix` names the lane in failures.
+fn check_tool_lane(
+    failures: &mut Vec<String>,
+    prefix: &str,
+    expect: ToolLaneView<'_>,
+    tools: &[&str],
+) {
+    let called = || format!("[{}]", tools.join(", "));
+    for tool in expect.used {
+        if !tools.contains(&tool.as_str()) {
+            failures.push(format!(
+                "{prefix}tools_used: `{tool}` was never called (calls: {})",
+                called()
+            ));
+        }
+    }
+    for tool in expect.not_used {
+        let count = tools.iter().filter(|t| **t == tool).count();
+        if count > 0 {
+            failures.push(format!(
+                "{prefix}tools_not_used: `{tool}` was called {count} time(s)"
+            ));
+        }
+    }
+
+    if !expect.in_order.is_empty() {
+        let mut want = expect.in_order.iter().peekable();
+        for tool in tools {
+            if want.peek().is_some_and(|w| w == tool) {
+                want.next();
+            }
+        }
+        if let Some(missing) = want.next() {
+            failures.push(format!(
+                "{prefix}tools_in_order: expected subsequence [{}], stopped matching at `{missing}` (calls: {})",
+                expect.in_order.join(", "),
+                called()
+            ));
+        }
+    }
+
+    for (tool, expected) in expect.counts {
+        let actual = tools.iter().filter(|t| **t == tool).count();
+        if actual != *expected as usize {
+            failures.push(format!(
+                "{prefix}tool_call_counts: `{tool}` expected {expected} call(s), got {actual}"
+            ));
+        }
+    }
 }
 
 fn truncate(text: &str, max: usize) -> String {
