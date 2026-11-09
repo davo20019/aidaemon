@@ -122,14 +122,6 @@ impl OutcomeTool for WriteFile {
         let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
 
-        // Block sensitive paths
-        if self
-            .policy
-            .is_sensitive(std::path::Path::new(path.as_str()))
-        {
-            anyhow::bail!("Cannot write to sensitive path: {}", path_str);
-        }
-
         // Create parent dirs if requested
         if create_dirs {
             if let Some(parent) = path.parent() {
@@ -247,6 +239,7 @@ impl crate::semantics::ToolSemantics for WriteFile {
         crate::semantics::ToolDispatchFacts {
             always_offered: true,
             checkpoints_writes: true,
+            file_guard: crate::semantics::FileGuard::Writes,
             ..Default::default()
         }
     }

@@ -14,6 +14,9 @@ pub mod file_delivery;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]
 mod file_policy;
+#[cfg(test)]
+pub(crate) use file_policy::guarded_call;
+pub(crate) use file_policy::{daemon_file_policy, file_guard_paths};
 mod goal_trace;
 mod health_probe;
 pub mod image_generation;

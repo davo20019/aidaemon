@@ -140,11 +140,13 @@ mod tests {
         std::fs::write(&config, "[provider]\nname = \"synthetic\"\n").unwrap();
         let _guard = fs_utils::DaemonPathsGuard::set(vec![config.clone()]);
         let args = json!({"path": config.to_str().unwrap(), "content": "x = 1"}).to_string();
-        let err = WriteFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = crate::tools::guarded_call(
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("sensitive"), "got: {err}");
         assert!(std::fs::read_to_string(&config)
             .unwrap()
@@ -210,9 +212,11 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await;
+        let result = crate::tools::guarded_call(
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
@@ -356,9 +360,11 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await;
+        let result = crate::tools::guarded_call(
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }

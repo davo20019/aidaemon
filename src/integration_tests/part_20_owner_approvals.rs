@@ -279,6 +279,69 @@ async fn private_address_depends_on_the_tool() {
     );
 }
 
+/// A file tool's protected path is refused by the hook in a real turn, and a
+/// symlink does not get around it.
+#[tokio::test]
+async fn protected_paths_are_refused_in_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join(".env");
+    std::fs::write(&secret, "API_KEY=synthetic-secret-value\n").unwrap();
+    let link = dir.path().join("notes.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    #[cfg(not(unix))]
+    std::fs::write(&link, "").unwrap();
+    let read = |path: &std::path::Path| {
+        MockProvider::tool_call_response(
+            "read_file",
+            &json!({"path": path.to_str().unwrap()}).to_string(),
+        )
+    };
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(crate::tools::ReadFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+        Arc::new(crate::tools::WriteFileTool::new(
+            crate::execution::active_execution_backend(),
+        )),
+    ];
+    let (harness, approver) = approvals_harness_with(
+        vec![
+            read(&secret),
+            read(&link),
+            MockProvider::tool_call_response(
+                "write_file",
+                &json!({"path": secret.to_str().unwrap(), "content": "x"}).to_string(),
+            ),
+            MockProvider::text_response("Refused."),
+        ],
+        vec![],
+        None,
+        tools,
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 0);
+    let results = tool_results(&harness).await;
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.contains("does not open credential or secret files"))
+            .count(),
+        if cfg!(unix) { 2 } else { 1 },
+        "{results:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.contains("cannot change sensitive path")),
+        "{results:?}"
+    );
+    assert!(!results.iter().any(|r| r.contains("synthetic-secret-value")));
+    assert!(std::fs::read_to_string(&secret)
+        .unwrap()
+        .contains("synthetic-secret-value"));
+}
+
 #[tokio::test]
 async fn http_post_card_comes_from_kernel_interrupt() {
     let (port, sent) = spawn_approvals_server().await;

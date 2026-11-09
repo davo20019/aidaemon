@@ -1189,6 +1189,13 @@ impl Agent {
             aidaemon_tools::NetworkGuard::new(),
             |guard, (name, tool)| guard.reach(name.clone(), tool.dispatch_facts().network_reach),
         );
+        let protected_paths = turn_tools.iter().fold(
+            aidaemon_tools::ProtectedPathGuard::new(
+                crate::execution::active_execution_backend(),
+                crate::tools::daemon_file_policy(),
+            ),
+            |guard, (name, tool)| guard.tool(name.clone(), tool.dispatch_facts().file_guard),
+        );
         let hooks = TurnHooks {
             canonical: tool_calls::CanonicalCallHook {
                 tools: Arc::new(turn_tools),
@@ -1208,6 +1215,7 @@ impl Agent {
                 calls: calls_tx.clone(),
             },
             memory: memory_hooks,
+            protected_paths,
             network,
             egress,
             untrusted: sdk::UntrustedHook::new(

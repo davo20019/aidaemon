@@ -53,9 +53,11 @@ mod tests {
         let file = dir.path().join(name);
         std::fs::write(&file, body).unwrap();
         let args = json!({"path": file.to_str().unwrap()}).to_string();
-        ReadFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
+        crate::tools::guarded_call(
+            &ReadFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -66,9 +68,11 @@ mod tests {
         let key = ssh.join("id_ed25519");
         std::fs::write(&key, "synthetic-private-key-material\n").unwrap();
         let args = json!({"path": key.to_str().unwrap()}).to_string();
-        let out = ReadFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await;
+        let out = crate::tools::guarded_call(
+            &ReadFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         let text = match out {
             Ok(text) => text,
             Err(error) => error.to_string(),
@@ -120,10 +124,13 @@ mod tests {
         std::fs::write(&own, "token = \"synthetic-secret\"\n").unwrap();
         let _guard = fs_utils::DaemonPathsGuard::set(vec![own.clone()]);
         let args = json!({"path": own.to_str().unwrap()}).to_string();
-        let text = ReadFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
-            .unwrap();
+        let text = crate::tools::guarded_call(
+            &ReadFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(text.contains("does not open credential or secret files"));
         assert!(!text.contains("synthetic-secret"));
         let other = dir.path().join("config.toml");
@@ -145,10 +152,13 @@ mod tests {
         std::fs::create_dir(&ssh).unwrap();
         std::fs::write(ssh.join(".env.example"), "synthetic-secret\n").unwrap();
         let args = json!({"path": ssh.join(".env.example").to_str().unwrap()}).to_string();
-        let text = ReadFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await
-            .unwrap();
+        let text = crate::tools::guarded_call(
+            &ReadFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(text.contains("does not open credential or secret files"));
         assert!(!text.contains("synthetic-secret"));
     }

@@ -196,9 +196,11 @@ mod tests {
         })
         .to_string();
 
-        let result = EditFileTool::new(crate::execution::active_execution_backend())
-            .call(&args)
-            .await;
+        let result = crate::tools::guarded_call(
+            &EditFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         assert!(result.is_err(), "expected error for sensitive path");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -218,15 +220,19 @@ mod tests {
         let edit = |p: &std::path::Path| {
             json!({"path": p.to_str().unwrap(), "old_text": "a", "new_text": "b"}).to_string()
         };
-        EditFileTool::new(crate::execution::active_execution_backend())
-            .call(&edit(&project))
-            .await
-            .unwrap();
-        let err = EditFileTool::new(crate::execution::active_execution_backend())
-            .call(&edit(&own))
-            .await
-            .unwrap_err()
-            .to_string();
+        crate::tools::guarded_call(
+            &EditFileTool::new(crate::execution::active_execution_backend()),
+            &edit(&project),
+        )
+        .await
+        .unwrap();
+        let err = crate::tools::guarded_call(
+            &EditFileTool::new(crate::execution::active_execution_backend()),
+            &edit(&own),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("sensitive"), "got: {err}");
         assert_eq!(std::fs::read_to_string(&own).unwrap(), "mode = \"a\"\n");
     }

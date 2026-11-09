@@ -109,6 +109,8 @@ pub struct ToolDispatchFacts {
     pub goal_context: GoalContext,
     /// Which addresses a call may name, judged by `web::NetworkGuard`.
     pub network_reach: NetworkReach,
+    /// Which of a call's paths `ProtectedPathGuard` judges.
+    pub file_guard: FileGuard,
     /// The dispatcher takes a file checkpoint before the call runs, so its
     /// writes can be rolled back.
     pub checkpoints_writes: bool,
@@ -118,6 +120,18 @@ pub struct ToolDispatchFacts {
     /// The status line summarizes a finished call from its arguments, not
     /// its result (memory and people edits, whose result text is terse).
     pub status_from_arguments: bool,
+}
+
+/// Which of a tool's paths are judged against the secret and sensitive
+/// patterns. A shell is not: the owner is asked about its commands instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileGuard {
+    #[default]
+    None,
+    /// The paths it reads must not hold secrets.
+    Reads,
+    /// The paths it changes must not be sensitive.
+    Writes,
 }
 
 /// Which addresses a tool's egress may name. Cloud metadata endpoints are

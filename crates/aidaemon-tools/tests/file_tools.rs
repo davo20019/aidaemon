@@ -1,7 +1,7 @@
 //! The file tools confined to a workspace, as a kernel agent runs them.
 
 use aidaemon_core::Tool;
-use aidaemon_tools::{EditFile, ReadFile, Workspace, WriteFile};
+use aidaemon_tools::{EditFile, ProtectedPathGuard, ReadFile, Workspace, WriteFile};
 use serde_json::json;
 
 fn workspace() -> (tempfile::TempDir, Workspace) {
@@ -91,20 +91,76 @@ async fn a_symlink_cannot_lead_out_of_the_workspace() {
     assert!(!outside.path().join("new.txt").exists());
 }
 
+fn paths(path: &std::path::Path) -> Vec<String> {
+    vec![path.display().to_string()]
+}
+
 #[tokio::test]
-async fn secret_files_are_refused_and_writes_report_no_backup() {
+async fn the_guard_refuses_secrets_and_sensitive_writes() {
     let (dir, workspace) = workspace();
     std::fs::write(dir.path().join(".env"), "API_KEY=synthetic").unwrap();
+    std::fs::write(dir.path().join(".env.example"), "API_KEY=changeme").unwrap();
+    let guard = ProtectedPathGuard::for_workspace(workspace.clone());
+    let root = workspace.root();
+
+    let reason = guard
+        .refusal("read_file", &paths(&root.join(".env")), &[])
+        .await
+        .expect("a secret is refused");
+    assert!(!reason.contains("synthetic"), "{reason}");
+    assert!(guard
+        .refusal("read_file", &paths(&root.join(".env.example")), &[])
+        .await
+        .is_none());
+    assert!(guard
+        .refusal("read_file", &paths(&root.join("main.rs")), &[])
+        .await
+        .is_none());
+    for tool in ["write_file", "edit_file"] {
+        assert!(guard
+            .refusal(tool, &[], &paths(&root.join(".env")))
+            .await
+            .is_some());
+        assert!(guard
+            .refusal(tool, &[], &paths(&root.join("notes.txt")))
+            .await
+            .is_none());
+    }
+    // A tool the guard was not told about is not judged.
+    assert!(guard
+        .refusal("other_tool", &paths(&root.join(".env")), &[])
+        .await
+        .is_none());
+    drop(dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_guard_follows_symlinks_to_what_they_name() {
+    let (dir, workspace) = workspace();
+    let root = workspace.root().to_path_buf();
+    std::fs::write(root.join(".env"), "API_KEY=synthetic").unwrap();
+    std::fs::create_dir(root.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+    std::os::unix::fs::symlink(root.join(".ssh"), root.join("keys")).unwrap();
+    let guard = ProtectedPathGuard::for_workspace(workspace);
+
+    assert!(guard
+        .refusal("read_file", &paths(&root.join("notes.txt")), &[])
+        .await
+        .is_some());
+    // A file not created yet, under a link to a sensitive directory.
+    assert!(guard
+        .refusal("write_file", &[], &paths(&root.join("keys/new_key")))
+        .await
+        .is_some());
+    drop(dir);
+}
+
+#[tokio::test]
+async fn writes_report_no_backup_without_one() {
+    let (dir, workspace) = workspace();
     std::fs::write(dir.path().join("a.txt"), "old").unwrap();
-
-    let read = ReadFile::new(workspace.clone());
-    let out = read.call(json!({"path": ".env"}), &ctx()).await.unwrap();
-    assert!(
-        out.is_error && !out.content.contains("synthetic"),
-        "{}",
-        out.content
-    );
-
     let write = WriteFile::new(workspace);
     let out = write
         .call(json!({"path": "a.txt", "content": "new"}), &ctx())

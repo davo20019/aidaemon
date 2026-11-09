@@ -16,11 +16,13 @@ use crate::path_class::PathClassifier;
 use crate::workspace::Workspace;
 
 mod edit;
+mod guard;
 mod read;
 mod workspace_backend;
 mod write;
 
 pub use edit::EditFile;
+pub use guard::ProtectedPathGuard;
 pub use read::{render_read_file_output, render_read_file_output_within, ReadFile, MAX_READ_CHARS};
 pub use workspace_backend::WorkspaceBackend;
 pub use write::WriteFile;
@@ -70,7 +72,8 @@ pub trait FilePolicy: Send + Sync {
     /// [`FilePolicy::is_secret`] without name-shape rules, for `.env.example`
     /// style templates, which are judged by where they live.
     fn is_secret_ignoring_name_shape(&self, path: &Path) -> bool;
-    /// Paths the file tools must not change.
+    /// Paths the file tools must not change. [`ProtectedPathGuard`] enforces
+    /// these three; add it to the agent.
     fn is_sensitive(&self, path: &Path) -> bool;
 
     /// The path a kernel access manifest declares for a path argument.

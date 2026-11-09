@@ -3658,6 +3658,10 @@ fn hook_order_is_pinned() {
             calls: calls.clone(),
         },
         memory: vec![Arc::new(NoopMemoryHook)],
+        protected_paths: aidaemon_tools::ProtectedPathGuard::new(
+            crate::execution::active_execution_backend(),
+            crate::tools::daemon_file_policy(),
+        ),
         network: aidaemon_tools::NetworkGuard::new(),
         egress: aidaemon_policies::EgressGuard::new(),
         untrusted: sdk::UntrustedHook::new(
@@ -3701,6 +3705,7 @@ fn hook_order_is_pinned() {
             HookSlot::Cutoff,
             HookSlot::Retry,
             HookSlot::Memory,
+            HookSlot::ProtectedPaths,
             HookSlot::Network,
             HookSlot::Egress,
             HookSlot::Untrusted,

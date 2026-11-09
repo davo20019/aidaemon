@@ -343,9 +343,20 @@ Order:
       kernel's `UntrustedHook` no longer re-marks daemon output. Text that
       never passes through a tool result (the `cli_agent` continuity message)
       still wraps where it is written.
+      Done 2026-11-08: network targets and protected paths are hooks over
+      what a call declares. `NetworkGuard` refuses cloud metadata endpoints
+      for every tool and other private addresses by the tool's typed
+      `NetworkReach`, before any card. `ProtectedPathGuard` resolves file
+      tools' paths through their backend, follows symlinks, and replaces the
+      checks inside `read_file`, `write_file` and `edit_file`. Shell effects
+      now see through launchers for egress.
+      Stay in the tools on purpose: each redirect hop (it exists only once
+      the request runs), the first-request check in `web_fetch` and
+      `http_request` (their effects are unknown on an unparsable URL), and
+      the per-entry checks of `search_files`'s collaboration walk. The
+      browser's `render_pdf` source check is still in the tool.
       The in-tool approvals are done (8.1). Scope is judged by `DispatchGate`
-      already. Left: sensitive paths and SSRF as hooks over effects, and an
-      allowlist for `cli_agent` arguments.
+      already. Left: an allowlist for `cli_agent` arguments.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
       `AgentBuilder`. Done 2026-11-07: declines move both ways between
       parent and child runs. `c98314c`: kernel `SharedDeclines`, attached

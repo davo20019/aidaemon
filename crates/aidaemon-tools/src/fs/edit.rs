@@ -120,17 +120,6 @@ impl OutcomeTool for EditFile {
         let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
 
-        // Block sensitive paths (~/.ssh/*, ~/.aws/*, ~/.gnupg/*, *.env, etc.)
-        // mirroring `write_file`. Even though `edit_file` only does
-        // find-and-replace, it can still mutate credentials in place, so the
-        // same blocklist applies.
-        if self
-            .policy
-            .is_sensitive(std::path::Path::new(path.as_str()))
-        {
-            anyhow::bail!("Cannot edit sensitive path: {}", path_str);
-        }
-
         if backend.metadata(&path).await.is_err() {
             anyhow::bail!("File not found: {}", path_str);
         }
@@ -249,6 +238,7 @@ impl crate::semantics::ToolSemantics for EditFile {
         crate::semantics::ToolDispatchFacts {
             always_offered: true,
             checkpoints_writes: true,
+            file_guard: crate::semantics::FileGuard::Writes,
             ..Default::default()
         }
     }

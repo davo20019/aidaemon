@@ -128,6 +128,7 @@ impl crate::semantics::ToolSemantics for ReadFile {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
             same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            file_guard: crate::semantics::FileGuard::Reads,
             ..Default::default()
         }
     }
@@ -177,17 +178,6 @@ impl crate::semantics::ToolSemantics for ReadFile {
     }
 }
 
-/// `.env.example` style templates hold placeholders, not secrets.
-fn is_env_template(path: &std::path::Path) -> bool {
-    path.file_name().is_some_and(|name| {
-        let name = name.to_string_lossy().to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            ".env.example" | ".env.sample" | ".env.template"
-        )
-    })
-}
-
 impl ReadFile {
     pub(crate) async fn read_outcome(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
@@ -228,18 +218,6 @@ impl ReadFile {
 
         let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
-        let local_path = std::path::Path::new(path.as_str());
-        let refused = if is_env_template(local_path) {
-            // A template is judged by where it lives, not by its `.env.` name.
-            self.policy.is_secret_ignoring_name_shape(local_path)
-        } else {
-            self.policy.is_secret(local_path)
-        };
-        if refused {
-            return Ok(ToolCallOutcome::contract_rejection(format!(
-                "read_file does not open credential or secret files ({path_str}). Ask the owner to share what is needed."
-            )));
-        }
         let metadata = backend
             .metadata(&path)
             .await

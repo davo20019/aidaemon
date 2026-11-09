@@ -99,6 +99,7 @@ pub(super) enum HookSlot {
     Cutoff,
     Retry,
     Memory,
+    ProtectedPaths,
     Network,
     Egress,
     Untrusted,
@@ -126,6 +127,7 @@ pub(super) struct TurnHooks {
     pub(super) cutoff: CutoffAdjust,
     pub(super) retry: ModelRetry,
     pub(super) memory: Vec<Arc<dyn sdk::Hook>>,
+    pub(super) protected_paths: aidaemon_tools::ProtectedPathGuard,
     pub(super) network: aidaemon_tools::NetworkGuard,
     pub(super) egress: aidaemon_policies::EgressGuard,
     pub(super) untrusted: sdk::UntrustedHook,
@@ -148,6 +150,7 @@ impl TurnHooks {
             (HookSlot::Retry, Arc::new(self.retry)),
         ];
         chain.extend(self.memory.into_iter().map(|hook| (HookSlot::Memory, hook)));
+        chain.push((HookSlot::ProtectedPaths, Arc::new(self.protected_paths)));
         chain.push((HookSlot::Network, Arc::new(self.network)));
         chain.push((HookSlot::Egress, Arc::new(self.egress)));
         chain.push((HookSlot::Untrusted, Arc::new(self.untrusted)));
@@ -461,6 +464,19 @@ impl sdk::Tool for BridgedTool {
             };
             if !list.contains(&key.target) {
                 list.push(key.target);
+            }
+        }
+        // A file tool's paths, for the protected-path guard. Effects do not
+        // name reads, and name no writes on a remote backend.
+        if self.tool.dispatch_facts().file_guard != crate::traits::FileGuard::None {
+            let raw = arguments.to_string();
+            let canonical = self.tool.canonicalize_arguments(&raw).unwrap_or(raw);
+            let (reads, writes) = crate::tools::file_guard_paths(self.tool.as_ref(), &canonical);
+            manifest.reads.extend(reads);
+            for write in writes {
+                if !manifest.writes.contains(&write) {
+                    manifest.writes.push(write);
+                }
             }
         }
         manifest

@@ -83,8 +83,8 @@ pub(crate) use tools::NothingSentError;
 pub use tools::{
     default_call_annotations, prepare_invocation, semantics_for_exact_read_actions, AgentRole,
     ApprovalCall, ApprovalScope, AuthorizationPreflightRecord, AuthorizationPreflightStatus,
-    DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, GoalContext,
-    NetworkReach, OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata,
+    DurableReplayDecision, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, FileGuard,
+    GoalContext, NetworkReach, OwnerApprovalNeed, PreparedToolInvocation, ReadFileResultMetadata,
     ReadFileSelectionMetadata, RuntimePreparationFailure, SameToolStreak, ScopeEscalation,
     SpecialistKind, StableObservationSubject, Tool, ToolAccessDenial, ToolAccessEnforcement,
     ToolArgumentContractViolation, ToolCallAccessManifest, ToolCallContext, ToolCallEffect,
