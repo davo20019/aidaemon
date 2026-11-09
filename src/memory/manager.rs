@@ -1,14 +1,14 @@
 use crate::events::{Consolidator, EventStore};
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::memory::binary::encode_embedding;
-use crate::memory::embedding_index::{
-    content_hash, EmbeddingIndex, EmbeddingItem, MemoryOwner, SqliteEmbeddingIndex,
-};
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::history_source::EventHistory;
 use crate::traits::{Message, MessageAnnotation, StateStore};
 use crate::types::UserRole;
+use aidaemon_memory::embedding_index::{
+    content_hash, EmbeddingIndex, EmbeddingItem, MemoryOwner, SqliteEmbeddingIndex,
+};
+use aidaemon_memory::encode_embedding;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -767,7 +767,8 @@ impl MemoryManager {
                 {
                     continue;
                 }
-                msg.importance = crate::memory::scoring::score_turn(&turn);
+                msg.importance =
+                    aidaemon_memory::turn_importance(turn.role.as_str(), turn.content.as_deref());
                 messages.push(msg);
             }
         }
@@ -885,7 +886,8 @@ impl MemoryManager {
                 {
                     continue;
                 }
-                msg.importance = crate::memory::scoring::score_turn(&turn);
+                msg.importance =
+                    aidaemon_memory::turn_importance(turn.role.as_str(), turn.content.as_deref());
                 messages.push(msg);
             }
         }
@@ -960,7 +962,8 @@ impl MemoryManager {
                 {
                     continue;
                 }
-                msg.importance = crate::memory::scoring::score_turn(&turn);
+                msg.importance =
+                    aidaemon_memory::turn_importance(turn.role.as_str(), turn.content.as_deref());
                 messages.push(msg);
             }
         }
@@ -1040,7 +1043,8 @@ impl MemoryManager {
                 {
                     continue;
                 }
-                msg.importance = crate::memory::scoring::score_turn(&turn);
+                msg.importance =
+                    aidaemon_memory::turn_importance(turn.role.as_str(), turn.content.as_deref());
                 messages.push(msg);
             }
         }

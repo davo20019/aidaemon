@@ -209,7 +209,7 @@ impl DaemonRecall {
                 .get(&turn.session_id)
                 .cloned();
             let (profile_str, new_ids, digest) = or_logged(
-                crate::memory::core_profile::build_core_profile(
+                aidaemon_memory::profile::build_core_profile(
                     store.as_ref(),
                     cached_ids,
                     people_enabled,

@@ -17,10 +17,10 @@ use super::{
 };
 use super::{Event, EventStore, EventType, TaskOutcome};
 use crate::llm_runtime::SharedLlmRuntime;
-use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
 use crate::traits::{ErrorSolution, Procedure};
+use aidaemon_memory::encode_embedding;
 
 /// Statistics from a consolidation run
 #[derive(Debug, Default)]
@@ -544,7 +544,7 @@ impl Consolidator {
         let existing: Vec<Vec<f32>> = rows
             .iter()
             .filter_map(|row| row.get::<Option<Vec<u8>>, _>("trigger_embedding"))
-            .filter_map(|blob| crate::memory::binary::decode_embedding(&blob).ok())
+            .filter_map(|blob| aidaemon_memory::decode_embedding_with_dim(&blob, 384).ok())
             .collect();
         aidaemon_memory::trajectory::duplicates_existing_trigger(&new_emb, &existing)
     }

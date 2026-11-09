@@ -1192,15 +1192,15 @@ impl ManageMemoriesTool {
                 //
                 // Deduped by lowercased value, capped at 6.
                 let results_signal_relational = merged.iter().any(|(f, _)| {
-                    crate::memory::neighborhood::is_relationship_key(&f.key)
-                        || crate::memory::neighborhood::fact_namespace(&f.key).is_some()
+                    aidaemon_memory::neighborhood::is_relationship_key(&f.key)
+                        || aidaemon_memory::neighborhood::fact_namespace(&f.key).is_some()
                 });
                 if results_signal_relational {
                     let mut seen_lower: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     let mut candidates: Vec<String> = Vec::new();
                     for (f, _) in &merged {
-                        if crate::memory::neighborhood::is_relationship_key(&f.key) {
+                        if aidaemon_memory::neighborhood::is_relationship_key(&f.key) {
                             let v = f.value.trim();
                             if !v.is_empty() {
                                 let lower = v.to_ascii_lowercase();
@@ -1209,7 +1209,7 @@ impl ManageMemoriesTool {
                                 }
                             }
                         }
-                        if let Some(ns) = crate::memory::neighborhood::fact_namespace(&f.key) {
+                        if let Some(ns) = aidaemon_memory::neighborhood::fact_namespace(&f.key) {
                             let lower = ns.to_ascii_lowercase();
                             if seen_lower.insert(lower) {
                                 candidates.push(ns.to_string());

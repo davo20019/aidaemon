@@ -1,19 +1,11 @@
-pub mod binary;
-pub mod core_profile;
-pub mod embedding_index;
 pub mod embeddings;
-pub mod expertise;
 pub(crate) mod history_intake;
 pub mod history_source;
 pub mod manager;
-pub mod neighborhood;
 pub mod people_intelligence;
 pub mod procedures;
 pub mod progressive;
 pub mod retention;
-#[cfg(test)]
-pub mod retrieval_eval;
-pub mod scoring;
 pub mod task_learning;
 
 /// Derive a canonical `channel_id` from a `session_id` string.
