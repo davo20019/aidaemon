@@ -20,8 +20,7 @@ const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    event_store: Arc<crate::events::EventStore>,
-    llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
     model: String,
     task: Task,
 ) -> anyhow::Result<()> {
@@ -94,13 +93,8 @@ pub async fn extract_task_knowledge(
         activity_log.push_str(&line);
     }
 
-    let provider = crate::agent::RuntimeProvider::with_accounting(
-        llm_runtime,
-        state.clone(),
-        event_store,
-        "task_learning",
-    );
-    aidaemon_memory::task_learning::TaskLearner::new(Arc::new(provider), model)
+    let provider = side_calls.provider(crate::llm_runtime::side_calls::SideCall::TaskLearning);
+    aidaemon_memory::task_learning::TaskLearner::new(provider, model)
         .learn(
             store.as_ref(),
             &aidaemon_memory::task_learning::FinishedTask {
@@ -113,4 +107,120 @@ pub async fn extract_task_knowledge(
         )
         .await
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_runtime::gateway::test_support::{
+        failed_calls, gateway_with, ok_calls, provider_answering, provider_failing,
+    };
+    use crate::state::SqliteStateStore;
+    use crate::traits::store_prelude::*;
+
+    /// A state store holding one finished task with one activity, and its
+    /// memory store.
+    async fn stores_with_finished_task(
+        task_id: &str,
+    ) -> (
+        Arc<SqliteStateStore>,
+        Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        // The store keeps the file open; the file outlives the test.
+        std::mem::forget(file);
+        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&path, 100, None, embeddings)
+                .await
+                .unwrap(),
+        );
+        let goal = crate::traits::Goal::new_finite("Ship the Acme Corp report", "session_1");
+        state.create_goal(&goal).await.unwrap();
+        let mut finished = task(task_id);
+        finished.goal_id = goal.id.clone();
+        state.create_task(&finished).await.unwrap();
+        state
+            .log_task_activity(&crate::traits::TaskActivity {
+                id: 0,
+                task_id: task_id.to_string(),
+                activity_type: "tool_call".to_string(),
+                tool_name: Some("terminal".to_string()),
+                tool_args: Some("{\"command\":\"make report\"}".to_string()),
+                result: Some("report.pdf written".to_string()),
+                success: Some(true),
+                tokens_used: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        let store = state.memory_stores();
+        (state, store)
+    }
+
+    fn task(id: &str) -> Task {
+        let now = chrono::Utc::now().to_rfc3339();
+        Task {
+            id: id.to_string(),
+            goal_id: "goal-1".to_string(),
+            description: "Build the Acme Corp report".to_string(),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some("Report built".to_string()),
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            completed_at: Some(now),
+        }
+    }
+
+    /// Facts, procedures and error solutions in the store.
+    async fn count_learned(state: &SqliteStateStore) -> i64 {
+        let mut learned = 0;
+        for table in ["facts", "procedures", "error_solutions"] {
+            let (count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&state.pool())
+                .await
+                .unwrap();
+            learned += count;
+        }
+        learned
+    }
+
+    #[tokio::test]
+    async fn a_failed_learning_call_writes_nothing_and_is_recorded() {
+        let (gateway, events) = gateway_with(provider_failing("503")).await;
+        let (state, store) = stores_with_finished_task("task-1").await;
+        let task = state.get_task("task-1").await.unwrap().unwrap();
+        let result = extract_task_knowledge(state.clone(), store, gateway, "m".into(), task).await;
+        assert!(result.is_err());
+        assert_eq!(count_learned(&state).await, 0);
+        assert!(failed_calls(&events, "task_learning").await >= 1);
+        assert_eq!(ok_calls(&events, "task_learning").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_learning_call_is_recorded_once() {
+        let (gateway, events) = gateway_with(provider_answering(
+            r#"{"facts": [], "procedures": [], "error_solutions": []}"#,
+        ))
+        .await;
+        let (state, store) = stores_with_finished_task("task-1").await;
+        let task = state.get_task("task-1").await.unwrap().unwrap();
+        extract_task_knowledge(state, store, gateway, "m".into(), task)
+            .await
+            .unwrap();
+        assert_eq!(ok_calls(&events, "task_learning").await, 1);
+        assert_eq!(failed_calls(&events, "task_learning").await, 0);
+    }
 }

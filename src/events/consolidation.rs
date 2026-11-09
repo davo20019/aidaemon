@@ -21,6 +21,8 @@ use super::{
     UserMessageData,
 };
 use super::{Event, EventStore, EventType, TaskOutcome};
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
@@ -70,9 +72,8 @@ pub struct Consolidator {
     memory: Arc<dyn MemoryStores>,
     llm_runtime: Option<SharedLlmRuntime>,
     embedding_service: Option<Arc<EmbeddingService>>,
-    state: Option<Arc<dyn crate::traits::StateStore>>,
-    #[allow(dead_code)] // used from Task 5
-    side_calls: Option<crate::llm_runtime::gateway::SideCallGateway>,
+    /// Runs the procedure enhancer's model calls.
+    side_calls: SideCallGateway,
     learning_evidence_gate_enforce: bool,
 }
 
@@ -83,6 +84,7 @@ impl Consolidator {
         pool: sqlx::SqlitePool,
         memory: Arc<dyn MemoryStores>,
         llm_runtime: Option<SharedLlmRuntime>,
+        side_calls: SideCallGateway,
         embedding_service: Option<Arc<EmbeddingService>>,
     ) -> Self {
         Self {
@@ -92,25 +94,9 @@ impl Consolidator {
             memory,
             llm_runtime,
             embedding_service,
-            state: None,
-            side_calls: None,
+            side_calls,
             learning_evidence_gate_enforce: false,
         }
-    }
-
-    /// Set the state store for token usage tracking.
-    pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
-        self.state = Some(state);
-        self
-    }
-
-    /// Set the gateway its model calls go through.
-    pub fn with_side_calls(
-        mut self,
-        side_calls: crate::llm_runtime::gateway::SideCallGateway,
-    ) -> Self {
-        self.side_calls = Some(side_calls);
-        self
     }
 
     pub fn with_learning_evidence_gate(mut self, enforce: bool) -> Self {
@@ -244,8 +230,8 @@ impl Consolidator {
         Ok(result)
     }
 
-    /// The memory crate's learner, with the daemon's embeddings and its
-    /// current model (whose calls are accounted to this session's budget).
+    /// The memory crate's learner, with the daemon's embeddings and, when
+    /// it has a model, a procedure enhancer that calls through the gateway.
     fn learner(&self) -> TaskLearner {
         let mut learner = TaskLearner::new(self.memory.clone())
             .with_evidence_gate(self.learning_evidence_gate_enforce);
@@ -253,19 +239,8 @@ impl Consolidator {
             learner = learner.with_embedder(embeddings.clone());
         }
         if let Some(runtime) = &self.llm_runtime {
-            let snapshot = runtime.snapshot();
-            let model = snapshot.primary_model();
-            let provider: Arc<dyn aidaemon_core::Provider> = match &self.state {
-                Some(state) => Arc::new(crate::agent::AccountedProvider {
-                    inner: snapshot.provider(),
-                    accounting: crate::agent::ModelCallAccounting {
-                        state: state.clone(),
-                        event_store: self.event_store.clone(),
-                        purpose: "consolidation",
-                    },
-                }),
-                None => snapshot.provider(),
-            };
+            let model = runtime.snapshot().primary_model();
+            let provider = self.side_calls.provider(SideCall::ProcedureEnhancement);
             learner = learner.with_enhancer(ProcedureEnhancer::new(provider, model));
         }
         learner
@@ -515,7 +490,6 @@ mod tests {
     use crate::plans::PlanStore;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
-    use crate::traits::StateStore;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -541,10 +515,24 @@ mod tests {
             state.pool(),
             state.memory_stores(),
             None,
+            unused_side_calls(&state, &event_store),
             None,
-        )
-        .with_state(state.clone() as Arc<dyn StateStore>);
+        );
         (state, event_store, consolidator, db_file)
+    }
+
+    /// A gateway for a consolidator that has no model to call.
+    fn unused_side_calls(
+        state: &Arc<SqliteStateStore>,
+        event_store: &Arc<EventStore>,
+    ) -> SideCallGateway {
+        let runtime = SharedLlmRuntime::new(
+            Arc::new(MockProvider::with_responses(vec![])),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        SideCallGateway::new(runtime, state.clone(), event_store.clone())
     }
 
     async fn append_old_procedure_trace(
@@ -654,17 +642,15 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             "mock".to_string(),
         );
-        let consolidator = Arc::new(
-            Consolidator::new(
-                event_store.clone(),
-                plan_store,
-                state.pool(),
-                state.memory_stores(),
-                Some(runtime),
-                None,
-            )
-            .with_state(state.clone() as Arc<dyn StateStore>),
-        );
+        let consolidator = Arc::new(Consolidator::new(
+            event_store.clone(),
+            plan_store,
+            state.pool(),
+            state.memory_stores(),
+            Some(runtime.clone()),
+            SideCallGateway::new(runtime, state.clone(), event_store.clone()),
+            None,
+        ));
         sqlx::query(
             "INSERT INTO events (session_id, event_type, data, created_at)
              VALUES ('ordinary-owner-session', 'user_message', '{\"content\":\"hello\"}',
@@ -717,17 +703,15 @@ mod tests {
             ProviderKind::OpenaiCompatible,
             "mock".to_string(),
         );
-        let consolidator = Arc::new(
-            Consolidator::new(
-                event_store.clone(),
-                plan_store,
-                state.pool(),
-                state.memory_stores(),
-                Some(runtime),
-                None,
-            )
-            .with_state(state.clone() as Arc<dyn StateStore>),
-        );
+        let consolidator = Arc::new(Consolidator::new(
+            event_store.clone(),
+            plan_store,
+            state.pool(),
+            state.memory_stores(),
+            Some(runtime.clone()),
+            SideCallGateway::new(runtime, state.clone(), event_store.clone()),
+            None,
+        ));
 
         // Deliberately use an owner-looking session ID for the mandate: the
         // explicit event provenance, not a prefix or role, must isolate it.

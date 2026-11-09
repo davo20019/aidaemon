@@ -7,7 +7,6 @@ use serde_json::json;
 use tracing::debug;
 
 use crate::events::EventStore;
-use crate::traits::StateStore;
 use crate::types::UserRole;
 
 /// Run progressive fact extraction in the background: the SDK memory
@@ -17,9 +16,8 @@ use crate::types::UserRole;
 /// [`ProgressiveExtractor`]: aidaemon_memory::progressive::ProgressiveExtractor
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_progressive_extraction(
-    llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
     fast_model: String,
-    state: Arc<dyn StateStore>,
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<EventStore>,
     source_task_id: String,
@@ -34,13 +32,9 @@ pub fn spawn_progressive_extraction(
         if !may_extract(user_role, visibility) {
             return;
         }
-        let provider = crate::agent::RuntimeProvider::with_accounting(
-            llm_runtime,
-            state.clone(),
-            event_store.clone(),
-            "progressive_extraction",
-        );
-        let extractor = extractor(Arc::new(provider), &fast_model);
+        let provider =
+            side_calls.provider(crate::llm_runtime::side_calls::SideCall::ProgressiveExtraction);
+        let extractor = extractor(provider, &fast_model);
         let exchange = Exchange {
             user_text: &user_text,
             assistant_reply: &assistant_response,

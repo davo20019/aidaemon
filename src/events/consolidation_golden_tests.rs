@@ -819,20 +819,30 @@ async fn run(setup: Setup) -> Snapshot {
     );
     seed_memory(&pool, &embeddings).await;
 
+    let provider = Arc::new(MockProvider::with_responses(if setup.with_models {
+        model_replies()
+    } else {
+        Vec::new()
+    }));
     let runtime = setup.with_models.then(|| {
         SharedLlmRuntime::new(
-            Arc::new(MockProvider::with_responses(model_replies())),
+            provider.clone(),
             None,
             ProviderKind::OpenaiCompatible,
             "mock".to_string(),
         )
     });
+    // The gateway records its calls in its own database, so they stay out
+    // of the history this test consolidates.
+    let (side_calls, _gateway_events) =
+        crate::llm_runtime::gateway::test_support::gateway_with(provider).await;
     let consolidator = Consolidator::new(
         event_store.clone(),
         plan_store.clone(),
         pool.clone(),
         memory,
         runtime,
+        side_calls,
         setup.with_models.then(|| embeddings.clone()),
     )
     .with_learning_evidence_gate(setup.evidence_gate);

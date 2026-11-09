@@ -1,4 +1,6 @@
-use crate::events::{Consolidator, EventStore};
+use crate::events::Consolidator;
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::history_source::EventHistory;
@@ -18,10 +20,9 @@ pub struct MemoryManager {
     llm_runtime: SharedLlmRuntime,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
-    event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
-    #[allow(dead_code)] // used from Task 5
-    side_calls: Option<crate::llm_runtime::gateway::SideCallGateway>,
+    /// Runs the background jobs' model calls.
+    side_calls: SideCallGateway,
     memory: Option<Arc<dyn aidaemon_memory::stores::MemoryStores>>,
 }
 
@@ -30,6 +31,7 @@ impl MemoryManager {
         pool: SqlitePool,
         embedding_service: Arc<EmbeddingService>,
         llm_runtime: SharedLlmRuntime,
+        side_calls: SideCallGateway,
         consolidation_interval: Duration,
         consolidator: Option<Arc<Consolidator>>,
     ) -> Self {
@@ -40,31 +42,16 @@ impl MemoryManager {
             llm_runtime,
             consolidation_interval,
             consolidator,
-            event_store: None,
             state: None,
-            side_calls: None,
+            side_calls,
             memory: None,
         }
-    }
-
-    pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
-        self.event_store = Some(event_store);
-        self
     }
 
     /// Set the state store memory is written to.
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
         self.history = EventHistory::new(self.pool.clone(), Some(state.clone()));
         self.state = Some(state);
-        self
-    }
-
-    /// Set the gateway the background jobs' model calls go through.
-    pub fn with_side_calls(
-        mut self,
-        side_calls: crate::llm_runtime::gateway::SideCallGateway,
-    ) -> Self {
-        self.side_calls = Some(side_calls);
         self
     }
 
@@ -167,27 +154,16 @@ impl MemoryManager {
     ///
     /// [`FactConsolidator`]: aidaemon_memory::consolidation::FactConsolidator
     async fn consolidate_memories(&self) -> anyhow::Result<()> {
-        let Some(state) = self.state.clone() else {
+        if self.state.is_none() {
             return Ok(());
-        };
+        }
         let Some(memory) = self.memory.clone() else {
             return Ok(());
         };
         let snapshot = self.llm_runtime.snapshot();
         // Background work does not need the strongest model.
         let model = snapshot.cheap_model();
-        let chain: Arc<dyn aidaemon_core::Provider> = Arc::new(snapshot.background_chain(&model));
-        let provider: Arc<dyn aidaemon_core::Provider> = match &self.event_store {
-            Some(event_store) => Arc::new(crate::agent::AccountedProvider {
-                inner: chain,
-                accounting: crate::agent::ModelCallAccounting {
-                    state: state.clone(),
-                    event_store: event_store.clone(),
-                    purpose: "memory_consolidation",
-                },
-            }),
-            None => chain,
-        };
+        let provider = self.side_calls.provider(SideCall::FactConsolidation);
         let report = aidaemon_memory::consolidation::FactConsolidator::new(provider, model)
             .consolidate(
                 &self.history,
@@ -229,9 +205,9 @@ impl MemoryManager {
             !self.history.session_is_memory_isolated(session_id).await?,
             "Memory-isolated worker sessions cannot create global episodes"
         );
-        let Some(state) = self.state.clone() else {
+        if self.state.is_none() {
             anyhow::bail!("No memory store to record the episode in");
-        };
+        }
         let Some(memory) = self.memory.clone() else {
             anyhow::bail!("No memory store to record the episode in");
         };
@@ -247,18 +223,7 @@ impl MemoryManager {
         let snapshot = self.llm_runtime.snapshot();
         // An episode is a short summary of a finished session: fast-tier work.
         let model = snapshot.cheap_model();
-        let chain: Arc<dyn aidaemon_core::Provider> = Arc::new(snapshot.background_chain(&model));
-        let provider: Arc<dyn aidaemon_core::Provider> = match &self.event_store {
-            Some(event_store) => Arc::new(crate::agent::AccountedProvider {
-                inner: chain,
-                accounting: crate::agent::ModelCallAccounting {
-                    state: state.clone(),
-                    event_store: event_store.clone(),
-                    purpose: "episode_creation",
-                },
-            }),
-            None => chain,
-        };
+        let provider = self.side_calls.provider(SideCall::SessionAnalysis);
         let (episode_id, analysis) =
             aidaemon_memory::episodes::SessionAnalyst::new(provider, model)
                 .record_episode(
@@ -1019,6 +984,15 @@ mod tests {
         assert!(!transcript.contains("Worker output from an internal retry."));
     }
 
+    /// An event store over `store`'s database, for the gateway's rows.
+    async fn test_event_store(store: &Arc<SqliteStateStore>) -> Arc<crate::events::EventStore> {
+        Arc::new(
+            <crate::events::EventStore as crate::events::EventStoreForTests>::new(store.pool())
+                .await
+                .expect("event store"),
+        )
+    }
+
     async fn setup_memory_manager_with_responses(
         responses: Vec<crate::traits::ProviderResponse>,
     ) -> (
@@ -1049,7 +1023,8 @@ mod tests {
         let manager = MemoryManager::new(
             store.pool(),
             embedding_service,
-            llm_runtime,
+            llm_runtime.clone(),
+            SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
             Duration::from_secs(60),
             None,
         )
@@ -1405,7 +1380,8 @@ mod tests {
         let mgr = MemoryManager::new(
             store.pool(),
             embedding_service,
-            llm_runtime,
+            llm_runtime.clone(),
+            SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
             Duration::from_secs(60),
             None,
         )
@@ -1512,7 +1488,8 @@ mod tests {
         let mgr = MemoryManager::new(
             store.pool(),
             embedding_service,
-            llm_runtime,
+            llm_runtime.clone(),
+            SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
             Duration::from_secs(60),
             None,
         )
@@ -1614,7 +1591,8 @@ mod tests {
         let mgr = MemoryManager::new(
             store.pool(),
             embedding_service,
-            llm_runtime,
+            llm_runtime.clone(),
+            SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
             Duration::from_secs(60),
             None,
         )
@@ -1713,7 +1691,8 @@ mod tests {
         let mgr = MemoryManager::new(
             store.pool(),
             embedding_service,
-            llm_runtime,
+            llm_runtime.clone(),
+            SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
             Duration::from_secs(60),
             None,
         )

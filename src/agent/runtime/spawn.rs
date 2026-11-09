@@ -2889,8 +2889,7 @@ impl Agent {
                         if completed_task.status == "completed" && self.memory.is_daemons_own() {
                             let state = self.state.clone();
                             let store = self.memory_store.clone();
-                            let event_store = self.event_store.clone();
-                            let llm_runtime = self.llm_runtime.clone();
+                            let side_calls = self.side_calls.clone();
                             let tid = task_id.clone();
                             let model = match tokio::time::timeout(
                                 Duration::from_secs(2),
@@ -2912,8 +2911,7 @@ impl Agent {
                                     crate::memory::task_learning::extract_task_knowledge(
                                         state,
                                         store,
-                                        event_store,
-                                        llm_runtime,
+                                        side_calls,
                                         model,
                                         completed_task,
                                     )

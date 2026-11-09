@@ -116,8 +116,8 @@ pub async fn run(
     let memory = crate::agent::memory_plugin::configured_memory(
         &config.memory,
         &llm_runtime,
+        &side_calls,
         state.clone(),
-        event_store.clone(),
         pool.clone(),
     )
     .await;

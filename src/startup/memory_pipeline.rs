@@ -36,10 +36,9 @@ pub fn build_memory_pipeline(
             pool.clone(),
             memory_store.clone(),
             Some(llm_runtime.clone()),
+            side_calls.clone(),
             Some(embedding_service.clone()),
         )
-        .with_state(state.clone())
-        .with_side_calls(side_calls.clone())
         .with_learning_evidence_gate(config.policy.learning_evidence_gate_enforce),
     );
 
@@ -56,12 +55,11 @@ pub fn build_memory_pipeline(
             pool,
             embedding_service,
             llm_runtime,
+            side_calls,
             consolidation_interval,
             Some(consolidator.clone()),
         )
-        .with_event_store(event_store)
         .with_state(state)
-        .with_side_calls(side_calls)
         .with_memory(memory_store),
     );
 

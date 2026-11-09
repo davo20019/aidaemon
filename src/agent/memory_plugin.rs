@@ -242,8 +242,8 @@ impl ConfiguredMemory {
 pub(crate) async fn configured_memory(
     config: &crate::config::MemoryConfig,
     llm_runtime: &crate::llm_runtime::SharedLlmRuntime,
+    side_calls: &crate::llm_runtime::gateway::SideCallGateway,
     state: Arc<dyn StateStore>,
-    event_store: Arc<crate::events::EventStore>,
     pool: sqlx::SqlitePool,
 ) -> ConfiguredMemory {
     match config.backend {
@@ -262,20 +262,12 @@ pub(crate) async fn configured_memory(
                     return ConfiguredMemory::daemons_own();
                 }
             };
-            let intake_state = state.clone();
             let fast_model = llm_runtime
                 .router()
                 .map(|router| router.select(crate::router::Tier::Fast).to_string())
                 .unwrap_or_else(|| llm_runtime.snapshot().primary_model());
-            let extractor = aidaemon_memory::FactExtractor::new(
-                super::sdk_provider::RuntimeProvider {
-                    runtime: llm_runtime.clone(),
-                    accounting: Some(super::sdk_provider::ModelCallAccounting {
-                        state,
-                        event_store,
-                        purpose: "sdk_memory_extraction",
-                    }),
-                },
+            let extractor = aidaemon_memory::FactExtractor::from_arc(
+                side_calls.provider(crate::llm_runtime::side_calls::SideCall::FactExtraction),
                 fast_model,
             );
             let builder = aidaemon_memory::Memory::builder(
@@ -292,7 +284,7 @@ pub(crate) async fn configured_memory(
                     crate::memory::history_intake::HistoryIntake::new(
                         system,
                         pool,
-                        intake_state,
+                        state,
                         &format!("sdk:{}", config.path),
                     )
                     .into_service(),
@@ -302,7 +294,7 @@ pub(crate) async fn configured_memory(
         }
         #[cfg(not(feature = "sdk-memory"))]
         crate::config::MemoryBackend::Sdk => {
-            let _ = (llm_runtime, state, event_store, pool);
+            let _ = (llm_runtime, side_calls, state, pool);
             tracing::warn!(
                 "[memory] backend = \"sdk\" needs a build with the sdk-memory feature; \
                  using the daemon's memory"
@@ -374,9 +366,8 @@ impl MemoryWrites for DaemonMemoryInner {
     fn extract_facts(&self, turn: &MemoryTurn, reply: &str) {
         let snapshot = self.llm_runtime.snapshot();
         crate::memory::progressive::spawn_progressive_extraction(
-            self.llm_runtime.clone(),
+            self.side_calls.clone(),
             fast_model(&snapshot, &turn.model),
-            self.state.clone(),
             self.store.clone(),
             self.event_store.clone(),
             turn.task_id.clone(),
