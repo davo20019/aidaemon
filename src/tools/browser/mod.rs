@@ -33,6 +33,11 @@ use session::{BrowserSessionRegistry, TabView};
 use tokio::sync::OwnedMutexGuard;
 
 /// The warning on a card for a sensitive (`execute_js`) action.
+/// How long an Allow Once answer on a local-site card lasts. The approval
+/// has to outlive the navigation: reading or screenshotting the page rechecks
+/// its host.
+const LOCAL_SITE_ONCE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 const POINT_OF_ACTION_SENSITIVE: &str = "This can read or access private data on the page.";
 /// The warning on a card for a consequential click or fill.
 const POINT_OF_ACTION_CONSEQUENTIAL: &str =
@@ -197,6 +202,23 @@ impl WaitCondition {
 enum GateDecision {
     Allow,
     Deny(String),
+}
+
+/// The card for letting the browser open a site on this computer. It names
+/// only the site, never the path or query (a login link is a credential).
+fn local_site_request(key: &str) -> aidaemon_core::OwnerApprovalRequest {
+    let minutes = LOCAL_SITE_ONCE.as_secs() / 60;
+    aidaemon_core::OwnerApprovalRequest {
+        effects: Vec::new(),
+        summary: format!(
+            "Let the browser open {key}, a site on this computer? Approve only if you \
+             asked for it. Allow Once lasts {minutes} minutes; Allow Session or Always \
+             lasts until this browser session ends."
+        ),
+        subject: format!("browser local site {key}"),
+        risk: aidaemon_core::ApprovalRisk::High,
+        warnings: Vec::new(),
+    }
 }
 
 /// What a browser call needs from the owner before it runs.
@@ -697,12 +719,21 @@ impl BrowserTool {
     /// - Consequential click/fill is point-of-action for interactive sessions,
     ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
     ///   issued call without waking the owner.
-    /// - `Navigation` (`navigate`/`new_tab`/`switch_tab`): never ask. Public
+    /// - Opening a site on this computer: ask once per site, in every kind of
+    ///   session, unless the owner already let this session open it.
+    /// - Other `Navigation` (`navigate`/`new_tab`/`switch_tab`): never ask. Public
     ///   HTTP(S) targets are validated against network/private-host policy before
     ///   this gate, while tab-only operations have no external side effect.
     /// - Ordinary mutation: session-level only. Allowed without asking once
     ///   the session is approved; otherwise ask.
     async fn approval_need(&self, args: &ActionArgs<'_>) -> BrowserApproval {
+        if let Some(key) = self.unapproved_local_site(args).await {
+            return BrowserApproval::Ask {
+                request: local_site_request(&key),
+                point_of_action: false,
+            };
+        }
+
         let risk = policy::classify(args.action, args.selector, args.script);
 
         // Free actions: never ask. Navigation reaches this point only after
@@ -811,7 +842,7 @@ impl BrowserTool {
 
     /// The card the kernel sends for a call, judged from the session state
     /// the call will run in. A call `run_action` refuses before its gate (no
-    /// session, a rejected script, a blocked navigation target) asks nothing.
+    /// session, a rejected script, a target that cannot be approved) asks nothing.
     async fn kernel_approval_need(
         &self,
         arguments: &Value,
@@ -867,6 +898,40 @@ impl BrowserTool {
         Ok((page, guard))
     }
 
+    /// The shared network policy, plus the local sites the owner let this
+    /// session open.
+    async fn check_network(
+        &self,
+        session_id: &str,
+        url: &str,
+    ) -> Result<(), policy::BlockedRequest> {
+        let Err(blocked) = policy::validate_network_url(url) else {
+            return Ok(());
+        };
+        if blocked.is_loopback() {
+            if let Some(key) = policy::local_site_key(url) {
+                if self.sessions.is_local_site_approved(session_id, &key).await {
+                    return Ok(());
+                }
+            }
+        }
+        Err(blocked)
+    }
+
+    /// The local site this call would open that the owner has not approved
+    /// for this session.
+    async fn unapproved_local_site(&self, args: &ActionArgs<'_>) -> Option<String> {
+        if !matches!(args.action, "navigate" | "new_tab") {
+            return None;
+        }
+        let key = policy::local_site_key(args.url?)?;
+        (!self
+            .sessions
+            .is_local_site_approved(args.session_id, &key)
+            .await)
+            .then_some(key)
+    }
+
     /// Defense-in-depth gate for observation/JS actions: read the page's LIVE
     /// committed URL and re-validate it against the shared private-network policy
     /// BEFORE reading/capturing/evaluating any page content.
@@ -883,9 +948,13 @@ impl BrowserTool {
     ///
     /// On block, returns a structured host-CLASS error only — never the URL,
     /// path, query, or any embedded credentials.
-    async fn ensure_current_url_allowed(&self, page: &Arc<dyn PageHandle>) -> Result<(), String> {
+    async fn ensure_current_url_allowed(
+        &self,
+        page: &Arc<dyn PageHandle>,
+        session_id: &str,
+    ) -> Result<(), String> {
         if let Some(current_url) = page.url().await {
-            if let Err(blocked) = policy::validate_network_url(&current_url) {
+            if let Err(blocked) = self.check_network(session_id, &current_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "observation/JS action refused: current page is on a blocked host"
@@ -908,7 +977,7 @@ impl BrowserTool {
         // Pre-flight SSRF check on the requested URL. The error names ONLY the
         // host class (loopback/private/link-local) — never the URL, path,
         // query, or credentials — via the shared policy seam.
-        if let Err(blocked) = policy::validate_network_url(url) {
+        if let Err(blocked) = self.check_network(session_id, url).await {
             return Err(blocked.message());
         }
 
@@ -940,7 +1009,7 @@ impl BrowserTool {
         // which may carry a path/query/token.
         let final_url = page.url().await;
         if let Some(final_url) = final_url.as_deref() {
-            if let Err(blocked) = policy::validate_network_url(final_url) {
+            if let Err(blocked) = self.check_network(session_id, final_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "navigation landed on a blocked host after redirect; blocking"
@@ -981,7 +1050,7 @@ impl BrowserTool {
 
         // Defense-in-depth: refuse to capture if the live committed URL is a
         // blocked host (e.g. reached via post-load JS-redirect/meta-refresh).
-        self.ensure_current_url_allowed(&page).await?;
+        self.ensure_current_url_allowed(&page, session_id).await?;
 
         let selector = args.get("selector").and_then(|v| v.as_str());
         // Default to a VIEWPORT capture; full-page must be opted into explicitly.
@@ -1332,7 +1401,7 @@ impl BrowserTool {
         // A same-tab click may have navigated. Refresh the last-known URL so a
         // later point-of-action prompt names the actual site origin.
         if let Some(current_url) = page.url().await {
-            if policy::validate_network_url(&current_url).is_ok() {
+            if self.check_network(session_id, &current_url).await.is_ok() {
                 self.sessions
                     .update_active_tab_url(session_id, current_url)
                     .await;
@@ -1436,7 +1505,7 @@ impl BrowserTool {
 
         // Defense-in-depth: refuse to read if the live committed URL is a blocked
         // host (e.g. reached via post-load JS-redirect/meta-refresh).
-        self.ensure_current_url_allowed(&page).await?;
+        self.ensure_current_url_allowed(&page, session_id).await?;
 
         let text = if let Some(selector) = args.get("selector").and_then(|v| v.as_str()) {
             page.inner_text(selector).await?
@@ -1461,7 +1530,7 @@ impl BrowserTool {
     /// script execution behind point-of-action approval.
     async fn action_inspect_page(&self, session_id: &str) -> Result<String, String> {
         let (page, _guard) = self.page_for(session_id).await?;
-        self.ensure_current_url_allowed(&page).await?;
+        self.ensure_current_url_allowed(&page, session_id).await?;
 
         let result = page.evaluate(INSPECT_PAGE_SCRIPT).await?;
         let value_str = match result {
@@ -1511,14 +1580,14 @@ impl BrowserTool {
         // This runs AFTER the approval gate (which fires in `call()` before
         // dispatch) but BEFORE the script is evaluated, so an approved execute_js
         // still cannot read out a private host the page redirected to post-load.
-        self.ensure_current_url_allowed(&page).await?;
+        self.ensure_current_url_allowed(&page, session_id).await?;
 
         let result = page.evaluate(script).await?;
 
         // Arbitrary JavaScript can change `location`. Preserve the last observed
         // public URL so the next approval prompt names the resulting origin.
         if let Some(current_url) = page.url().await {
-            if policy::validate_network_url(&current_url).is_ok() {
+            if self.check_network(session_id, &current_url).await.is_ok() {
                 self.sessions
                     .update_active_tab_url(session_id, current_url)
                     .await;
@@ -1951,7 +2020,7 @@ impl BrowserTool {
         let url = args.get("url").and_then(|v| v.as_str());
         if let Some(url) = url {
             // Pre-flight SSRF check (host class only — no URL/secret leak).
-            if let Err(blocked) = policy::validate_network_url(url) {
+            if let Err(blocked) = self.check_network(session_id, url).await {
                 return Err(blocked.message());
             }
         }
@@ -1975,7 +2044,7 @@ impl BrowserTool {
         // does, so a redirect to a blocked host can't leave a live tab pointed
         // at an internal address. Close the tab and report the host class only.
         if let Some(ref final_url) = current_url {
-            if let Err(blocked) = policy::validate_network_url(final_url) {
+            if let Err(blocked) = self.check_network(session_id, final_url).await {
                 warn!(
                     class = blocked.class.label(),
                     "new tab landed on a blocked host after redirect; closing"
@@ -2108,11 +2177,14 @@ impl BrowserTool {
                 ));
             }
             if let Some(url) = url {
-                if let Err(blocked) = policy::validate_network_url(url) {
-                    return Ok(DispatchResult::text_only(format!(
-                        "Error: {}",
-                        blocked.message()
-                    )));
+                if let Err(blocked) = self.check_network(session_id, url).await {
+                    // A local site goes on to the owner's approval gate.
+                    if policy::local_site_key(url).is_none() {
+                        return Ok(DispatchResult::text_only(format!(
+                            "Error: {}",
+                            blocked.message()
+                        )));
+                    }
                 }
             }
         }
@@ -2181,6 +2253,21 @@ impl Tool for BrowserTool {
         if matches!(response, ApprovalResponse::Deny) {
             return;
         }
+        let local_site = Self::action_args(
+            call.arguments,
+            facts.session_id.as_str(),
+            facts.trusted_session,
+        );
+        if let Some(args) = local_site {
+            if let Some(key) = self.unapproved_local_site(&args).await {
+                let expires_at = matches!(response, ApprovalResponse::AllowOnce)
+                    .then(|| tokio::time::Instant::now() + LOCAL_SITE_ONCE);
+                self.sessions
+                    .approve_local_site(args.session_id, key, expires_at)
+                    .await;
+                return;
+            }
+        }
         let Some((request, point_of_action)) =
             self.kernel_approval_need(call.arguments, facts).await
         else {
@@ -2196,7 +2283,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a persistent browser for JavaScript/login-required pages and interactive website tasks. For readable public research, prefer web_search/web_fetch; use browser when those cannot access the content. Validated public navigation and read-only inspection do not require approval; page mutations may require approval, and execute_js always requires one-time approval. Use only opaque tab IDs returned by the tool."
+        "Control a persistent browser for JavaScript/login-required pages and interactive website tasks. For readable public research, prefer web_search/web_fetch; use browser when those cannot access the content. Validated public navigation and read-only inspection do not require approval; opening a site on this computer asks the owner once per site; page mutations may require approval, and execute_js always requires one-time approval. Use only opaque tab IDs returned by the tool."
     }
 
     fn schema(&self) -> Value {

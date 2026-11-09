@@ -40,7 +40,7 @@
 #![allow(dead_code)]
 
 use crate::agent::keyword_match;
-use crate::tools::web_fetch::{classify_blocked_host, BlockedHostClass};
+use crate::tools::web_fetch::{classify_blocked_host, resolves_only_to_loopback, BlockedHostClass};
 
 // ─── Network policy glue (SSRF) ─────────────────────────────────────────────────
 //
@@ -64,6 +64,11 @@ impl BlockedRequest {
     pub fn message(self) -> String {
         format!("Navigation blocked: target is a {}", self.class.label())
     }
+
+    /// Only a loopback target can be opened with the owner's approval.
+    pub fn is_loopback(self) -> bool {
+        self.class == BlockedHostClass::Loopback
+    }
 }
 
 /// Validate a URL against the shared private-network policy.
@@ -80,6 +85,29 @@ pub fn validate_network_url(url: &str) -> Result<(), BlockedRequest> {
     match classify_blocked_host(url) {
         None => Ok(()),
         Some(class) => Err(BlockedRequest { class }),
+    }
+}
+
+/// What the owner approves to let the browser open a site on this computer,
+/// or `None` when `url` is not loopback-only (public, private network,
+/// metadata and malformed targets are never approvable). A dev site's name
+/// is its own key; `localhost` and IP literals are shared by every local
+/// service, so their key includes the port.
+pub fn local_site_key(url: &str) -> Option<String> {
+    if !resolves_only_to_loopback(url) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    let shared_name = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok();
+    if shared_name {
+        Some(format!("{host}:{}", parsed.port_or_known_default()?))
+    } else {
+        Some(host)
     }
 }
 

@@ -4823,3 +4823,161 @@ fn browser_effects_declare_navigation_hosts() {
         CallEffects::unknown()
     );
 }
+
+fn local_navigate(url: &str) -> String {
+    json!({ "action": "navigate", "url": url }).to_string()
+}
+
+#[tokio::test]
+async fn local_site_card_lets_the_session_open_that_site_only() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    let facts = || crate::testing::call_facts("sess-a");
+
+    tool.call_with(
+        &local_navigate("http://127.0.0.1:8080/login?token=SECRET"),
+        facts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1, "first open asks");
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("http://127.0.0.1:8080/login?token=SECRET".to_string())
+        )
+        .await
+    );
+    let card = recorder.commands.lock().await[0].clone();
+    assert!(card.contains("127.0.0.1:8080"), "{card}");
+    assert!(
+        !card.contains("SECRET") && !card.contains("/login"),
+        "{card}"
+    );
+
+    tool.call_with(&local_navigate("http://127.0.0.1:8080/other"), facts())
+        .await
+        .unwrap();
+    assert_eq!(recorder.count().await, 1, "same site does not ask again");
+
+    tool.call_with(&local_navigate("http://127.0.0.1:9090/"), facts())
+        .await
+        .unwrap();
+    assert_eq!(recorder.count().await, 2, "another local port asks");
+
+    assert!(
+        !tool.sessions.is_session_approved("sess-a").await,
+        "a local-site answer must not approve page mutations"
+    );
+}
+
+#[tokio::test]
+async fn declined_local_site_never_reaches_the_backend() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    tool.call_with(
+        &local_navigate("http://localhost:3000/"),
+        crate::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recorder.count().await, 1);
+    assert!(
+        !calls_contains(
+            &backend,
+            &MockCall::Goto("http://localhost:3000/".to_string())
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn local_site_cannot_be_opened_without_the_owner() {
+    let backend = MockBackend::new();
+    let (tool, backend, _recorder) = approving_tool(backend, ApprovalResponse::AllowSession);
+    let out = tool
+        .tool
+        .call_with_execution_context(
+            &local_navigate("http://localhost:3000/"),
+            None,
+            crate::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap()
+        .output;
+
+    assert!(out.contains("Approval required"), "{out}");
+    assert!(
+        !calls_contains(
+            &backend,
+            &MockCall::Goto("http://localhost:3000/".to_string())
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn private_network_and_metadata_targets_get_no_card() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    for url in [
+        "http://10.0.0.5/",
+        "http://169.254.169.254/latest/meta-data",
+    ] {
+        let out = tool
+            .call_with(&local_navigate(url), crate::testing::call_facts("sess-a"))
+            .await
+            .unwrap();
+        assert!(out.to_lowercase().contains("block"), "{out}");
+        assert!(!calls_contains(&backend, &MockCall::Goto(url.to_string())).await);
+    }
+    assert_eq!(recorder.count().await, 0);
+}
+
+#[test]
+fn local_site_key_scopes_shared_names_by_port() {
+    use super::policy::local_site_key;
+    assert_eq!(
+        local_site_key("http://localhost:3000/x").as_deref(),
+        Some("localhost:3000")
+    );
+    assert_eq!(
+        local_site_key("https://127.0.0.1/").as_deref(),
+        Some("127.0.0.1:443")
+    );
+    assert_eq!(
+        local_site_key("https://shop.localhost:8443/a?b=c").as_deref(),
+        Some("shop.localhost")
+    );
+    assert_eq!(local_site_key("http://10.0.0.5/"), None);
+    assert_eq!(local_site_key("http://169.254.169.254/"), None);
+    assert_eq!(local_site_key("file:///etc/hosts"), None);
+}
+
+#[tokio::test]
+async fn expired_local_site_approval_no_longer_counts() {
+    let sessions = super::session::BrowserSessionRegistry::default();
+    let past = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+    sessions
+        .approve_local_site("sess-a", "site.localhost".to_string(), Some(past))
+        .await;
+    assert!(
+        !sessions
+            .is_local_site_approved("sess-a", "site.localhost")
+            .await
+    );
+    sessions
+        .approve_local_site("sess-a", "site.localhost".to_string(), None)
+        .await;
+    assert!(
+        sessions
+            .is_local_site_approved("sess-a", "site.localhost")
+            .await
+    );
+    assert!(
+        !sessions
+            .is_local_site_approved("sess-b", "site.localhost")
+            .await
+    );
+}

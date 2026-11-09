@@ -87,6 +87,9 @@ pub struct BrowserSessionRegistry {
     /// are re-prompted every call. Kept in its own map so it survives even when a
     /// session's last tab is closed.
     approvals: Mutex<HashMap<String, bool>>,
+    /// Sites on this computer the owner let each session open, by
+    /// `policy::local_site_key`; `None` lasts until the session is evicted.
+    local_sites: Mutex<HashMap<String, HashMap<String, Option<Instant>>>>,
 }
 
 /// A tab as surfaced to the tool/LLM: opaque id, title, raw URL (the tool
@@ -124,6 +127,7 @@ impl BrowserSessionRegistry {
         Self {
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
+            local_sites: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,6 +150,31 @@ impl BrowserSessionRegistry {
             .lock()
             .await
             .insert(session_id.to_string(), true);
+    }
+
+    /// Whether the owner has let this session open the local site `key`.
+    pub async fn is_local_site_approved(&self, session_id: &str, key: &str) -> bool {
+        self.local_sites
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|sites| sites.get(key))
+            .is_some_and(|expires| expires.is_none_or(|at| Instant::now() < at))
+    }
+
+    /// Let this session open the local site `key`, until `expires_at` if set.
+    pub async fn approve_local_site(
+        &self,
+        session_id: &str,
+        key: String,
+        expires_at: Option<Instant>,
+    ) {
+        self.local_sites
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(key, expires_at);
     }
 
     /// Update the cached URL for this session's active tab after an action has
@@ -481,6 +510,11 @@ impl BrowserSessionRegistry {
             let mut approvals = self.approvals.lock().await;
             for ev in &evicted {
                 approvals.remove(&ev.session_id);
+            }
+            drop(approvals);
+            let mut local_sites = self.local_sites.lock().await;
+            for ev in &evicted {
+                local_sites.remove(&ev.session_id);
             }
         }
 
