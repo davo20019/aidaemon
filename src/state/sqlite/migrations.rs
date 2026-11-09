@@ -2833,6 +2833,39 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         tracing::warn!(%error, "SQLite FTS5 unavailable; exact history search disabled");
     }
 
+    // Written last, so a start that failed above records nothing.
+    record_state_version(pool, STATE_BASELINE_VERSION, "unversioned_baseline").await?;
+
+    Ok(())
+}
+
+/// Everything `migrate_state` does above this record: steps written before
+/// versions existed. They stay idempotent and keep running on every start,
+/// because a database gives no way to tell which of them it has seen.
+const STATE_BASELINE_VERSION: i64 = 1;
+
+/// Record that a state schema version has been applied.
+///
+/// A new step that cannot be made idempotent takes the next version: it runs
+/// once when that version is absent here, in a transaction that also records
+/// it. Existing steps are never moved behind a version. The table is not the
+/// SDK store's `schema_migrations`, which lives in the same database file and
+/// counts its own migrations.
+async fn record_state_version(pool: &SqlitePool, version: i64, name: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS state_schema_versions (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("INSERT OR IGNORE INTO state_schema_versions (version, name) VALUES (?, ?)")
+        .bind(version)
+        .bind(name)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -3161,5 +3194,200 @@ mod mandate_ledger_upgrade_tests {
             .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod state_version_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::collections::BTreeMap;
+
+    const VERSION_TABLE: &str = "state_schema_versions";
+
+    async fn open(path: &std::path::Path) -> SqlitePool {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap()
+    }
+
+    /// Every stored object's DDL and every table's rows, without the version
+    /// table this change adds.
+    async fn snapshot(pool: &SqlitePool) -> BTreeMap<String, Vec<String>> {
+        let objects = sqlx::query(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND tbl_name <> ?",
+        )
+        .bind(VERSION_TABLE)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        // A full-text index's shadow tables hold segment counters that the
+        // existing steps' rebuilds advance on every start; they are a
+        // projection of rows compared elsewhere, not stored data.
+        let virtual_tables: Vec<String> = objects
+            .iter()
+            .filter(|o| {
+                o.get::<Option<String>, _>("sql")
+                    .is_some_and(|sql| sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL"))
+            })
+            .map(|o| format!("{}_", o.get::<String, _>("name")))
+            .collect();
+        let mut seen = BTreeMap::new();
+        for object in objects {
+            let kind: String = object.get("type");
+            let name: String = object.get("name");
+            let sql = object.get::<Option<String>, _>("sql").unwrap_or_default();
+            let has_rows = kind == "table"
+                && !sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL")
+                && !virtual_tables.iter().any(|prefix| name.starts_with(prefix));
+            seen.insert(format!("ddl:{kind}:{name}"), vec![sql]);
+            if !has_rows {
+                continue;
+            }
+            let columns = sqlx::query(&format!("PRAGMA table_info(\"{name}\")"))
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            let select = columns
+                .iter()
+                .map(|c| format!("quote(\"{}\")", c.get::<String, _>("name")))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            let mut rows: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT {select} FROM \"{name}\""))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+            rows.sort();
+            seen.insert(format!("rows:{name}"), rows);
+        }
+        seen
+    }
+
+    async fn recorded(pool: &SqlitePool) -> Vec<(i64, String, String)> {
+        sqlx::query(&format!(
+            "SELECT version, name, applied_at FROM {VERSION_TABLE} ORDER BY version"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get("version"), row.get("name"), row.get("applied_at")))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_versions_upgrades_with_no_data_change() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = open(database.path()).await;
+
+        // A current database as the previous release left it: rows from real
+        // use, then that release's own start, and no version record.
+        migrate_state(&pool).await.unwrap();
+        for statement in [
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('telegram:synthetic-user-1', 'user_message',
+                     '{\"content\":\"Book the Acme Corp review, Alice Rivera\"}',
+                     '2026-10-01T09:00:00Z')",
+            "INSERT INTO terminal_allowed_prefixes (prefix, created_at)
+             VALUES ('git status', '2026-10-01 09:00:01')",
+            "INSERT INTO settings (key, value) VALUES ('synthetic_setting', 'kept')",
+            "INSERT INTO session_context_boundaries (session_id, cleared_after_id, cleared_at)
+             VALUES ('telegram:synthetic-user-1', 0, '2026-10-01T09:00:02Z')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        migrate_state(&pool).await.unwrap();
+        sqlx::query(&format!("DROP TABLE {VERSION_TABLE}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = snapshot(&pool).await;
+        assert_eq!(before["rows:settings"].len(), 1);
+        assert_eq!(before["rows:terminal_allowed_prefixes"].len(), 1);
+        assert!(!before["rows:events"].is_empty());
+
+        migrate_state(&pool).await.unwrap();
+
+        assert_eq!(snapshot(&pool).await, before);
+        let first = recorded(&pool).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, STATE_BASELINE_VERSION);
+
+        // Later starts add nothing and keep the first record.
+        migrate_state(&pool).await.unwrap();
+        assert_eq!(snapshot(&pool).await, before);
+        assert_eq!(recorded(&pool).await, first);
+    }
+
+    #[tokio::test]
+    async fn rows_in_an_old_shaped_table_survive_and_the_version_is_recorded() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = open(database.path()).await;
+
+        // Tables from early releases, before the columns later steps add.
+        for statement in [
+            "CREATE TABLE oauth_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL UNIQUE,
+                auth_type TEXT NOT NULL,
+                username TEXT,
+                scopes TEXT NOT NULL DEFAULT '[]',
+                token_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            "INSERT INTO oauth_connections
+                (service, auth_type, username, scopes, created_at, updated_at)
+             VALUES ('synthetic', 'oauth2_pkce', 'jordan-lee', '[\"read\"]',
+                     '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z')",
+            "CREATE TABLE terminal_allowed_prefixes (
+                prefix TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+            "INSERT INTO terminal_allowed_prefixes (prefix, created_at)
+             VALUES ('cargo test', '2026-01-02 00:00:00')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        migrate_state(&pool).await.unwrap();
+
+        let connection = sqlx::query(
+            "SELECT id, auth_type, username, scopes, created_at, updated_at, account_id
+             FROM oauth_connections WHERE service = 'synthetic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(connection.get::<i64, _>("id"), 1);
+        assert_eq!(connection.get::<String, _>("auth_type"), "oauth2_pkce");
+        assert_eq!(connection.get::<String, _>("username"), "jordan-lee");
+        assert_eq!(connection.get::<String, _>("scopes"), "[\"read\"]");
+        assert_eq!(
+            connection.get::<String, _>("created_at"),
+            "2026-01-02T00:00:00Z"
+        );
+        assert_eq!(
+            connection.get::<String, _>("updated_at"),
+            "2026-01-03T00:00:00Z"
+        );
+        assert!(connection.get::<Option<String>, _>("account_id").is_none());
+        let prefixes: Vec<(String, String)> =
+            sqlx::query_as("SELECT prefix, created_at FROM terminal_allowed_prefixes")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            prefixes,
+            vec![("cargo test".to_string(), "2026-01-02 00:00:00".to_string())]
+        );
+        assert_eq!(recorded(&pool).await.len(), 1);
     }
 }

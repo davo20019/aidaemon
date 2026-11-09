@@ -669,7 +669,10 @@ Independent of the SDK; each is a small PR against `master`.
       named `{server}__{tool}`. Fixed with a typed
       `ToolDispatchFacts::opaque_execution` that MCP tools declare;
       `mandates::is_non_delegable(tool)` reads it.
-- [ ] State migrations have no version table.
+- [x] State migrations have no version table. `state_schema_versions` now
+      records the unversioned baseline as version 1 after every existing step
+      has run; those steps are unchanged and still run on each start. New
+      steps that cannot be idempotent take the next version.
 
 ## Known issues
 
