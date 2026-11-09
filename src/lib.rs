@@ -519,15 +519,12 @@ fn handle_memory_export_command(args: &[String], default_config_path: &Path) -> 
     let Some(directory) = directory else {
         anyhow::bail!("Usage: aidaemon memory-export DIR [--config PATH]");
     };
+    let _ = dotenvy::dotenv();
     let config = config::AppConfig::load(&config_path)?;
     let written = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(crate::core::run_memory_export(
-            config,
-            config_path.clone(),
-            directory.clone(),
-        ))?;
+        .block_on(crate::core::run_memory_export(config, directory.clone()))?;
     for (name, entries) in written {
         println!("{name}: {entries} entries");
     }

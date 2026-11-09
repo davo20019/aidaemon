@@ -516,22 +516,41 @@ async fn shutdown_signal() {
 }
 
 /// Write a readable copy of the daemon's memory to `directory`. The directory
-/// must not exist yet, and only the owner can read what is written.
+/// must not exist yet, and only the owner can read what is written. The
+/// database is opened read-only, so this is safe while the daemon runs.
 pub async fn run_memory_export(
-    mut config: AppConfig,
-    config_path: std::path::PathBuf,
+    config: AppConfig,
     directory: std::path::PathBuf,
 ) -> anyhow::Result<Vec<(String, usize)>> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
-    let state = crate::state::SqliteStateStore::new(
-        &config.state.db_path,
-        config.state.working_memory_cap,
-        config.state.encryption_key.as_deref(),
+
+    let key = config
+        .state
+        .encryption_key
+        .clone()
+        .or_else(|| std::env::var("AIDAEMON_ENCRYPTION_KEY").ok())
+        .filter(|key| !key.trim().is_empty());
+    let mut options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&config.state.db_path)
+        .read_only(true)
+        .busy_timeout(std::time::Duration::from_secs(30));
+    #[cfg(feature = "encryption")]
+    if let Some(key) = &key {
+        options = options.pragma("key", format!("'{}'", key.trim().replace('\'', "''")));
+    }
+    #[cfg(not(feature = "encryption"))]
+    let _ = key;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let files = aidaemon_memory::sqlite::SqliteMemory::new(
+        pool,
         Arc::new(crate::memory::embeddings::EmbeddingService::new()?),
     )
+    .export_readable()
     .await?;
-    let files = state.memory().export_readable().await?;
+
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)
@@ -881,6 +900,48 @@ api_key = "test"
 primary = "gpt-4o"
 "#,
         )
+    }
+
+    /// The export runs beside a live daemon: it must not need the write lock.
+    #[tokio::test]
+    async fn memory_export_works_while_the_database_is_being_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let state = crate::state::SqliteStateStore::new(
+            db.to_str().unwrap(),
+            100,
+            None,
+            Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut writer = state.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let mut config = minimal_config();
+        config.state.db_path = db.to_str().unwrap().to_string();
+        config.state.encryption_key = None;
+        let output = dir.path().join("export");
+
+        let written = run_memory_export(config.clone(), output.clone())
+            .await
+            .unwrap();
+
+        assert!(written.iter().any(|(name, _)| name == "facts.md"));
+        let mode = std::fs::metadata(output.join("facts.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(
+            run_memory_export(config, output).await.is_err(),
+            "never writes into an existing directory"
+        );
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
     }
 
     #[test]
