@@ -260,10 +260,14 @@ impl SqliteStore {
     }
 
     /// Runs paused on an interruption (`pending` set). Settle each with
-    /// `Agent::resume`.
+    /// `Agent::resume`. A child run is not listed: it was started by its
+    /// parent's tool call, and an answer reaches it through the parent, whose
+    /// state holds it. Resuming its own row would run it behind the parent's
+    /// back and again when the parent resumes.
     pub async fn interrupted_runs(&self) -> Result<Vec<RunState>, Error> {
         self.states_where(
-            "json_extract(state, '$.pending') IS NOT NULL",
+            "json_extract(state, '$.pending') IS NOT NULL \
+             AND json_extract(state, '$.parent_run') IS NULL",
             None,
             false,
             None,

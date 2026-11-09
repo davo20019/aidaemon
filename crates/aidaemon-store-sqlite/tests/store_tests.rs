@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{
-    Agent, CancellationToken, Event, Hook, HookContext, ReceiptStatus, Resolution, RunId,
-    RunStatus, RunStore, Tool, ToolAnnotations, ToolCall, ToolContext, ToolDecision, ToolInfo,
-    ToolOutput, ToolResult, ToolSpec,
+    Agent, CancellationToken, Event, Hook, HookContext, InterruptKind, Interruption, Pending,
+    ReceiptStatus, Resolution, RunId, RunState, RunStatus, RunStore, Tool, ToolAnnotations,
+    ToolCall, ToolContext, ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
 };
 use aidaemon_store_sqlite::{latest_version, Error, SqliteStore};
 use async_trait::async_trait;
@@ -432,6 +432,38 @@ async fn erase_session_without_a_journal_is_a_no_op() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_paused_parent_keeps_its_child_and_only_the_parent_is_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(db_path(&dir)).await.unwrap();
+
+    let pending = |call: &str, child: Option<RunState>| Pending {
+        calls: vec![ToolCall::new(call, "send", json!({}))],
+        next: 0,
+        interruption: Interruption {
+            call: ToolCall::new("k1", "send", json!({})),
+            reason: "the owner must confirm".to_string(),
+            kind: InterruptKind::default(),
+        },
+        hook_index: None,
+        hook_chain: Vec::new(),
+        child: child.map(Box::new),
+    };
+    let mut parent = RunState::new("parent", "telegram:synthetic-user-1", "go");
+    let mut child = RunState::new("child", "telegram:synthetic-user-1/sub/c1", "task")
+        .with_parent(parent.run_id);
+    child.pending = Some(pending("k1", None));
+    parent.pending = Some(pending("c1", Some(child.clone())));
+    store.upsert_state(&child).await.unwrap();
+    store.upsert_state(&parent).await.unwrap();
+
+    let mut listed = store.interrupted_runs().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let listed = listed.pop().unwrap();
+    assert_eq!(listed, parent);
+    assert_eq!(listed.waiting_run().unwrap().run_id, child.run_id);
 }
 
 #[tokio::test]
