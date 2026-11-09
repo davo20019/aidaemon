@@ -25,11 +25,6 @@ use crate::tasks::{QueueOutcome, QueuedMessage};
 use crate::traits::MessageAttachment;
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
-/// Longest a single turn may work, whatever the heartbeat says. Time waiting
-/// for the owner to answer a card does not count.
-const TURN_WALL_CLOCK: Duration = Duration::from_secs(20 * 60);
-/// How often the turn limit looks at the clock again.
-const TURN_LIMIT_CHECK: Duration = Duration::from_secs(1);
 /// Least time between two ordinary status messages.
 const STATUS_INTERVAL: Duration = Duration::from_secs(3);
 const CANCELLED: &str = "Task cancelled";
@@ -125,35 +120,15 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
     }
 }
 
-/// Resolves once the turn has worked for `limit`, not counting the time its
-/// cards waited for the owner.
-async fn turn_limit_reached(limit: Duration, owner_wait: &crate::tools::OwnerWaitClock) {
-    crate::tools::WorkDeadline::starting_now(limit, owner_wait.clone())
-        .reached(TURN_LIMIT_CHECK)
-        .await;
-}
-
 /// Runs turns for one channel (bot).
 #[derive(Clone)]
 pub(crate) struct TurnRunner {
     deps: ChannelRuntimeDeps,
-    /// Longest one turn may run ([`TURN_WALL_CLOCK`]).
-    wall_clock: Duration,
 }
 
 impl TurnRunner {
     pub(crate) fn new(deps: ChannelRuntimeDeps) -> Self {
-        Self {
-            deps,
-            wall_clock: TURN_WALL_CLOCK,
-        }
-    }
-
-    /// A runner whose turns get `limit` instead of [`TURN_WALL_CLOCK`].
-    #[cfg(test)]
-    pub(crate) fn with_wall_clock(mut self, limit: Duration) -> Self {
-        self.wall_clock = limit;
-        self
+        Self { deps }
     }
 
     /// Remember that `session_id` belongs to `channel_name`, so outbound
@@ -316,11 +291,6 @@ impl TurnRunner {
                         stale_mins,
                         if stale_mins == 1 { "" } else { "s" }
                     ))
-                },
-                _ = turn_limit_reached(self.wall_clock, &owner_wait) => {
-                    let minutes = self.wall_clock.as_secs() / 60;
-                    tracing::error!(session_id = %session_id, minutes, "Task hit its hard wall-clock limit");
-                    Err(anyhow::anyhow!("Task exceeded maximum wall-clock time ({minutes} minutes). This may indicate a hang."))
                 },
             };
             working.cancel();
@@ -735,86 +705,6 @@ mod tests {
         };
         assert_eq!(status(&finite).await, "cancelled");
         assert_ne!(status(&recurring).await, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn a_queued_turn_gets_its_own_wall_clock() {
-        // Each turn takes most of the limit; together they exceed it.
-        let provider = MockProvider::with_delayed_responses(
-            vec![
-                MockProvider::text_response("first done"),
-                MockProvider::text_response("second done"),
-            ],
-            vec![Duration::from_millis(600), Duration::from_millis(600)],
-        );
-        let mut harness = setup_test_agent(provider).await.unwrap();
-        let agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> =
-            Arc::new(std::mem::replace(
-                &mut harness.agent,
-                setup_test_agent(MockProvider::new()).await.unwrap().agent,
-            ));
-        let inbox = tempfile::tempdir().unwrap().keep();
-        let registry = Arc::new(crate::tasks::TaskRegistry::new(50));
-        let mut runner = TurnRunner::new(ChannelRuntimeDeps {
-            agent,
-            config_path: inbox.join("config.toml"),
-            session_map: Arc::default(),
-            task_registry: registry.clone(),
-            files_enabled: false,
-            inbox_dir: inbox,
-            max_file_size_mb: 10,
-            state: harness.state.clone(),
-            watchdog_stale_threshold_secs: 0,
-        });
-        runner.wall_clock = Duration::from_millis(1000);
-        let surface = Arc::new(Recording::default());
-
-        runner.submit(surface.clone(), turn("first", "m1")).await;
-        while !registry.has_running_task("test:wall-clock").await {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        runner.submit(surface.clone(), turn("second", "m2")).await;
-
-        let said = || surface.0.lock().unwrap().clone();
-        for _ in 0..500 {
-            if said()
-                .iter()
-                .any(|s| s.contains("second done") || s.starts_with("Error"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let said = said();
-        assert!(said.iter().any(|s| s.contains("first done")), "{said:?}");
-        assert!(said.iter().any(|s| s.contains("second done")), "{said:?}");
-        assert!(!said.iter().any(|s| s.contains("wall-clock")), "{said:?}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn time_waiting_for_the_owner_does_not_use_up_the_turn() {
-        use crate::tools::OwnerWaitClock;
-        let clock = OwnerWaitClock::default();
-        let limit = Duration::from_secs(60);
-        let reached = tokio::spawn({
-            let clock = clock.clone();
-            async move { turn_limit_reached(limit, &clock).await }
-        });
-        OwnerWaitClock::within(Some(clock.clone()), async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let waiting = OwnerWaitClock::begin_waiting();
-            tokio::time::sleep(Duration::from_secs(600)).await;
-            assert!(!reached.is_finished(), "a wait on the owner used the limit");
-            drop(waiting);
-            tokio::time::sleep(Duration::from_secs(29)).await;
-            assert!(
-                !reached.is_finished(),
-                "fired before the turn used its limit"
-            );
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            assert!(reached.is_finished(), "the limit never fired");
-        })
-        .await;
     }
 
     #[test]

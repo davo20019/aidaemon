@@ -674,52 +674,6 @@ fn card_runner(
     (runner, registry)
 }
 
-/// The goal card's 30 minutes against the turn's 20, through the real turn
-/// runner and kernel approval path (scaled down, same order): a card that
-/// outlasts the turn limit does not kill the turn, and the run goes on once
-/// the card expires.
-#[tokio::test]
-async fn a_card_outlasting_the_turn_limit_does_not_kill_the_turn() {
-    let (port, sent) = spawn_approvals_server().await;
-    let url = format!("http://localhost:{port}/report");
-    let (harness, approver) = approvals_harness(
-        vec![
-            http_call("POST", &url, Some("report")),
-            MockProvider::text_response("Nothing was sent."),
-        ],
-        vec![None],
-        Some(std::time::Duration::from_secs(4)),
-    )
-    .await;
-    let state = harness.state.clone();
-    let (runner, _registry) = card_runner(harness.agent, state);
-    let runner = runner.with_wall_clock(std::time::Duration::from_secs(2));
-    let surface = Arc::new(SaidInChat::default());
-
-    let started = std::time::Instant::now();
-    runner.submit(surface.clone(), card_turn("m1")).await;
-    let said = || surface.0.lock().unwrap().clone();
-    for _ in 0..2000 {
-        if said()
-            .iter()
-            .any(|s| s.contains("Nothing was sent") || s.contains("wall-clock"))
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let said = said();
-    assert!(!said.iter().any(|s| s.contains("wall-clock")), "{said:?}");
-    assert!(
-        said.iter().any(|s| s.contains("Nothing was sent")),
-        "{said:?}"
-    );
-    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
-    assert_eq!(approver.card_count(), 1);
-    assert_eq!(requests_sent(&sent), 0);
-}
-
 /// A turn stopped while its card is open closes the delivered card (through
 /// the durable broker), which is what makes the channel expire it.
 #[tokio::test]

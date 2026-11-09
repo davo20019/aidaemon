@@ -327,7 +327,7 @@ Order:
       redirects. `track_requirements` stays in the daemon: it feeds the
       receipts ledger, and the crate's `Checklist` is an in-memory list.
       Left: step 10, and passing `PathClassifier` instead of the static.
-- [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
+- [x] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
       Done 2026-11-08: destructive deletes. `irreversible_delete_reason`
