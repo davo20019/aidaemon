@@ -841,3 +841,53 @@ async fn test_executor_spawn_persists_needs_approval_blocker_result() {
         Some("needs_approval")
     );
 }
+
+async fn plain_spawn_call(specialist: Option<&str>) -> (Vec<String>, String) {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("child finished")]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let provider_log = harness.provider.clone();
+    let agent = Arc::new(harness.agent);
+
+    agent
+        .spawn_child(
+            "synthetic mission",
+            "synthetic task",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            None,
+            None,
+            None,
+            None,
+            specialist,
+        )
+        .await
+        .unwrap();
+
+    let calls = provider_log.call_log.lock().await;
+    let last = calls.last().expect("the child called the model");
+    (
+        extract_tool_names(&last.tools),
+        format!("{:?}", last.messages),
+    )
+}
+
+#[tokio::test]
+async fn test_plain_spawn_without_specialist_keeps_the_parent_prompt_alone() {
+    let (_, prompt) = plain_spawn_call(None).await;
+    assert!(!prompt.contains("## Specialist Profile"));
+}
+
+#[tokio::test]
+async fn test_plain_spawn_with_specialist_uses_its_prompt() {
+    let (_, prompt) = plain_spawn_call(Some("code")).await;
+    assert!(prompt.contains("You are a Code specialist."));
+}
+
+#[tokio::test]
+async fn test_review_specialist_prompt_reaches_a_plain_spawn() {
+    let (_, prompt) = plain_spawn_call(Some("review")).await;
+    assert!(prompt.contains("You are a Review specialist."));
+}

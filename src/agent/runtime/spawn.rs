@@ -43,21 +43,95 @@ pub(crate) struct SalvagedTaskOutcome {
     pub details: String,
 }
 
+/// The child's own end record, retrying briefly on SQLite contention. An
+/// error means the record could not be read, which is not the same as the
+/// child having succeeded.
 async fn latest_child_task_end(
     event_store: &crate::events::EventStore,
     child_session: &str,
-) -> Option<TaskEndData> {
-    event_store
-        .query_recent_events(child_session, 30)
-        .await
-        .ok()?
-        .iter()
-        .rev()
-        .find_map(|event| {
-            (event.event_type == EventType::TaskEnd)
-                .then(|| event.parse_data::<TaskEndData>().ok())
-                .flatten()
-        })
+) -> anyhow::Result<Option<TaskEndData>> {
+    const MAX_BUSY_RETRIES: usize = 3;
+    let mut busy_retries = 0_usize;
+    let events = loop {
+        match event_store.query_recent_events(child_session, 30).await {
+            Ok(events) => break events,
+            Err(error) if busy_retries < MAX_BUSY_RETRIES && is_sqlite_busy(&error) => {
+                tokio::time::sleep(Duration::from_millis(25_u64 << busy_retries)).await;
+                busy_retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(events.iter().rev().find_map(|event| {
+        (event.event_type == EventType::TaskEnd)
+            .then(|| event.parse_data::<TaskEndData>().ok())
+            .flatten()
+    }))
+}
+
+/// A child's outcome comes from its own end record. A reply with no readable
+/// record is unverified, so it is never reported as a success.
+fn resolve_child_outcome(
+    replied: bool,
+    record: &anyhow::Result<Option<TaskEndData>>,
+) -> TaskOutcome {
+    match record {
+        Ok(Some(data)) => data.effective_outcome(),
+        _ if replied => TaskOutcome::Partial,
+        _ => TaskOutcome::Failed,
+    }
+}
+
+/// The specialist the caller named on a plain spawn, if it is one a caller
+/// may name.
+fn named_specialist(arg_specialist: Option<&str>) -> Option<SpecialistKind> {
+    arg_specialist
+        .and_then(SpecialistKind::from_str)
+        .filter(|kind| *kind != SpecialistKind::TaskLead)
+}
+
+/// Whether a child gets its own `spawn_agent`. A named specialist is a leaf:
+/// its allowlist would not otherwise cover the tool, which is added after
+/// the allowlist is applied.
+fn child_can_spawn(
+    child_depth: usize,
+    max_depth: usize,
+    role: AgentRole,
+    named_specialist: bool,
+) -> bool {
+    child_depth < max_depth && role != AgentRole::Executor && !named_specialist
+}
+
+/// The system prompt of a plain child: the parent's prompt, the mission and,
+/// when the caller named one, the specialist's own profile.
+fn plain_child_prompt(
+    parent_prompt: &str,
+    child_depth: usize,
+    max_depth: usize,
+    mission: &str,
+    specialist_prompt: Option<&str>,
+) -> String {
+    const NO_SPAWN: &str = "You CANNOT spawn further sub-agents; the `spawn_agent` tool is not \
+         available to you. Complete the task directly.";
+    let depth_note = if child_depth >= max_depth {
+        format!("\nYou are at the maximum sub-agent depth. {NO_SPAWN}")
+    } else if specialist_prompt.is_some() {
+        format!("\n{NO_SPAWN}")
+    } else {
+        String::new()
+    };
+    let mut prompt = format!(
+        "{parent_prompt}\n\n## Sub-Agent Context\n\
+         You are a sub-agent (depth {child_depth}/{max_depth}) spawned to accomplish a specific mission.\n\
+         **Mission:** {mission}\n\n\
+         Focus exclusively on this mission. Be concise. Return your findings/results \
+         directly — they will be consumed by the parent agent.{depth_note}"
+    );
+    if let Some(specialist_prompt) = specialist_prompt {
+        prompt.push_str("\n\n## Specialist Profile\n");
+        prompt.push_str(specialist_prompt);
+    }
+    prompt
 }
 
 fn enforce_child_terminal_outcome(
@@ -1437,22 +1511,6 @@ impl Agent {
         timeout_secs_override: Option<u64>,
         inherited_authority: crate::agent::authority::InheritedAuthority,
     ) -> Arc<Agent> {
-        let spawn_tool = if add_spawn_tool {
-            Some(Arc::new(
-                crate::tools::spawn::SpawnAgentTool::new_deferred(
-                    self.limits.max_response_chars,
-                    self.limits.timeout_secs,
-                )
-                .with_state(self.state.clone()),
-            ))
-        } else {
-            None
-        };
-
-        if let Some(ref spawn_tool) = spawn_tool {
-            tools.push(spawn_tool.clone());
-        }
-
         let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -1460,6 +1518,21 @@ impl Agent {
                 None
             }
         };
+
+        let spawn_tool = if add_spawn_tool {
+            Some(Arc::new(crate::tools::spawn::SpawnAgentTool::for_child(
+                self.limits.max_response_chars,
+                self.limits.timeout_secs,
+                self.state.clone(),
+                hub.clone(),
+            )))
+        } else {
+            None
+        };
+
+        if let Some(ref spawn_tool) = spawn_tool {
+            tools.push(spawn_tool.clone());
+        }
 
         let effective_max_iterations =
             max_iterations_override.unwrap_or(self.limits.max_iterations);
@@ -1973,28 +2046,38 @@ impl Agent {
                 }
             }
         } else {
-            // Legacy behavior: no role scoping
-            let at_max_depth = child_depth >= self.limits.max_depth;
-            let depth_note = if at_max_depth {
-                "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
-                the `spawn_agent` tool is not available to you. Complete the task directly."
-            } else {
-                ""
-            };
-            let prompt = format!(
-                "{}\n\n## Sub-Agent Context\n\
-                You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
-                **Mission:** {}\n\n\
-                Focus exclusively on this mission. Be concise. Return your findings/results \
-                directly — they will be consumed by the parent agent.{}",
-                self.system_prompt, child_depth, self.limits.max_depth, mission, depth_note
+            // No role scoping. A specialist the caller named brings its
+            // own profile on top of the parent's prompt.
+            let specialist_prompt = named_specialist(arg_specialist).map(|kind| {
+                Self::compose_executor_prompt_from_registry(
+                    self.specialists.as_ref(),
+                    kind,
+                    task,
+                    mission,
+                    child_depth,
+                    self.limits.max_depth,
+                    false,
+                    None,
+                    inherited_project_scope,
+                )
+            });
+            let prompt = plain_child_prompt(
+                &self.system_prompt,
+                child_depth,
+                self.limits.max_depth,
+                mission,
+                specialist_prompt.as_deref(),
             );
             (full_tools, prompt, None)
         };
 
         let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
-        let can_spawn =
-            child_depth < self.limits.max_depth && effective_role != AgentRole::Executor;
+        let can_spawn = child_can_spawn(
+            child_depth,
+            self.limits.max_depth,
+            effective_role,
+            child_role.is_none() && named_specialist(arg_specialist).is_some(),
+        );
 
         // For TaskLead, pass goal_id; other roles get no goal context injection.
         let goal_for_child = if effective_role == AgentRole::TaskLead {
@@ -2555,18 +2638,20 @@ impl Agent {
 
         drop(approval_route_guard);
 
-        let child_task_end =
+        let child_end_record =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
-        let child_outcome = child_task_end
-            .as_ref()
-            .map(TaskEndData::effective_outcome)
-            .unwrap_or_else(|| {
-                if result.is_ok() {
-                    TaskOutcome::Succeeded
-                } else {
-                    TaskOutcome::Failed
-                }
-            });
+        let child_outcome = resolve_child_outcome(result.is_ok(), &child_end_record);
+        let child_task_end = match child_end_record {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    child_session = %child_session_for_events,
+                    %error,
+                    "Could not read the child's end record; its outcome is unverified"
+                );
+                None
+            }
+        };
         let mut result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
 
         if self.harness_eval_enabled() {
@@ -2954,8 +3039,78 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// A child that saw untrusted content but could not record it, or
     /// whose record cannot be read, returns an untrusted result.
+    #[test]
+    fn a_reply_with_no_readable_end_record_is_not_a_success() {
+        let unreadable: anyhow::Result<Option<TaskEndData>> =
+            Err(anyhow::anyhow!("database is locked"));
+        assert_eq!(resolve_child_outcome(true, &unreadable), TaskOutcome::Partial);
+        assert_eq!(resolve_child_outcome(true, &Ok(None)), TaskOutcome::Partial);
+        assert_eq!(resolve_child_outcome(false, &Ok(None)), TaskOutcome::Failed);
+    }
+
+    #[test]
+    fn a_named_specialist_is_a_leaf_and_a_plain_child_is_not() {
+        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, false));
+        assert!(!child_can_spawn(1, 3, AgentRole::Orchestrator, true));
+        assert!(!child_can_spawn(3, 3, AgentRole::Orchestrator, false));
+        assert!(!child_can_spawn(1, 3, AgentRole::Executor, false));
+    }
+
+    #[test]
+    fn task_lead_cannot_be_named_on_a_plain_spawn() {
+        assert_eq!(named_specialist(Some("task_lead")), None);
+        assert_eq!(named_specialist(Some("not-a-kind")), None);
+        assert_eq!(named_specialist(None), None);
+        assert_eq!(named_specialist(Some("review")), Some(SpecialistKind::Review));
+    }
+
+    #[test]
+    fn review_specialist_keeps_only_reading_tools() {
+        let registry = SpecialistRegistry::load(None);
+        let declared = registry
+            .get(SpecialistKind::Review)
+            .tools
+            .clone()
+            .expect("review declares its tools");
+        let mut tools: Vec<Arc<dyn Tool>> = ["read_file", "write_file", "edit_file", "terminal"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(crate::testing::MockTool::new(name, "synthetic", "ok")) as Arc<dyn Tool>
+            })
+            .collect();
+        Agent::apply_specialist_tool_allowlist(SpecialistKind::Review, &declared, &mut tools);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    /// A background result from a nested child goes to the chat the work
+    /// answers to, not to the child's own session.
+    #[tokio::test]
+    async fn nested_background_results_go_to_the_chat_the_work_answers_to() {
+        use crate::runtime_ports::ChildAgentRuntime;
+        let provider = crate::testing::MockProvider::new();
+        let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            harness.agent.background_delivery_session("specialist:code:1"),
+            "specialist:code:1",
+            "a root agent answers to its own session"
+        );
+        harness.agent.approval_session_id = Some("telegram:synthetic-user-1".to_string());
+        assert_eq!(
+            harness.agent.background_delivery_session("specialist:code:1"),
+            "telegram:synthetic-user-1"
+        );
+    }
+
     #[test]
     fn a_childs_unrecorded_or_unreadable_taint_fails_closed() {
         use aidaemon_core::SourceTrust::{Trusted, Untrusted};

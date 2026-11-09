@@ -102,6 +102,21 @@ impl SpawnAgentTool {
         }
     }
 
+    /// The tool a child agent uses to delegate further: fully wired, because
+    /// a child's own results reach the chat through the same hub.
+    pub(crate) fn for_child(
+        max_response_chars: usize,
+        timeout_secs: u64,
+        state: Arc<dyn StateStore>,
+        hub: Option<Weak<dyn OutboundRouter>>,
+    ) -> Self {
+        let tool = Self::new_deferred(max_response_chars, timeout_secs).with_state(state);
+        if let Some(hub) = hub {
+            tool.set_hub(hub);
+        }
+        tool
+    }
+
     /// Set state store reference for queued background notifications when direct
     /// channel delivery is unavailable.
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
@@ -552,7 +567,7 @@ impl Tool for SpawnAgentTool {
             return result;
         }
         let session_id = match approval_session_id.as_deref() {
-            Some(id) if !id.is_empty() => id.to_string(),
+            Some(id) if !id.is_empty() => agent.background_delivery_session(id),
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
                 let result = self
@@ -1335,6 +1350,16 @@ mod child_runtime_tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    /// A child's own delegations reach the chat without waiting for the queue.
+    #[tokio::test]
+    async fn a_childs_spawn_tool_has_the_hub() {
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store;
+        let router: Arc<dyn OutboundRouter> = Arc::new(CountingHub::default());
+        let tool = SpawnAgentTool::for_child(100, 30, state, Some(Arc::downgrade(&router)));
+        assert!(tool.get_hub().is_some());
     }
 
     /// A task that merely starts like a delay reaches the child at once and

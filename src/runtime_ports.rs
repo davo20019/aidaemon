@@ -70,6 +70,12 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
 
     async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun>;
 
+    /// The session a background child's result belongs to, given the session
+    /// of the call that spawned it.
+    fn background_delivery_session(&self, call_session: &str) -> String {
+        call_session.to_string()
+    }
+
     async fn salvage_executor_task_outcome(
         &self,
         task_id: &str,

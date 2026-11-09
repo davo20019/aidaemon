@@ -71,6 +71,14 @@ impl ChildAgentRuntime for Agent {
         })
     }
 
+    /// A child answers to the chat its chain started from; its own session
+    /// has no chat to deliver to.
+    fn background_delivery_session(&self, call_session: &str) -> String {
+        self.approval_session_id
+            .clone()
+            .unwrap_or_else(|| call_session.to_string())
+    }
+
     async fn salvage_executor_task_outcome(
         &self,
         task_id: &str,
