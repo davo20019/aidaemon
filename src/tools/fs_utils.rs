@@ -981,26 +981,6 @@ you should NOT modify the test file — implement the module to pass the tests a
     notes.join("")
 }
 
-/// Whether a command mentions a shell operator anywhere, quotes included.
-///
-/// `run_command` runs what passes through a shell after only a prefix check,
-/// so it refuses on any occurrence. This is deliberately not
-/// `aidaemon_policies::contains_shell_operator`: that one skips quoted text,
-/// and `$(...)` and backticks still run inside double quotes.
-pub fn mentions_shell_operator(cmd: &str) -> bool {
-    for ch in [';', '|', '`', '\n'] {
-        if cmd.contains(ch) {
-            return true;
-        }
-    }
-    for op in ["&&", "||", "$(", ">(", "<("] {
-        if cmd.contains(op) {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,19 +1339,6 @@ mod tests {
         assert!(should_skip_dir("target"));
         assert!(!should_skip_dir("src"));
         assert!(!should_skip_dir("lib"));
-    }
-
-    #[test]
-    fn test_mentions_shell_operator() {
-        assert!(mentions_shell_operator("ls; rm"));
-        assert!(mentions_shell_operator("cat | grep"));
-        assert!(mentions_shell_operator("a && b"));
-        assert!(mentions_shell_operator("echo $(cmd)"));
-        assert!(!mentions_shell_operator("cargo build --release"));
-        assert!(!mentions_shell_operator("ls -la /tmp"));
-        // Quotes do not hide an operator from `run_command`.
-        assert!(mentions_shell_operator(r#"ls "$(id)""#));
-        assert!(mentions_shell_operator("ls 'a;b'"));
     }
 
     /// A bound workspace anchors bare relative references even when the daemon

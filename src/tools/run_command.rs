@@ -275,8 +275,20 @@ impl RunCommandTool {
 
         let trimmed = command.trim();
 
+        // A background job gets the more useful refusal.
+        let daemon_hits = detect_daemonization_primitives(trimmed);
+        if !daemon_hits.is_empty() {
+            return Ok(routing_rejection(
+                format!(
+                    "Daemonization primitives are blocked in run_command ({}). Use terminal and explicit owner approval if detached/background execution is truly needed.",
+                    daemon_hits.join(", ")
+                ),
+                "terminal",
+            ));
+        }
+
         // Reject shell operators
-        if fs_utils::mentions_shell_operator(trimmed) {
+        if aidaemon_policies::contains_shell_operator(trimmed) {
             return Ok(routing_rejection(
                 "Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands.".to_string(),
                 "terminal",
@@ -293,17 +305,6 @@ impl RunCommandTool {
                 format!(
                     "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command.\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
                     preview, SAFE_NPM_PREFIX_HINT
-                ),
-                "terminal",
-            ));
-        }
-
-        let daemon_hits = detect_daemonization_primitives(trimmed);
-        if !daemon_hits.is_empty() {
-            return Ok(routing_rejection(
-                format!(
-                    "Daemonization primitives are blocked in run_command ({}). Use terminal and explicit owner approval if detached/background execution is truly needed.",
-                    daemon_hits.join(", ")
                 ),
                 "terminal",
             ));

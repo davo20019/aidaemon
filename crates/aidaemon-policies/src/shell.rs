@@ -551,55 +551,107 @@ pub(crate) fn segment_matches_prefix(segment: &[String], prefix: &[String]) -> b
         })
 }
 
-/// Check if a command string contains shell operators.
-/// Used for prefix matching - we don't allow prefix matches for commands with operators
-/// since "cargo" shouldn't match "cargo test | bash".
-///
-/// Everything inside quotes is skipped, including `$(...)` and backticks in
-/// double quotes, which a shell still runs. Do not use this to decide that a
-/// command is safe to run unreviewed.
-pub fn contains_shell_operator(cmd: &str) -> bool {
-    // Must be quote-aware: operators inside single/double quotes are not shell operators
+/// How a shell would read a command line: where it splits and whether it runs
+/// anything nested. Quoting follows the shell: nothing is special inside
+/// single quotes, and `$(...)` and backticks still run inside double quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellScan<'a> {
+    /// The simple commands, split at `;`, newlines, `|`, `||`, `&&` and `&`.
+    pub segments: Vec<&'a str>,
+    /// The line has a control operator or a nested command.
+    pub has_operator: bool,
+    /// A command runs nested inside another: `$(...)`, backticks, `<(...)`,
+    /// `>(...)`. The segments do not show what it is.
+    pub has_substitution: bool,
+}
+
+/// Read `cmd` the way a shell would.
+pub fn scan_shell(cmd: &str) -> ShellScan<'_> {
     let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < len {
-        let b = bytes[i];
-        match b {
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                i += 1;
+    let at = |index: usize| bytes.get(index).copied();
+    let mut segments = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    let (mut in_single, mut in_double) = (false, false);
+    let (mut split, mut has_substitution) = (false, false);
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single {
+            in_single = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match byte {
+                b'\\' => i += 1,
+                b'"' => in_double = false,
+                b'`' => has_substitution = true,
+                b'$' if at(i + 1) == Some(b'(') => has_substitution = true,
+                _ => {}
             }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                i += 1;
+            i += 1;
+            continue;
+        }
+        let operator_len = match byte {
+            b'\\' => {
+                i += 2;
+                continue;
             }
-            // Nothing is special inside single quotes, a backslash included.
-            _ if in_single => {
-                i += 1;
+            b'\'' => {
+                in_single = true;
+                0
             }
-            b'\\' if in_double && i + 1 < len => {
-                i += 2; // skip escaped char
+            b'"' => {
+                in_double = true;
+                0
             }
-            // The shell still runs command substitutions in double quotes.
-            b'`' if in_double => return true,
-            b'$' if in_double && i + 1 < len && bytes[i + 1] == b'(' => return true,
-            _ if in_double => {
-                i += 1; // inside double quotes, skip
+            b';' | b'\n' => 1,
+            b'|' => {
+                if at(i + 1) == Some(b'|') {
+                    2
+                } else {
+                    1
+                }
             }
-            b';' | b'|' | b'`' | b'\n' => return true,
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
-            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            b'>' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            b'<' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            _ => {
-                i += 1;
+            b'&' if at(i + 1) == Some(b'&') => 2,
+            // `2>&1` and `&>file` are redirections, not background jobs.
+            b'&' if at(i + 1) == Some(b'>') || (i > 0 && matches!(bytes[i - 1], b'>' | b'<')) => 0,
+            b'&' => 1,
+            b'`' => {
+                has_substitution = true;
+                0
             }
+            b'$' | b'<' | b'>' if at(i + 1) == Some(b'(') => {
+                has_substitution = true;
+                0
+            }
+            _ => 0,
+        };
+        if operator_len > 0 {
+            segments.push(&cmd[start..i]);
+            i += operator_len;
+            start = i;
+            split = true;
+        } else {
+            i += 1;
         }
     }
-    false
+    if start < cmd.len() {
+        segments.push(&cmd[start..]);
+    }
+    ShellScan {
+        segments: segments
+            .into_iter()
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect(),
+        has_operator: split || has_substitution,
+        has_substitution,
+    }
+}
+
+/// Whether a shell would treat `cmd` as more than one plain command.
+pub fn contains_shell_operator(cmd: &str) -> bool {
+    scan_shell(cmd).has_operator
 }
 
 #[cfg(test)]
@@ -619,6 +671,28 @@ mod tests {
         assert!(!contains_shell_operator("echo '$(id)'"));
         assert!(!contains_shell_operator("echo \"a; b | c\""));
         assert!(!contains_shell_operator("echo \"\\$(id)\""));
+    }
+
+    #[test]
+    fn a_background_job_is_an_operator_but_a_redirection_is_not() {
+        assert!(contains_shell_operator("ls & rm x"));
+        assert_eq!(scan_shell("ls & rm x").segments, ["ls", "rm x"]);
+        assert!(!contains_shell_operator("cargo test 2>&1"));
+        assert!(!contains_shell_operator("cargo test &>out.log"));
+    }
+
+    #[test]
+    fn an_escaped_quote_outside_quotes_does_not_open_one() {
+        assert!(contains_shell_operator("echo \\\" ; rm x \\\""));
+        assert!(!contains_shell_operator("echo a\\;b"));
+    }
+
+    #[test]
+    fn a_substitution_is_reported_apart_from_splitting() {
+        let scan = scan_shell("ls \"$(id)\"");
+        assert!(scan.has_substitution && scan.has_operator);
+        assert_eq!(scan.segments, ["ls \"$(id)\""]);
+        assert!(!scan_shell("ls -la; pwd").has_substitution);
     }
 
     #[test]
