@@ -58,6 +58,7 @@ impl ModelList {
 /// chat JSON. Bring it into scope to call `provider.chat(..)`.
 #[async_trait]
 pub(crate) trait ChatJson {
+    #[cfg(test)]
     async fn chat(
         &self,
         model: &str,
@@ -76,6 +77,7 @@ pub(crate) trait ChatJson {
 
 #[async_trait]
 impl<P: sdk::Provider + ?Sized> ChatJson for P {
+    #[cfg(test)]
     async fn chat(
         &self,
         model: &str,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::events::{
@@ -11,16 +11,12 @@ use crate::events::{
     ErrorType, Event, EventStore, EventType, FailureCategory, RootCauseCandidate, TaskEndData,
     TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
 };
-use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::sanitize::redact_secrets;
-use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCallContext, ToolCapabilities};
+use crate::traits::{Tool, ToolCallContext, ToolCapabilities};
 use crate::utils::truncate_str;
 
 pub struct DiagnoseTool {
     event_store: Arc<EventStore>,
-    #[allow(dead_code)]
-    state: Arc<dyn TokenUsageStore>,
-    llm_runtime: SharedLlmRuntime,
     max_events: usize,
     include_raw_args: bool,
 }
@@ -56,17 +52,9 @@ struct ExecutionReplaySummary {
 }
 
 impl DiagnoseTool {
-    pub fn new(
-        event_store: Arc<EventStore>,
-        state: Arc<dyn TokenUsageStore>,
-        llm_runtime: SharedLlmRuntime,
-        max_events: usize,
-        include_raw_args: bool,
-    ) -> Self {
+    pub fn new(event_store: Arc<EventStore>, max_events: usize, include_raw_args: bool) -> Self {
         Self {
             event_store,
-            state,
-            llm_runtime,
             max_events: max_events.clamp(50, 1000),
             include_raw_args,
         }
@@ -792,165 +780,9 @@ impl DiagnoseTool {
         DeterministicAnalysis {
             what_failed: redact_secrets(&what_failed),
             candidates,
-            why_previous_step_looked_valid: None,
             minimal_fix,
             verification_steps,
         }
-    }
-
-    async fn llm_rank_candidates(
-        &self,
-        task_id: &str,
-        timeline_text: &str,
-        deterministic: &DeterministicAnalysis,
-    ) -> Option<LlmDiagnosisResponse> {
-        let allowed_categories: Vec<String> = deterministic
-            .candidates
-            .iter()
-            .map(|c| {
-                serde_json::to_string(&c.category)
-                    .unwrap_or_else(|_| "\"incorrect_result\"".to_string())
-            })
-            .map(|s| s.trim_matches('"').to_string())
-            .collect();
-        let deterministic_json = serde_json::to_string_pretty(&deterministic).ok()?;
-
-        let system =
-            "You are a strict diagnostics ranker. Ground every claim in provided event IDs. \
-Return JSON only, no markdown.";
-        let user = format!(
-            "Task: {task_id}\n\
-Allowed categories (must choose only from these): {allowed}\n\n\
-Deterministic baseline:\n{baseline}\n\n\
-Timeline:\n{timeline}\n\n\
-Return JSON object:\n\
-{{\n\
-  \"what_failed\": \"...\",\n\
-  \"candidates\": [{{\"category\":\"...\",\"confidence\":0.0,\"description\":\"...\",\"evidence_event_ids\":[1,2],\"why_previous_step_looked_valid\":\"...\"}}],\n\
-  \"why_previous_step_looked_valid\": \"...\",\n\
-  \"minimal_fix\": [\"...\"],\n\
-  \"verification_steps\": [\"...\"]\n\
-}}\n\
-Rules: no invented event IDs; confidence 0..1.",
-            allowed = allowed_categories.join(", "),
-            baseline = deterministic_json,
-            timeline = truncate_str(timeline_text, 12000)
-        );
-        let messages = vec![
-            json!({"role":"system","content":system}),
-            json!({"role":"user","content":user}),
-        ];
-
-        let runtime_snapshot = self.llm_runtime.snapshot();
-        // Background work does not need the strongest model.
-        let model = runtime_snapshot.cheap_model();
-        let call_start = std::time::Instant::now();
-        let resp: ProviderResponse = match runtime_snapshot
-            .background_chat(&model, &messages, &[])
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
-        crate::events::record_background_model_call_telemetry(
-            self.event_store.clone(),
-            self.state.as_ref(),
-            "background:diagnose",
-            "diagnose",
-            &model,
-            &resp,
-            call_start.elapsed(),
-        )
-        .await;
-        let raw = resp.content.or(resp.thinking)?;
-        let json_text = extract_json_object(&raw)?;
-        serde_json::from_str::<LlmDiagnosisResponse>(&json_text).ok()
-    }
-
-    fn merge_llm_analysis(
-        &self,
-        mut deterministic: DeterministicAnalysis,
-        llm: Option<LlmDiagnosisResponse>,
-        events: &[Event],
-    ) -> DeterministicAnalysis {
-        let Some(llm) = llm else {
-            return deterministic;
-        };
-
-        let mut evidence_by_id: HashMap<i64, crate::events::EvidenceRef> = HashMap::new();
-        for event in events {
-            evidence_by_id.insert(event.id, self.evidence_from_event(event));
-        }
-        let mut by_category: HashMap<FailureCategory, usize> = HashMap::new();
-        for (idx, c) in deterministic.candidates.iter().enumerate() {
-            by_category.insert(c.category, idx);
-        }
-
-        if let Some(cands) = llm.candidates {
-            for cand in cands {
-                if let Some(idx) = by_category.get(&cand.category).copied() {
-                    let existing = &mut deterministic.candidates[idx];
-                    let llm_conf = cand.confidence.clamp(0.0, 1.0);
-                    existing.confidence =
-                        (existing.confidence * 0.6 + llm_conf * 0.4).clamp(0.0, 1.0);
-                    if !cand.description.trim().is_empty() {
-                        existing.description = redact_secrets(&cand.description);
-                    }
-                    let mut mapped = Vec::new();
-                    for id in cand.evidence_event_ids {
-                        if let Some(ev) = evidence_by_id.get(&id) {
-                            mapped.push(ev.clone());
-                        }
-                    }
-                    if !mapped.is_empty() {
-                        existing.evidence = mapped;
-                    }
-                    if let Some(why) = cand.why_previous_step_looked_valid {
-                        if !why.trim().is_empty() {
-                            existing.why_previous_step_looked_valid =
-                                Some(redact_secrets(&truncate_str(&why, 220)));
-                        }
-                    }
-                }
-            }
-        }
-        deterministic
-            .candidates
-            .sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
-
-        if let Some(what_failed) = llm.what_failed {
-            if !what_failed.trim().is_empty() {
-                deterministic.what_failed = redact_secrets(&truncate_str(&what_failed, 300));
-            }
-        }
-        if let Some(why) = llm.why_previous_step_looked_valid {
-            if !why.trim().is_empty() {
-                deterministic.why_previous_step_looked_valid =
-                    Some(redact_secrets(&truncate_str(&why, 260)));
-            }
-        }
-        if let Some(fixes) = llm.minimal_fix {
-            let filtered: Vec<String> = fixes
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| redact_secrets(&truncate_str(&s, 200)))
-                .collect();
-            if !filtered.is_empty() {
-                deterministic.minimal_fix = filtered;
-            }
-        }
-        if let Some(steps) = llm.verification_steps {
-            let filtered: Vec<String> = steps
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| redact_secrets(&truncate_str(&s, 200)))
-                .collect();
-            if !filtered.is_empty() {
-                deterministic.verification_steps = filtered;
-            }
-        }
-
-        deterministic
     }
 
     fn parse_resumed_task_id_from_error(&self, text: &str) -> Option<String> {
@@ -1228,15 +1060,9 @@ Rules: no invented event IDs; confidence 0..1.",
 
         out.push_str("\n### Why Previous Step Looked Valid\n");
         if let Some(why) = analysis
-            .why_previous_step_looked_valid
-            .as_ref()
-            .or_else(|| {
-                analysis
-                    .candidates
-                    .first()?
-                    .why_previous_step_looked_valid
-                    .as_ref()
-            })
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.why_previous_step_looked_valid.as_ref())
         {
             out.push_str(why);
         } else {
@@ -1577,13 +1403,8 @@ Rules: no invented event IDs; confidence 0..1.",
             ));
         }
 
-        let timeline_text = self.timeline_text(&events);
         let replay_summary = self.build_execution_replay_summary(&events);
-        let deterministic = self.build_deterministic_analysis(&events, &replay_summary);
-        let llm = self
-            .llm_rank_candidates(&resolved_task, &timeline_text, &deterministic)
-            .await;
-        let merged = self.merge_llm_analysis(deterministic, llm, &events);
+        let analysis = self.build_deterministic_analysis(&events, &replay_summary);
         let execution_replay_section = self.format_execution_replay_section(&replay_summary);
         let route_health_alerts = self.build_route_health_alerts_section(session_id).await;
         let route_reason_trends = self.build_route_reason_trends_section(session_id).await;
@@ -1593,7 +1414,7 @@ Rules: no invented event IDs; confidence 0..1.",
             .await;
         let diagnosis = self.format_diagnosis(
             &resolved_task,
-            &merged,
+            &analysis,
             &execution_replay_section,
             &route_health_alerts,
             &route_reason_trends,
@@ -1804,12 +1625,10 @@ Rules: no invented event IDs; confidence 0..1.",
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct DeterministicAnalysis {
     what_failed: String,
     candidates: Vec<RootCauseCandidate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    why_previous_step_looked_valid: Option<String>,
     minimal_fix: Vec<String>,
     verification_steps: Vec<String>,
 }
@@ -1829,31 +1648,6 @@ struct DiagnoseArgs {
     failures_only: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LlmDiagnosisResponse {
-    #[serde(default)]
-    what_failed: Option<String>,
-    #[serde(default)]
-    candidates: Option<Vec<LlmCandidate>>,
-    #[serde(default)]
-    why_previous_step_looked_valid: Option<String>,
-    #[serde(default)]
-    minimal_fix: Option<Vec<String>>,
-    #[serde(default)]
-    verification_steps: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LlmCandidate {
-    category: FailureCategory,
-    confidence: f32,
-    description: String,
-    #[serde(default)]
-    evidence_event_ids: Vec<i64>,
-    #[serde(default)]
-    why_previous_step_looked_valid: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 struct ResumeCheckpointSnapshot {
     task_id: String,
@@ -1868,10 +1662,6 @@ struct ResumeCheckpointSnapshot {
     last_assistant_summary: Option<String>,
     last_tool_summary: Option<String>,
     last_error: Option<String>,
-}
-
-fn extract_json_object(raw: &str) -> Option<String> {
-    crate::utils::extract_json_object(raw)
 }
 
 #[async_trait]
@@ -2002,43 +1792,9 @@ mod tests {
     use crate::testing::CallWithFacts;
     use chrono::{Duration, Utc};
 
-    use crate::config::ProviderKind;
     use crate::events::{DecisionPointData, TaskStatus};
-    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::TokenUsage;
-
-    struct MockProvider {
-        content: String,
-    }
-
-    crate::testing::chat_json_provider!(MockProvider);
-
-    impl MockProvider {
-        async fn respond(
-            &self,
-            _model: &str,
-            _messages: &[Value],
-            _tools: &[Value],
-            _options: &crate::traits::ChatOptions,
-        ) -> anyhow::Result<ProviderResponse> {
-            Ok(ProviderResponse {
-                content: Some(self.content.clone()),
-                tool_calls: vec![],
-                usage: Some(TokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cached_input_tokens: None,
-                    cache_creation_input_tokens: None,
-                    model: "mock".to_string(),
-                    ..Default::default()
-                }),
-                thinking: None,
-                response_note: None,
-            })
-        }
-    }
 
     async fn setup_tool() -> DiagnoseTool {
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
@@ -2052,30 +1808,91 @@ mod tests {
         std::mem::forget(db_file);
 
         let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
-        let provider: crate::llm_runtime::ModelBackend = Arc::new(MockProvider {
-            content: json!({
-                "what_failed":"Tool execution failed",
-                "candidates":[
-                    {"category":"tool_failure","confidence":0.8,"description":"Tool failed","evidence_event_ids":[3]}
-                ],
-                "minimal_fix":["Fix tool arguments"],
-                "verification_steps":["Re-run and confirm success"]
-            })
-            .to_string(),
-        });
-        let llm_runtime = SharedLlmRuntime::new(
-            provider,
-            None,
-            ProviderKind::OpenaiCompatible,
-            "mock-fast".to_string(),
-        );
-        DiagnoseTool::new(
-            event_store,
-            state as Arc<dyn TokenUsageStore>,
-            llm_runtime,
-            200,
-            false,
+        DiagnoseTool::new(event_store, 200, false)
+    }
+
+    async fn record_failed_task(tool: &DiagnoseTool, session_id: &str, task_id: &str) {
+        append_event(
+            tool,
+            session_id,
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: task_id.to_string(),
+                description: "Send the weekly report to Alice Rivera".to_string(),
+                parent_task_id: None,
+                user_message: None,
+                turn_id: None,
+            },
+            Some(task_id),
         )
+        .await;
+        append_event(
+            tool,
+            session_id,
+            EventType::Error,
+            ErrorData::tool_error(
+                "terminal",
+                "No such file or directory",
+                Some(task_id.to_string()),
+            ),
+            Some(task_id),
+        )
+        .await;
+        append_event(
+            tool,
+            session_id,
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: task_id.to_string(),
+                status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
+                duration_secs: 2,
+                iterations: 1,
+                tool_calls_count: 1,
+                error: Some("failed".to_string()),
+                summary: None,
+                efficiency: None,
+                turn_id: None,
+                completion_proof: None,
+                harness_eval: None,
+            },
+            Some(task_id),
+        )
+        .await;
+    }
+
+    /// The diagnosis is built from the recorded events alone. The tool holds
+    /// no model backend, so nothing can re-rank or rewrite the deterministic
+    /// analysis: its candidates, order and fix steps reach the report as built.
+    #[tokio::test]
+    async fn diagnose_makes_no_model_call() {
+        let tool = setup_tool().await;
+        record_failed_task(&tool, "telegram:synthetic-user-1", "task-1").await;
+
+        let events = tool
+            .collect_task_timeline("telegram:synthetic-user-1", "task-1")
+            .await
+            .unwrap();
+        let replay = tool.build_execution_replay_summary(&events);
+        let analysis = tool.build_deterministic_analysis(&events, &replay);
+
+        let report = tool
+            .call_with(
+                r#"{"action":"diagnose","task_id":"task-1"}"#,
+                crate::testing::call_facts("telegram:synthetic-user-1"),
+            )
+            .await
+            .unwrap();
+
+        assert!(report.contains("Diagnosis for Task task-1"));
+        let first = analysis
+            .candidates
+            .first()
+            .expect("a deterministic candidate");
+        assert!(report.contains(&format!("1. **{:?}**", first.category)));
+        for step in &analysis.minimal_fix {
+            assert!(report.contains(step.as_str()), "missing fix step: {step}");
+        }
     }
 
     async fn append_event<T: serde::Serialize>(

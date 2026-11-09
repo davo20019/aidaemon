@@ -556,8 +556,6 @@ async fn fact_reading_tools_receive_call_context() {
         .tools
         .push(Arc::new(crate::tools::DiagnoseTool::new(
             harness.agent.event_store.clone(),
-            harness.state.clone(),
-            harness.agent.llm_runtime.clone(),
             20,
             false,
         )));

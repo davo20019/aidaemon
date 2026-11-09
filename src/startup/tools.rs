@@ -726,8 +726,6 @@ pub async fn register_optional_tools(
                 }
                 tools.push(Arc::new(DiagnoseTool::new(
                     event_store.clone(),
-                    state.clone(),
-                    llm_runtime.clone(),
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));

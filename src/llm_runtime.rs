@@ -155,6 +155,7 @@ impl LlmRuntimeSnapshot {
     ///
     /// `first_model` (usually a primary-provider model such as a cheaper
     /// tier) is tried first; the primary provider's other models follow.
+    #[cfg(test)]
     pub(crate) fn background_chain(&self, first_model: &str) -> aidaemon_core::Failover {
         self.background_chain_through(first_model, |provider| provider)
     }
@@ -315,6 +316,7 @@ impl LlmRuntimeSnapshot {
     }
 
     /// One background call on [`Self::background_chain`], starting at `model`.
+    #[cfg(test)]
     pub(crate) async fn background_chat(
         &self,
         model: &str,
