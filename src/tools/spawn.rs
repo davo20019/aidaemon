@@ -227,22 +227,25 @@ fn truncate_utf8(s: &str, max_chars: usize) -> &str {
     &s[..boundary]
 }
 
-/// A child's reply, cut to `max_len` with a notice saying what was left out
-/// and how to get it.
-fn bounded_child_response(response: &str, max_len: usize) -> String {
+/// A child's reply cut to `max_len`, and what was left out if anything.
+fn bounded_child_response(
+    response: &str,
+    max_len: usize,
+) -> (&str, Option<crate::traits::TruncationInfo>) {
     if response.len() <= max_len {
-        return response.to_string();
+        return (response, None);
     }
     let shown = truncate_utf8(response, max_len);
-    format!(
-        "{shown}\n\n{}",
-        crate::utils::truncation_notice_with_hint(
-            shown.chars().count(),
-            response.chars().count(),
+    let info = crate::traits::TruncationInfo {
+        shown_chars: shown.chars().count(),
+        total_chars: response.chars().count(),
+        remediation_hint: Some(
             "To see the rest, delegate again and ask the sub-agent to write the full \
-             result to a file and return its path, or to answer a narrower question.",
-        )
-    )
+             result to a file and return its path, or to answer a narrower question."
+                .to_string(),
+        ),
+    };
+    (shown, Some(info))
 }
 
 fn format_background_completion(
@@ -251,7 +254,17 @@ fn format_background_completion(
     outcome: TaskOutcome,
     max_response_chars: usize,
 ) -> (&'static str, String) {
-    let text = bounded_child_response(response, max_response_chars);
+    // This goes straight to the chat, past the loop that renders truncation
+    // metadata for tool results.
+    let text = match bounded_child_response(response, max_response_chars) {
+        (shown, Some(info)) => {
+            format!(
+                "{shown}\n\n{}",
+                crate::utils::render_truncation_notice(&info)
+            )
+        }
+        (shown, None) => shown.to_string(),
+    };
     match outcome {
         TaskOutcome::Succeeded => (
             "completed",
@@ -972,8 +985,11 @@ impl SpawnAgentTool {
                         return Err(anyhow::anyhow!("Sub-agent failed: {}", run.response));
                     }
                 };
-                let response = bounded_child_response(&response, self.max_response_chars);
-                Ok(reported(response, run.trust))
+                let (shown, truncation) =
+                    bounded_child_response(&response, self.max_response_chars);
+                let mut outcome = reported(shown.to_string(), run.trust);
+                outcome.metadata.truncation = truncation;
+                Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
                 None => Err(anyhow::anyhow!("Specialist failed: {}", error)),
@@ -1707,8 +1723,9 @@ mod child_runtime_tests {
             .await
             .unwrap();
 
-        assert!(outcome.output.contains("OUTPUT TRUNCATED"));
-        assert!(outcome.output.contains("400 omitted"));
+        let truncation = outcome.metadata.truncation.expect("reported out of band");
+        assert_eq!((truncation.shown_chars, truncation.total_chars), (100, 500));
+        assert!(!outcome.output.contains("OUTPUT TRUNCATED"));
     }
 
     #[test]
