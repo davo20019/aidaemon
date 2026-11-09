@@ -13,7 +13,9 @@ use aidaemon_core::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::shell::{catastrophic_reason, command_segments, segment_matches_prefix};
+use crate::shell::{
+    catastrophic_reason, command_segments, irreversible_delete_reason, segment_matches_prefix,
+};
 
 /// When to ask a human before a call runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,6 +97,7 @@ pub struct ApprovalPolicy {
     deny_commands: Vec<Vec<String>>,
     rules: Option<Arc<dyn ApprovalRules>>,
     grants: Option<Arc<dyn ApprovalGrants>>,
+    workspace_root: Option<String>,
 }
 
 impl std::fmt::Debug for ApprovalPolicy {
@@ -107,6 +110,7 @@ impl std::fmt::Debug for ApprovalPolicy {
             .field("deny_commands", &self.deny_commands)
             .field("rules", &self.rules.is_some())
             .field("grants", &self.grants.is_some())
+            .field("workspace_root", &self.workspace_root)
             .finish()
     }
 }
@@ -163,6 +167,14 @@ impl ApprovalPolicy {
         self
     }
 
+    /// Also refuse irreversible deletes of anything outside `root` (see
+    /// [`crate::irreversible_delete_reason`]). Like the catastrophic check,
+    /// no rule or grant can allow one.
+    pub fn workspace_root(mut self, root: impl Into<String>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
+    }
+
     pub fn mode(&self) -> ApprovalMode {
         self.mode
     }
@@ -183,7 +195,11 @@ impl ApprovalPolicy {
     /// Steps 1 and 2: hard blocks and deny rules.
     fn blocked(&self, tool_name: &str, info: &ToolInfo) -> Option<ToolDecision> {
         for command in &info.access.commands {
-            if let Some(reason) = catastrophic_reason(command) {
+            let delete = self
+                .workspace_root
+                .as_deref()
+                .and_then(|root| irreversible_delete_reason(command, root));
+            if let Some(reason) = catastrophic_reason(command).or(delete) {
                 return Some(ToolDecision::Deny {
                     reason: format!("blocked by policy: {reason} (command: `{command}`)"),
                 });

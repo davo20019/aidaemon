@@ -191,6 +191,32 @@ async fn tool_results(harness: &crate::testing::TestHarness) -> Vec<String> {
         .collect()
 }
 
+/// An irreversible delete of the home directory is refused by the approval
+/// hook before anyone is asked, however it is launched.
+#[tokio::test]
+async fn wrapped_broad_delete_is_refused_before_any_card() {
+    for command in [
+        "sudo rm -rf ~/synthetic-never-created",
+        "bash -c 'rm -rf ~/synthetic-never-created'",
+        "rm -r ~/synthetic-never-created",
+    ] {
+        let (harness, approver) = approvals_harness(
+            vec![curl_call(command), MockProvider::text_response("Refused.")],
+            vec![],
+            None,
+        )
+        .await;
+        run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+        assert_eq!(approver.card_count(), 0, "{command}");
+        let results = tool_results(&harness).await;
+        assert!(
+            results.iter().any(|r| r.contains("irreversible delete")),
+            "{command}: {results:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn http_post_card_comes_from_kernel_interrupt() {
     let (port, sent) = spawn_approvals_server().await;

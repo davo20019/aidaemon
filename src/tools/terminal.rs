@@ -32,7 +32,7 @@ use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
-use super::command_risk::{approval_floor_reason, hard_block_reason, PermissionMode, RiskLevel};
+use super::command_risk::{approval_floor_reason, PermissionMode, RiskLevel};
 use super::daemon_guard::detect_daemonization_primitives;
 use super::process_control::{send_sigkill, send_sigterm};
 use super::semantic_command_risk::assess_command;
@@ -3725,7 +3725,7 @@ impl TerminalTool {
     /// The hard blocks a `run` meets before any approval (T2–T7, in order):
     /// unscoped recursive grep and unbounded disk scans, large unquoted
     /// heredocs, AppleScript UI scripting, daemonization by a non-owner or
-    /// without `detach=true`, irreversible broad deletes, and detached runs
+    /// without `detach=true`, and detached runs
     /// in trusted scheduled sessions. The tool refuses these whatever the
     /// owner said, so the kernel's rules never ask about them.
     fn pre_approval_block(
@@ -3792,19 +3792,6 @@ impl TerminalTool {
                     daemon_hits.join(", ")
                 ));
             }
-        }
-        // Deterministic hard block for irreversible broad-path deletes.
-        if let Some(reason) = hard_block_reason(command, self.backend.workspace_root().as_str()) {
-            warn!(
-                session_id = %trust.session_id,
-                command = %command,
-                reason = %reason,
-                "Blocked dangerous irreversible command"
-            );
-            return Some(format!(
-                "{} Use scoped, non-destructive commands instead.",
-                reason
-            ));
         }
         if args.detach && trust.trusted_session {
             // Intentional: trusted scheduled sessions are auto-approved, so
@@ -11823,44 +11810,6 @@ mod tests {
             .await
             .unwrap();
         assert!(response.contains("only owners can approve"));
-    }
-
-    #[tokio::test]
-    async fn test_terminal_hard_blocks_broad_irreversible_delete_even_in_yolo() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_url = format!("sqlite:{}", db_file.path().display());
-        let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
-        let tool = TerminalTool::new(
-            crate::execution::active_execution_backend(),
-            vec!["*".to_string()],
-            approval_tx,
-            1,
-            1000,
-            PermissionMode::Yolo,
-            pool,
-        )
-        .await
-        .with_confinement(crate::types::TerminalConfinement::Sandbox);
-
-        let outcome = tool
-            .call_with_execution_context(
-                r#"{"action":"run","command":"find / -delete"}"#,
-                None,
-                ToolCallContext {
-                    session_id: "s1".into(),
-                    ..ToolCallContext::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(outcome.output.contains("Blocked irreversible delete"));
-        assert!(outcome.output.contains("scoped, non-destructive"));
-        assert_eq!(
-            outcome.metadata.outcome_status,
-            Some(ToolOutcomeStatus::Blocked)
-        );
     }
 
     #[tokio::test]

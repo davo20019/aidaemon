@@ -6,6 +6,8 @@
 //! unwraps common launchers (`sudo`, `env`, `nohup`, `bash -c "..."`) so a
 //! policy sees the program that actually runs and its real arguments.
 
+use std::path::{Component, Path, PathBuf};
+
 /// Split `command` into segments of tokens, with launchers unwrapped.
 /// `bash -c "a; b"` contributes the segments of `a; b`.
 pub fn command_segments(command: &str) -> Vec<Vec<String>> {
@@ -270,6 +272,180 @@ fn segment_reason(tokens: &[String]) -> Option<String> {
     }
 }
 
+/// Path segments that hold credentials.
+const CREDENTIAL_PATH_SEGMENTS: &[&str] = &[
+    ".ssh",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "id_dsa",
+    "id_ecdsa",
+    "shadow",
+    "sudoers",
+    "master.key",
+    "credentials",
+    "secrets",
+    ".netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+];
+
+/// The credential segment `arg` names as a path, if any. `.env.example`
+/// style templates hold placeholders and do not count.
+pub fn credential_path_segment(arg: &str) -> Option<&'static str> {
+    for segment in arg.split(&['/', '\\'][..]) {
+        for sensitive in CREDENTIAL_PATH_SEGMENTS {
+            if segment == *sensitive {
+                return Some(sensitive);
+            }
+            if segment.starts_with(sensitive)
+                && segment.chars().nth(sensitive.len()) == Some('.')
+                && !matches!(
+                    segment,
+                    ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+                )
+            {
+                return Some(sensitive);
+            }
+        }
+    }
+    None
+}
+
+/// Why `command` is an irreversible delete of something outside
+/// `workspace_root`: a recursive `rm`, or a `find` that deletes, aimed at a
+/// credential path, the home directory, a system directory or a relative
+/// path leaving the workspace. Launchers and subshells are unwrapped.
+/// Scoped cleanup inside the workspace is not reported.
+pub fn irreversible_delete_reason(command: &str, workspace_root: &str) -> Option<String> {
+    command_segments(command)
+        .iter()
+        .find_map(|segment| segment_delete_reason(segment, workspace_root))
+}
+
+fn segment_delete_reason(tokens: &[String], workspace_root: &str) -> Option<String> {
+    // `xargs` runs the command it is given; its own options come first.
+    let tokens = match tokens.first().map(|program| basename(program)) {
+        Some("xargs") => {
+            let start = tokens
+                .iter()
+                .position(|token| matches!(basename(token), "rm" | "find"))?;
+            &tokens[start..]
+        }
+        _ => tokens,
+    };
+    let broad = |target: &str| is_broad_delete_target(target, workspace_root);
+    let reason = |form: &str, target: &str| {
+        format!(
+            "irreversible delete: `{form}` targeting broad/sensitive path `{target}`. \
+             Use scoped, non-destructive commands instead."
+        )
+    };
+    match basename(tokens.first()?) {
+        "rm" => {
+            let (flags, operands) = split_flags(&tokens[1..]);
+            let recursive = flags.iter().any(|f| {
+                f == "--recursive"
+                    || (f.starts_with('-') && !f.starts_with("--") && f.contains(['r', 'R']))
+            });
+            if !recursive {
+                return None;
+            }
+            operands
+                .iter()
+                .find(|operand| broad(operand))
+                .map(|target| reason("rm -r", target))
+        }
+        "find" if find_deletes(tokens) => find_roots(tokens)
+            .into_iter()
+            .find(|root| broad(root))
+            .map(|root| reason("find ... -delete", root)),
+        _ => None,
+    }
+}
+
+fn find_deletes(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().skip(1).any(|(i, token)| {
+        token == "-delete"
+            || (matches!(token.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|program| basename(program) == "rm"))
+    })
+}
+
+fn find_roots(tokens: &[String]) -> Vec<&str> {
+    let mut roots: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .take_while(|arg| !arg.starts_with('-') && !matches!(arg.as_str(), "(" | ")" | "!" | ","))
+        .map(String::as_str)
+        .collect();
+    if roots.is_empty() {
+        roots.push(".");
+    }
+    roots
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn is_within_workspace(target: &str, workspace_root: &str) -> bool {
+    if workspace_root.trim().is_empty() || target.contains('*') || target.starts_with('~') {
+        return false;
+    }
+    let root = normalize_lexically(Path::new(workspace_root));
+    let path = Path::new(target);
+    let resolved = if path.is_absolute() {
+        normalize_lexically(path)
+    } else {
+        normalize_lexically(&root.join(path))
+    };
+    resolved == root || resolved.starts_with(&root)
+}
+
+fn is_broad_delete_target(raw_target: &str, workspace_root: &str) -> bool {
+    let target = raw_target.trim_matches(|c| c == '"' || c == '\'');
+    if target.is_empty() {
+        return false;
+    }
+    if credential_path_segment(target).is_some() {
+        return true;
+    }
+    if matches!(target, "/" | "/*" | "~" | "~/" | "$HOME" | "${HOME}")
+        || target.starts_with("~/")
+        || target.starts_with("$HOME/")
+        || target.starts_with("${HOME}/")
+    {
+        return true;
+    }
+    if is_within_workspace(target, workspace_root) {
+        return false;
+    }
+    if !Path::new(target).is_absolute() {
+        return true;
+    }
+    const BROAD_PREFIXES: &[&str] = &[
+        "/home", "/Users", "/root", "/etc", "/boot", "/sys", "/proc", "/dev", "/usr", "/var",
+        "/opt", "/bin", "/sbin", "/lib",
+    ];
+    BROAD_PREFIXES
+        .iter()
+        .any(|prefix| target == *prefix || target.starts_with(&format!("{prefix}/")))
+}
+
 fn is_block_device(path: &str) -> bool {
     path.starts_with("/dev/")
         && !matches!(
@@ -324,6 +500,72 @@ mod tests {
 
     fn segs(command: &str) -> Vec<Vec<String>> {
         command_segments(command)
+    }
+
+    const WORKSPACE: &str = "/Users/alice/projects/acme";
+
+    fn blocked(command: &str) -> bool {
+        irreversible_delete_reason(command, WORKSPACE).is_some()
+    }
+
+    #[test]
+    fn broad_deletes_are_blocked_and_scoped_workspace_cleanup_is_not() {
+        for command in [
+            "rm -rf /",
+            "/bin/rm -fr /Users/alice",
+            "find /etc -name '*.tmp' -delete",
+            "rm -rf .env",
+            "rm -rf ../../..",
+        ] {
+            assert!(blocked(command), "{command}");
+        }
+        for command in [
+            "rm -rf ./target",
+            "rm -rf /Users/alice/projects/acme/target",
+            "find . -name '*.tmp' -delete",
+            "rm -rf -- \"$root\"",
+            "rm notes.txt",
+            "rm ~/notes.txt",
+            "git rm -r ~/Documents",
+            "echo 'rm -rf ~/Documents'",
+        ] {
+            assert!(!blocked(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn launchers_and_subshells_do_not_hide_a_delete() {
+        for command in [
+            "sudo rm -rf ~/Documents",
+            "bash -c 'rm -rf ~/Documents'",
+            "env X=1 rm -rf ~/Documents",
+            "nohup rm -rf /Users/alice/Documents",
+            "sudo find /etc -delete",
+            "(rm -rf ~/Documents)",
+            "echo ok; $(rm -rf ~/Documents)",
+            "true && sh -c \"bash -c 'rm -rf ~/Documents'\"",
+        ] {
+            assert!(blocked(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn every_delete_form_counts() {
+        for command in [
+            "rm -r ~/Documents",
+            "rm --recursive ~/Documents",
+            "rm -R /etc/nginx",
+            "rm -rf -- ~/Documents",
+            "xargs rm -rf ~/Documents",
+            "xargs -n 1 rm -r ~/Documents",
+            "find ~/Documents -exec rm -rf {} +",
+            "find /etc -execdir rm {} ;",
+        ] {
+            assert!(blocked(command), "{command}");
+        }
+        assert!(!blocked("find . -exec rm {} +"));
+        assert!(!blocked("find /etc -name '*.conf'"));
+        assert!(!blocked("find . | xargs rm -f"));
     }
 
     #[test]

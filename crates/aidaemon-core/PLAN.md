@@ -185,10 +185,10 @@ adapters, tested against local mock servers.
 
 ### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
 
-Status: 8.1, 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-3 of 10; 8.8
+Status: 8.1, 8.1b, 8.2 done; 8.3 mostly done; 8.4 steps 1-9 of 10; 8.8
 providers done and MCP transport moved, channels on the SDK adapters; 8.5-8.7,
 8.7b and 8.9 open (8.6's declines between parent and child runs are done).
-Next: 8.5 (in-tool approvals), which closes safety gaps. 8.4, 8.8 (MCP and store) and
+Next: 8.5, which closes safety gaps. The rest of 8.4, 8.8 (MCP and store) and
 8.9 move working code between crates and wait for a second user of the SDK.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
@@ -318,11 +318,27 @@ Order:
       (`file_output_trust` in `semantics.rs`, `18ab5e8`) and step 3
       (`PathClassifier`, `7c623cf`; the daemon still holds one instance in
       a static, and passing it to each tool is the follow-up).
-      Steps 4-7 depend on 8.3's name checks staying valid; the tool names
-      do not change.
+      Done 2026-11-08: steps 4-9 (`e612f19`, `11011ab`). The daemon's
+      implementations run on `ExecutionBackend` in the crate, behind
+      `OutcomeTool` and `FilePolicy`; `KernelTool` wraps them. `Glob` and
+      `Grep` stay beside `SearchFiles` (they honour gitignore and offer
+      content modes). The SDK `web_fetch` gained the private-network policy
+      and kept its same-host redirect limit; the daemon follows public
+      redirects. `track_requirements` stays in the daemon: it feeds the
+      receipts ledger, and the crate's `Checklist` is an in-memory list.
+      Left: step 10, and passing `PathClassifier` instead of the static.
 - [ ] 8.5 Authority Phases 3b and 3c, as SDK policies over effects:
       scope, sensitive paths, SSRF, destructive deletes, the remaining
       in-tool approvals, one output-wrapping layer.
+      Done 2026-11-08: destructive deletes. `irreversible_delete_reason`
+      in `aidaemon-policies` replaces the terminal's in-tool
+      `hard_block_reason` and is applied by `ApprovalPolicy` when given a
+      `workspace_root`. It sees through launchers and subshells and also
+      covers `rm -r`, `xargs rm` and `find -exec rm`, which all escaped
+      before and ran unasked in scheduled sessions.
+      The in-tool approvals are done (8.1). Left: scope, sensitive paths,
+      SSRF and output wrapping as hooks over effects, and an allowlist for
+      `cli_agent` arguments.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
       `AgentBuilder`. Done 2026-11-07: declines move both ways between
       parent and child runs. `c98314c`: kernel `SharedDeclines`, attached

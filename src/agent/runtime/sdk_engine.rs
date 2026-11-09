@@ -1143,7 +1143,12 @@ impl Agent {
         let approval =
             aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
                 .with_rules(rules.clone())
-                .with_grants(approvals.grants_for(&grant_session));
+                .with_grants(approvals.grants_for(&grant_session))
+                .workspace_root(
+                    crate::execution::active_execution_backend()
+                        .workspace_root()
+                        .as_str(),
+                );
         let secrets = self.configured_secret_literals(engine).await;
         let egress = secrets
             .iter()
