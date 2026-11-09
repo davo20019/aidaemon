@@ -438,6 +438,43 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
     None
 }
 
+/// Whether `url` targets this computer and nothing else: blocked as loopback,
+/// with every address its host resolves to on loopback. A name that also maps
+/// to a private or metadata address is not loopback-only.
+pub fn resolves_only_to_loopback(url: &str) -> bool {
+    if classify_blocked_host(url) != Some(BlockedHostClass::Loopback) {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_lowercase) else {
+        return false;
+    };
+    if matches!(
+        host.as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    ) || host.ends_with(".localhost")
+    {
+        return true;
+    }
+    let Some(port) = parsed.port_or_known_default() else {
+        return false;
+    };
+    match format!("{host}:{port}").to_socket_addrs() {
+        Ok(addrs) => {
+            let mut addrs = addrs.peekable();
+            addrs.peek().is_some()
+                && addrs
+                    .all(|addr| classify_blocked_ip(addr.ip()) == Some(BlockedHostClass::Loopback))
+        }
+        // A literal IP in a form the resolver refused was classified above.
+        Err(_) => host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| classify_blocked_ip(ip) == Some(BlockedHostClass::Loopback)),
+    }
+}
+
 const BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:142.0) Gecko/20100101 Firefox/142.0";
 
