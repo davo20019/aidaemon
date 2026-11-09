@@ -35,6 +35,84 @@ pub(crate) struct SalvagedTaskOutcome {
     pub details: String,
 }
 
+/// How long a child may work.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChildTimeLimit {
+    pub limit: std::time::Duration,
+    /// The child outlives the call that spawned it (background), so the
+    /// spawning agent's own limit does not bound it.
+    pub detached: bool,
+}
+
+/// What a stopped child had already done, from its own tool records.
+#[derive(Debug, Default)]
+pub(crate) struct ChildWorkReport {
+    /// Calls that finished and may have changed something.
+    pub changed: Vec<String>,
+    /// Calls still running when the child was stopped.
+    pub unfinished: Vec<String>,
+    /// The records could not be read, so nothing is known.
+    pub unknown: bool,
+}
+
+impl ChildWorkReport {
+    pub(crate) fn may_have_changed_something(&self) -> bool {
+        self.unknown || !self.changed.is_empty() || !self.unfinished.is_empty()
+    }
+}
+
+/// A child ran out of working time and was stopped.
+#[derive(Debug)]
+pub(crate) struct ChildTimedOut {
+    pub limit_secs: u64,
+    pub report: ChildWorkReport,
+}
+
+impl std::fmt::Display for ChildTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Specialist timed out after {} seconds", self.limit_secs)
+    }
+}
+
+impl std::error::Error for ChildTimedOut {}
+
+impl ChildTimedOut {
+    /// What the parent needs to decide whether running it again is safe.
+    pub(crate) fn render(&self) -> String {
+        if !self.report.may_have_changed_something() {
+            return format!(
+                "The sub-agent ran out of time after {} seconds. It only used read-only \
+                 tools, so running it again is safe.",
+                self.limit_secs
+            );
+        }
+        let mut text = format!(
+            "The sub-agent ran out of time after {} seconds and was stopped, but some of its \
+             work may already have taken effect. Do NOT run it again until you have checked \
+             the state of the items below: repeating them could duplicate side effects.",
+            self.limit_secs
+        );
+        if self.report.unknown {
+            text.push_str("\n\nIts action records could not be read.");
+        }
+        if !self.report.changed.is_empty() {
+            text.push_str("\n\nActions it completed:");
+            for item in &self.report.changed {
+                text.push_str("\n- ");
+                text.push_str(item);
+            }
+        }
+        if !self.report.unfinished.is_empty() {
+            text.push_str("\n\nStill running when it was stopped (outcome unknown):");
+            for item in &self.report.unfinished {
+                text.push_str("\n- ");
+                text.push_str(item);
+            }
+        }
+        text
+    }
+}
+
 /// Owned input for a child-agent run. Using an owned request keeps the port
 /// object-safe and safe to move into background tasks.
 pub(crate) struct ChildAgentRequest {
@@ -52,6 +130,8 @@ pub(crate) struct ChildAgentRequest {
     /// The spawning turn's actual authority, taint and root request
     /// (dispatcher-injected; `None` falls back to re-resolution).
     pub parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+    /// `None` leaves the child unlimited.
+    pub time_limit: Option<ChildTimeLimit>,
 }
 
 /// Child-delegation capability required by `spawn_agent`.

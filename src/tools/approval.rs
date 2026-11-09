@@ -85,6 +85,48 @@ impl OwnerWaitClock {
     }
 }
 
+/// A limit on working time: time spent waiting for the owner does not count.
+#[derive(Clone)]
+pub(crate) struct WorkDeadline {
+    started: tokio::time::Instant,
+    limit: std::time::Duration,
+    owner_wait: OwnerWaitClock,
+}
+
+impl WorkDeadline {
+    pub(crate) fn starting_now(limit: std::time::Duration, owner_wait: OwnerWaitClock) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            limit,
+            owner_wait,
+        }
+    }
+
+    pub(crate) fn limit(&self) -> std::time::Duration {
+        self.limit
+    }
+
+    /// Working time left.
+    pub(crate) fn remaining(&self) -> std::time::Duration {
+        let worked = self
+            .started
+            .elapsed()
+            .saturating_sub(self.owner_wait.waited());
+        self.limit.saturating_sub(worked)
+    }
+
+    /// Resolves once the limit has been worked, checking every `check`.
+    pub(crate) async fn reached(&self, check: std::time::Duration) {
+        loop {
+            let left = self.remaining();
+            if left.is_zero() {
+                return;
+            }
+            tokio::time::sleep(left.min(check)).await;
+        }
+    }
+}
+
 impl Drop for OwnerWaiting {
     fn drop(&mut self) {
         let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
@@ -298,6 +340,29 @@ async fn persist_resolution(
 mod tests {
     use super::*;
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
+
+    #[tokio::test]
+    async fn waiting_for_the_owner_does_not_use_up_a_work_deadline() {
+        use std::time::Duration;
+        let clock = OwnerWaitClock::default();
+        OwnerWaitClock::within(Some(clock.clone()), async {
+            let deadline = WorkDeadline::starting_now(Duration::from_millis(300), clock.clone());
+            let waiting = OwnerWaitClock::begin_waiting();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !deadline.remaining().is_zero(),
+                "a card was open throughout"
+            );
+            drop(waiting);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                deadline.reached(Duration::from_millis(10)),
+            )
+            .await
+            .expect("working time runs out once the card closes");
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn durable_broker_projects_pending_then_resolved_interaction() {

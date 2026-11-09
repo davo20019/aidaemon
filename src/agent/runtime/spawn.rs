@@ -3,7 +3,7 @@ use crate::agent::specialists::{
     validation as specialist_validation, SpecialistRegistry, SpecialistRenderContext,
 };
 use crate::events::TaskOutcome;
-use crate::runtime_ports::SessionRouteLease;
+use crate::runtime_ports::{ChildTimeLimit, ChildTimedOut, ChildWorkReport, SessionRouteLease};
 use crate::traits::SpecialistKind;
 
 struct TaskLeadSpec {
@@ -80,6 +80,77 @@ fn resolve_child_outcome(
         _ if replied => TaskOutcome::Partial,
         _ => TaskOutcome::Failed,
     }
+}
+
+/// How often a running child checks its working-time limit.
+const CHILD_LIMIT_CHECK: Duration = Duration::from_millis(250);
+/// Time left for a nested child's report to reach its parent before the
+/// parent's own limit stops it.
+const NESTED_REPORT_GRACE: Duration = Duration::from_secs(10);
+/// How many entries a stopped child's report lists per section.
+const MAX_REPORTED_ACTIONS: usize = 20;
+const REPORTED_ACTION_CHARS: usize = 160;
+
+/// The working time a child gets. A child waited on by its parent must end
+/// inside the parent's own limit, or the parent is stopped first and the
+/// child's report is lost.
+fn child_time_limit(requested: ChildTimeLimit, parent_remaining: Option<Duration>) -> Duration {
+    match parent_remaining {
+        Some(left) if !requested.detached => requested
+            .limit
+            .min(left.saturating_sub(NESTED_REPORT_GRACE))
+            .max(Duration::from_secs(1)),
+        _ => requested.limit,
+    }
+}
+
+/// What a stopped child had done, from its typed tool records: every call to
+/// a tool not known to be read-only, finished or not.
+async fn child_work_report(
+    event_store: &crate::events::EventStore,
+    child_session: &str,
+    read_only_tools: &std::collections::HashSet<String>,
+) -> ChildWorkReport {
+    let events = match event_store.query_recent_events(child_session, 400).await {
+        Ok(events) => events,
+        Err(error) => {
+            warn!(child_session, %error, "Could not read a stopped child's tool records");
+            return ChildWorkReport {
+                unknown: true,
+                ..Default::default()
+            };
+        }
+    };
+    let results: std::collections::HashMap<String, bool> = events
+        .iter()
+        .filter(|event| event.event_type == EventType::ToolResult)
+        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+        .map(|data| (data.tool_call_id, data.success))
+        .collect();
+    let mut report = ChildWorkReport::default();
+    for call in events
+        .iter()
+        .filter(|event| event.event_type == EventType::ToolCall)
+        .filter_map(|event| event.parse_data::<crate::events::ToolCallData>().ok())
+        .filter(|call| !read_only_tools.contains(&call.name))
+    {
+        let detail = call.summary.unwrap_or_else(|| call.arguments.to_string());
+        let detail: String = detail.chars().take(REPORTED_ACTION_CHARS).collect();
+        let entry = format!("{}: {detail}", call.name);
+        match results.get(&call.tool_call_id) {
+            Some(true) => report.changed.push(entry),
+            Some(false) => report.changed.push(format!("{entry} (reported a failure)")),
+            None => report.unfinished.push(entry),
+        }
+    }
+    for list in [&mut report.changed, &mut report.unfinished] {
+        if list.len() > MAX_REPORTED_ACTIONS {
+            let omitted = list.len() - MAX_REPORTED_ACTIONS;
+            list.drain(..omitted);
+            list.insert(0, format!("(and {omitted} earlier)"));
+        }
+    }
+    report
 }
 
 /// The specialist the caller named on a plain spawn, if it is one a caller
@@ -1510,6 +1581,7 @@ impl Agent {
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
         inherited_authority: crate::agent::authority::InheritedAuthority,
+        child_deadline: Option<crate::tools::WorkDeadline>,
     ) -> Arc<Agent> {
         let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
             Ok(guard) => guard.clone(),
@@ -1599,6 +1671,7 @@ impl Agent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(inherited_authority.clone());
         child.inherited_authority = Some(inherited_authority);
+        child.child_deadline = child_deadline;
         child.sdk_engine = self.sdk_engine.clone();
         child.run_store = self.run_store.clone();
         child.owner_approvals = self.owner_approvals.clone();
@@ -1652,6 +1725,7 @@ impl Agent {
             arg_specialist,
             None,
             None,
+            None,
         )
         .await
         .map(|result| result.response)
@@ -1672,6 +1746,7 @@ impl Agent {
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        time_limit: Option<ChildTimeLimit>,
     ) -> anyhow::Result<SpawnChildResult> {
         self.spawn_child_with_outcome_and_attempt(
             mission,
@@ -1687,6 +1762,7 @@ impl Agent {
             approval_session_id,
             None,
             parent_authority,
+            time_limit,
         )
         .await
     }
@@ -1710,6 +1786,7 @@ impl Agent {
         approval_session_id: Option<&str>,
         bound_task_attempt: Option<crate::traits::TaskAttempt>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        time_limit: Option<ChildTimeLimit>,
     ) -> anyhow::Result<SpawnChildResult> {
         if self.depth >= self.limits.max_depth {
             anyhow::bail!(
@@ -1798,6 +1875,7 @@ impl Agent {
                             inherited_project_scope,
                             approval_session_id,
                             parent_authority,
+                            time_limit,
                         )
                         .await;
                 }
@@ -2022,6 +2100,7 @@ impl Agent {
                             inherited_project_scope,
                             approval_session_id,
                             parent_authority,
+                            time_limit,
                         )
                         .await;
                 }
@@ -2108,6 +2187,7 @@ impl Agent {
             inherited_project_scope,
             approval_session_id,
             parent_authority,
+            time_limit,
         )
         .await
     }
@@ -2260,6 +2340,7 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
+        time_limit: Option<ChildTimeLimit>,
     ) -> anyhow::Result<SpawnChildResult> {
         // Resolve the immutable mandate fence before any child-setup write or
         // filesystem provisioning. A stale/revoked attempt must fail without
@@ -2523,6 +2604,24 @@ impl Agent {
                 goal_id.as_deref(),
             )
             .await;
+        // Waiting on the owner never counts against the child, whether or not
+        // this call runs inside a turn that already keeps that clock.
+        let owner_wait = crate::tools::OwnerWaitClock::current().unwrap_or_default();
+        let deadline = time_limit.map(|requested| {
+            let parent_remaining = self
+                .child_deadline
+                .as_ref()
+                .map(crate::tools::WorkDeadline::remaining);
+            crate::tools::WorkDeadline::starting_now(
+                child_time_limit(requested, parent_remaining),
+                owner_wait.clone(),
+            )
+        });
+        let read_only_tools: std::collections::HashSet<String> = scoped_tools
+            .iter()
+            .filter(|tool| tool.capabilities().read_only)
+            .map(|tool| tool.name().to_string())
+            .collect();
         let child = self
             .create_child_agent(
                 scoped_tools,
@@ -2541,6 +2640,7 @@ impl Agent {
                 max_iterations_override,
                 timeout_secs_override,
                 parent_authority,
+                deadline.clone(),
             )
             .await;
         let child_session_for_events = child_session.clone();
@@ -2563,9 +2663,8 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
-        let owner_wait = crate::tools::OwnerWaitClock::current();
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
-            owner_wait,
+            Some(owner_wait),
             async move {
                 child
                     .handle_message(
@@ -2580,63 +2679,100 @@ impl Agent {
             },
         ));
         let _abort = AbortOnDrop(join.abort_handle());
-        let result = if let Some(attempt) = task_attempt.as_ref() {
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(45));
-            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    joined = &mut join => {
-                        break match joined {
-                            Ok(result) => result,
-                            Err(join_err) => Err(anyhow::anyhow!(
-                                "child agent task did not complete: {join_err}"
-                            )),
-                        };
-                    }
-                    _ = heartbeat.tick() => {
-                        let renewed = match self
-                            .state
-                            .heartbeat_task_attempt(
-                                &attempt.id,
-                                &attempt.lease_token,
-                                180,
-                            )
-                            .await
-                        {
-                            Ok(renewed) => renewed,
-                            Err(error) => {
-                                // A transient store failure must not be
-                                // promoted to lease loss. The next heartbeat
-                                // still has a chance to renew the live lease;
-                                // an actual expiry/revocation is the explicit
-                                // Ok(false) result below.
-                                warn!(
-                                    attempt_id = %attempt.id,
-                                    %error,
-                                    "Child-agent heartbeat could not renew; will retry"
-                                );
-                                continue;
-                            }
-                        };
-                        if !renewed {
-                            join.abort();
-                            break Err(anyhow::anyhow!(
-                                "Task execution lease was lost; stale worker stopped"
-                            ));
+        let mut timed_out = false;
+        let deadline_reached = async {
+            match deadline.as_ref() {
+                Some(deadline) => deadline.reached(CHILD_LIMIT_CHECK).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline_reached);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(45));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let result = loop {
+            tokio::select! {
+                joined = &mut join => {
+                    break match joined {
+                        Ok(result) => result,
+                        Err(join_err) => Err(anyhow::anyhow!(
+                            "child agent task did not complete: {join_err}"
+                        )),
+                    };
+                }
+                _ = &mut deadline_reached => {
+                    join.abort();
+                    let _ = (&mut join).await;
+                    timed_out = true;
+                    break Err(anyhow::anyhow!("child agent ran out of working time"));
+                }
+                _ = heartbeat.tick(), if task_attempt.is_some() => {
+                    let Some(attempt) = task_attempt.as_ref() else {
+                        continue;
+                    };
+                    let renewed = match self
+                        .state
+                        .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                        .await
+                    {
+                        Ok(renewed) => renewed,
+                        Err(error) => {
+                            // A transient store failure must not be promoted
+                            // to lease loss. The next heartbeat still has a
+                            // chance to renew the live lease; an actual
+                            // expiry/revocation is the explicit Ok(false)
+                            // result below.
+                            warn!(
+                                attempt_id = %attempt.id,
+                                %error,
+                                "Child-agent heartbeat could not renew; will retry"
+                            );
+                            continue;
                         }
+                    };
+                    if !renewed {
+                        join.abort();
+                        break Err(anyhow::anyhow!(
+                            "Task execution lease was lost; stale worker stopped"
+                        ));
                     }
                 }
-            }
-        } else {
-            match join.await {
-                Ok(result) => result,
-                Err(join_err) => Err(anyhow::anyhow!(
-                    "child agent task did not complete: {join_err}"
-                )),
             }
         };
 
         drop(approval_route_guard);
+
+        // A stopped child never reached its own closeout. The caller decides
+        // what the timeout means for any durable task; here we record what
+        // the child had already done.
+        if timed_out {
+            let report = child_work_report(
+                &self.event_store,
+                &child_session_for_events,
+                &read_only_tools,
+            )
+            .await;
+            let limit_secs = deadline
+                .as_ref()
+                .map(|deadline| deadline.limit().as_secs())
+                .unwrap_or_default();
+            let timed_out = ChildTimedOut { limit_secs, report };
+            let emitter =
+                crate::events::EventEmitter::new(self.event_store.clone(), child_session.clone());
+            let _ = emitter
+                .emit(
+                    EventType::SubAgentComplete,
+                    SubAgentCompleteData {
+                        child_session_id: child_session.clone(),
+                        specialist_kind: Some(specialist_kind.as_str().to_string()),
+                        success: false,
+                        result_summary: timed_out.to_string(),
+                        duration_secs: start.elapsed().as_secs(),
+                        parent_task_id: saved_task_id.clone(),
+                    },
+                )
+                .await;
+            return Err(timed_out.into());
+        }
 
         let child_end_record =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
@@ -3044,10 +3180,42 @@ mod tests {
     /// A child that saw untrusted content but could not record it, or
     /// whose record cannot be read, returns an untrusted result.
     #[test]
+    fn a_waited_on_child_ends_inside_its_parents_limit() {
+        let requested = ChildTimeLimit {
+            limit: Duration::from_secs(300),
+            detached: false,
+        };
+        assert_eq!(child_time_limit(requested, None), Duration::from_secs(300));
+        assert_eq!(
+            child_time_limit(requested, Some(Duration::from_secs(100))),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            child_time_limit(requested, Some(Duration::from_secs(4))),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn a_background_child_is_not_bound_by_its_parents_limit() {
+        let requested = ChildTimeLimit {
+            limit: Duration::from_secs(300),
+            detached: true,
+        };
+        assert_eq!(
+            child_time_limit(requested, Some(Duration::from_secs(5))),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
     fn a_reply_with_no_readable_end_record_is_not_a_success() {
         let unreadable: anyhow::Result<Option<TaskEndData>> =
             Err(anyhow::anyhow!("database is locked"));
-        assert_eq!(resolve_child_outcome(true, &unreadable), TaskOutcome::Partial);
+        assert_eq!(
+            resolve_child_outcome(true, &unreadable),
+            TaskOutcome::Partial
+        );
         assert_eq!(resolve_child_outcome(true, &Ok(None)), TaskOutcome::Partial);
         assert_eq!(resolve_child_outcome(false, &Ok(None)), TaskOutcome::Failed);
     }
@@ -3065,7 +3233,10 @@ mod tests {
         assert_eq!(named_specialist(Some("task_lead")), None);
         assert_eq!(named_specialist(Some("not-a-kind")), None);
         assert_eq!(named_specialist(None), None);
-        assert_eq!(named_specialist(Some("review")), Some(SpecialistKind::Review));
+        assert_eq!(
+            named_specialist(Some("review")),
+            Some(SpecialistKind::Review)
+        );
     }
 
     #[test]
@@ -3093,20 +3264,22 @@ mod tests {
     async fn nested_background_results_go_to_the_chat_the_work_answers_to() {
         use crate::runtime_ports::ChildAgentRuntime;
         let provider = crate::testing::MockProvider::new();
-        let mut harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
-            provider,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
+        let mut harness =
+            crate::testing::setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+                .await
+                .unwrap();
         assert_eq!(
-            harness.agent.background_delivery_session("specialist:code:1"),
+            harness
+                .agent
+                .background_delivery_session("specialist:code:1"),
             "specialist:code:1",
             "a root agent answers to its own session"
         );
         harness.agent.approval_session_id = Some("telegram:synthetic-user-1".to_string());
         assert_eq!(
-            harness.agent.background_delivery_session("specialist:code:1"),
+            harness
+                .agent
+                .background_delivery_session("specialist:code:1"),
             "telegram:synthetic-user-1"
         );
     }

@@ -9,7 +9,10 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::events::TaskOutcome;
-use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime, OutboundRouter};
+use crate::runtime_ports::{
+    ChildAgentRequest, ChildAgentRun, ChildAgentRuntime, ChildTimeLimit, ChildTimedOut,
+    OutboundRouter,
+};
 use crate::traits::{
     AgentRole, StateStore, Tool, ToolCallContext, ToolCallOutcome, ToolCapabilities,
 };
@@ -182,6 +185,14 @@ impl SpawnAgentTool {
         };
 
         format_specialist_arg_description(&agent.specialist_descriptions())
+    }
+
+    /// The working time a child spawned by this tool gets.
+    fn time_limit(&self, detached: bool) -> Option<ChildTimeLimit> {
+        Some(ChildTimeLimit {
+            limit: Duration::from_secs(self.timeout_secs),
+            detached,
+        })
     }
 
     /// Acquire a per-task in-flight lock for executor spawns.
@@ -597,6 +608,7 @@ impl Tool for SpawnAgentTool {
         let task = effective_task.clone();
         let mission = effective_mission.clone();
         let timeout_secs = self.timeout_secs;
+        let time_limit = self.time_limit(true);
         let max_response_chars = self.max_response_chars;
         let executor_task_runs = Arc::clone(&self.executor_task_runs);
         let executor_task_id_for_bg = executor_task_id;
@@ -608,25 +620,22 @@ impl Tool for SpawnAgentTool {
             let mut progress_interval =
                 tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
             progress_interval.tick().await; // consume immediate tick
-            let timeout_duration = Duration::from_secs(timeout_secs);
-            let mut result_fut = std::pin::pin!(tokio::time::timeout(
-                timeout_duration,
-                agent.run_child(ChildAgentRequest {
-                    mission: mission.clone(),
-                    task: task.clone(),
-                    status_tx: status_tx.clone(),
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id: goal_id_ref.clone(),
-                    task_id: task_id_ref.clone(),
-                    project_scope: project_scope.clone(),
-                    specialist: args.specialist.clone(),
-                    approval_session_id: Some(session_id.clone()),
-                    parent_authority: parent_authority.clone(),
-                }),
-            ));
-            let result = loop {
+            let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
+                mission: mission.clone(),
+                task: task.clone(),
+                status_tx: status_tx.clone(),
+                channel_ctx,
+                user_role,
+                child_role,
+                goal_id: goal_id_ref.clone(),
+                task_id: task_id_ref.clone(),
+                project_scope: project_scope.clone(),
+                specialist: args.specialist.clone(),
+                approval_session_id: Some(session_id.clone()),
+                parent_authority: parent_authority.clone(),
+                time_limit,
+            }),);
+            let result: anyhow::Result<ChildAgentRun> = loop {
                 tokio::select! {
                     res = &mut result_fut => break res,
                     _ = progress_interval.tick() => {
@@ -647,67 +656,77 @@ impl Tool for SpawnAgentTool {
             // Only a finished child's own record decides; any other result
             // may carry child-written text and counts as untrusted.
             let trust = match &result {
-                Ok(Ok(run)) => run.trust,
-                Err(_) if task_id_ref.is_none() => SourceTrust::Trusted,
-                _ => SourceTrust::Untrusted,
+                Ok(run) => run.trust,
+                Err(error)
+                    if task_id_ref.is_none()
+                        && error
+                            .downcast_ref::<ChildTimedOut>()
+                            .is_some_and(|t| !t.report.may_have_changed_something()) =>
+                {
+                    SourceTrust::Trusted
+                }
+                Err(_) => SourceTrust::Untrusted,
             };
             let (notification_type, message) = match result {
-                Ok(Ok(run)) => format_background_completion(
+                Ok(run) => format_background_completion(
                     &mission,
                     &run.response,
                     run.outcome,
                     max_response_chars,
                 ),
-                Ok(Err(e)) => (
-                    "failed",
-                    format!(
-                        "\u{274c} Background task failed\nMission: {}\nError: {}",
-                        mission, e
+                Err(error) => match error.downcast_ref::<ChildTimedOut>() {
+                    None => (
+                        "failed",
+                        format!(
+                            "\u{274c} Background task failed\nMission: {}\nError: {}",
+                            mission, error
+                        ),
                     ),
-                ),
-                Err(_) => {
-                    // The child may have persisted a terminal outcome before
-                    // the timeout cancelled it — deliver that instead of a
-                    // generic timeout failure.
-                    let salvaged = match task_id_ref.as_deref() {
-                        Some(task_id) => {
-                            agent
-                                .salvage_executor_task_outcome(task_id, timeout_secs)
-                                .await
+                    Some(timed_out) => {
+                        // The child may have persisted a terminal outcome
+                        // before it was stopped — deliver that instead of a
+                        // generic timeout failure.
+                        let salvaged = match task_id_ref.as_deref() {
+                            Some(task_id) => {
+                                agent
+                                    .salvage_executor_task_outcome(task_id, timeout_secs)
+                                    .await
+                            }
+                            None => None,
+                        };
+                        match salvaged {
+                            Some(outcome) if outcome.status == "completed" => (
+                                "completed",
+                                format!(
+                                    "\u{2705} Background task complete\nMission: {}\n\n{}",
+                                    mission, outcome.details
+                                ),
+                            ),
+                            Some(outcome) if outcome.status == "blocked" => (
+                                "blocked",
+                                format!(
+                                    "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
+                                    mission, outcome.details
+                                ),
+                            ),
+                            Some(outcome) => (
+                                "failed",
+                                format!(
+                                    "\u{274c} Background task failed\nMission: {}\n\n{}",
+                                    mission, outcome.details
+                                ),
+                            ),
+                            None => (
+                                "failed",
+                                format!(
+                                    "\u{23f1} Background task timed out\nMission: {}\n\n{}",
+                                    mission,
+                                    timed_out.render()
+                                ),
+                            ),
                         }
-                        None => None,
-                    };
-                    match salvaged {
-                        Some(outcome) if outcome.status == "completed" => (
-                            "completed",
-                            format!(
-                                "\u{2705} Background task complete\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        Some(outcome) if outcome.status == "blocked" => (
-                            "blocked",
-                            format!(
-                                "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        Some(outcome) => (
-                            "failed",
-                            format!(
-                                "\u{274c} Background task failed\nMission: {}\n\n{}",
-                                mission, outcome.details
-                            ),
-                        ),
-                        None => (
-                            "failed",
-                            format!(
-                                "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
-                                mission, timeout_secs
-                            ),
-                        ),
                     }
-                }
+                },
             };
             // Without a hub the queue delivers it (and the heartbeat records
             // it in the parent session then), so it is recorded once.
@@ -827,10 +846,8 @@ impl SpawnAgentTool {
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let result = tokio::time::timeout(
-            timeout_duration,
-            agent.run_child(ChildAgentRequest {
+        let result = agent
+            .run_child(ChildAgentRequest {
                 mission: mission.to_string(),
                 task: task.to_string(),
                 status_tx,
@@ -843,12 +860,12 @@ impl SpawnAgentTool {
                 specialist: arg_specialist.map(str::to_string),
                 approval_session_id: approval_session_id.map(str::to_string),
                 parent_authority,
-            }),
-        )
-        .await;
+                time_limit: self.time_limit(false),
+            })
+            .await;
 
         match result {
-            Ok(Ok(run)) => {
+            Ok(run) => {
                 let response = match run.outcome {
                     TaskOutcome::Succeeded => run.response,
                     TaskOutcome::Partial => {
@@ -861,39 +878,50 @@ impl SpawnAgentTool {
                 let response = bounded_child_response(&response, self.max_response_chars);
                 Ok(reported(response, run.trust))
             }
-            Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
-            Err(_) => {
-                if let Some(task_id) = task_id {
-                    // The child may have persisted a terminal outcome (e.g.
-                    // report_blocker) before the timeout cancelled it — use
-                    // that instead of discarding the work.
-                    if let Some(salvaged) = agent
-                        .salvage_executor_task_outcome(task_id, self.timeout_secs)
-                        .await
-                    {
-                        let prefix = match salvaged.status.as_str() {
-                            "completed" => "\u{2705} Sub-agent complete",
-                            "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
-                            _ => "\u{274c} Sub-agent failed",
-                        };
-                        // The child wrote these details; its taint is
-                        // unknown after a timeout.
+            Err(error) => match error.downcast_ref::<ChildTimedOut>() {
+                None => Err(anyhow::anyhow!("Specialist failed: {}", error)),
+                Some(timed_out) => {
+                    if let Some(task_id) = task_id {
+                        // The child may have persisted a terminal outcome (e.g.
+                        // report_blocker) before it was stopped — use that
+                        // instead of discarding the work.
+                        if let Some(salvaged) = agent
+                            .salvage_executor_task_outcome(task_id, self.timeout_secs)
+                            .await
+                        {
+                            let prefix = match salvaged.status.as_str() {
+                                "completed" => "\u{2705} Sub-agent complete",
+                                "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
+                                _ => "\u{274c} Sub-agent failed",
+                            };
+                            // The child wrote these details; its taint is
+                            // unknown after a timeout.
+                            return Ok(reported(
+                                format!("{prefix}\n\n{}", salvaged.details),
+                                SourceTrust::Untrusted,
+                            ));
+                        }
+                        if child_role == Some(AgentRole::Executor) {
+                            agent
+                                .mark_executor_task_timeout(task_id, self.timeout_secs)
+                                .await;
+                        }
+                    }
+                    if timed_out.report.may_have_changed_something() {
+                        // Not a failure the loop may retry on its own: the
+                        // parent has to look at what already happened. The
+                        // action details come from the child's run.
                         return Ok(reported(
-                            format!("{prefix}\n\n{}", salvaged.details),
+                            format!(
+                                "\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}",
+                                timed_out.render()
+                            ),
                             SourceTrust::Untrusted,
                         ));
                     }
-                    if child_role == Some(AgentRole::Executor) {
-                        agent
-                            .mark_executor_task_timeout(task_id, self.timeout_secs)
-                            .await;
-                    }
+                    Err(anyhow::anyhow!("{timed_out}"))
                 }
-                Err(anyhow::anyhow!(
-                    "Specialist timed out after {} seconds",
-                    self.timeout_secs
-                ))
-            }
+            },
         }
     }
 }
@@ -1255,7 +1283,7 @@ mod specialist_arg_tests {
 mod child_runtime_tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
-    use crate::runtime_ports::{ChildAgentRun, SalvagedTaskOutcome};
+    use crate::runtime_ports::{ChildWorkReport, SalvagedTaskOutcome};
     use crate::state::SqliteStateStore;
     use crate::traits::NotificationStore;
     use std::sync::Mutex as StdMutex;
@@ -1265,6 +1293,7 @@ mod child_runtime_tests {
         response: String,
         delay: Duration,
         tasks: StdMutex<Vec<String>>,
+        failure: StdMutex<Option<anyhow::Error>>,
     }
 
     impl ScriptedChild {
@@ -1273,6 +1302,7 @@ mod child_runtime_tests {
                 response: response.to_string(),
                 delay,
                 tasks: StdMutex::new(Vec::new()),
+                failure: StdMutex::new(None),
             })
         }
     }
@@ -1301,6 +1331,9 @@ mod child_runtime_tests {
         async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
             self.tasks.lock().unwrap().push(request.task);
             tokio::time::sleep(self.delay).await;
+            if let Some(failure) = self.failure.lock().unwrap().take() {
+                return Err(failure);
+            }
             Ok(ChildAgentRun {
                 response: self.response.clone(),
                 outcome: TaskOutcome::Succeeded,
@@ -1362,6 +1395,54 @@ mod child_runtime_tests {
         assert!(tool.get_hub().is_some());
     }
 
+    /// A timed-out child that already acted is not a retryable failure.
+    #[tokio::test]
+    async fn timeout_after_side_effects_warns_instead_of_failing() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport {
+                    changed: vec!["send_file: report.pdf".to_string()],
+                    ..Default::default()
+                },
+            }
+            .into(),
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Send", "task": "Send it"}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect("reported, not an error");
+
+        assert!(outcome.output.contains("send_file: report.pdf"));
+        assert!(outcome.output.contains("Do NOT run it again"));
+        assert_eq!(outcome.metadata.output_trust, Some(SourceTrust::Untrusted));
+    }
+
+    #[tokio::test]
+    async fn timeout_with_no_side_effects_stays_a_retryable_error() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport::default(),
+            }
+            .into(),
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Read", "task": "Read it"}).to_string();
+
+        let error = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .expect_err("nothing happened, so a retry is safe");
+
+        assert!(error.to_string().contains("timed out after 30 seconds"));
+    }
+
     /// A task that merely starts like a delay reaches the child at once and
     /// word for word: wording never decides whether to wait.
     #[tokio::test]
@@ -1399,12 +1480,8 @@ mod child_runtime_tests {
 
     #[test]
     fn truncated_background_result_says_what_is_missing() {
-        let (_, message) = format_background_completion(
-            "Report",
-            &"x".repeat(500),
-            TaskOutcome::Succeeded,
-            100,
-        );
+        let (_, message) =
+            format_background_completion("Report", &"x".repeat(500), TaskOutcome::Succeeded, 100);
         assert!(message.contains("OUTPUT TRUNCATED"));
     }
 
@@ -1481,8 +1558,7 @@ mod child_runtime_tests {
         let state: Arc<dyn StateStore> = store.clone();
         let tool = tool_for(&child).with_state(state);
         tool.set_hub(Arc::downgrade(&router));
-        let args =
-            json!({"mission": "Report", "task": "Write it", "background": true}).to_string();
+        let args = json!({"mission": "Report", "task": "Write it", "background": true}).to_string();
 
         tool.call_with_execution_context(&args, None, facts())
             .await

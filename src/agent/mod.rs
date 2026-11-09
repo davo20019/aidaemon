@@ -329,6 +329,8 @@ pub struct Agent {
     mandate_execution: Option<MandateExecutionFence>,
     /// Cancellation token — checked each iteration; cancelled by parent or user.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// This child's own working-time limit; its children finish within it.
+    child_deadline: Option<crate::tools::WorkDeadline>,
     /// SDK kernel settings for this agent's turns; inherited by spawned children.
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
     /// The kernel's durable run store: every SDK run journals its events and

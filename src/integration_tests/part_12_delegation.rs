@@ -891,3 +891,64 @@ async fn test_review_specialist_prompt_reaches_a_plain_spawn() {
     let (_, prompt) = plain_spawn_call(Some("review")).await;
     assert!(prompt.contains("You are a Review specialist."));
 }
+
+async fn run_limited_child(
+    provider: MockProvider,
+) -> crate::runtime_ports::ChildTimedOut {
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let agent = Arc::new(harness.agent);
+    let error = agent
+        .spawn_child_with_outcome(
+            "synthetic mission",
+            "synthetic task",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime_ports::ChildTimeLimit {
+                limit: std::time::Duration::from_millis(1_500),
+                detached: false,
+            }),
+        )
+        .await
+        .expect_err("the child runs past its limit");
+    error
+        .downcast::<crate::runtime_ports::ChildTimedOut>()
+        .expect("a typed timeout")
+}
+
+#[tokio::test]
+async fn test_child_past_its_limit_reports_the_actions_it_completed() {
+    let timed_out = run_limited_child(MockProvider::with_delayed_responses(
+        vec![
+            MockProvider::tool_call_response("terminal", r#"{"command":"echo synthetic"}"#),
+            MockProvider::text_response("never reached"),
+        ],
+        vec![std::time::Duration::ZERO, std::time::Duration::from_secs(30)],
+    ))
+    .await;
+    assert!(
+        timed_out.report.changed.iter().any(|item| item.starts_with("terminal:")),
+        "{:?}",
+        timed_out.report
+    );
+    assert!(timed_out.render().contains("Do NOT run it again"));
+}
+
+#[tokio::test]
+async fn test_child_past_its_limit_with_no_actions_is_safe_to_rerun() {
+    let timed_out = run_limited_child(MockProvider::with_delayed_responses(
+        vec![MockProvider::text_response("never reached")],
+        vec![std::time::Duration::from_secs(30)],
+    ))
+    .await;
+    assert!(!timed_out.report.may_have_changed_something());
+}

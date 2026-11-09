@@ -128,16 +128,9 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
 /// Resolves once the turn has worked for `limit`, not counting the time its
 /// cards waited for the owner.
 async fn turn_limit_reached(limit: Duration, owner_wait: &crate::tools::OwnerWaitClock) {
-    let started = tokio::time::Instant::now();
-    loop {
-        let worked = started.elapsed().saturating_sub(owner_wait.waited());
-        match limit.checked_sub(worked) {
-            Some(left) if !left.is_zero() => {
-                tokio::time::sleep(left.min(TURN_LIMIT_CHECK)).await;
-            }
-            _ => return,
-        }
-    }
+    crate::tools::WorkDeadline::starting_now(limit, owner_wait.clone())
+        .reached(TURN_LIMIT_CHECK)
+        .await;
 }
 
 /// Runs turns for one channel (bot).
