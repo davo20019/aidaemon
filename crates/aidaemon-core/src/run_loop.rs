@@ -86,9 +86,22 @@ struct Approved {
     annotations: ToolAnnotations,
 }
 
+/// What a dispatch asks of the tool.
+enum Invocation {
+    Call,
+    /// Pass an answer to the child run the tool suspended.
+    Resume {
+        child: Box<RunState>,
+        resolution: Resolution,
+    },
+}
+
 impl<'a> Driver<'a> {
     pub(crate) fn new(agent: &'a AgentInner, state: RunState, cancel: CancellationToken) -> Self {
         let base_elapsed_ms = state.elapsed_ms;
+        // Whatever version it was saved at, it is written back at this one.
+        let mut state = state;
+        state.schema = crate::state::RUN_STATE_SCHEMA;
         // Tools that start other runs share this set, so a decline in any of
         // them binds the rest.
         let own_declines = state.shared_declines().is_none();
@@ -159,7 +172,7 @@ impl<'a> Driver<'a> {
         mut self,
         resolution: Option<Resolution>,
     ) -> Result<RunOutcome, CoreError> {
-        if let Some(pending) = self.state.pending.take() {
+        if let Some(mut pending) = self.state.pending.take() {
             let resolution = self.settle(&pending.interruption, resolution);
             self.emit(Event::RunResumed).await?;
             let earlier: Vec<String> = pending.calls[..pending.next]
@@ -176,8 +189,15 @@ impl<'a> Driver<'a> {
             let resume_after = pending
                 .hook_index
                 .filter(|_| pending.hook_chain == self.hook_chain());
+            let child = pending.child.take();
             match self
-                .execute_batch(&pending.calls, pending.next, resolution, resume_after)
+                .execute_batch(
+                    &pending.calls,
+                    pending.next,
+                    resolution,
+                    resume_after,
+                    child,
+                )
                 .await?
             {
                 BatchEnd::Done => self.checkpoint().await?,
@@ -448,7 +468,7 @@ impl<'a> Driver<'a> {
                 ..InFlight::default()
             });
             self.checkpoint().await?;
-            match self.execute_batch(&calls, 0, None, None).await? {
+            match self.execute_batch(&calls, 0, None, None, None).await? {
                 BatchEnd::Done => self.checkpoint().await?,
                 end => return self.finish_batch(end).await,
             }
@@ -467,9 +487,10 @@ impl<'a> Driver<'a> {
         start: usize,
         resolution: Option<Resolution>,
         resume_after: Option<usize>,
+        child: Option<Box<RunState>>,
     ) -> Result<BatchEnd, CoreError> {
         let end = self
-            .run_batch(calls, start, resolution, resume_after)
+            .run_batch(calls, start, resolution, resume_after, child)
             .await?;
         Ok(match end {
             BatchEnd::Done | BatchEnd::Limit(_) | BatchEnd::Stuck(_) => {
@@ -495,6 +516,7 @@ impl<'a> Driver<'a> {
         start: usize,
         mut resolution: Option<Resolution>,
         resume_after: Option<usize>,
+        mut child: Option<Box<RunState>>,
     ) -> Result<BatchEnd, CoreError> {
         let mut group: Vec<Approved> = Vec::new();
         let mut nudge: Option<String> = None;
@@ -591,7 +613,8 @@ impl<'a> Driver<'a> {
             // Authority and receipts use the per-call value; concurrent
             // scheduling uses only the tool's worst case, since a per-call
             // relaxation is a statement about authority, not isolation.
-            let may_run_concurrently = tool.annotations().read_only;
+            let suspends = tool.suspends();
+            let may_run_concurrently = tool.annotations().read_only && !suspends;
             let mut info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
@@ -610,6 +633,23 @@ impl<'a> Driver<'a> {
                 {
                     return Ok(end);
                 }
+            }
+
+            // This call is already inside its tool: it passed policy when it
+            // started, and the answer is for the run paused below it.
+            if let Some(child) = child.take() {
+                let resolution = resolution.take().unwrap_or_else(|| Resolution::Deny {
+                    reason: "the run was resumed without an answer".to_string(),
+                });
+                let item = Approved { call, annotations };
+                let invocation = Invocation::Resume { child, resolution };
+                if let Some(end) = self
+                    .run_suspendable(item, invocation, calls, index, &mut nudge, &mut stop)
+                    .await?
+                {
+                    return Ok(end);
+                }
+                continue;
             }
 
             // Policy: a pending resolution settles the first call; otherwise
@@ -646,6 +686,28 @@ impl<'a> Driver<'a> {
             match verdict {
                 Verdict::Allow if may_run_concurrently => {
                     group.push(Approved { call, annotations });
+                }
+                Verdict::Allow if suspends => {
+                    if let Some(end) = self
+                        .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                        .await?
+                    {
+                        return Ok(end);
+                    }
+                    let item = Approved { call, annotations };
+                    if let Some(end) = self
+                        .run_suspendable(
+                            item,
+                            Invocation::Call,
+                            calls,
+                            index,
+                            &mut nudge,
+                            &mut stop,
+                        )
+                        .await?
+                    {
+                        return Ok(end);
+                    }
                 }
                 Verdict::Allow => {
                     if let Some(end) = self
@@ -712,22 +774,14 @@ impl<'a> Driver<'a> {
                     // Save the call exactly as the hooks left it: a resumed
                     // `Approve` runs what the approver was shown, including
                     // any rewrite, without consulting the hooks again.
-                    let mut pending_calls = calls.to_vec();
-                    pending_calls[index] = call.clone();
-                    let interruption = Interruption { call, reason, kind };
-                    self.state.in_flight = None;
-                    self.state.pending = Some(Pending {
-                        calls: pending_calls,
-                        next: index,
-                        interruption: interruption.clone(),
-                        hook_index: Some(hook_index),
-                        hook_chain: self.hook_chain(),
-                    });
-                    self.emit(Event::Interrupted {
-                        interruption: interruption.clone(),
-                    })
-                    .await?;
-                    return Ok(BatchEnd::Interrupted(interruption));
+                    let interruption = Interruption {
+                        call: call.clone(),
+                        reason,
+                        kind,
+                    };
+                    return self
+                        .hold_batch(calls, index, call, interruption, Some(hook_index), None)
+                        .await;
                 }
             }
         }
@@ -749,6 +803,77 @@ impl<'a> Driver<'a> {
                 .push(Message::from_origin(MessageOrigin::Harness, message));
         }
         Ok(BatchEnd::Done)
+    }
+
+    /// Save the batch as waiting on `calls[index]`, sent as `call`.
+    async fn hold_batch(
+        &mut self,
+        calls: &[ToolCall],
+        index: usize,
+        call: ToolCall,
+        interruption: Interruption,
+        hook_index: Option<usize>,
+        child: Option<Box<RunState>>,
+    ) -> Result<BatchEnd, CoreError> {
+        let mut pending_calls = calls.to_vec();
+        pending_calls[index] = call;
+        self.state.in_flight = None;
+        self.state.pending = Some(Pending {
+            calls: pending_calls,
+            next: index,
+            interruption: interruption.clone(),
+            hook_index,
+            hook_chain: self.hook_chain(),
+            child,
+        });
+        self.emit(Event::Interrupted {
+            interruption: interruption.clone(),
+        })
+        .await?;
+        Ok(BatchEnd::Interrupted(interruption))
+    }
+
+    /// Run a call of a tool that may suspend, alone. Marking it started is
+    /// checkpointed first, which also consumes an answer being passed down:
+    /// after a crash the call is recovered like any other that was running,
+    /// so the answer is not applied twice and the child's finished calls do
+    /// not run again. Returns how the batch ends if the child paused.
+    async fn run_suspendable(
+        &mut self,
+        item: Approved,
+        invocation: Invocation,
+        calls: &[ToolCall],
+        index: usize,
+        nudge: &mut Option<String>,
+        stop: &mut Option<StuckSignal>,
+    ) -> Result<Option<BatchEnd>, CoreError> {
+        if let Some(in_flight) = self.state.in_flight.as_mut() {
+            in_flight.started.push(item.call.id.clone());
+        }
+        self.checkpoint().await?;
+        if matches!(invocation, Invocation::Call) {
+            self.emit(Event::ToolStarted {
+                call_id: item.call.id.clone(),
+                tool: item.call.name.clone(),
+            })
+            .await?;
+        }
+        let (receipt, mut output) = self.dispatch(&item, invocation).await;
+        let paused = output.suspended.take().and_then(|child| {
+            let interruption = child.pending.as_ref()?.interruption.clone();
+            Some((interruption, child))
+        });
+        if let Some((interruption, mut child)) = paused {
+            // A runtime handle: the resumed child gets the set in force then.
+            child.shared_declines = None;
+            let end = self
+                .hold_batch(calls, index, item.call, interruption, None, Some(child))
+                .await?;
+            return Ok(Some(end));
+        }
+        track(self.record(receipt, output).await?, nudge, stop);
+        self.checkpoint().await?;
+        Ok(None)
     }
 
     /// Flush the queued read-only calls before `rest[0]` is handled. If
@@ -876,7 +1001,12 @@ impl<'a> Driver<'a> {
             .await?;
         }
         let this = &*self;
-        let results = join_all(items.iter().map(|item| this.dispatch(item))).await;
+        let results = join_all(
+            items
+                .iter()
+                .map(|item| this.dispatch(item, Invocation::Call)),
+        )
+        .await;
         for (receipt, output) in results {
             let action = self.record(receipt, output).await?;
             track(action, nudge, stop);
@@ -886,7 +1016,7 @@ impl<'a> Driver<'a> {
     }
 
     /// Run one tool with a timeout and cancellation, producing its receipt.
-    async fn dispatch(&self, item: &Approved) -> (Receipt, ToolOutput) {
+    async fn dispatch(&self, item: &Approved, invocation: Invocation) -> (Receipt, ToolOutput) {
         let call = &item.call;
         let tool = self
             .agent
@@ -908,12 +1038,20 @@ impl<'a> Driver<'a> {
             None => per_tool,
         };
         let started = Instant::now();
+        let work = async {
+            match invocation {
+                Invocation::Call => tool.call(call.arguments.clone(), &ctx).await,
+                Invocation::Resume { child, resolution } => {
+                    tool.resume_child(*child, resolution, &ctx).await
+                }
+            }
+        };
         let result = tokio::time::timeout(timeout, async {
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => None,
                 // A panicking tool is a failed call, not a crashed run.
-                result = AssertUnwindSafe(tool.call(call.arguments.clone(), &ctx)).catch_unwind() => {
+                result = AssertUnwindSafe(work).catch_unwind() => {
                     Some(result.map_err(|panic| panic_message(&*panic)))
                 }
             }
@@ -929,7 +1067,36 @@ impl<'a> Driver<'a> {
                 .trust
                 .unwrap_or_else(|| tool.source_trust(&call.arguments))
         };
+        let cancelled = || {
+            (
+                ReceiptStatus::Cancelled,
+                Some("cancelled".to_string()),
+                ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
+                SourceTrust::Trusted,
+            )
+        };
         let (status, reason, output, source) = match result {
+            // The owner's cancel wins over a pause that raced it.
+            Ok(Some(Ok(Ok(output)))) if output.suspended.is_some() && ctx.cancel.is_cancelled() => {
+                cancelled()
+            }
+            Ok(Some(Ok(Ok(output))))
+                if output
+                    .suspended
+                    .as_ref()
+                    .is_some_and(|child| !tool.suspends() || child.pending.is_none()) =>
+            {
+                let reason = format!(
+                    "`{}` returned a paused run it cannot pause this run for",
+                    call.name
+                );
+                (
+                    ReceiptStatus::Failed,
+                    Some(reason.clone()),
+                    ToolOutput::error(format!("Error: {reason}")),
+                    SourceTrust::Trusted,
+                )
+            }
             Ok(Some(Ok(Ok(output)))) if output.is_error => {
                 let reason = output.content.chars().take(300).collect::<String>();
                 let source = tool_trust(&output);
@@ -954,12 +1121,7 @@ impl<'a> Driver<'a> {
                     SourceTrust::Trusted,
                 )
             }
-            Ok(None) => (
-                ReceiptStatus::Cancelled,
-                Some("cancelled".to_string()),
-                ToolOutput::error("Cancelled: the run was cancelled while this tool was running."),
-                SourceTrust::Trusted,
-            ),
+            Ok(None) => cancelled(),
             Err(_) => {
                 let secs = timeout.as_secs_f64();
                 (
@@ -1204,7 +1366,8 @@ impl<'a> Driver<'a> {
             indeterminate,
         })
         .await?;
-        self.execute_batch(&in_flight.calls, 0, None, None).await
+        self.execute_batch(&in_flight.calls, 0, None, None, None)
+            .await
     }
 
     fn is_done(&self, call_id: &str) -> bool {

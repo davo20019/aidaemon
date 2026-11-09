@@ -15,7 +15,12 @@ use crate::tool::Finish;
 /// can resume. State saved before the field existed reads as version 1.
 /// Bump it when a change would make older saved state resume wrongly, and
 /// teach `resume` to migrate or refuse the old version.
-pub const RUN_STATE_SCHEMA: u32 = 1;
+///
+/// Version 2 added [`Pending::child`]. A version 1 snapshot has no child and
+/// means the same thing under version 2, so it loads as is. A kernel that
+/// knows only version 1 must refuse version 2: it would drop the child and
+/// take the child's interruption for the parent's own.
+pub const RUN_STATE_SCHEMA: u32 = 2;
 
 fn first_schema() -> u32 {
     1
@@ -46,7 +51,9 @@ impl fmt::Display for RunId {
 /// Why the run paused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Interruption {
-    /// The call waiting for a decision. It has not run.
+    /// The call waiting for a decision. It has not run. In a parent paused
+    /// for a child ([`Pending::child`]) this is the child's call, at whatever
+    /// depth it is waiting, so the approver is shown what would really run.
     pub call: ToolCall,
     pub reason: String,
     /// Who the interruption waits for. State saved before kinds existed
@@ -71,6 +78,13 @@ pub struct Pending {
     /// the first hook when this does not match.
     #[serde(default)]
     pub hook_chain: Vec<String>,
+    /// The paused run of a child this call started, when the interrupted
+    /// call is a tool that delegates ([`crate::Tool::suspends`]). The call at
+    /// `next` is already inside that tool, so an answer goes to the child (at
+    /// any depth) and the call's result is what the child ends with.
+    /// [`Pending::interruption`] is then a copy of the deepest run's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<Box<RunState>>,
 }
 
 /// A tool batch that was executing when the state was last saved. Present
@@ -270,6 +284,17 @@ impl RunState {
             Some(shared) => shared.exchange(&mut self.declined),
             None => false,
         }
+    }
+
+    /// The run actually waiting for an answer: this one, or the child it is
+    /// paused for, at any depth. `None` when this run is not interrupted.
+    pub fn waiting_run(&self) -> Option<&RunState> {
+        let mut run = self;
+        run.pending.as_ref()?;
+        while let Some(child) = run.pending.as_ref().and_then(|p| p.child.as_deref()) {
+            run = child;
+        }
+        Some(run)
     }
 
     /// The serialization format version this state was written with.

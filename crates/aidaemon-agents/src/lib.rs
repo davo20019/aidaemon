@@ -30,7 +30,8 @@
 //!   `Completed` becomes an error result (failed receipt) naming the status.
 //! - **Sequential by default.** The tool is annotated
 //!   [`ToolAnnotations::WRITE`], so two children never run concurrently
-//!   unless the caller marks them read-only (e.g. research children).
+//!   unless the caller marks them read-only (e.g. research children). A
+//!   suspending child always runs alone.
 //! - **Depth guard.** Nesting depth is the number of `/sub/` segments in the
 //!   session id; calls beyond `max_depth` are refused.
 //!
@@ -41,9 +42,20 @@
 //! [`AgentTool::interrupt_resolver`], and keeps going. The parent's tool call
 //! stays open meanwhile, so `Limits::tool_timeout` on the parent bounds the
 //! wait, and a cancelled parent stops waiting. With no resolver, or when it
-//! leaves the interruption unsettled, the child is reported as an error. The
-//! parent itself never pauses for its child, so an answer cannot arrive after
-//! a restart.
+//! leaves the interruption unsettled, the child is reported as an error,
+//! unless the tool suspends.
+//!
+//! ## Durable mode
+//!
+//! With [`AgentTool::suspend_on_interrupt`], a child left interrupted pauses
+//! the parent instead: the parent's `RunStatus::Interrupted` carries the
+//! child's interruption, the child's whole state is saved in the parent's
+//! `Pending`, and the process may exit. `Agent::resume` on the parent, even
+//! in another process, passes the answer down to the child, and the parent's
+//! call ends with what the child ends with. A crash after the answer was
+//! given and before the child finished is the crash of any running call: the
+//! delegation is re-run if annotated idempotent and marked indeterminate
+//! otherwise, and nothing the child did is repeated.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -51,10 +63,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_core::{
-    Agent, AgentBuilder, AuthorityHook, BuildError, CancellationToken, FinishOutcome, Hook,
-    HookContext, InterruptResolver, Interruption, Limits, Message, ModelRequest, Resolution, Role,
-    RunOutcome, RunState, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput,
-    ToolResult, ToolSpec,
+    Agent, AgentBuilder, AuthorityHook, BuildError, CancellationToken, CoreError, FinishOutcome,
+    Hook, HookContext, InterruptResolver, Interruption, Limits, Message, ModelRequest, Resolution,
+    Role, RunOutcome, RunState, RunStatus, Tool, ToolAnnotations, ToolContext, ToolError,
+    ToolOutput, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -173,6 +185,7 @@ pub struct AgentTool {
     annotations: ToolAnnotations,
     max_depth: usize,
     resolver: Option<Arc<dyn InterruptResolver>>,
+    suspend_on_interrupt: bool,
 }
 
 /// Alias matching the name used in the design notes.
@@ -212,6 +225,7 @@ impl AgentTool {
             annotations: ToolAnnotations::WRITE,
             max_depth: DEFAULT_MAX_DEPTH,
             resolver: None,
+            suspend_on_interrupt: false,
         }
     }
 
@@ -281,8 +295,115 @@ impl AgentTool {
         self
     }
 
+    /// Pause the parent durably for a child left interrupted, instead of
+    /// ending the delegation with an error (see the crate docs). A resolver
+    /// set with [`AgentTool::interrupt_resolver`] is asked first; only what
+    /// it leaves unsettled pauses the parent. A call of this tool runs alone,
+    /// even when the tool is marked read-only.
+    pub fn suspend_on_interrupt(mut self) -> Self {
+        self.suspend_on_interrupt = true;
+        self
+    }
+
     pub fn agent(&self) -> &Agent {
         &self.agent
+    }
+
+    /// The child agent, answering to everything the parent does: its
+    /// authority stacks on the child's own. Applied afresh on every resume,
+    /// so a resumed child can never do more than the parent may now.
+    fn child_for(&self, ctx: &ToolContext) -> Agent {
+        match &ctx.authority {
+            Some(authority) => self.agent.with_hook(AuthorityHook::new(authority.clone())),
+            None => self.agent.clone(),
+        }
+    }
+
+    /// The tool result for a child run that ended or paused.
+    fn conclude(&self, outcome: RunOutcome, session: &str) -> ToolResult {
+        if self.suspend_on_interrupt && matches!(outcome.status, RunStatus::Interrupted { .. }) {
+            return Ok(ToolOutput::suspended(outcome.state));
+        }
+        let details = self.details(&outcome, session);
+        let usage = outcome.usage();
+        let output = match &outcome.status {
+            // Completed means the child stopped, not that it did the work:
+            // unmet requirements are passed up so the caller cannot mistake
+            // a stop for a success.
+            RunStatus::Completed if !outcome.unmet().is_empty() => {
+                let text = condense(
+                    outcome.final_text.as_deref().unwrap_or_default(),
+                    self.max_result_chars,
+                );
+                let mut message = format!(
+                    "sub-agent `{}` stopped without finishing; still unmet:",
+                    self.name
+                );
+                for line in outcome.unmet() {
+                    message.push_str("\n- ");
+                    message.push_str(line);
+                }
+                message.push_str("\n\nIts reply:\n");
+                message.push_str(&text);
+                ToolOutput::text(message)
+            }
+            RunStatus::Completed => {
+                let text = outcome.final_text.as_deref().unwrap_or_default();
+                ToolOutput::text(condense(text, self.max_result_chars))
+            }
+            // A tool in the sub-agent ended its run: the finish reply is the
+            // answer. Partial work says so; a blocked one is a failure the
+            // caller should react to.
+            RunStatus::Finished {
+                outcome: finish, ..
+            } => {
+                let text = condense(
+                    outcome.final_text.as_deref().unwrap_or_default(),
+                    self.max_result_chars,
+                );
+                match finish {
+                    FinishOutcome::Succeeded => ToolOutput::text(text),
+                    FinishOutcome::Partial => ToolOutput::text(format!(
+                        "sub-agent `{}` finished part of the task:\n{text}",
+                        self.name
+                    )),
+                    _ => {
+                        ToolOutput::error(format!("sub-agent `{}` is blocked:\n{text}", self.name))
+                    }
+                }
+            }
+            RunStatus::Interrupted { interruption } if self.resolver.is_some() => {
+                ToolOutput::error(format!(
+                    "sub-agent `{}` paused waiting for approval of `{}` ({}) and it was not \
+                     settled, so the call did not run. Do it yourself (your own approval policy \
+                     applies) or ask the user.",
+                    self.name, interruption.call.name, interruption.reason
+                ))
+            }
+            RunStatus::Interrupted { interruption } => ToolOutput::error(format!(
+                "sub-agent `{}` paused waiting for approval of `{}` ({}). Sub-agents that need \
+                 approval are not supported in synchronous agent-as-tool mode, so the call did \
+                 not run. Do it yourself (your own approval policy applies) or ask the user.",
+                self.name, interruption.call.name, interruption.reason
+            )),
+            status => {
+                let mut message = format!(
+                    "sub-agent `{}` did not complete: {}.",
+                    self.name,
+                    status_label(status)
+                );
+                if let Some(partial) = last_assistant_text(&outcome.state.messages) {
+                    message.push_str("\nLast message from the sub-agent:\n");
+                    message.push_str(&condense(partial, self.max_result_chars));
+                }
+                ToolOutput::error(message)
+            }
+        };
+        Ok(output.with_details(details).with_usage(usage))
+    }
+
+    fn could_not_run(&self, error: CoreError) -> ToolError {
+        ToolError(format!("sub-agent `{}` could not run: {error}", self.name))
     }
 
     fn compose_input(&self, task: &str, context: Option<&str>, ctx: &ToolContext) -> String {
@@ -408,12 +529,8 @@ impl Tool for AgentTool {
         let input = self.compose_input(task, context, ctx);
         let session = child_session_id(&ctx.session_id, &ctx.call_id);
 
-        // The child answers to everything the parent does: its authority
-        // stacks on the child's own, and a decline in one binds the other.
-        let agent = match &ctx.authority {
-            Some(authority) => self.agent.with_hook(AuthorityHook::new(authority.clone())),
-            None => self.agent.clone(),
-        };
+        // A decline in the child binds the parent, and the other way round.
+        let agent = self.child_for(ctx);
         let mut state = RunState::new(agent.id(), &session, &input).with_parent(ctx.run_id);
         if let Some(declines) = &ctx.declines {
             state = state.share_declines(declines.clone());
@@ -430,84 +547,45 @@ impl Tool for AgentTool {
             }
             None => agent.run_from(state, ctx.cancel.clone()).await,
         }
-        .map_err(|e| ToolError(format!("sub-agent `{}` could not run: {e}", self.name)))?;
+        .map_err(|e| self.could_not_run(e))?;
+        self.conclude(outcome, &session)
+    }
 
-        let details = self.details(&outcome, &session);
-        let usage = outcome.usage();
-        let output = match &outcome.status {
-            // Completed means the child stopped, not that it did the work:
-            // unmet requirements are passed up so the caller cannot mistake
-            // a stop for a success.
-            RunStatus::Completed if !outcome.unmet().is_empty() => {
-                let text = condense(
-                    outcome.final_text.as_deref().unwrap_or_default(),
-                    self.max_result_chars,
-                );
-                let mut message = format!(
-                    "sub-agent `{}` stopped without finishing; still unmet:",
-                    self.name
-                );
-                for line in outcome.unmet() {
-                    message.push_str("\n- ");
-                    message.push_str(line);
-                }
-                message.push_str("\n\nIts reply:\n");
-                message.push_str(&text);
-                ToolOutput::text(message)
+    fn suspends(&self) -> bool {
+        self.suspend_on_interrupt
+    }
+
+    async fn resume_child(
+        &self,
+        mut child: RunState,
+        resolution: Resolution,
+        ctx: &ToolContext,
+    ) -> ToolResult {
+        // Declines are runtime handles, not saved state: join the set in
+        // force now, so the child and the parent bind each other again.
+        if let Some(declines) = &ctx.declines {
+            child = child.share_declines(declines.clone());
+        }
+        let session = child.session_id.clone();
+        let agent = self.child_for(ctx);
+        let outcome = match &self.resolver {
+            Some(resolver) => {
+                let resolver = UntilCancelled {
+                    inner: resolver.as_ref(),
+                    cancel: ctx.cancel.clone(),
+                };
+                agent
+                    .resume_resolving(child, resolution, ctx.cancel.clone(), &resolver)
+                    .await
             }
-            RunStatus::Completed => {
-                let text = outcome.final_text.as_deref().unwrap_or_default();
-                ToolOutput::text(condense(text, self.max_result_chars))
+            None => {
+                agent
+                    .resume_with_cancel(child, resolution, ctx.cancel.clone())
+                    .await
             }
-            // A tool in the sub-agent ended its run: the finish reply is the
-            // answer. Partial work says so; a blocked one is a failure the
-            // caller should react to.
-            RunStatus::Finished {
-                outcome: finish, ..
-            } => {
-                let text = condense(
-                    outcome.final_text.as_deref().unwrap_or_default(),
-                    self.max_result_chars,
-                );
-                match finish {
-                    FinishOutcome::Succeeded => ToolOutput::text(text),
-                    FinishOutcome::Partial => ToolOutput::text(format!(
-                        "sub-agent `{}` finished part of the task:\n{text}",
-                        self.name
-                    )),
-                    _ => {
-                        ToolOutput::error(format!("sub-agent `{}` is blocked:\n{text}", self.name))
-                    }
-                }
-            }
-            RunStatus::Interrupted { interruption } if self.resolver.is_some() => {
-                ToolOutput::error(format!(
-                    "sub-agent `{}` paused waiting for approval of `{}` ({}) and it was not \
-                     settled, so the call did not run. Do it yourself (your own approval policy \
-                     applies) or ask the user.",
-                    self.name, interruption.call.name, interruption.reason
-                ))
-            }
-            RunStatus::Interrupted { interruption } => ToolOutput::error(format!(
-                "sub-agent `{}` paused waiting for approval of `{}` ({}). Sub-agents that need \
-                 approval are not supported in synchronous agent-as-tool mode, so the call did \
-                 not run. Do it yourself (your own approval policy applies) or ask the user.",
-                self.name, interruption.call.name, interruption.reason
-            )),
-            status => {
-                let mut message = format!(
-                    "sub-agent `{}` did not complete: {}.",
-                    self.name,
-                    status_label(status)
-                );
-                if let Some(partial) = last_assistant_text(&outcome.state.messages) {
-                    message.push_str("\nLast message from the sub-agent:\n");
-                    message.push_str(&condense(partial, self.max_result_chars));
-                }
-                ToolOutput::error(message)
-            }
-        };
-        Ok(output.with_details(details).with_usage(usage))
+        }
+        .map_err(|e| self.could_not_run(e))?;
+        self.conclude(outcome, &session)
     }
 }
 

@@ -157,10 +157,39 @@ impl Agent {
         if state.pending.is_some() {
             return Err(CoreError::PendingInterruption);
         }
-        let mut outcome = Driver::new(&self.inner, state, cancel.clone())
+        let outcome = Driver::new(&self.inner, state, cancel.clone())
             .without_run_end()
             .drive(None)
             .await?;
+        self.settle_interruptions(outcome, cancel, resolver).await
+    }
+
+    /// Like [`Agent::resume_with_cancel`], but settles each later
+    /// interruption with `resolver`, as [`Agent::run_resolving`] does.
+    pub async fn resume_resolving(
+        &self,
+        state: RunState,
+        resolution: Resolution,
+        cancel: CancellationToken,
+        resolver: &dyn InterruptResolver,
+    ) -> Result<RunOutcome, CoreError> {
+        self.check_owner(&state)?;
+        if state.pending.is_none() {
+            return Err(CoreError::NotInterrupted);
+        }
+        let outcome = Driver::new(&self.inner, state, cancel.clone())
+            .without_run_end()
+            .drive(Some(resolution))
+            .await?;
+        self.settle_interruptions(outcome, cancel, resolver).await
+    }
+
+    async fn settle_interruptions(
+        &self,
+        mut outcome: RunOutcome,
+        cancel: CancellationToken,
+        resolver: &dyn InterruptResolver,
+    ) -> Result<RunOutcome, CoreError> {
         while let RunStatus::Interrupted { interruption } = &outcome.status {
             let Some(resolution) = resolver.resolve(&outcome.state, interruption).await else {
                 break;
@@ -176,7 +205,9 @@ impl Agent {
     }
 
     /// Settle the interruption in `state` and keep going. `state` may come
-    /// from another process: it is plain data.
+    /// from another process: it is plain data. A run paused for a child
+    /// ([`crate::Pending::child`]) passes the answer down to the run that is
+    /// waiting, at any depth; [`RunState::waiting_run`] says which that is.
     pub async fn resume(
         &self,
         state: RunState,
@@ -202,11 +233,15 @@ impl Agent {
     }
 
     fn check_owner(&self, state: &RunState) -> Result<(), CoreError> {
-        if state.schema > RUN_STATE_SCHEMA {
-            return Err(CoreError::UnsupportedRunState {
-                found: state.schema,
-                supported: RUN_STATE_SCHEMA,
-            });
+        let mut run = Some(state);
+        while let Some(current) = run {
+            if current.schema > RUN_STATE_SCHEMA {
+                return Err(CoreError::UnsupportedRunState {
+                    found: current.schema,
+                    supported: RUN_STATE_SCHEMA,
+                });
+            }
+            run = current.pending.as_ref().and_then(|p| p.child.as_deref());
         }
         if state.agent_id != self.inner.id {
             return Err(CoreError::AgentMismatch {

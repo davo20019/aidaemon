@@ -326,6 +326,21 @@ impl InterruptResolver for Answers {
 
 /// A child that asks before `echo`, then replies; and how often `echo` ran.
 fn asking_child(reply: &str) -> (AgentTool, Arc<ScriptedProvider>, Arc<Mutex<u32>>) {
+    child_replying([
+        tool_calls([call("k", "echo", json!({"text": "a"}))]),
+        text(reply),
+    ])
+}
+
+/// The same child as a process rebuilds it to answer an interruption: its
+/// first model turn is already in the saved state.
+fn resumed_child(reply: &str) -> (AgentTool, Arc<ScriptedProvider>, Arc<Mutex<u32>>) {
+    child_replying([text(reply)])
+}
+
+fn child_replying<const N: usize>(
+    replies: [aidaemon_core::ModelResponse; N],
+) -> (AgentTool, Arc<ScriptedProvider>, Arc<Mutex<u32>>) {
     let runs = Arc::new(Mutex::new(0));
     let counted = {
         let runs = runs.clone();
@@ -341,10 +356,7 @@ fn asking_child(reply: &str) -> (AgentTool, Arc<ScriptedProvider>, Arc<Mutex<u32
             },
         )
     };
-    let provider = Arc::new(ScriptedProvider::new([
-        tool_calls([call("k", "echo", json!({"text": "a"}))]),
-        text(reply),
-    ]));
+    let provider = Arc::new(ScriptedProvider::new(replies));
     let tool = AgentTool::from_builder(
         child_builder(provider.clone()).tool(counted).hook(AskFirst),
         ChildBudget::default(),
@@ -406,6 +418,122 @@ async fn a_child_left_unsettled_is_an_error_and_its_call_does_not_run() {
     assert_eq!(receipt.status, ReceiptStatus::Failed);
     assert!(seen.contains("it was not settled"), "{seen}");
     assert!(seen.contains("`echo`"), "{seen}");
+    assert_eq!(*runs.lock().unwrap(), 0);
+}
+
+/// Save the run and read it back, as a process that exits and restarts does.
+fn through_json(state: &RunState) -> RunState {
+    serde_json::from_str(&serde_json::to_string(state).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_suspending_child_pauses_the_parent_and_a_later_answer_finishes_it() {
+    let (tool, _, runs) = asking_child("unused");
+    let out = parent(
+        Arc::new(ScriptedProvider::new([tool_calls([delegate(
+            "c1", "do it",
+        )])])),
+        tool.name("research").suspend_on_interrupt(),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+
+    let RunStatus::Interrupted { interruption } = &out.status else {
+        panic!("{:?}", out.status);
+    };
+    assert_eq!(interruption.call.name, "echo");
+    assert_eq!(*runs.lock().unwrap(), 0);
+    let saved = through_json(&out.state);
+    assert_eq!(saved.waiting_run().unwrap().session_id, "s/sub/c1");
+
+    let (tool, _, runs) = resumed_child("Echo finished for Alice Rivera.");
+    let parent_provider = Arc::new(ScriptedProvider::new([text("handled")]));
+    let agent = parent(
+        parent_provider.clone(),
+        tool.name("research").suspend_on_interrupt(),
+    );
+    let out = agent.resume(saved, Resolution::Approve).await.unwrap();
+
+    assert!(out.is_completed(), "{:?}", out.status);
+    assert_eq!(*runs.lock().unwrap(), 1);
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Succeeded);
+    assert_eq!(out.receipts()[0].details["child_session_id"], "s/sub/c1");
+    assert!(tool_message(&parent_provider, "c1").contains("Echo finished for Alice Rivera."));
+}
+
+#[tokio::test]
+async fn a_suspended_childs_decline_is_told_to_the_child() {
+    let (tool, _, runs) = asking_child("unused");
+    let out = parent(
+        Arc::new(ScriptedProvider::new([tool_calls([delegate(
+            "c1", "do it",
+        )])])),
+        tool.name("research").suspend_on_interrupt(),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+    let saved = through_json(&out.state);
+
+    let (tool, child_provider, _) = resumed_child("I did not echo.");
+    let parent_provider = Arc::new(ScriptedProvider::new([text("handled")]));
+    let agent = parent(
+        parent_provider.clone(),
+        tool.name("research").suspend_on_interrupt(),
+    );
+    let out = agent
+        .resume(
+            saved,
+            Resolution::Deny {
+                reason: "Jordan Lee said no".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(*runs.lock().unwrap(), 0);
+    assert!(tool_message(&child_provider, "k").contains("Jordan Lee said no"));
+    assert!(tool_message(&parent_provider, "c1").contains("I did not echo."));
+    assert!(out.is_completed());
+}
+
+#[tokio::test]
+async fn the_live_resolver_still_settles_first_and_only_what_it_leaves_suspends() {
+    // Settled live: no pause, the parent's call just returns.
+    let (tool, _, runs) = asking_child("Finished live.");
+    let parent_provider = Arc::new(ScriptedProvider::new([
+        tool_calls([delegate("c1", "do it")]),
+        text("handled"),
+    ]));
+    let out = parent(
+        parent_provider.clone(),
+        tool.name("research")
+            .interrupt_resolver(Answers::new(Some(Resolution::Approve)))
+            .suspend_on_interrupt(),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+    assert!(out.is_completed());
+    assert_eq!(*runs.lock().unwrap(), 1);
+    assert!(tool_message(&parent_provider, "c1").contains("Finished live."));
+
+    // Left unsettled: the parent pauses rather than reporting an error.
+    let (tool, _, runs) = asking_child("unused");
+    let out = parent(
+        Arc::new(ScriptedProvider::new([tool_calls([delegate(
+            "c1", "do it",
+        )])])),
+        tool.name("research")
+            .interrupt_resolver(Answers::new(None))
+            .suspend_on_interrupt(),
+    )
+    .run("s", "go")
+    .await
+    .unwrap();
+    assert!(matches!(out.status, RunStatus::Interrupted { .. }));
+    assert!(out.state.pending.as_ref().unwrap().child.is_some());
     assert_eq!(*runs.lock().unwrap(), 0);
 }
 
