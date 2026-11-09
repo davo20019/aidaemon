@@ -290,6 +290,25 @@ impl Drop for Inner {
 }
 
 impl Inner {
+    /// A connection that never had a process: every request fails closed.
+    pub(crate) fn detached(name: &str, options: &McpOptions) -> Self {
+        Self {
+            name: name.to_string(),
+            annotations: options.annotations,
+            shared: Arc::new(Shared {
+                pending: Mutex::default(),
+                closed: AtomicBool::new(true),
+                stderr: Mutex::new(VecDeque::new()),
+                stderr_capacity: 0,
+                stdin: tokio::sync::Mutex::new(None),
+            }),
+            next_id: AtomicU64::new(1),
+            request_timeout: options.request_timeout,
+            child: Mutex::new(None),
+            tasks: Vec::new(),
+        }
+    }
+
     fn closed_error(&self) -> McpError {
         McpError::Closed {
             server: self.name.clone(),

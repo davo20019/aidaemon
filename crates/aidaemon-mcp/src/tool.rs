@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aidaemon_core::{
-    Image, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput, ToolResult, ToolSpec,
+    CancellationToken, Image, Tool, ToolAnnotations, ToolContext, ToolError, ToolOutput,
+    ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-use crate::client::{Inner, McpError};
+use crate::client::{Inner, McpError, McpOptions};
 
 const MAX_TOOL_NAME: usize = 64;
 
@@ -90,6 +91,7 @@ pub fn normalize_schema(schema: Option<&Value>) -> Value {
 pub struct McpTool {
     server: Arc<Inner>,
     remote_name: String,
+    definition: Value,
     spec: ToolSpec,
     annotations: ToolAnnotations,
 }
@@ -123,8 +125,28 @@ impl McpTool {
                 description,
                 parameters: normalize_schema(def.get("inputSchema")),
             },
+            definition: def.clone(),
             remote_name,
         }
+    }
+
+    /// A tool with no server behind it: named, described and annotated as
+    /// `definition` under `options` would be on a live server, but every
+    /// call fails with [`McpError::Closed`]. For checking how a definition
+    /// maps, and for tests that hold a tool without calling it.
+    pub fn detached(server: &str, definition: &Value, options: &McpOptions) -> Self {
+        let name = tool_name(
+            server,
+            definition
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        Self::from_def(
+            &Arc::new(Inner::detached(server, options)),
+            definition,
+            name,
+        )
     }
 
     /// The tool's name on the MCP server (unprefixed, unsanitized).
@@ -134,6 +156,30 @@ impl McpTool {
 
     pub fn server_name(&self) -> &str {
         &self.server.name
+    }
+
+    /// The raw `tools/list` entry this tool was built from.
+    pub fn definition(&self) -> &Value {
+        &self.definition
+    }
+
+    /// Send `tools/call` and return the server's result unrendered, for
+    /// callers with their own rendering ([`Tool::call`] uses
+    /// [`render_result`]). `isError` results are `Ok`; only transport and
+    /// JSON-RPC failures are `Err`.
+    pub async fn call_raw(
+        &self,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value, McpError> {
+        self.server
+            .request_cancellable(
+                "tools/call",
+                json!({"name": self.remote_name, "arguments": arguments}),
+                None,
+                cancel,
+            )
+            .await
     }
 }
 
@@ -177,16 +223,7 @@ impl Tool for McpTool {
         } else {
             arguments
         };
-        let result = self
-            .server
-            .request_cancellable(
-                "tools/call",
-                json!({"name": self.remote_name, "arguments": arguments}),
-                None,
-                Some(&ctx.cancel),
-            )
-            .await;
-        match result {
+        match self.call_raw(arguments, Some(&ctx.cancel)).await {
             Ok(result) => Ok(render_result(&self.server.name, &result)),
             // The server answered with a JSON-RPC error (unknown tool, bad
             // params): the model can react to it.

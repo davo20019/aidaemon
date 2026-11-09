@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aidaemon_core::testing::{call, text, tool_calls, ScriptedProvider};
 use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolContext};
-use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec, StderrCallback};
+use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec, McpTool, StderrCallback};
 use serde_json::{json, Value};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake_mcp_server");
@@ -398,6 +398,37 @@ async fn stderr_callback_gets_whole_lines_and_the_tail_still_works() {
         "{lines:?}"
     );
     assert!(server.stderr_tail().contains("fake-mcp: started"));
+}
+
+#[tokio::test]
+async fn call_raw_returns_the_unrendered_result() {
+    let server = spawn().await;
+    let tools = server.mcp_tools();
+    let fail = tools.iter().find(|t| t.remote_name() == "fail").unwrap();
+    assert_eq!(fail.definition()["description"], "Always reports isError");
+    let raw = fail.call_raw(json!({}), None).await.unwrap();
+    assert_eq!(raw["isError"], true, "isError stays in the result: {raw}");
+}
+
+#[tokio::test]
+async fn a_detached_tool_maps_its_definition_and_fails_when_called() {
+    let def = json!({
+        "name": "synthetic_tool",
+        "description": "Synthetic",
+        "inputSchema": {"$schema": "x", "type": "object"},
+        "annotations": {"readOnlyHint": true},
+    });
+    let tool = McpTool::detached("acme", &def, &McpOptions::default());
+    assert_eq!(tool.spec().name, "acme__synthetic_tool");
+    assert_eq!(
+        tool.spec().parameters,
+        json!({"type": "object", "properties": {}})
+    );
+    assert_eq!(tool.annotations(), ToolAnnotations::READ_ONLY);
+    assert_eq!(tool.server_name(), "acme");
+    let err = tool.call_raw(json!({}), None).await.unwrap_err();
+    assert!(matches!(err, McpError::Closed { .. }), "{err}");
+    assert!(tool.call(json!({}), &ctx()).await.is_err());
 }
 
 #[tokio::test]
