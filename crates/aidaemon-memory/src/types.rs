@@ -1,9 +1,12 @@
 //! Plain data types shared by stores, scorers and writers.
 
+use aidaemon_core::ChannelVisibility;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MemoryError, Result};
+use crate::records::FactPrivacy;
+use crate::sqlite::{memory_visible, ExactChannelIds};
 
 /// Longest fact value accepted, in characters.
 pub const MAX_FACT_VALUE_CHARS: usize = 4_000;
@@ -267,6 +270,155 @@ pub struct EpisodeRecord {
     pub embedding: Option<StoredEmbedding>,
 }
 
+/// Who may see a stored fact or episode. The default is the narrowest level,
+/// [`FactPrivacy::Private`], so a record nobody classified stays out of
+/// shared channels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactAccess {
+    pub privacy: FactPrivacy,
+    /// The originating channel; only meaningful with [`FactPrivacy::Channel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+}
+
+impl Default for FactAccess {
+    fn default() -> Self {
+        Self::private()
+    }
+}
+
+impl FactAccess {
+    /// Direct messages with the owner only.
+    pub fn private() -> Self {
+        Self {
+            privacy: FactPrivacy::Private,
+            channel_id: None,
+        }
+    }
+
+    /// Shareable outside direct messages.
+    pub fn global() -> Self {
+        Self {
+            privacy: FactPrivacy::Global,
+            channel_id: None,
+        }
+    }
+
+    /// Only in `channel_id` (and the owner's direct messages).
+    pub fn channel(channel_id: impl Into<String>) -> Self {
+        Self {
+            privacy: FactPrivacy::Channel,
+            channel_id: Some(channel_id.into()),
+        }
+    }
+
+    /// Read from stored text. Anything unrecognized, and a channel level with
+    /// no channel, is private: never widen on data this build cannot read.
+    pub fn from_stored(privacy: &str, channel_id: Option<String>) -> Self {
+        match (privacy, channel_id) {
+            ("global", _) => Self::global(),
+            ("channel", Some(channel)) => Self::channel(channel),
+            _ => Self::private(),
+        }
+    }
+
+    /// The access that satisfies both sides. Used when two writes land on
+    /// one record, so restating something can never widen who sees it.
+    pub fn narrowest(&self, other: &Self) -> Self {
+        match (self.privacy, other.privacy) {
+            (FactPrivacy::Private, _) | (_, FactPrivacy::Private) => Self::private(),
+            (FactPrivacy::Global, _) => other.clone(),
+            (_, FactPrivacy::Global) => self.clone(),
+            (FactPrivacy::Channel, FactPrivacy::Channel) => {
+                if self.channel_id == other.channel_id {
+                    self.clone()
+                } else {
+                    Self::private()
+                }
+            }
+        }
+    }
+}
+
+/// Who a recall is for, as the host knows it. Uses the same visibility rule
+/// as the daemon's own store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallAudience {
+    pub visibility: ChannelVisibility,
+    pub channel_id: Option<String>,
+    pub requester_is_owner: bool,
+}
+
+impl RecallAudience {
+    pub fn new(
+        visibility: ChannelVisibility,
+        channel_id: Option<String>,
+        requester_is_owner: bool,
+    ) -> Self {
+        Self {
+            visibility,
+            channel_id,
+            requester_is_owner,
+        }
+    }
+
+    /// The owner in a direct conversation: sees everything in the scope.
+    pub fn owner() -> Self {
+        Self::new(ChannelVisibility::Private, None, true)
+    }
+
+    /// From a host's stored visibility text. An unrecognized value is the
+    /// most restrictive visibility, unlike
+    /// [`ChannelVisibility::from_str_lossy`], which defaults to `Internal`.
+    pub fn from_stored(
+        visibility: &str,
+        channel_id: Option<String>,
+        requester_is_owner: bool,
+    ) -> Self {
+        let visibility = match visibility {
+            "private" => ChannelVisibility::Private,
+            "private_group" => ChannelVisibility::PrivateGroup,
+            "public" => ChannelVisibility::Public,
+            "internal" => ChannelVisibility::Internal,
+            _ => ChannelVisibility::PublicExternal,
+        };
+        Self::new(visibility, channel_id, requester_is_owner)
+    }
+
+    /// Whether this audience may see a record with `access`. `None` means
+    /// the store could not say, which is treated as private.
+    pub fn may_see(&self, access: Option<&FactAccess>) -> bool {
+        let private = FactAccess::private();
+        let access = access.unwrap_or(&private);
+        memory_visible(
+            &ExactChannelIds,
+            access.privacy,
+            access.channel_id.as_deref(),
+            self.channel_id.as_deref(),
+            self.visibility,
+            self.requester_is_owner,
+        )
+    }
+
+    /// Sees every record whatever its access, so no lookup is needed.
+    pub fn sees_everything(&self) -> bool {
+        self.may_see(None)
+    }
+
+    /// The access of something learned in this audience's conversation:
+    /// a shared channel's record stays in that channel, anything else is
+    /// private. Sharing wider is a deliberate call to
+    /// [`crate::Memory::remember_with`].
+    pub fn access_for_writes(&self) -> FactAccess {
+        match (self.visibility, &self.channel_id) {
+            (ChannelVisibility::PrivateGroup | ChannelVisibility::Public, Some(channel_id)) => {
+                FactAccess::channel(channel_id.clone())
+            }
+            _ => FactAccess::private(),
+        }
+    }
+}
+
 /// The independently bounded retrieval signals behind a score (port of
 /// the daemon's `HybridSignals`). All 0.0-1.0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -385,6 +537,98 @@ mod tests {
         assert_eq!(normalize_category(" Preference "), "preference");
         assert!(same_value("Dark  Mode", "dark mode"));
         assert!(!same_value("dark mode", "light mode"));
+    }
+
+    #[test]
+    fn stored_access_fails_closed() {
+        assert_eq!(
+            FactAccess::from_stored("global", None),
+            FactAccess::global()
+        );
+        assert_eq!(
+            FactAccess::from_stored("channel", Some("c1".into())),
+            FactAccess::channel("c1")
+        );
+        for unreadable in ["", "GLOBAL", "public", "everyone"] {
+            assert_eq!(
+                FactAccess::from_stored(unreadable, None),
+                FactAccess::private(),
+                "{unreadable}"
+            );
+        }
+        // A channel level that names no channel cannot be scoped.
+        assert_eq!(
+            FactAccess::from_stored("channel", None),
+            FactAccess::private()
+        );
+    }
+
+    #[test]
+    fn merged_access_never_widens() {
+        let (private, global) = (FactAccess::private(), FactAccess::global());
+        let (one, two) = (FactAccess::channel("c1"), FactAccess::channel("c2"));
+        assert_eq!(global.narrowest(&global), global);
+        assert_eq!(global.narrowest(&one), one);
+        assert_eq!(one.narrowest(&global), one);
+        assert_eq!(one.narrowest(&one), one);
+        assert_eq!(one.narrowest(&two), private);
+        assert_eq!(private.narrowest(&global), private);
+        assert_eq!(global.narrowest(&private), private);
+    }
+
+    #[test]
+    fn audience_visibility_matches_the_daemon_rule() {
+        use ChannelVisibility as V;
+        let group = RecallAudience::new(V::PrivateGroup, Some("c1".into()), true);
+        assert!(!group.may_see(Some(&FactAccess::private())));
+        assert!(group.may_see(Some(&FactAccess::global())));
+        assert!(group.may_see(Some(&FactAccess::channel("c1"))));
+        assert!(!group.may_see(Some(&FactAccess::channel("c2"))));
+        assert!(!group.may_see(None), "an unknown level is private");
+
+        let public = RecallAudience::new(V::Public, Some("c1".into()), true);
+        assert!(!public.may_see(Some(&FactAccess::private())));
+        assert!(!public.may_see(Some(&FactAccess::global())));
+
+        let external = RecallAudience::new(V::PublicExternal, Some("c1".into()), true);
+        assert!(!external.may_see(Some(&FactAccess::global())));
+        assert!(!external.may_see(Some(&FactAccess::channel("c1"))));
+
+        let guest_dm = RecallAudience::new(V::Private, None, false);
+        assert!(!guest_dm.may_see(Some(&FactAccess::private())));
+        assert!(guest_dm.may_see(Some(&FactAccess::global())));
+
+        assert!(RecallAudience::owner().sees_everything());
+        assert!(RecallAudience::new(V::Internal, None, true).sees_everything());
+        assert!(!group.sees_everything());
+    }
+
+    #[test]
+    fn unknown_visibility_text_is_the_most_restrictive() {
+        for unknown in ["", "PUBLIC", "dm", "internal "] {
+            let audience = RecallAudience::from_stored(unknown, None, true);
+            assert_eq!(audience.visibility, ChannelVisibility::PublicExternal);
+            assert!(!audience.may_see(Some(&FactAccess::global())));
+        }
+        assert_eq!(
+            RecallAudience::from_stored("private_group", None, true).visibility,
+            ChannelVisibility::PrivateGroup
+        );
+    }
+
+    #[test]
+    fn writes_stay_in_the_conversation_they_came_from() {
+        use ChannelVisibility as V;
+        let in_channel = |v| RecallAudience::new(v, Some("c1".into()), true).access_for_writes();
+        assert_eq!(in_channel(V::PrivateGroup), FactAccess::channel("c1"));
+        assert_eq!(in_channel(V::Public), FactAccess::channel("c1"));
+        assert_eq!(in_channel(V::Private), FactAccess::private());
+        assert_eq!(in_channel(V::Internal), FactAccess::private());
+        assert_eq!(in_channel(V::PublicExternal), FactAccess::private());
+        assert_eq!(
+            RecallAudience::new(V::Public, None, true).access_for_writes(),
+            FactAccess::private()
+        );
     }
 
     #[test]

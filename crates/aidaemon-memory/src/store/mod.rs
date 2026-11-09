@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use crate::error::Result;
 use crate::scoring::term_overlap;
 use crate::types::{
-    DecayReport, Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, NewEpisode, NewFact,
-    RetentionConfig, ScoredEpisode, ScoredFact, StoredEmbedding, UpsertOutcome,
+    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
+    NewFact, RetentionConfig, ScoredEpisode, ScoredFact, StoredEmbedding, UpsertOutcome,
 };
 
 pub use in_memory::InMemoryMemoryStore;
@@ -40,6 +40,11 @@ pub use sqlite::SqliteMemoryStore;
 /// stores rows. A store with its own ranking (vector DB, hybrid search
 /// engine) overrides [`MemoryStore::search_facts`] /
 /// [`MemoryStore::search_episodes`] and the [`crate::Scorer`] is bypassed.
+///
+/// Access levels are optional too. A store that keeps the default
+/// [`MemoryStore::fact_access`] cannot say who may see a record, so
+/// [`crate::Memory`] shows its records only to the owner in a direct
+/// conversation and never in a shared channel.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     /// Insert, reinforce or supersede (see the trait docs). `embedding`
@@ -50,6 +55,31 @@ pub trait MemoryStore: Send + Sync {
         embedding: Option<StoredEmbedding>,
         now: DateTime<Utc>,
     ) -> Result<UpsertOutcome>;
+
+    /// [`MemoryStore::upsert_fact`] that records who may see the fact,
+    /// atomically with the write. A reinforced fact keeps the narrowest of
+    /// its access and `access` ([`FactAccess::narrowest`]); a new version
+    /// takes `access`. The default ignores `access`, which leaves the fact
+    /// unclassified and so private.
+    async fn upsert_fact_with_access(
+        &self,
+        fact: NewFact,
+        embedding: Option<StoredEmbedding>,
+        _access: &FactAccess,
+        now: DateTime<Utc>,
+    ) -> Result<UpsertOutcome> {
+        self.upsert_fact(fact, embedding, now).await
+    }
+
+    /// Who may see these facts, by id, for ids in `scope` the store knows. A
+    /// fact absent from the map is unclassified and treated as private.
+    async fn fact_access(
+        &self,
+        _scope: &str,
+        _ids: &[String],
+    ) -> Result<HashMap<String, FactAccess>> {
+        Ok(HashMap::new())
+    }
 
     /// Mark the active fact for this key superseded. `false` if none.
     async fn supersede_fact(
@@ -104,6 +134,27 @@ pub trait MemoryStore: Send + Sync {
         embedding: Option<StoredEmbedding>,
         now: DateTime<Utc>,
     ) -> Result<Episode>;
+
+    /// [`MemoryStore::insert_episode`] that records who may see the episode.
+    /// The default ignores `access`, leaving the episode private.
+    async fn insert_episode_with_access(
+        &self,
+        episode: NewEpisode,
+        embedding: Option<StoredEmbedding>,
+        _access: &FactAccess,
+        now: DateTime<Utc>,
+    ) -> Result<Episode> {
+        self.insert_episode(episode, embedding, now).await
+    }
+
+    /// Who may see these episodes; see [`MemoryStore::fact_access`].
+    async fn episode_access(
+        &self,
+        _scope: &str,
+        _ids: &[String],
+    ) -> Result<HashMap<String, FactAccess>> {
+        Ok(HashMap::new())
+    }
 
     /// Every episode in `scope`, with embeddings.
     async fn episodes(&self, scope: &str) -> Result<Vec<EpisodeRecord>>;

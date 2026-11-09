@@ -115,8 +115,9 @@ pub use learning::{
     update_communication_profile, verbosity_from_messages, BehaviorPattern, ErrorSolution,
     Expertise, LearningStore, Procedure, UserProfile,
 };
-pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
+pub use memory::{AudienceResolver, IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;
+pub use records::FactPrivacy;
 pub use scoring::{
     episode_importance, episode_recall_boost, term_overlap, tokens, turn_importance, word_overlap,
     HybridScorer, HybridWeights, Scorer, ScoringConfig,
@@ -128,8 +129,8 @@ pub use system::ScopedMemory;
 pub use tools::{RecallTool, RememberTool};
 pub use types::{
     episode_search_text, fact_search_text, normalize_category, normalize_key, same_value,
-    DecayReport, Episode, EpisodeRecord, Fact, FactRecord, MemoryStats, NewEpisode, NewFact,
-    Provenance, RetentionConfig, Score, ScoredEpisode, ScoredFact, Signals, StoredEmbedding,
-    UpsertOutcome, MAX_FACT_VALUE_CHARS,
+    DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
+    NewFact, Provenance, RecallAudience, RetentionConfig, Score, ScoredEpisode, ScoredFact,
+    Signals, StoredEmbedding, UpsertOutcome, MAX_FACT_VALUE_CHARS,
 };
 pub use writer::{MemoryWriter, WriterReport};

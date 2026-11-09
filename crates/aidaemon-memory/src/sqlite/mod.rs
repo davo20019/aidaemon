@@ -32,6 +32,7 @@ mod rows;
 mod schema;
 mod structured;
 
+pub(crate) use claims::memory_visible;
 pub use claims::{project_event_span, MemoryClaimRecord};
 pub use export::ExportFile;
 pub use facts::{

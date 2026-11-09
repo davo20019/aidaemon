@@ -31,7 +31,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::store::MemoryStore;
 use crate::types::{
-    DecayReport, Episode, Fact, NewEpisode, NewFact, RetentionConfig, StoredEmbedding,
+    DecayReport, Episode, Fact, FactAccess, NewEpisode, NewFact, RetentionConfig, StoredEmbedding,
     UpsertOutcome,
 };
 
@@ -88,6 +88,11 @@ pub mod store_checks {
     /// lowered by one. The report matches what changed, and active facts or
     /// recently recalled rows are never touched.
     pub const DECAY_FOLLOWS_RETENTION: &str = "store.decay_follows_retention";
+    /// `fact_access` / `episode_access` are either empty (the trait default:
+    /// records stay private; noted) or return exactly what was written, for
+    /// the asked scope only. Restating a fact never widens its access, and a
+    /// new version takes the access it was written with.
+    pub const ACCESS_LEVELS_ROUND_TRIP: &str = "store.access_levels_round_trip";
 }
 
 /// Run every store check (see [`store_checks`]); each check uses a fresh
@@ -134,6 +139,17 @@ where
             ));
         }
         Err(e) => report.fail(DECAY_FOLLOWS_RETENTION, e),
+    }
+    match access_levels(make().await).await {
+        Ok(true) => report.pass(ACCESS_LEVELS_ROUND_TRIP),
+        Ok(false) => {
+            report.pass(ACCESS_LEVELS_ROUND_TRIP);
+            report.note(format!(
+                "{ACCESS_LEVELS_ROUND_TRIP}: the store keeps no access levels, so its records \
+                 are hidden from shared channels"
+            ));
+        }
+        Err(e) => report.fail(ACCESS_LEVELS_ROUND_TRIP, e),
     }
     report
 }
@@ -1022,4 +1038,90 @@ async fn decay_default(store: Arc<dyn MemoryStore>) -> Check<bool> {
     } else {
         Err(problems.join("; "))
     }
+}
+
+/// `Ok(true)` when the store keeps access levels, `Ok(false)` for the trait
+/// default.
+async fn access_levels(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    let shared = FactAccess::channel("conformance-channel");
+    let first = call!(
+        "upsert_fact_with_access",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &FactAccess::global(),
+            at(0)
+        )
+    );
+    let id = first.id().to_string();
+    let ids = [id.clone()];
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    if access.is_empty() {
+        return Ok(false);
+    }
+    ensure(access.get(&id) == Some(&FactAccess::global()), || {
+        format!("expected global access for {id}, got {access:?}")
+    })?;
+    let other = call!("fact_access", store.fact_access(OTHER_SCOPE, &ids));
+    ensure(other.is_empty(), || {
+        format!("fact_access answered for another scope: {other:?}")
+    })?;
+
+    call!(
+        "upsert_fact_with_access (restated, narrower)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &shared,
+            at(10)
+        )
+    );
+    call!(
+        "upsert_fact_with_access (restated, wider)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Acme Corp"),
+            None,
+            &FactAccess::global(),
+            at(20)
+        )
+    );
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    ensure(access.get(&id) == Some(&shared), || {
+        format!("restating must keep the narrowest access, got {access:?}")
+    })?;
+
+    let next = call!(
+        "upsert_fact_with_access (new value)",
+        store.upsert_fact_with_access(
+            fact(SCOPE, "work", "employer", "Globex"),
+            None,
+            &FactAccess::global(),
+            at(30)
+        )
+    );
+    let ids = [next.id().to_string()];
+    let access = call!("fact_access", store.fact_access(SCOPE, &ids));
+    ensure(access.get(next.id()) == Some(&FactAccess::global()), || {
+        format!("a new version takes the access it was written with, got {access:?}")
+    })?;
+
+    let stored = call!(
+        "insert_episode_with_access",
+        store.insert_episode_with_access(
+            episode(SCOPE, "Reviewed the roadmap", &[]),
+            None,
+            &shared,
+            at(40)
+        )
+    );
+    let ids = [stored.id.clone()];
+    let access = call!("episode_access", store.episode_access(SCOPE, &ids));
+    ensure(access.get(&stored.id) == Some(&shared), || {
+        format!("expected the channel access back for the episode, got {access:?}")
+    })?;
+    let other = call!("episode_access", store.episode_access(OTHER_SCOPE, &ids));
+    ensure(other.is_empty(), || {
+        format!("episode_access answered for another scope: {other:?}")
+    })?;
+    Ok(true)
 }

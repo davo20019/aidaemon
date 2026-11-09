@@ -54,9 +54,9 @@ async fn vec_store_conforms() {
     let report =
         check_store(|| async { Arc::new(VecStore::default()) as Arc<dyn MemoryStore> }).await;
     report.assert_all_passed();
-    // It keeps the trait's default decay and search.
+    // It keeps the trait's default decay, search and access levels.
     assert!(report.passed_check(store_checks::DECAY_FOLLOWS_RETENTION));
-    assert_eq!(report.notes.len(), 3, "{report}");
+    assert_eq!(report.notes.len(), 4, "{report}");
 }
 
 #[test]
