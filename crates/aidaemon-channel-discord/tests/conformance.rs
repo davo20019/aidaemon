@@ -207,6 +207,18 @@ impl ChannelHarness for DiscordHarness {
         );
     }
 
+    async fn inject_named_message(&self, text: &str, display_name: &str) -> bool {
+        let id = self.snowflake();
+        let mut author = alice();
+        author["global_name"] = json!(display_name);
+        self.dispatch(
+            "MESSAGE_CREATE",
+            json!({"id": id, "type": 0, "channel_id": DM_CHANNEL, "content": text,
+                   "author": author, "mentions": []}),
+        );
+        true
+    }
+
     async fn inject_group_message(&self, text: &str, addressed: bool) {
         let id = self.snowflake();
         let (content, mentions) = if addressed {
@@ -318,6 +330,6 @@ async fn discord_channel_conforms() {
     let discord = Arc::new(channel(&harness.http).with_gateway_url(harness.gateway.url.clone()));
     let report = check_channel(discord, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 17, "{report}");
+    assert_eq!(report.passed.len(), 20, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }

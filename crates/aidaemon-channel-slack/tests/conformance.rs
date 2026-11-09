@@ -200,6 +200,15 @@ impl ChannelHarness for SlackHarness {
         }));
     }
 
+    async fn inject_named_message(&self, text: &str, display_name: &str) -> bool {
+        let ts = format!("1700000000.{:06}", self.next());
+        self.inject_event(json!({
+            "type": "message", "user": ALICE, "channel": DM, "channel_type": "im",
+            "ts": ts, "text": text, "user_profile": { "display_name": display_name }
+        }));
+        true
+    }
+
     async fn inject_group_message(&self, text: &str, addressed: bool) {
         let ts = format!("1700000000.{:06}", self.next());
         let text = if addressed {
@@ -297,6 +306,6 @@ async fn slack_channel_conforms() {
     );
     let report = check_channel(channel, &harness).await;
     report.assert_all_passed();
-    assert_eq!(report.passed.len(), 17, "{report}");
+    assert_eq!(report.passed.len(), 20, "{report}");
     assert!(report.notes.is_empty(), "{report}");
 }
