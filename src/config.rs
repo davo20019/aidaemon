@@ -2700,6 +2700,13 @@ pub struct SubagentsConfig {
     /// Defaults to 500,000. Set to 0 to disable (unlimited).
     #[serde(default = "default_task_token_budget")]
     pub task_token_budget: Option<u64>,
+    /// Plain sub-agents one request may run at the same time, across its
+    /// whole tree. Task-lead executors have their own per-task limits.
+    #[serde(default = "default_subagents_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Plain sub-agents one request may start in total, across its whole tree.
+    #[serde(default = "default_subagents_max_per_request")]
+    pub max_per_request: usize,
     /// Optional directory of user-override specialist `.md` files.
     /// Default: `~/.aidaemon/specialists/` (resolved at construction time if absent).
     #[serde(default)]
@@ -2740,11 +2747,21 @@ impl Default for SubagentsConfig {
             iteration_limit: IterationLimitConfig::default(),
             task_timeout_secs: default_task_timeout_secs(),
             task_token_budget: default_task_token_budget(),
+            max_concurrent: default_subagents_max_concurrent(),
+            max_per_request: default_subagents_max_per_request(),
             specialists_override_dir: None,
         }
     }
 }
 
+pub(crate) const DEFAULT_SUBAGENTS_MAX_CONCURRENT: usize = 4;
+pub(crate) const DEFAULT_SUBAGENTS_MAX_PER_REQUEST: usize = 12;
+fn default_subagents_max_concurrent() -> usize {
+    DEFAULT_SUBAGENTS_MAX_CONCURRENT
+}
+fn default_subagents_max_per_request() -> usize {
+    DEFAULT_SUBAGENTS_MAX_PER_REQUEST
+}
 fn default_subagents_enabled() -> bool {
     true
 }

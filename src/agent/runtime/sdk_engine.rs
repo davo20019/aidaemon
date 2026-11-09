@@ -640,6 +640,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// is a child) and with the children it spawns: the kernel refuses any
     /// of them an effect the owner declined in another.
     shared_declines: sdk::SharedDeclines,
+    /// The request's sub-agent tree (a root turn starts one).
+    spawn_family: crate::agent::authority::SpawnFamily,
     run_id: sdk::RunId,
     /// The single-project scope lock passed to tools.
     project_scope: Option<String>,
@@ -674,7 +676,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     restrict_untrusted_reference_tools: bool,
     untrusted_reference_skills: Vec<String>,
     /// Billable tokens this run spent, and the task budget (0: none).
-    task_tokens: AtomicU64,
+    /// Tokens used by this request's whole tree of plain sub-agents.
+    task_tokens: Arc<AtomicU64>,
     task_budget: AtomicU64,
     task_budget_extensions: std::sync::atomic::AtomicUsize,
     /// Distinct successful operations (tool and canonical arguments).
@@ -1299,6 +1302,11 @@ impl Agent {
             .as_ref()
             .and_then(|parent| parent.shared_declines.clone())
             .unwrap_or_default();
+        let spawn_family = self
+            .inherited_authority
+            .as_ref()
+            .and_then(|parent| parent.spawn_family.clone())
+            .unwrap_or_else(|| crate::agent::authority::SpawnFamily::new(self.limits.spawn_family));
         let mut state = state.share_declines(shared_declines.clone());
         state.parent_run = self
             .inherited_authority
@@ -1404,7 +1412,8 @@ impl Agent {
             context_overflowed: AtomicBool::new(false),
             provider_failure: std::sync::Mutex::new(None),
             context_overflow_retries: std::sync::atomic::AtomicU32::new(0),
-            task_tokens: AtomicU64::new(0),
+            task_tokens: spawn_family.tokens(),
+            spawn_family,
             task_budget: AtomicU64::new(task_token_budget(
                 self.limits.task_token_budget,
                 scheduled_budget_per_check,

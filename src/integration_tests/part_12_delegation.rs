@@ -952,3 +952,43 @@ async fn test_child_past_its_limit_with_no_actions_is_safe_to_rerun() {
     .await;
     assert!(!timed_out.report.may_have_changed_something());
 }
+
+/// A child charges the tree it belongs to, so a request's budget covers all
+/// of its sub-agents.
+#[tokio::test]
+async fn test_child_tokens_count_against_the_requests_tree() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("done")]);
+    let mut harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let family = crate::agent::authority::SpawnFamily::new(Default::default());
+    harness
+        .agent
+        .set_test_inherited_authority(crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::full(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: None,
+            untrusted_context: false,
+            origin_request: Some("synthetic request".to_string()),
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: Vec::new(),
+            shared_declines: None,
+            spawn_family: Some(family.clone()),
+            parent_run: None,
+        });
+    harness
+        .agent
+        .handle_message(
+            "sub_agent_synthetic_child",
+            "synthetic task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(family.tokens().load(std::sync::atomic::Ordering::Relaxed) > 0);
+}

@@ -457,7 +457,7 @@ impl Tool for SpawnAgentTool {
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
         let project_scope = facts.project_scope.clone();
-        let parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
+        let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         let agent = self.get_agent()?;
 
         info!(
@@ -488,6 +488,23 @@ impl Tool for SpawnAgentTool {
         // LLM-provided task_id takes priority; fall back to the call's task
         let task_id_ref = args.task_id.or(facts.task_id.clone());
         let goal_id_ref = facts.goal_id.clone();
+
+        // Plain children count against the request's tree. A task lead's
+        // executors are bounded per task instead, and keep budgets of their own.
+        let family_permit = if child_role.is_some() {
+            if let Some(parent) = parent_authority.as_mut() {
+                parent.spawn_family = None;
+            }
+            None
+        } else {
+            match parent_authority
+                .as_ref()
+                .and_then(|parent| parent.spawn_family.as_ref())
+            {
+                Some(family) => Some(family.try_admit().map_err(|why| anyhow::anyhow!(why))?),
+                None => None,
+            }
+        };
 
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
         // are deduplicated per task_id so the same work is not launched twice.
@@ -616,6 +633,8 @@ impl Tool for SpawnAgentTool {
         let notify_status_tx = status_tx.clone();
 
         tokio::spawn(async move {
+            // The slot stays taken until this child has finished.
+            let _family_permit = family_permit;
             let started_at = std::time::Instant::now();
             let mut progress_interval =
                 tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
@@ -1074,6 +1093,7 @@ mod tests {
                 None,
             )],
             shared_declines: None,
+            spawn_family: None,
             parent_run: None,
         };
         let mut facts = ToolCallContext::default();
@@ -1441,6 +1461,45 @@ mod child_runtime_tests {
             .expect_err("nothing happened, so a retry is safe");
 
         assert!(error.to_string().contains("timed out after 30 seconds"));
+    }
+
+    /// Children past the request's running limit are refused, not queued.
+    #[tokio::test]
+    async fn a_request_cannot_run_more_children_than_its_limit() {
+        let child = ScriptedChild::new("done", Duration::from_millis(300));
+        let tool = tool_for(&child);
+        let family =
+            crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+                max_concurrent: 1,
+                max_total: 10,
+            });
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::read_only(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                spawn_family: Some(family),
+                parent_run: None,
+            });
+        let args = json!({"mission": "m", "task": "t"}).to_string();
+
+        let (first, second) = tokio::join!(
+            tool.call_with_execution_context(&args, None, call_facts.clone()),
+            tool.call_with_execution_context(&args, None, call_facts.clone()),
+        );
+
+        let refused = usize::from(first.is_err()) + usize::from(second.is_err());
+        assert_eq!(refused, 1);
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
     }
 
     /// A task that merely starts like a delay reaches the child at once and

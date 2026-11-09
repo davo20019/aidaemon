@@ -463,6 +463,7 @@ struct AgentLimits {
     llm_call_timeout: Option<Duration>,
     task_timeout: Option<Duration>,
     task_token_budget: Option<u64>,
+    spawn_family: authority::SpawnFamilyLimits,
 }
 
 impl AgentLimits {

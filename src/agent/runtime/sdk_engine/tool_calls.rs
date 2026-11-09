@@ -750,6 +750,7 @@ impl Agent {
             // The child shares this run's live declines: each is refused
             // what the owner declined in the other, even after the spawn.
             shared_declines: Some(scope.shared_declines.clone()),
+            spawn_family: Some(scope.spawn_family.clone()),
             parent_run: Some(scope.run_id),
         }
     }

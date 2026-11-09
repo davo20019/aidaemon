@@ -158,6 +158,98 @@ pub(in crate::agent) struct ResolvedAuthority {
     pub task_access: Option<ToolCallAccessManifest>,
 }
 
+/// How many plain sub-agents one request may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpawnFamilyLimits {
+    /// At the same time, across the whole tree.
+    pub max_concurrent: usize,
+    /// In total, across the whole tree.
+    pub max_total: usize,
+}
+
+impl Default for SpawnFamilyLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: crate::config::DEFAULT_SUBAGENTS_MAX_CONCURRENT,
+            max_total: crate::config::DEFAULT_SUBAGENTS_MAX_PER_REQUEST,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpawnCounts {
+    active: usize,
+    started: usize,
+}
+
+#[derive(Debug)]
+struct SpawnFamilyState {
+    limits: SpawnFamilyLimits,
+    counts: std::sync::Mutex<SpawnCounts>,
+    tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One request's tree of plain sub-agents: its running count, how many it
+/// has started, and the tokens the whole tree has used. Clones share all of
+/// it. A runtime handle, never serialized.
+#[derive(Debug, Clone)]
+pub(crate) struct SpawnFamily(std::sync::Arc<SpawnFamilyState>);
+
+impl PartialEq for SpawnFamily {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Holds one running slot in a family until dropped.
+#[derive(Debug)]
+pub(crate) struct SpawnPermit(SpawnFamily);
+
+impl Drop for SpawnPermit {
+    fn drop(&mut self) {
+        let mut counts = (self.0).0.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.active = counts.active.saturating_sub(1);
+    }
+}
+
+impl SpawnFamily {
+    pub(crate) fn new(limits: SpawnFamilyLimits) -> Self {
+        Self(std::sync::Arc::new(SpawnFamilyState {
+            limits,
+            counts: std::sync::Mutex::default(),
+            tokens: std::sync::Arc::default(),
+        }))
+    }
+
+    /// The tree's token counter, charged by every run in it.
+    pub(crate) fn tokens(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.0.tokens.clone()
+    }
+
+    /// Admit one more child, or say why not.
+    pub(crate) fn try_admit(&self) -> Result<SpawnPermit, String> {
+        let limits = self.0.limits;
+        let mut counts = self.0.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.started >= limits.max_total {
+            return Err(format!(
+                "This request has already started {} sub-agents, which is the limit. \
+                 Finish with the results you have, or do the remaining work directly.",
+                limits.max_total
+            ));
+        }
+        if counts.active >= limits.max_concurrent {
+            return Err(format!(
+                "{} sub-agents are already running for this request, which is the limit. \
+                 Wait for one to finish, or do this work directly.",
+                limits.max_concurrent
+            ));
+        }
+        counts.active += 1;
+        counts.started += 1;
+        Ok(SpawnPermit(self.clone()))
+    }
+}
+
 /// What a spawned child inherits from the turn that spawned it: the turn's
 /// actual authority (not a re-resolution at spawn time), the chat whose
 /// `/readonly` narrows it, the turn's taint, and the root request egress is
@@ -196,6 +288,10 @@ pub(crate) struct InheritedAuthority {
     /// runtime handle, never serialized.
     #[serde(skip)]
     pub shared_declines: Option<aidaemon_core::SharedDeclines>,
+    /// The request's sub-agent tree, shared by every plain child in it.
+    /// `None` starts a new tree. A runtime handle, never serialized.
+    #[serde(skip)]
+    pub spawn_family: Option<SpawnFamily>,
     /// The kernel run that started this child, for tracing the family.
     #[serde(default)]
     pub parent_run: Option<aidaemon_core::RunId>,
@@ -328,6 +424,43 @@ fn bound_workspace_access(workspace: &str) -> Option<ToolCallAccessManifest> {
 mod tests {
     use super::*;
     use aidaemon_core::Authority;
+
+    fn family(max_concurrent: usize, max_total: usize) -> SpawnFamily {
+        SpawnFamily::new(SpawnFamilyLimits {
+            max_concurrent,
+            max_total,
+        })
+    }
+
+    #[test]
+    fn a_family_refuses_past_its_running_limit_until_one_finishes() {
+        let family = family(1, 10);
+        let first = family.try_admit().unwrap();
+        assert!(family.try_admit().unwrap_err().contains("already running"));
+        drop(first);
+        assert!(family.try_admit().is_ok());
+    }
+
+    #[test]
+    fn a_family_refuses_past_its_total_even_when_nothing_is_running() {
+        let family = family(5, 2);
+        drop(family.try_admit().unwrap());
+        drop(family.try_admit().unwrap());
+        assert!(family.try_admit().unwrap_err().contains("already started"));
+    }
+
+    #[test]
+    fn clones_of_a_family_share_its_tokens() {
+        let family = family(1, 1);
+        family
+            .clone()
+            .tokens()
+            .fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            family.tokens().load(std::sync::atomic::Ordering::Relaxed),
+            7
+        );
+    }
 
     async fn temp_store(path: &std::path::Path) -> crate::state::SqliteStateStore {
         let embedding = std::sync::Arc::new(
@@ -660,6 +793,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            spawn_family: None,
             parent_run: None,
         }
     }
@@ -769,6 +903,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            spawn_family: None,
             parent_run: None,
         };
         let own = resolve_authority(&AuthorityFacts {

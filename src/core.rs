@@ -187,6 +187,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         iteration_config: config.subagents.effective_iteration_limit(),
         task_timeout_secs: config.subagents.task_timeout_secs,
         task_token_budget: config.subagents.task_token_budget,
+        spawn_family: crate::agent::authority::SpawnFamilyLimits {
+            max_concurrent: config.subagents.max_concurrent,
+            max_total: config.subagents.max_per_request,
+        },
         llm_call_timeout_secs,
         mcp_registry: Some(mcp_registry.clone()),
         goal_token_registry: Some(goal_token_registry.clone()),
