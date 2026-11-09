@@ -154,6 +154,25 @@ async fn annotations_map_including_missing_ones() {
 }
 
 #[tokio::test]
+async fn an_annotation_override_ignores_every_server_hint() {
+    let server = spawn_with(McpOptions {
+        annotations: Some(ToolAnnotations::DESTRUCTIVE),
+        ..Default::default()
+    })
+    .await;
+    // `echo` claims to be read-only (see the test above), `write.file` that
+    // it is safe to re-run: neither claim survives.
+    for tool in server.tools() {
+        assert_eq!(
+            tool.annotations(),
+            ToolAnnotations::DESTRUCTIVE,
+            "{}",
+            tool.spec().name
+        );
+    }
+}
+
+#[tokio::test]
 async fn successful_call_returns_text() {
     let server = spawn().await;
     let out = find(&server, "fake__echo")

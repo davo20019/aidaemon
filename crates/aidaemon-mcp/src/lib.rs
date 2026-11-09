@@ -24,9 +24,10 @@
 //! Tool names are `{server}__{tool}`, sanitized to `[a-zA-Z0-9_-]` and cut
 //! to 64 characters. MCP annotations map onto [`aidaemon_core::ToolAnnotations`]
 //! with MCP's conservative defaults: a tool without annotations is treated
-//! as mutating and destructive. A server that crashes or times out never
-//! panics the agent; the call fails with a tool error carrying the server's
-//! recent stderr.
+//! as mutating and destructive, and [`McpOptions::annotations`] replaces the
+//! hints altogether for callers that do not trust them. A server that
+//! crashes or times out never panics the agent; the call fails with a tool
+//! error carrying the server's recent stderr.
 //!
 //! The child gets a scrubbed environment ([`SAFE_ENV_KEYS`] plus the `env`
 //! you pass) and is killed when the [`McpServer`] and every tool taken from
@@ -39,4 +40,4 @@ pub use client::{
     McpError, McpOptions, McpServer, ServerInfo, PROTOCOL_VERSION, SAFE_ENV_KEYS,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-pub use tool::{map_annotations, render_result, tool_name, McpTool};
+pub use tool::{map_annotations, normalize_schema, render_result, tool_name, McpTool};

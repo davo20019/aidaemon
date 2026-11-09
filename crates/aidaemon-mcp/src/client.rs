@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aidaemon_core::Tool;
+use aidaemon_core::{Tool, ToolAnnotations};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -103,6 +103,11 @@ pub struct McpOptions {
     /// Sent as `clientInfo`.
     pub client_name: String,
     pub client_version: String,
+    /// Annotations every tool of this server gets, instead of the ones
+    /// mapped from the server's hints. The MCP specification calls those
+    /// hints untrusted: set `Some(ToolAnnotations::DESTRUCTIVE)` to judge
+    /// every call at its worst whatever the server claims.
+    pub annotations: Option<ToolAnnotations>,
 }
 
 impl Default for McpOptions {
@@ -115,6 +120,7 @@ impl Default for McpOptions {
             cwd: None,
             client_name: "aidaemon".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            annotations: None,
         }
     }
 }
@@ -168,6 +174,7 @@ impl Shared {
 
 pub(crate) struct Inner {
     pub(crate) name: String,
+    pub(crate) annotations: Option<ToolAnnotations>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     request_timeout: Duration,
@@ -404,6 +411,7 @@ impl McpServer {
         ];
         let inner = Arc::new(Inner {
             name: name.clone(),
+            annotations: options.annotations,
             shared,
             next_id: AtomicU64::new(1),
             request_timeout: options.request_timeout,

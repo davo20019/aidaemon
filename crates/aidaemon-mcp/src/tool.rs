@@ -71,6 +71,20 @@ pub fn map_annotations(annotations: Option<&Value>) -> ToolAnnotations {
     }
 }
 
+/// A `tools/list` `inputSchema` as model-facing function parameters: an
+/// object schema with `properties` (MCP allows a bare `{"type": "object"}`)
+/// and no `$schema` (Gemini rejects it). A missing or non-object schema
+/// becomes an empty object schema.
+pub fn normalize_schema(schema: Option<&Value>) -> Value {
+    let Some(Value::Object(schema)) = schema else {
+        return json!({"type": "object", "properties": {}});
+    };
+    let mut schema = schema.clone();
+    schema.remove("$schema");
+    schema.entry("properties").or_insert_with(|| json!({}));
+    Value::Object(schema)
+}
+
 /// One MCP server tool. Calls go through the shared server connection.
 #[derive(Clone)]
 pub struct McpTool {
@@ -99,17 +113,15 @@ impl McpTool {
             .or_else(|| def.get("title").and_then(Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| format!("`{remote_name}` from MCP server `{}`", server.name));
-        let parameters = match def.get("inputSchema") {
-            Some(schema @ Value::Object(_)) => schema.clone(),
-            _ => json!({"type": "object", "properties": {}}),
-        };
         Self {
             server: server.clone(),
-            annotations: map_annotations(def.get("annotations")),
+            annotations: server
+                .annotations
+                .unwrap_or_else(|| map_annotations(def.get("annotations"))),
             spec: ToolSpec {
                 name,
                 description,
-                parameters,
+                parameters: normalize_schema(def.get("inputSchema")),
             },
             remote_name,
         }
@@ -342,6 +354,33 @@ mod tests {
             map_annotations(Some(&json!({"readOnlyHint": false}))),
             ToolAnnotations::DESTRUCTIVE
         );
+    }
+
+    #[test]
+    fn schemas_are_normalized_for_providers() {
+        assert_eq!(
+            normalize_schema(Some(&json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "required": ["a"],
+                "properties": {"a": {"type": "string"}}
+            }))),
+            json!({
+                "type": "object",
+                "required": ["a"],
+                "properties": {"a": {"type": "string"}}
+            })
+        );
+        assert_eq!(
+            normalize_schema(Some(&json!({"type": "object"}))),
+            json!({"type": "object", "properties": {}})
+        );
+        for missing in [None, Some(&Value::Null), Some(&json!("not a schema"))] {
+            assert_eq!(
+                normalize_schema(missing),
+                json!({"type": "object", "properties": {}})
+            );
+        }
     }
 
     #[test]
