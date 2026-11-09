@@ -153,7 +153,18 @@ impl HeartbeatCoordinator {
             // flight or wedged; reconcile first and try again next tick.
             match self.reconcile_open_scheduled_runs_for_goal(&goal_id).await {
                 Ok(open_runs) if !open_runs.is_empty() => {
-                    let stale = open_runs.iter().all(|run| run.status == "blocked");
+                    let mut stale = true;
+                    for run in &open_runs {
+                        // A recovery run whose task never got created (a crash
+                        // between the two writes) has nothing left to finish.
+                        let no_work = match run.root_task_id.as_deref() {
+                            Some(root) if run.trigger_type == "recovery" => {
+                                matches!(self.state.get_task(root).await, Ok(None))
+                            }
+                            _ => false,
+                        };
+                        stale &= run.status == "blocked" || no_work;
+                    }
                     if !stale {
                         continue;
                     }
@@ -224,14 +235,17 @@ impl HeartbeatCoordinator {
                 started_at: None,
                 completed_at: None,
             };
-            if let Err(error) = self
+            let recovery_run = match self
                 .state
                 .start_goal_run(&goal_id, "recovery", None, Some(&recovery_task_id))
                 .await
             {
-                warn!(goal_id = %goal_id, %error, "Failed to start automatic recovery run");
-                continue;
-            }
+                Ok(run) => run,
+                Err(error) => {
+                    warn!(goal_id = %goal_id, %error, "Failed to start automatic recovery run");
+                    continue;
+                }
+            };
             match self.state.create_task(&task).await {
                 Ok(()) => info!(
                     goal_id = %goal_id,
@@ -241,7 +255,16 @@ impl HeartbeatCoordinator {
                     "Launched automatic recovery run for escalated scheduled objective"
                 ),
                 Err(error) => {
-                    warn!(goal_id = %goal_id, %error, "Failed to create automatic recovery task")
+                    warn!(goal_id = %goal_id, %error, "Failed to create automatic recovery task");
+                    // A run with no work would hold the objective forever.
+                    let _ = self
+                        .state
+                        .finish_goal_run(
+                            &recovery_run.id,
+                            "failed",
+                            Some("The recovery task could not be created."),
+                        )
+                        .await;
                 }
             }
         }
@@ -571,6 +594,10 @@ impl HeartbeatCoordinator {
                 false
             };
             if delivered {
+                // Delivered: nothing below may let a one-shot fire again.
+                if schedule.is_one_shot {
+                    let _ = self.state.delete_goal_schedule(&schedule.id).await;
+                }
                 // Record a completed task so history/diagnostics show the run.
                 let task = crate::traits::Task {
                     id: run_root_task_id.clone(),
@@ -615,9 +642,6 @@ impl HeartbeatCoordinator {
                 updated.updated_at = now_ts.clone();
                 let _ = self.state.update_goal(&updated).await;
 
-                if schedule.is_one_shot {
-                    let _ = self.state.delete_goal_schedule(&schedule.id).await;
-                }
                 info!(
                     goal_id = %goal.id,
                     one_shot = schedule.is_one_shot,

@@ -505,8 +505,11 @@ impl sdk::Tool for BridgedTool {
 
     async fn call(&self, arguments: Value, ctx: &sdk::ToolContext) -> sdk::ToolResult {
         let (reply, answer) = oneshot::channel();
+        let abandoned = tokio_util::sync::CancellationToken::new();
+        let _stop_when_dropped = abandoned.clone().drop_guard();
         self.calls
             .send(DaemonCall::Tool(ToolRequest {
+                abandoned,
                 call: KernelCall {
                     run_id: ctx.run_id,
                     name: self.spec.name.clone(),

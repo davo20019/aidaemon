@@ -153,6 +153,28 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses at connection time any name that resolves to a blocked address.
+/// The check before a request and the connection look a name up separately,
+/// so a name could answer with a public address first and a private one next.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if let Some(blocked) = addrs.iter().find(|addr| is_blocked_ip(addr.ip())) {
+                let reason = format!("{host} resolves to blocked address {}", blocked.ip());
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason).into(),
+                );
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// Check if an IP address is in a blocked range (private, loopback, link-local, etc.)
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
@@ -743,6 +765,9 @@ impl WebFetch {
             .timeout(self.timeout)
             .redirect(policy)
             .user_agent(&self.user_agent);
+        if guarded {
+            builder = builder.dns_resolver(std::sync::Arc::new(PublicOnlyResolver));
+        }
         if self.browser_headers {
             builder = builder.default_headers(browser_headers());
         }
@@ -1334,6 +1359,18 @@ fn format_fetch_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_name_resolving_to_a_blocked_address_is_refused_at_connection() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let error = match PublicOnlyResolver.resolve(name).await {
+            Ok(_) => panic!("localhost must not resolve"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("blocked address"), "{error}");
+    }
     use crate::testutil::ctx;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

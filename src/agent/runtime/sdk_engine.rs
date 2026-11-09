@@ -497,6 +497,9 @@ pub(super) struct KernelCall {
 pub(super) struct ToolRequest {
     call: KernelCall,
     reply: oneshot::Sender<sdk::ToolResult>,
+    /// Cancelled when the kernel stops waiting for this call (its timeout, or
+    /// the run ending), so the tool stops too instead of running on unseen.
+    abandoned: tokio_util::sync::CancellationToken,
 }
 
 impl std::ops::Deref for ToolRequest {

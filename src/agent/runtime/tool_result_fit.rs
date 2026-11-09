@@ -47,10 +47,10 @@ impl Agent {
         }
         // This is the one place a tool result is marked as data: it feeds
         // both the model's view and the stored history. Untrusted output is
-        // sanitized and wrapped from the call's typed trust. Errors come from
-        // the daemon itself. Capping comes first, so a cut result is still
-        // one intact block.
-        let untrusted = !result_is_err && scope.trust == aidaemon_core::SourceTrust::Untrusted;
+        // sanitized and wrapped from the call's typed trust, errors included:
+        // a remote server can write its own error text. Capping comes first,
+        // so a cut result is still one intact block.
+        let untrusted = scope.trust == aidaemon_core::SourceTrust::Untrusted;
         let result_text = if untrusted && !result_metadata.untrusted_verbatim {
             crate::tools::sanitize::sanitize_external_content(&result_text)
         } else if !untrusted && !result_is_err && scope.tool_name == "terminal" {

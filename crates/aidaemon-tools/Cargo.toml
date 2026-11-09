@@ -25,7 +25,7 @@ sha2 = "0.10"
 shellexpand = "3"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["process", "fs", "io-util", "time", "macros", "rt"] }
+tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -33,4 +33,4 @@ libc = "0.2"
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 tempfile = "3"
-tokio = { version = "1", features = ["process", "fs", "io-util", "time", "macros", "rt", "rt-multi-thread", "net", "test-util"] }
+tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "rt-multi-thread", "net", "test-util"] }

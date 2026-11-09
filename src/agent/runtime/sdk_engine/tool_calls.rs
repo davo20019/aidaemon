@@ -695,15 +695,20 @@ impl Agent {
         let (injected_dir, judgment) =
             canonicalize_dispatched_call(scope, tool.as_deref(), &mut request);
         let arguments = serde_json::to_string(&request.arguments).unwrap_or_else(|_| "{}".into());
-        let mut output = self
-            .run_sdk_tool_call(
+        let abandoned = request.abandoned.clone();
+        let mut output = tokio::select! {
+            output = self.run_sdk_tool_call(
                 scope,
                 &request,
                 &arguments,
                 injected_dir.as_deref(),
                 &judgment,
-            )
-            .await;
+            ) => output,
+            _ = abandoned.cancelled() => {
+                warn!(tool = %request.name, "Tool call stopped: the run no longer waits for it");
+                return;
+            }
+        };
         // Refusals, deferrals, replays and suppressed duplicates are the
         // daemon's own words: trusted.
         output.trust.get_or_insert(sdk::SourceTrust::Trusted);
@@ -1109,7 +1114,12 @@ impl Agent {
                             model: scope.model,
                             emitter: scope.emitter,
                             mandate_execution: self.mandate_execution.is_some(),
-                            trust: aidaemon_core::SourceTrust::Trusted,
+                            trust: self.call_output_trust(
+                                scope,
+                                &request.name,
+                                arguments,
+                                Some(&metadata),
+                            ),
                         },
                         error_text.clone(),
                         true,
