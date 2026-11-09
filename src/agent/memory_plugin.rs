@@ -244,6 +244,7 @@ pub(crate) async fn configured_memory(
     llm_runtime: &crate::llm_runtime::SharedLlmRuntime,
     state: Arc<dyn StateStore>,
     event_store: Arc<crate::events::EventStore>,
+    pool: sqlx::SqlitePool,
 ) -> ConfiguredMemory {
     match config.backend {
         crate::config::MemoryBackend::Daemon => ConfiguredMemory::daemons_own(),
@@ -261,6 +262,7 @@ pub(crate) async fn configured_memory(
                     return ConfiguredMemory::daemons_own();
                 }
             };
+            let intake_state = state.clone();
             let fast_model = llm_runtime
                 .router()
                 .map(|router| router.select(crate::router::Tier::Fast).to_string())
@@ -282,11 +284,25 @@ pub(crate) async fn configured_memory(
             )
             .extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
-            ConfiguredMemory::replaced_by(Arc::new(aidaemon_memory::ScopedMemory::new(builder)))
+            let system: Arc<dyn aidaemon_policies::MemorySystem> =
+                Arc::new(aidaemon_memory::ScopedMemory::new(builder));
+            let mut memory = ConfiguredMemory::replaced_by(system.clone());
+            if config.learn_from_history {
+                memory.services.push(
+                    crate::memory::history_intake::HistoryIntake::new(
+                        system,
+                        pool,
+                        intake_state,
+                        &format!("sdk:{}", config.path),
+                    )
+                    .into_service(),
+                );
+            }
+            memory
         }
         #[cfg(not(feature = "sdk-memory"))]
         crate::config::MemoryBackend::Sdk => {
-            let _ = (llm_runtime, state, event_store);
+            let _ = (llm_runtime, state, event_store, pool);
             tracing::warn!(
                 "[memory] backend = \"sdk\" needs a build with the sdk-memory feature; \
                  using the daemon's memory"

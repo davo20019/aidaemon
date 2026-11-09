@@ -472,6 +472,10 @@ pub struct MemoryConfig {
     /// SQLite file for the `sdk` backend.
     #[serde(default = "default_sdk_memory_path")]
     pub path: String,
+    /// Let a replacing memory system learn from the retained conversations.
+    /// It reads them once, in the background, and costs model calls.
+    #[serde(default)]
+    pub learn_from_history: bool,
 }
 
 impl Default for MemoryConfig {
@@ -479,6 +483,7 @@ impl Default for MemoryConfig {
         Self {
             backend: MemoryBackend::default(),
             path: default_sdk_memory_path(),
+            learn_from_history: false,
         }
     }
 }

@@ -646,3 +646,72 @@ async fn finished_run_is_extracted_unless_blocked() {
         assert_eq!(extraction.requests().len(), extracted);
     }
 }
+
+fn past(
+    session: &str,
+    scope: &str,
+    role: aidaemon_policies::PastRole,
+    text: &str,
+) -> aidaemon_policies::PastMessage {
+    aidaemon_policies::PastMessage {
+        session_id: session.to_string(),
+        scope: scope.to_string(),
+        role,
+        text: text.to_string(),
+        at: "2026-01-01T00:00:00+00:00".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_new_memory_learns_from_retained_conversations_in_their_scopes() {
+    use aidaemon_memory::ScopedMemory;
+    use aidaemon_policies::{HistoryIntake, MemorySystem, PastRole};
+
+    let provider = Arc::new(ScriptedProvider::new([facts_reply(json!([
+        {"category": "user", "key": "employer", "value": "Acme Corp", "confidence": 0.9}
+    ]))]));
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let system = ScopedMemory::new(
+        Memory::builder(store, Arc::new(HashEmbedder::default()))
+            .extractor(FactExtractor::from_arc(provider, "small")),
+    );
+
+    let outcome = system
+        .absorb_history(&[
+            past(
+                SESSION,
+                "owner",
+                PastRole::User,
+                "I work at Acme Corp as an engineer",
+            ),
+            past(SESSION, "owner", PastRole::Assistant, "Good to know."),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, HistoryIntake::Absorbed);
+    let facts = system.memory().facts("owner").await.unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].value, "Acme Corp");
+}
+
+#[tokio::test]
+async fn a_memory_without_an_extractor_says_it_cannot_learn_from_history() {
+    use aidaemon_memory::ScopedMemory;
+    use aidaemon_policies::{HistoryIntake, MemorySystem, PastRole};
+
+    let system = ScopedMemory::new(Memory::builder(
+        Arc::new(InMemoryMemoryStore::new()),
+        Arc::new(HashEmbedder::default()),
+    ));
+    let outcome = system
+        .absorb_history(&[past(
+            SESSION,
+            "owner",
+            PastRole::User,
+            "hello there, a long enough note",
+        )])
+        .await
+        .unwrap();
+    assert_eq!(outcome, HistoryIntake::NotSupported);
+}

@@ -90,6 +90,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         &llm_runtime,
         state.clone(),
         event_store.clone(),
+        pool.clone(),
     )
     .await;
 
@@ -512,6 +513,40 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.ok();
+}
+
+/// Write a readable copy of the daemon's memory to `directory`. The directory
+/// must not exist yet, and only the owner can read what is written.
+pub async fn run_memory_export(
+    mut config: AppConfig,
+    config_path: std::path::PathBuf,
+    directory: std::path::PathBuf,
+) -> anyhow::Result<Vec<(String, usize)>> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+    let state = crate::state::SqliteStateStore::new(
+        &config.state.db_path,
+        config.state.working_memory_cap,
+        config.state.encryption_key.as_deref(),
+        Arc::new(crate::memory::embeddings::EmbeddingService::new()?),
+    )
+    .await?;
+    let files = state.memory().export_readable().await?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|error| anyhow::anyhow!("cannot create {}: {error}", directory.display()))?;
+    let mut written = Vec::new();
+    for file in files {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(file.name))?;
+        std::io::Write::write_all(&mut output, file.content.as_bytes())?;
+        written.push((file.name.to_string(), file.entries));
+    }
+    Ok(written)
 }
 
 /// Run all startup database migrations and exit.

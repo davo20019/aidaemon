@@ -3,6 +3,7 @@ pub mod core_profile;
 pub mod embedding_index;
 pub mod embeddings;
 pub mod expertise;
+pub(crate) mod history_intake;
 pub mod history_source;
 pub mod manager;
 pub mod neighborhood;

@@ -31,11 +31,46 @@ pub trait MemorySystem: Send + Sync {
         None
     }
 
+    /// Learn from the host's retained conversations, oldest first, in
+    /// batches. This is how a system starts out knowing what a previous one
+    /// knew: memory systems share no record format, but any of them can read
+    /// a conversation. The host resumes where the last batch ended.
+    async fn absorb_history(&self, _messages: &[PastMessage]) -> Result<HistoryIntake, String> {
+        Ok(HistoryIntake::NotSupported)
+    }
+
     /// The background work this memory system needs (consolidation, expiry,
     /// indexing). The host runs these in place of its own memory jobs.
     fn services(&self) -> Vec<Arc<dyn Service>> {
         Vec::new()
     }
+}
+
+/// Who said a [`PastMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastRole {
+    User,
+    Assistant,
+}
+
+/// One message from the host's retained conversations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastMessage {
+    pub session_id: String,
+    /// The memory it belongs to, as the host would scope a turn today.
+    pub scope: String,
+    pub role: PastRole,
+    pub text: String,
+    /// RFC 3339.
+    pub at: String,
+}
+
+/// What became of a batch given to [`MemorySystem::absorb_history`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryIntake {
+    Absorbed,
+    /// This system does not learn from history. The host stops offering.
+    NotSupported,
 }
 
 /// What a [`MemorySystem`] may do on one turn, as the host decided it.

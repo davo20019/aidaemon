@@ -23,6 +23,7 @@ use aidaemon_core::ChannelVisibility;
 
 mod claims;
 mod episodes;
+mod export;
 mod facts;
 mod learning;
 mod people;
@@ -31,6 +32,7 @@ mod schema;
 mod structured;
 
 pub use claims::{project_event_span, MemoryClaimRecord};
+pub use export::ExportFile;
 pub use facts::{
     build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
     is_owner_authored_fact_source,

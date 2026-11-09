@@ -3,10 +3,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use aidaemon_core::{FnService, Schedule, Service, ServiceError};
-use aidaemon_policies::{MemoryInjection, MemoryParts, MemorySystem, MemoryTurn};
+use aidaemon_core::{FnService, Message, Schedule, Service, ServiceError};
+use aidaemon_policies::{
+    HistoryIntake, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn, PastMessage, PastRole,
+};
 use async_trait::async_trait;
 
+use crate::error::MemoryError;
 use crate::memory::{Memory, MemoryBuilder};
 use crate::recall::MemoryRecall;
 use crate::tools::{RecallTool, RememberTool};
@@ -144,6 +147,38 @@ impl MemorySystem for ScopedMemory {
              Only state what memory returns; \"I don't have that stored\" is a valid answer."
                 .to_string(),
         )
+    }
+
+    async fn absorb_history(&self, messages: &[PastMessage]) -> Result<HistoryIntake, String> {
+        // Conversations stay separate; each is one extraction.
+        let mut order: Vec<&str> = Vec::new();
+        let mut sessions: HashMap<&str, Vec<&PastMessage>> = HashMap::new();
+        for message in messages {
+            let session = message.session_id.as_str();
+            if !sessions.contains_key(session) {
+                order.push(session);
+            }
+            sessions.entry(session).or_default().push(message);
+        }
+        for session in order {
+            let past = &sessions[session];
+            if let Ok(mut scopes) = self.scopes.write() {
+                scopes.insert(session.to_string(), past[0].scope.clone());
+            }
+            let transcript: Vec<Message> = past
+                .iter()
+                .map(|message| match message.role {
+                    PastRole::User => Message::user(message.text.clone()),
+                    PastRole::Assistant => Message::assistant(message.text.clone(), Vec::new()),
+                })
+                .collect();
+            match self.memory.ingest_turn(session, None, &transcript).await {
+                Ok(_) => {}
+                Err(MemoryError::NotConfigured(_)) => return Ok(HistoryIntake::NotSupported),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(HistoryIntake::Absorbed)
     }
 
     fn services(&self) -> Vec<Arc<dyn Service>> {

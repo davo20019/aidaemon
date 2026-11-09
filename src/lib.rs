@@ -188,6 +188,9 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  install-service       Install as a system service (launchd/systemd)");
                 println!("  check-update          Check for available updates");
                 println!("  migrate [--config]    Run DB migrations and exit");
+                println!(
+                    "  memory-export DIR     Write a readable copy of memory to a new directory"
+                );
                 println!("  setup low-latency     Configure Telegram webhook low-latency mode");
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
@@ -243,6 +246,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "migrate" => {
                 return handle_migrate_command(&args[2..], config_path.as_path());
+            }
+            "memory-export" => {
+                return handle_memory_export_command(&args[2..], config_path.as_path());
             }
             "setup" => {
                 return handle_setup_command(&args[2..], config_path.as_path());
@@ -479,6 +485,53 @@ fn handle_browser_command(
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+fn handle_memory_export_command(args: &[String], default_config_path: &Path) -> anyhow::Result<()> {
+    let mut config_path = default_config_path.to_path_buf();
+    let mut directory = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("Usage: aidaemon memory-export DIR [--config PATH]");
+                println!();
+                println!("Write everything the daemon's own memory holds as Markdown files.");
+                println!("DIR must not exist yet. The files contain personal data and are");
+                println!("readable only by you.");
+                return Ok(());
+            }
+            "-c" | "--config" => {
+                let Some(path) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for --config");
+                };
+                config_path = PathBuf::from(path);
+                i += 2;
+            }
+            other if directory.is_none() && !other.starts_with('-') => {
+                directory = Some(PathBuf::from(other));
+                i += 1;
+            }
+            other => anyhow::bail!("Unknown memory-export option: {other}"),
+        }
+    }
+    let Some(directory) = directory else {
+        anyhow::bail!("Usage: aidaemon memory-export DIR [--config PATH]");
+    };
+    let config = config::AppConfig::load(&config_path)?;
+    let written = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(crate::core::run_memory_export(
+            config,
+            config_path.clone(),
+            directory.clone(),
+        ))?;
+    for (name, entries) in written {
+        println!("{name}: {entries} entries");
+    }
+    println!("Wrote {}", directory.display());
     Ok(())
 }
 

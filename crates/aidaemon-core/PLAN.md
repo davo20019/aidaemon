@@ -458,13 +458,16 @@ Order:
              is owned by it; post-run learning is its own. A test backend with
              one `journal_note` tool runs a whole turn and writes none of the
              SQLite memory tables (`memory_plugin/swap_tests.rs`).
-           - Next: `StateStore` drops the memory traits and the forwards.
-             Tool-name tables in `turn/` (`inquiry`, `message_build`,
-             `sliding_window`, `turn_context`) move to typed tool metadata so
-             a backend's tools get the same treatment. Switching backends: no
-             common record format. History is the one thing any system can
-             read, so a new system may ingest the retained transcript, and
-             the daemon's memory gets its own readable export.
+           - Done 2026-11-09: `StateStore` no longer has the memory traits;
+             memory's users hold `MemoryStores`, and `search_history` and
+             `cli_agent` read the daemon's memory only while it is active.
+             The turn treats memory tools by `MemoryToolFacts`, not by name;
+             a replacing system's tools get facts from what they declare.
+             Switching: `MemorySystem::absorb_history` learns from the
+             retained conversations (`[memory] learn_from_history`, off by
+             default, resumable, same privacy rules as a live turn), and
+             `aidaemon memory-export DIR` writes the daemon's memory as
+             Markdown.
         5. Live N-of-M against the current daemon, then delete what is left
            of the old daemon modules.
         Not memory, noted on the way: `memory/context_window.rs` now holds

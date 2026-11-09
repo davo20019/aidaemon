@@ -60,7 +60,10 @@ pub use egress::EgressGuard;
 pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, ProjectInstructions};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
-pub use memory::{InMemoryRecall, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn, Recall};
+pub use memory::{
+    HistoryIntake, InMemoryRecall, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn,
+    PastMessage, PastRole, Recall,
+};
 #[cfg(feature = "otel")]
 pub use otel::{otlp_provider, OtelSink};
 pub use redact::{secret_patterns, Redactor};
