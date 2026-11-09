@@ -1,14 +1,9 @@
 use crate::events::{Consolidator, EventStore};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
-use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::history_source::EventHistory;
 use crate::traits::{Message, MessageAnnotation, StateStore};
 use crate::types::UserRole;
-use aidaemon_memory::embedding_index::{
-    content_hash, EmbeddingIndex, EmbeddingItem, MemoryOwner, SqliteEmbeddingIndex,
-};
-use aidaemon_memory::encode_embedding;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -143,138 +138,14 @@ impl MemoryManager {
     }
 
     async fn process_embeddings(&self) -> anyhow::Result<bool> {
-        let mut did_work = false;
-        did_work |= self.process_procedure_embeddings().await?;
-        did_work |= self.process_error_solution_embeddings().await?;
-        Ok(did_work)
-    }
-
-    async fn process_procedure_embeddings(&self) -> anyhow::Result<bool> {
-        let rows = sqlx::query(
-            "SELECT id, trigger_pattern FROM procedures p
-             WHERE trigger_pattern IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_embeddings me
-                   WHERE me.owner_type = 'procedure' AND me.owner_id = CAST(p.id AS TEXT)
-                     AND me.embedding_purpose = 'trigger' AND me.embedding_model = ?
-                     AND me.stale_at IS NULL
-               )
-             LIMIT 10",
-        )
-        .bind(EMBEDDING_MODEL_ID)
-        .fetch_all(&self.pool)
-        .await?;
-
-        if rows.is_empty() {
+        let Some(memory) = &self.memory else {
             return Ok(false);
-        }
-
-        info!(
-            "Generating trigger embeddings for {} procedures",
-            rows.len()
-        );
-        for row in rows {
-            let id: i64 = row.get("id");
-            let trigger: String = row.get("trigger_pattern");
-            let trigger = trigger.trim();
-            if trigger.is_empty() {
-                continue;
-            }
-            match self.embedding_service.embed(trigger.to_string()).await {
-                Ok(embedding) => {
-                    let blob = encode_embedding(&embedding);
-                    let _ = sqlx::query("UPDATE procedures SET trigger_embedding = ? WHERE id = ?")
-                        .bind(blob)
-                        .bind(id)
-                        .execute(&self.pool)
-                        .await;
-                    if let Err(error) = SqliteEmbeddingIndex::new(self.pool.clone())
-                        .upsert(EmbeddingItem {
-                            owner: MemoryOwner::new("procedure", id),
-                            purpose: "trigger".to_string(),
-                            model: EMBEDDING_MODEL_ID.to_string(),
-                            content_hash: content_hash(trigger),
-                            embedding,
-                        })
-                        .await
-                    {
-                        warn!(procedure_id = id, %error, "Failed to project procedure embedding");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        procedure_id = id,
-                        error = %e,
-                        "Failed to generate trigger embedding for procedure"
-                    );
-                }
-            }
-        }
-
-        Ok(true)
-    }
-
-    async fn process_error_solution_embeddings(&self) -> anyhow::Result<bool> {
-        let rows = sqlx::query(
-            "SELECT id, error_pattern FROM error_solutions e
-             WHERE error_pattern IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM memory_embeddings me
-                   WHERE me.owner_type = 'error_solution' AND me.owner_id = CAST(e.id AS TEXT)
-                     AND me.embedding_purpose = 'error' AND me.embedding_model = ?
-                     AND me.stale_at IS NULL
-               )
-             LIMIT 10",
+        };
+        Ok(aidaemon_memory::backfill_learning_embeddings(
+            memory.as_ref(),
+            self.embedding_service.as_ref(),
         )
-        .bind(EMBEDDING_MODEL_ID)
-        .fetch_all(&self.pool)
-        .await?;
-
-        if rows.is_empty() {
-            return Ok(false);
-        }
-
-        info!("Generating embeddings for {} error solutions", rows.len());
-        for row in rows {
-            let id: i64 = row.get("id");
-            let pat: String = row.get("error_pattern");
-            let pat = pat.trim();
-            if pat.is_empty() {
-                continue;
-            }
-            match self.embedding_service.embed(pat.to_string()).await {
-                Ok(embedding) => {
-                    let blob = encode_embedding(&embedding);
-                    let _ =
-                        sqlx::query("UPDATE error_solutions SET error_embedding = ? WHERE id = ?")
-                            .bind(blob)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await;
-                    if let Err(error) = SqliteEmbeddingIndex::new(self.pool.clone())
-                        .upsert(EmbeddingItem {
-                            owner: MemoryOwner::new("error_solution", id),
-                            purpose: "error".to_string(),
-                            model: EMBEDDING_MODEL_ID.to_string(),
-                            content_hash: content_hash(pat),
-                            embedding,
-                        })
-                        .await
-                    {
-                        warn!(error_solution_id = id, %error, "Failed to project error-solution embedding");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error_solution_id = id,
-                        error = %e,
-                        "Failed to generate embedding for error solution"
-                    );
-                }
-            }
-        }
-
-        Ok(true)
+        .await?)
     }
 
     /// Consolidate durable facts from owner history (the SDK memory crate's
@@ -533,6 +404,16 @@ impl MemoryManager {
 
     // ==================== Background Task Helpers ====================
 
+    /// Each session's latest episode end, as a JSON list of pairs the event
+    /// queries below can join against. Episodes are memory's, events ours.
+    async fn latest_episode_ends_json(&self) -> anyhow::Result<String> {
+        let ends = match &self.memory {
+            Some(memory) => memory.latest_episode_ends().await?,
+            None => Vec::new(),
+        };
+        Ok(serde_json::to_string(&ends)?)
+    }
+
     /// Create episodes for sessions that have been idle for 30+ minutes without an episode.
     async fn create_episodes_for_idle_sessions(&self) -> anyhow::Result<()> {
         let thirty_mins_ago = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
@@ -540,13 +421,14 @@ impl MemoryManager {
         // Find sessions with conversation events older than 30 mins that have
         // uncaptured events (events newer than the latest episode, or no episode
         // at all) and at least 5 such events.
+        let latest_episode_ends = self.latest_episode_ends_json().await?;
         let idle_sessions: Vec<String> = sqlx::query_scalar(
             "SELECT ev.session_id
              FROM events ev
              LEFT JOIN (
-                 SELECT session_id, MAX(end_time) AS latest_end
-                 FROM episodes
-                 GROUP BY session_id
+                 SELECT json_extract(value, '$[0]') AS session_id,
+                        json_extract(value, '$[1]') AS latest_end
+                 FROM json_each(?)
              ) ep ON ep.session_id = ev.session_id
              WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
                AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
@@ -555,6 +437,7 @@ impl MemoryManager {
              HAVING COUNT(ev.id) >= 5
                AND MAX(ev.created_at) < ?",
         )
+        .bind(&latest_episode_ends)
         .bind(&thirty_mins_ago)
         .bind(&thirty_mins_ago)
         .fetch_all(&self.pool)
@@ -606,19 +489,21 @@ impl MemoryManager {
     async fn create_episodes_for_active_long_sessions(&self) -> anyhow::Result<()> {
         // Find sessions with 20+ events since their last episode (or no episode
         // at all). These sessions risk losing context as the message window rotates.
+        let latest_episode_ends = self.latest_episode_ends_json().await?;
         let session_ids: Vec<String> = sqlx::query_scalar(
             "SELECT ev.session_id
              FROM events ev
              LEFT JOIN (
-                 SELECT session_id, MAX(end_time) AS latest_end
-                 FROM episodes
-                 GROUP BY session_id
+                 SELECT json_extract(value, '$[0]') AS session_id,
+                        json_extract(value, '$[1]') AS latest_end
+                 FROM json_each(?)
              ) ep ON ep.session_id = ev.session_id
              WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
                AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
              GROUP BY ev.session_id
              HAVING COUNT(ev.id) >= 20",
         )
+        .bind(&latest_episode_ends)
         .fetch_all(&self.pool)
         .await?;
         let session_ids = self
@@ -671,19 +556,13 @@ impl MemoryManager {
             .history
             .memory_suppressed_tasks_for_session(session_id)
             .await?;
-        let last_episode = sqlx::query(
-            "SELECT end_event_id, end_time FROM episodes
-             WHERE session_id = ?
-             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let last_episode = match &self.memory {
+            Some(memory) => memory.last_episode_bound(session_id).await?,
+            None => None,
+        };
 
-        let rows = if let Some(end_event_id) = last_episode
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
-            .flatten()
+        let rows = if let Some(end_event_id) =
+            last_episode.as_ref().and_then(|bound| bound.end_event_id)
         {
             sqlx::query(
                 "SELECT id, session_id, event_type, data, created_at, task_id
@@ -701,7 +580,7 @@ impl MemoryManager {
             .await?
         } else if let Some(since) = last_episode
             .as_ref()
-            .and_then(|row| row.try_get::<String, _>("end_time").ok())
+            .and_then(|bound| bound.end_time.as_ref())
         {
             sqlx::query(
                 "SELECT id, session_id, event_type, data, created_at, task_id
@@ -713,7 +592,7 @@ impl MemoryManager {
                  LIMIT ?",
             )
             .bind(session_id)
-            .bind(&since)
+            .bind(since)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?
@@ -1344,6 +1223,52 @@ mod tests {
                 .expect("mandate episode count");
         assert_eq!(ordinary_count, 1);
         assert_eq!(mandate_count, 0);
+    }
+
+    /// Episodes are read through the memory stores and joined to events as
+    /// a parameter: a session its latest episode covers is not a candidate,
+    /// and one with newer events is.
+    #[tokio::test]
+    async fn idle_candidates_respect_each_sessions_latest_episode() {
+        let (store, provider, manager, _db_file) =
+            setup_memory_manager_with_responses(vec![]).await;
+        for session in ["covered-session", "stale-episode-session"] {
+            insert_owner_session_events(
+                &store.pool(),
+                session,
+                5,
+                chrono::Duration::minutes(45),
+                None,
+                "EPISODE_BOUND_SENTINEL",
+            )
+            .await;
+        }
+        // Ends after every event, but bound to event 0: selecting this
+        // session by mistake would summarize all of its events.
+        let covered_end = Utc::now().to_rfc3339();
+        let stale_end = (Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        for (session, end) in [
+            ("covered-session", &covered_end),
+            ("stale-episode-session", &stale_end),
+        ] {
+            sqlx::query(
+                "INSERT INTO episodes (session_id, summary, importance, message_count,
+                                       start_time, end_time, created_at, end_event_id)
+                 VALUES (?1, 'earlier', 0.5, 5, ?2, ?2, ?2, 0)",
+            )
+            .bind(session)
+            .bind(end)
+            .execute(&store.pool())
+            .await
+            .expect("seed episode");
+        }
+
+        manager
+            .create_episodes_for_idle_sessions()
+            .await
+            .expect("idle episode pass");
+
+        assert_eq!(provider.call_count().await, 1, "only the stale session");
     }
 
     #[tokio::test]

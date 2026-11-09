@@ -63,6 +63,7 @@ impl EmbeddingService {
 
     /// Compute embedding for a single string.
     /// Runs on a blocking thread to avoid blocking the async runtime.
+    #[allow(dead_code)]
     pub async fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
         #[cfg(test)]
         return Ok(deterministic_test_embedding(&text));

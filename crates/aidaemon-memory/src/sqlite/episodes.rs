@@ -282,3 +282,68 @@ impl EpisodeStore for SqliteMemory {
         Ok(episodes)
     }
 }
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    async fn memory() -> SqliteMemory {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        SqliteMemory::new(pool, Arc::new(crate::HashEmbedder::new(384)))
+    }
+
+    async fn episode(memory: &SqliteMemory, session: &str, end: &str, end_event: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO episodes (session_id, summary, importance, message_count,
+                                   start_time, end_time, created_at, end_event_id)
+             VALUES (?1, 'summary', 0.5, 5, ?2, ?2, ?2, ?3)",
+        )
+        .bind(session)
+        .bind(end)
+        .bind(end_event)
+        .execute(&memory.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_is_bounded_by_its_last_episode() {
+        let memory = memory().await;
+        assert_eq!(memory.last_episode_bound("s1").await.unwrap(), None);
+        episode(&memory, "s1", "2026-01-02T00:00:00+00:00", None).await;
+        assert_eq!(
+            memory.last_episode_bound("s1").await.unwrap(),
+            Some(EpisodeBound {
+                end_event_id: None,
+                end_time: Some("2026-01-02T00:00:00+00:00".into()),
+            })
+        );
+        // A recorded event bound outranks a later end time without one.
+        episode(&memory, "s1", "2026-01-01T00:00:00+00:00", Some(7)).await;
+        episode(&memory, "s1", "2026-01-03T00:00:00+00:00", None).await;
+        let bound = memory.last_episode_bound("s1").await.unwrap().unwrap();
+        assert_eq!(bound.end_event_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn latest_ends_take_the_newest_per_session() {
+        let memory = memory().await;
+        episode(&memory, "s1", "2026-01-01T00:00:00+00:00", None).await;
+        episode(&memory, "s1", "2026-01-05T00:00:00+00:00", None).await;
+        episode(&memory, "s\"2", "2026-01-02T00:00:00+00:00", None).await;
+        let mut ends = memory.latest_episode_ends().await.unwrap();
+        ends.sort();
+        assert_eq!(
+            ends,
+            [
+                ("s\"2".to_string(), "2026-01-02T00:00:00+00:00".to_string()),
+                ("s1".to_string(), "2026-01-05T00:00:00+00:00".to_string()),
+            ]
+        );
+    }
+}
