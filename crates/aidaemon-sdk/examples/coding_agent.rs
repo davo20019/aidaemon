@@ -14,8 +14,9 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use aidaemon_sdk::policies::{
-    ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, ProjectInstructions,
-    ReceiptCompletionCheck, Redactor, Requirement, ScopeGuard, UntrustedOutput,
+    ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, NestedInstructions,
+    ProjectInstructions, ReceiptCompletionCheck, Redactor, Requirement, ScopeGuard,
+    UntrustedOutput,
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
@@ -51,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace = Workspace::new(&dir)?;
     let store = Arc::new(SqliteStore::open(workspace.root().join(".aidaemon-runs.db")).await?);
 
+    let project_instructions = ProjectInstructions::discover(workspace.root())?;
     let mut builder = provider(Agent::builder("coding-agent"))
         .model(model)
         .instructions(
@@ -58,7 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Read before editing, make the smallest change that solves the task, \
              and verify with the project's own tests before saying you are done.",
         )
-        .hook(ProjectInstructions::discover(workspace.root())?)
+        .hook(NestedInstructions::for_project(&project_instructions))
+        .hook(project_instructions)
         .hook(ContextWindow::new(120_000))
         // The owner of this example grants full authority; the approval
         // policy asks before destructive actions.

@@ -105,8 +105,9 @@ database.
 All listed policies exist in `aidaemon-policies`. What remains is the
 measurement gate: keep each one only if N-of-M runs show a gain.
 - [ ] Measure each policy on/off with `aidaemon_eval::compare`.
-- [ ] Just-in-time discovery of deeper `AGENTS.md` files (only start-up
-      discovery is ported).
+- [x] Just-in-time discovery of deeper `AGENTS.md` files:
+      `NestedInstructions` reads a call's access manifest. A shell command
+      declares no paths, so it finds nothing.
 - [x] Port the daemon's memory (`aidaemon-memory`): facts with supersession,
       episodes, hybrid scoring, decay/retention, fastembed behind a feature,
       model-driven extraction; store/embedder/scorer are swappable traits.

@@ -12,6 +12,7 @@
 //! | [`Redactor`] | `after_tool` | secret shapes and literal secrets in output |
 //! | [`UntrustedOutput`] | `after_tool` | tool name / prefix configuration |
 //! | [`ProjectInstructions`] | `before_model` | `AGENTS.md` hierarchy on disk |
+//! | [`NestedInstructions`] | `before_tool`, `before_model` | deeper `AGENTS.md` files under a call's access manifest |
 //! | [`ContextWindow`] | `before_model` | estimated request size |
 //! | [`MemoryInjection`] | `before_model` | a [`Recall`] backend |
 //! | [`TracingSink`] | `EventSink` | the event stream |
@@ -58,7 +59,7 @@ pub use conversation::{
 };
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
-pub use instructions::{InstructionSource, ProjectInstructions};
+pub use instructions::{InstructionSource, NestedInstructions, ProjectInstructions};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
 pub use memory::{
     HistoryIntake, InMemoryRecall, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn,
