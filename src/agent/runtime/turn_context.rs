@@ -375,6 +375,7 @@ impl Agent {
                 .or(prev_user.as_deref());
             let mismatch_preflight_drop = request_anchor.is_some_and(|prev| {
                 has_project_scope_divergence_with_aliases(
+                    &*self.execution_backend,
                     prev,
                     &authored_current,
                     &self.path_aliases.projects,
@@ -478,6 +479,7 @@ impl Agent {
         let intent_scope_text = continuation_request_anchor.unwrap_or(&authored_current);
         let mut current_project_scopes = Vec::new();
         extract_explicit_path_scopes_from_text_anchored(
+            &*self.execution_backend,
             intent_scope_text,
             &mut current_project_scopes,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
@@ -489,6 +491,7 @@ impl Agent {
         // scope structurally or receive a grounded semantic project reference.
         let allow_scope_carryover = internal_continuation || followup_mode != FollowupMode::NewTask;
         let mut project_scopes = extract_project_scopes_from_history_anchored(
+            &*self.execution_backend,
             &history,
             intent_scope_text,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
@@ -512,6 +515,7 @@ impl Agent {
             });
             if let Some(anchor) = request_anchor {
                 extract_explicit_path_scopes_from_text_anchored(
+                    &*self.execution_backend,
                     anchor,
                     &mut antecedent_project_scopes,
                     GOAL_CONTEXT_MAX_PROJECT_SCOPES,
@@ -539,7 +543,9 @@ impl Agent {
             resolve_primary_project_scope(
                 unify_current_turn_scopes(&current_project_scopes)
                     .or_else(|| unify_current_turn_scopes(&antecedent_project_scopes))
-                    .or_else(|| choose_primary_project_scope(&project_scopes)),
+                    .or_else(|| {
+                        choose_primary_project_scope(&*self.execution_backend, &project_scopes)
+                    }),
                 self.inherited_project_scope.as_deref(),
                 allow_multi_project_scope,
                 allow_scope_carryover,
@@ -556,6 +562,7 @@ impl Agent {
             };
         let contract_text = continuation_request_anchor.unwrap_or(&goal_user_text);
         let mut completion_contract = infer_structural_completion_contract_anchored(
+            &*self.execution_backend,
             contract_text,
             &self.path_aliases.projects,
             workspace_anchor,
@@ -570,6 +577,7 @@ impl Agent {
                     .map(completion_contract_from_persisted)
                     .unwrap_or_else(|| {
                         infer_structural_completion_contract_anchored(
+                            &*self.execution_backend,
                             &request.text,
                             &self.path_aliases.projects,
                             workspace_anchor,

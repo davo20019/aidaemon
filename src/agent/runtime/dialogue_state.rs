@@ -20,7 +20,11 @@ fn is_courtesy_only(lower: &str) -> bool {
     )
 }
 
-fn infer_open_request_scope(text: &str, alias_roots: &[String]) -> Option<ToolSemanticScope> {
+fn infer_open_request_scope(
+    backend: &dyn crate::execution::ExecutionBackend,
+    text: &str,
+    alias_roots: &[String],
+) -> Option<ToolSemanticScope> {
     if text.trim().is_empty() {
         return None;
     }
@@ -40,7 +44,7 @@ fn infer_open_request_scope(text: &str, alias_roots: &[String]) -> Option<ToolSe
             return Some(ToolSemanticScope::ExternalRemote);
         }
         if crate::tools::fs_utils::resolve_structural_filesystem_reference(
-            &*crate::execution::active_execution_backend(),
+            backend,
             token,
             alias_roots,
         )
@@ -351,6 +355,7 @@ pub(in crate::agent) fn unambiguous_request_antecedent(
 }
 
 fn classify_user_turn(
+    backend: &dyn crate::execution::ExecutionBackend,
     state: &DialogueState,
     text: &str,
     alias_roots: &[String],
@@ -372,7 +377,8 @@ fn classify_user_turn(
                 .mandate_id
                 .as_deref()
                 .is_some_and(|id| !id.is_empty());
-        let separate_scoped_request = infer_open_request_scope(trimmed, alias_roots).is_some();
+        let separate_scoped_request =
+            infer_open_request_scope(backend, trimmed, alias_roots).is_some();
         question.awaiting_user_reply
             && !separate_scoped_request
             && (durable_mandate_input
@@ -434,6 +440,7 @@ fn apply_task_start(state: &mut DialogueState, task_id: &str, started_at: chrono
 }
 
 fn apply_user_message(
+    backend: &dyn crate::execution::ExecutionBackend,
     state: &mut DialogueState,
     message_id: &str,
     text: &str,
@@ -472,7 +479,7 @@ fn apply_user_message(
         .len()
         .saturating_sub(RECENT_USER_MESSAGE_LIMIT);
     state.recent_user_messages.drain(..excess);
-    let turn_kind = classify_user_turn(state, trimmed, alias_roots, observed_at);
+    let turn_kind = classify_user_turn(backend, state, trimmed, alias_roots, observed_at);
     state.last_user_turn = Some(UserTurnSummary {
         message_id: message_id.to_string(),
         kind: turn_kind,
@@ -904,6 +911,7 @@ async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> 
                         continue;
                     }
                     apply_user_message(
+                        &*agent.execution_backend,
                         &mut state,
                         data.message_id.as_deref().unwrap_or_default(),
                         &data.content,
@@ -985,6 +993,7 @@ pub(in crate::agent) async fn record_dialogue_user_message(
     };
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_user_message(
+        &*agent.execution_backend,
         &mut state,
         &message.id,
         &content,
@@ -1102,6 +1111,23 @@ pub(in crate::agent) async fn record_dialogue_task_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply_user_message(
+        state: &mut DialogueState,
+        message_id: &str,
+        text: &str,
+        alias_roots: &[String],
+        observed_at: chrono::DateTime<Utc>,
+    ) {
+        super::apply_user_message(
+            &*crate::execution::active_execution_backend(),
+            state,
+            message_id,
+            text,
+            alias_roots,
+            observed_at,
+        );
+    }
 
     #[tokio::test]
     async fn internal_continuation_does_not_rotate_open_request() {

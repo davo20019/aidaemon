@@ -44,7 +44,6 @@ use sqlx::SqlitePool;
 /// this point.
 pub struct ToolSetup {
     pub tools: Vec<Arc<dyn Tool>>,
-    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_rx: mpsc::Receiver<MediaMessage>,
@@ -73,6 +72,7 @@ pub struct ToolMemoryAccess {
 }
 
 pub struct ToolSetupDependencies {
+    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub state: Arc<dyn StateStore>,
     pub memory: ToolMemoryAccess,
     pub pool: SqlitePool,
@@ -95,6 +95,7 @@ pub async fn setup_tools(
     dependencies: ToolSetupDependencies,
 ) -> anyhow::Result<ToolSetup> {
     let ToolSetupDependencies {
+        execution_backend,
         state,
         memory,
         pool,
@@ -106,7 +107,6 @@ pub async fn setup_tools(
     } = dependencies;
     let BaseToolsBundle {
         mut tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_tx,
@@ -116,6 +116,7 @@ pub async fn setup_tools(
         config,
         config_path.to_path_buf(),
         daemon_paths,
+        execution_backend.clone(),
         state.clone(),
         memory.clone(),
         pool.clone(),
@@ -188,7 +189,6 @@ pub async fn setup_tools(
 
     Ok(ToolSetup {
         tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_rx,
@@ -204,7 +204,6 @@ pub async fn setup_tools(
 
 pub struct BaseToolsBundle {
     pub tools: Vec<Arc<dyn Tool>>,
-    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_tx: mpsc::Sender<MediaMessage>,
@@ -622,6 +621,7 @@ pub async fn build_base_tools(
     config: &AppConfig,
     config_path: PathBuf,
     daemon_paths: crate::tools::DaemonPaths,
+    execution_backend: crate::execution::SharedExecutionBackend,
     state: Arc<dyn StateStore>,
     memory: ToolMemoryAccess,
     pool: SqlitePool,
@@ -629,16 +629,6 @@ pub async fn build_base_tools(
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
 ) -> anyhow::Result<BaseToolsBundle> {
-    let execution_backend = crate::execution::install_execution_backend(
-        crate::execution::build_execution_backend(&config.execution, &config_path).await?,
-    )?;
-    info!(
-        backend = execution_backend.kind().as_str(),
-        backend_id = execution_backend.id(),
-        workspace = execution_backend.workspace_root().as_str(),
-        confined = !execution_backend.allows_outside_workspace(),
-        "Initialized agent execution environment"
-    );
     let checkpoint_manager = crate::checkpoints::install_manager(
         &config.checkpoints,
         pool.clone(),
@@ -691,7 +681,6 @@ pub async fn build_base_tools(
 
     Ok(BaseToolsBundle {
         tools,
-        execution_backend,
         approval_tx,
         approval_rx,
         media_tx,
@@ -1347,6 +1336,7 @@ mod tests {
             &config,
             config_file.path().to_path_buf(),
             crate::tools::DaemonPaths::default(),
+            crate::execution::active_execution_backend(),
             state.clone(),
             ToolMemoryAccess {
                 store: state.memory_stores(),
@@ -1377,7 +1367,7 @@ mod tests {
             llm_runtime,
             None,
             bundle.media_tx.clone(),
-            bundle.execution_backend.clone(),
+            crate::execution::active_execution_backend(),
         )
         .await?;
 
@@ -1702,6 +1692,7 @@ mod tests {
             &config,
             config_file.path().to_path_buf(),
             crate::tools::DaemonPaths::default(),
+            crate::execution::active_execution_backend(),
             state.clone(),
             ToolMemoryAccess {
                 store: state.memory_stores(),

@@ -67,22 +67,21 @@ fn is_likely_filename(token: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(in crate::agent) fn token_looks_like_filesystem_path(token: &str) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(
-        &*crate::execution::active_execution_backend(),
-        token,
-        &[],
-    )
-    .is_some()
+pub(in crate::agent) fn token_looks_like_filesystem_path(
+    backend: &dyn crate::execution::ExecutionBackend,
+    token: &str,
+) -> bool {
+    crate::tools::fs_utils::resolve_structural_filesystem_reference(backend, token, &[]).is_some()
 }
 
 fn token_looks_like_project_scope_path(
+    backend: &dyn crate::execution::ExecutionBackend,
     token: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) -> bool {
     crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
-        &*crate::execution::active_execution_backend(),
+        backend,
         token,
         alias_roots,
         workspace_anchor,
@@ -290,16 +289,22 @@ pub(super) fn normalize_project_scope_path_with_aliases(
     raw_path: &str,
     alias_roots: &[String],
 ) -> Option<String> {
-    normalize_project_scope_path_anchored(raw_path, alias_roots, None)
+    normalize_project_scope_path_anchored(
+        &*crate::execution::active_execution_backend(),
+        raw_path,
+        alias_roots,
+        None,
+    )
 }
 
 fn normalize_project_scope_path_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     raw_path: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) -> Option<String> {
     crate::tools::fs_utils::resolve_project_scope_reference_from(
-        &*crate::execution::active_execution_backend(),
+        backend,
         raw_path,
         alias_roots,
         workspace_anchor,
@@ -315,12 +320,13 @@ pub(super) fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_sc
 }
 
 pub(super) fn extract_project_scopes_from_text(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, None);
+    extract_project_scopes_from_text_inner(backend, text, scopes, max_scopes, alias_roots, None);
 }
 
 /// Extract only explicit filesystem paths (tokens with `~/`, `/`, `./`, etc.)
@@ -328,24 +334,33 @@ pub(super) fn extract_project_scopes_from_text(
 /// is skipped.  Use this for the current user message to avoid false positives
 /// from common English words that happen to match project directory prefixes.
 pub(super) fn extract_explicit_path_scopes_from_text(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, None);
+    extract_project_scopes_from_text_inner(backend, text, scopes, max_scopes, alias_roots, None);
 }
 
 /// [`extract_explicit_path_scopes_from_text`] with relative paths anchored to
 /// the turn's typed workspace instead of the daemon cwd.
 pub(super) fn extract_explicit_path_scopes_from_text_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) {
-    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, workspace_anchor);
+    extract_project_scopes_from_text_inner(
+        backend,
+        text,
+        scopes,
+        max_scopes,
+        alias_roots,
+        workspace_anchor,
+    );
 }
 
 #[cfg(test)]
@@ -353,7 +368,12 @@ pub(super) fn extract_exact_filesystem_resources_from_text(
     text: &str,
     alias_roots: &[String],
 ) -> Vec<String> {
-    extract_exact_filesystem_resources_from_text_anchored(text, alias_roots, None)
+    extract_exact_filesystem_resources_from_text_anchored(
+        &*crate::execution::active_execution_backend(),
+        text,
+        alias_roots,
+        None,
+    )
 }
 
 /// Extract exact filesystem resource identities without promoting a file or
@@ -362,6 +382,7 @@ pub(super) fn extract_exact_filesystem_resources_from_text(
 /// Relative references are anchored to the turn's typed workspace (or the
 /// daemon cwd when the turn has none).
 pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
@@ -369,7 +390,7 @@ pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
     let mut resources = Vec::new();
     for token in structural_filesystem_reference_tokens(text) {
         let Some(path) = crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
-            &*crate::execution::active_execution_backend(),
+            backend,
             &token,
             alias_roots,
             workspace_anchor,
@@ -429,6 +450,7 @@ fn structural_filesystem_reference_tokens(text: &str) -> Vec<String> {
 }
 
 fn extract_project_scopes_from_text_inner(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
@@ -442,8 +464,13 @@ fn extract_project_scopes_from_text_inner(
         if token.is_empty() || token.contains("://") {
             continue;
         }
-        let scope = if token_looks_like_project_scope_path(&token, alias_roots, workspace_anchor) {
-            normalize_project_scope_path_anchored(&token, alias_roots, workspace_anchor)
+        let scope = if token_looks_like_project_scope_path(
+            backend,
+            &token,
+            alias_roots,
+            workspace_anchor,
+        ) {
+            normalize_project_scope_path_anchored(backend, &token, alias_roots, workspace_anchor)
         } else {
             None
         };
@@ -453,23 +480,19 @@ fn extract_project_scopes_from_text_inner(
     }
 }
 
-fn scope_looks_like_project_root(scope: &str) -> bool {
-    let backend = crate::execution::active_execution_backend();
+fn scope_looks_like_project_root(
+    backend: &dyn crate::execution::ExecutionBackend,
+    scope: &str,
+) -> bool {
     if backend.kind() != crate::execution::BackendKind::Local {
-        let Ok(path) = crate::execution::normalize_path_lexically(
-            &*crate::execution::active_execution_backend(),
-            scope,
-        ) else {
+        let Ok(path) = crate::execution::normalize_path_lexically(backend, scope) else {
             return false;
         };
         return std::path::Path::new(path.as_str())
             .starts_with(std::path::Path::new(backend.workspace_root().as_str()));
     }
 
-    let Ok(path) = crate::tools::fs_utils::validate_path(
-        &*crate::execution::active_execution_backend(),
-        scope,
-    ) else {
+    let Ok(path) = crate::tools::fs_utils::validate_path(backend, scope) else {
         return false;
     };
     if !path.is_dir() {
@@ -488,10 +511,13 @@ pub(super) fn drop_inbox_scopes(scopes: &mut Vec<String>, inbox: Option<&Path>) 
     scopes.retain(|scope| !Path::new(scope).starts_with(inbox));
 }
 
-pub(super) fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
+pub(super) fn choose_primary_project_scope(
+    backend: &dyn crate::execution::ExecutionBackend,
+    scopes: &[String],
+) -> Option<String> {
     scopes
         .iter()
-        .find(|scope| scope_looks_like_project_root(scope))
+        .find(|scope| scope_looks_like_project_root(backend, scope))
         .cloned()
         .or_else(|| scopes.first().cloned())
 }
@@ -611,6 +637,7 @@ pub(super) fn extract_project_scopes_from_history(
     alias_roots: &[String],
 ) -> Vec<String> {
     extract_project_scopes_from_history_anchored(
+        &*crate::execution::active_execution_backend(),
         history,
         current_user_text,
         max_scopes,
@@ -624,6 +651,7 @@ pub(super) fn extract_project_scopes_from_history(
 /// user turns, with relative paths anchored to the turn's typed workspace (or
 /// the daemon cwd when the turn has none).
 pub(super) fn extract_project_scopes_from_history_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     history: &[Message],
     current_user_text: &str,
     max_scopes: usize,
@@ -633,6 +661,7 @@ pub(super) fn extract_project_scopes_from_history_anchored(
 ) -> Vec<String> {
     let mut scopes = Vec::new();
     extract_project_scopes_from_text_inner(
+        backend,
         current_user_text,
         &mut scopes,
         max_scopes,
@@ -655,6 +684,7 @@ pub(super) fn extract_project_scopes_from_history_anchored(
             continue;
         };
         extract_project_scopes_from_text_inner(
+            backend,
             content,
             &mut scopes,
             max_scopes,
@@ -669,6 +699,47 @@ pub(super) fn extract_project_scopes_from_history_anchored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
+        super::choose_primary_project_scope(&*crate::execution::active_execution_backend(), scopes)
+    }
+
+    fn token_looks_like_filesystem_path(token: &str) -> bool {
+        super::token_looks_like_filesystem_path(
+            &*crate::execution::active_execution_backend(),
+            token,
+        )
+    }
+
+    fn extract_project_scopes_from_text(
+        text: &str,
+        scopes: &mut Vec<String>,
+        max_scopes: usize,
+        alias_roots: &[String],
+    ) {
+        super::extract_project_scopes_from_text(
+            &*crate::execution::active_execution_backend(),
+            text,
+            scopes,
+            max_scopes,
+            alias_roots,
+        );
+    }
+
+    fn extract_explicit_path_scopes_from_text(
+        text: &str,
+        scopes: &mut Vec<String>,
+        max_scopes: usize,
+        alias_roots: &[String],
+    ) {
+        super::extract_explicit_path_scopes_from_text(
+            &*crate::execution::active_execution_backend(),
+            text,
+            scopes,
+            max_scopes,
+            alias_roots,
+        );
+    }
     use chrono::Utc;
 
     fn msg(role: &str, content: &str) -> Message {

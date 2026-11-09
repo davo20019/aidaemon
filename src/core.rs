@@ -47,6 +47,19 @@ pub async fn run(
         queue_policy.overload_ratio,
     ));
 
+    // The one execution environment of this process. Built here, once, and
+    // passed to everything that needs it: approvals, process handles and file
+    // observations can never be replayed against a different target.
+    let execution_backend =
+        crate::execution::build_execution_backend(&config.execution, &config_path).await?;
+    info!(
+        backend = execution_backend.kind().as_str(),
+        backend_id = execution_backend.id(),
+        workspace = execution_backend.workspace_root().as_str(),
+        confined = !execution_backend.allows_outside_workspace(),
+        "Initialized agent execution environment"
+    );
+
     let stores::StoreBundle {
         embedding_service,
         state,
@@ -55,7 +68,11 @@ pub async fn run(
         event_store,
         plan_store,
         health_store,
-    } = stores::build_stores(&config).await?;
+    } = stores::build_stores(
+        &config,
+        crate::execution::LexicalPaths::of(&*execution_backend),
+    )
+    .await?;
 
     let crate::providers::factory::ProviderRouterBundle {
         provider,
@@ -100,7 +117,6 @@ pub async fn run(
 
     let startup_tools::ToolSetup {
         tools,
-        execution_backend: _execution_backend,
         approval_tx,
         approval_rx,
         media_rx,
@@ -116,6 +132,7 @@ pub async fn run(
         &config_path,
         daemon_paths.clone(),
         startup_tools::ToolSetupDependencies {
+            execution_backend: execution_backend.clone(),
             state: state.clone(),
             memory: startup_tools::ToolMemoryAccess {
                 store: memory_store.clone(),
@@ -188,7 +205,7 @@ pub async fn run(
         specialists_dir.as_deref(),
     ));
 
-    let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config);
+    let sdk_engine = crate::agent::sdk_engine::settings_from_config(&config, &*execution_backend);
 
     #[allow(unused_mut)]
     let mut agent = Agent::new(crate::agent::AgentConstruction {
@@ -203,6 +220,7 @@ pub async fn run(
         system_prompt: base_system_prompt,
         config_path: config_path.clone(),
         daemon_paths,
+        execution_backend: execution_backend.clone(),
         skills_dir: skills_dir.clone().unwrap_or_default(),
         max_depth: config.subagents.max_depth,
         max_iterations: config.subagents.max_iterations,
@@ -310,6 +328,7 @@ pub async fn run(
             oauth_gateway: oauth_gateway.clone(),
             watchdog_stale_threshold_secs,
             goal_token_registry: goal_token_registry.clone(),
+            execution_backend: execution_backend.clone(),
             terminal_tool: terminal_tool.clone(),
         },
     )
@@ -585,7 +604,8 @@ pub async fn run_migrations_only(
     let mut config = config;
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
 
-    let stores::StoreBundle { state, pool, .. } = stores::build_stores(&config).await?;
+    let stores::StoreBundle { state, pool, .. } =
+        stores::build_stores(&config, crate::execution::LexicalPaths::daemon_host()).await?;
     startup_migrations::maybe_run_legacy_system_maintenance_goal_migration(state, pool).await;
 
     Ok(())

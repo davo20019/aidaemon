@@ -617,8 +617,10 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
     let has_structured_target = words.iter().skip(1).any(|word| {
         let token = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
         !token.is_empty()
-            && (token_looks_like_filesystem_path(token)
-                || token.starts_with('-')
+            && (token_looks_like_filesystem_path(
+                &*crate::execution::active_execution_backend(),
+                token,
+            ) || token.starts_with('-')
                 || token.chars().any(|c| c.is_ascii_digit()))
     }) || has_cli_token;
     if !has_structured_target {
@@ -806,14 +808,15 @@ pub(super) fn classify_followup_mode(
 }
 
 pub(super) fn has_project_scope_divergence_with_aliases(
+    backend: &dyn crate::execution::ExecutionBackend,
     prev_user_text: &str,
     current: &str,
     alias_roots: &[String],
 ) -> bool {
     let mut prev_scopes = Vec::new();
     let mut current_scopes = Vec::new();
-    extract_project_scopes_from_text(prev_user_text, &mut prev_scopes, 6, alias_roots);
-    extract_project_scopes_from_text(current, &mut current_scopes, 6, alias_roots);
+    extract_project_scopes_from_text(backend, prev_user_text, &mut prev_scopes, 6, alias_roots);
+    extract_project_scopes_from_text(backend, current, &mut current_scopes, 6, alias_roots);
     if !prev_scopes.is_empty() && !current_scopes.is_empty() {
         return !current_scopes
             .iter()
@@ -839,6 +842,19 @@ fn looks_like_followup_reply(current: &str, prev_assistant: Option<&str>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn has_project_scope_divergence_with_aliases(
+        prev_user_text: &str,
+        current: &str,
+        alias_roots: &[String],
+    ) -> bool {
+        super::has_project_scope_divergence_with_aliases(
+            &*crate::execution::active_execution_backend(),
+            prev_user_text,
+            current,
+            alias_roots,
+        )
+    }
     use proptest::prelude::*;
 
     #[test]

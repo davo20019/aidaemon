@@ -26,7 +26,10 @@ pub struct StoreBundle {
     pub health_store: Option<Arc<HealthProbeStore>>,
 }
 
-pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
+pub async fn build_stores(
+    config: &AppConfig,
+    paths: crate::execution::LexicalPaths,
+) -> anyhow::Result<StoreBundle> {
     let embedding_service = Arc::new(
         EmbeddingService::new().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))?,
     );
@@ -59,7 +62,7 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
         }
     }
 
-    let event_store = Arc::new(EventStore::new(state.pool()).await?);
+    let event_store = Arc::new(EventStore::on_paths(state.pool(), paths).await?);
     info!("Event store initialized");
 
     let plan_store = Arc::new(PlanStore::new(state.pool()).await?);

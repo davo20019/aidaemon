@@ -38,7 +38,7 @@ fn legacy_engine_model_pin_is_dropped_for_a_non_anthropic_provider() {
         "openai_chatgpt",
         "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
     );
-    let settings = settings_from_config(&config);
+    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
     assert_eq!(settings.model_override, None);
 }
 
@@ -48,14 +48,14 @@ fn legacy_engine_model_pin_is_kept_for_an_anthropic_provider() {
         "anthropic",
         "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
     );
-    let settings = settings_from_config(&config);
+    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
     assert_eq!(settings.model_override.as_deref(), Some("claude-haiku-5-5"));
 }
 
 #[test]
 fn engine_model_pin_without_api_key_is_honored() {
     let config = engine_config("openai_chatgpt", "model = \"gpt-6-luna\"");
-    let settings = settings_from_config(&config);
+    let settings = settings_from_config(&config, &*crate::execution::active_execution_backend());
     assert_eq!(settings.model_override.as_deref(), Some("gpt-6-luna"));
 }
 
@@ -1120,7 +1120,11 @@ fn scoped_runs_read_their_own_spilled_results_only() {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        grant_own_spill_reads(&mut call, "specialist:research:synthetic-1");
+        grant_own_spill_reads(
+            &*crate::execution::active_execution_backend(),
+            &mut call,
+            "specialist:research:synthetic-1",
+        );
         access_manifest_scope_check(
             "read_file",
             &call,
@@ -3702,6 +3706,7 @@ fn hook_order_is_pinned() {
     let (calls, _rx) = mpsc::channel(1);
     let hooks = TurnHooks {
         canonical: super::tool_calls::CanonicalCallHook {
+            backend: crate::execution::active_execution_backend(),
             paths: Default::default(),
             tools: Arc::new(Default::default()),
             known_project_dir: Arc::new(std::sync::Mutex::new(None)),
@@ -3836,6 +3841,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        backend: crate::execution::active_execution_backend(),
                         paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: known.clone(),
@@ -3896,6 +3902,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
         tool.as_ref(),
         &dispatched.call.arguments.to_string(),
         &CallScopeFacts {
+            backend: &*crate::execution::active_execution_backend(),
             paths: &crate::tools::DaemonPaths::default(),
             session_id: "telegram:synthetic-user-1",
             task_access: None,
@@ -3930,6 +3937,7 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
         tool.as_ref(),
         &raw.to_string(),
         &CallScopeFacts {
+            backend: &*crate::execution::active_execution_backend(),
             paths: &crate::tools::DaemonPaths::default(),
             session_id: "telegram:synthetic-user-1",
             task_access: None,
@@ -3988,6 +3996,7 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        backend: crate::execution::active_execution_backend(),
                         paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: Arc::new(std::sync::Mutex::new(Some(
@@ -4087,6 +4096,7 @@ async fn judged_terminal_rules(
             .map(|terminal| {
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        backend: crate::execution::active_execution_backend(),
                         paths: Default::default(),
                         tool: tool.clone(),
                         known_project_dir: known,
@@ -4550,6 +4560,7 @@ async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     let known = Arc::new(std::sync::Mutex::new(Some(project_dir.clone())));
     let records = super::tool_calls::CanonicalCalls::default();
     let hook = super::tool_calls::CanonicalCallHook {
+        backend: crate::execution::active_execution_backend(),
         paths: Default::default(),
         tools: Arc::new(
             [(tool.name().to_string(), tool.clone())]
@@ -4676,6 +4687,7 @@ fn guessed_scope_check(
         &ScopeFileTool(tool),
         &args.to_string(),
         &CallScopeFacts {
+            backend: &*crate::execution::active_execution_backend(),
             paths: &crate::tools::DaemonPaths::default(),
             session_id: "synthetic-session",
             task_access: None,

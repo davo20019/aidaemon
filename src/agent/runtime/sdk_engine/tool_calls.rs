@@ -13,6 +13,7 @@ use super::*;
 /// session's directory alone, never another session's or the spill root.
 /// What the controller's filesystem scope check reads besides the call.
 pub(super) struct CallScopeFacts<'a> {
+    pub backend: &'a dyn crate::execution::ExecutionBackend,
     pub session_id: &'a str,
     pub task_access: Option<&'a crate::traits::ToolCallAccessManifest>,
     pub authorized_scopes: &'a [String],
@@ -38,7 +39,7 @@ pub(super) fn call_scope_check(
     manifest.adapter_read_targets = tool
         .adapter_owned_access_manifest(arguments)
         .adapter_read_targets;
-    grant_own_spill_reads(&mut manifest, facts.session_id);
+    grant_own_spill_reads(facts.backend, &mut manifest, facts.session_id);
     // A guess picks where the agent starts; it never refuses the owner. The
     // kernel's approval rules send writes outside it to a card. The terminal
     // keeps its own escalation card.
@@ -60,13 +61,12 @@ pub(super) fn call_scope_check(
 }
 
 pub(super) fn grant_own_spill_reads(
+    backend: &dyn crate::execution::ExecutionBackend,
     manifest: &mut crate::traits::ToolCallAccessManifest,
     session_id: &str,
 ) {
-    let Some(dir) = crate::tools::result_spill::session_spill_dir_for_backend(
-        &*crate::execution::active_execution_backend(),
-        session_id,
-    ) else {
+    let Some(dir) = crate::tools::result_spill::session_spill_dir_for_backend(backend, session_id)
+    else {
         return;
     };
     // macOS temp paths have a `/private` canonical twin; grant both spellings.
@@ -87,6 +87,7 @@ pub(super) fn grant_own_spill_reads(
 
 /// What canonicalizing a call reads from the turn.
 pub(super) struct CanonFacts<'a> {
+    pub backend: &'a dyn crate::execution::ExecutionBackend,
     /// A channel workspace grant scopes the file tools itself: no anchor.
     pub workspace_grant: bool,
     pub known_project_dir: Option<&'a str>,
@@ -129,13 +130,14 @@ pub(super) fn canonicalize_call(
     if !facts.workspace_grant {
         if let Ok(text) = serde_json::to_string(&call.arguments) {
             if let Some(explicit) =
-                crate::agent::tool_execution::project_dir_from_tool_args(name, &text)
+                crate::agent::tool_execution::project_dir_from_tool_args(facts.backend, name, &text)
             {
                 known = Some(explicit.clone());
                 call.explicit_dir = Some(explicit);
             }
             if let Some((updated, injected)) =
                 crate::agent::tool_execution::maybe_inject_project_dir_into_tool_args(
+                    facts.backend,
                     name,
                     &text,
                     known.as_deref(),
@@ -221,6 +223,7 @@ pub(super) struct CanonicalCallHook {
     pub(super) authorized_scopes: Vec<String>,
     pub(super) records: CanonicalCalls,
     pub(super) paths: crate::tools::DaemonPaths,
+    pub(super) backend: crate::execution::SharedExecutionBackend,
 }
 
 #[async_trait]
@@ -246,6 +249,7 @@ impl sdk::Hook for CanonicalCallHook {
             &call.name,
             &call.arguments,
             &CanonFacts {
+                backend: &*self.backend,
                 workspace_grant: self.workspace_grant,
                 known_project_dir: known.as_deref(),
                 task_access: self.task_access.as_ref(),
@@ -445,6 +449,7 @@ pub(super) fn canonicalize_dispatched_call(
                 &request.name,
                 &request.arguments,
                 &CanonFacts {
+                    backend: scope.execution_backend,
                     workspace_grant: scope
                         .channel_ctx
                         .active_workspace_grant(scope.user_role)
@@ -684,6 +689,7 @@ impl Agent {
             tool.as_ref(),
             arguments,
             &CallScopeFacts {
+                backend: &*self.execution_backend,
                 session_id: scope.session_id,
                 task_access: scope.authority.task_access.as_ref(),
                 authorized_scopes: &scope.authorized_scopes,
@@ -1844,6 +1850,7 @@ impl Agent {
         }
         let tracker = scope.instruction_tracker.as_ref()?;
         let targets = crate::agent::tool_execution::project_instruction_targets_for_tool_call(
+            &*self.execution_backend,
             &request.name,
             arguments,
             semantics,
@@ -1854,7 +1861,7 @@ impl Agent {
         let discovered = tracker
             .lock()
             .await
-            .discover_for_targets(crate::execution::active_execution_backend(), &targets)
+            .discover_for_targets(self.execution_backend.clone(), &targets)
             .await;
         let instructions = match discovered {
             Ok(Some(instructions)) => instructions,

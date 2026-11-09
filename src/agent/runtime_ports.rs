@@ -234,6 +234,10 @@ impl ChannelAgentRuntime for Agent {
         self.daemon_paths.is_sensitive(path)
     }
 
+    fn execution_backend(&self) -> crate::execution::SharedExecutionBackend {
+        self.execution_backend.clone()
+    }
+
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

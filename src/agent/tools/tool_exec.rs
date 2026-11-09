@@ -90,6 +90,7 @@ fn sanitize_workspace_tool_outcome(
 }
 
 async fn call_scoped_builtin_file_tool(
+    backend: crate::execution::SharedExecutionBackend,
     name: &str,
     arguments: &str,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -101,19 +102,19 @@ async fn call_scoped_builtin_file_tool(
     // inherit the collaborator allowlist merely by choosing the same name.
     let tool: Box<dyn crate::traits::Tool> = match name {
         "read_file" => Box::new(crate::tools::ReadFileTool::on_backend(
-            crate::execution::active_execution_backend(),
+            backend.clone(),
             paths.clone(),
         )),
         "search_files" => Box::new(crate::tools::SearchFilesTool::on_backend(
-            crate::execution::active_execution_backend(),
+            backend.clone(),
             paths.clone(),
         )),
         "write_file" => Box::new(crate::tools::WriteFileTool::on_backend(
-            crate::execution::active_execution_backend(),
+            backend.clone(),
             paths.clone(),
         )),
         "edit_file" => Box::new(crate::tools::EditFileTool::on_backend(
-            crate::execution::active_execution_backend(),
+            backend.clone(),
             paths.clone(),
         )),
         _ => anyhow::bail!("The workspace grant does not allow this tool."),
@@ -182,6 +183,7 @@ pub(super) struct ToolExecCtx<'a> {
 }
 
 async fn scoped_workspace_arguments(
+    backend: &dyn crate::execution::ExecutionBackend,
     name: &str,
     arguments: &str,
     grant: &WorkspaceGrant,
@@ -193,7 +195,6 @@ async fn scoped_workspace_arguments(
         name
     );
 
-    let backend = crate::execution::active_execution_backend();
     anyhow::ensure!(
         backend.kind() == crate::execution::BackendKind::Local,
         "Tool access denied: collaborator grants require the local execution backend."
@@ -838,7 +839,16 @@ impl Agent {
             .await;
 
         let scoped_args = if let Some(grant) = active_workspace_grant {
-            Some(scoped_workspace_arguments(name, arguments, grant, &self.daemon_paths).await?)
+            Some(
+                scoped_workspace_arguments(
+                    &*self.execution_backend,
+                    name,
+                    arguments,
+                    grant,
+                    &self.daemon_paths,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -885,6 +895,7 @@ impl Agent {
             let mut exec_ctx = call_facts.clone();
             exec_ctx.mandate_preapproved = mandate_preapproved;
             let result = call_scoped_builtin_file_tool(
+                self.execution_backend.clone(),
                 name,
                 &enriched_args,
                 ctx.status_tx.clone(),
@@ -1119,6 +1130,22 @@ mod tool_call_context_tests;
 mod scoped_workspace_tests {
     use super::*;
     use crate::types::WorkspaceAccessLevel;
+
+    async fn scoped_workspace_arguments(
+        name: &str,
+        arguments: &str,
+        grant: &WorkspaceGrant,
+        paths: &crate::tools::DaemonPaths,
+    ) -> anyhow::Result<Value> {
+        super::scoped_workspace_arguments(
+            &*crate::execution::active_execution_backend(),
+            name,
+            arguments,
+            grant,
+            paths,
+        )
+        .await
+    }
 
     fn grant(root: &std::path::Path) -> WorkspaceGrant {
         std::fs::write(root.join("package.json"), r#"{"name":"test-project"}"#).unwrap();

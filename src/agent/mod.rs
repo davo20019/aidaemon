@@ -311,6 +311,8 @@ pub struct Agent {
     config_path: PathBuf,
     /// How paths are classified for this daemon (its own files included).
     daemon_paths: crate::tools::DaemonPaths,
+    /// The process's one execution environment, built once at startup.
+    execution_backend: crate::execution::SharedExecutionBackend,
     skills_dir: PathBuf,
     skill_cache: skills::SkillCache,
     /// Current recursion depth (0 = root agent).
@@ -950,7 +952,7 @@ impl Agent {
             None
         };
 
-        let backend = crate::execution::active_execution_backend();
+        let backend = self.execution_backend.clone();
         let mut execution_user_text = user_text.to_string();
         if backend.kind() != crate::execution::BackendKind::Local {
             for attachment in attachments {

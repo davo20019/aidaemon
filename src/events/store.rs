@@ -17,6 +17,7 @@ use super::{
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, RunAggregate,
     TaskContractCompiledData, TaskEndData, TaskStatus, ToolCallData, ToolResultData,
 };
+use crate::execution::LexicalPaths;
 use crate::traits::{Message, TokenUsage};
 
 #[derive(Debug, Clone)]
@@ -175,6 +176,9 @@ impl TaskReceiptClosure {
 /// The event store backed by SQLite.
 pub struct EventStore {
     pool: SqlitePool,
+    /// How replayed run ledgers compare path targets: the execution backend's
+    /// flavor and bases, fixed for this store's life.
+    paths: LexicalPaths,
 }
 
 enum TaskLifecycleTransition {
@@ -990,8 +994,14 @@ impl EventStore {
 
     /// Create a new EventStore with the given database pool.
     /// This also runs migrations to create/update the events table.
+    #[cfg(test)]
     pub async fn new(pool: SqlitePool) -> anyhow::Result<Self> {
-        let store = Self { pool };
+        Self::on_paths(pool, LexicalPaths::daemon_host()).await
+    }
+
+    /// Open the store for a daemon whose execution backend has these paths.
+    pub async fn on_paths(pool: SqlitePool, paths: LexicalPaths) -> anyhow::Result<Self> {
+        let store = Self { pool, paths };
         store.migrate().await?;
         Ok(store)
     }
@@ -1229,7 +1239,11 @@ impl EventStore {
         .bind(&task_id)
         .fetch_all(&mut *tx)
         .await?;
-        let aggregate = RunAggregate::replay(&task_id, &self.rows_to_events(rows)?);
+        let aggregate = RunAggregate::replay_on_paths(
+            &task_id,
+            &self.rows_to_events(rows)?,
+            self.paths.clone(),
+        );
         let effective_claim = aggregate.effective_operation_claim(claim);
         let admission = aggregate.admit_operation(&effective_claim);
 
@@ -1612,6 +1626,11 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
+    /// The aggregate of a run with no readable history.
+    pub(crate) fn empty_run_aggregate(&self, task_id: &str) -> RunAggregate {
+        RunAggregate::on_paths(task_id, self.paths.clone())
+    }
+
     /// Rebuild the authoritative lifecycle state for one task from its
     /// immutable event history. The aggregate is deliberately a discardable
     /// projection: every caller observes the same obligations and outcome,
@@ -1626,7 +1645,11 @@ impl EventStore {
             .await?;
         self.adopt_continuation_evidence(session_id, task_id, &mut events)
             .await?;
-        Ok(RunAggregate::replay(task_id, &events))
+        Ok(RunAggregate::replay_on_paths(
+            task_id,
+            &events,
+            self.paths.clone(),
+        ))
     }
 
     /// A background continuation child inherits the parent's observation
@@ -2592,7 +2615,7 @@ impl EventStore {
         let aggregate = self
             .task_run_aggregate(session_id, &task_id)
             .await
-            .unwrap_or_else(|_| RunAggregate::new(&task_id));
+            .unwrap_or_else(|_| self.empty_run_aggregate(&task_id));
         let terminal_decision = aggregate.terminal_decision();
         let outcome = match (status, terminal_decision) {
             (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
