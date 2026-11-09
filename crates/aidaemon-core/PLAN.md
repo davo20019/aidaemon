@@ -138,10 +138,11 @@ Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
       first. A crash after the answer is the crash of any running call: the
       delegation re-runs if idempotent and is indeterminate otherwise, so the
       child is not continued.
-- [ ] The daemon does not use this. Its children are `spawn_agent` runs that
-      ask through an in-memory card, and a restart declines pending approvals
-      on purpose (`sdk_engine/recovery.rs`). Durable daemon children need
-      persisted cards, a rebuildable `TurnScope`, and a change to that policy.
+- [x] Owner ruling (2026-11-09): the daemon does not use this and keeps its
+      policy. Its children are `spawn_agent` runs that ask through an
+      in-memory card, and a restart declines pending approvals
+      (`sdk_engine/recovery.rs`), because a stale card arriving hours later
+      is riskier than asking again.
 - [x] Images in messages and tool results (`Image`; Anthropic, OpenAI-compatible, MCP).
 - [x] Reasoning content in messages: `Message::reasoning` keeps each model
       turn's visible reasoning in the transcript; the OpenAI-compatible
@@ -542,8 +543,8 @@ Order:
            commit with both paths (`2a590d0`) and is guarded by a golden file.
            Live on Telegram, save/recall/forget with synthetic data: 3 of 3 on
            the build before the move, 3 of 3 after. The owner's facts and
-           people were unchanged. The six-hourly background pass had not
-           fired on the new build when this was written.
+           people were unchanged. The background consolidation pass ran
+           on the new build and completed.
         Not memory, noted on the way: `memory/context_window.rs` now holds
         only token budgeting, which belongs with the policies crate's
         `ContextWindow`; `memory/skill_promotion.rs` belongs to skills.
