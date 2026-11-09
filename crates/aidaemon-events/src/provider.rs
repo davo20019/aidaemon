@@ -2,6 +2,54 @@ use serde_json::Value;
 
 use crate::conversation::ToolCall;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    /// 401/403 — bad API key or permissions.
+    Auth,
+    /// 402 — billing/quota exhausted.
+    Billing,
+    /// 429 — rate limited; check retry_after_secs.
+    RateLimit,
+    /// A usage quota (a subscription plan's cap, a daily allowance) is used
+    /// up until `resets_at`; waiting seconds does not help.
+    QuotaExhausted,
+    /// 400 — malformed request (e.g. missing thought_signature, invalid schema).
+    BadRequest,
+    /// 404 or "model not found" — bad model name.
+    NotFound,
+    /// 408, request timeout, or provider took too long.
+    Timeout,
+    /// Connection refused, DNS failure, reset, etc.
+    Network,
+    /// 500/502/503/504 — provider-side outage.
+    ServerError,
+    /// Provider returned a malformed success payload.
+    /// Recovery is reason-aware (parse may be transient; shape is often deterministic).
+    MalformedResponse,
+    /// Anything else.
+    Unknown,
+}
+
+impl ProviderErrorKind {
+    /// Provider/account/platform failures that should preserve autonomous work
+    /// for a later retry rather than count as semantic no-progress. Request
+    /// shape and malformed-response failures are deliberately excluded.
+    pub fn is_infrastructure_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Auth
+                | Self::Billing
+                | Self::QuotaExhausted
+                | Self::RateLimit
+                | Self::NotFound
+                | Self::Timeout
+                | Self::Network
+                | Self::ServerError
+        )
+    }
+}
+
 /// Structured response mode requested for a provider call.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[allow(dead_code)]

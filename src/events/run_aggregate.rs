@@ -16,6 +16,7 @@ use super::{
     TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData, TaskStatus, ToolCallData,
     ToolResultData,
 };
+use super::TaskKernelOperationClaim;
 use crate::execution::LexicalPaths;
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
@@ -192,19 +193,6 @@ pub(crate) enum TaskKernelPhase {
     Failed,
     Cancelled,
     Interrupted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TaskKernelOperationClaim {
-    pub operation_id: String,
-    pub stable_operation_key: String,
-    pub tool_name: String,
-    #[serde(default)]
-    pub obligation_ids: Vec<String>,
-    pub max_attempts: usize,
-    pub max_invocations: usize,
-    pub idempotency_key: Option<String>,
-    pub operation_lineage: Option<super::ToolOperationLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
