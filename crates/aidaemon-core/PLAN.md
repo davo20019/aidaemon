@@ -188,9 +188,9 @@ adapters, tested against local mock servers.
 Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5 and 8.7b done; 8.3 mostly done; 8.4
 steps 1-9 of 10; 8.6 done except a child's model tier and recording its
 resolved authority; 8.7's memory port done except the live comparison; 8.8
-providers done, MCP transport moved, channels on the SDK adapters. The rest of
-8.4, 8.8 (MCP and store) and 8.9 move working code between crates and wait for
-a second user of the SDK.
+providers, MCP and channels done, the store mapped (what has a second consumer
+is already in crates). The rest of 8.4 and 8.9 move working code between crates
+and wait for a second user of the SDK.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -502,12 +502,50 @@ Order:
            and port the hints-never-loosen test.
         4. `McpRegistry` holds crate servers.
         5. Delete the daemon client and the dead paths.
-        Steps 1-2 were skipped: the daemon keeps its own tool wrapper and
-        rendering, and only the transport moved (done: `McpClient` wraps
-        `aidaemon_mcp::McpServer`; the dead retry path is deleted).
+        Done (2026-11-09), all five. The crate gained
+        `McpOptions::annotations` (the daemon sets the worst case, so server
+        hints are never read), `normalize_schema`, `McpServerSpec`,
+        `respawn`/`respawn_with_env`, `McpOptions::on_stderr`, `call_raw` and
+        `detached`. The daemon's `McpTool` wraps `aidaemon_mcp::McpTool` and
+        `McpRegistry` holds `McpServer`s; `src/mcp/client.rs` is deleted.
+        What the daemon still owns on purpose: the `{server}__{tool}` name
+        (unsanitized), the text a result renders to (`src/mcp/render.rs`,
+        `isError` is a failed call), the suspicious-pattern logging, the owner
+        approval on `restart`/`enable`, and `opaque_execution`.
+        Differences: a tool whose server sends no object `inputSchema` (the
+        MCP spec requires one) is now offered with an empty object schema, not
+        `parameters: null`. `on_stderr` is not wired: the daemon has not logged
+        server stderr since the transport moved (`c1ba172`).
         Separate fixes, done: `restart` and `enable` ask the owner before
         respawning a stored command; `is_non_delegable_tool` no longer
         relies on an `mcp__` prefix no real name has.
+      - Store map (2026-11-09). The parts with a second consumer are already
+        in crates: the run journal and snapshots (`aidaemon-store-sqlite`,
+        which the daemon opens over its own pool), session erasure
+        (`erase_session_in_tx`) and memory (`aidaemon_memory::sqlite`). Nothing
+        else moves now:
+        - goals, mandates, tasks and work coordination (`goals.rs`,
+          `mandates.rs`, `work.rs`, `notifications.rs`, about 14,200 lines):
+          no crate has these concepts or implements these traits, so a move
+          would only relocate daemon code;
+        - the concrete `EventStore` (6,700 lines): every writer and its
+          payloads are the daemon's. `aidaemon-memory` does read the `events`
+          table, by raw SQL that tolerates its absence, so the shared part is
+          a table contract and not code to move;
+        - `settings` and OAuth: the traits are in `aidaemon-tools`, every
+          user is the daemon;
+        - `conversation_summaries` is the only candidate: the SDK's
+          `SummaryStore` has consumers (`Compactor`, `ConversationCompaction`)
+          and only an in-memory implementation. It does not fit the table:
+          the SDK's `Transcript` source compares
+          `ConversationSummary::fingerprint`, which the table has no column
+          for, so a store over it would discard every SDK summary on load.
+          Adding the column is a schema change on every existing database,
+          and a new versioned migration makes older builds refuse the file
+          (`SchemaTooNew`). Do it when an SDK user needs durable summaries,
+          as a table of its own.
+        All of this keeps table names, columns and rows as they are, so
+        existing databases upgrade with no conversion.
       - Channels map (2026-11-07). Update: the daemon's Telegram, Slack and
         Discord bots now run on the SDK channel adapters, and on the daemon's
         own turn runner (`src/channels/turns.rs`, `57788a2`, `fda3475`,
