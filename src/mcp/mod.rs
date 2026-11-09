@@ -1,4 +1,3 @@
-mod client;
 pub mod registry;
 mod render;
 
@@ -8,7 +7,6 @@ use tracing::info;
 
 use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects};
 
-pub use client::McpClient;
 pub use registry::McpRegistry;
 
 /// A tool proxied from an MCP server: the SDK's tool does the call, the

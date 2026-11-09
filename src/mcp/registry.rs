@@ -1,19 +1,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aidaemon_mcp::{McpError, McpServer, McpServerSpec};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
-use crate::mcp::{McpClient, McpTool};
+use crate::mcp::McpTool;
 use crate::traits::{DynamicMcpServer, MandateAuthority, McpRegistryStore, Tool};
 
 /// A running MCP server entry in the registry.
 pub struct McpServerEntry {
     pub name: String,
     pub config: McpServerConfig,
-    pub client: Arc<McpClient>,
+    pub server: McpServer,
     pub tools: Vec<Arc<dyn Tool>>,
     pub triggers: Vec<String>,
     pub db_id: Option<i64>,
@@ -108,14 +109,40 @@ impl McpRegistry {
     ) -> anyhow::Result<Vec<String>> {
         Self::validate_server_name(name)?;
 
-        // Spawn the MCP client
-        let client =
-            Arc::new(McpClient::spawn(name, &config.command, &config.args, &config.env).await?);
+        // The subprocess environment is scrubbed to the SDK's safe allowlist
+        // plus `config.env` (for example API keys resolved from the
+        // keychain), so no other credential leaks to the server.
+        let spec = McpServerSpec::new(name, &config.command)
+            .with_args(&config.args)
+            .with_env(&config.env)
+            .with_options(crate::mcp::server_options());
+        let server = McpServer::connect(spec)
+            .await
+            .map_err(|error| start_error(name, error))?;
+
+        self.register_server(name, config, server, persist).await
+    }
+
+    /// Record a server that is running: its tools, and its database row
+    /// when `persist` is set.
+    async fn register_server(
+        &self,
+        name: &str,
+        config: McpServerConfig,
+        server: McpServer,
+        persist: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        info!(
+            server = name,
+            protocol = %server.info().protocol_version,
+            tools = server.info().tools.len(),
+            "MCP server connected"
+        );
 
         let mut tool_names = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
-        for tool in client.tools() {
+        for tool in server.mcp_tools() {
             let tool = McpTool::wrap(name, tool);
             tool_names.push(tool.name().to_string());
             tools.push(Arc::new(tool));
@@ -154,7 +181,7 @@ impl McpRegistry {
         let entry = McpServerEntry {
             name: name.to_string(),
             config,
-            client,
+            server,
             tools,
             triggers,
             db_id,
@@ -175,7 +202,7 @@ impl McpRegistry {
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?;
 
         // Shut down the process
-        entry.client.shutdown().await;
+        entry.server.shutdown().await;
 
         // Delete from DB if persisted
         if let Some(id) = entry.db_id {
@@ -238,18 +265,15 @@ impl McpRegistry {
 
     /// Restart an MCP server (re-spawn with fresh env from keychain).
     pub async fn restart_server(&self, name: &str) -> anyhow::Result<Vec<String>> {
-        let (config, db_id) = {
+        let (server, config, db_id) = {
             let servers = self.servers.read().await;
             let entry = servers
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?;
-            (entry.config.clone(), entry.db_id)
+            (entry.server.clone(), entry.config.clone(), entry.db_id)
         };
 
-        // Shut down old instance
-        if let Some(entry) = self.servers.write().await.remove(name) {
-            entry.client.shutdown().await;
-        }
+        self.servers.write().await.remove(name);
 
         // Resolve env from keychain
         let mut resolved_config = config.clone();
@@ -266,8 +290,16 @@ impl McpRegistry {
             }
         }
 
+        // Stop the old process and start it with the fresh environment.
+        let server = server
+            .respawn_with_env(&resolved_config.env)
+            .await
+            .map_err(|error| start_error(name, error))?;
+
         // Re-add (without persisting again since it's already in DB)
-        let tool_names = self.add_server(name, resolved_config, false).await?;
+        let tool_names = self
+            .register_server(name, resolved_config, server, false)
+            .await?;
 
         // Restore the db_id
         if let Some(id) = db_id {
@@ -392,7 +424,7 @@ impl McpRegistry {
         }
 
         if let Some(entry) = self.servers.write().await.remove(name) {
-            entry.client.shutdown().await;
+            entry.server.shutdown().await;
         }
 
         info!(server = name, "Dynamic MCP server disabled");
@@ -419,7 +451,7 @@ impl McpRegistry {
 
         // Replace any stale runtime instance before re-spawning.
         if let Some(entry) = self.servers.write().await.remove(name) {
-            entry.client.shutdown().await;
+            entry.server.shutdown().await;
         }
 
         let tools = self.spawn_dynamic_server_from_record(&dynamic).await?;
@@ -550,7 +582,7 @@ impl McpRegistry {
         let mut servers = self.servers.write().await;
         for (name, entry) in servers.drain() {
             info!(server = %name, "Shutting down MCP server");
-            entry.client.shutdown().await;
+            entry.server.shutdown().await;
         }
     }
 
@@ -628,6 +660,10 @@ impl McpRegistry {
 }
 
 // ==================== Helper functions ====================
+
+fn start_error(name: &str, error: McpError) -> anyhow::Error {
+    anyhow::anyhow!("MCP server '{name}' failed to start: {error}")
+}
 
 fn normalize_server_ref(token: &str) -> String {
     token
