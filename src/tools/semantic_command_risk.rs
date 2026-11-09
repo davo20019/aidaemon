@@ -7,20 +7,17 @@
 //! execution boundary. Invalid, unavailable, or contradictory assessments fail
 //! closed so they can never silently authorize execution.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::events::EventStore;
+use aidaemon_core as sdk;
+
 use crate::execution::SharedExecutionBackend;
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::traits::{ChatOptions, StateStore};
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::types::RiskLevel;
 
-pub(crate) const ASSESSMENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REFERENCED_FILES: usize = 3;
 const MAX_REFERENCED_FILE_CHARS: usize = 8_000;
 
@@ -318,15 +315,14 @@ fn parse_assessment(raw: &str) -> Option<SemanticCommandAssessment> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The model's typed assessment of `command`, asked through the gateway,
+/// which bounds the call by the spec's deadline and records every attempt.
+/// An error, a timeout, an empty reply or one that does not parse is an
+/// `Err`, which the terminal turns into an owner approval.
 pub(crate) async fn assess_command(
-    runtime: &SharedLlmRuntime,
+    gateway: &SideCallGateway,
     command: &str,
     backend: &SharedExecutionBackend,
-    session_id: &str,
-    state: Option<&Arc<dyn StateStore>>,
-    event_store: Option<Arc<EventStore>>,
-    timeout_after: Duration,
 ) -> anyhow::Result<SemanticCommandAssessment> {
     let referenced_files = referenced_file_context(backend, command).await;
     let messages = classifier_messages(
@@ -337,60 +333,20 @@ pub(crate) async fn assess_command(
         backend.allows_outside_workspace(),
         &referenced_files,
     );
-    let snapshot = runtime.snapshot();
-    let options = ChatOptions {
-        response_mode: crate::traits::ResponseMode::JsonSchema {
+    let options = sdk::RequestOptions {
+        response_format: sdk::ResponseFormat::JsonSchema {
             name: "terminal_command_risk".to_string(),
             schema: assessment_schema(),
             strict: true,
         },
-        reasoning_effort_override: Some("low".to_string()),
-        single_attempt_fail_closed: true,
-        ..ChatOptions::default()
+        reasoning_effort: Some("low".to_string()),
+        single_attempt: true,
     };
-    let outcome = snapshot
-        .ask_for_judgment(&messages, &options, timeout_after)
-        .await;
-    if let (Some(state), Some(event_store)) = (state, event_store) {
-        for failure in &outcome.failures {
-            crate::events::record_background_model_call_failure(
-                event_store.clone(),
-                state.as_ref(),
-                session_id,
-                "terminal_command_risk",
-                &failure.model,
-                &failure.error,
-                failure.elapsed,
-            )
-            .await;
-        }
-        if let Some(answer) = &outcome.answer {
-            crate::events::record_background_model_call_telemetry(
-                event_store,
-                state.as_ref(),
-                session_id,
-                "terminal_command_risk",
-                &answer.model,
-                &answer.response,
-                answer.elapsed,
-            )
-            .await;
-        }
-    }
-    let Some(answer) = outcome.answer else {
-        let reason = outcome
-            .failures
-            .last()
-            .map_or("no model available", |failure| failure.error.as_str());
-        anyhow::bail!("semantic command-risk assessment failed: {reason}");
-    };
-    let response = answer.response;
-
-    let raw = response
-        .content
-        .as_deref()
-        .or(response.thinking.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("semantic command-risk assessment returned no content"))?;
+    let answer = gateway
+        .ask(SideCall::CommandRisk, &messages, &options, None)
+        .await
+        .map_err(|error| anyhow::anyhow!("semantic command-risk assessment failed: {error}"))?;
+    let raw = answer.text.as_str();
     parse_assessment(raw).ok_or_else(|| {
         warn!(response = %crate::utils::truncate_str(raw, 500), "Invalid semantic command-risk assessment");
         anyhow::anyhow!("semantic command-risk assessment was invalid")
@@ -399,7 +355,12 @@ pub(crate) async fn assess_command(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::llm_runtime::gateway::test_support::*;
+    use crate::llm_runtime::gateway::SideCallGateway;
+    use crate::llm_runtime::side_calls::SideCall;
 
     fn quota_exhausted() -> crate::providers::ProviderError {
         let mut error = crate::providers::ProviderError::from_status(429, "plan limit");
@@ -410,7 +371,7 @@ mod tests {
     async fn assess_with_primary_error(
         primary_error: crate::providers::ProviderError,
     ) -> (anyhow::Result<SemanticCommandAssessment>, usize) {
-        use crate::llm_runtime::{ModelBackend, ProviderRuntimeTarget};
+        use crate::llm_runtime::ModelBackend;
         use crate::testing::MockProvider;
         let primary: ModelBackend =
             Arc::new(MockProvider::new().with_leading_provider_errors(vec![primary_error]));
@@ -419,28 +380,9 @@ mod tests {
                 r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":[]}"#,
             ),
         ]));
-        let runtime = SharedLlmRuntime::new_with_failovers(
-            primary,
-            None,
-            crate::config::ProviderKind::OpenaiChatgpt,
-            "plan-model".to_string(),
-            vec![ProviderRuntimeTarget::new(
-                failover.clone() as ModelBackend,
-                None,
-                crate::config::ProviderKind::Anthropic,
-                "failover-model".to_string(),
-            )],
-        );
-        let outcome = assess_command(
-            &runtime,
-            "df -h /",
-            &crate::execution::active_execution_backend(),
-            "risk-session",
-            None,
-            None,
-            Duration::from_secs(5),
-        )
-        .await;
+        let (gateway, _) =
+            gateway_with_targets(vec![primary, failover.clone() as ModelBackend]).await;
+        let outcome = assess(&gateway, "df -h /").await;
         let asked = failover.call_log.lock().await.len();
         (outcome, asked)
     }
@@ -464,6 +406,75 @@ mod tests {
         .await;
         assert!(outcome.is_err());
         assert_eq!(asked, 0);
+    }
+
+    async fn assess(
+        gateway: &SideCallGateway,
+        command: &str,
+    ) -> anyhow::Result<SemanticCommandAssessment> {
+        assess_command(
+            gateway,
+            command,
+            &crate::execution::active_execution_backend(),
+        )
+        .await
+    }
+
+    /// What the terminal does with an assessment: a failed one asks the
+    /// owner just as a dangerous one does.
+    fn requires_approval(outcome: &anyhow::Result<SemanticCommandAssessment>) -> bool {
+        outcome
+            .as_ref()
+            .map_or(true, |assessment| assessment.requires_approval)
+    }
+
+    #[tokio::test]
+    async fn an_assessor_that_fails_does_not_lower_the_risk() {
+        let (gateway, events) = gateway_with(provider_failing("503")).await;
+        let assessed = assess(&gateway, "rm -rf build").await;
+        assert!(requires_approval(&assessed));
+        assert!(failed_calls(&events, SideCall::CommandRisk.spec().purpose).await >= 1);
+    }
+
+    #[tokio::test]
+    async fn an_assessor_that_answers_nonsense_does_not_lower_the_risk() {
+        let (gateway, _) = gateway_with(provider_answering("looks fine to me")).await;
+        assert!(requires_approval(&assess(&gateway, "rm -rf build").await));
+    }
+
+    /// An assessor that never answers ends at the spec's deadline and the
+    /// command still asks the owner.
+    #[tokio::test]
+    async fn an_assessor_that_hangs_does_not_lower_the_risk() {
+        let (gateway, events) = gateway_with(provider_hanging()).await;
+        // Virtual time for the wait only: the database pool times out under
+        // virtual time, so real time resumes once the deadline has passed.
+        tokio::time::pause();
+        let deadline = SideCall::CommandRisk.spec().deadline;
+        let (assessed, ()) = tokio::join!(assess(&gateway, "rm -rf build"), async {
+            tokio::time::sleep(deadline).await;
+            tokio::time::resume();
+        });
+        let error = assessed
+            .as_ref()
+            .expect_err("a hung assessor has no answer");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert!(failed_calls(&events, SideCall::CommandRisk.spec().purpose).await >= 1);
+    }
+
+    /// The gateway writes the assessor's row; the assessor writes none of
+    /// its own.
+    #[tokio::test]
+    async fn an_assessment_is_recorded_once() {
+        let (gateway, events) = gateway_with(provider_answering(
+            r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":[]}"#,
+        ))
+        .await;
+        let assessed = assess(&gateway, "df -h /").await.expect("judged");
+        assert!(assessed.observation_only);
+        let purpose = SideCall::CommandRisk.spec().purpose;
+        assert_eq!(ok_calls(&events, purpose).await, 1);
+        assert_eq!(failed_calls(&events, purpose).await, 0);
     }
 
     #[test]

@@ -30,13 +30,12 @@ pub struct SideCallGateway {
 /// A side call's answer.
 #[derive(Debug, Clone)]
 pub struct SideCallAnswer {
-    #[allow(dead_code)] // used from Task 3
     pub text: String,
     /// The model that answered.
-    #[allow(dead_code)] // used from Task 3
+    #[allow(dead_code)] // no caller reads it yet; Task 9 removes it if none does
     pub model: String,
     /// Time from the request to the answer, across every attempt.
-    #[allow(dead_code)] // used from Task 3
+    #[allow(dead_code)] // no caller reads it yet; Task 9 removes it if none does
     pub elapsed: Duration,
 }
 
@@ -175,7 +174,6 @@ impl SideCallGateway {
 
     /// One request, no tools. `model` is required when the spec says
     /// `ModelChoice::CallerSupplied` and ignored otherwise.
-    #[allow(dead_code)] // used from Task 3
     pub async fn ask(
         &self,
         call: SideCall,

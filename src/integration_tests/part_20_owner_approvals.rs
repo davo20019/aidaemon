@@ -947,14 +947,13 @@ fn terminal_run(command: &str) -> crate::traits::ProviderResponse {
 }
 
 /// A real terminal with `allowed` command prefixes and, when `assessments`
-/// is given, a semantic assessor answering with them after `delay` (and
-/// failing closed after `assessment_timeout`). The terminal's own broker
+/// is given, a semantic assessor answering with them after `delay`, called
+/// through a side-call gateway. The terminal's own broker
 /// is closed: a card the tool tried to send itself would fail at once, and
 /// only cards on the agent's (kernel) broker reach the scripted owner.
 struct TerminalSetup {
     allowed: Vec<String>,
     assessments: Option<(Vec<crate::traits::ProviderResponse>, std::time::Duration)>,
-    assessment_timeout: Option<std::time::Duration>,
     mode: crate::types::PermissionMode,
     confinement: crate::types::TerminalConfinement,
 }
@@ -975,7 +974,7 @@ async fn terminal_harness(
     std::mem::forget(pool_file);
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
-    let mut terminal = crate::tools::TerminalTool::new(
+    let terminal = crate::tools::TerminalTool::new(
         crate::execution::active_execution_backend(),
         setup.allowed,
         crate::tools::ApprovalBroker::new(tool_tx),
@@ -986,18 +985,11 @@ async fn terminal_harness(
     )
     .await
     .with_confinement(setup.confinement);
-    if let Some(timeout) = setup.assessment_timeout {
-        terminal = terminal.with_assessment_timeout(timeout);
-    }
     if let Some((responses, delay)) = setup.assessments {
         let delays = vec![delay; responses.len()];
         let assessor = Arc::new(MockProvider::with_delayed_responses(responses, delays));
-        terminal.set_command_risk_runtime(crate::llm_runtime::SharedLlmRuntime::new(
-            assessor,
-            None,
-            crate::config::ProviderKind::OpenaiCompatible,
-            "mock-semantic-risk".to_string(),
-        ));
+        let (gateway, _) = crate::llm_runtime::gateway::test_support::gateway_with(assessor).await;
+        terminal.set_side_calls(gateway);
     }
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(terminal);
     let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
@@ -1016,7 +1008,6 @@ fn no_assessor(allowed: &[&str]) -> TerminalSetup {
     TerminalSetup {
         allowed: allowed.iter().map(|p| p.to_string()).collect(),
         assessments: None,
-        assessment_timeout: None,
         mode: crate::types::PermissionMode::Default,
         confinement: crate::types::TerminalConfinement::Host,
     }
@@ -1155,21 +1146,21 @@ async fn trusted_session_terminal_no_card() {
     assert!(results[0].contains("synthetic-trusted-ok"), "{results:?}");
 }
 
+/// An assessor reply the terminal cannot use is no verdict: the command
+/// asks the owner at the highest risk. (The gateway's own tests cover an
+/// assessor cut off by the deadline.)
 #[tokio::test]
-async fn terminal_semantic_timeout_fails_closed_to_card() {
-    let assessment = MockProvider::text_response(
-        r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Prints a literal"]}"#,
-    );
+async fn terminal_semantic_failure_fails_closed_to_card() {
+    let assessment = MockProvider::text_response("looks fine to me");
     let (harness, approver, _pool) = terminal_harness(
         vec![
-            terminal_run("printf synthetic-slow"),
+            terminal_run("printf synthetic-unjudged"),
             MockProvider::text_response("The owner declined."),
         ],
         vec![Some(crate::types::ApprovalResponse::Deny)],
         TerminalSetup {
             allowed: Vec::new(),
-            assessments: Some((vec![assessment], std::time::Duration::from_secs(5))),
-            assessment_timeout: Some(std::time::Duration::from_millis(100)),
+            assessments: Some((vec![assessment], std::time::Duration::ZERO)),
             mode: crate::types::PermissionMode::Default,
             confinement: crate::types::TerminalConfinement::Host,
         },
@@ -1180,7 +1171,7 @@ async fn terminal_semantic_timeout_fails_closed_to_card() {
     assert_eq!(
         approver.card_count(),
         1,
-        "a slow assessor fails closed to a card"
+        "an unusable assessment fails closed to a card"
     );
     let card = approver.cards.lock().unwrap()[0].clone();
     assert_eq!(
@@ -1190,7 +1181,7 @@ async fn terminal_semantic_timeout_fails_closed_to_card() {
     assert!(
         card.warnings
             .iter()
-            .any(|w| w.contains("failed closed") && w.contains("timed out")),
+            .any(|w| w.contains("failed closed") && w.contains("invalid")),
         "{card:?}"
     );
     let results = tool_results(&harness).await;

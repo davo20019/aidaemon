@@ -22,7 +22,6 @@ use crate::events::{
     DecisionType, DiagnosticSeverity, EventStore, EventType,
 };
 use crate::execution::{BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend};
-use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
     StateStore, Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata,
@@ -938,15 +937,10 @@ pub struct TerminalTool {
     inbox_dir: PathBuf,
     /// Allowed outbox directories for harness-side file delivery validation.
     outbox_dirs: Vec<PathBuf>,
-    /// Configured model runtime used to assess novel shell commands by their
+    /// The gateway novel shell commands are assessed through, by their
     /// complete effects. Deterministic checks remain a non-downgradable safety
     /// floor; invalid/unavailable model assessments fail closed to approval.
-    command_risk_runtime: OnceLock<SharedLlmRuntime>,
-    /// The gateway the semantic risk assessment calls the model through.
-    #[allow(dead_code)] // used from Task 3
     side_calls: OnceLock<crate::llm_runtime::gateway::SideCallGateway>,
-    /// How long the semantic assessment may take before it fails closed.
-    assessment_timeout: Duration,
 }
 
 /// Split a chained command into individual segments by pipe, semicolon, &&, ||.
@@ -3440,9 +3434,7 @@ impl TerminalTool {
             plan_store: OnceLock::new(),
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
-            command_risk_runtime: OnceLock::new(),
             side_calls: OnceLock::new(),
-            assessment_timeout: super::semantic_command_risk::ASSESSMENT_TIMEOUT,
         }
     }
 
@@ -3480,30 +3472,14 @@ impl TerminalTool {
         self
     }
 
-    /// Enable semantic risk assessment for novel terminal commands. This is
-    /// wired after provider startup so model hot-swaps remain visible through
-    /// the shared runtime.
-    pub fn set_command_risk_runtime(&self, runtime: SharedLlmRuntime) {
-        assert!(
-            self.command_risk_runtime.set(runtime).is_ok(),
-            "TerminalTool::set_command_risk_runtime called more than once"
-        );
-    }
-
-    /// The gateway the semantic risk assessment calls the model through.
+    /// Enable semantic risk assessment for novel terminal commands, through
+    /// the side-call gateway. Wired after provider startup; the gateway reads
+    /// the shared runtime, so model hot-swaps stay visible.
     pub fn set_side_calls(&self, side_calls: crate::llm_runtime::gateway::SideCallGateway) {
         assert!(
             self.side_calls.set(side_calls).is_ok(),
             "TerminalTool::set_side_calls called more than once"
         );
-    }
-
-    /// Semantic assessments that fail closed after `timeout` instead of
-    /// fifteen seconds.
-    #[cfg(test)]
-    pub(crate) fn with_assessment_timeout(mut self, timeout: Duration) -> Self {
-        self.assessment_timeout = timeout;
-        self
     }
 
     /// Set channel hub reference for immediate background progress/completion delivery.
@@ -3802,18 +3778,8 @@ impl TerminalTool {
         } else if is_allowed {
             info!(command = %command, "Auto-approved: explicit command grant");
             false
-        } else if let Some(runtime) = self.command_risk_runtime.get() {
-            match assess_command(
-                runtime,
-                command,
-                &self.backend,
-                &trust.session_id,
-                self.state.as_ref(),
-                self.event_store.clone(),
-                self.assessment_timeout,
-            )
-            .await
-            {
+        } else if let Some(side_calls) = self.side_calls.get() {
+            match assess_command(side_calls, command, &self.backend).await {
                 Ok(semantic) => {
                     approval_risk = semantic.risk_level;
                     approval_warnings = semantic.warnings;
@@ -8038,8 +8004,6 @@ impl crate::traits::ToolSemantics for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProviderKind;
-    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::CallWithFacts;
@@ -8068,13 +8032,12 @@ mod tests {
         }
     }
 
-    fn semantic_runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
-        SharedLlmRuntime::new(
-            provider,
-            None,
-            ProviderKind::OpenaiCompatible,
-            "mock-semantic-risk".to_string(),
-        )
+    async fn semantic_gateway(
+        provider: Arc<MockProvider>,
+    ) -> crate::llm_runtime::gateway::SideCallGateway {
+        crate::llm_runtime::gateway::test_support::gateway_with(provider)
+            .await
+            .0
     }
 
     #[test]
@@ -9482,7 +9445,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+        tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let output = tool
             .call_with(
@@ -9530,7 +9493,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+        tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let parent = tempfile::tempdir().expect("parent");
         let root = parent.path().join("synthetic-lone-root");
@@ -9626,7 +9589,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+        tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let parent = tempfile::tempdir().expect("parent");
         let blocker = parent.path().join("blocker");
@@ -9684,7 +9647,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        tool.set_command_risk_runtime(semantic_runtime(provider));
+        tool.set_side_calls(semantic_gateway(provider).await);
 
         let args = serde_json::json!({"action":"run","command":"git push synthetic-remote main"});
         // The kernel's rules get the card from the ladder; the tool never asks.
@@ -10295,7 +10258,7 @@ mod tests {
         )
         .await
         .with_confinement(crate::types::TerminalConfinement::Sandbox);
-        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+        tool.set_side_calls(semantic_gateway(provider.clone()).await);
 
         let outcome = tool
             .call_with_execution_context(

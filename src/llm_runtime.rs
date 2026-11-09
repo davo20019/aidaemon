@@ -92,13 +92,16 @@ fn cheap_first(router: Option<&Router>, mut models: Vec<String>) -> Vec<String> 
 pub(crate) struct JudgmentAnswer {
     pub model: String,
     pub response: crate::traits::ProviderResponse,
+    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
     pub elapsed: std::time::Duration,
 }
 
 /// A model that could not answer a safety judgment.
 pub(crate) struct JudgmentFailure {
+    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
     pub model: String,
     pub error: String,
+    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
     pub elapsed: std::time::Duration,
 }
 
@@ -215,6 +218,7 @@ impl LlmRuntimeSnapshot {
     /// infrastructure failure. A failure tied to this request stops, so the
     /// content being judged cannot pick a different judge. One attempt per
     /// model; the caller fails closed when no answer comes back.
+    #[allow(dead_code)] // its readers moved to the gateway in Task 3; Task 9 narrows or removes it
     pub(crate) async fn ask_for_judgment(
         &self,
         messages: &[serde_json::Value],

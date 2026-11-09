@@ -129,7 +129,6 @@ pub async fn setup_tools(
     .await?;
 
     if let Some(terminal) = &terminal_tool {
-        terminal.set_command_risk_runtime(llm_runtime.clone());
         terminal.set_side_calls(side_calls);
     }
 

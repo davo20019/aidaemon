@@ -7,9 +7,6 @@
 //! a clean verifier, a tool-less model call that sees only the owner's request
 //! and the proposed call, never the content that tainted the run.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use aidaemon_core as sdk;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -18,9 +15,8 @@ use tracing::warn;
 use super::sdk_engine::TurnScope;
 use super::Agent;
 use crate::config::OwnerLevel;
-use crate::events::EventStore;
-use crate::llm_runtime::SharedLlmRuntime;
-use crate::traits::{ChatOptions, ResponseMode, TokenUsageStore};
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::types::{ChannelVisibility, UserRole};
 
 /// `Unrestricted` records egress after untrusted reads; every other level
@@ -138,15 +134,7 @@ pub(in crate::agent) struct VerifierVerdict {
     pub decided: bool,
 }
 
-/// Where the verifier's model call is recorded.
-pub(in crate::agent) struct VerifierTelemetry<'a> {
-    pub event_store: Arc<EventStore>,
-    pub state: &'a dyn TokenUsageStore,
-    pub session_id: &'a str,
-}
-
 const VERIFIER_PURPOSE: &str = "untrusted_call_verifier";
-const VERIFIER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The proposed call's arguments are capped at this many characters.
 const VERIFIER_ARGUMENT_CHARS: usize = 4000;
 /// A value longer than this may be cut; shorter ones always reach the
@@ -330,30 +318,28 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
 }
 
 /// No output cap: thinking counts against it on models that think, and a cut
-/// reply fails closed as a false refusal. `VERIFIER_TIMEOUT` bounds the call.
-fn verifier_options() -> ChatOptions {
-    ChatOptions {
-        response_mode: ResponseMode::JsonSchema {
+/// reply fails closed as a false refusal. The side call's spec bounds the call.
+fn verifier_options() -> sdk::RequestOptions {
+    sdk::RequestOptions {
+        response_format: sdk::ResponseFormat::JsonSchema {
             name: VERIFIER_PURPOSE.to_string(),
             schema: verifier_schema(),
             strict: true,
         },
-        reasoning_effort_override: Some("low".to_string()),
-        single_attempt_fail_closed: true,
-        ..ChatOptions::default()
+        reasoning_effort: Some("low".to_string()),
+        single_attempt: true,
     }
 }
 
 /// Ask a clean model whether performing exactly this call is consistent with
-/// and needed for the owner's request. One tool-less call on the primary
-/// model, moving to the failover providers only while the provider cannot
-/// serve at all. A timeout, a failure tied to this request, an unreadable
+/// and needed for the owner's request. One tool-less side call through the
+/// gateway, which bounds it by the spec's deadline, records every attempt,
+/// and moves to the failover providers only while the provider cannot serve
+/// at all. A timeout, a failure tied to this request, an empty or unreadable
 /// reply, or no provider left is `could not verify` (not consistent). A
 /// cancelled turn stops waiting and the call is refused as `cancelled`.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn verify_untrusted_call(
-    runtime: &SharedLlmRuntime,
-    telemetry: Option<VerifierTelemetry<'_>>,
+    gateway: &SideCallGateway,
     origin_request: &str,
     origin_trusted: bool,
     tool: &str,
@@ -362,10 +348,9 @@ pub(in crate::agent) async fn verify_untrusted_call(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> VerifierVerdict {
     let messages = verifier_messages(origin_request, origin_trusted, tool, description, arguments);
-    let snapshot = runtime.snapshot();
     let options = verifier_options();
     let outcome = tokio::select! {
-        outcome = snapshot.ask_for_judgment(&messages, &options, VERIFIER_TIMEOUT) => outcome,
+        outcome = gateway.ask(SideCall::UntrustedVerifier, &messages, &options, None) => outcome,
         _ = cancel.cancelled() => {
             return VerifierVerdict {
                 consistent: false,
@@ -374,43 +359,13 @@ pub(in crate::agent) async fn verify_untrusted_call(
             };
         }
     };
-    if let Some(telemetry) = &telemetry {
-        for failure in &outcome.failures {
-            crate::events::record_background_model_call_failure(
-                telemetry.event_store.clone(),
-                telemetry.state,
-                telemetry.session_id,
-                VERIFIER_PURPOSE,
-                &failure.model,
-                &failure.error,
-                failure.elapsed,
-            )
-            .await;
-        }
-        if let Some(answer) = &outcome.answer {
-            crate::events::record_background_model_call_telemetry(
-                telemetry.event_store.clone(),
-                telemetry.state,
-                telemetry.session_id,
-                VERIFIER_PURPOSE,
-                &answer.model,
-                &answer.response,
-                answer.elapsed,
-            )
-            .await;
+    match outcome {
+        Ok(answer) => parse_verdict(&answer.text),
+        Err(error) => {
+            warn!(tool, %error, "Untrusted call verifier got no answer");
+            could_not_verify()
         }
     }
-    let Some(answer) = outcome.answer else {
-        warn!(tool, "Untrusted call verifier got no answer");
-        return could_not_verify();
-    };
-    let raw = answer
-        .response
-        .content
-        .as_deref()
-        .or(answer.response.thinking.as_deref())
-        .unwrap_or_default();
-    parse_verdict(raw)
 }
 
 /// Settles the kernel's untrusted-egress interruptions with the verifier:
@@ -448,12 +403,7 @@ impl UntrustedVerifier<'_> {
             .map(|candidate| candidate.description().to_string())
             .unwrap_or_default();
         let verdict = verify_untrusted_call(
-            &self.agent.llm_runtime,
-            Some(VerifierTelemetry {
-                event_store: self.agent.event_store.clone(),
-                state: self.agent.state.as_ref(),
-                session_id: self.scope.session_id,
-            }),
+            &self.agent.side_calls,
             self.origin_request,
             self.origin_trusted,
             tool,
@@ -514,6 +464,9 @@ pub(in crate::agent) const UNTRUSTED_BLOCKED: &str = "[UNTRUSTED BLOCKED]";
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
 
     fn quota_exhausted() -> crate::providers::ProviderError {
@@ -550,8 +503,7 @@ mod tests {
             crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
         );
         let verdict = verify_untrusted_call(
-            &harness.agent.llm_runtime,
-            None,
+            &harness.agent.side_calls,
             "Send Jordan Lee the summary.",
             true,
             "send_probe",
@@ -647,8 +599,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let verdict = verify_untrusted_call(
-            &harness.agent.llm_runtime,
-            None,
+            &harness.agent.side_calls,
             "Send Jordan Lee the summary.",
             true,
             "send_probe",
@@ -671,9 +622,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verifier_sets_no_output_cap() {
-        assert_eq!(verifier_options().max_tokens_override, None);
+    fn proposed_call() -> Value {
+        json!({"to": "alice.rivera@example.invalid", "body": "The quarterly report."})
+    }
+
+    async fn verify(gateway: &SideCallGateway, request: &str) -> VerifierVerdict {
+        verify_untrusted_call(
+            gateway,
+            request,
+            true,
+            "send_probe",
+            "Sends a synthetic message.",
+            &proposed_call(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_fails_refuses_the_call() {
+        use crate::llm_runtime::gateway::test_support::*;
+        let (gateway, events) = gateway_with(provider_failing("503")).await;
+        let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+        assert!(!verdict.consistent);
+        assert_eq!(verdict, could_not_verify());
+        assert!(failed_calls(&events, SideCall::UntrustedVerifier.spec().purpose).await >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_answers_nonsense_refuses_the_call() {
+        use crate::llm_runtime::gateway::test_support::*;
+        for reply in ["", "sure, go ahead", "{\"consistent\": "] {
+            let (gateway, _) = gateway_with(provider_answering(reply)).await;
+            let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+            assert!(!verdict.consistent, "reply {reply:?} must refuse");
+            assert_eq!(verdict, could_not_verify(), "reply {reply:?}");
+        }
+    }
+
+    /// The gateway writes the verifier's row; the verifier writes none of
+    /// its own.
+    #[tokio::test]
+    async fn a_verifier_answer_is_recorded_once() {
+        use crate::llm_runtime::gateway::test_support::*;
+        let (gateway, events) = gateway_with(provider_answering(
+            r#"{"consistent":true,"reason":"asked"}"#,
+        ))
+        .await;
+        let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+        assert!(verdict.consistent && verdict.decided, "{verdict:?}");
+        let purpose = SideCall::UntrustedVerifier.spec().purpose;
+        assert_eq!(ok_calls(&events, purpose).await, 1);
+        assert_eq!(failed_calls(&events, purpose).await, 0);
+    }
+
+    #[tokio::test]
+    async fn verifier_sets_no_output_cap() {
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([]).then_repeat(
+                aidaemon_core::testing::text(r#"{"consistent":true,"reason":"asked"}"#),
+            ),
+        );
+        let (gateway, _) =
+            crate::llm_runtime::gateway::test_support::gateway_with(scripted.clone()).await;
+        verify(&gateway, "send the report to Alice Rivera").await;
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].max_output_tokens, None);
     }
 
     fn owner_private<'a>(projected: &'a [String], tainted: Option<&'a [String]>) -> TaintFacts<'a> {
