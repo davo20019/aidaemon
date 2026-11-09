@@ -121,9 +121,11 @@ Where to look first:
 - `src/traits.rs` is a thin re-export layer. The actual trait definitions live
   under `src/traits/`.
 - `src/state/sqlite/` is the SQLite persistence implementation, split by domain:
-  facts, messages, goals, people, skills, dynamic bots/agents/MCP, OAuth,
-  settings, prompt snapshots, notifications, token usage, and migrations.
-- `src/events/` stores immutable activity events and event-derived context.
+  messages, skills, dynamic bots/agents/MCP, OAuth, settings, prompt snapshots,
+  and migrations. Goals, mandates, tasks, work coordination and notifications
+  are in `crates/aidaemon-work`; memory is in `aidaemon_memory::sqlite`.
+- `crates/aidaemon-events` holds the event store, payloads and run aggregate.
+  `src/events/` keeps the daemon's host adapter and consolidation.
 - `src/memory/` handles embeddings, retrieval/scoring, retention, procedures,
   people intelligence, task learning, proactive memory, and background
   consolidation.
