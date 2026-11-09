@@ -23,10 +23,14 @@ mod recall;
 #[cfg(test)]
 mod swap_tests;
 mod system_memory;
+mod tool_facts;
 mod writer;
 pub(crate) use recall::DaemonRecall;
 #[cfg_attr(not(feature = "sdk-memory"), allow(unused_imports))]
 pub(crate) use system_memory::SystemMemory;
+pub(in crate::agent) use tool_facts::{
+    memory_tool_facts, modeled_memory_tools, register_memory_system_tool,
+};
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin

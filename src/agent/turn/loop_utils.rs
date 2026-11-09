@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::borrow::Cow;
 use tracing::warn;
 
-pub(super) fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
+pub(in crate::agent) fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
     crate::traits::extract_primary_message_content(raw, &[])
 }
 
@@ -388,39 +388,6 @@ fn is_external_data_tool(tool_name: &str) -> bool {
     matches!(tool_name, "web_fetch" | "http_request")
 }
 
-fn manage_memories_read_output_is_report(result_text: &str, tool_arguments: Option<&str>) -> bool {
-    let action = tool_arguments
-        .and_then(|args| serde_json::from_str::<Value>(args).ok())
-        .and_then(|args| {
-            args.get("action")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    if !matches!(
-        action.as_deref(),
-        Some(
-            "list"
-                | "health"
-                | "search"
-                | "search_episodes"
-                | "list_goals"
-                | "list_scheduled"
-                | "list_scheduled_matching"
-                | "diagnose_scheduled"
-        )
-    ) {
-        return false;
-    }
-
-    let cleaned = strip_appended_diagnostics(result_text);
-    let trimmed = cleaned.trim_start();
-    !trimmed.starts_with("ERROR:")
-        && !trimmed.starts_with("Error:")
-        && !trimmed.starts_with("Failed to ")
-        && !trimmed.starts_with("Request blocked:")
-        && !trimmed.starts_with("Blocked:")
-}
-
 fn successful_management_output_is_structural(
     tool_name: &str,
     result_text: &str,
@@ -565,8 +532,9 @@ pub(super) fn classify_tool_result_failure_with_args(
     if successful_management_output_is_structural(tool_name, result_text, tool_arguments) {
         return None;
     }
-    if tool_name == "manage_memories"
-        && manage_memories_read_output_is_report(result_text, tool_arguments)
+    if crate::agent::memory_plugin::memory_tool_facts(tool_name)
+        .and_then(|facts| facts.output_is_report)
+        .is_some_and(|is_report| is_report(result_text, tool_arguments))
     {
         return None;
     }

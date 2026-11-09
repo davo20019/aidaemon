@@ -90,6 +90,11 @@ async fn a_memory_system_of_another_shape_runs_a_whole_turn() {
         .unwrap();
 
     assert_eq!(*journal.lock().unwrap(), ["synthetic entry"]);
+    let facts = super::memory_tool_facts("journal_note").expect("described by the turn");
+    assert_eq!(
+        facts.scope,
+        Some(crate::traits::ToolSemanticScope::UserMemory)
+    );
 
     let calls = harness.provider.call_log.lock().await;
     let first = calls.first().expect("the model was called");

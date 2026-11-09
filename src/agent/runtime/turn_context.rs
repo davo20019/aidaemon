@@ -173,15 +173,9 @@ fn is_low_signal_http_metadata_line(line: &str) -> bool {
 }
 
 fn is_low_info_recent_tool_context(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "write_file"
-            | "edit_file"
-            | "manage_memories"
-            | "manage_people"
-            | "remember_fact"
-            | "check_environment"
-    )
+    matches!(tool_name, "write_file" | "edit_file" | "check_environment")
+        || crate::agent::memory_plugin::memory_tool_facts(tool_name)
+            .is_some_and(|facts| facts.low_signal_result)
 }
 
 fn is_low_signal_tool_context_line(line: &str) -> bool {

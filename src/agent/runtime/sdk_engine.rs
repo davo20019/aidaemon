@@ -1094,6 +1094,10 @@ impl Agent {
         memory_hooks.extend(memory.hooks);
         if user_role != UserRole::Public {
             for tool in memory.tools {
+                crate::agent::memory_plugin::register_memory_system_tool(
+                    &tool.spec().name,
+                    tool.annotations().read_only,
+                );
                 builder = builder.tool_arc(tool);
             }
         }

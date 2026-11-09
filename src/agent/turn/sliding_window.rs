@@ -75,14 +75,23 @@ fn extract_args_summary(tool_name: &str, args_json: &str) -> String {
             .map(|q| format!("'{}'", q))
             .unwrap_or_default(),
 
-        "remember_fact" | "manage_memories" | "search_history" => parsed
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "search_history" => action_field(&parsed),
+        name if crate::agent::memory_plugin::memory_tool_facts(name)
+            .is_some_and(|facts| facts.summary_from_action) =>
+        {
+            action_field(&parsed)
+        }
 
         _ => first_string_value(&parsed),
     }
+}
+
+fn action_field(parsed: &Value) -> String {
+    parsed
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Extract the file path from tool arguments, checking common field names.
@@ -118,7 +127,12 @@ fn extract_outcome(tool_name: &str, result: &str) -> String {
         // answer. Keeping a bounded excerpt is essential for a subsequent
         // source question; replacing it with merely "completed" discards the
         // very provenance the user is asking to inspect.
-        "manage_memories" | "search_history" | "web_search" => truncate_str(result, 1_200),
+        "search_history" | "web_search" => truncate_str(result, 1_200),
+        name if crate::agent::memory_plugin::memory_tool_facts(name)
+            .is_some_and(|facts| facts.keep_result_excerpt) =>
+        {
+            truncate_str(result, 1_200)
+        }
         _ => "completed".to_string(),
     }
 }

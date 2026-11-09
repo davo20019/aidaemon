@@ -15,6 +15,9 @@ const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
 const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
 
 pub(in crate::agent) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
+    if let Some(facts) = crate::agent::memory_plugin::memory_tool_facts(tool_name) {
+        return facts.scope;
+    }
     match tool_name {
         "web_search" | "web_fetch" | "http_request" | "browser" => {
             Some(ToolSemanticScope::ExternalRemote)
@@ -22,7 +25,6 @@ pub(in crate::agent) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<
         "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
         | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
         "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
-        "remember_fact" | "manage_memories" | "share_memory" => Some(ToolSemanticScope::UserMemory),
         "scheduled_goals"
         | "scheduled_goal_runs"
         | "manage_goal_tasks"

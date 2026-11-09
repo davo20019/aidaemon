@@ -394,15 +394,9 @@ fn build_empty_response_retry_messages(existing: &[Value], user_text: &str) -> V
 }
 
 fn tool_is_low_info_for_checkpoint(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "write_file"
-            | "edit_file"
-            | "manage_memories"
-            | "manage_people"
-            | "remember_fact"
-            | "check_environment"
-    )
+    matches!(tool_name, "write_file" | "edit_file" | "check_environment")
+        || crate::agent::memory_plugin::memory_tool_facts(tool_name)
+            .is_some_and(|facts| facts.low_signal_result)
 }
 
 fn build_execution_checkpoint_message(

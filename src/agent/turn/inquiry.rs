@@ -12,7 +12,7 @@ use crate::traits::{
     ToolEvidenceCapability, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
 };
 
-fn capability(
+pub(in crate::agent) fn capability(
     scope: ToolSemanticScope,
     purposes: &[EvidencePurpose],
     authority: EvidenceAuthority,
@@ -21,7 +21,7 @@ fn capability(
     ToolEvidenceCapability::new(scope, purposes, authority, temporal_scope)
 }
 
-fn action_from_arguments(arguments: &str) -> Option<String> {
+pub(in crate::agent) fn action_from_arguments(arguments: &str) -> Option<String> {
     string_argument(arguments, "action")
 }
 
@@ -48,8 +48,12 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
     };
     use EvidenceTemporalScope::{Both, Current, Historical};
     use ToolSemanticScope::{
-        ConversationHistory, ExternalRemote, GoalState, HostLocal, LocalWorkspace, UserMemory,
+        ConversationHistory, ExternalRemote, GoalState, HostLocal, LocalWorkspace,
     };
+
+    if let Some(facts) = crate::agent::memory_plugin::memory_tool_facts(tool_name) {
+        return (facts.evidence)(arguments);
+    }
 
     match tool_name {
         "goal_trace" | "tool_trace" => {
@@ -141,52 +145,6 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
             Canonical,
             Historical,
         )],
-        "manage_memories" => match action_from_arguments(arguments).as_deref() {
-            Some("list_goals" | "list_scheduled" | "list_scheduled_matching") => vec![capability(
-                GoalState,
-                &[CurrentState, Content],
-                Canonical,
-                Current,
-            )],
-            Some("diagnose_scheduled") => vec![capability(
-                GoalState,
-                &[
-                    CurrentState,
-                    HistoricalRecord,
-                    Outcome,
-                    CausalExplanation,
-                    Content,
-                ],
-                Canonical,
-                Both,
-            )],
-            Some("search_episodes") => vec![capability(
-                UserMemory,
-                &[HistoricalRecord, Content, Attribution],
-                Advisory,
-                Historical,
-            )],
-            Some("list" | "search") | None => vec![capability(
-                UserMemory,
-                &[CurrentState, HistoricalRecord, Content, Attribution],
-                // This operation reads the canonical persisted memory ledger.
-                // The stored claim may itself be user-supplied, but whether it
-                // exists (or does not exist) is an authoritative store fact.
-                // A current lookup can return claims about either current or
-                // historical subjects; the receipt separately timestamps the
-                // lookup itself.
-                Canonical,
-                Both,
-            )],
-            _ => Vec::new(),
-        },
-        "manage_people" => vec![capability(
-            UserMemory,
-            &[CurrentState, HistoricalRecord, Content, Attribution],
-            Canonical,
-            Both,
-        )],
-        "remember_fact" | "share_memory" => Vec::new(),
         "http_request" | "web_fetch" | "browser" => vec![capability(
             ExternalRemote,
             &[CurrentState, Content, Outcome],
@@ -320,14 +278,12 @@ fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> 
             r#"{"action":"get","mandate_id":"candidate","section":"history"}"#,
             r#"{"action":"list_intentions","mandate_id":"candidate"}"#,
         ],
-        "manage_memories" => &[
-            r#"{"action":"search"}"#,
-            r#"{"action":"search_episodes"}"#,
-            r#"{"action":"list_goals"}"#,
-            r#"{"action":"diagnose_scheduled"}"#,
-        ],
         _ => &["{}"],
     };
+    let facts = crate::agent::memory_plugin::memory_tool_facts(tool_name);
+    let representative_calls = facts
+        .as_ref()
+        .map_or(representative_calls, |facts| facts.representative_calls);
     let mut capabilities = Vec::new();
     for arguments in representative_calls {
         for capability in evidence_capabilities_for_tool_call(tool_name, arguments) {
@@ -390,8 +346,6 @@ pub(in crate::agent) fn requirement_has_builtin_evidence_route(
         "manage_goal_tasks",
         "scheduled_goal_runs",
         "search_history",
-        "manage_memories",
-        "manage_people",
         "http_request",
         "read_node_health",
         "send_node_audio",
@@ -403,11 +357,16 @@ pub(in crate::agent) fn requirement_has_builtin_evidence_route(
         "system_info",
         "self_diagnose",
     ];
-    EVIDENCE_MODELED_TOOLS.iter().any(|tool_name| {
-        static_evidence_capabilities(tool_name)
-            .iter()
-            .any(|capability| capability_supports_requirement(capability, requirement))
-    })
+    let memory_tools = crate::agent::memory_plugin::modeled_memory_tools();
+    EVIDENCE_MODELED_TOOLS
+        .iter()
+        .copied()
+        .chain(memory_tools.iter().map(String::as_str))
+        .any(|tool_name| {
+            static_evidence_capabilities(tool_name)
+                .iter()
+                .any(|capability| capability_supports_requirement(capability, requirement))
+        })
 }
 
 pub(in crate::agent) fn candidate_tools_for_requirements<'a>(
