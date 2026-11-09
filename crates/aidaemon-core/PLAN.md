@@ -353,10 +353,14 @@ Order:
       Stay in the tools on purpose: each redirect hop (it exists only once
       the request runs), the first-request check in `web_fetch` and
       `http_request` (their effects are unknown on an unparsable URL), and
-      the per-entry checks of `search_files`'s collaboration walk. The
-      browser's `render_pdf` source check is still in the tool.
-      The in-tool approvals are done (8.1). Scope is judged by `DispatchGate`
-      already. Left: an allowlist for `cli_agent` arguments.
+      the per-entry checks of `search_files`'s collaboration walk.
+      Done 2026-11-08: the browser's `render_pdf` source goes through the
+      guard (`FileGuard::SensitiveReads`), and stored CLI agents launch only
+      with arguments listed for their program (`known_launch_arguments`);
+      the defaults no longer list bypass flags. An agent in the owner's
+      `config.toml`, or a program with no list, is held to the bypass flags
+      alone. The in-tool approvals are done (8.1). Scope is judged by
+      `DispatchGate` already.
 - [ ] 8.6 Authority Phase 3d: children assembled on request through
       `AgentBuilder`. Done 2026-11-07: declines move both ways between
       parent and child runs. `c98314c`: kernel `SharedDeclines`, attached

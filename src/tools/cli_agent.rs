@@ -674,54 +674,32 @@ async fn list_backend_files(
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
-/// Any auto-approve flags listed here are stripped at launch
-/// (`strip_permission_bypass_flags`), so descriptions must not promise that mode.
 fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>
 {
     vec![
         (
             "claude",
             "claude",
-            vec![
-                "-p",
-                "--dangerously-skip-permissions",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-            ],
+            vec!["-p", "--output-format", "stream-json", "--verbose"],
             "Claude Code — Anthropic's AI coding agent",
         ),
         (
             "gemini",
             "gemini",
-            vec![
-                "--sandbox=false",
-                "--yolo",
-                "--output-format",
-                "stream-json",
-            ],
+            vec!["--output-format", "stream-json"],
             "Gemini CLI — Google's AI coding agent",
         ),
         (
             "codex",
             "codex",
-            vec![
-                "exec",
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-            ],
+            vec!["exec", "--json"],
             "Codex CLI — OpenAI's AI coding agent",
         ),
-        (
-            "copilot",
-            "copilot",
-            vec!["-p", "--allow-all-tools", "--allow-all-paths"],
-            "GitHub Copilot CLI",
-        ),
+        ("copilot", "copilot", vec!["-p"], "GitHub Copilot CLI"),
         (
             "aider",
             "aider",
-            vec!["--yes", "--message"],
+            vec!["--message"],
             "Aider — AI pair programming",
         ),
     ]
@@ -873,6 +851,108 @@ fn without_permission_bypass(args: &[String], agent: &str) -> Vec<String> {
         index += 1;
     }
     out
+}
+
+/// The arguments a stored agent may launch with. Options that can change what
+/// an agent is allowed to do (`codex -c`, `--permission-mode`, `--add-dir`)
+/// are deliberately absent.
+struct LaunchArguments {
+    flags: &'static [&'static str],
+    /// Options followed by a value.
+    valued: &'static [&'static str],
+    subcommands: &'static [&'static str],
+}
+
+fn known_launch_arguments(agent: &str) -> Option<LaunchArguments> {
+    let arguments = match agent.to_ascii_lowercase().as_str() {
+        "claude" => LaunchArguments {
+            flags: &["-p", "--print", "--verbose", "--include-partial-messages"],
+            valued: &[
+                "--output-format",
+                "--model",
+                "--fallback-model",
+                "--max-turns",
+                "--append-system-prompt",
+                "--system-prompt",
+            ],
+            subcommands: &[],
+        },
+        "codex" => LaunchArguments {
+            flags: &["--json", "--skip-git-repo-check", "--ephemeral"],
+            valued: &["--model", "-m", "--color"],
+            subcommands: &["exec"],
+        },
+        "gemini" => LaunchArguments {
+            flags: &["--debug", "-d"],
+            valued: &["--output-format", "-o", "--model", "-m"],
+            subcommands: &[],
+        },
+        "copilot" => LaunchArguments {
+            flags: &["-p", "--silent", "-s"],
+            valued: &["--model"],
+            subcommands: &[],
+        },
+        "aider" => LaunchArguments {
+            flags: &[
+                "--message",
+                "--no-auto-commits",
+                "--no-git",
+                "--no-pretty",
+                "--no-stream",
+                "--no-check-update",
+            ],
+            valued: &["--model"],
+            subcommands: &[],
+        },
+        _ => return None,
+    };
+    Some(arguments)
+}
+
+/// The program a launch really runs: the one `env` wraps, else the command,
+/// else the tool's own name.
+fn launched_agent<'a>(command: &'a str, args: &'a [String], tool_name: &'a str) -> &'a str {
+    let basename = |path: &'a str| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+    };
+    let program = if is_env_launcher(command) {
+        env_wrapped_program_index(args).and_then(|index| basename(&args[index]))
+    } else {
+        basename(command)
+    };
+    program.unwrap_or(tool_name)
+}
+
+/// The first argument of a stored agent's launch that is not on its list, if
+/// any. An agent this daemon has no list for is judged by the bypass flags
+/// alone. `args` are the agent's own, after any `env` wrapper.
+fn unlisted_launch_argument(agent: &str, args: &[String]) -> Option<String> {
+    let allowed = known_launch_arguments(agent)?;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        index += 1;
+        if !arg.starts_with('-') {
+            if !allowed.subcommands.contains(&arg) {
+                return Some(arg.to_string());
+            }
+            continue;
+        }
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (arg, false),
+        };
+        if allowed.valued.contains(&name) {
+            if !inline_value {
+                index += 1;
+            }
+        } else if inline_value || !allowed.flags.contains(&name) {
+            return Some(arg.to_string());
+        }
+    }
+    None
 }
 
 /// Remove auto-approve flags from a launch argument list. `agent` is the
@@ -2184,7 +2264,7 @@ impl CliAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
-        let (mut command, mut args, timeout, max_output) = {
+        let (mut command, mut args, timeout, max_output, is_dynamic) = {
             let tools = self.tools.read().unwrap();
             let entry = tools
                 .get(tool_name)
@@ -2194,6 +2274,7 @@ impl CliAgentTool {
                 entry.args.clone(),
                 entry.timeout,
                 entry.max_output_chars,
+                entry.is_dynamic,
             )
         };
 
@@ -2271,6 +2352,22 @@ impl CliAgentTool {
         };
         if strip_permission_bypass_flags(&mut args, agent_kind).is_err() {
             return Ok("Blocked: CLI delegation was not started because its permission-bypass flags could not be removed.".to_string());
+        }
+        if is_dynamic {
+            let agent = launched_agent(&command, &args, tool_name);
+            let own_args = if is_env_launcher(&command) {
+                env_wrapped_program_index(&args).map_or(0, |index| index + 1)
+            } else {
+                0
+            };
+            if let Some(unlisted) = unlisted_launch_argument(agent, &args[own_args..]) {
+                return Ok(format!(
+                    "Blocked: CLI delegation was not started because the stored agent \
+                     '{tool_name}' launches with `{unlisted}`, which is not on the list of \
+                     arguments allowed for {agent}. Remove it with manage_cli_agents, or the \
+                     owner can define this agent under [cli_agents.tools] in config.toml."
+                ));
+            }
         }
 
         let canonical_working_dir = match working_dir {
@@ -4899,8 +4996,7 @@ mod tests {
     use super::*;
     use crate::traits::ToolSemantics;
 
-    /// The bypass flags in the defaults are stripped at launch, so the
-    /// model-facing descriptions must not promise an auto-approve mode.
+    /// The model-facing descriptions must not promise an auto-approve mode.
     #[test]
     fn default_descriptions_do_not_claim_auto_approve() {
         for (name, _, _, description) in default_tool_definitions() {
@@ -5270,6 +5366,112 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic run tests
     // -----------------------------------------------------------------------
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn every_default_launch_is_on_its_list() {
+        for (name, command, args, _) in default_tool_definitions() {
+            assert_eq!(
+                unlisted_launch_argument(command, &strings(&args)),
+                None,
+                "{name}"
+            );
+            assert!(without_permission_bypass(&strings(&args), name).len() == args.len());
+        }
+    }
+
+    #[test]
+    fn a_stored_agent_cannot_widen_what_it_may_do() {
+        for (agent, args) in [
+            (
+                "codex",
+                vec!["exec", "-c", "sandbox_mode=danger-full-access"],
+            ),
+            ("codex", vec!["exec", "--config=approval_policy=never"]),
+            ("codex", vec!["--profile", "unsafe"]),
+            ("claude", vec!["-p", "--permission-mode", "acceptEdits"]),
+            ("claude", vec!["--add-dir", "/synthetic/elsewhere"]),
+            ("claude", vec!["--verbose=true"]),
+            ("gemini", vec!["--approval-mode", "auto_edit"]),
+            ("aider", vec!["--auto-commits"]),
+            ("codex", vec!["sandbox"]),
+        ] {
+            assert!(
+                unlisted_launch_argument(agent, &strings(&args)).is_some(),
+                "{agent} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_values_are_not_read_as_arguments() {
+        let args = strings(&["exec", "--model", "-c", "--json"]);
+        assert_eq!(unlisted_launch_argument("codex", &args), None);
+        let args = strings(&["--model=synthetic", "-p"]);
+        assert_eq!(unlisted_launch_argument("Claude", &args), None);
+    }
+
+    #[test]
+    fn an_agent_without_a_list_is_not_judged() {
+        let args = strings(&["--anything", "goes"]);
+        assert_eq!(unlisted_launch_argument("opaque-agent", &args), None);
+    }
+
+    #[test]
+    fn the_launched_program_is_found_through_env() {
+        let args = strings(&["FOO=1", "/opt/bin/codex", "exec"]);
+        assert_eq!(launched_agent("/usr/bin/env", &args, "my-tool"), "codex");
+        assert_eq!(launched_agent("/opt/bin/claude", &[], "my-tool"), "claude");
+    }
+
+    /// A stored agent's unlisted argument stops the launch; the same argument
+    /// in the owner's own config does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_stored_agent_is_held_to_the_list() {
+        use std::os::unix::fs::PermissionsExt;
+        for (is_dynamic, launches) in [(true, false), (false, true)] {
+            let (tool, _db) = setup_echo_tool().await;
+            let dir = tempfile::tempdir().unwrap();
+            let argv_file = dir.path().join("argv.txt");
+            let script = dir.path().join("codex");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                    argv_file.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            tool.tools.write().unwrap().insert(
+                "codex".to_string(),
+                CliToolEntry {
+                    command: script.to_string_lossy().to_string(),
+                    args: strings(&["exec", "-c", "synthetic=1"]),
+                    description: "fake codex".to_string(),
+                    timeout: Duration::from_secs(10),
+                    max_output_chars: 10000,
+                    is_dynamic,
+                },
+            );
+            tool.tool_names.write().unwrap().push("codex".to_string());
+            let output = tool
+                .call(r#"{"action":"run","tool":"codex","prompt":"hello"}"#)
+                .await
+                .unwrap();
+            assert_eq!(argv_file.exists(), launches, "{is_dynamic}: {output}");
+            if !launches {
+                assert!(
+                    output.starts_with("Blocked:") && output.contains("-c"),
+                    "{output}"
+                );
+            }
+        }
+    }
 
     const BYPASS_FLAGS: [&str; 4] = [
         "--dangerously-skip-permissions",
