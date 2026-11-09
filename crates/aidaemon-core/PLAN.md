@@ -123,9 +123,19 @@ Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
 - [x] Approval inside sub-agents: `AgentTool::interrupt_resolver` settles a
       child's interruption inside the parent's tool call, and the child keeps
       going. Without a resolver a child that interrupts is still an error.
-- [ ] Durable parent pause for a child's approval (the parent's tool call
-      stays open, so an answer cannot arrive after a restart). Needs the
-      child's `RunState` nested in the parent's `Pending`, a schema change.
+- [x] Durable parent pause for a child's approval in the kernel and
+      `AgentTool`: a tool that declares `Tool::suspends` answers with
+      `ToolOutput::suspended`, the child's `RunState` is nested in
+      `Pending::child` (`RUN_STATE_SCHEMA` 2; older snapshots still load), and
+      `Agent::resume` passes the answer down at any depth.
+      `AgentTool::suspend_on_interrupt` opts in; the live resolver is asked
+      first. A crash after the answer is the crash of any running call: the
+      delegation re-runs if idempotent and is indeterminate otherwise, so the
+      child is not continued.
+- [ ] The daemon does not use this. Its children are `spawn_agent` runs that
+      ask through an in-memory card, and a restart declines pending approvals
+      on purpose (`sdk_engine/recovery.rs`). Durable daemon children need
+      persisted cards, a rebuildable `TurnScope`, and a change to that policy.
 - [x] Images in messages and tool results (`Image`; Anthropic, OpenAI-compatible, MCP).
 - [x] Reasoning content in messages: `Message::reasoning` keeps each model
       turn's visible reasoning in the transcript; the OpenAI-compatible
