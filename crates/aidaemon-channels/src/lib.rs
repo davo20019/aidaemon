@@ -13,6 +13,7 @@
 //! The runner is [`ChannelRunner`]; see [`runner`] for how to wire an agent,
 //! an [`EventRouter`] and channels together.
 
+mod approvals;
 pub mod channel;
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -27,6 +28,7 @@ pub mod split;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+pub use approvals::{ApprovalStore, MemoryApprovalStore, StoredApproval};
 pub use channel::{
     ApprovalAnswer, ApprovalChoice, ApprovalPrompt, Attachment, Channel, ChannelCapabilities,
     ChannelError, ChannelEvent, CommandInvocation, CommandSpec, Conversation, ConversationKind,

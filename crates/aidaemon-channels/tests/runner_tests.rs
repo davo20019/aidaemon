@@ -7,8 +7,8 @@ use std::time::Duration;
 use aidaemon_channels::testing::{direct, group, message, TestChannel};
 use aidaemon_channels::ChannelEvent;
 use aidaemon_channels::{
-    AccessPolicy, ChannelError, ChannelRunner, EventRouter, MemorySessionIndex, RunnerConfig,
-    SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
+    AccessPolicy, ApprovalStore, ChannelError, ChannelRunner, EventRouter, MemoryApprovalStore,
+    MemorySessionIndex, RunnerBuildError, RunnerConfig, SessionIndex, APPROVE_CHOICE, DENY_CHOICE,
 };
 use aidaemon_core::testing::{call, spec, text, tool_calls, ScriptedProvider, StreamingProvider};
 use aidaemon_core::{
@@ -121,6 +121,7 @@ struct Setup {
     config: RunnerConfig,
     policy: AccessPolicy,
     store: Option<(Arc<MemoryStore>, Arc<MemorySessionIndex>)>,
+    approvals: Option<Arc<MemoryApprovalStore>>,
     deploys: Arc<AtomicUsize>,
 }
 
@@ -134,6 +135,7 @@ impl Setup {
                 .owner("telegram", OWNER)
                 .allow("telegram", FRIEND),
             store: None,
+            approvals: None,
             deploys: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -170,6 +172,9 @@ impl Setup {
             builder = builder
                 .store(store.clone() as Arc<dyn RunStore>)
                 .session_index(index.clone() as Arc<dyn SessionIndex>);
+        }
+        if let Some(approvals) = &self.approvals {
+            builder = builder.approval_store(approvals.clone() as Arc<dyn ApprovalStore>);
         }
         let runner = builder.build().expect("runner builds");
         let shutdown = CancellationToken::new();
@@ -826,6 +831,141 @@ async fn run_store_and_session_index_continue_across_runners() {
     assert!(contents.contains(&"stored answer"), "{contents:?}");
     assert_ne!(index.latest_run("telegram:chat-1").await, Some(run_id));
     run.stop().await;
+}
+
+/// Run until the prompt is open and saved, then stop as a restart would.
+async fn stop_with_open_approval(provider: Arc<dyn Provider>, durable: &Durable) -> String {
+    let run = durable.setup(provider).start();
+    run.say("chat-1", "deploy please");
+    assert!(run.channel.wait_for(WAIT, |c| c.prompts().len() == 1).await);
+    let prompt_id = run.channel.prompts().remove(0).id;
+    assert_eq!(durable.approvals.load_all().await.unwrap().len(), 1);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 0);
+    run.stop().await;
+    prompt_id
+}
+
+/// What survives a restart.
+struct Durable {
+    store: Arc<MemoryStore>,
+    index: Arc<MemorySessionIndex>,
+    approvals: Arc<MemoryApprovalStore>,
+}
+
+impl Durable {
+    fn new() -> Self {
+        Self {
+            store: Arc::new(MemoryStore::new()),
+            index: Arc::new(MemorySessionIndex::new()),
+            approvals: Arc::new(MemoryApprovalStore::new()),
+        }
+    }
+
+    fn setup(&self, provider: Arc<dyn Provider>) -> Setup {
+        let mut setup = Setup::new(provider).channel(
+            TestChannel::new("telegram")
+                .with_buttons(true)
+                .with_edits(true),
+        );
+        setup.store = Some((self.store.clone(), self.index.clone()));
+        setup.approvals = Some(self.approvals.clone());
+        setup
+    }
+}
+
+#[tokio::test]
+async fn an_open_approval_can_be_answered_after_a_restart() {
+    let durable = Durable::new();
+    let provider = deploy_script("Deployed after the restart.");
+    let prompt_id = stop_with_open_approval(provider.clone(), &durable).await;
+
+    let run = durable.setup(provider.clone()).start();
+    run.channel
+        .press(&prompt_id, APPROVE_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "Deployed after the restart.").await);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 1);
+    assert!(durable.approvals.load_all().await.unwrap().is_empty());
+    run.stop().await;
+
+    // Settled for good: the next start has nothing left to run.
+    let run = durable.setup(provider).start();
+    run.channel
+        .press(&prompt_id, APPROVE_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "already answered or expired").await);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 0);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_restored_session_still_waits_and_may_be_denied() {
+    let durable = Durable::new();
+    let provider = deploy_script("Understood, not deploying.");
+    let prompt_id = stop_with_open_approval(provider.clone(), &durable).await;
+
+    let run = durable.setup(provider).start();
+    run.say("chat-1", "are you there?");
+    assert!(run.wait_text("chat-1", "Waiting for an answer").await);
+    run.channel
+        .press(&prompt_id, DENY_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "not deploying").await);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 0);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_approval_that_expired_while_stopped_is_denied_on_start() {
+    let durable = Durable::new();
+    let provider = deploy_script("It expired, so I did not deploy.");
+    stop_with_open_approval(provider.clone(), &durable).await;
+    let mut record = durable.approvals.load_all().await.unwrap().remove(0);
+    record.expires_at_ms = 1;
+    durable.approvals.save(&record).await.unwrap();
+
+    let run = durable.setup(provider).start();
+    assert!(
+        run.wait_text("chat-1", "expired, so the action was denied")
+            .await
+    );
+    assert!(run.wait_text("chat-1", "I did not deploy.").await);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 0);
+    assert!(durable.approvals.load_all().await.unwrap().is_empty());
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_approval_whose_run_is_gone_is_dropped_on_start() {
+    let durable = Durable::new();
+    let provider = deploy_script("never reached");
+    let prompt_id = stop_with_open_approval(provider.clone(), &durable).await;
+
+    // The run store was replaced: the approval has nothing to resume.
+    let empty = Durable {
+        store: Arc::new(MemoryStore::new()),
+        index: durable.index.clone(),
+        approvals: durable.approvals.clone(),
+    };
+    let run = empty.setup(provider).start();
+    run.channel
+        .press(&prompt_id, APPROVE_CHOICE, OWNER, direct("chat-1"));
+    assert!(run.wait_text("chat-1", "already answered or expired").await);
+    assert_eq!(run.deploys.load(Ordering::SeqCst), 0);
+    assert!(durable.approvals.load_all().await.unwrap().is_empty());
+    run.stop().await;
+}
+
+#[test]
+fn an_approval_store_needs_a_run_store() {
+    let agent = Agent::builder("assistant")
+        .allow_unguarded()
+        .provider(scripted(vec![]) as Arc<dyn Provider>)
+        .model("synthetic-model")
+        .build()
+        .expect("agent builds");
+    let built = ChannelRunner::builder(agent)
+        .channel(Arc::new(TestChannel::new("telegram")))
+        .approval_store(Arc::new(MemoryApprovalStore::new()))
+        .build();
+    assert!(matches!(built, Err(RunnerBuildError::InvalidConfig(_))));
 }
 
 #[tokio::test]

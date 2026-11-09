@@ -33,11 +33,18 @@
 //! [`RunStore`] the runner saves every outcome's state and records its run
 //! id in the [`SessionIndex`], so continuation survives restarts; without one
 //! it continues from the last state kept in memory.
+//!
+//! # Approvals across restarts
+//!
+//! With an [`ApprovalStore`] (which needs a [`RunStore`], where the interrupted
+//! run lives) open approvals come back on the next start: their buttons and
+//! `/approve <id>` keep working, and the time spent stopped counts toward
+//! `approval_timeout`.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aidaemon_core::{
     Agent, CoreError, Event, Resolution, Role, RunId, RunOutcome, RunState, RunStatus, RunStore,
@@ -47,6 +54,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::approvals::{ApprovalStore, StoredApproval};
 use crate::channel::{
     ApprovalChoice, ApprovalPrompt, Channel, ChannelError, ChannelEvent, Conversation,
     ConversationKind, InboundMessage, MessageRef, OutboundMessage,
@@ -122,6 +130,7 @@ pub struct ChannelRunnerBuilder {
     router: Option<EventRouter>,
     store: Option<Arc<dyn RunStore>>,
     index: Option<Arc<dyn SessionIndex>>,
+    approval_store: Option<Arc<dyn ApprovalStore>>,
     config: RunnerConfig,
 }
 
@@ -157,6 +166,13 @@ impl ChannelRunnerBuilder {
         self
     }
 
+    /// Keep open approvals here so they survive a restart. Needs a
+    /// [`Self::store`]: an approval resumes the run saved there.
+    pub fn approval_store(mut self, approvals: Arc<dyn ApprovalStore>) -> Self {
+        self.approval_store = Some(approvals);
+        self
+    }
+
     pub fn config(mut self, config: RunnerConfig) -> Self {
         self.config = config;
         self
@@ -189,6 +205,11 @@ impl ChannelRunnerBuilder {
                 "event_buffer must be at least 1",
             ));
         }
+        if self.approval_store.is_some() && self.store.is_none() {
+            return Err(RunnerBuildError::InvalidConfig(
+                "an approval store needs a run store",
+            ));
+        }
         let permits = Arc::new(Semaphore::new(self.config.max_concurrent_runs));
         Ok(ChannelRunner {
             inner: Arc::new(Inner {
@@ -200,6 +221,7 @@ impl ChannelRunnerBuilder {
                 index: self
                     .index
                     .unwrap_or_else(|| Arc::new(MemorySessionIndex::new())),
+                approval_store: self.approval_store,
                 config: self.config,
                 sessions: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
@@ -226,6 +248,7 @@ impl ChannelRunner {
             router: None,
             store: None,
             index: None,
+            approval_store: None,
             config: RunnerConfig::default(),
         }
     }
@@ -239,6 +262,8 @@ impl ChannelRunner {
     pub async fn run(&self, shutdown: CancellationToken) {
         let inner = self.inner.clone();
         let root = inner.root.clone();
+        // Before any channel starts, so a press that arrives first finds it.
+        let restored = inner.restore_approvals().await;
         let mut handles = Vec::new();
         for (index, channel) in inner.channels.iter().enumerate() {
             let (tx, rx) = mpsc::channel(inner.config.event_buffer);
@@ -249,6 +274,9 @@ impl ChannelRunner {
                 inner.config.clone(),
             )));
             handles.push(tokio::spawn(dispatch(inner.clone(), index, rx)));
+        }
+        for (prompt_id, remaining) in restored {
+            inner.arm_expiry(prompt_id, remaining);
         }
         tokio::select! {
             _ = shutdown.cancelled() => {}
@@ -326,17 +354,13 @@ impl Default for Slot {
 }
 
 struct PendingApproval {
+    prompt_id: String,
     session_id: String,
     origin: Origin,
     state: RunState,
     prompt_text: String,
     prompt_ref: Option<MessageRef>,
-}
-
-/// An approval to register once the worker gives up the session.
-struct NewApproval {
-    prompt_id: String,
-    pending: PendingApproval,
+    expires_at_ms: u64,
 }
 
 enum Command {
@@ -372,6 +396,7 @@ struct Inner {
     router: Option<EventRouter>,
     store: Option<Arc<dyn RunStore>>,
     index: Arc<dyn SessionIndex>,
+    approval_store: Option<Arc<dyn ApprovalStore>>,
     config: RunnerConfig,
     sessions: Mutex<HashMap<String, Slot>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
@@ -635,9 +660,9 @@ impl Inner {
             let next = {
                 let mut sessions = self.sessions.lock().expect("sessions poisoned");
                 let slot = sessions.entry(session.clone()).or_default();
-                if let Some(new) = &approval {
+                if let Some(pending) = &approval {
                     slot.state = SlotState::Awaiting {
-                        prompt_id: new.prompt_id.clone(),
+                        prompt_id: pending.prompt_id.clone(),
                     };
                     None
                 } else if let Some(next) = slot.queue.pop_front() {
@@ -650,8 +675,8 @@ impl Inner {
                     None
                 }
             };
-            if let Some(new) = approval {
-                self.open_approval(new).await;
+            if let Some(pending) = approval {
+                self.open_approval(pending).await;
                 return;
             }
             match next {
@@ -698,7 +723,7 @@ impl Inner {
         session: &str,
         job: Job,
         cancel: CancellationToken,
-    ) -> Option<NewApproval> {
+    ) -> Option<PendingApproval> {
         let generation = self.generation(session);
         let agent = self.agent.clone();
         let (origin, outcome, base) = match job {
@@ -783,15 +808,15 @@ impl Inner {
                 let prompt_id = self.new_prompt_id();
                 let prompt_text =
                     render::approval_text(interruption, self.config.max_argument_chars);
-                Some(NewApproval {
+                Some(PendingApproval {
                     prompt_id,
-                    pending: PendingApproval {
-                        session_id: session.to_string(),
-                        origin,
-                        state: outcome.state,
-                        prompt_text,
-                        prompt_ref: None,
-                    },
+                    session_id: session.to_string(),
+                    origin,
+                    state: outcome.state,
+                    prompt_text,
+                    prompt_ref: None,
+                    expires_at_ms: now_ms()
+                        .saturating_add(self.config.approval_timeout.as_millis() as u64),
                 })
             }
             status => {
@@ -927,8 +952,8 @@ impl Inner {
     }
 
     /// Register the approval, show the prompt, and arm its expiry.
-    async fn open_approval(self: &Arc<Self>, new: NewApproval) {
-        let NewApproval { prompt_id, pending } = new;
+    async fn open_approval(self: &Arc<Self>, pending: PendingApproval) {
+        let prompt_id = pending.prompt_id.clone();
         let origin = pending.origin.clone();
         let prompt = ApprovalPrompt {
             id: prompt_id.clone(),
@@ -945,6 +970,9 @@ impl Inner {
                 },
             ],
         };
+        // Saved before it is shown, so a prompt on screen is always one a
+        // restart can still settle.
+        self.persist_approval(&pending).await;
         self.approvals
             .lock()
             .expect("approvals poisoned")
@@ -975,20 +1003,29 @@ impl Inner {
                 }
             }
         };
-        if let Some(entry) = self
-            .approvals
-            .lock()
-            .expect("approvals poisoned")
-            .get_mut(&prompt_id)
-        {
-            entry.prompt_ref = prompt_ref;
+        let updated = {
+            let mut approvals = self.approvals.lock().expect("approvals poisoned");
+            approvals.get_mut(&prompt_id).and_then(|entry| {
+                entry.prompt_ref = prompt_ref;
+                self.stored_approval(entry)
+            })
+        };
+        // Only while still open: an answer may have settled it during `ask`.
+        if let (Some(store), Some(record)) = (&self.approval_store, updated) {
+            if let Err(err) = store.save(&record).await {
+                tracing::warn!(prompt = %prompt_id, error = %err, "saving approval failed");
+            }
         }
 
+        self.arm_expiry(prompt_id, self.config.approval_timeout);
+    }
+
+    /// Deny the approval when `after` has passed, unless it is settled first.
+    fn arm_expiry(self: &Arc<Self>, prompt_id: String, after: Duration) {
         let inner = self.clone();
-        let timeout = self.config.approval_timeout;
         self.tasks.spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(timeout) => {}
+                _ = tokio::time::sleep(after) => {}
                 _ = inner.root.cancelled() => return,
             }
             let expired = inner
@@ -997,6 +1034,7 @@ impl Inner {
                 .expect("approvals poisoned")
                 .remove(&prompt_id);
             if let Some(pending) = expired {
+                inner.forget_approval(&prompt_id).await;
                 inner.mark_prompt(&pending, "Expired (denied)").await;
                 inner
                     .say(
@@ -1013,6 +1051,110 @@ impl Inner {
                 );
             }
         });
+    }
+
+    /// The durable form of an open approval, if approvals are persisted.
+    fn stored_approval(&self, pending: &PendingApproval) -> Option<StoredApproval> {
+        self.approval_store.as_ref()?;
+        Some(StoredApproval {
+            prompt_id: pending.prompt_id.clone(),
+            session_id: pending.session_id.clone(),
+            channel: self.channel_name(pending.origin.channel).to_string(),
+            conversation: pending.origin.conversation.clone(),
+            reply_to: pending.origin.reply_to.clone(),
+            run_id: pending.state.run_id,
+            prompt_text: pending.prompt_text.clone(),
+            prompt_ref: pending.prompt_ref.clone(),
+            expires_at_ms: pending.expires_at_ms,
+        })
+    }
+
+    async fn persist_approval(&self, pending: &PendingApproval) {
+        if let (Some(store), Some(record)) = (&self.approval_store, self.stored_approval(pending)) {
+            if let Err(err) = store.save(&record).await {
+                tracing::warn!(prompt = %pending.prompt_id, error = %err, "saving approval failed");
+            }
+        }
+    }
+
+    /// Drop the durable record of an approval that has been settled.
+    async fn forget_approval(&self, prompt_id: &str) {
+        if let Some(store) = &self.approval_store {
+            if let Err(err) = store.remove(prompt_id).await {
+                tracing::warn!(prompt = prompt_id, error = %err, "removing approval failed");
+            }
+        }
+    }
+
+    /// Bring back the approvals open at the last stop, each with its session
+    /// waiting on it. Returns how long each has left, for [`Self::arm_expiry`].
+    async fn restore_approvals(&self) -> Vec<(String, Duration)> {
+        let (Some(approvals), Some(store)) = (&self.approval_store, &self.store) else {
+            return Vec::new();
+        };
+        let records = match approvals.load_all().await {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::error!(error = %err, "could not load pending approvals");
+                return Vec::new();
+            }
+        };
+        let now = now_ms();
+        let mut restored = Vec::new();
+        for record in records {
+            let Some(channel) = self
+                .channels
+                .iter()
+                .position(|c| c.name() == record.channel)
+            else {
+                // Not configured on this start; it may be back on the next.
+                if record.expires_at_ms <= now {
+                    self.forget_approval(&record.prompt_id).await;
+                }
+                continue;
+            };
+            let state = match store.load_state(record.run_id).await {
+                Ok(Some(state)) if state.pending.is_some() && state.agent_id == self.agent.id() => {
+                    state
+                }
+                Ok(_) => {
+                    tracing::warn!(prompt = %record.prompt_id, run = %record.run_id, "approval has no interrupted run to resume; dropping it");
+                    self.forget_approval(&record.prompt_id).await;
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(prompt = %record.prompt_id, error = %err, "could not load the run of a pending approval");
+                    continue;
+                }
+            };
+            let remaining = Duration::from_millis(record.expires_at_ms.saturating_sub(now));
+            self.sessions
+                .lock()
+                .expect("sessions poisoned")
+                .entry(record.session_id.clone())
+                .or_default()
+                .state = SlotState::Awaiting {
+                prompt_id: record.prompt_id.clone(),
+            };
+            restored.push((record.prompt_id.clone(), remaining));
+            self.approvals.lock().expect("approvals poisoned").insert(
+                record.prompt_id.clone(),
+                PendingApproval {
+                    prompt_id: record.prompt_id,
+                    session_id: record.session_id,
+                    origin: Origin {
+                        channel,
+                        conversation: record.conversation,
+                        reply_to: record.reply_to,
+                    },
+                    state,
+                    prompt_text: record.prompt_text,
+                    prompt_ref: record.prompt_ref,
+                    expires_at_ms: record.expires_at_ms,
+                },
+            );
+        }
+        restored
     }
 
     /// Edit the prompt message to show how it was settled.
@@ -1105,6 +1247,7 @@ impl Inner {
             return;
         };
         tracing::info!(session = %session, prompt = %id, approve, "approval settled");
+        self.forget_approval(&id).await;
         self.mark_prompt(&pending, if approve { "Approved" } else { "Denied" })
             .await;
         let resolution = if approve {
@@ -1165,6 +1308,7 @@ impl Inner {
                     self.say(origin, &format!("Dropped {dropped} queued message(s)."))
                         .await;
                 }
+                self.forget_approval(&pending.prompt_id).await;
                 self.mark_prompt(&pending, "Stopped").await;
                 self.resume(
                     *pending,
@@ -1202,6 +1346,7 @@ impl Inner {
             }
         };
         if let Some(pending) = dropped_approval {
+            self.forget_approval(&pending.prompt_id).await;
             self.mark_prompt(&pending, "Cancelled").await;
         }
         self.index.clear(session).await;
@@ -1229,6 +1374,12 @@ impl Inner {
         };
         self.say(origin, &text).await;
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// The message text plus a short list of attachments the agent cannot see.

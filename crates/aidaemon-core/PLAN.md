@@ -124,7 +124,9 @@ Agents-as-tools, MCP client, tracing sink, `aidaemon-sdk` bundle and example.
 ### Phase 6b: channels (done, with gaps)
 `aidaemon-channels` (contract + runner) and Telegram, Slack and Discord
 adapters, tested against local mock servers.
-- [ ] Persist pending approvals (they live in memory; a restart loses them).
+- [x] Persist pending approvals: `ApprovalStore` (with `MemoryApprovalStore`,
+      the same shape as `SessionIndex`) and `ChannelRunnerBuilder::approval_store`.
+      No SQLite implementation yet, and the daemon does not use `ChannelRunner`.
 - [ ] Attachment download helpers (Slack `url_private` needs the bot token;
       Telegram needs `getFile`); attachments reach the agent as names only.
 - [ ] Contract follow-ups from the adapters: `Attachment::kind`, a message
