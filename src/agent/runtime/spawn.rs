@@ -1205,6 +1205,7 @@ impl Agent {
                 );
             }
             let workspace_evidence = match crate::workspaces::preserve_task_workspace(
+                &*self.execution_backend,
                 self.state.as_ref(),
                 task_id,
             )
@@ -1632,6 +1633,7 @@ impl Agent {
             system_prompt,
             self.config_path.clone(),
             self.daemon_paths.clone(),
+            self.execution_backend.clone(),
             self.skills_dir.clone(),
             child_depth,
             self.limits.max_depth,
@@ -2261,7 +2263,7 @@ impl Agent {
                     None => None,
                 };
                 let configured = self.configured_trust_roots();
-                let cwd = super::sdk_engine::turn_cwd();
+                let cwd = super::sdk_engine::turn_cwd(&*self.execution_backend);
                 super::sdk_engine::turn_trust_roots(super::sdk_engine::TrustRootSources {
                     configured: &configured,
                     cwd: Some(&cwd),
@@ -2429,6 +2431,7 @@ impl Agent {
                     anyhow::anyhow!("A claimed executor attempt requires its durable task ID")
                 })?;
                 match crate::workspaces::provision_task_workspace(
+                    &*self.execution_backend,
                     self.state.as_ref(),
                     task_id,
                     attempt,

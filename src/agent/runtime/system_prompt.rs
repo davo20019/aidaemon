@@ -366,7 +366,7 @@ impl Agent {
         {
             if let Some(scope) = project_instruction_scope {
                 match crate::project_instructions::initialize_project_instructions(
-                    crate::execution::active_execution_backend(),
+                    self.execution_backend.clone(),
                     scope,
                 )
                 .await

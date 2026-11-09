@@ -881,7 +881,7 @@ impl Agent {
             .event_store
             .task_run_aggregate(emitter.session_id(), task_id)
             .await
-            .unwrap_or_else(|_| crate::events::RunAggregate::new(task_id));
+            .unwrap_or_else(|_| self.event_store.empty_run_aggregate(task_id));
         // A background launch receipt is a nonterminal transition owned by a
         // durable notifier. A local finalizer/budget path may have proposed
         // `Failed` after the inline loop stopped, but it cannot turn that

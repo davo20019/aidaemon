@@ -32,41 +32,54 @@ pub use aidaemon_tools::{
 
 pub type SharedExecutionBackend = Arc<dyn ExecutionBackend>;
 
-static ACTIVE_BACKEND: once_cell::sync::OnceCell<SharedExecutionBackend> =
-    once_cell::sync::OnceCell::new();
-static DEFAULT_LOCAL_BACKEND: once_cell::sync::Lazy<SharedExecutionBackend> =
-    once_cell::sync::Lazy::new(|| Arc::new(LocalBackend::current_unrestricted()));
-
-/// Install the one execution environment used by this daemon process.
-///
-/// A daemon has one persistent agent-visible workspace. Keeping this immutable
-/// after startup prevents approvals, process handles, and file observations
-/// from being replayed against a different target.
-pub fn install_execution_backend(
-    backend: SharedExecutionBackend,
-) -> anyhow::Result<SharedExecutionBackend> {
-    if let Some(existing) = ACTIVE_BACKEND.get() {
-        anyhow::ensure!(
-            existing.id() == backend.id(),
-            "Execution backend is already fixed as {}; refusing to switch to {} at runtime",
-            existing.id(),
-            backend.id()
-        );
-        return Ok(existing.clone());
-    }
-    ACTIVE_BACKEND
-        .set(backend.clone())
-        .map_err(|_| anyhow::anyhow!("Execution backend was initialized concurrently"))?;
-    Ok(backend)
+/// The default local backend for isolated unit tests that construct a tool
+/// without running startup. Production code never reads this: startup builds
+/// the one backend for the process and passes it to whatever needs it.
+#[cfg(test)]
+pub fn active_execution_backend() -> SharedExecutionBackend {
+    static DEFAULT_LOCAL_BACKEND: once_cell::sync::Lazy<SharedExecutionBackend> =
+        once_cell::sync::Lazy::new(|| Arc::new(LocalBackend::current_unrestricted()));
+    DEFAULT_LOCAL_BACKEND.clone()
 }
 
-/// Return the daemon's immutable execution environment. The lazy local value is
-/// only for isolated unit tests that construct a tool without running startup.
-pub fn active_execution_backend() -> SharedExecutionBackend {
-    ACTIVE_BACKEND
-        .get()
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_LOCAL_BACKEND.clone())
+/// What lexical path normalization needs from a backend: its path flavor and
+/// the two bases that give relative and `~` paths a meaning. A plain value, so
+/// code that compares paths without touching the target (the run ledger) can
+/// hold it without holding the backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexicalPaths {
+    kind: BackendKind,
+    workspace_root: BackendPath,
+    home: BackendPath,
+}
+
+impl LexicalPaths {
+    pub fn of(backend: &dyn ExecutionBackend) -> Self {
+        Self {
+            kind: backend.kind(),
+            workspace_root: backend.workspace_root().clone(),
+            home: backend.home_hint().clone(),
+        }
+    }
+
+    /// The daemon host's own paths, for a store opened outside the daemon's
+    /// run (a one-shot CLI command) where no execution backend exists.
+    pub fn daemon_host() -> Self {
+        Self::of(&LocalBackend::current_unrestricted())
+    }
+
+    pub fn normalize(&self, path: &str) -> anyhow::Result<BackendPath> {
+        normalize_lexically(self.kind, &self.workspace_root, &self.home, path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn posix(workspace_root: &str, home: &str) -> Self {
+        Self {
+            kind: BackendKind::Ssh,
+            workspace_root: BackendPath::new(workspace_root),
+            home: BackendPath::new(home),
+        }
+    }
 }
 
 /// Synchronous lexical normalization for policy/scope code that cannot perform
@@ -76,16 +89,30 @@ pub fn normalize_path_lexically(
     backend: &dyn ExecutionBackend,
     path: &str,
 ) -> anyhow::Result<BackendPath> {
+    normalize_lexically(
+        backend.kind(),
+        backend.workspace_root(),
+        backend.home_hint(),
+        path,
+    )
+}
+
+fn normalize_lexically(
+    kind: BackendKind,
+    workspace_root: &BackendPath,
+    home: &BackendPath,
+    path: &str,
+) -> anyhow::Result<BackendPath> {
     let expanded = if path == "~" {
-        backend.home_hint().as_str().to_string()
+        home.as_str().to_string()
     } else if let Some(rest) = path.strip_prefix("~/") {
-        backend.home_hint().join(rest).to_string()
+        home.join(rest).to_string()
     } else if Path::new(path).is_absolute() {
         path.to_string()
     } else {
-        backend.workspace_root().join(path).to_string()
+        workspace_root.join(path).to_string()
     };
-    match backend.kind() {
+    match kind {
         BackendKind::Local => Ok(BackendPath::new(
             normalize_local_lexically(Path::new(&expanded))?
                 .to_string_lossy()
@@ -1727,6 +1754,19 @@ mod tests {
         let backend = LocalBackend::new(&config).await.unwrap();
         assert!(backend.resolve_path("ok.txt").await.is_ok());
         assert!(backend.resolve_path("/etc/passwd").await.is_err());
+    }
+
+    #[test]
+    fn lexical_paths_normalize_exactly_as_their_backend() {
+        let backend = LocalBackend::current_unrestricted();
+        let paths = LexicalPaths::of(&backend);
+        for path in ["relative/file.txt", "~/notes.md", "~", "/tmp/a/../b"] {
+            assert_eq!(
+                paths.normalize(path).unwrap(),
+                normalize_path_lexically(&backend, path).unwrap(),
+                "{path}"
+            );
+        }
     }
 
     #[test]

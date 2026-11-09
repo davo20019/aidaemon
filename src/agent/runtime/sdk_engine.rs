@@ -123,7 +123,10 @@ impl Default for SdkEngineSettings {
 }
 
 /// The engine settings from `[agent.engine]`.
-pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
+pub(crate) fn settings_from_config(
+    config: &AppConfig,
+    backend: &dyn crate::execution::ExecutionBackend,
+) -> SdkEngineSettings {
     let engine = &config.agent.engine;
     if engine.kind.is_some() {
         warn!("[agent.engine] kind is ignored: the SDK kernel is the only agent loop");
@@ -165,7 +168,10 @@ pub(crate) fn settings_from_config(config: &AppConfig) -> SdkEngineSettings {
         outbound_secrets: super::approvals::ConfiguredSecrets::new(config.outbound_secret_values()),
     };
     info!(model_override = ?settings.model_override, "Agent engine: SDK kernel");
-    log_configured_trust_roots(&settings.trusted_roots);
+    log_configured_trust_roots(
+        &settings.trusted_roots,
+        backend.workspace_root().as_str().to_string(),
+    );
     settings
 }
 
@@ -246,8 +252,7 @@ impl Agent {
 
 /// Log, once at startup, the trusted roots the owner configured plus the
 /// execution workspace, and which of them are dropped as too broad.
-fn log_configured_trust_roots(configured: &[String]) {
-    let workspace = turn_cwd();
+fn log_configured_trust_roots(configured: &[String], workspace: String) {
     let (kept, dropped): (Vec<String>, Vec<String>) = configured
         .iter()
         .map(|root| shellexpand::tilde(root.trim()).into_owned())
@@ -295,11 +300,8 @@ fn is_narrow_root(dir: &str) -> bool {
 
 /// Where the file tools resolve a relative path: the execution backend's
 /// workspace (the daemon's working directory on the local backend).
-pub(in crate::agent) fn turn_cwd() -> String {
-    crate::execution::active_execution_backend()
-        .workspace_root()
-        .as_str()
-        .to_string()
+pub(in crate::agent) fn turn_cwd(backend: &dyn crate::execution::ExecutionBackend) -> String {
+    backend.workspace_root().as_str().to_string()
 }
 
 /// Everything the SDK run asks of the daemon, served on the turn's own task.
@@ -412,6 +414,7 @@ pub(super) struct TerminalCanonTurn {
     /// How `CanonicalCallHook` canonicalized each call.
     pub(super) records: tool_calls::CanonicalCalls,
     pub paths: crate::tools::DaemonPaths,
+    pub backend: crate::execution::SharedExecutionBackend,
 }
 
 /// How the kernel's terminal rules see a call: in the canonical form the
@@ -444,6 +447,7 @@ pub(super) fn terminal_canonicalizer(
                     "terminal",
                     raw,
                     &tool_calls::CanonFacts {
+                        backend: &*turn.backend,
                         workspace_grant: turn.workspace_grant,
                         known_project_dir: known.as_deref(),
                         task_access: turn.task_access.as_ref(),
@@ -458,6 +462,7 @@ pub(super) fn terminal_canonicalizer(
             }
         };
         let facts = tool_calls::CallScopeFacts {
+            backend: &*turn.backend,
             session_id: &turn.session_id,
             task_access: turn.task_access.as_ref(),
             authorized_scopes: &turn.authorized_scopes,
@@ -585,6 +590,7 @@ fn kernel_tool_name(name: &str) -> bool {
 pub(in crate::agent) struct TurnScope<'a> {
     pub(in crate::agent) session_id: &'a str,
     daemon_paths: &'a crate::tools::DaemonPaths,
+    execution_backend: &'a dyn crate::execution::ExecutionBackend,
     /// The MCP-registry tools bridged for this turn (daemon tools are
     /// `Agent::tools`); see [`Agent::turn_tool`].
     mcp_tools: Vec<Arc<dyn crate::traits::Tool>>,
@@ -919,7 +925,7 @@ impl Agent {
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
-        let cwd = turn_cwd();
+        let cwd = turn_cwd(&*self.execution_backend);
         // Trusted only by explicit grant, never by inference from the
         // request: `project_scope` and `known_project_dir` steer where tools
         // run but are not trust sources.
@@ -1130,6 +1136,7 @@ impl Agent {
                 let scopes = authorized_scopes.clone();
                 terminal.with_canonicalizer(
                     terminal_canonicalizer(TerminalCanonTurn {
+                        backend: self.execution_backend.clone(),
                         paths: self.daemon_paths.clone(),
                         tool,
                         known_project_dir: known,
@@ -1172,11 +1179,7 @@ impl Agent {
             aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
                 .with_rules(rules.clone())
                 .with_grants(approvals.grants_for(&grant_session))
-                .workspace_root(
-                    crate::execution::active_execution_backend()
-                        .workspace_root()
-                        .as_str(),
-                );
+                .workspace_root(self.execution_backend.workspace_root().as_str());
         let secrets = self.configured_secret_literals(engine).await;
         let egress = secrets
             .iter()
@@ -1204,7 +1207,7 @@ impl Agent {
         );
         let protected_paths = turn_tools.iter().fold(
             aidaemon_tools::ProtectedPathGuard::new(
-                crate::execution::active_execution_backend(),
+                self.execution_backend.clone(),
                 crate::tools::daemon_file_policy(self.daemon_paths.clone()),
             ),
             |guard, (name, tool)| guard.tool(name.clone(), tool.dispatch_facts().file_guard),
@@ -1218,6 +1221,7 @@ impl Agent {
                 authorized_scopes: authorized_scopes.clone(),
                 records: canonical_calls.clone(),
                 paths: self.daemon_paths.clone(),
+                backend: self.execution_backend.clone(),
             },
             authority: authority_hook,
             same_tool: aidaemon_policies::SameToolStreakGuard {
@@ -1423,6 +1427,7 @@ impl Agent {
                 && inherited.is_none_or(|parent| parent.origin_trusted);
         let scope = TurnScope {
             daemon_paths: &self.daemon_paths,
+            execution_backend: &*self.execution_backend,
             run_id,
             session_id,
             mcp_tools,

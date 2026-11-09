@@ -645,7 +645,7 @@ impl SlackChannel {
     }
 
     async fn resolve_workspace_project_root(&self, raw_path: &str) -> anyhow::Result<String> {
-        let backend = crate::execution::active_execution_backend();
+        let backend = self.agent.execution_backend();
         anyhow::ensure!(
             backend.kind() == crate::execution::BackendKind::Local,
             "Workspace collaboration is currently available only with the local execution backend"

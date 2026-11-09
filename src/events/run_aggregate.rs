@@ -16,6 +16,7 @@ use super::{
     TaskContractCompiledData, TaskEndData, TaskOutcome, TaskStartData, TaskStatus, ToolCallData,
     ToolResultData,
 };
+use crate::execution::LexicalPaths;
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
     RequestObservationTarget, RequestReceiptPredicate, RequestResponseContract,
@@ -332,12 +333,21 @@ pub(crate) struct RunAggregate {
     /// id; this alias is the typed bridge that lets it prove ours.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_obligation_aliases: BTreeMap<String, String>,
+    /// How this run's path targets and hints compare. The backend's fixed
+    /// facts, not part of the projection, so never serialized.
+    #[serde(skip, default = "LexicalPaths::daemon_host")]
+    paths: LexicalPaths,
 }
 
 impl RunAggregate {
     pub const SCHEMA_VERSION: u16 = 4;
 
+    #[cfg(test)]
     pub(crate) fn new(task_id: impl Into<String>) -> Self {
+        Self::on_paths(task_id, LexicalPaths::daemon_host())
+    }
+
+    pub(crate) fn on_paths(task_id: impl Into<String>, paths: LexicalPaths) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             task_id: task_id.into(),
@@ -361,11 +371,17 @@ impl RunAggregate {
             prepared_response_id: None,
             delivery_states: BTreeMap::new(),
             adopted_obligation_aliases: BTreeMap::new(),
+            paths,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn replay(task_id: &str, events: &[Event]) -> Self {
-        let mut aggregate = Self::new(task_id);
+        Self::replay_on_paths(task_id, events, LexicalPaths::daemon_host())
+    }
+
+    pub(crate) fn replay_on_paths(task_id: &str, events: &[Event], paths: LexicalPaths) -> Self {
+        let mut aggregate = Self::on_paths(task_id, paths);
         let mut ordered = events.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|event| event.id);
         for event in ordered {
@@ -797,15 +813,15 @@ impl RunAggregate {
             for receipt in &receipts {
                 let target_compatible = match obligation.class {
                     RunObligationClass::Observe => observation_targets_supported(
+                        &self.paths,
                         &obligation.observation_targets,
                         &receipt.targets,
                         &receipt.observations,
                         &receipt.collection_observations,
                     ),
-                    _ => obligation
-                        .required_target
-                        .as_ref()
-                        .is_none_or(|target| hints_touch_target(target, &receipt.targets)),
+                    _ => obligation.required_target.as_ref().is_none_or(|target| {
+                        hints_touch_target(&self.paths, target, &receipt.targets)
+                    }),
                 };
                 let proven = match obligation.class {
                     RunObligationClass::Achieve => {
@@ -835,7 +851,11 @@ impl RunAggregate {
                         later.succeeded
                             && !later.mutation_effects.is_empty()
                             && later.revision > receipt.revision
-                            && obligation_touched_by_targets(obligation, &later.targets)
+                            && obligation_touched_by_targets(
+                                &self.paths,
+                                obligation,
+                                &later.targets,
+                            )
                     });
                     if stale {
                         continue;
@@ -1231,7 +1251,7 @@ impl RunAggregate {
                     && obligation
                         .satisfied_at_revision
                         .is_some_and(|revision| revision < self.effect_revision)
-                    && obligation_touched_by_targets(obligation, &mutation_targets)
+                    && obligation_touched_by_targets(&self.paths, obligation, &mutation_targets)
                 {
                     obligation.state = RunObligationState::Invalidated;
                 }
@@ -1249,15 +1269,19 @@ impl RunAggregate {
             if obligation.state == RunObligationState::Unverifiable {
                 continue;
             }
-            let observation_compatible = obligation
-                .evidence_requirement
-                .as_ref()
-                .is_none_or(|requirement| evidence_receipt_supports(requirement, receipt));
+            let observation_compatible =
+                obligation
+                    .evidence_requirement
+                    .as_ref()
+                    .is_none_or(|requirement| {
+                        evidence_receipt_supports(&self.paths, requirement, receipt)
+                    });
             let target_compatible = obligation
                 .required_target
                 .as_ref()
-                .is_none_or(|target| receipt_touches_target(target, receipt));
+                .is_none_or(|target| receipt_touches_target(&self.paths, target, receipt));
             let observation_selector_compatible = observation_targets_supported(
+                &self.paths,
                 &obligation.observation_targets,
                 &receipt_targets(receipt),
                 &receipt.observations,
@@ -1599,7 +1623,7 @@ impl RunAggregate {
                     };
                 if bound_targets
                     .iter()
-                    .any(|target| hints_touch_target(target, &operation.targets))
+                    .any(|target| hints_touch_target(&self.paths, target, &operation.targets))
                 {
                     return true;
                 }
@@ -2124,6 +2148,7 @@ pub(crate) fn receipt_matches_predicate(
 }
 
 fn evidence_receipt_supports(
+    paths: &LexicalPaths,
     requirement: &RequestEvidenceRequirement,
     receipt: &super::ToolReceiptV1,
 ) -> bool {
@@ -2138,7 +2163,7 @@ fn evidence_receipt_supports(
     let Some(target) = requirement.target.as_ref() else {
         return true;
     };
-    receipt_touches_target(target, receipt)
+    receipt_touches_target(paths, target, receipt)
 }
 
 /// Subjects a receipt touched or proposed to touch: semantic target hints
@@ -2164,20 +2189,25 @@ fn receipt_targets(receipt: &super::ToolReceiptV1) -> Vec<ToolTargetHint> {
 /// is the target itself or one of its ancestors (a directory declared as a
 /// write root covers the directory and everything created inside it).
 fn receipt_touches_target(
+    paths: &LexicalPaths,
     target: &crate::traits::RequestVerificationTarget,
     receipt: &super::ToolReceiptV1,
 ) -> bool {
-    hints_touch_target(target, &receipt_targets(receipt))
+    hints_touch_target(paths, target, &receipt_targets(receipt))
 }
 
 fn hints_touch_target(
+    paths: &LexicalPaths,
     target: &crate::traits::RequestVerificationTarget,
     hints: &[ToolTargetHint],
 ) -> bool {
-    hints.iter().any(|hint| hint_matches_target(target, hint))
+    hints
+        .iter()
+        .any(|hint| hint_matches_target(paths, target, hint))
 }
 
 fn hint_matches_target(
+    paths: &LexicalPaths,
     target: &crate::traits::RequestVerificationTarget,
     hint: &ToolTargetHint,
 ) -> bool {
@@ -2187,14 +2217,8 @@ fn hint_matches_target(
             // The target itself, or a path under it: only a directory has
             // paths under it, so a folder-scoped item is met by work on its
             // files while a file-bound item still needs that exact file.
-            let expected = crate::execution::normalize_path_lexically(
-                &*crate::execution::active_execution_backend(),
-                &target.value,
-            );
-            let actual = crate::execution::normalize_path_lexically(
-                &*crate::execution::active_execution_backend(),
-                &hint.value,
-            );
+            let expected = paths.normalize(&target.value);
+            let actual = paths.normalize(&hint.value);
             expected
                 .ok()
                 .zip(actual.ok())
@@ -2205,14 +2229,8 @@ fn hint_matches_target(
                 })
         }
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::ProjectScope) => {
-            let expected = crate::execution::normalize_path_lexically(
-                &*crate::execution::active_execution_backend(),
-                &target.value,
-            );
-            let root = crate::execution::normalize_path_lexically(
-                &*crate::execution::active_execution_backend(),
-                &hint.value,
-            );
+            let expected = paths.normalize(&target.value);
+            let root = paths.normalize(&hint.value);
             expected.ok().zip(root.ok()).is_some_and(|(target, root)| {
                 let target = target.as_str();
                 let root = root.as_str().trim_end_matches('/');
@@ -2231,11 +2249,12 @@ fn facets_cover(observed: &[ToolSemanticFacet], required: &[ToolSemanticFacet]) 
 }
 
 fn direct_observation_supports(
+    paths: &LexicalPaths,
     target: &RequestObservationTarget,
     observations: &[ToolObservationEvidence],
 ) -> bool {
     observations.iter().any(|observation| {
-        hint_matches_target(&target.subject, &observation.subject)
+        hint_matches_target(paths, &target.subject, &observation.subject)
             && facets_cover(&observation.facets, &target.facets)
     })
 }
@@ -2244,6 +2263,7 @@ fn direct_observation_supports(
 /// collection coverage can prove non-membership; partial coverage can only
 /// prove rows it actually returned, and those rows still need direct facets.
 fn observation_target_supported(
+    paths: &LexicalPaths,
     target: &RequestObservationTarget,
     receipt_targets: &[ToolTargetHint],
     observations: &[ToolObservationEvidence],
@@ -2251,7 +2271,7 @@ fn observation_target_supported(
 ) -> bool {
     if let Some(requirement) = target.collection_coverage.as_ref() {
         let Some(collection) = collections.iter().find(|collection| {
-            hint_matches_target(&requirement.collection, &collection.collection)
+            hint_matches_target(paths, &requirement.collection, &collection.collection)
                 && collection
                     .completeness
                     .satisfies(requirement.minimum_completeness)
@@ -2262,53 +2282,58 @@ fn observation_target_supported(
         // A selector may name the collection itself when the exact member
         // subject is not known until discovery. This binds the obligation to
         // complete typed coverage, never to an invented display-name alias.
-        if hint_matches_target(&target.subject, &collection.collection) {
+        if hint_matches_target(paths, &target.subject, &collection.collection) {
             return true;
         }
         let subject_is_member = collection
             .members
             .iter()
-            .any(|member| hint_matches_target(&target.subject, member));
+            .any(|member| hint_matches_target(paths, &target.subject, member));
         if !subject_is_member {
             return collection.completeness == crate::traits::ToolCollectionCompleteness::Complete;
         }
-        return direct_observation_supports(target, observations);
+        return direct_observation_supports(paths, target, observations);
     }
 
-    if direct_observation_supports(target, observations) {
+    if direct_observation_supports(paths, target, observations) {
         return true;
     }
     // Legacy path/URL/resource checklist declarations did not include facets.
     // Preserve their exact-target behavior while refusing to infer any typed
     // facet merely from proposed call semantics.
-    target.facets.is_empty() && hints_touch_target(&target.subject, receipt_targets)
+    target.facets.is_empty() && hints_touch_target(paths, &target.subject, receipt_targets)
 }
 
 fn observation_targets_supported(
+    paths: &LexicalPaths,
     targets: &[RequestObservationTarget],
     receipt_targets: &[ToolTargetHint],
     observations: &[ToolObservationEvidence],
     collections: &[ToolCollectionObservation],
 ) -> bool {
     targets.iter().all(|target| {
-        observation_target_supported(target, receipt_targets, observations, collections)
+        observation_target_supported(paths, target, receipt_targets, observations, collections)
     })
 }
 
-fn obligation_touched_by_targets(obligation: &RunObligation, hints: &[ToolTargetHint]) -> bool {
+fn obligation_touched_by_targets(
+    paths: &LexicalPaths,
+    obligation: &RunObligation,
+    hints: &[ToolTargetHint],
+) -> bool {
     if !obligation.observation_targets.is_empty() {
         return obligation.observation_targets.iter().any(|target| {
-            hints_touch_target(&target.subject, hints)
+            hints_touch_target(paths, &target.subject, hints)
                 || target
                     .collection_coverage
                     .as_ref()
-                    .is_some_and(|coverage| hints_touch_target(&coverage.collection, hints))
+                    .is_some_and(|coverage| hints_touch_target(paths, &coverage.collection, hints))
         });
     }
     obligation
         .required_target
         .as_ref()
-        .is_none_or(|target| hints_touch_target(target, hints))
+        .is_none_or(|target| hints_touch_target(paths, target, hints))
 }
 
 fn executor_item_summary(
@@ -2353,6 +2378,41 @@ mod tests {
         ToolInvocationStage, ToolReceiptKind, ToolResultProvenance, ToolSemanticScope,
     };
     use serde_json::json;
+
+    #[test]
+    fn path_targets_compare_on_the_backend_the_store_was_given() {
+        let paths = LexicalPaths::posix("/remote/work", "/home/synthetic-user");
+        let target = |value: &str| {
+            crate::traits::RequestVerificationTarget::new(
+                RequestVerificationTargetKind::Path,
+                value,
+            )
+            .unwrap()
+        };
+        let hint = |kind, value: &str| ToolTargetHint::new(kind, value).unwrap();
+        // Relative targets and `~` resolve on the execution backend, not on
+        // the daemon host running this test.
+        assert!(hint_matches_target(
+            &paths,
+            &target("notes/todo.md"),
+            &hint(ToolTargetHintKind::Path, "/remote/work/notes/todo.md"),
+        ));
+        assert!(hint_matches_target(
+            &paths,
+            &target("~/plan.md"),
+            &hint(ToolTargetHintKind::Path, "/home/synthetic-user/plan.md"),
+        ));
+        assert!(hint_matches_target(
+            &paths,
+            &target("/remote/work/a/../notes/todo.md"),
+            &hint(ToolTargetHintKind::ProjectScope, "/remote/work/notes"),
+        ));
+        assert!(!hint_matches_target(
+            &paths,
+            &target("notes/todo.md"),
+            &hint(ToolTargetHintKind::Path, "/elsewhere/notes/todo.md"),
+        ));
+    }
 
     fn event(event_type: EventType, value: impl Serialize) -> Event {
         let mut event = Event::new(

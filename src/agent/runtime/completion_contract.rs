@@ -552,12 +552,14 @@ pub(super) fn retain_structural_completion_contract(contract: &mut CompletionCon
 /// with relative filesystem targets anchored to the turn's typed workspace
 /// (or the daemon cwd when the turn has none).
 pub(super) fn infer_structural_completion_contract_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&std::path::Path>,
 ) -> CompletionContract {
     let mut contract = CompletionContract {
         verification_targets: extract_verification_targets_anchored(
+            backend,
             text,
             alias_roots,
             workspace_anchor,
@@ -1268,6 +1270,7 @@ pub(super) static HTTP_URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
 
 fn extract_verification_filesystem_targets(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     targets: &mut Vec<VerificationTarget>,
     max_targets: usize,
@@ -1275,6 +1278,7 @@ fn extract_verification_filesystem_targets(
     workspace_anchor: Option<&std::path::Path>,
 ) {
     for value in super::project_scope::extract_exact_filesystem_resources_from_text_anchored(
+        backend,
         text,
         alias_roots,
         workspace_anchor,
@@ -1296,10 +1300,16 @@ fn extract_verification_filesystem_targets(
 
 #[cfg(test)]
 fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<VerificationTarget> {
-    extract_verification_targets_anchored(text, alias_roots, None)
+    extract_verification_targets_anchored(
+        &*crate::execution::active_execution_backend(),
+        text,
+        alias_roots,
+        None,
+    )
 }
 
 fn extract_verification_targets_anchored(
+    backend: &dyn crate::execution::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&std::path::Path>,
@@ -1326,7 +1336,14 @@ fn extract_verification_targets_anchored(
         });
     }
 
-    extract_verification_filesystem_targets(text, &mut targets, 4, alias_roots, workspace_anchor);
+    extract_verification_filesystem_targets(
+        backend,
+        text,
+        &mut targets,
+        4,
+        alias_roots,
+        workspace_anchor,
+    );
 
     targets
 }

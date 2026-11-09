@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::execution::{active_execution_backend, ExecutionRequest};
+use crate::execution::{ExecutionBackend, ExecutionRequest};
 use crate::traits::{HandoffArtifact, StateStore, TaskAttempt, TaskWorkspace};
 
 #[derive(Debug, Default)]
@@ -91,8 +91,12 @@ fn isolated_workspace_slug(description: &str, task_id: &str) -> String {
     format!("{}-{}", base, short_component(task_id))
 }
 
-async fn git_output(cwd: &str, args: Vec<String>, timeout: Duration) -> anyhow::Result<String> {
-    let backend = active_execution_backend();
+async fn git_output(
+    backend: &dyn ExecutionBackend,
+    cwd: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let mut full_args = vec!["-C".to_string(), cwd.to_string()];
     full_args.extend(args);
     let output = backend
@@ -111,6 +115,7 @@ async fn git_output(cwd: &str, args: Vec<String>, timeout: Duration) -> anyhow::
 }
 
 pub(crate) async fn provision_task_workspace(
+    backend: &dyn ExecutionBackend,
     state: &dyn StateStore,
     task_id: &str,
     attempt: &TaskAttempt,
@@ -122,7 +127,6 @@ pub(crate) async fn provision_task_workspace(
         }
     }
 
-    let backend = active_execution_backend();
     let requested_policy = state.get_task_workspace_policy(task_id).await?;
     let task_description = state
         .get_task(task_id)
@@ -180,12 +184,14 @@ pub(crate) async fn provision_task_workspace(
     let resolved_scope = backend.resolve_path(scope).await?;
     let canonical_scope = backend.canonicalize(&resolved_scope).await?;
     let git_root = git_output(
+        backend,
         canonical_scope.as_str(),
         vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
         Duration::from_secs(20),
     )
     .await?;
     let base_ref = git_output(
+        backend,
         &git_root,
         vec!["rev-parse".to_string(), "HEAD".to_string()],
         Duration::from_secs(20),
@@ -215,6 +221,7 @@ pub(crate) async fn provision_task_workspace(
         released_at: None,
     };
     let create = git_output(
+        backend,
         &git_root,
         vec![
             "worktree".to_string(),
@@ -237,6 +244,7 @@ pub(crate) async fn provision_task_workspace(
 }
 
 pub(crate) async fn preserve_task_workspace(
+    backend: &dyn ExecutionBackend,
     state: &dyn StateStore,
     task_id: &str,
 ) -> anyhow::Result<WorkspaceEvidence> {
@@ -258,6 +266,7 @@ pub(crate) async fn preserve_task_workspace(
     };
     if workspace.policy == "worktree" {
         match git_output(
+            backend,
             &workspace.root_path,
             vec!["rev-parse".to_string(), "HEAD".to_string()],
             Duration::from_secs(20),
@@ -278,6 +287,7 @@ pub(crate) async fn preserve_task_workspace(
                 .push(format!("Could not read workspace HEAD: {error}")),
         }
         match git_output(
+            backend,
             &workspace.root_path,
             vec!["status".to_string(), "--porcelain".to_string()],
             Duration::from_secs(20),

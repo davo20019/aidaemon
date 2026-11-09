@@ -69,13 +69,14 @@ async fn task_failed_only_due_to_provider_infrastructure(
 /// hostname. When the operator configured none, the parent directory of the
 /// execution workspace is the structural default: sibling projects of the
 /// daemon's own checkout live there, whatever that directory is called.
-fn effective_alias_roots(configured: &[String]) -> Vec<String> {
+fn effective_alias_roots(
+    backend: &dyn crate::execution::ExecutionBackend,
+    configured: &[String],
+) -> Vec<String> {
     if !configured.is_empty() {
         return configured.to_vec();
     }
-    let workspace = crate::execution::active_execution_backend()
-        .workspace_root()
-        .to_string();
+    let workspace = backend.workspace_root().to_string();
     std::path::Path::new(&workspace)
         .parent()
         .filter(|parent| parent.is_dir())
@@ -118,9 +119,14 @@ fn recovery_task_context(
     .to_string()
 }
 
-fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
+fn resolve_dispatch_project_scope(
+    backend: &dyn crate::execution::ExecutionBackend,
+    mission: &str,
+    alias_roots: &[String],
+) -> Option<String> {
     let mut scopes = Vec::new();
     super::project_scope::extract_explicit_path_scopes_from_text(
+        backend,
         mission,
         &mut scopes,
         8,
@@ -174,11 +180,9 @@ fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Opti
                 continue;
             };
             let host = host.strip_prefix("www.").unwrap_or(host);
-            if let Some(scope) = crate::tools::fs_utils::resolve_named_project_root(
-                &*crate::execution::active_execution_backend(),
-                host,
-                alias_roots,
-            ) {
+            if let Some(scope) =
+                crate::tools::fs_utils::resolve_named_project_root(backend, host, alias_roots)
+            {
                 super::project_scope::push_project_scope(
                     &mut scopes,
                     scope.to_string_lossy().to_string(),
@@ -1226,8 +1230,12 @@ pub fn spawn_background_task_lead(
                 .or_else(|| inferred_project_scope_from_context(trigger_task_context.as_deref()))
                 .or_else(|| {
                     resolve_dispatch_project_scope(
+                        &*agent.execution_backend,
                         &mission,
-                        &effective_alias_roots(&agent.path_aliases.projects),
+                        &effective_alias_roots(
+                            &*agent.execution_backend,
+                            &agent.path_aliases.projects,
+                        ),
                     )
                 });
 
@@ -3295,6 +3303,18 @@ pub fn spawn_background_task_lead(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
+        super::resolve_dispatch_project_scope(
+            &*crate::execution::active_execution_backend(),
+            mission,
+            alias_roots,
+        )
+    }
+
+    fn effective_alias_roots(configured: &[String]) -> Vec<String> {
+        super::effective_alias_roots(&*crate::execution::active_execution_backend(), configured)
+    }
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, Intention, MandateAuthority, MandateDecisionCycle, Task};

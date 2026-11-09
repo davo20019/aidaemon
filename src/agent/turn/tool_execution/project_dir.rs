@@ -57,7 +57,9 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
             || token.starts_with("./")
             || token.starts_with("../")
             || looks_windows_abs;
-        let normalized = looks_path.then(|| normalize_project_dir(token)).flatten();
+        let normalized = looks_path
+            .then(|| normalize_project_dir(&*crate::execution::active_execution_backend(), token))
+            .flatten();
         let Some(normalized) = normalized else {
             continue;
         };
@@ -73,24 +75,20 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
     best.map(|(_, path)| path)
 }
 
-fn normalize_project_dir(raw_path: &str) -> Option<String> {
-    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
-        let mut path = crate::execution::normalize_path_lexically(
-            &*crate::execution::active_execution_backend(),
-            raw_path,
-        )
-        .ok()?;
+fn normalize_project_dir(
+    backend: &dyn crate::execution::ExecutionBackend,
+    raw_path: &str,
+) -> Option<String> {
+    if backend.kind() != crate::execution::BackendKind::Local {
+        let mut path = crate::execution::normalize_path_lexically(backend, raw_path).ok()?;
         if crate::tools::fs_utils::path_points_to_file(raw_path) {
             path = path.parent()?;
         }
         return Some(path.to_string());
     }
-    crate::tools::fs_utils::normalize_project_scope_path(
-        &*crate::execution::active_execution_backend(),
-        raw_path,
-    )
-    .ok()
-    .map(|path| path.to_string_lossy().to_string())
+    crate::tools::fs_utils::normalize_project_scope_path(backend, raw_path)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
@@ -99,15 +97,14 @@ fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn resolve_injected_working_dir(project_dir: &str) -> String {
-    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
+fn resolve_injected_working_dir(
+    backend: &dyn crate::execution::ExecutionBackend,
+    project_dir: &str,
+) -> String {
+    if backend.kind() != crate::execution::BackendKind::Local {
         return project_dir.to_string();
     }
-    let resolved = crate::tools::fs_utils::validate_path(
-        &*crate::execution::active_execution_backend(),
-        project_dir,
-    )
-    .ok();
+    let resolved = crate::tools::fs_utils::validate_path(backend, project_dir).ok();
     if let Some(path) = resolved {
         if !path.is_dir() {
             if let Some(parent) = path.parent() {
@@ -128,8 +125,10 @@ fn workspace_policy_allows_injected_working_dir(
     allow_outside_workspace || std::path::Path::new(candidate).starts_with(workspace_root)
 }
 
-fn active_workspace_policy_allows_injected_working_dir(candidate: &str) -> bool {
-    let backend = crate::execution::active_execution_backend();
+fn active_workspace_policy_allows_injected_working_dir(
+    backend: &dyn crate::execution::ExecutionBackend,
+    candidate: &str,
+) -> bool {
     workspace_policy_allows_injected_working_dir(
         candidate,
         backend.workspace_root().as_str(),
@@ -138,6 +137,7 @@ fn active_workspace_policy_allows_injected_working_dir(candidate: &str) -> bool 
 }
 
 fn collect_project_dirs_from_value(
+    backend: &dyn crate::execution::ExecutionBackend,
     value: &Value,
     parent_key: Option<&str>,
     collected: &mut Vec<String>,
@@ -154,13 +154,13 @@ fn collect_project_dirs_from_value(
             if !key_is_path_like {
                 return;
             }
-            if let Some(dir) = normalize_project_dir(trimmed) {
+            if let Some(dir) = normalize_project_dir(backend, trimmed) {
                 push_unique_project_dir(collected, dir);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_project_dirs_from_value(item, parent_key, collected);
+                collect_project_dirs_from_value(backend, item, parent_key, collected);
             }
         }
         Value::Object(map) => {
@@ -168,14 +168,18 @@ fn collect_project_dirs_from_value(
                 if k.starts_with('_') {
                     continue;
                 }
-                collect_project_dirs_from_value(v, Some(k.as_str()), collected);
+                collect_project_dirs_from_value(backend, v, Some(k.as_str()), collected);
             }
         }
         _ => {}
     }
 }
 
-pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &str) -> Vec<String> {
+pub(super) fn extract_project_dirs_from_tool_args(
+    backend: &dyn crate::execution::ExecutionBackend,
+    tool_name: &str,
+    args_json: &str,
+) -> Vec<String> {
     let parsed = match serde_json::from_str::<Value>(args_json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -184,24 +188,24 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
     let mut dirs = Vec::new();
     if tool_name == "terminal" {
         if let Some(cwd) = parsed.get("cwd") {
-            collect_project_dirs_from_value(cwd, Some("cwd"), &mut dirs);
+            collect_project_dirs_from_value(backend, cwd, Some("cwd"), &mut dirs);
         }
         if let Some(working_dir) = parsed.get("working_dir") {
-            collect_project_dirs_from_value(working_dir, Some("working_dir"), &mut dirs);
+            collect_project_dirs_from_value(backend, working_dir, Some("working_dir"), &mut dirs);
         }
         return dirs;
     }
     if tool_name == "project_inspect" {
         if let Some(path) = parsed.get("path") {
-            collect_project_dirs_from_value(path, Some("path"), &mut dirs);
+            collect_project_dirs_from_value(backend, path, Some("path"), &mut dirs);
         }
         if let Some(paths) = parsed.get("paths") {
-            collect_project_dirs_from_value(paths, Some("paths"), &mut dirs);
+            collect_project_dirs_from_value(backend, paths, Some("paths"), &mut dirs);
         }
         return dirs;
     }
 
-    collect_project_dirs_from_value(&parsed, None, &mut dirs);
+    collect_project_dirs_from_value(backend, &parsed, None, &mut dirs);
     dirs
 }
 
@@ -210,6 +214,7 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
 /// excluded; high-intent reads, writes, project entry, and command working
 /// directories mirror the just-in-time behavior of established coding agents.
 pub(in crate::agent) fn project_instruction_targets_for_tool_call(
+    backend: &dyn crate::execution::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
     semantics: &ToolCallSemantics,
@@ -238,7 +243,7 @@ pub(in crate::agent) fn project_instruction_targets_for_tool_call(
             targets.push(hint.value.clone());
         }
     }
-    for directory in extract_project_dirs_from_tool_args(tool_name, args_json) {
+    for directory in extract_project_dirs_from_tool_args(backend, tool_name, args_json) {
         if !targets.iter().any(|existing| existing == &directory) {
             targets.push(directory);
         }
@@ -258,15 +263,17 @@ fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
 }
 
 pub(in crate::agent) fn project_dir_from_tool_args(
+    backend: &dyn crate::execution::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
 ) -> Option<String> {
-    extract_project_dirs_from_tool_args(tool_name, args_json)
+    extract_project_dirs_from_tool_args(backend, tool_name, args_json)
         .into_iter()
         .next()
 }
 
 pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
+    backend: &dyn crate::execution::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
     known_project_dir: Option<&str>,
@@ -294,12 +301,12 @@ pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
         if !has_program {
             return None;
         }
-        let injected_dir = resolve_injected_working_dir(project_dir);
+        let injected_dir = resolve_injected_working_dir(backend, project_dir);
         // A shell command may safely reference paths outside a confined
         // workspace while still running from the workspace itself. Do not turn
         // that valid command into a rejected one by auto-prepending `cd` to an
         // out-of-scope inferred path.
-        if !active_workspace_policy_allows_injected_working_dir(&injected_dir) {
+        if !active_workspace_policy_allows_injected_working_dir(backend, &injected_dir) {
             return None;
         }
         // Execution cwd is first-class authority. Never hide it by rewriting
@@ -334,7 +341,7 @@ pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
     let injected_dir = if matches!(tool_name, "run_command" | "cli_agent") {
         // Scaffolding flow: if the target project dir doesn't exist yet, use
         // the nearest existing parent as working_dir so creation commands can run.
-        resolve_injected_working_dir(project_dir)
+        resolve_injected_working_dir(backend, project_dir)
     } else {
         project_dir.to_string()
     };
@@ -347,6 +354,52 @@ pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn maybe_inject_project_dir_into_tool_args(
+        tool_name: &str,
+        args_json: &str,
+        known_project_dir: Option<&str>,
+    ) -> Option<(String, String)> {
+        super::maybe_inject_project_dir_into_tool_args(
+            &*crate::execution::active_execution_backend(),
+            tool_name,
+            args_json,
+            known_project_dir,
+        )
+    }
+
+    fn project_dir_from_tool_args(tool_name: &str, args_json: &str) -> Option<String> {
+        super::project_dir_from_tool_args(
+            &*crate::execution::active_execution_backend(),
+            tool_name,
+            args_json,
+        )
+    }
+
+    fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &str) -> Vec<String> {
+        super::extract_project_dirs_from_tool_args(
+            &*crate::execution::active_execution_backend(),
+            tool_name,
+            args_json,
+        )
+    }
+
+    fn project_instruction_targets_for_tool_call(
+        tool_name: &str,
+        args_json: &str,
+        semantics: &ToolCallSemantics,
+    ) -> Vec<String> {
+        super::project_instruction_targets_for_tool_call(
+            &*crate::execution::active_execution_backend(),
+            tool_name,
+            args_json,
+            semantics,
+        )
+    }
+
+    fn normalize_project_dir(raw_path: &str) -> Option<String> {
+        super::normalize_project_dir(&*crate::execution::active_execution_backend(), raw_path)
+    }
     use proptest::prelude::*;
 
     #[test]

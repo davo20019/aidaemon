@@ -1251,7 +1251,10 @@ impl Agent {
             .event_store
             .task_run_aggregate(session_id, &unhandled_error_task_id)
             .await
-            .unwrap_or_else(|_| crate::events::RunAggregate::new(&unhandled_error_task_id));
+            .unwrap_or_else(|_| {
+                self.event_store
+                    .empty_run_aggregate(&unhandled_error_task_id)
+            });
         // Select the result for the aggregate's causal operation rather than
         // whichever unrelated receipt happened to be newest.
         let latest_result =

@@ -63,6 +63,7 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) watchdog_stale_threshold_secs: u64,
     pub(crate) goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
     pub(crate) terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
+    pub(crate) execution_backend: crate::execution::SharedExecutionBackend,
 }
 
 pub(crate) async fn init_heartbeat_coordinator(
@@ -86,6 +87,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         watchdog_stale_threshold_secs,
         goal_token_registry,
         terminal_tool,
+        execution_backend,
     } = dependencies;
     let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
@@ -374,12 +376,12 @@ pub(crate) async fn init_heartbeat_coordinator(
         heartbeat.register_job(
             "tool_result_cleanup",
             Duration::from_secs(3600),
-            move || async move {
-                crate::tools::result_spill::prune_spill_dir_for_backend(
-                    &*crate::execution::active_execution_backend(),
-                )
-                .await;
-                Ok(())
+            move || {
+                let backend = execution_backend.clone();
+                async move {
+                    crate::tools::result_spill::prune_spill_dir_for_backend(&*backend).await;
+                    Ok(())
+                }
             },
         );
 
