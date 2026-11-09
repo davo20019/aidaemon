@@ -1974,11 +1974,9 @@ async fn tools_declare_their_source_class() {
     let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
         std::collections::HashMap::new(),
     )));
-    let mcp = crate::mcp::McpTool::new(
-        "synthetic_mcp_tool".to_string(),
-        serde_json::json!({"name": "synthetic_mcp_tool", "description": "x", "parameters": {}}),
-        Arc::new(crate::mcp::McpClient::idle_for_test()),
-        crate::traits::ToolCapabilities::default(),
+    let mcp = crate::mcp::McpTool::detached_for_test(
+        "acme",
+        serde_json::json!({"name": "synthetic_mcp_tool", "description": "x"}),
     );
     let search_config: crate::config::SearchConfig = Default::default();
     let url = r#"{"url":"https://example.invalid"}"#;

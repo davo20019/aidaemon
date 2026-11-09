@@ -1,65 +1,59 @@
 mod client;
 pub mod registry;
-
-use std::sync::Arc;
+mod render;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::info;
 
-use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolVerificationMode,
-};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects};
 
 pub use client::McpClient;
 pub use registry::McpRegistry;
 
-/// A tool proxied from an MCP server.
+/// A tool proxied from an MCP server: the SDK's tool does the call, the
+/// daemon keeps the name, schema and rendering the model sees and the
+/// safeguards below.
 pub struct McpTool {
-    /// The name advertised to the LLM (may be prefixed for namespacing).
+    /// The name advertised to the LLM (`{server}__{tool}`, unsanitized).
     tool_name: String,
-    /// The raw name used when calling the MCP server (always unprefixed).
-    server_tool_name: String,
     tool_schema: Value,
-    client: Arc<McpClient>,
-    capabilities: ToolCapabilities,
+    tool: aidaemon_mcp::McpTool,
+}
+
+/// Every daemon MCP server starts with these: its tools are annotated at
+/// their worst whatever the server's hints claim (see
+/// [`mcp_tool_capabilities`]).
+pub(crate) fn server_options() -> aidaemon_mcp::McpOptions {
+    aidaemon_mcp::McpOptions {
+        annotations: Some(aidaemon_core::ToolAnnotations::DESTRUCTIVE),
+        ..Default::default()
+    }
 }
 
 impl McpTool {
-    /// A tool whose advertised name is its server name (tests only; the
-    /// registry always prefixes).
-    #[cfg(test)]
-    pub fn new(
-        tool_name: String,
-        tool_schema: Value,
-        client: Arc<McpClient>,
-        capabilities: ToolCapabilities,
-    ) -> Self {
-        let server_tool_name = tool_name.clone();
+    /// The daemon's view of a tool from `server`.
+    pub(crate) fn wrap(server: &str, tool: aidaemon_mcp::McpTool) -> Self {
+        let tool_name = format!("{server}__{}", tool.remote_name());
+        let tool_schema = serde_json::json!({
+            "name": tool_name,
+            "description": tool.definition()["description"].as_str().unwrap_or(""),
+            "parameters": aidaemon_core::Tool::spec(&tool).parameters,
+        });
         Self {
             tool_name,
-            server_tool_name,
             tool_schema,
-            client,
-            capabilities,
+            tool,
         }
     }
 
-    /// Create a tool with a prefixed name for the LLM but a raw name for the server.
-    pub fn with_prefix(
-        server_tool_name: String,
-        prefixed_name: String,
-        tool_schema: Value,
-        client: Arc<McpClient>,
-        capabilities: ToolCapabilities,
-    ) -> Self {
-        Self {
-            tool_name: prefixed_name,
-            server_tool_name,
-            tool_schema,
-            client,
-            capabilities,
-        }
+    /// A tool built as the registry builds one, with no process behind it.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(server: &str, definition: Value) -> Self {
+        Self::wrap(
+            server,
+            aidaemon_mcp::McpTool::detached(server, &definition, &server_options()),
+        )
     }
 }
 
@@ -112,7 +106,12 @@ impl Tool for McpTool {
         info!(mcp_tool = %self.tool_name, args = %args_preview, "MCP tool call started");
 
         let start = std::time::Instant::now();
-        let result = self.client.call_tool(&self.server_tool_name, args).await;
+        let result = self
+            .tool
+            .call_raw(args, None)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| render::format_tool_call_result(&result));
         let elapsed = start.elapsed();
 
         match &result {
@@ -143,7 +142,7 @@ impl Tool for McpTool {
 
 impl crate::traits::ToolSemantics for McpTool {
     fn capabilities(&self) -> ToolCapabilities {
-        self.capabilities
+        mcp_tool_capabilities()
     }
 
     /// The server is an opaque process: a mandate never delegates its tools.
@@ -168,32 +167,22 @@ impl crate::traits::ToolSemantics for McpTool {
         aidaemon_core::CallEffects::unknown()
     }
 
-    /// Never from the server's hints: every call is egress, not read-only,
-    /// destructive and non-idempotent, so the authority hook, the untrusted
-    /// verifier and the approval policy judge it at its worst.
+    /// Never from the server's hints ([`server_options`]): every call is
+    /// egress, not read-only, destructive and non-idempotent, so the
+    /// authority hook, the untrusted verifier and the approval policy judge
+    /// it at its worst.
     fn call_annotations_in(
         &self,
         _arguments: &str,
         _roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
-        aidaemon_core::ToolAnnotations {
-            read_only: false,
-            destructive: true,
-            idempotent: false,
-            egress: true,
-        }
+        aidaemon_core::Tool::annotations(&self.tool)
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        if self.capabilities.read_only {
-            return ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent);
-        }
-        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
-        if self.capabilities.high_impact_write {
-            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
-        }
-        ToolCallSemantics::mutation_with(effects)
+        ToolCallSemantics::mutation_with(
+            ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::DESTRUCTIVE),
+        )
     }
 }
 
@@ -271,31 +260,50 @@ mod annotation_tests {
     use super::*;
 
     fn mcp_tool(annotations: Value) -> McpTool {
-        McpTool::new(
-            "synthetic_tool".to_string(),
-            // The server's hints travel with the definition; nothing reads them.
+        // The definition carries the server's hints, as `tools/list` does.
+        McpTool::detached_for_test(
+            "acme",
             serde_json::json!({
                 "name": "synthetic_tool",
                 "description": "",
-                "parameters": {"type": "object"},
+                "inputSchema": {"type": "object"},
                 "annotations": annotations,
             }),
-            Arc::new(McpClient::idle_for_test()),
-            mcp_tool_capabilities(),
         )
+    }
+
+    /// The model sees `{server}__{tool}` with the name the server gave,
+    /// not the SDK's sanitized one, and the server's own description.
+    #[test]
+    fn wrapped_tools_keep_the_daemon_name_and_schema() {
+        let tool = McpTool::detached_for_test(
+            "acme",
+            serde_json::json!({
+                "name": "files.read",
+                "title": "Reads files",
+                "inputSchema": {"$schema": "x", "type": "object"},
+            }),
+        );
+        assert_eq!(tool.name(), "acme__files.read");
+        assert_eq!(
+            tool.schema(),
+            serde_json::json!({
+                "name": "acme__files.read",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            })
+        );
     }
 
     /// A mandate never delegates an MCP tool, whatever the server and tool
     /// are called: the tool declares opaque execution.
     #[test]
     fn mcp_tools_are_never_delegated_to_a_mandate() {
-        let tool = McpTool::with_prefix(
-            "post".to_string(),
-            "x__post".to_string(),
-            serde_json::json!({"name": "x__post", "description": "", "parameters": {}}),
-            Arc::new(McpClient::idle_for_test()),
-            mcp_tool_capabilities(),
+        let tool = McpTool::detached_for_test(
+            "x",
+            serde_json::json!({"name": "post", "inputSchema": {"type": "object"}}),
         );
+        assert_eq!(tool.name(), "x__post");
         assert!(crate::mandates::is_non_delegable(&tool));
         assert!(!crate::mandates::is_non_delegable_tool("x__post"));
     }

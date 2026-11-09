@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
-use crate::mcp::{mcp_tool_capabilities, McpClient, McpTool};
+use crate::mcp::{McpClient, McpTool};
 use crate::traits::{DynamicMcpServer, MandateAuthority, McpRegistryStore, Tool};
 
 /// A running MCP server entry in the registry.
@@ -112,40 +112,13 @@ impl McpRegistry {
         let client =
             Arc::new(McpClient::spawn(name, &config.command, &config.args, &config.env).await?);
 
-        // List tools from the server
-        let tool_defs = client.list_tools().await?;
-
         let mut tool_names = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
-        for td in &tool_defs {
-            let raw_name = td["name"].as_str().unwrap_or("unknown").to_string();
-            let prefixed_name = format!("{}__{}", name, raw_name);
-            let desc = td["description"].as_str().unwrap_or("").to_string();
-            let mut schema = td["inputSchema"].clone();
-            // Strip $schema — Google Gemini API rejects it in function parameters
-            if let Some(obj) = schema.as_object_mut() {
-                obj.remove("$schema");
-                // MCP allows a bare `{"type": "object"}` for a tool without
-                // arguments; the tool contract wants `properties`.
-                obj.entry("properties")
-                    .or_insert_with(|| serde_json::json!({}));
-            }
-
-            let tool_schema = serde_json::json!({
-                "name": prefixed_name,
-                "description": desc,
-                "parameters": schema,
-            });
-
-            tool_names.push(prefixed_name.clone());
-            tools.push(Arc::new(McpTool::with_prefix(
-                raw_name.clone(),
-                prefixed_name,
-                tool_schema,
-                Arc::clone(&client),
-                mcp_tool_capabilities(),
-            )));
+        for tool in client.tools() {
+            let tool = McpTool::wrap(name, tool);
+            tool_names.push(tool.name().to_string());
+            tools.push(Arc::new(tool));
         }
 
         // Keep explicit server aliases only. We no longer infer trigger keywords
