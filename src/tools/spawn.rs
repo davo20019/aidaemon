@@ -3,8 +3,6 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -203,13 +201,31 @@ fn truncate_utf8(s: &str, max_chars: usize) -> &str {
     &s[..boundary]
 }
 
+/// A child's reply, cut to `max_len` with a notice saying what was left out
+/// and how to get it.
+fn bounded_child_response(response: &str, max_len: usize) -> String {
+    if response.len() <= max_len {
+        return response.to_string();
+    }
+    let shown = truncate_utf8(response, max_len);
+    format!(
+        "{shown}\n\n{}",
+        crate::utils::truncation_notice_with_hint(
+            shown.chars().count(),
+            response.chars().count(),
+            "To see the rest, delegate again and ask the sub-agent to write the full \
+             result to a file and return its path, or to answer a narrower question.",
+        )
+    )
+}
+
 fn format_background_completion(
     mission: &str,
     response: &str,
     outcome: TaskOutcome,
     max_response_chars: usize,
 ) -> (&'static str, String) {
-    let text = truncate_utf8(response, max_response_chars);
+    let text = bounded_child_response(response, max_response_chars);
     match outcome {
         TaskOutcome::Succeeded => (
             "completed",
@@ -235,48 +251,9 @@ fn format_background_completion(
     }
 }
 
-/// Parse a leading wait/delay prefix from a task string.
-/// Examples: "wait for 2 minutes ...", "in 30 seconds ...", "after 1 hour ..."
-fn parse_leading_wait_seconds(task: &str) -> Option<u64> {
-    static LEADING_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\b",
-        )
-        .expect("leading wait regex should compile")
-    });
-
-    let caps = LEADING_WAIT_RE.captures(task.trim())?;
-    let value: u64 = caps.get(1)?.as_str().parse().ok()?;
-    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
-    match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(value),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(value.saturating_mul(60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(value.saturating_mul(3600)),
-        _ => None,
-    }
-}
-
-/// Strip a leading wait/delay prefix from a task string.
-fn strip_leading_wait(task: &str) -> String {
-    static STRIP_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)\d+\s*(?:seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\s*[,;]?\s*(?:then\s+|and\s+|,\s*)?",
-        )
-        .expect("strip wait regex should compile")
-    });
-
-    let remainder = STRIP_WAIT_RE.replace(task.trim(), "").to_string();
-    let trimmed = remainder.trim().to_string();
-    if trimmed.len() < 3 {
-        String::new()
-    } else {
-        trimmed
-    }
-}
-
+/// Queue a background job's notification for later delivery.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_background_notification(
-    hub: Option<&Arc<dyn OutboundRouter>>,
+async fn enqueue_background_notification(
     state: Option<&Arc<dyn StateStore>>,
     goal_id: &str,
     session_id: &str,
@@ -286,44 +263,25 @@ async fn deliver_background_notification(
     untrusted: bool,
 ) {
     let message = crate::channels::present_notification(notification_type, message);
-    let mut delivered = false;
-    if let Some(hub_arc) = hub {
-        if let Err(e) = hub_arc.send_text(session_id, &message).await {
-            warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: direct hub delivery failed"
-            );
-        } else {
-            delivered = true;
-        }
-    }
-
-    if delivered {
-        return;
-    }
-
-    if let Some(state_store) = state {
-        let entry =
-            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message)
-                .with_untrusted(untrusted);
-        if let Err(e) = state_store.enqueue_notification(&entry).await {
-            warn!(
-                session_id = %session_id,
-                goal_id = %goal_id,
-                notification_type = %notification_type,
-                error = %e,
-                "{context}: enqueue fallback failed"
-            );
-        }
-    } else {
+    let Some(state_store) = state else {
         warn!(
             session_id = %session_id,
             goal_id = %goal_id,
             notification_type = %notification_type,
-            "{context}: no hub and no queue fallback configured; update dropped"
+            "{context}: no queue configured; update dropped"
+        );
+        return;
+    };
+    let entry =
+        crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, &message)
+            .with_untrusted(untrusted);
+    if let Err(e) = state_store.enqueue_notification(&entry).await {
+        warn!(
+            session_id = %session_id,
+            goal_id = %goal_id,
+            notification_type = %notification_type,
+            error = %e,
+            "{context}: enqueue failed"
         );
     }
 }
@@ -534,40 +492,8 @@ impl Tool for SpawnAgentTool {
             None
         };
 
-        // Fast-path leading wait tasks to avoid burning tokens in a child loop.
-        // This covers direct spawn_agent executor calls (which bypass task-lead
-        // auto-dispatch wait interception).
-        let mut effective_mission = args.mission.clone();
-        let mut effective_task = args.task.clone();
-        if let Some(wait_secs) = parse_leading_wait_seconds(&effective_task) {
-            let remainder = strip_leading_wait(&effective_task);
-            info!(
-                wait_secs,
-                has_remainder = !remainder.is_empty(),
-                "Intercepted leading wait in spawn_agent task; sleeping locally"
-            );
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-
-            if remainder.is_empty() {
-                if let Some(ref task_id) = executor_task_id {
-                    self.finish_executor_task(task_id).await;
-                }
-                return Ok(reported(
-                    format!("Waited for {} second(s).", wait_secs),
-                    SourceTrust::Trusted,
-                ));
-            }
-
-            effective_task = remainder.clone();
-            // Keep mission aligned when it appears to mirror task input.
-            if parse_leading_wait_seconds(&effective_mission).is_some()
-                || effective_mission
-                    .trim()
-                    .eq_ignore_ascii_case(args.task.trim())
-            {
-                effective_mission = remainder;
-            }
-        }
+        let effective_mission = args.mission.clone();
+        let effective_task = args.task.clone();
 
         let approval_session_id = facts.session().map(str::to_string);
 
@@ -690,10 +616,6 @@ impl Tool for SpawnAgentTool {
                     res = &mut result_fut => break res,
                     _ = progress_interval.tick() => {
                         let elapsed_secs = started_at.elapsed().as_secs();
-                        let progress_message = format!(
-                            "Background sub-agent still running after {}s.\nMission: {}",
-                            elapsed_secs, mission
-                        );
                         if let Some(ref tx) = notify_status_tx {
                             let _ = tx.try_send(StatusUpdate::ToolProgress {
                                 name: "spawn_agent".to_string(),
@@ -703,17 +625,6 @@ impl Tool for SpawnAgentTool {
                                 ),
                             });
                         }
-                        deliver_background_notification(
-                            hub.as_ref(),
-                            state.as_ref(),
-                            &notify_goal_id,
-                            &session_id,
-                            "progress",
-                            &progress_message,
-                            "spawn_agent background progress notifier",
-                            false,
-                        )
-                        .await;
                     }
                 }
             };
@@ -810,8 +721,7 @@ impl Tool for SpawnAgentTool {
             if !delivered {
                 // The queued copy carries the child's taint into whichever
                 // parent turn records it.
-                deliver_background_notification(
-                    None,
+                enqueue_background_notification(
                     state.as_ref(),
                     &notify_goal_id,
                     &session_id,
@@ -933,16 +843,7 @@ impl SpawnAgentTool {
                         return Err(anyhow::anyhow!("Sub-agent failed: {}", run.response));
                     }
                 };
-                let max_len = self.max_response_chars;
-                let response = if response.len() > max_len {
-                    let truncated = truncate_utf8(&response, max_len);
-                    format!(
-                        "{}\n\n[Sub-agent response truncated at {} chars]",
-                        truncated, max_len
-                    )
-                } else {
-                    response
-                };
+                let response = bounded_child_response(&response, self.max_response_chars);
                 Ok(reported(response, run.trust))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Specialist failed: {}", e)),
@@ -1177,26 +1078,6 @@ mod tests {
         assert!(!build_child_channel_context(&ToolCallContext::default()).trusted);
     }
 
-    #[test]
-    fn parse_and_strip_leading_wait() {
-        assert_eq!(
-            parse_leading_wait_seconds("wait for 2 minutes then run df"),
-            Some(120)
-        );
-        assert_eq!(
-            strip_leading_wait("wait for 2 minutes then run df"),
-            "run df"
-        );
-        assert_eq!(parse_leading_wait_seconds("in 45 sec check disk"), Some(45));
-        assert_eq!(strip_leading_wait("after 1 hour, reboot"), "reboot");
-    }
-
-    #[test]
-    fn strip_leading_wait_pure_wait_returns_empty() {
-        assert_eq!(parse_leading_wait_seconds("wait 5 min"), Some(300));
-        assert!(strip_leading_wait("wait 5 min").is_empty());
-    }
-
     #[tokio::test]
     async fn executor_task_lock_deduplicates_concurrent_spawns() {
         let tool = SpawnAgentTool::new_deferred(8000, 300);
@@ -1213,7 +1094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_notification_falls_back_to_queue_when_hub_missing() {
+    async fn background_notification_reaches_the_queue() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
@@ -1224,13 +1105,12 @@ mod tests {
         );
         let state_dyn: Arc<dyn StateStore> = state.clone();
 
-        deliver_background_notification(
-            None,
+        enqueue_background_notification(
             Some(&state_dyn),
             "goal_spawn_test",
             "sess_spawn_test",
-            "progress",
-            "Background sub-agent still running after 20s.\nMission: test",
+            "completed",
+            "Background task complete.\nMission: test",
             "spawn_test",
             false,
         )
@@ -1240,8 +1120,8 @@ mod tests {
         assert!(pending.iter().any(|entry| {
             entry.goal_id == "goal_spawn_test"
                 && entry.session_id == "sess_spawn_test"
-                && entry.notification_type == "progress"
-                && entry.message.contains("still running")
+                && entry.notification_type == "completed"
+                && entry.message.contains("Mission: test")
         }));
     }
 }
@@ -1353,5 +1233,249 @@ mod specialist_arg_tests {
             .and_then(|d| d.as_str())
             .expect("specialist description string");
         assert_eq!(desc, STATIC_SPECIALIST_ARG_DESCRIPTION);
+    }
+}
+
+#[cfg(test)]
+mod child_runtime_tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::runtime_ports::{ChildAgentRun, SalvagedTaskOutcome};
+    use crate::state::SqliteStateStore;
+    use crate::traits::NotificationStore;
+    use std::sync::Mutex as StdMutex;
+
+    /// A child runtime that answers from a script, recording what it was asked.
+    struct ScriptedChild {
+        response: String,
+        delay: Duration,
+        tasks: StdMutex<Vec<String>>,
+    }
+
+    impl ScriptedChild {
+        fn new(response: &str, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                response: response.to_string(),
+                delay,
+                tasks: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChildAgentRuntime for ScriptedChild {
+        fn depth(&self) -> usize {
+            0
+        }
+        fn max_depth(&self) -> usize {
+            3
+        }
+        fn role(&self) -> AgentRole {
+            AgentRole::Orchestrator
+        }
+        fn specialist_descriptions(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        async fn validate_executor_task_for_spawn(
+            &self,
+            _task_id: &str,
+            _expected_goal_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
+            self.tasks.lock().unwrap().push(request.task);
+            tokio::time::sleep(self.delay).await;
+            Ok(ChildAgentRun {
+                response: self.response.clone(),
+                outcome: TaskOutcome::Succeeded,
+                trust: SourceTrust::Trusted,
+            })
+        }
+        async fn salvage_executor_task_outcome(
+            &self,
+            _task_id: &str,
+            _timeout_secs: u64,
+        ) -> Option<SalvagedTaskOutcome> {
+            None
+        }
+        async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
+        async fn deliver_background_child_result(
+            &self,
+            _router: Option<&Weak<dyn OutboundRouter>>,
+            _parent_session_id: &str,
+            _text: &str,
+            _trust: SourceTrust,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn tool_for(child: &Arc<ScriptedChild>) -> SpawnAgentTool {
+        let tool = SpawnAgentTool::new_deferred(100, 30);
+        let runtime: Arc<dyn ChildAgentRuntime> = child.clone();
+        tool.set_agent(Arc::downgrade(&runtime));
+        tool
+    }
+
+    fn facts() -> ToolCallContext {
+        ToolCallContext {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn notification_store() -> Arc<SqliteStateStore> {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        std::mem::forget(db_file);
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A task that merely starts like a delay reaches the child at once and
+    /// word for word: wording never decides whether to wait.
+    #[tokio::test]
+    async fn task_wording_never_delays_the_child() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let tool = tool_for(&child);
+        let task = "In 5 hours of logs, find the errors";
+        let args = json!({"mission": "Log review", "task": task}).to_string();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.call_with_execution_context(&args, None, facts()),
+        )
+        .await
+        .expect("the child starts immediately")
+        .unwrap();
+
+        assert_eq!(*child.tasks.lock().unwrap(), vec![task.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn truncated_foreground_result_says_what_is_missing() {
+        let child = ScriptedChild::new(&"x".repeat(500), Duration::ZERO);
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Report", "task": "Write the report"}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("OUTPUT TRUNCATED"));
+        assert!(outcome.output.contains("400 omitted"));
+    }
+
+    #[test]
+    fn truncated_background_result_says_what_is_missing() {
+        let (_, message) = format_background_completion(
+            "Report",
+            &"x".repeat(500),
+            TaskOutcome::Succeeded,
+            100,
+        );
+        assert!(message.contains("OUTPUT TRUNCATED"));
+    }
+
+    /// Counts what reaches the chat.
+    #[derive(Default)]
+    struct CountingHub {
+        sent: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for CountingHub {
+        async fn send_text(&self, _session_id: &str, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// A background job reports when it has something to report: its result.
+    #[tokio::test]
+    async fn background_child_sends_no_interim_chat_messages() {
+        let child = ScriptedChild::new("all done", Duration::from_millis(2_500));
+        let hub = Arc::new(CountingHub::default());
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        tool.set_hub(Arc::downgrade(&router));
+        let args =
+            json!({"mission": "Report", "task": "Write it", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = store.get_pending_notifications(10).await.unwrap();
+                if pending.iter().any(|n| n.notification_type == "completed") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the result arrives");
+
+        let sent = hub.sent.lock().unwrap();
+        assert!(sent.is_empty(), "no interim pings: {sent:?}");
     }
 }
