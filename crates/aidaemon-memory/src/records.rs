@@ -260,6 +260,14 @@ pub struct Episode {
     pub channel_id: Option<String>,
 }
 
+/// Where an episode stopped: the last event it covers (recent episodes) or
+/// its end time (older ones, which recorded no event bound), as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeBound {
+    pub end_event_id: Option<i64>,
+    pub end_time: Option<String>,
+}
+
 /// A person in the owner's social circle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Person {

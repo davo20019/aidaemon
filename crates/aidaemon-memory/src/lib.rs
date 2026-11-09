@@ -109,11 +109,11 @@ pub use extract::{
     parse_facts, EpisodeDraft, EpisodeSummarizer, ExtractedFact, Extraction, FactExtractor,
 };
 pub use learning::{
-    detect_domains, error_pattern, expertise_level, extract_trigger_pattern, generalize_procedure,
-    new_error_solution, new_procedure, procedure_base_name, procedure_keyed_name,
-    record_tool_sequence_patterns, summarize_solution, tool_sequence_patterns,
-    update_communication_profile, verbosity_from_messages, BehaviorPattern, ErrorSolution,
-    Expertise, LearningStore, Procedure, UserProfile,
+    backfill_learning_embeddings, detect_domains, error_pattern, expertise_level,
+    extract_trigger_pattern, generalize_procedure, new_error_solution, new_procedure,
+    procedure_base_name, procedure_keyed_name, record_tool_sequence_patterns, summarize_solution,
+    tool_sequence_patterns, update_communication_profile, verbosity_from_messages, BehaviorPattern,
+    ErrorSolution, Expertise, LearningStore, Procedure, UserProfile,
 };
 pub use memory::{IngestReport, Memory, MemoryBuilder, ScopeResolver};
 pub use recall::MemoryRecall;

@@ -177,6 +177,18 @@ pub trait FactStore: Send + Sync {
         Ok(())
     }
 
+    /// Record where the active fact at this key came from.
+    async fn stamp_fact_provenance(
+        &self,
+        _category: &str,
+        _key: &str,
+        _source: &str,
+        _first_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+        _source_excerpt: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Soft-delete a fact by superseding it.
     async fn delete_fact(&self, _fact_id: i64) -> anyhow::Result<()> {
         Ok(())
@@ -284,6 +296,17 @@ pub trait EpisodeStore: Send + Sync {
         _limit: usize,
         _session_id: &str,
     ) -> anyhow::Result<Vec<Episode>> {
+        Ok(vec![])
+    }
+
+    /// Where the session's most recent episode stopped, if it has one.
+    async fn last_episode_bound(&self, _session_id: &str) -> anyhow::Result<Option<EpisodeBound>> {
+        Ok(None)
+    }
+
+    /// `(session id, latest episode end time)` for every session with an
+    /// episode.
+    async fn latest_episode_ends(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(vec![])
     }
 

@@ -2,6 +2,32 @@ use super::*;
 
 #[async_trait]
 impl EpisodeStore for SqliteMemory {
+    async fn last_episode_bound(&self, session_id: &str) -> anyhow::Result<Option<EpisodeBound>> {
+        let row = sqlx::query(
+            "SELECT end_event_id, end_time FROM episodes
+             WHERE session_id = ?
+             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| EpisodeBound {
+            end_event_id: row.try_get::<Option<i64>, _>("end_event_id").ok().flatten(),
+            end_time: row.try_get::<String, _>("end_time").ok(),
+        }))
+    }
+
+    async fn latest_episode_ends(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT session_id, MAX(end_time) FROM episodes GROUP BY session_id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(session_id, end)| end.map(|end| (session_id, end)))
+            .collect())
+    }
+
     /// Insert the episode with the event span it covers, then embed its
     /// summary and project it into the memory index. Multiple episodes per
     /// session are allowed (mid-session ones for long conversations, then a
