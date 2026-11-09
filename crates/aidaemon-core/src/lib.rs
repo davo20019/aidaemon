@@ -30,6 +30,7 @@ mod quota;
 mod receipt;
 mod run_loop;
 mod safeguard;
+mod service;
 mod state;
 mod store;
 mod stuck;
@@ -68,6 +69,10 @@ pub use provider::{
 pub use quota::{Cooldown, QuotaGuard};
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};
 pub use safeguard::Safeguard;
+pub use service::{
+    FnService, Schedule, Service, ServiceContext, ServiceError, ServiceEvent, ServiceGate,
+    ServiceHost, ServiceObserver, ServiceWaker,
+};
 pub use state::{
     InFlight, Interruption, Pending, PendingFinish, RunId, RunState, RUN_STATE_SCHEMA,
 };

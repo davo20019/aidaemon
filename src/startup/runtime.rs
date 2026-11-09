@@ -483,14 +483,15 @@ pub(crate) fn start_heartbeat_coordinator(
     heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator>,
     hub: &Arc<ChannelHub>,
     agent: &Arc<Agent>,
-) {
-    if let Some(mut heartbeat) = heartbeat_opt {
+    shutdown: aidaemon_core::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    heartbeat_opt.map(|mut heartbeat| {
         let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
         heartbeat.set_hub(Arc::downgrade(&outbound));
         heartbeat.set_agent(Arc::downgrade(agent));
         info!("Heartbeat coordinator starting with hub and agent references");
-        heartbeat.start();
-    }
+        heartbeat.start(shutdown)
+    })
 }
 
 pub(crate) async fn restore_session_map(state: Arc<dyn SessionChannelStore>) -> SessionMap {

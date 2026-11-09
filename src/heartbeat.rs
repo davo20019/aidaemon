@@ -1,16 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use aidaemon_core::{
+    CancellationToken, FnService, Schedule, Service, ServiceContext, ServiceError, ServiceEvent,
+    ServiceGate, ServiceHost, ServiceObserver,
+};
+use async_trait::async_trait;
+
 use chrono::Utc;
-use futures::FutureExt;
 use serde::Serialize;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::agent::{build_goal_task_results_summary, is_group_session, Agent};
@@ -439,35 +443,137 @@ type HeartbeatRunFn =
 pub struct HeartbeatJob {
     pub name: String,
     pub interval: Duration,
-    pub last_run: Option<Instant>,
-    /// Guards against overlapping invocations of the same job.
-    pub is_running: Arc<AtomicBool>,
-    /// Consecutive failure count — drives exponential backoff.
-    pub consecutive_failures: Arc<AtomicU32>,
-    /// The async function to call. Runs in a spawned tokio task.
+    /// The async function to call.
     pub run: HeartbeatRunFn,
 }
 
-/// Coordinates all background periodic tasks in a single tick loop.
-///
-/// Each tick takes milliseconds (SQLite reads + task spawns). Actual work
-/// runs in parallel tokio tasks gated by an `Arc<Semaphore>`.
+/// The daemon's background work: its periodic jobs, and the goal cycle
+/// (schedules, mandates, stuck tasks, notifications), run on a
+/// [`ServiceHost`].
 pub struct HeartbeatCoordinator {
     jobs: Vec<HeartbeatJob>,
     state: Arc<dyn StateStore>,
-    semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
     tick_interval: Duration,
-    wake_rx: mpsc::Receiver<()>,
+    wake_rx: Option<mpsc::Receiver<()>>,
     hub: Option<Weak<dyn OutboundRouter>>,
     goal_token_registry: Option<GoalTokenRegistry>,
     telemetry: Option<Arc<HeartbeatTelemetry>>,
     agent: Option<Weak<Agent>>,
-    db_healthy: bool,
     last_stale_goal_cleanup: Option<Instant>,
     /// Seconds of no task activity before `detect_stuck_tasks` interrupts a
     /// running/claimed task. Defaults to 300; overridden from config via
     /// `set_task_inactivity_timeout`.
     task_inactivity_timeout_secs: i64,
+}
+
+/// Skips a whole tick while the database cannot answer.
+struct DbHealthGate {
+    state: Arc<dyn StateStore>,
+    healthy: AtomicBool,
+}
+
+#[async_trait]
+impl ServiceGate for DbHealthGate {
+    async fn ready(&self) -> bool {
+        match self.state.health_check().await {
+            Ok(_) => {
+                if !self.healthy.swap(true, Ordering::Relaxed) {
+                    info!("DB health restored");
+                }
+                true
+            }
+            Err(e) => {
+                if self.healthy.swap(false, Ordering::Relaxed) {
+                    error!(error = %e, "DB health check failed — skipping tick");
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Logs service outcomes and feeds the dashboard's job table.
+struct JobObserver {
+    telemetry: Option<Arc<HeartbeatTelemetry>>,
+}
+
+impl ServiceObserver for JobObserver {
+    fn event(&self, event: ServiceEvent) {
+        let telemetry = self.telemetry.as_ref();
+        match event {
+            ServiceEvent::Launched { service } => {
+                tracing::debug!(job = %service, "Heartbeat job starting");
+                if let Some(t) = telemetry {
+                    t.mark_started(&service);
+                }
+            }
+            ServiceEvent::Succeeded {
+                service,
+                previous_failures,
+            } => {
+                if previous_failures > 0 {
+                    info!(job = %service, prev_failures = previous_failures, "Heartbeat job recovered");
+                }
+                if let Some(t) = telemetry {
+                    t.mark_success(&service);
+                }
+            }
+            ServiceEvent::Failed {
+                service,
+                failures,
+                error,
+            } => {
+                error!(
+                    job = %service,
+                    error = %error,
+                    consecutive_failures = failures,
+                    "Heartbeat job failed — backing off"
+                );
+                if let Some(t) = telemetry {
+                    t.mark_failure(&service, failures, error);
+                }
+            }
+            ServiceEvent::StartFailed { service, error } => {
+                error!(job = %service, error = %error, "Heartbeat service failed to start");
+            }
+            ServiceEvent::Finished { service } => {
+                if let Some(t) = telemetry {
+                    t.mark_not_running(&service);
+                }
+            }
+        }
+    }
+}
+
+/// The goal cycle as one service: its phases depend on their order.
+struct GoalCycle {
+    coordinator: tokio::sync::Mutex<HeartbeatCoordinator>,
+}
+
+#[async_trait]
+impl Service for GoalCycle {
+    fn name(&self) -> &str {
+        "goal_cycle"
+    }
+
+    fn schedule(&self) -> Schedule {
+        Schedule::EveryTick
+    }
+
+    async fn start(&self, _ctx: &ServiceContext) -> Result<(), ServiceError> {
+        self.coordinator.lock().await.startup_recovery().await;
+        Ok(())
+    }
+
+    async fn run(&self, _ctx: &ServiceContext) -> Result<(), ServiceError> {
+        self.coordinator
+            .lock()
+            .await
+            .tick()
+            .await
+            .map_err(|e| ServiceError::new(e.to_string()))
+    }
 }
 
 impl HeartbeatCoordinator {
@@ -492,14 +598,13 @@ impl HeartbeatCoordinator {
         Self {
             jobs: Vec::new(),
             state,
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
             tick_interval: Duration::from_secs(tick_interval_secs),
-            wake_rx,
+            wake_rx: Some(wake_rx),
             hub,
             goal_token_registry,
             telemetry,
             agent: None,
-            db_healthy: true,
             last_stale_goal_cleanup: None,
             task_inactivity_timeout_secs: 300,
         }
@@ -531,9 +636,6 @@ impl HeartbeatCoordinator {
         self.jobs.push(HeartbeatJob {
             name: name.to_string(),
             interval,
-            last_run: None,
-            is_running: Arc::new(AtomicBool::new(false)),
-            consecutive_failures: Arc::new(AtomicU32::new(0)),
             run: Box::new(move || Box::pin(f())),
         });
         if let Some(telemetry) = &self.telemetry {
@@ -541,22 +643,46 @@ impl HeartbeatCoordinator {
         }
     }
 
-    /// Consume self and start the tick loop in a spawned tokio task.
-    pub fn start(mut self) {
-        tokio::spawn(async move {
-            // One-time startup recovery before entering the tick loop
-            self.startup_recovery().await;
+    /// The host that runs this coordinator's jobs and goal cycle.
+    pub(crate) fn into_host(mut self) -> ServiceHost {
+        let mut host = ServiceHost::new(self.tick_interval)
+            .max_concurrent(self.max_concurrent)
+            .gate(Arc::new(DbHealthGate {
+                state: self.state.clone(),
+                healthy: AtomicBool::new(true),
+            }))
+            .observer(Arc::new(JobObserver {
+                telemetry: self.telemetry.clone(),
+            }));
+        for job in std::mem::take(&mut self.jobs) {
+            let HeartbeatJob {
+                name,
+                interval,
+                run,
+            } = job;
+            let service = FnService::new(name, Schedule::Every(interval), move || {
+                let run = run();
+                async move { run.await.map_err(|e| ServiceError::new(e.to_string())) }
+            });
+            host = host.service(Arc::new(service));
+        }
+        // A user message wakes the cycle at once.
+        if let Some(mut wake_rx) = self.wake_rx.take() {
+            let waker = host.waker();
+            tokio::spawn(async move {
+                while wake_rx.recv().await.is_some() {
+                    waker.wake();
+                }
+            });
+        }
+        host.service(Arc::new(GoalCycle {
+            coordinator: tokio::sync::Mutex::new(self),
+        }))
+    }
 
-            loop {
-                if let Err(e) = self.tick().await {
-                    error!("Heartbeat tick failed: {}", e);
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(self.tick_interval) => {},
-                    _ = self.wake_rx.recv() => {},  // user message wakes immediately
-                }
-            }
-        });
+    /// Run in the background until `shutdown` is cancelled.
+    pub fn start(self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.into_host().run(shutdown))
     }
 
     /// One-time recovery after startup: mark interrupted tasks, rebuild token registry.
@@ -691,120 +817,10 @@ impl HeartbeatCoordinator {
         info!("Startup recovery complete");
     }
 
-    /// Run one tick: 5-phase cycle.
+    /// One pass of the goal cycle. Periodic jobs and the database check are
+    /// the host's.
     pub(crate) async fn tick(&mut self) -> anyhow::Result<()> {
-        // Phase 0: Health check
-        if let Err(e) = self.state.health_check().await {
-            if self.db_healthy {
-                error!(error = %e, "DB health check failed — skipping tick");
-                self.db_healthy = false;
-            }
-            return Ok(());
-        }
-        if !self.db_healthy {
-            info!("DB health restored");
-            self.db_healthy = true;
-        }
-
-        // Phase 1: Fire registered periodic jobs
         let now = Instant::now();
-        for job in &mut self.jobs {
-            let should_run = match job.last_run {
-                None => true,
-                Some(last) => now.duration_since(last) >= job.interval,
-            };
-
-            if should_run {
-                // Skip if previous invocation is still running
-                if job.is_running.load(Ordering::Relaxed) {
-                    tracing::debug!(job = %job.name, "Skipping — previous invocation still running");
-                    continue;
-                }
-
-                // Exponential backoff: if the job has been failing, delay its next run.
-                // effective_interval = interval * 2^min(failures, 5)
-                let failures = job.consecutive_failures.load(Ordering::Relaxed);
-                if failures > 0 {
-                    let backoff_multiplier = 2u32.pow(failures.min(5));
-                    let effective_interval = job.interval * backoff_multiplier;
-                    let actual_elapsed = match job.last_run {
-                        Some(last) => now.duration_since(last),
-                        None => effective_interval, // first run, allow it
-                    };
-                    if actual_elapsed < effective_interval {
-                        tracing::debug!(
-                            job = %job.name,
-                            failures,
-                            backoff_secs = effective_interval.as_secs(),
-                            "Skipping — backoff not elapsed"
-                        );
-                        continue;
-                    }
-                }
-
-                job.last_run = Some(now);
-                let sem = self.semaphore.clone();
-                let run_fn = &job.run;
-                let fut = (run_fn)();
-                let job_name = job.name.clone();
-                let is_running = job.is_running.clone();
-                let consecutive_failures = job.consecutive_failures.clone();
-                let telemetry = self.telemetry.clone();
-                is_running.store(true, Ordering::Relaxed);
-                if let Some(ref t) = telemetry {
-                    t.mark_started(&job_name);
-                }
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await;
-                    tracing::debug!(job = %job_name, "Heartbeat job starting");
-                    // Catch panics as failures for backoff purposes
-                    let result = AssertUnwindSafe(fut).catch_unwind().await;
-                    is_running.store(false, Ordering::Relaxed);
-                    match result {
-                        Ok(Ok(())) => {
-                            let prev = consecutive_failures.swap(0, Ordering::Relaxed);
-                            if prev > 0 {
-                                info!(job = %job_name, prev_failures = prev, "Heartbeat job recovered");
-                            }
-                            if let Some(ref t) = telemetry {
-                                t.mark_success(&job_name);
-                            }
-                            tracing::debug!(job = %job_name, "Heartbeat job completed");
-                        }
-                        Ok(Err(e)) => {
-                            let count = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                            error!(
-                                job = %job_name,
-                                error = %e,
-                                consecutive_failures = count,
-                                "Heartbeat job failed — backing off"
-                            );
-                            if let Some(ref t) = telemetry {
-                                t.mark_failure(&job_name, count, e.to_string());
-                            }
-                        }
-                        Err(_) => {
-                            let count = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                            error!(
-                                job = %job_name,
-                                consecutive_failures = count,
-                                "Heartbeat job panicked — backing off"
-                            );
-                            if let Some(ref t) = telemetry {
-                                t.mark_failure(
-                                    &job_name,
-                                    count,
-                                    "Heartbeat job panicked".to_string(),
-                                );
-                            }
-                        }
-                    }
-                    if let Some(ref t) = telemetry {
-                        t.mark_not_running(&job_name);
-                    }
-                });
-            }
-        }
 
         // Phase 1d: Pending tasks whose dependencies reached terminal failure
         // can never dispatch. Mark them blocked before schedule coalescing so
@@ -3793,11 +3809,11 @@ mod tests {
             }
         });
 
-        // Tick once
-        coordinator.tick().await.unwrap();
-
-        // Give the spawned task time to execute
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let shutdown = CancellationToken::new();
+        let host = tokio::spawn(coordinator.into_host().run(shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.cancel();
+        host.await.unwrap();
 
         assert!(
             counter.load(Ordering::SeqCst) >= 1,
@@ -3991,49 +4007,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_job_respects_interval() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-
-        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state: Arc<dyn StateStore> = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-
-        let mut coordinator = HeartbeatCoordinator::new(state, 1, 3, wake_rx, None, None, None);
-
-        coordinator.register_job("test_job", Duration::from_secs(3600), move || {
-            let c = counter_clone.clone();
-            async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        });
-
-        // Tick twice rapidly
-        coordinator.tick().await.unwrap();
-        coordinator.tick().await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Should only have fired once (interval is 1 hour)
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            1,
-            "Job should have fired exactly once due to 1h interval"
-        );
-    }
-
-    #[tokio::test]
     async fn test_heartbeat_telemetry_tracks_failures_and_recovery() {
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -4050,7 +4023,7 @@ mod tests {
         );
         let telemetry = Arc::new(HeartbeatTelemetry::new());
         let mut coordinator =
-            HeartbeatCoordinator::new(state, 1, 3, wake_rx, None, None, Some(telemetry.clone()));
+            HeartbeatCoordinator::new(state, 3600, 3, wake_rx, None, None, Some(telemetry.clone()));
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
@@ -4065,8 +4038,11 @@ mod tests {
             }
         });
 
-        coordinator.tick().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let shutdown = CancellationToken::new();
+        let host = coordinator.into_host();
+        let waker = host.waker();
+        let host = tokio::spawn(host.run(shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let first = telemetry.snapshots();
         let first_job = first
@@ -4077,8 +4053,10 @@ mod tests {
         assert!(first_job.last_error.is_some());
         assert!(first_job.last_run_at.is_some());
 
-        coordinator.tick().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        waker.wake();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.cancel();
+        host.await.unwrap();
 
         let second = telemetry.snapshots();
         let second_job = second

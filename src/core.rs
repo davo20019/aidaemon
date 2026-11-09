@@ -346,7 +346,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     agent.set_plan_store(plan_store.clone()).await;
 
     // Start the heartbeat coordinator now that hub and agent are available.
-    startup_runtime::start_heartbeat_coordinator(heartbeat_opt, &hub, &agent);
+    let shutdown = aidaemon_core::CancellationToken::new();
+    let background =
+        startup_runtime::start_heartbeat_coordinator(heartbeat_opt, &hub, &agent, shutdown.clone());
 
     // Give all channels a reference to the hub for dynamic bot registration
     let weak_hub = Arc::downgrade(&hub);
@@ -428,7 +430,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // 16. Start channels
     info!("Starting aidaemon v{}", env!("CARGO_PKG_VERSION"));
     let startup_recipients = channel_bundle.startup_recipients(&config);
-    channel_bundle.spawn_all();
+    channel_bundle.spawn_all(shutdown.clone());
     {
         // Failover into a dead key is only discovered during an outage.
         let provider = config.provider.clone();
@@ -456,15 +458,43 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     crate::terminal_bridge::spawn_if_configured(&config, state.clone());
 
     // Wait for shutdown signal (ctrl+c), then gracefully pause plans
-    info!("All subsystems started, waiting for shutdown signal (ctrl+c)");
-    tokio::signal::ctrl_c().await.ok();
+    info!("All subsystems started, waiting for a shutdown signal");
+    shutdown_signal().await;
     info!("Shutdown signal received");
+
+    // Stop launching background work and let what is running finish.
+    shutdown.cancel();
+    if let Some(background) = background {
+        let _ = background.await;
+    }
 
     // Shut down all MCP server processes
     info!("Shutting down MCP servers...");
     mcp_registry.shutdown_all().await;
 
     Ok(())
+}
+
+/// Ctrl-C, or the SIGTERM a service manager sends on restart.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not listen for SIGTERM");
+                tokio::signal::ctrl_c().await.ok();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.ok();
 }
 
 /// Run all startup database migrations and exit.

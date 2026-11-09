@@ -81,45 +81,45 @@ impl ChannelBundle {
         Some((bot, users))
     }
 
-    pub fn spawn_all(self) {
+    /// Run every bot as a service until `shutdown` is cancelled.
+    pub fn spawn_all(self, shutdown: aidaemon_core::CancellationToken) {
+        use aidaemon_core::{FnService, Schedule, ServiceHost};
+
+        // A bot reconnects by itself; `start_with_retry` never returns.
+        macro_rules! bot_service {
+            ($host:ident, $kind:literal, $bots:expr) => {
+                for (index, bot) in $bots.into_iter().enumerate() {
+                    let service = FnService::new(
+                        format!("{}_bot_{index}", $kind),
+                        Schedule::Continuous,
+                        move || {
+                            let bot = bot.clone();
+                            async move {
+                                bot.start_with_retry().await;
+                                Ok(())
+                            }
+                        },
+                    );
+                    $host = $host.service(std::sync::Arc::new(service));
+                }
+            };
+        }
+
+        let mut host =
+            ServiceHost::new(std::time::Duration::from_secs(5)).grace(std::time::Duration::ZERO);
         #[cfg(feature = "discord")]
         {
-            for dc in self.discord_bots {
-                tokio::spawn(async move {
-                    dc.start_with_retry().await;
-                });
-            }
-            for dc in self.dynamic_discord_bots {
-                tokio::spawn(async move {
-                    dc.start_with_retry().await;
-                });
-            }
+            bot_service!(host, "discord", self.discord_bots);
+            bot_service!(host, "discord_dynamic", self.dynamic_discord_bots);
         }
-
         #[cfg(feature = "slack")]
         {
-            for sc in self.slack_bots {
-                tokio::spawn(async move {
-                    sc.start_with_retry().await;
-                });
-            }
-            for sc in self.dynamic_slack_bots {
-                tokio::spawn(async move {
-                    sc.start_with_retry().await;
-                });
-            }
+            bot_service!(host, "slack", self.slack_bots);
+            bot_service!(host, "slack_dynamic", self.dynamic_slack_bots);
         }
-
-        for tg in self.dynamic_telegram_bots {
-            tokio::spawn(async move {
-                tg.start_with_retry().await;
-            });
-        }
-        for tg in self.telegram_bots {
-            tokio::spawn(async move {
-                tg.start_with_retry().await;
-            });
-        }
+        bot_service!(host, "telegram_dynamic", self.dynamic_telegram_bots);
+        bot_service!(host, "telegram", self.telegram_bots);
+        tokio::spawn(host.run(shutdown));
     }
 }
 
