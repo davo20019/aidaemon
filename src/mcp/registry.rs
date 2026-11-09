@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aidaemon_mcp::{McpError, McpServer, McpServerSpec};
-use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -638,24 +637,6 @@ impl McpRegistry {
             }
         }
         None
-    }
-
-    /// Return all MCP tool definitions (for listing purposes).
-    #[allow(dead_code)] // Available for future use (e.g. debug/dashboard)
-    pub async fn all_tool_definitions(&self) -> Vec<Value> {
-        let servers = self.servers.read().await;
-        let mut defs = Vec::new();
-        for entry in servers.values() {
-            for tool in &entry.tools {
-                if self.allows_tool_name(tool.name()) {
-                    defs.push(serde_json::json!({
-                        "type": "function",
-                        "function": tool.schema()
-                    }));
-                }
-            }
-        }
-        defs
     }
 }
 
