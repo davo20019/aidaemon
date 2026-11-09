@@ -219,9 +219,9 @@ adapters, tested against local mock servers.
 
 ### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
 
-Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5 and 8.7b done; 8.3 mostly done; 8.4's
-ten steps done; 8.6 done except a child's model tier and recording its
-resolved authority; 8.7's memory port done except the live comparison; 8.8
+Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5, 8.6 and 8.7b done; 8.3 mostly done;
+8.4's ten steps done, and the daemon's tools are SDK tools; 8.7's memory port
+done, compared live; 8.8
 providers, MCP and channels done, the store mapped (what has a second consumer
 is already in crates). 8.9 is in progress.
 
@@ -416,7 +416,7 @@ Order:
       `config.toml`, or a program with no list, is held to the bypass flags
       alone. The in-tool approvals are done (8.1). Scope is judged by
       `DispatchGate` already.
-- [ ] 8.6 Authority Phase 3d: children assembled on request through
+- [x] 8.6 Authority Phase 3d: children assembled on request through
       `AgentBuilder`. Done 2026-11-07: declines move both ways between
       parent and child runs. `c98314c`: kernel `SharedDeclines`, attached
       with `RunState::share_declines` and exchanged with the run's own
@@ -430,8 +430,9 @@ Order:
       a restart shares none. Done 2026-11-08: `spawn_agent` takes `tools`
       and `access`, applied with `Authority::narrow`, so a parent can describe
       a child narrower than itself and never wider. Children already run
-      on the kernel through `AgentBuilder`. Not done: choosing a child's
-      model tier, and recording the resolved child authority as an event.
+      on the kernel through `AgentBuilder`. Done 2026-11-09
+      (`e1457cf`): a parent can pick a child's model tier, and the child's
+      resolved authority is recorded as an event.
 - [ ] 8.7 Authority Phase 4 (end check, typed final outcome, budgets) and
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
@@ -537,8 +538,13 @@ Order:
              default, resumable, same privacy rules as a live turn), and
              `aidaemon memory-export DIR` writes the daemon's memory as
              Markdown.
-        5. Live N-of-M against the current daemon, then delete what is left
-           of the old daemon modules.
+        5. Done 2026-11-09: the old modules' memory logic is in the crate
+           (`TaskLearner`, the stores). Consolidation parity was proved on one
+           commit with both paths (`2a590d0`) and is guarded by a golden file.
+           Live on Telegram, save/recall/forget with synthetic data: 3 of 3 on
+           the build before the move, 3 of 3 after. The owner's facts and
+           people were unchanged. The six-hourly background pass had not
+           fired on the new build when this was written.
         Not memory, noted on the way: `memory/context_window.rs` now holds
         only token budgeting, which belongs with the policies crate's
         `ContextWindow`; `memory/skill_promotion.rs` belongs to skills.
