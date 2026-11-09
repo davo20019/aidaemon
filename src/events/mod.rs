@@ -11,8 +11,9 @@ mod consolidation;
 mod context;
 mod conversation_turn;
 mod model_call_telemetry;
-mod run_aggregate;
 mod store;
+#[cfg(test)]
+mod run_aggregate_checklist_tests;
 pub mod terminal_state;
 
 pub use consolidation::{Consolidator, Pruner};
@@ -28,7 +29,7 @@ pub use aidaemon_events::{
     is_memory_isolated_worker_session, session_has_mandate_execution_provenance, Event, EventType,
     TaskOutcome, TaskStatus,
 };
-pub(crate) use run_aggregate::{
+pub(crate) use aidaemon_events::run_aggregate::{
     CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
     RunTerminalDecision, TaskKernelAdmission, OWNER_APPROVAL_DECLINED,
 };

@@ -17,7 +17,7 @@ use super::{
     ToolResultData,
 };
 use super::TaskKernelOperationClaim;
-use crate::execution::LexicalPaths;
+use aidaemon_tools::LexicalPaths;
 use crate::traits::{
     EvidenceTemporalScope, RequestDispatchStopRule, RequestEvidenceRequirement,
     RequestObservationTarget, RequestReceiptPredicate, RequestResponseContract,
@@ -28,7 +28,7 @@ use crate::traits::{
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RunObligationClass {
+pub enum RunObligationClass {
     /// A requested invocation/result occurred. This is historical and monotonic.
     Perform,
     /// A requested effect was achieved. This is historical and monotonic.
@@ -42,7 +42,7 @@ pub(crate) enum RunObligationClass {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RunObligationState {
+pub enum RunObligationState {
     Pending,
     Satisfied,
     Invalidated,
@@ -58,7 +58,7 @@ pub(crate) enum RunObligationState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RunObligation {
+pub struct RunObligation {
     pub id: String,
     pub class: RunObligationClass,
     pub state: RunObligationState,
@@ -97,10 +97,10 @@ pub(crate) struct RunObligation {
 }
 
 /// The typed reason code of a refusal the owner declined.
-pub(crate) const OWNER_APPROVAL_DECLINED: &str = "owner_approval_declined";
+pub const OWNER_APPROVAL_DECLINED: &str = "owner_approval_declined";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RunOperation {
+pub struct RunOperation {
     pub operation_id: String,
     pub tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,7 +180,7 @@ impl RunOperation {
 /// transport acknowledgement.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TaskKernelPhase {
+pub enum TaskKernelPhase {
     Initialized,
     Running,
     WorkPending,
@@ -196,7 +196,7 @@ pub(crate) enum TaskKernelPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TaskKernelAdmission {
+pub enum TaskKernelAdmission {
     Admitted,
     Rejected { code: &'static str, detail: String },
 }
@@ -204,7 +204,7 @@ pub(crate) enum TaskKernelAdmission {
 /// Why a pending expectation can no longer be satisfied in this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum UnreachableReason {
+pub enum UnreachableReason {
     /// An operation bound to it was refused by a typed policy boundary.
     PolicyDenied,
     /// Its bounded invocation budget is spent.
@@ -218,7 +218,7 @@ pub(crate) enum UnreachableReason {
 
 /// The ledger-first closeout verdict. See [`RunAggregate::closeout`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CloseoutDecision {
+pub enum CloseoutDecision {
     /// Nothing more is owed: proven by contract, by evidence, or by a
     /// credited denial; or the contract carried no obligations.
     Closed { proof_basis: &'static str },
@@ -232,7 +232,7 @@ pub(crate) enum CloseoutDecision {
 }
 
 impl CloseoutDecision {
-    pub(crate) fn verdict(&self) -> &'static str {
+    pub fn verdict(&self) -> &'static str {
         match self {
             Self::Closed { .. } => "closed",
             Self::Reachable { .. } => "reachable",
@@ -241,13 +241,13 @@ impl CloseoutDecision {
     }
 
     /// Whether the loop may still demand more work from the model.
-    pub(crate) fn work_reachable(&self) -> bool {
+    pub fn work_reachable(&self) -> bool {
         matches!(self, Self::Reachable { .. })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunTerminalDecision {
+pub enum RunTerminalDecision {
     /// Every accepted obligation has durable proof.
     Succeeded,
     /// The compiled contract is exhausted without crediting the work, but
@@ -268,7 +268,7 @@ pub(crate) enum RunTerminalDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RunAggregate {
+pub struct RunAggregate {
     pub schema_version: u16,
     pub task_id: String,
     #[serde(default)]
@@ -330,12 +330,12 @@ pub(crate) struct RunAggregate {
 impl RunAggregate {
     pub const SCHEMA_VERSION: u16 = 4;
 
-    #[cfg(test)]
-    pub(crate) fn new(task_id: impl Into<String>) -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new(task_id: impl Into<String>) -> Self {
         Self::on_paths(task_id, LexicalPaths::daemon_host())
     }
 
-    pub(crate) fn on_paths(task_id: impl Into<String>, paths: LexicalPaths) -> Self {
+    pub fn on_paths(task_id: impl Into<String>, paths: LexicalPaths) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             task_id: task_id.into(),
@@ -363,12 +363,12 @@ impl RunAggregate {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn replay(task_id: &str, events: &[Event]) -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn replay(task_id: &str, events: &[Event]) -> Self {
         Self::replay_on_paths(task_id, events, LexicalPaths::daemon_host())
     }
 
-    pub(crate) fn replay_on_paths(task_id: &str, events: &[Event], paths: LexicalPaths) -> Self {
+    pub fn replay_on_paths(task_id: &str, events: &[Event], paths: LexicalPaths) -> Self {
         let mut aggregate = Self::on_paths(task_id, paths);
         let mut ordered = events.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|event| event.id);
@@ -379,7 +379,7 @@ impl RunAggregate {
         aggregate
     }
 
-    pub(crate) fn apply(&mut self, event: &Event) {
+    pub fn apply(&mut self, event: &Event) {
         match event.event_type {
             EventType::TaskStart => {
                 if let Ok(start) = event.parse_data::<TaskStartData>() {
@@ -914,14 +914,14 @@ impl RunAggregate {
 
     /// Whether any typed expectations exist to arbitrate: from the compiled
     /// contract, the executor's own declaration, or both.
-    pub(crate) fn expectations_present(&self) -> bool {
+    pub fn expectations_present(&self) -> bool {
         self.contract_present || self.executor_expectations_present
     }
 
     /// Executor-declared obligations not yet proven, deferred ones included.
     /// These are the model's own statement of unmet work; a run that ends
     /// with any is incomplete, not "closed by evidence".
-    pub(crate) fn open_executor_expectations(&self) -> usize {
+    pub fn open_executor_expectations(&self) -> usize {
         self.obligations
             .iter()
             .filter(|(id, obligation)| {
@@ -934,7 +934,7 @@ impl RunAggregate {
     /// One line per obligation for a "still expected" directive: its
     /// summary, its evidence requirement, the tools that would satisfy it,
     /// or its id.
-    pub(crate) fn expectation_summaries(&self, obligation_ids: &[String]) -> Vec<String> {
+    pub fn expectation_summaries(&self, obligation_ids: &[String]) -> Vec<String> {
         obligation_ids
             .iter()
             .filter_map(|id| self.obligations.get(id))
@@ -1016,7 +1016,7 @@ impl RunAggregate {
     /// still-open predicate. If every eligible obligation is already closed,
     /// retain the original set so an extra proposal is still checked against
     /// the user's maximum cardinality instead of escaping the contract.
-    pub(crate) fn effective_operation_claim(
+    pub fn effective_operation_claim(
         &self,
         claim: &TaskKernelOperationClaim,
     ) -> TaskKernelOperationClaim {
@@ -1471,18 +1471,18 @@ impl RunAggregate {
 
     /// Every obligation counts as required: a deferred item is unmet work,
     /// not a smaller denominator.
-    pub(crate) fn required_count(&self) -> usize {
+    pub fn required_count(&self) -> usize {
         self.obligations.len()
     }
 
-    pub(crate) fn satisfied_count(&self) -> usize {
+    pub fn satisfied_count(&self) -> usize {
         self.obligations
             .values()
             .filter(|obligation| obligation.state == RunObligationState::Satisfied)
             .count()
     }
 
-    pub(crate) fn is_fulfilled(&self) -> bool {
+    pub fn is_fulfilled(&self) -> bool {
         self.expectations_present()
             && self.cardinality_violations == 0
             && self.invariant_violations.is_empty()
@@ -1496,7 +1496,7 @@ impl RunAggregate {
     /// Whether all execution/evidence work is proved and only presentation may
     /// remain. This is deliberately separate from terminal success: preparing
     /// the requested response artifact closes the `Deliver` obligation later.
-    pub(crate) fn work_is_fulfilled(&self) -> bool {
+    pub fn work_is_fulfilled(&self) -> bool {
         if !self.contract_present
             || self.cardinality_violations > 0
             || !self.invariant_violations.is_empty()
@@ -1521,7 +1521,7 @@ impl RunAggregate {
     /// Deterministic successful response projection. A semantic producer owns
     /// the presentation choice; the reducer exposes the typed artifact only
     /// after non-delivery proof has closed.
-    pub(crate) fn projected_success_response(&self) -> Option<&str> {
+    pub fn projected_success_response(&self) -> Option<&str> {
         self.work_is_fulfilled()
             .then(|| {
                 self.response_contract
@@ -1653,7 +1653,7 @@ impl RunAggregate {
     /// recorded denial or spent budget blocks it and some admissible tool can
     /// satisfy it. Only a reachable expectation may ask the loop for more
     /// work; everything else closes on the evidence that exists.
-    pub(crate) fn closeout(&self, admissible: impl Fn(&RunObligation) -> bool) -> CloseoutDecision {
+    pub fn closeout(&self, admissible: impl Fn(&RunObligation) -> bool) -> CloseoutDecision {
         if !self.expectations_present() || self.obligations.is_empty() {
             return CloseoutDecision::Closed {
                 proof_basis: "no_obligations",
@@ -1712,14 +1712,14 @@ impl RunAggregate {
 
     /// The owner declined at least one operation of the run: what it was
     /// asked to do did not all happen, so it never closes as a success.
-    pub(crate) fn owner_declined(&self) -> bool {
+    pub fn owner_declined(&self) -> bool {
         self.operations
             .values()
             .any(|operation| operation.owner_declined)
     }
 
     /// Operations refused before dispatch by a typed policy boundary.
-    pub(crate) fn policy_denied_operations(&self) -> usize {
+    pub fn policy_denied_operations(&self) -> usize {
         self.operations
             .values()
             .filter(|operation| operation.policy_denied)
@@ -1727,7 +1727,7 @@ impl RunAggregate {
     }
 
     /// Operations whose adapter actually ran.
-    pub(crate) fn dispatched_operations(&self) -> usize {
+    pub fn dispatched_operations(&self) -> usize {
         self.operations
             .values()
             .filter(|operation| operation.dispatched)
@@ -1736,7 +1736,7 @@ impl RunAggregate {
 
     /// A dispatched invocation has handed execution to durable background
     /// tracking and has not emitted its terminal receipt yet.
-    pub(crate) fn has_background_in_flight(&self) -> bool {
+    pub fn has_background_in_flight(&self) -> bool {
         self.operations
             .values()
             .any(RunOperation::is_background_in_flight)
@@ -1746,11 +1746,11 @@ impl RunAggregate {
     /// observed the request's authority boundary and nothing it can retry
     /// would cross it. Finalization treats the model's narration of that
     /// boundary as the closeout instead of demanding more evidence.
-    pub(crate) fn terminal_policy_denial(&self) -> bool {
+    pub fn terminal_policy_denial(&self) -> bool {
         self.policy_denied_operations() > 0 && self.dispatched_operations() == 0
     }
 
-    pub(crate) fn evidence_closed(&self) -> bool {
+    pub fn evidence_closed(&self) -> bool {
         // Receipts close a run the contract could not credit — but not past
         // the executor's own declared, still-open work. Those items are the
         // model's typed statement that more is required, so "every receipt
@@ -1790,7 +1790,7 @@ impl RunAggregate {
     /// receipt failed: nothing succeeded and nothing was refused by policy.
     /// A run with no contract has no other proof that it accomplished
     /// anything, so its success cannot be credited.
-    pub(crate) fn only_failed_operations(&self) -> bool {
+    pub fn only_failed_operations(&self) -> bool {
         let mut terminal = self
             .operations
             .values()
@@ -1800,7 +1800,7 @@ impl RunAggregate {
             && terminal.all(|operation| operation.outcome.is_some_and(|status| status.is_failure()))
     }
 
-    pub(crate) fn terminal_decision(&self) -> RunTerminalDecision {
+    pub fn terminal_decision(&self) -> RunTerminalDecision {
         if !self.expectations_present() || self.obligations.is_empty() {
             return RunTerminalDecision::Unspecified;
         }
@@ -1880,7 +1880,7 @@ impl RunAggregate {
     /// Decide admission from durable history. This is the only correctness
     /// gate for operation retry and request cardinality; in-memory ledgers are
     /// compatibility telemetry and cannot veto an admitted claim.
-    pub(crate) fn admit_operation(&self, claim: &TaskKernelOperationClaim) -> TaskKernelAdmission {
+    pub fn admit_operation(&self, claim: &TaskKernelOperationClaim) -> TaskKernelAdmission {
         if self.recorded_task_status.is_some() {
             return TaskKernelAdmission::Rejected {
                 code: "task_already_terminal",
@@ -2035,7 +2035,7 @@ impl RunAggregate {
     /// Exact tool lanes closed by already-satisfied receipt triggers. The
     /// projection is deterministic from durable obligations and is safe to use
     /// both for model tool visibility and atomic admission.
-    pub(crate) fn triggered_dispatch_stop_tools(&self) -> BTreeSet<String> {
+    pub fn triggered_dispatch_stop_tools(&self) -> BTreeSet<String> {
         self.dispatch_stop_rules
             .iter()
             .filter(|rule| {
@@ -2048,7 +2048,7 @@ impl RunAggregate {
             .collect()
     }
 
-    pub(crate) fn lifecycle_phase(&self) -> TaskKernelPhase {
+    pub fn lifecycle_phase(&self) -> TaskKernelPhase {
         if let Some(status) = self.recorded_task_status {
             match status {
                 TaskStatus::Cancelled => return TaskKernelPhase::Cancelled,
@@ -2103,7 +2103,7 @@ impl RunAggregate {
     }
 }
 
-pub(crate) fn receipt_matches_predicate(
+pub fn receipt_matches_predicate(
     result: &ToolResultData,
     predicate: &RequestReceiptPredicate,
 ) -> bool {
@@ -2356,7 +2356,7 @@ fn executor_item_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
+    use crate::{
         Event, ExecutorExpectationItem, ExecutorExpectationsDeclaredData, TaskContractCompiledData,
         ToolOutcomeEvidenceSource, ToolReceiptV1,
     };
@@ -2869,7 +2869,7 @@ mod tests {
                 turn_id: None,
                 task_id: Some("task-1".to_string()),
                 referenced_receipts: Vec::new(),
-                disposition: crate::events::AssistantResponseDisposition::Terminal,
+                disposition: crate::AssistantResponseDisposition::Terminal,
             },
         )
     }
@@ -3966,7 +3966,7 @@ mod tests {
             0,
             ToolCallSemantics::observation(),
         );
-        let lineage = crate::events::ToolOperationLineage::DurableReplay {
+        let lineage = crate::ToolOperationLineage::DurableReplay {
             source_operation_id: "run".to_string(),
             source_result_id: "result:run".to_string(),
         };
@@ -4047,7 +4047,7 @@ mod tests {
         contract.data["contract"]["required_mutation_effects"] =
             json!(ToolMutationEffects::PROCESS_STATE.bits());
 
-        let lineage = crate::events::ToolOperationLineage::DurableReplay {
+        let lineage = crate::ToolOperationLineage::DurableReplay {
             source_operation_id: "run".to_string(),
             source_result_id: "result:run".to_string(),
         };
@@ -5256,219 +5256,6 @@ mod tests {
     /// the run closed `partial`. Binding checklist targets against the stable
     /// subjects tools actually advertise turns the invented ID into a
     /// recorded, untargeted observation that the credential read satisfies.
-    #[test]
-    fn unbound_checklist_target_no_longer_leaves_an_all_success_audit_partial() {
-        use crate::tools::track_requirements::{
-            bind_checklist_targets, executor_expectations_from_checklist_arguments,
-            StableSubjectVocabulary,
-        };
-        use crate::traits::StableObservationSubject;
-
-        let objective_facets = [
-            ToolSemanticFacet::Schedule,
-            ToolSemanticFacet::RunState,
-            ToolSemanticFacet::Recovery,
-            ToolSemanticFacet::Control,
-            ToolSemanticFacet::Measurement,
-            ToolSemanticFacet::Ownership,
-        ];
-        let vocabulary = StableSubjectVocabulary::from_subjects(vec![
-            StableObservationSubject::collection(
-                "objective_collection:scheduled_goals",
-                &objective_facets,
-                "objective:",
-                "every scheduled goal",
-            ),
-            StableObservationSubject::collection(
-                "objective_collection:mandate_controllers",
-                &objective_facets,
-                "objective:",
-                "every mandate controller",
-            ),
-            StableObservationSubject::collection(
-                "auth_profile_collection:configured",
-                &[ToolSemanticFacet::Authorization],
-                "auth_profile:",
-                "every configured auth profile",
-            ),
-        ]);
-        let raw_arguments = serde_json::json!({
-            "items": [
-                {
-                    "text": "Audit the schedule state and latest run outcome.",
-                    "status": "completed",
-                    "requires_observation": true,
-                    "targets": [{
-                        "subject": {"kind": "resource_id", "value": "objective_collection:scheduled_goals"},
-                        "facets": ["schedule", "run_state"],
-                        "collection_coverage": {
-                            "collection": {"kind": "resource_id", "value": "objective_collection:scheduled_goals"},
-                            "minimum_completeness": "complete"
-                        }
-                    }]
-                },
-                {
-                    "text": "Audit objective-control presence.",
-                    "status": "completed",
-                    "requires_observation": true,
-                    "targets": [{
-                        "subject": {"kind": "resource_id", "value": "objective_collection:mandate_controllers"},
-                        "facets": ["control"],
-                        "collection_coverage": {
-                            "collection": {"kind": "resource_id", "value": "objective_collection:mandate_controllers"},
-                            "minimum_completeness": "complete"
-                        }
-                    }]
-                },
-                {
-                    "text": "Audit owner configuration and credential readiness.",
-                    "status": "completed",
-                    "requires_observation": true,
-                    "targets": ["x_owner_credential_state"]
-                }
-            ]
-        })
-        .to_string();
-
-        let goals_hint = ToolTargetHint::new(
-            ToolTargetHintKind::ResourceId,
-            "objective_collection:scheduled_goals",
-        )
-        .unwrap();
-        let mandates_hint = ToolTargetHint::new(
-            ToolTargetHintKind::ResourceId,
-            "objective_collection:mandate_controllers",
-        )
-        .unwrap();
-        let profile_collection_hint = ToolTargetHint::new(
-            ToolTargetHintKind::ResourceId,
-            "auth_profile_collection:configured",
-        )
-        .unwrap();
-        let profile_hint =
-            ToolTargetHint::new(ToolTargetHintKind::ResourceId, "auth_profile:twitter").unwrap();
-        let goal_member =
-            ToolTargetHint::new(ToolTargetHintKind::ResourceId, "objective:sha256:synthetic")
-                .unwrap();
-        let receipts = || {
-            vec![
-                call("goal-runs", "scheduled_goal_runs"),
-                with_exact_observations(
-                    result(
-                        "goal-runs",
-                        "scheduled_goal_runs",
-                        ToolOutcomeStatus::Succeeded,
-                        0,
-                        ToolCallSemantics::observation(),
-                    ),
-                    vec![objective_observation(
-                        "objective:sha256:synthetic",
-                        &objective_facets,
-                    )],
-                    vec![ToolCollectionObservation::complete(
-                        goals_hint.clone(),
-                        &objective_facets,
-                        vec![goal_member.clone()],
-                    )],
-                ),
-                call("mandates", "manage_mandates"),
-                with_exact_observations(
-                    result(
-                        "mandates",
-                        "manage_mandates",
-                        ToolOutcomeStatus::Succeeded,
-                        0,
-                        ToolCallSemantics::observation(),
-                    ),
-                    Vec::new(),
-                    vec![
-                        ToolCollectionObservation::complete(
-                            goals_hint.clone(),
-                            &objective_facets,
-                            vec![goal_member.clone()],
-                        ),
-                        ToolCollectionObservation::complete(
-                            mandates_hint.clone(),
-                            &objective_facets,
-                            Vec::new(),
-                        ),
-                    ],
-                ),
-                call("auth", "manage_http_auth"),
-                with_exact_observations(
-                    result(
-                        "auth",
-                        "manage_http_auth",
-                        ToolOutcomeStatus::Succeeded,
-                        0,
-                        ToolCallSemantics::observation(),
-                    ),
-                    vec![ToolObservationEvidence::new(
-                        profile_hint.clone(),
-                        &[ToolSemanticFacet::Authorization],
-                    )],
-                    vec![ToolCollectionObservation::complete(
-                        profile_collection_hint.clone(),
-                        &[ToolSemanticFacet::Authorization],
-                        vec![profile_hint.clone()],
-                    )],
-                ),
-            ]
-        };
-
-        // Negative control: the pre-fix declaration keeps the invented ID as an
-        // exact obligation, which no receipt can ever credit.
-        let unbound_declaration =
-            executor_expectations_from_checklist_arguments("task-1", &raw_arguments).unwrap();
-        assert_eq!(
-            unbound_declaration.items[2].targets,
-            ["x_owner_credential_state"]
-        );
-        let mut control_events = vec![event(
-            EventType::ExecutorExpectationsDeclared,
-            unbound_declaration,
-        )];
-        control_events.extend(receipts());
-        renumber(&mut control_events);
-        let control = RunAggregate::replay("task-1", &control_events);
-        assert_eq!(
-            control.obligations["task:task-1/obligation:checklist:2"].state,
-            RunObligationState::Pending
-        );
-        assert_eq!(control.open_executor_expectations(), 1);
-        assert!(!control.evidence_closed());
-
-        // Bound declaration: the invented ID is recorded as unbound and the
-        // item becomes an untargeted observation expectation.
-        let bound_arguments = bind_checklist_targets(&raw_arguments, &vocabulary).unwrap();
-        let bound_declaration =
-            executor_expectations_from_checklist_arguments("task-1", &bound_arguments).unwrap();
-        assert!(bound_declaration.items[2].targets.is_empty());
-        assert!(bound_declaration.items[2].observation_targets.is_empty());
-        assert_eq!(
-            bound_declaration.items[2].unbound_targets,
-            ["x_owner_credential_state"]
-        );
-        assert_eq!(bound_declaration.items[0].observation_targets.len(), 1);
-        assert_eq!(bound_declaration.items[1].observation_targets.len(), 1);
-
-        let mut events = vec![event(
-            EventType::ExecutorExpectationsDeclared,
-            bound_declaration,
-        )];
-        events.extend(receipts());
-        renumber(&mut events);
-        let aggregate = RunAggregate::replay("task-1", &events);
-        for index in 0..3 {
-            assert_eq!(
-                aggregate.obligations[&format!("task:task-1/obligation:checklist:{index}")].state,
-                RunObligationState::Satisfied,
-                "checklist item {index} must be credited by the typed receipts"
-            );
-        }
-        assert_eq!(aggregate.open_executor_expectations(), 0);
-        assert!(aggregate.evidence_closed());
-    }
 
     #[test]
     fn mutation_of_a_covered_collection_invalidates_prior_absence_proof() {

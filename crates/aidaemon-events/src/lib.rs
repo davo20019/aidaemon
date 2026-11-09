@@ -10,6 +10,7 @@ pub mod mandate_grant;
 pub mod provider;
 pub mod session;
 pub mod payloads;
+pub mod run_aggregate;
 pub mod text;
 
 /// The contract types the payloads and the store are written against.
@@ -23,6 +24,10 @@ pub mod traits {
 }
 
 pub use payloads::*;
+pub use run_aggregate::{
+    CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
+    RunTerminalDecision, TaskKernelAdmission, OWNER_APPROVAL_DECLINED,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

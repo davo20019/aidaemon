@@ -411,6 +411,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dirs",
  "globset",
  "htmd",
  "ignore",

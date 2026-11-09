@@ -62,7 +62,7 @@ mod testutil;
 
 pub use backend::{
     shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
-    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, ProcessHandle,
+    CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
     SpawnedProcess, WriteMode,
 };
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};

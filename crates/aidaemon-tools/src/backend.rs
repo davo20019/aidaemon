@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -516,4 +516,117 @@ pub fn shell_quote(value: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// What lexical path normalization needs from a backend: its path flavor and
+/// the two bases that give relative and `~` paths a meaning. A plain value, so
+/// code that compares paths without touching the target (the run ledger) can
+/// hold it without holding the backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexicalPaths {
+    kind: BackendKind,
+    workspace_root: BackendPath,
+    home: BackendPath,
+}
+
+impl LexicalPaths {
+    pub fn of(backend: &dyn ExecutionBackend) -> Self {
+        Self {
+            kind: backend.kind(),
+            workspace_root: backend.workspace_root().clone(),
+            home: backend.home_hint().clone(),
+        }
+    }
+
+    /// The daemon host's own paths, for a store opened outside the daemon's
+    /// run (a one-shot CLI command) where no execution backend exists.
+    pub fn daemon_host() -> Self {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let canonical = std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+        let home = dirs::home_dir().unwrap_or_else(|| canonical.clone());
+        Self {
+            kind: BackendKind::Local,
+            workspace_root: BackendPath::new(canonical.to_string_lossy().into_owned()),
+            home: BackendPath::new(home.to_string_lossy().into_owned()),
+        }
+    }
+
+    pub fn normalize(&self, path: &str) -> anyhow::Result<BackendPath> {
+        normalize_lexically(self.kind, &self.workspace_root, &self.home, path)
+    }
+
+    /// Paths on a POSIX target reached over a remote backend.
+    pub fn posix(workspace_root: &str, home: &str) -> Self {
+        Self {
+            kind: BackendKind::Ssh,
+            workspace_root: BackendPath::new(workspace_root),
+            home: BackendPath::new(home),
+        }
+    }
+}
+
+pub fn normalize_lexically(
+    kind: BackendKind,
+    workspace_root: &BackendPath,
+    home: &BackendPath,
+    path: &str,
+) -> anyhow::Result<BackendPath> {
+    let expanded = if path == "~" {
+        home.as_str().to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest).to_string()
+    } else if Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        workspace_root.join(path).to_string()
+    };
+    match kind {
+        BackendKind::Local => Ok(BackendPath::new(
+            normalize_local_lexically(Path::new(&expanded))?
+                .to_string_lossy()
+                .into_owned(),
+        )),
+        BackendKind::Docker | BackendKind::Ssh => {
+            Ok(BackendPath::new(normalize_posix_absolute(&expanded)?))
+        }
+    }
+}
+
+pub fn normalize_posix_absolute(path: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        path.starts_with('/'),
+        "Remote execution path must be absolute: {path}"
+    );
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                anyhow::ensure!(
+                    parts.pop().is_some(),
+                    "Path traversal escapes filesystem root: {path}"
+                );
+            }
+            other => parts.push(other),
+        }
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+pub fn normalize_local_lexically(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::ensure!(
+                    normalized.pop(),
+                    "Path traversal escapes filesystem root: {}",
+                    path.display()
+                );
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
