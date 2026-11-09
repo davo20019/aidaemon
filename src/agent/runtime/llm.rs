@@ -556,6 +556,49 @@ mod tests {
         );
     }
 
+    /// A test agent whose side calls go through a gateway over `provider`,
+    /// and the event store that gateway records into.
+    async fn agent_with(
+        provider: crate::llm_runtime::ModelBackend,
+    ) -> (crate::testing::TestHarness, Arc<crate::events::EventStore>) {
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let (gateway, events) =
+            crate::llm_runtime::gateway::test_support::gateway_with(provider).await;
+        harness.agent.side_calls = gateway;
+        (harness, events)
+    }
+
+    #[tokio::test]
+    async fn interpretation_is_recorded_and_falls_back_to_none_on_failure() {
+        use crate::llm_runtime::gateway::test_support::{
+            failed_calls, ok_calls, provider_answering, provider_failing,
+        };
+
+        let (harness, events) = agent_with(provider_answering("12 files matched.")).await;
+        assert_eq!(
+            harness
+                .agent
+                .interpret_background_result("rg -c TODO", "12")
+                .await
+                .as_deref(),
+            Some("12 files matched.")
+        );
+        assert_eq!(ok_calls(&events, "background_interpretation").await, 1);
+
+        let (harness, events) = agent_with(provider_failing("503")).await;
+        assert_eq!(
+            harness
+                .agent
+                .interpret_background_result("rg -c TODO", "12")
+                .await,
+            None
+        );
+        assert!(failed_calls(&events, "background_interpretation").await >= 1);
+        assert_eq!(ok_calls(&events, "background_interpretation").await, 0);
+    }
+
     #[tokio::test]
     async fn interpret_background_result_falls_back_to_none_on_empty() {
         // Empty model output → None, so the caller falls back to the raw result

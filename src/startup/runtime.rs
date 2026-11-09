@@ -17,7 +17,6 @@ use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::health::HealthProbeManager;
-use crate::llm_runtime::SharedLlmRuntime;
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::QueueTelemetry;
 use crate::traits::{MandateStore, SessionChannelStore, SettingsStore};
@@ -58,7 +57,6 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) wake_rx: tokio::sync::mpsc::Receiver<()>,
     pub(crate) inbox_dir: String,
     pub(crate) skills_dir: Option<std::path::PathBuf>,
-    pub(crate) llm_runtime: SharedLlmRuntime,
     pub(crate) side_calls: crate::llm_runtime::gateway::SideCallGateway,
     pub(crate) oauth_gateway: Option<crate::oauth::OAuthGateway>,
     pub(crate) watchdog_stale_threshold_secs: u64,
@@ -83,7 +81,6 @@ pub(crate) async fn init_heartbeat_coordinator(
         wake_rx,
         inbox_dir,
         skills_dir,
-        llm_runtime,
         side_calls,
         oauth_gateway,
         watchdog_stale_threshold_secs,
@@ -316,8 +313,6 @@ pub(crate) async fn init_heartbeat_coordinator(
         if let Some(sd) = skills_dir {
             let promoter = Arc::new(crate::skills::promotion::SkillPromoter::new(
                 state.clone(),
-                event_store.clone(),
-                llm_runtime.clone(),
                 side_calls.clone(),
                 sd,
                 config.policy.learning_evidence_gate_enforce,

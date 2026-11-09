@@ -333,7 +333,6 @@ pub async fn run(
             wake_rx,
             inbox_dir: inbox_dir.clone(),
             skills_dir: skills_dir.clone(),
-            llm_runtime: llm_runtime.clone(),
             side_calls,
             oauth_gateway: oauth_gateway.clone(),
             watchdog_stale_threshold_secs,

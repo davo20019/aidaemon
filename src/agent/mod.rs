@@ -109,7 +109,6 @@ use loop_utils::{
 mod post_task;
 #[path = "runtime/task_outcome.rs"]
 mod task_outcome;
-use crate::providers::ChatJson;
 use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]
@@ -827,19 +826,15 @@ impl Agent {
     /// One-shot, TOOL-LESS interpretation of a finished background command's
     /// result. The terminal notifier uses this to turn a bare value (a `wc -l`
     /// count, a path, a status line) into one short plain-language sentence
-    /// WITHOUT re-entering the full agent loop. The provider is called with an
-    /// empty tools slice, so the model can only reply in text — it physically
-    /// cannot re-run the command. (Re-running is what caused the small-model
+    /// WITHOUT re-entering the full agent loop. The side-call gateway sends no
+    /// tools, so the model can only reply in text — it physically cannot
+    /// re-run the command. (Re-running is what caused the small-model
     /// background-detach churn: the loop re-ran a slow `find`, re-detached, and
     /// re-engaged repeatedly, emitting duplicate "finished" pings.)
     ///
     /// Returns `None` on any failure or empty reply so the caller can fall back
     /// to delivering the raw result — the answer is never lost.
     pub async fn interpret_background_result(&self, command: &str, output: &str) -> Option<String> {
-        let snapshot = self.llm_runtime.snapshot();
-        let provider = snapshot.provider();
-        let model = snapshot.primary_model();
-
         let system = "You translate the result of a shell command into ONE short, \
             plain-language sentence for a non-technical user. Say what the result \
             represents and flag any obvious caveat (for example, a raw text-match \
@@ -854,16 +849,19 @@ impl Agent {
             json!({"role": "user", "content": user}),
         ];
 
-        // Empty tools slice — the model has nothing to call, so no re-run / churn.
-        match provider.chat(&model, &messages, &[]).await {
-            Ok(resp) => {
-                let text = resp.content.unwrap_or_default();
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+        match self
+            .side_calls
+            .ask(
+                crate::llm_runtime::side_calls::SideCall::BackgroundInterpretation,
+                &messages,
+                &Default::default(),
+                None,
+            )
+            .await
+        {
+            Ok(answer) => {
+                let trimmed = answer.text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
             Err(e) => {
                 warn!(error = %e, "Background-result interpretation LLM call failed");
