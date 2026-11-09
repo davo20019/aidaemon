@@ -181,7 +181,7 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         &self,
         entry: &crate::traits::NotificationEntry,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let notified_at = chrono::Utc::now().to_rfc3339();
         let claimed = sqlx::query(
             "UPDATE goals

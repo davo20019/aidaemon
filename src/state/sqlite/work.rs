@@ -269,7 +269,7 @@ impl WorkCoordinationStore for SqliteStateStore {
             ),
             "unsupported goal run trigger type"
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let project_id = sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM goals
              WHERE id = ? AND domain = 'orchestration'",
@@ -792,7 +792,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         let lease_secs = normalized_lease_secs(lease_secs);
         let now = chrono::Utc::now();
         let expires = now + chrono::Duration::seconds(lease_secs);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT t.goal_id, t.goal_run_id, t.worker_profile_id, g.project_id
              FROM tasks t JOIN goals g ON g.id = t.goal_id
@@ -1288,7 +1288,7 @@ impl WorkCoordinationStore for SqliteStateStore {
     }
 
     async fn recover_expired_task_attempts(&self) -> anyhow::Result<Vec<String>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.task_id, a.goal_run_id,
                     t.goal_id, g.project_id, t.idempotent, t.retry_count,
@@ -1404,7 +1404,7 @@ impl WorkCoordinationStore for SqliteStateStore {
     }
 
     async fn append_task_journal(&self, entry: &TaskJournalEntry) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         insert_journal(&mut tx, entry).await?;
         tx.commit().await?;
         Ok(())
@@ -1453,7 +1453,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(!resolution.trim().is_empty(), "resolution cannot be empty");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1518,7 +1518,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1568,7 +1568,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1706,7 +1706,7 @@ impl WorkCoordinationStore for SqliteStateStore {
         actor_id: &str,
         source_channel: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some((project_id, goal_id, goal_run_id)) = task_scope(&mut tx, task_id).await? else {
             return Ok(false);
         };
@@ -1798,7 +1798,7 @@ impl WorkCoordinationStore for SqliteStateStore {
     }
 
     async fn create_task_workspace(&self, workspace: &TaskWorkspace) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO task_workspaces
                 (id, task_id, attempt_id, backend_id, policy, root_path,
@@ -2600,6 +2600,43 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn starting_a_run_waits_out_a_competing_writer() {
+        let (store, _database) = test_store().await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        let goal = Goal::new_finite("start after contention", "session-a");
+        store.create_goal(&goal).await.unwrap();
+
+        let mut competing_writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE goals SET updated_at = datetime('now') WHERE id = ?")
+            .bind(&goal.id)
+            .execute(&mut *competing_writer)
+            .await
+            .unwrap();
+
+        let store = Arc::new(store);
+        let starting = store.clone();
+        let goal_id = goal.id.clone();
+        let started = tokio::spawn(async move {
+            starting
+                .start_goal_run(&goal_id, "scheduled", None, None)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        competing_writer.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started)
+            .await
+            .expect("the start should resume after the competing writer commits")
+            .unwrap()
+            .expect("a competing write must not fail the start");
     }
 
     #[tokio::test]

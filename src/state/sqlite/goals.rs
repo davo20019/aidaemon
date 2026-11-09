@@ -294,7 +294,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         if let Some(note) = progress_note {
             let row = sqlx::query(
@@ -532,7 +532,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO tasks (id, goal_id, goal_run_id, description, status, priority, task_order,
              parallel_group, depends_on, agent_id, context, result, error, blocker,
@@ -622,7 +622,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE tasks SET description = ?, status = ?, priority = ?, task_order = ?,
              parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
@@ -998,7 +998,7 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
     ) -> anyhow::Result<u64> {
         let now = chrono::Utc::now().to_rfc3339();
         let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // If we're cancelling stale pending confirmations, remove their schedules
         // so they don't appear as "scheduled" (zombie schedules).
@@ -1156,7 +1156,7 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
         goal_id: &str,
         delta_tokens: i64,
     ) -> anyhow::Result<Option<GoalTokenBudgetStatus>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let today = chrono::Utc::now().date_naive().to_string();
 
         // Lazy daily reset keyed by UTC day anchor.

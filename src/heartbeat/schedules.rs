@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How soon a one-shot that failed to fire is tried again.
+const ONE_SHOT_RETRY_SECS: i64 = 60;
+
 impl HeartbeatCoordinator {
     /// Check for due schedules across active orchestration goals and enqueue tasks.
     ///
@@ -23,6 +26,7 @@ impl HeartbeatCoordinator {
         for schedule in due {
             let schedule_id = schedule.id.clone();
             let goal_id = schedule.goal_id.clone();
+            let is_one_shot = schedule.is_one_shot;
             if let Err(e) = self.fire_due_schedule(schedule).await {
                 error!(
                     schedule_id = %schedule_id,
@@ -30,7 +34,26 @@ impl HeartbeatCoordinator {
                     error = %e,
                     "Failed to fire due schedule"
                 );
+                if is_one_shot {
+                    self.retry_one_shot_soon(&schedule_id).await;
+                }
             }
+        }
+    }
+
+    /// A one-shot is parked a day ahead while it fires, so one that failed
+    /// would otherwise run a day late. It has no later occurrence to wait for.
+    async fn retry_one_shot_soon(&self, schedule_id: &str) {
+        let schedule = match self.state.get_goal_schedule(schedule_id).await {
+            Ok(Some(schedule)) => schedule,
+            // A delivered reminder has already removed its schedule.
+            _ => return,
+        };
+        let mut schedule = schedule;
+        schedule.next_run_at =
+            (chrono::Utc::now() + chrono::Duration::seconds(ONE_SHOT_RETRY_SECS)).to_rfc3339();
+        if let Err(error) = self.state.update_goal_schedule(&schedule).await {
+            warn!(schedule_id, %error, "Could not reschedule a one-shot that failed to fire");
         }
     }
 

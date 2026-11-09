@@ -1027,7 +1027,7 @@ impl EventStore {
             None
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let result = sqlx::query(
             r#"
@@ -1315,7 +1315,7 @@ impl EventStore {
 
         let data_json = serde_json::to_string(&event.data)?;
         let created_at_str = event.created_at.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             r#"
             INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name, turn_id)

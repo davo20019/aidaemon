@@ -258,7 +258,7 @@ pub(crate) async fn project_event(pool: &SqlitePool, event_id: i64) -> anyhow::R
         }
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM history_message_fts WHERE rowid = ?")
         .bind(event_id)
         .execute(&mut *tx)
@@ -352,7 +352,7 @@ pub(crate) async fn remove_projection_rows(
     if event_ids.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for id in event_ids {
         // If FTS is damaged, metadata deletion still proceeds on a later repair.
         let _ = sqlx::query("DELETE FROM history_message_fts WHERE rowid = ?")

@@ -1544,7 +1544,7 @@ impl MandateStore for SqliteStateStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         validate_source_goal(
             &mut tx,
             mandate.source_goal_id.as_deref(),
@@ -1735,7 +1735,7 @@ impl MandateStore for SqliteStateStore {
         );
         anyhow::ensure!(expected_version > 0, "mandate version must be positive");
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT m.goal_id, m.owner_principal_id
              FROM mandates m
@@ -1847,7 +1847,7 @@ impl MandateStore for SqliteStateStore {
             observed_at <= chrono::Utc::now() + chrono::Duration::minutes(5),
             "objective measurement cannot be future-dated"
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let run_started_at = sqlx::query_scalar::<_, Option<String>>(
             "SELECT gr.started_at
              FROM mandates m
@@ -1948,7 +1948,7 @@ impl MandateStore for SqliteStateStore {
             .filter(|version| *version > 0)
             .ok_or_else(|| anyhow::anyhow!("updated mandate version must be at least 2"))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "UPDATE mandates
              SET objective = ?, autonomy_mode = ?, authority_json = ?, strategy_json = ?, objective_control_json = ?, constraints_json = ?,
@@ -2062,7 +2062,7 @@ impl MandateStore for SqliteStateStore {
             })
             .transpose()?;
         let now = activated_at.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', confirmed_at = ?, next_review_at = ?,
@@ -2125,7 +2125,7 @@ impl MandateStore for SqliteStateStore {
             )),
             MandateStatus::Active | MandateStatus::Completed | MandateStatus::Cancelled => None,
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = ?,
@@ -2204,7 +2204,7 @@ impl MandateStore for SqliteStateStore {
             serde_json::from_str::<serde_json::Value>(context)?;
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', next_review_at = ?,
@@ -2306,7 +2306,7 @@ impl MandateStore for SqliteStateStore {
 
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT m.goal_id, g.project_id
              FROM mandates m
@@ -2477,7 +2477,7 @@ impl MandateStore for SqliteStateStore {
         let now_string = now.to_rfc3339();
         let lease_expires_at = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
         let lease_token = format!("{}:{}", lease_owner.trim(), uuid::Uuid::new_v4());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Recover the only crash state produced by the pre-atomic dispatcher:
         // an open mandate run whose root task was never inserted. No work can
@@ -2700,7 +2700,7 @@ impl MandateStore for SqliteStateStore {
         );
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // First write: acquire the writer lock and prove the complete authority
         // chain in one CAS. A pause, policy revision, run replacement, or root
         // attempt replacement either linearizes before this statement (and
@@ -2834,7 +2834,7 @@ impl MandateStore for SqliteStateStore {
         let lease_secs = lease_secs.clamp(1, 86_400);
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let fenced = sqlx::query(
             "UPDATE task_attempts
              SET last_heartbeat_at = datetime('now')
@@ -3083,7 +3083,7 @@ impl MandateStore for SqliteStateStore {
 
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(task_attempt_id) = task_attempt_id {
             anyhow::ensure!(
                 !task_attempt_id.trim().is_empty() && task_attempt_id.trim() == task_attempt_id,
@@ -3580,7 +3580,7 @@ impl MandateStore for SqliteStateStore {
 
     async fn record_mandate_learning_note(&self, note: &MandateLearningNote) -> anyhow::Result<()> {
         note.validate().map_err(anyhow::Error::msg)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let decision_exists = sqlx::query_scalar::<_, i64>(
             "SELECT 1
              FROM mandate_decision_cycles dc
@@ -3719,7 +3719,7 @@ impl MandateStore for SqliteStateStore {
         );
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut awakened = Vec::new();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for mandate in mandates.into_iter().filter(|mandate| {
             crate::mandates::authority::mandate_accepts_wake_signal(mandate, signal)
         }) {
@@ -3814,7 +3814,7 @@ impl MandateStore for SqliteStateStore {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query(
             "SELECT goal_id, created_by_session, suspension_json, objective_control_json
              FROM mandates
@@ -3912,7 +3912,7 @@ impl MandateStore for SqliteStateStore {
         let targets_json = serde_json::to_string(&reservation.targets)?;
         let account_identifiers_json = serde_json::to_string(&reservation.account_identifiers)?;
         let ledger_id = uuid::Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // This UPDATE is deliberately the transaction's first database access.
         // SQLite therefore acquires the writer lock before evaluating the
@@ -4233,7 +4233,7 @@ impl MandateStore for SqliteStateStore {
             });
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Acquire SQLite's writer lock before reading the proof snapshot. All
         // subsequent task, ledger, policy, and lifecycle checks therefore
         // linearize with owner updates and worker finalization writes.

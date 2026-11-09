@@ -933,7 +933,7 @@ impl SqliteMemory {
         channel: Option<&str>,
         privacy: FactPrivacy,
     ) -> anyhow::Result<PersonalMemoryWriteResult> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut result = PersonalMemoryWriteResult::default();
         let confidence = confidence(source, write.direct_user_statement);
         let privacy = privacy.to_string();
@@ -1446,7 +1446,7 @@ impl SqliteMemory {
             .fetch_all(&self.pool)
             .await?;
             if candidates.len() != 1 {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 review(
                     &mut tx,
                     "ambiguous_legacy_child_identity",
@@ -1472,7 +1472,7 @@ impl SqliteMemory {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(collision_id) = collision {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
                 review(
                     &mut tx,
                     "legacy_child_name_collision",
@@ -1494,7 +1494,7 @@ impl SqliteMemory {
             let channel = row.get::<Option<String>, _>("channel_id");
             let provenance = row.get::<Option<String>, _>("source_excerpt");
             let mut result = PersonalMemoryWriteResult::default();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let current: String =
                 sqlx::query_scalar("SELECT canonical_name FROM memory_entities WHERE id = ?")
                     .bind(child_id)
@@ -1648,7 +1648,7 @@ impl SqliteMemory {
             let channel = row.get::<Option<String>, _>("channel_id");
             let provenance = row.get::<Option<String>, _>("source_excerpt");
             let mut result = PersonalMemoryWriteResult::default();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             write_fact(
                 &mut tx,
                 child_id,
@@ -1736,7 +1736,7 @@ impl SqliteMemory {
             let channel = row.get::<Option<String>, _>("channel_id");
             let provenance = row.get::<Option<String>, _>("source_excerpt");
             let mut result = PersonalMemoryWriteResult::default();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             for child_id in child_ids {
                 write_edge(
                     &mut tx,
@@ -1839,7 +1839,7 @@ impl SqliteMemory {
             let duplicate_id: i64 = candidate.get("duplicate_id");
             let normalized_value: String = candidate.get("normalized_value");
             let now = Utc::now().to_rfc3339();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             sqlx::query(
                 "UPDATE memory_relationships
                  SET status = 'superseded', valid_to = ?, updated_at = ?

@@ -585,7 +585,7 @@ impl FactStore for SqliteMemory {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (folded_id, kept_id) in &folded {
             sqlx::query(
                 "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",

@@ -168,7 +168,7 @@ impl crate::traits::MessageStore for SqliteStateStore {
         // conversation text. Keep the logical deletion atomic: a damaged FTS
         // index or foreign-key failure rolls everything back instead of
         // reporting a successful partial wipe.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         super::history_search::remove_session_projection_in_tx(&mut tx, session_id).await?;
         sqlx::query(
             "UPDATE facts SET source_excerpt = NULL
