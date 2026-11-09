@@ -137,6 +137,15 @@ impl MemorySystem for ScopedMemory {
         parts
     }
 
+    fn guidance(&self) -> Option<String> {
+        Some(
+            "You have persistent memory across sessions. Relevant memories may appear in your \
+             context. Use `recall` to search it and `remember` to save durable information. \
+             Only state what memory returns; \"I don't have that stored\" is a valid answer."
+                .to_string(),
+        )
+    }
+
     fn services(&self) -> Vec<Arc<dyn Service>> {
         let memory = self.memory.clone();
         vec![Arc::new(FnService::new(

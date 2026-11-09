@@ -1078,7 +1078,7 @@ impl Agent {
                     crate::agent::memory_plugin::WriterSettings {
                         progressive_facts: false,
                         summarization: self.context_window_config.enabled,
-                        learning: true,
+                        learning: self.memory.is_daemons_own(),
                     },
                     self.transcript_writes.clone(),
                 ),

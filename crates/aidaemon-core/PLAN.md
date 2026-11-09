@@ -445,19 +445,26 @@ Order:
              `events/consolidation.rs`. `StateStore` also inherits every
              memory trait. The crate's own SQL reads the host's `events`
              table in three places.
-           - Design: one `MemorySystem` is the unit that gets replaced. It
-             contributes hooks and tools per turn and background `services()`.
-             Conversation history (`search_history`, `events`) stays the
-             host's. Done: `services()`; a replacing system's jobs run in
-             place of the daemon's, and old events still reach retention
-             without being learned from (`Pruner::retire_old_events`).
-             Next, in order: the daemon's own memory becomes a `MemorySystem`
-             that owns `remember_fact`, `share_memory`, `manage_people`, the
-             memory actions of `manage_memories` (split from its goal
-             actions), `recall.rs` and post-task learning; `StateStore` drops
-             the memory traits and the forwards; a test backend proves a turn
-             leaves the SQLite tables untouched; export/import so switching
-             backends keeps data.
+           - Owner ruling (2026-11-09): another memory system may work in
+             a completely different way. The seam says only what a system
+             adds: per-turn hooks and tools, `guidance()` for the prompt, and
+             background `services()`. The daemon assumes no facts, people,
+             episodes or particular operations. Conversation history
+             (`events`, `search_history`) stays the host's.
+           - Done: `services()`, and old events still reach retention without
+             learning (`Pruner::retire_old_events`); `guidance()`; the prompt's
+             memory section, tool rows and fact rules apply only to the
+             daemon's own memory (its prompt is byte-identical); `share_memory`
+             is owned by it; post-run learning is its own. A test backend with
+             one `journal_note` tool runs a whole turn and writes none of the
+             SQLite memory tables (`memory_plugin/swap_tests.rs`).
+           - Next: `StateStore` drops the memory traits and the forwards.
+             Tool-name tables in `turn/` (`inquiry`, `message_build`,
+             `sliding_window`, `turn_context`) move to typed tool metadata so
+             a backend's tools get the same treatment. Switching backends: no
+             common record format. History is the one thing any system can
+             read, so a new system may ingest the retained transcript, and
+             the daemon's memory gets its own readable export.
         5. Live N-of-M against the current daemon, then delete what is left
            of the old daemon modules.
         Not memory, noted on the way: `memory/context_window.rs` now holds

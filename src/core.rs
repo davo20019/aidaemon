@@ -136,8 +136,19 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Vec::new()
     };
     let custom_persona = startup_prompt::load_agent_persona(&config, &config_path)?;
-    let base_system_prompt =
-        startup_prompt::build_base_system_prompt(&config, &skill_names, custom_persona.as_deref())?;
+    let memory = crate::agent::memory_plugin::configured_memory(
+        &config.memory,
+        &llm_runtime,
+        state.clone(),
+        event_store.clone(),
+    )
+    .await;
+    let base_system_prompt = startup_prompt::build_base_system_prompt(
+        &config,
+        &skill_names,
+        custom_persona.as_deref(),
+        &memory.prompt,
+    )?;
 
     let llm_call_timeout_secs = if config.daemon.watchdog.enabled {
         Some(config.daemon.watchdog.llm_call_timeout_secs)
@@ -228,13 +239,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // Owner-approval cards from the kernel go out on the same channel the
     // tools' cards use.
     agent.owner_approvals().set_broker(approval_tx.clone());
-    let memory = crate::agent::memory_plugin::configured_memory(
-        &config.memory,
-        &llm_runtime,
-        state.clone(),
-        event_store.clone(),
-    )
-    .await;
     let own_memory = memory.own_memory();
     let memory_services = memory.services;
     if let Some(plugin) = memory.plugin {
@@ -836,9 +840,36 @@ primary = "gpt-4o"
     }
 
     #[test]
+    fn the_base_prompt_says_only_what_the_memory_system_says() {
+        use crate::startup::prompt::MemoryPrompt;
+        let config = minimal_config();
+        let prompt =
+            |memory: MemoryPrompt| build_base_system_prompt(&config, &[], None, &memory).unwrap();
+
+        let own = prompt(MemoryPrompt::DaemonsOwn);
+        assert!(own.contains("`remember_fact`"));
+        assert!(own.contains("manage_people"));
+
+        let none = prompt(MemoryPrompt::Replaced(None));
+        assert!(!none.contains("## Memory"));
+        let guided = prompt(MemoryPrompt::Replaced(Some("Keep a journal.".to_string())));
+        assert!(guided.contains("## Memory\nKeep a journal."));
+        for replaced in [none, guided] {
+            assert!(!replaced.contains("remember_fact"));
+            assert!(!replaced.contains("manage_people"));
+        }
+    }
+
+    #[test]
     fn base_prompt_uses_default_agent_identity() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains(
             "You are aidaemon, a personal AI assistant with persistent memory running on aidaemon"
         ));
@@ -848,7 +879,13 @@ primary = "gpt-4o"
     #[test]
     fn base_prompt_is_outcome_driven_instead_of_tool_count_driven() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
 
         assert!(prompt.contains("**Outcome-driven autonomy — when to continue and when to stop:**"));
         assert!(prompt.contains(
@@ -874,6 +911,7 @@ primary = "gpt-4o"
             &config,
             &[],
             Some("# Role\nBe a candid research partner.\n\n# Style\nBe concise."),
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
         )
         .unwrap();
 
@@ -923,7 +961,13 @@ primary = "gpt-4o"
     #[test]
     fn base_prompt_replaces_catalog_with_pointer() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
 
         // Pointer text is present.
         assert!(
@@ -980,7 +1024,13 @@ primary = "gpt-4o"
 enabled = true
 "#,
         );
-        let prompt = build_base_system_prompt(&enabled, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &enabled,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("## CLI Agent Delegation"));
         assert!(prompt.contains("Always set working_dir"));
 
@@ -998,7 +1048,13 @@ primary = "gpt-4o"
 enabled = false
 "#,
         );
-        let prompt = build_base_system_prompt(&disabled, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &disabled,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(!prompt.contains("## CLI Agent Delegation"));
     }
 
@@ -1025,7 +1081,13 @@ allowed_domains = ["api.twitter.com"]
         );
 
         // Only "twitter" has a matching skill guide; "stripe" is missing one.
-        let prompt = build_base_system_prompt(&config, &["twitter".to_string()], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &["twitter".to_string()],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("## API Runtime Context"));
         assert!(
             prompt.contains("Available manual HTTP auth profiles: stripe, twitter")
@@ -1042,7 +1104,13 @@ allowed_domains = ["api.twitter.com"]
     #[test]
     fn api_runtime_context_reports_none_when_empty() {
         let config = minimal_config();
-        let prompt = build_base_system_prompt(&config, &[], None).unwrap();
+        let prompt = build_base_system_prompt(
+            &config,
+            &[],
+            None,
+            &crate::startup::prompt::MemoryPrompt::DaemonsOwn,
+        )
+        .unwrap();
         assert!(prompt.contains("Available manual HTTP auth profiles: none."));
         assert!(prompt.contains("Profiles missing API guides: none."));
     }

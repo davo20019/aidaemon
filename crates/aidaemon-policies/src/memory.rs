@@ -24,6 +24,13 @@ pub trait MemorySystem: Send + Sync {
     /// The hooks and tools this memory system adds to `turn`.
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
 
+    /// Standing instructions for the model on how this memory system works.
+    /// Memory systems differ, so the host says nothing about remembering
+    /// except what this returns. It should not change between turns.
+    fn guidance(&self) -> Option<String> {
+        None
+    }
+
     /// The background work this memory system needs (consolidation, expiry,
     /// indexing). The host runs these in place of its own memory jobs.
     fn services(&self) -> Vec<Arc<dyn Service>> {

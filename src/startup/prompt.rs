@@ -51,10 +51,76 @@ pub(crate) fn load_agent_persona(
     Ok(Some(persona.to_string()))
 }
 
+/// What the base prompt says about memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemoryPrompt {
+    /// The daemon's own memory and its tools.
+    DaemonsOwn,
+    /// Another memory system, with its own guidance if it has any.
+    Replaced(Option<String>),
+}
+
+const DAEMON_MEMORY_SECTION: &str = "## Memory
+You have persistent memory across sessions. Your memory is accessed on demand via tools — \
+it is NOT pre-loaded into this prompt. When the user asks about their preferences, goals, \
+contacts, or past interactions, use the appropriate tool to look it up.
+
+**Storing facts:** Use `remember_fact` ONLY for stable, long-term knowledge about the user — \
+preferences, personal info, environment details, communication patterns. \
+Do NOT save task-scoped research or content being built for a specific project. \
+When the user says \"learn this\", \"remember this\", or \"save these\" about themselves, use `remember_fact`. \
+When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
+
+**Recalling facts:** Use `manage_memories(action='search', query='...')` to look up stored facts. \
+Use `manage_memories(action='search_episodes', query='...')` for coarse semantic conversation recall, \
+then `search_history(action='search', query='...')` for exact retained user/assistant messages, anchored \
+context, task bookends, and signed forward/backward paging. \
+Only state what your tools return. NEVER infer, guess, or fabricate personal data. \
+\"I don't have that stored\" is always a valid answer.
+
+";
+
+const DAEMON_MEMORY_TABLE_ROWS: &str = "| Store user info | remember_fact | — |
+| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
+";
+
+const DAEMON_CORRECTION_RULE: &str =
+    "- **Learn from corrections.** When the user corrects you, store it with `remember_fact` \
+(category \"preference\") so you remember next time.
+";
+
+const DAEMON_PEOPLE_TABLE_ROW: &str =
+    "\n| Track contacts, relationships, birthdays | manage_people | — |";
+
+/// The memory parts of the base prompt: section, tool-table rows, correction
+/// rule, people row.
+fn memory_prompt_parts(
+    memory: &MemoryPrompt,
+) -> (String, &'static str, &'static str, &'static str) {
+    match memory {
+        MemoryPrompt::DaemonsOwn => (
+            DAEMON_MEMORY_SECTION.to_string(),
+            DAEMON_MEMORY_TABLE_ROWS,
+            DAEMON_CORRECTION_RULE,
+            DAEMON_PEOPLE_TABLE_ROW,
+        ),
+        MemoryPrompt::Replaced(guidance) => (
+            guidance
+                .as_deref()
+                .map(|guidance| format!("## Memory\n{}\n\n", guidance.trim()))
+                .unwrap_or_default(),
+            "",
+            "",
+            "",
+        ),
+    }
+}
+
 pub(crate) fn build_base_system_prompt(
     config: &AppConfig,
     skill_names: &[String],
     custom_persona: Option<&str>,
+    memory: &MemoryPrompt,
 ) -> anyhow::Result<String> {
     let agent_name = config.agent.validated_name()?;
     let custom_persona_section = custom_persona
@@ -117,8 +183,8 @@ pub(crate) fn build_base_system_prompt(
         ""
     };
 
-    let manage_people_table_row =
-        "\n| Track contacts, relationships, birthdays | manage_people | — |";
+    let (memory_section, memory_table_rows, correction_rule, manage_people_table_row) =
+        memory_prompt_parts(memory);
 
     let http_request_table_row =
         "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
@@ -308,25 +374,7 @@ When asked to fix bugs, implement features, or modify code, follow this structur
 **NEVER use `terminal` with `python3 -c` to read or write files.** Use `read_file` and `write_file` instead — they are faster and do not require approval.
 **NEVER use `terminal` with `cat`, `head`, or `tail` to read files.** Always use `read_file` — it is the dedicated tool for reading files and avoids unnecessary terminal overhead.
 
-## Memory
-You have persistent memory across sessions. Your memory is accessed on demand via tools — \
-it is NOT pre-loaded into this prompt. When the user asks about their preferences, goals, \
-contacts, or past interactions, use the appropriate tool to look it up.
-
-**Storing facts:** Use `remember_fact` ONLY for stable, long-term knowledge about the user — \
-preferences, personal info, environment details, communication patterns. \
-Do NOT save task-scoped research or content being built for a specific project. \
-When the user says \"learn this\", \"remember this\", or \"save these\" about themselves, use `remember_fact`. \
-When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
-
-**Recalling facts:** Use `manage_memories(action='search', query='...')` to look up stored facts. \
-Use `manage_memories(action='search_episodes', query='...')` for coarse semantic conversation recall, \
-then `search_history(action='search', query='...')` for exact retained user/assistant messages, anchored \
-context, task bookends, and signed forward/backward paging. \
-Only state what your tools return. NEVER infer, guess, or fabricate personal data. \
-\"I don't have that stored\" is always a valid answer.
-
-## Planning
+{memory_section}## Planning
 Before using any tool, pause and think:
 1. **What exactly are they asking for?** Restate it in your own words. \
    If the request references something vague (\"the site\", \"that file\", \"the thing we did\"), \
@@ -371,9 +419,7 @@ treating an error as active — stale log lines may only describe a past failure
 | Check ports/containers | service_status | terminal |
 | Run commands, scripts, get real-time data (only when no dedicated tool fits) | terminal | — |
 | Get system specs, current time/date | system_info, terminal | — |
-| Store user info | remember_fact | — |
-| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
-| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
+{memory_table_rows}| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
 | Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
 | Fixed-time or fixed-cadence work where the cadence itself is the instruction | scheduled goal | manage_memories |
 | List/cancel/pause/resume/retry/diagnose scheduled goals (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
@@ -425,9 +471,7 @@ When presenting a draft, preserve exact operation-scope identifiers and resolved
 
 ## Behavior
 - **Investigate before escalating.** When uncertainty can be reduced with safe, relevant, in-scope observation, use your tools and follow the evidence. Ask for clarification only when the unresolved ambiguity is material or further progress needs the user's authority. Never claim you can't access files or folders — you have `terminal`.
-- **Learn from corrections.** When the user corrects you, store it with `remember_fact` \
-(category \"preference\") so you remember next time.
-- **Show results.** After using a tool, include the actual output in your response.
+{correction_rule}- **Show results.** After using a tool, include the actual output in your response.
 - **Be concise.** Adjust verbosity to user preferences.
 - **Plain text math.** Never use LaTeX ($...$, \\times, \\frac). Use plain symbols: × ÷ √ ≈ ≤ ≥ and a/b for fractions.
 - The approval system handles command permissions — let the user decide via the approval prompt.

@@ -1018,8 +1018,7 @@ impl Agent {
             );
         } else {
             rules.push_str(
-                "- `manage_memories` (goal actions) — for personal goals and scheduled tasks\n\
-                 - your memory recall tool — for stored facts and preferences\n",
+                "- `manage_memories` (goal actions) — for personal goals and scheduled tasks\n",
             );
         }
         rules.push_str(
@@ -1030,9 +1029,11 @@ impl Agent {
         );
 
         // Truthfulness and memory accuracy guardrails.
-        rules.push_str(
-            "\n\n[Truthfulness and Memory Accuracy]\n\
-             2. **Cross-reference memory before answering fact questions.** \
+        let own_memory = self.memory.is_daemons_own();
+        rules.push_str("\n\n[Truthfulness and Memory Accuracy]\n");
+        if own_memory {
+            rules.push_str(
+            "2. **Cross-reference memory before answering fact questions.** \
              When the user asks about stored preferences, personal details, or previously saved information \
              (favorite color, name, location, etc.), retrieve the actual stored value using your memory/fact tools \
              before answering. Do not guess, assume, or fill in from general knowledge. If no stored fact exists, say so.\n\
@@ -1041,13 +1042,23 @@ impl Agent {
              (e.g., a different name, identity, or key personal detail), do NOT silently accept and overwrite it. \
              Acknowledge the discrepancy and ask for confirmation: \
              \"I have you recorded as [X]. Would you like me to update this to [Y]?\" \
-             Only update after explicit confirmation.\n\
-             4. **Never mention tool names in responses.** \
+             Only update after explicit confirmation.\n",
+        );
+        }
+        let tool_names_rule =
+            "4. **Never mention tool names in responses.** \
              Do not reference internal tool names like `remember_fact`, `terminal`, `web_search`, or any other tool \
              by its programmatic name in your replies. Describe actions in natural language instead \
              (e.g., \"I'll look that up\" not \"I'll use the web_search tool\"). Do not invent slash commands \
-             for tools either (for example, do not tell users to type `/manage_oauth ...` unless `/help` actually exposes it as a channel command).\n\
-             5. **Proactively store personal information.** \
+             for tools either (for example, do not tell users to type `/manage_oauth ...` unless `/help` actually exposes it as a channel command).\n";
+        if own_memory {
+            rules.push_str(tool_names_rule);
+        } else {
+            rules.push_str(&tool_names_rule.replace("`remember_fact`, ", ""));
+        }
+        if own_memory {
+            rules.push_str(
+            "5. **Proactively store personal information.** \
              When the user shares personal details about themselves — name, location, preferences, schedule, pets, \
              hobbies, work habits, family, food/drink preferences, or anything they explicitly ask you to remember — \
              you MUST use your fact storage tools to save this information persistently. \
@@ -1057,8 +1068,11 @@ impl Agent {
              Then write the correction through the personal-memory pipeline so the previous value is superseded, \
              not erased. Preserve aliases, provenance, and history; never manufacture a second person merely because \
              a corrected name or nickname differs. Deactivate legacy duplicate keys only when the canonical entity \
-             and predicate have been resolved unambiguously.\n\
-             6. **Never claim you lack capabilities you have.** \
+             and predicate have been resolved unambiguously.\n",
+        );
+        }
+        rules.push_str(
+            "6. **Never claim you lack capabilities you have.** \
              You have tools listed in your tool definitions. Never tell the user you \"don't have access\" to memory, \
              file operations, web search, or any other capability that appears in your available tools. \
              If you're unsure whether you can do something, TRY using the relevant tool first rather than telling \
@@ -1085,20 +1099,31 @@ impl Agent {
              Only fall back to files/scripts/shell if the purpose-built integration path is unavailable or the user explicitly asks for implementation work. \
              Do not ask the user where secrets are stored (.env, keychain, config file path) until you have first checked the available \
              config/auth tools for existing credentials or connection state. If reconnecting an OAuth service, verify whether client credentials \
-             are already stored before asking the user for them again. Prefer `connect` for OAuth reauthorization; do not call `remove` unless the user explicitly wants the service disconnected. \
-             For stable stored personal, project, organization, and relationship facts, answer from relevant memory \
+             are already stored before asking the user for them again. Prefer `connect` for OAuth reauthorization; do not call `remove` unless the user explicitly wants the service disconnected. ",
+        );
+        if own_memory {
+            rules.push_str(
+            "For stable stored personal, project, organization, and relationship facts, answer from relevant memory \
              when it directly contains the requested value. Browse only when the user asks for verification/current \
              information, the subject is time-sensitive, or memory lacks enough evidence. Do not perform redundant \
-             web searches merely to restate a stable fact already present in the current context.\n\
-             9. **Wait for background services to become ready before testing.** \
+             web searches merely to restate a stable fact already present in the current context.\n",
+        );
+        } else {
+            rules.push('\n');
+        }
+        rules.push_str(
+            "9. **Wait for background services to become ready before testing.** \
              When you start a server or service in the background (e.g., `python3 app.py &`), \
              add `sleep 2` before making requests to it. Services need a moment to bind their ports.\n\
              10. **Trust explicit paths the user provides.** \
              When the user gives you a specific file path (e.g., `~/projects/blog/drafts/file.md`), \
              use that path directly. Do NOT waste tool calls running `find` or `ls` to locate the directory — \
              just create any missing parent directories with `mkdir -p` and proceed. \
-             Only explore the filesystem when the user's path is genuinely ambiguous or unclear.\n\
-             11. **Quote stored fact values EXACTLY — never substitute or infer.** \
+             Only explore the filesystem when the user's path is genuinely ambiguous or unclear.\n",
+        );
+        if own_memory {
+            rules.push_str(
+            "11. **Quote stored fact values EXACTLY — never substitute or infer.** \
              When answering questions about stored facts (preferences, pet names, drinks, dates, personal details), \
              use the EXACT value from the [Critical Facts] block at the top of this prompt or from tool results. \
              Do NOT paraphrase, infer, or substitute a different value from your training data. \
@@ -1110,6 +1135,7 @@ impl Agent {
              (e.g. \"the owner\" right after discussing a company means that company's owner), \
              resolve it against the conversation, not against stored facts.",
         );
+        }
 
         rules.push_str("\n\n");
         rules.push_str(&Self::core_behavioral_rules());

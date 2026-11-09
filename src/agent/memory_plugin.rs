@@ -20,6 +20,8 @@ use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
 
 mod recall;
+#[cfg(test)]
+mod swap_tests;
 mod system_memory;
 mod writer;
 pub(crate) use recall::DaemonRecall;
@@ -29,8 +31,12 @@ pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
 /// lists them in [`MemoryParts::owned_daemon_tools`].
-pub(crate) const DAEMON_MEMORY_TOOLS: &[&str] =
-    &["remember_fact", "manage_memories", "manage_people"];
+pub(crate) const DAEMON_MEMORY_TOOLS: &[&str] = &[
+    "remember_fact",
+    "manage_memories",
+    "manage_people",
+    "share_memory",
+];
 
 /// `manage_memories` actions that manage goals, not memory. They stay with
 /// the daemon whatever the plugin: under a plugin that does not own
@@ -170,6 +176,13 @@ pub(crate) trait MemoryPlugin: Send + Sync {
     fn owned_daemon_tools(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// This is the daemon's own memory, so the daemon's prompts about facts
+    /// and its learning from finished runs apply. Another memory system may
+    /// have neither.
+    fn is_daemons_own(&self) -> bool {
+        false
+    }
 }
 
 /// The parts `plugin` adds to `turn`. A mandate worker gets none, whatever
@@ -190,6 +203,8 @@ pub(crate) struct ConfiguredMemory {
     pub plugin: Option<Arc<dyn MemoryPlugin>>,
     /// Background work of a replacing system.
     pub services: Vec<Arc<dyn aidaemon_core::Service>>,
+    /// What the base system prompt says about memory.
+    pub prompt: crate::startup::prompt::MemoryPrompt,
 }
 
 impl ConfiguredMemory {
@@ -197,6 +212,7 @@ impl ConfiguredMemory {
         Self {
             plugin: None,
             services: Vec::new(),
+            prompt: crate::startup::prompt::MemoryPrompt::DaemonsOwn,
         }
     }
 
@@ -204,6 +220,7 @@ impl ConfiguredMemory {
     pub(crate) fn replaced_by(system: Arc<dyn aidaemon_policies::MemorySystem>) -> Self {
         Self {
             services: system.services(),
+            prompt: crate::startup::prompt::MemoryPrompt::Replaced(system.guidance()),
             plugin: Some(Arc::new(SystemMemory::new(system))),
         }
     }
@@ -410,6 +427,10 @@ impl MemoryPlugin for DaemonMemory {
 
     fn owned_daemon_tools(&self) -> &'static [&'static str] {
         DAEMON_MEMORY_TOOLS
+    }
+
+    fn is_daemons_own(&self) -> bool {
+        true
     }
 }
 
@@ -703,7 +724,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             harness.agent.memory.owned_daemon_tools(),
-            ["remember_fact", "manage_memories", "manage_people"]
+            [
+                "remember_fact",
+                "manage_memories",
+                "manage_people",
+                "share_memory"
+            ]
         );
         let roster = |agent: &crate::agent::Agent| {
             agent
@@ -731,10 +757,7 @@ mod tests {
         assert_eq!(sdk.path, "m.db");
     }
 
-    /// Summarization and learning are the turn's, not the plugin's: they run
-    /// under a plugin that adds no writer.
-    #[tokio::test]
-    async fn transcript_memory_runs_under_any_plugin() {
+    async fn learned_after_one_turn(replace_memory: bool) -> usize {
         use crate::runtime_ports::AgentIngress;
         use crate::testing::MockProvider;
 
@@ -745,9 +768,11 @@ mod tests {
             .await
             .unwrap();
         let writes = Arc::new(writer::tests::RecordingWrites::default());
-        harness
-            .agent
-            .set_memory_plugin(Arc::new(StubMemory(Arc::default())));
+        if replace_memory {
+            harness
+                .agent
+                .set_memory_plugin(Arc::new(StubMemory(Arc::default())));
+        }
         harness.agent.set_test_transcript_writes(writes.clone());
         harness
             .agent
@@ -755,7 +780,15 @@ mod tests {
             .await
             .unwrap();
         let recorded = writes.0.lock().unwrap();
-        assert_eq!(recorded.learned.len(), 1);
         assert!(recorded.extracted.is_empty());
+        recorded.learned.len()
+    }
+
+    /// Learning from finished runs writes the daemon's own stores, so it
+    /// belongs to the daemon's memory and stops when another system replaces it.
+    #[tokio::test]
+    async fn only_the_daemons_memory_learns_from_runs() {
+        assert_eq!(learned_after_one_turn(false).await, 1);
+        assert_eq!(learned_after_one_turn(true).await, 0);
     }
 }
