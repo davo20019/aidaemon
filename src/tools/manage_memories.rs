@@ -660,6 +660,22 @@ fn memory_action_effects(arguments: &str) -> ToolMutationEffects {
             ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::DESTRUCTIVE)
         }
         Some("set_privacy") => ToolMutationEffects::CONFIGURATION,
+        Some(
+            "create_personal_goal"
+            | "complete_goal"
+            | "abandon_goal"
+            | "create_scheduled_goal"
+            | "activate_scheduled"
+            | "add_schedule"
+            | "cancel_scheduled"
+            | "pause_scheduled"
+            | "resume_scheduled"
+            | "retry_scheduled"
+            | "retry_failed_scheduled"
+            | "cancel_scheduled_matching"
+            | "retry_scheduled_matching"
+            | "trigger_now",
+        ) => ToolMutationEffects::SCHEDULED_WORK,
         _ => ToolMutationEffects::NONE,
     }
 }
@@ -3122,6 +3138,22 @@ mod tests {
             .unwrap()
             .output;
         assert!(trusted.contains("Jordan Lee"), "{trusted}");
+    }
+
+    #[test]
+    fn a_goal_action_reports_what_it_did_without_counting_as_outbound() {
+        use crate::traits::ToolMutationEffects as Effects;
+        let effects = memory_action_effects(r#"{"action":"create_scheduled_goal"}"#);
+        // A plan may name it any of these; each must be able to close.
+        for planned in [
+            Effects::SCHEDULED_WORK,
+            Effects::CONFIGURATION,
+            Effects::PROCESS_STATE,
+        ] {
+            assert!(effects.satisfies(planned));
+        }
+        assert!(!effects.satisfies(Effects::REMOTE_MUTATION));
+        assert!(!effects.intersects(crate::traits::EGRESS_EFFECTS));
     }
 
     fn test_tool(state: Arc<SqliteStateStore>) -> ManageMemoriesTool {

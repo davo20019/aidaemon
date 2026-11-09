@@ -132,7 +132,7 @@ impl crate::traits::ToolSemantics for SetReminderTool {
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::mutation()
+        ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::SCHEDULED_WORK)
     }
 
     fn capabilities(&self) -> ToolCapabilities {

@@ -197,7 +197,8 @@ impl TrackRequirementsTool {
     fn targets_description(&self) -> String {
         let mut description = String::from(
             "Exact receipt evidence targets. Prefer a structured subject/facet binding and never \
-             invent a resource ID; use an ID returned by a tool.",
+             invent a resource ID; use an ID returned by a tool. Leave this empty for something \
+             this run creates and has no ID for yet, such as a new goal or schedule.",
         );
         if !self.vocabulary.is_empty() {
             description.push_str(&self.vocabulary.render_schema_hint());
