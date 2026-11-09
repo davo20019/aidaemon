@@ -239,6 +239,11 @@ pub struct Expect {
     /// Exact call count per tool. Tools not listed are unconstrained.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_call_counts: BTreeMap<String, u32>,
+    /// Exact count per tool of calls whose code actually ran. Unlike
+    /// `tool_call_counts`, a call refused or rejected at the boundary has a
+    /// receipt but does not count, so this measures real side effects.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_dispatch_counts: BTreeMap<String, u32>,
     /// Exact sequence of receipt statuses per tool, e.g.
     /// `{delete_file: [denied]}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

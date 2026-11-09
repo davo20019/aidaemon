@@ -774,3 +774,36 @@ expect:
     .await;
     assert!(result.passed, "{:?}", result.failures);
 }
+
+#[tokio::test]
+async fn a_denied_call_has_a_receipt_but_is_not_dispatched() {
+    let result = run(r#"
+name: denied_is_not_dispatched
+input: Delete it.
+script:
+  - tool_calls: [{ name: delete_file, arguments: { path: a } }]
+  - text: That was not allowed.
+expect:
+  tool_call_counts: { delete_file: 1 }
+  tool_dispatch_counts: { delete_file: 0 }
+  receipt_statuses: { delete_file: [denied] }
+"#)
+    .await;
+    assert!(result.passed, "{:?}", result.failures);
+
+    let result = run(r#"
+name: denied_is_not_dispatched_wrong
+input: Delete it.
+script:
+  - tool_calls: [{ name: delete_file, arguments: { path: a } }]
+  - text: That was not allowed.
+expect:
+  tool_dispatch_counts: { delete_file: 1 }
+"#)
+    .await;
+    assert!(
+        has_failure(&result, "tool_dispatch_counts"),
+        "{:?}",
+        result.failures
+    );
+}

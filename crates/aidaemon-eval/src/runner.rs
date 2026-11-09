@@ -385,6 +385,18 @@ pub fn check_trajectory<O>(expect: &Expect, trajectory: &Trajectory<O>) -> Vec<S
         &proposed,
     );
 
+    for (tool, expected) in &expect.tool_dispatch_counts {
+        let actual = receipts
+            .iter()
+            .filter(|r| r.dispatched && &r.tool == tool)
+            .count();
+        if actual != *expected as usize {
+            failures.push(format!(
+                "tool_dispatch_counts: `{tool}` expected {expected} dispatch(es), got {actual}"
+            ));
+        }
+    }
+
     for (tool, expected) in &expect.receipt_statuses {
         let actual: Vec<String> = receipts
             .iter()
