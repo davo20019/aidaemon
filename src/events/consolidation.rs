@@ -494,6 +494,7 @@ mod golden_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::config::ProviderKind;
     use crate::events::{DiagnosticSeverity, Event, EventType, TaskStatus};

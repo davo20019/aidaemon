@@ -299,6 +299,7 @@ pub fn spawn_macos_keep_awake() {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
 
     async fn health_fixture() -> (

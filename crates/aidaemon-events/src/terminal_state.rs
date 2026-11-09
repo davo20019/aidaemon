@@ -1,6 +1,6 @@
 //! Pillar B: per-turn terminal state for archived rendering.
 //! Spec: 2026-06-06-cross-turn-prefix-stability-design.md §Rendering/§prerequisite.
-use crate::events::TaskStatus;
+use crate::TaskStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalState {

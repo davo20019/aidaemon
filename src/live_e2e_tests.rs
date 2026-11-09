@@ -9,6 +9,7 @@
 //! AIDAEMON_LIVE_TEST=1 cargo test test_live -- --nocapture
 //! ```
 
+use crate::events::EventStoreForTests as _;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

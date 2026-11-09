@@ -62,7 +62,12 @@ pub async fn build_stores(
         }
     }
 
-    let event_store = Arc::new(EventStore::on_paths(state.pool(), paths).await?);
+    let event_store = Arc::new(EventStore::on_paths(
+        state.pool(),
+        paths,
+        Arc::new(crate::events::DaemonEventHost),
+    )
+    .await?);
     info!("Event store initialized");
 
     let plan_store = Arc::new(PlanStore::new(state.pool()).await?);

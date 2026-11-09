@@ -293,6 +293,7 @@ mod tests;
 
 #[cfg(test)]
 mod turn_id_hydration_tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::events::{Event, EventStore, EventType};
     use crate::traits::MessageStore;

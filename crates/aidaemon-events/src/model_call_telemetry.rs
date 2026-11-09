@@ -228,7 +228,7 @@ async fn record_background_call(
 #[cfg(test)]
 mod tests {
     use super::token_usage_evidence;
-    use crate::events::TokenUsageEvidence;
+    use crate::TokenUsageEvidence;
 
     #[test]
     fn token_usage_provenance_never_presents_an_estimate_as_provider_measurement() {

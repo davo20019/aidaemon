@@ -338,6 +338,7 @@ async fn persist_resolution(
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::tools::command_risk::{PermissionMode, RiskLevel};
 

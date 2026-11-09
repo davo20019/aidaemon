@@ -2238,6 +2238,7 @@ fn directory_size(path: &Path) -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
 
     #[test]

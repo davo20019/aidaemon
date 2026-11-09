@@ -22,44 +22,7 @@ pub fn message_from_event(
         .map(|turn| turn.into_message())
 }
 
-/// Truncate a conversation while preserving the first user message ("anchor") within the slice.
-///
-/// Some providers require assistant/tool turns to follow a user message. This helper
-/// ensures the returned slice does not accidentally drop the first user message
-/// when truncating to a tail window.
-pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message> {
-    if messages.len() <= limit {
-        return messages;
-    }
-
-    // Find the first user message (anchor) *within* this slice.
-    let anchor_idx = messages.iter().position(|m| m.role == "user");
-    let skip = messages.len().saturating_sub(limit);
-
-    if let Some(anchor) = anchor_idx {
-        if skip > anchor {
-            // We would skip past the anchor - preserve it
-            let anchor_msg = messages[anchor].clone();
-            let remaining: Vec<_> = messages.into_iter().skip(skip).collect();
-
-            // Only prepend anchor if not already in remaining
-            if remaining.first().map(|m| m.role.as_str()) != Some("user") {
-                // Keep the newest `limit - 1` after the anchor. Taking the
-                // oldest instead dropped the latest message, so the last
-                // reply vanished from history and its question looked
-                // unanswered.
-                let mut result = vec![anchor_msg];
-                let keep = limit.saturating_sub(1);
-                result.extend(remaining.into_iter().rev().take(keep).rev());
-                return result;
-            }
-            return remaining;
-        }
-    }
-
-    // Normal case - just take last N
-    messages.into_iter().skip(skip).collect()
-}
+pub use aidaemon_events::conversation::truncate_with_anchor;
 
 #[cfg(test)]
 mod tests {

@@ -9,8 +9,14 @@ pub mod execution_graph;
 pub mod mandate_grant;
 pub mod provider;
 pub mod session;
+pub mod context;
+pub mod conversation_turn;
+pub mod model_call_telemetry;
 pub mod payloads;
 pub mod run_aggregate;
+pub mod schema;
+pub mod store;
+pub mod terminal_state;
 pub mod text;
 
 /// The contract types the payloads and the store are written against.
@@ -23,7 +29,22 @@ pub mod traits {
     pub use crate::provider::*;
 }
 
+pub use context::SessionContextCompiler;
+pub use conversation_turn::{turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn};
+pub use model_call_telemetry::{
+    record_background_model_call_failure, record_background_model_call_telemetry,
+    record_model_call_telemetry, ModelCallTelemetryInput,
+};
 pub use payloads::*;
+#[cfg(any(test, feature = "testing"))]
+pub use store::GeneratedResponseRef;
+pub use store::{
+    capture_generated_responses, CapturedGeneratedResponse, ContinuationToolEvidence, EventEmitter,
+    EventHost, EventStore, LlmStats, NoEventHost, PolicyGraduationReport, ProviderReadiness,
+    SessionWriteDrift, TaskLlmSummary, TaskReceiptClosure, TaskWindowStats, ToolStats,
+    WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
+};
+pub use terminal_state::TerminalState;
 pub use run_aggregate::{
     CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
     RunTerminalDecision, TaskKernelAdmission, OWNER_APPROVAL_DECLINED,

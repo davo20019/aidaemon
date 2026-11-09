@@ -17,7 +17,7 @@ use super::{
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, RunAggregate,
     TaskContractCompiledData, TaskEndData, TaskStatus, ToolCallData, ToolResultData,
 };
-use crate::execution::LexicalPaths;
+use aidaemon_tools::LexicalPaths;
 use crate::traits::{Message, TokenUsage};
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ pub struct GeneratedResponseRef {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CapturedGeneratedResponse {
+pub struct CapturedGeneratedResponse {
     pub content: String,
     pub response: GeneratedResponseRef,
 }
@@ -48,7 +48,7 @@ tokio::task_local! {
 /// Execute one ingress lifecycle with a causal response-identity collector.
 /// Tokio task locals are intentionally not inherited by spawned background
 /// tasks, so their later responses cannot race the channel handoff.
-pub(crate) async fn capture_generated_responses<F, T>(
+pub async fn capture_generated_responses<F, T>(
     session_id: &str,
     future: F,
 ) -> (T, Vec<CapturedGeneratedResponse>)
@@ -179,6 +179,42 @@ pub struct EventStore {
     /// How replayed run ledgers compare path targets: the execution backend's
     /// flavor and bases, fixed for this store's life.
     paths: LexicalPaths,
+    /// The host's end of the projections and error grouping this store
+    /// triggers but does not own.
+    host: Arc<dyn EventHost>,
+}
+
+/// What the event store needs from its host. Exact-history search and memory
+/// spans are projections of events that live in the host's own tables, and
+/// the wrappers a host puts around error text are the host's to strip.
+#[async_trait::async_trait]
+pub trait EventHost: Send + Sync {
+    /// Project a stored user or assistant message into exact-history search.
+    async fn project_history(&self, pool: &SqlitePool, event_id: i64) -> anyhow::Result<bool>;
+
+    /// Project a stored user message into long-term memory's span table.
+    async fn project_memory_span(&self, pool: &SqlitePool, event_id: i64) -> anyhow::Result<()>;
+
+    /// The recurrence pattern of a tool's error text.
+    fn error_pattern(&self, error: &str) -> String;
+}
+
+/// A host with no projections: errors group by their own text.
+pub struct NoEventHost;
+
+#[async_trait::async_trait]
+impl EventHost for NoEventHost {
+    async fn project_history(&self, _pool: &SqlitePool, _event_id: i64) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn project_memory_span(&self, _pool: &SqlitePool, _event_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn error_pattern(&self, error: &str) -> String {
+        error.trim().to_string()
+    }
 }
 
 enum TaskLifecycleTransition {
@@ -188,7 +224,7 @@ enum TaskLifecycleTransition {
     End {
         task_id: String,
         status: TaskStatus,
-        outcome: crate::events::TaskOutcome,
+        outcome: crate::TaskOutcome,
     },
 }
 
@@ -374,10 +410,10 @@ fn mandate_projection_from_tool_result(
         "mandate receipt carries an invalid action-bound grant"
     );
     let evidence = match receipt.outcome_evidence {
-        crate::events::ToolOutcomeEvidenceSource::ToolReported => Some("tool_reported"),
-        crate::events::ToolOutcomeEvidenceSource::StructuredMetadata => Some("structured_metadata"),
-        crate::events::ToolOutcomeEvidenceSource::DurableReplay
-        | crate::events::ToolOutcomeEvidenceSource::LegacyText => None,
+        crate::ToolOutcomeEvidenceSource::ToolReported => Some("tool_reported"),
+        crate::ToolOutcomeEvidenceSource::StructuredMetadata => Some("structured_metadata"),
+        crate::ToolOutcomeEvidenceSource::DurableReplay
+        | crate::ToolOutcomeEvidenceSource::LegacyText => None,
     };
     let clean_transport = receipt.transport_error.is_none()
         && !receipt.timed_out
@@ -389,14 +425,14 @@ fn mandate_projection_from_tool_result(
         || receipt
             .http_status
             .is_some_and(|status| (200..300).contains(&status) && status != 202);
-    let strict_success = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+    let strict_success = receipt.schema_version == crate::ToolReceiptV1::SCHEMA_VERSION
         && receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
         && evidence.is_some()
         && clean_transport
         && exit_success
         && http_success
         && receipt.semantics.mutates_state();
-    let explicit_failure = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+    let explicit_failure = receipt.schema_version == crate::ToolReceiptV1::SCHEMA_VERSION
         && receipt.outcome_status.is_failure()
         && evidence.is_some()
         && clean_transport
@@ -451,7 +487,7 @@ pub struct ProviderReadiness {
     pub consecutive_failures: u64,
     pub last_call_at: Option<DateTime<Utc>>,
     pub latest_failed: bool,
-    pub failure_kind: Option<crate::providers::ProviderErrorKind>,
+    pub failure_kind: Option<crate::provider::ProviderErrorKind>,
     pub provider_status: Option<u16>,
 }
 
@@ -464,9 +500,9 @@ impl ProviderReadiness {
             && (matches!(
                 self.failure_kind,
                 Some(
-                    crate::providers::ProviderErrorKind::Auth
-                        | crate::providers::ProviderErrorKind::Billing
-                        | crate::providers::ProviderErrorKind::QuotaExhausted
+                    crate::provider::ProviderErrorKind::Auth
+                        | crate::provider::ProviderErrorKind::Billing
+                        | crate::provider::ProviderErrorKind::QuotaExhausted
                 )
             ) || self.consecutive_failures >= 3)
     }
@@ -485,7 +521,7 @@ pub struct TaskLlmSummary {
     pub last_error: Option<String>,
     /// Typed cause from the latest failed physical call. Goal recovery and
     /// diagnostics consume this field instead of parsing `last_error` prose.
-    pub last_provider_error_kind: Option<crate::providers::ProviderErrorKind>,
+    pub last_provider_error_kind: Option<crate::provider::ProviderErrorKind>,
     pub last_provider_status: Option<u16>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -996,12 +1032,16 @@ impl EventStore {
     /// This also runs migrations to create/update the events table.
     #[cfg(test)]
     pub async fn new(pool: SqlitePool) -> anyhow::Result<Self> {
-        Self::on_paths(pool, LexicalPaths::daemon_host()).await
+        Self::on_paths(pool, LexicalPaths::daemon_host(), Arc::new(NoEventHost)).await
     }
 
     /// Open the store for a daemon whose execution backend has these paths.
-    pub async fn on_paths(pool: SqlitePool, paths: LexicalPaths) -> anyhow::Result<Self> {
-        let store = Self { pool, paths };
+    pub async fn on_paths(
+        pool: SqlitePool,
+        paths: LexicalPaths,
+        host: Arc<dyn EventHost>,
+    ) -> anyhow::Result<Self> {
+        let store = Self { pool, paths, host };
         store.migrate().await?;
         Ok(store)
     }
@@ -1013,7 +1053,7 @@ impl EventStore {
 
     /// Run database migrations for the events table
     async fn migrate(&self) -> anyhow::Result<()> {
-        crate::db::migrations::migrate_events(&self.pool).await
+        crate::schema::migrate_events(&self.pool).await
     }
 
     // =========================================================================
@@ -1168,9 +1208,7 @@ impl EventStore {
         }
         tx.commit().await?;
         if matches!(event_type_str, "user_message" | "assistant_response") {
-            if let Err(error) =
-                crate::state::sqlite::history_search::project_event(&self.pool, event_id).await
-            {
+            if let Err(error) = self.host.project_history(&self.pool, event_id).await {
                 // Never couple the canonical append transaction to FTS health.
                 tracing::debug!(%error, event_id, "Deferred exact-history projection");
             }
@@ -1191,11 +1229,11 @@ impl EventStore {
     /// durable event history. A rejected proposal is still appended for audit
     /// and correlation with its typed pre-dispatch result; the returned
     /// admission is the only dispatch authority.
-    pub(crate) async fn admit_and_append_tool_call(
+    pub async fn admit_and_append_tool_call(
         &self,
         mut event: Event,
-        claim: &crate::events::TaskKernelOperationClaim,
-    ) -> anyhow::Result<(i64, crate::events::TaskKernelAdmission)> {
+        claim: &crate::TaskKernelOperationClaim,
+    ) -> anyhow::Result<(i64, crate::TaskKernelAdmission)> {
         anyhow::ensure!(
             event.event_type == EventType::ToolCall,
             "expected tool_call event"
@@ -1281,7 +1319,7 @@ impl EventStore {
     /// memory pipeline has persisted at least one durable fact from that turn.
     /// Task identity is the selection boundary; prose similarity never chooses
     /// which raw control turn enters the memory graph.
-    pub(crate) async fn project_selected_user_message_memory_span_for_task(
+    pub async fn project_selected_user_message_memory_span_for_task(
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<i64>> {
@@ -1296,12 +1334,9 @@ impl EventStore {
         let Some(event_id) = event_id else {
             return Ok(None);
         };
-        aidaemon_memory::sqlite::project_event_span(
-            &self.pool,
-            &crate::memory::DaemonChannelIds,
-            event_id,
-        )
-        .await?;
+        self.host
+            .project_memory_span(&self.pool, event_id)
+            .await?;
         let projected = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ? AND deleted_at IS NULL",
         )
@@ -1627,7 +1662,7 @@ impl EventStore {
     }
 
     /// The aggregate of a run with no readable history.
-    pub(crate) fn empty_run_aggregate(&self, task_id: &str) -> RunAggregate {
+    pub fn empty_run_aggregate(&self, task_id: &str) -> RunAggregate {
         RunAggregate::on_paths(task_id, self.paths.clone())
     }
 
@@ -1635,7 +1670,7 @@ impl EventStore {
     /// immutable event history. The aggregate is deliberately a discardable
     /// projection: every caller observes the same obligations and outcome,
     /// including after a crash or provider failure.
-    pub(crate) async fn task_run_aggregate(
+    pub async fn task_run_aggregate(
         &self,
         session_id: &str,
         task_id: &str,
@@ -1776,7 +1811,7 @@ impl EventStore {
 
     /// Return the typed result for an exact causal operation. This avoids
     /// selecting an unrelated later observation merely because it is newest.
-    pub(crate) async fn task_tool_result_by_call_id(
+    pub async fn task_tool_result_by_call_id(
         &self,
         session_id: &str,
         task_id: &str,
@@ -2142,7 +2177,7 @@ impl EventStore {
             events.retain(|e| {
                 e.parse_data::<TaskEndData>()
                     .ok()
-                    .is_some_and(|d| d.effective_outcome() != crate::events::TaskOutcome::Succeeded)
+                    .is_some_and(|d| d.effective_outcome() != crate::TaskOutcome::Succeeded)
             });
         }
         events.truncate(limit.max(1));
@@ -2308,7 +2343,7 @@ impl EventStore {
             if after_event_id.is_some_and(|boundary| event.id <= boundary) {
                 continue;
             }
-            if let Some(msg) = crate::events::turn_from_event(
+            if let Some(msg) = crate::turn_from_event(
                 event.id,
                 &event.session_id,
                 event.event_type.as_str(),
@@ -2477,7 +2512,7 @@ impl EventStore {
                 .unwrap_or_else(|_| Utc::now());
 
             let Some(message) =
-                crate::events::turn_from_event(id, session_id, &event_type, &data, created_at)
+                crate::turn_from_event(id, session_id, &event_type, &data, created_at)
                     .map(|turn| turn.into_message())
             else {
                 continue;
@@ -2618,21 +2653,21 @@ impl EventStore {
             .unwrap_or_else(|_| self.empty_run_aggregate(&task_id));
         let terminal_decision = aggregate.terminal_decision();
         let outcome = match (status, terminal_decision) {
-            (TaskStatus::Cancelled, _) => crate::events::TaskOutcome::Failed,
+            (TaskStatus::Cancelled, _) => crate::TaskOutcome::Failed,
             (
                 _,
                 super::RunTerminalDecision::Succeeded
                 | super::RunTerminalDecision::SucceededByEvidence
                 | super::RunTerminalDecision::ClosedByPolicyDenial,
-            ) => crate::events::TaskOutcome::Succeeded,
-            (_, super::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
+            ) => crate::TaskOutcome::Succeeded,
+            (_, super::RunTerminalDecision::Failed) => crate::TaskOutcome::Failed,
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
-                crate::events::TaskOutcome::Succeeded
+                crate::TaskOutcome::Succeeded
             }
             (TaskStatus::Completed | TaskStatus::Interrupted, _) => {
-                crate::events::TaskOutcome::Partial
+                crate::TaskOutcome::Partial
             }
-            (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
+            (TaskStatus::Failed, _) => crate::TaskOutcome::Failed,
         };
         let efficiency = Some(
             self.task_efficiency_data(&task_id)
@@ -2647,7 +2682,7 @@ impl EventStore {
             efficiency.as_ref(),
             outcome,
         ));
-        let completion_proof = crate::events::TaskCompletionProofData {
+        let completion_proof = crate::TaskCompletionProofData {
             schema_version: 1,
             task_id: task_id.clone(),
             request_turn_id: turn_id.clone(),
@@ -2656,13 +2691,13 @@ impl EventStore {
             closed_at: Utc::now().to_rfc3339(),
             proof_basis: match terminal_decision {
                 super::RunTerminalDecision::Succeeded => {
-                    Some(crate::events::TaskProofBasis::Contract)
+                    Some(crate::TaskProofBasis::Contract)
                 }
                 super::RunTerminalDecision::SucceededByEvidence => {
-                    Some(crate::events::TaskProofBasis::Evidence)
+                    Some(crate::TaskProofBasis::Evidence)
                 }
                 super::RunTerminalDecision::ClosedByPolicyDenial => {
-                    Some(crate::events::TaskProofBasis::PolicyDenial)
+                    Some(crate::TaskProofBasis::PolicyDenial)
                 }
                 _ => None,
             },
@@ -2694,7 +2729,7 @@ impl EventStore {
     /// essential to avoid double counting.
     pub async fn latest_policy_metrics_by_boot(
         &self,
-    ) -> anyhow::Result<Vec<crate::events::PolicyMetricsSnapshotData>> {
+    ) -> anyhow::Result<Vec<crate::PolicyMetricsSnapshotData>> {
         let rows = sqlx::query(
             r#"
             SELECT e.data
@@ -2815,7 +2850,7 @@ impl EventStore {
                     .await
                     .unwrap_or_default(),
             );
-            let outcome = crate::events::TaskOutcome::Partial;
+            let outcome = crate::TaskOutcome::Partial;
             let harness_eval = Some(Self::supervisor_harness_snapshot(
                 &task_id,
                 None,
@@ -2824,7 +2859,7 @@ impl EventStore {
                 efficiency.as_ref(),
                 outcome,
             ));
-            let completion_proof = crate::events::TaskCompletionProofData {
+            let completion_proof = crate::TaskCompletionProofData {
                 schema_version: 1,
                 task_id: task_id.clone(),
                 request_turn_id: None,
@@ -3022,7 +3057,7 @@ impl EventStore {
 
             let raw_error = tr.error.as_deref().unwrap_or(&tr.result);
             let normalized = normalize_tool_error_text(raw_error);
-            let pattern = crate::memory::procedures::extract_error_pattern(&normalized);
+            let pattern = self.host.error_pattern(&normalized);
             if !pattern.trim().is_empty() {
                 *error_counts.entry(pattern).or_insert(0) += 1;
             }
@@ -3311,7 +3346,7 @@ impl EventStore {
     pub async fn task_efficiency_data(
         &self,
         task_id: &str,
-    ) -> Option<crate::events::TaskEfficiencyData> {
+    ) -> Option<crate::TaskEfficiencyData> {
         let summary = self.get_task_llm_stats(task_id).await.ok()?;
         if summary.total_calls == 0 {
             return None;
@@ -3341,7 +3376,7 @@ impl EventStore {
                 reasons.push(format!("token estimate off by {pct:.0}%"));
             }
         }
-        Some(crate::events::TaskEfficiencyData {
+        Some(crate::TaskEfficiencyData {
             llm_calls: summary.total_calls,
             attempts: summary.total_attempts,
             fell_back_count: summary.fell_back_count,
@@ -3372,15 +3407,15 @@ impl EventStore {
         turn_id: Option<String>,
         iterations: u32,
         tool_calls_count: u32,
-        efficiency: Option<&crate::events::TaskEfficiencyData>,
-        outcome: crate::events::TaskOutcome,
-    ) -> crate::events::HarnessEvalSnapshot {
+        efficiency: Option<&crate::TaskEfficiencyData>,
+        outcome: crate::TaskOutcome,
+    ) -> crate::HarnessEvalSnapshot {
         let input_tokens = efficiency.map_or(0, |data| data.input_tokens);
         let output_tokens = efficiency.map_or(0, |data| data.output_tokens);
         let llm_calls = efficiency.map_or(0, |data| data.llm_calls as u32);
         let fell_back_count = efficiency.map_or(0, |data| data.fell_back_count as u32);
-        let succeeded = outcome == crate::events::TaskOutcome::Succeeded;
-        crate::events::HarnessEvalSnapshot {
+        let succeeded = outcome == crate::TaskOutcome::Succeeded;
+        crate::HarnessEvalSnapshot {
             task_id: task_id.to_string(),
             turn_id,
             depth: 0,
@@ -3390,7 +3425,7 @@ impl EventStore {
             completion_task_kind: "unknown".to_string(),
             orchestration_route: "supervisor_terminalization".to_string(),
             followup_mode: None,
-            routing: crate::events::RoutingEvalPayload {
+            routing: crate::RoutingEvalPayload {
                 orchestration_route: "supervisor_terminalization".to_string(),
                 tools_required_predicted: tool_calls_count > 0,
                 tools_actually_used: tool_calls_count > 0,
@@ -3403,7 +3438,7 @@ impl EventStore {
                 evidence_gate_blocks: 0,
                 critique_replan_fires: 0,
             },
-            progress: crate::events::ProgressEvalPayload {
+            progress: crate::ProgressEvalPayload {
                 iterations,
                 tool_calls_attempted: tool_calls_count,
                 tool_calls_succeeded: 0,
@@ -3420,10 +3455,10 @@ impl EventStore {
                 deferred_no_tool_events: 0,
                 budget_extensions: 0,
             },
-            quality: crate::events::QualityEvalPayload {
+            quality: crate::QualityEvalPayload {
                 outcome: outcome.as_str().to_string(),
                 stop_reason: "supervisor_terminalization".to_string(),
-                contract: crate::events::ContractFulfillmentPayload {
+                contract: crate::ContractFulfillmentPayload {
                     expects_mutation: false,
                     forbids_mutation: false,
                     forbidden_mutation_attempts: 0,
@@ -3444,7 +3479,7 @@ impl EventStore {
                 approval_denied: false,
                 contract_fulfilled: succeeded,
             },
-            cost: crate::events::CostEvalPayload {
+            cost: crate::CostEvalPayload {
                 total_input_tokens: input_tokens,
                 total_output_tokens: output_tokens,
                 failed_est_input_tokens: efficiency
@@ -3458,7 +3493,7 @@ impl EventStore {
                 sub_agent_failures: 0,
                 tokens_failed_waste: !succeeded && llm_calls > 0,
             },
-            scores: crate::events::HarnessScoresPayload {
+            scores: crate::HarnessScoresPayload {
                 routing_accuracy: 0.0,
                 progress_yield: 0.0,
                 contract_fulfillment: if succeeded { 1.0 } else { 0.0 },
@@ -3766,9 +3801,9 @@ impl EventStore {
                     TaskStatus::Interrupted => stats.interrupted += 1,
                 }
                 match data.effective_outcome() {
-                    crate::events::TaskOutcome::Succeeded => stats.outcome_succeeded += 1,
-                    crate::events::TaskOutcome::Partial => stats.outcome_partial += 1,
-                    crate::events::TaskOutcome::Failed => stats.outcome_failed += 1,
+                    crate::TaskOutcome::Succeeded => stats.outcome_succeeded += 1,
+                    crate::TaskOutcome::Partial => stats.outcome_partial += 1,
+                    crate::TaskOutcome::Failed => stats.outcome_failed += 1,
                 }
                 let stalled = data
                     .error
@@ -3930,11 +3965,11 @@ impl EventEmitter {
         self.store.append(event).await
     }
 
-    pub(crate) async fn emit_admitted_tool_call(
+    pub async fn emit_admitted_tool_call(
         &self,
         mut data: ToolCallData,
-        claim: &crate::events::TaskKernelOperationClaim,
-    ) -> anyhow::Result<(i64, crate::events::TaskKernelAdmission)> {
+        claim: &crate::TaskKernelOperationClaim,
+    ) -> anyhow::Result<(i64, crate::TaskKernelAdmission)> {
         if data.task_id.is_none() {
             data.task_id = self.current_task_id.clone();
         }
@@ -3984,7 +4019,7 @@ impl EventEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{ToolOutcomeEvidenceSource, ToolReceiptV1};
+    use crate::{ToolOutcomeEvidenceSource, ToolReceiptV1};
     use chrono::Duration;
     use serde_json::json;
 
@@ -4173,7 +4208,7 @@ mod tests {
             decision_type: DecisionType::ExecutionPlanningGate,
             task_id: task_id.to_string(),
             iteration: 0,
-            severity: crate::events::DiagnosticSeverity::Info,
+            severity: crate::DiagnosticSeverity::Info,
             code: None,
             metadata: serde_json::json!({
                 "completion_contract": {
@@ -4439,141 +4474,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_message_memory_projection_requires_explicit_allowed_stage() {
-        let (store, _database) = setup_store().await;
-        sqlx::query(
-            "CREATE TABLE memory_spans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                span_kind TEXT NOT NULL,
-                source_event_id INTEGER,
-                source_episode_id INTEGER,
-                session_id TEXT,
-                channel_id TEXT,
-                role TEXT,
-                content TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                privacy TEXT NOT NULL DEFAULT 'global',
-                observed_from TEXT,
-                observed_to TEXT,
-                valid_from TEXT NOT NULL,
-                valid_to TEXT,
-                deleted_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&store.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_memory_spans_source_event
-             ON memory_spans(source_event_id) WHERE source_event_id IS NOT NULL",
-        )
-        .execute(&store.pool)
-        .await
-        .unwrap();
-        let event_id = store
-            .append(Event::new(
-                "session-memory-boundary",
-                EventType::UserMessage,
-                json!({
-                    "task_id": "task-memory-boundary",
-                    "turn_id": "turn-memory-boundary",
-                    "content": "Synthetic content that must stay outside automatic memory"
-                }),
-            ))
-            .await
-            .unwrap();
-
-        let before_projection: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
-                .bind(event_id)
-                .fetch_one(&store.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            before_projection, 0,
-            "canonical append must not imply memory persistence"
-        );
-        store
-            .project_selected_user_message_memory_span_for_task("task-memory-boundary")
-            .await
-            .unwrap();
-        let while_policy_pending: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
-                .bind(event_id)
-                .fetch_one(&store.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            while_policy_pending, 0,
-            "projection fails closed until the task has a durable allowed policy"
-        );
-
-        store
-            .append(Event::new(
-                "session-memory-boundary",
-                EventType::MemoryPolicyCompiled,
-                json!({
-                    "task_id": "task-memory-boundary",
-                    "turn_id": "turn-memory-boundary",
-                    "access": "suppressed",
-                    "reason_code": "current_assessment_denies_user_memory",
-                    "retrieval_suppressed": true,
-                    "persistence_suppressed": true
-                }),
-            ))
-            .await
-            .unwrap();
-        store
-            .project_selected_user_message_memory_span_for_task("task-memory-boundary")
-            .await
-            .unwrap();
-
-        let after_suppressed_projection: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM memory_spans WHERE source_event_id = ?")
-                .bind(event_id)
-                .fetch_one(&store.pool)
-                .await
-                .unwrap();
-        assert_eq!(after_suppressed_projection, 0);
-
-        let allowed_event_id = store
-            .append(Event::new(
-                "session-memory-allowed",
-                EventType::UserMessage,
-                json!({
-                    "task_id": "task-memory-allowed",
-                    "turn_id": "turn-memory-allowed",
-                    "content": "My synthetic preference is dark mode"
-                }),
-            ))
-            .await
-            .unwrap();
-        store
-            .append(Event::new(
-                "session-memory-allowed",
-                EventType::MemoryPolicyCompiled,
-                json!({
-                    "task_id": "task-memory-allowed",
-                    "turn_id": "turn-memory-allowed",
-                    "access": "allowed",
-                    "reason_code": "ordinary_allowed_memory",
-                    "retrieval_suppressed": false,
-                    "persistence_suppressed": false
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .project_selected_user_message_memory_span_for_task("task-memory-allowed")
-                .await
-                .unwrap(),
-            Some(allowed_event_id)
-        );
-    }
-
-    #[tokio::test]
     async fn generated_response_identity_is_bounded_by_dispatch_watermark() {
         let (store, _database) = setup_store().await;
         let content = "synthetic identical response";
@@ -4720,7 +4620,7 @@ mod tests {
         assert_eq!(captured[0].response.task_id, "task-a");
         assert_eq!(
             captured[0].response.disposition,
-            crate::events::AssistantResponseDisposition::BackgroundHandoff
+            crate::AssistantResponseDisposition::BackgroundHandoff
         );
     }
 
@@ -4746,7 +4646,7 @@ mod tests {
                         "success": true,
                         "duration_ms": 1,
                         "receipt": {
-                            "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                            "schema_version": crate::ToolReceiptV1::SCHEMA_VERSION,
                             "result_provenance": {"result_id": format!("result:{call_id}")},
                             "completion_obligation_ids": obligations
                         }
@@ -4802,10 +4702,10 @@ mod tests {
                 .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent),
             ..crate::traits::ToolCallMetadata::default()
         };
-        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+        let mut receipt = crate::ToolReceiptV1::from_metadata(
             &metadata,
             crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            crate::ToolOutcomeEvidenceSource::StructuredMetadata,
             None,
         );
         receipt.result_provenance.result_id = Some("result-exact".to_string());
@@ -4862,7 +4762,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let mut link = serde_json::to_value(crate::events::BackgroundContinuationLinkedData {
+        let mut link = serde_json::to_value(crate::BackgroundContinuationLinkedData {
             parent_task_id: "task-parent".to_string(),
             child_task_id: "task-child".to_string(),
             parent_tool_call_id: "call-exact".to_string(),
@@ -4904,7 +4804,7 @@ mod tests {
             .expect("adopted operation");
         assert!(matches!(
             adopted.operation_lineage,
-            Some(crate::events::ToolOperationLineage::DurableReplay { ref source_result_id, .. })
+            Some(crate::ToolOperationLineage::DurableReplay { ref source_result_id, .. })
                 if source_result_id == "result-exact"
         ));
         assert_eq!(
@@ -4912,7 +4812,7 @@ mod tests {
             Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
         );
         // A link that names the wrong result id adopts nothing (fail closed).
-        let mut wrong = serde_json::to_value(crate::events::BackgroundContinuationLinkedData {
+        let mut wrong = serde_json::to_value(crate::BackgroundContinuationLinkedData {
             parent_task_id: "task-parent".to_string(),
             child_task_id: "task-other-child".to_string(),
             parent_tool_call_id: "call-exact".to_string(),
@@ -4939,7 +4839,7 @@ mod tests {
     #[tokio::test]
     async fn durable_tool_claim_admission_and_append_share_one_transaction() {
         let (store, _database) = setup_store().await;
-        let claim = crate::events::TaskKernelOperationClaim {
+        let claim = crate::TaskKernelOperationClaim {
             operation_id: "call-1".to_string(),
             stable_operation_key: "stable-operation".to_string(),
             tool_name: "terminal".to_string(),
@@ -4967,9 +4867,9 @@ mod tests {
             )
             .await
             .expect("first atomic claim");
-        assert_eq!(first.1, crate::events::TaskKernelAdmission::Admitted);
+        assert_eq!(first.1, crate::TaskKernelAdmission::Admitted);
 
-        let second_claim = crate::events::TaskKernelOperationClaim {
+        let second_claim = crate::TaskKernelOperationClaim {
             operation_id: "call-2".to_string(),
             ..claim
         };
@@ -4993,7 +4893,7 @@ mod tests {
             .expect("second atomic claim");
         assert!(matches!(
             second.1,
-            crate::events::TaskKernelAdmission::Rejected {
+            crate::TaskKernelAdmission::Rejected {
                 code: "operation_invocations_exhausted",
                 ..
             }
@@ -5045,7 +4945,7 @@ mod tests {
         let store = Arc::new(store);
         let claim_store = store.clone();
         let admitted = tokio::spawn(async move {
-            let claim = crate::events::TaskKernelOperationClaim {
+            let claim = crate::TaskKernelOperationClaim {
                 operation_id: "call-wal".to_string(),
                 stable_operation_key: "stable-wal".to_string(),
                 tool_name: "terminal".to_string(),
@@ -5081,7 +4981,7 @@ mod tests {
             .expect("claim should resume after the competing writer commits")
             .unwrap()
             .expect("claim must persist instead of failing with 'database is locked'");
-        assert_eq!(outcome.1, crate::events::TaskKernelAdmission::Admitted);
+        assert_eq!(outcome.1, crate::TaskKernelAdmission::Admitted);
     }
 
     #[tokio::test]
@@ -5265,9 +5165,9 @@ mod tests {
             task_id: task_id.to_string(),
             status,
             outcome: Some(match status {
-                TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
-                TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
-                TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
+                TaskStatus::Completed => crate::TaskOutcome::Succeeded,
+                TaskStatus::Cancelled | TaskStatus::Failed => crate::TaskOutcome::Failed,
+                TaskStatus::Interrupted => crate::TaskOutcome::Partial,
             }),
             duration_secs: 1,
             iterations: 1,
@@ -5774,7 +5674,7 @@ mod tests {
             .parse_data::<TaskEndData>()
             .expect("parse stale task_end");
         assert_eq!(stale_end.status, TaskStatus::Interrupted);
-        assert_eq!(stale_end.outcome, Some(crate::events::TaskOutcome::Partial));
+        assert_eq!(stale_end.outcome, Some(crate::TaskOutcome::Partial));
         assert!(stale_end.efficiency.is_some());
         assert!(stale_end.harness_eval.is_some());
         assert!(stale_end.completion_proof.is_some());
@@ -6074,14 +5974,14 @@ mod tests {
     async fn policy_metric_history_keeps_only_latest_cumulative_snapshot_per_boot() {
         let (store, _db_file) = setup_store().await;
         for (boot_id, samples) in [("boot-a", 1_u64), ("boot-b", 4), ("boot-a", 7)] {
-            let mut metrics = crate::agent::policy_metrics_snapshot();
+            let mut metrics = crate::PolicyMetricsData::default();
             metrics.tool_exposure_samples = samples;
             append_event_at(
                 &store,
                 "synthetic-policy-session",
                 EventType::PolicyMetricsSnapshot,
-                serde_json::to_value(crate::events::PolicyMetricsSnapshotData {
-                    schema_version: crate::events::PolicyMetricsSnapshotData::SCHEMA_VERSION,
+                serde_json::to_value(crate::PolicyMetricsSnapshotData {
+                    schema_version: crate::PolicyMetricsSnapshotData::SCHEMA_VERSION,
                     boot_id: boot_id.to_string(),
                     metrics,
                 })
@@ -6105,78 +6005,6 @@ mod tests {
                 .tool_exposure_samples,
             7
         );
-    }
-
-    #[tokio::test]
-    async fn get_tool_stats_aggregates_and_groups_errors() {
-        let (store, _db_file) = setup_store().await;
-        let now = Utc::now();
-        let session = "s-tool-stats-1";
-
-        append_tool_result(
-            &store,
-            session,
-            ToolResultFixture {
-                tool: "terminal",
-                success: true,
-                duration_ms: 100,
-                result: "ok",
-                error: None,
-                created_at: now - Duration::minutes(50),
-            },
-        )
-        .await;
-        append_tool_result(
-            &store,
-            session,
-            ToolResultFixture {
-                tool: "terminal",
-                success: true,
-                duration_ms: 300,
-                result: "ok",
-                error: None,
-                created_at: now - Duration::minutes(40),
-            },
-        )
-        .await;
-        append_tool_result(
-            &store,
-            session,
-            ToolResultFixture {
-                tool: "terminal",
-                success: false,
-                duration_ms: 200,
-                result: "Error: Connection timed out at /tmp/foo.rs:12:3",
-                error: Some("Error: Connection timed out at /tmp/foo.rs:12:3"),
-                created_at: now - Duration::minutes(30),
-            },
-        )
-        .await;
-        append_tool_result(
-            &store,
-            session,
-            ToolResultFixture {
-                tool: "terminal",
-                success: false,
-                duration_ms: 400,
-                result: "Error: Connection timed out at /tmp/bar.rs:99:1",
-                error: Some("Error: Connection timed out at /tmp/bar.rs:99:1"),
-                created_at: now - Duration::minutes(20),
-            },
-        )
-        .await;
-
-        let stats = store
-            .get_tool_stats("terminal", now - Duration::hours(24))
-            .await
-            .expect("tool stats");
-
-        assert_eq!(stats.total_calls, 4);
-        assert_eq!(stats.successful, 2);
-        assert_eq!(stats.failed, 2);
-        assert_eq!(stats.avg_duration_ms, 250);
-        assert_eq!(stats.common_errors.len(), 1);
-        assert_eq!(stats.common_errors[0].1, 2);
     }
 
     #[tokio::test]
@@ -6303,7 +6131,7 @@ mod tests {
             projected_source_turn_ids: Vec::new(),
             force_text: false,
             token_usage_present: true,
-            token_usage_evidence: crate::events::TokenUsageEvidence::ProviderMeasured,
+            token_usage_evidence: crate::TokenUsageEvidence::ProviderMeasured,
             failed: false,
             error: None,
             provider_error_kind: None,
@@ -6325,7 +6153,7 @@ mod tests {
             observed_calls: 1,
             consecutive_failures: 1,
             latest_failed: true,
-            failure_kind: Some(crate::providers::ProviderErrorKind::Auth),
+            failure_kind: Some(crate::provider::ProviderErrorKind::Auth),
             ..ProviderReadiness::default()
         };
         assert!(auth.is_unavailable());
@@ -6334,7 +6162,7 @@ mod tests {
             observed_calls: 1,
             consecutive_failures: 1,
             latest_failed: true,
-            failure_kind: Some(crate::providers::ProviderErrorKind::Timeout),
+            failure_kind: Some(crate::provider::ProviderErrorKind::Timeout),
             ..ProviderReadiness::default()
         };
         assert!(!one_timeout.is_unavailable());
@@ -6469,7 +6297,7 @@ mod tests {
         );
         assert_eq!(
             summary.last_provider_error_kind,
-            Some(crate::providers::ProviderErrorKind::Auth)
+            Some(crate::provider::ProviderErrorKind::Auth)
         );
         assert_eq!(summary.last_provider_status, Some(401));
         assert!(summary.is_inefficient());

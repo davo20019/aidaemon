@@ -12,7 +12,7 @@ use super::{
     DecisionPointData, ErrorData, Event, EventStore, EventType, SubAgentSpawnData, TaskEndData,
     TaskStartData, TaskStatus, ThinkingStartData, ToolCallData, ToolResultData,
 };
-use crate::utils::truncate_str;
+use crate::text::truncate_str;
 
 /// Compiled session context for system prompt injection.
 ///

@@ -488,6 +488,7 @@ pub(super) mod test_support {
     /// An owner-DM turn with memory allowed.
     pub(crate) async fn turn(session_id: &str, user_text: &str) -> MemoryTurn {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        use crate::events::EventStoreForTests as _;
         let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
         MemoryTurn {
             session_id: session_id.to_string(),

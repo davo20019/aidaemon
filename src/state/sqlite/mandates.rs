@@ -4984,6 +4984,7 @@ impl MandateStore for SqliteStateStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::traits::store_prelude::*;

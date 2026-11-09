@@ -3,6 +3,7 @@
 //! Provides a fully wired Agent with a mock LLM and in-memory state,
 //! suitable for integration tests that exercise the real agent loop.
 
+use crate::events::EventStoreForTests as _;
 use crate::traits::ToolCalls as _;
 use std::collections::HashMap;
 use std::path::PathBuf;

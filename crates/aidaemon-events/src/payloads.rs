@@ -848,7 +848,7 @@ pub struct PolicyDecisionData {
 }
 
 /// Runtime policy metrics snapshot exposed by the dashboard API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyMetricsData {
     pub tool_exposure_samples: u64,
     pub tool_exposure_before_sum: u64,

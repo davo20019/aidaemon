@@ -1285,6 +1285,7 @@ async fn build_base_tool(
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::agent::Agent;
     use crate::llm_runtime::{router_from_models, SharedLlmRuntime};

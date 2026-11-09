@@ -823,6 +823,7 @@ impl crate::traits::ToolSemantics for GenerateImageTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::events::EventStoreForTests as _;
     use super::*;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
