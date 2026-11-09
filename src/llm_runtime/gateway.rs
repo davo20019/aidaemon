@@ -205,7 +205,6 @@ impl SideCallGateway {
 
     /// A provider for library code that makes the request itself. Each
     /// `complete` on it is bounded by the spec's deadline and recorded.
-    #[allow(dead_code)] // used from Task 4
     pub fn provider(&self, call: SideCall) -> Arc<dyn aidaemon_core::Provider> {
         Arc::new(SideCallProvider {
             gateway: self.clone(),

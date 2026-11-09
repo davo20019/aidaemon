@@ -1,9 +1,9 @@
-use crate::providers::ChatJson;
-use crate::traits::ProviderResponse;
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::utils::truncate_str;
+use aidaemon_core as sdk;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Build bounded relationship-assessment context. This is not provider
@@ -152,18 +152,13 @@ pub(crate) fn compile_memory_pipeline_policy(
     }
 }
 
-// Aggregate producer deadline. Candidates are bounded failover attempts under
-// one logical relationship envelope; valid results are selected by configured
-// priority, never by response wording or latency.
-const TASK_RELATIONSHIP_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
-
 /// JSON-object mode is rejected by a number of OpenAI-compatible gateways
 /// unless the prompt contains a provider-specific lowercase marker.  The
 /// daemon's semantic producers should not depend on prompt spelling.  A
 /// permissive named schema requests the same object protocol while leaving
 /// the domain parser as the authoritative validator for optional fields.
-fn typed_object_response_mode(name: &str) -> crate::traits::ResponseMode {
-    crate::traits::ResponseMode::JsonSchema {
+fn typed_object_response_format(name: &str) -> sdk::ResponseFormat {
+    sdk::ResponseFormat::JsonSchema {
         name: name.to_string(),
         schema: json!({
             "type": "object",
@@ -173,222 +168,19 @@ fn typed_object_response_mode(name: &str) -> crate::traits::ResponseMode {
     }
 }
 
-/// Divide the remaining relationship envelope fairly: every configured candidate receives a bounded share, and unused
-/// time is naturally returned to later candidates after a fast failure.
-fn relationship_attempt_timeout(
-    remaining: std::time::Duration,
-    candidates_left: usize,
-) -> Option<std::time::Duration> {
-    (candidates_left > 0 && !remaining.is_zero())
-        .then(|| remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX))
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PlannerTelemetryCtx<'a> {
-    pub emitter: &'a crate::events::EventEmitter,
-    pub state: &'a dyn crate::traits::TokenUsageStore,
-    pub session_id: &'a str,
-    pub task_id: &'a str,
-}
-
-struct AuxiliaryAttemptTelemetry {
-    attempt: u32,
-    fell_back: bool,
-    validation_error: Option<String>,
-}
-
-async fn record_auxiliary_model_call(
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
-    call_purpose: &str,
-    model: &str,
-    response: &ProviderResponse,
-    latency_ms: u64,
-    attempt_telemetry: AuxiliaryAttemptTelemetry,
-) {
-    let Some(telemetry) = telemetry else {
-        return;
-    };
-    let (
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        fresh_input_tokens,
-    ) = response
-        .usage
-        .as_ref()
-        .map(|usage| {
-            (
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_input_tokens,
-                usage.cache_creation_input_tokens,
-                usage.fresh_input_tokens(),
-            )
-        })
-        .unwrap_or((0, 0, None, None, None));
-    crate::events::record_model_call_telemetry(
-        telemetry.emitter,
-        telemetry.state,
-        crate::events::ModelCallTelemetryInput {
-            session_id: telemetry.session_id.to_string(),
-            task_id: telemetry.task_id.to_string(),
-            call_purpose: Some(call_purpose.to_string()),
-            iteration: Some(0),
-            llm_call: crate::events::LlmCallData {
-                call_id: None,
-                call_purpose: Some(call_purpose.to_string()),
-                task_id: telemetry.task_id.to_string(),
-                iteration: Some(0),
-                model: model.to_string(),
-                final_model: Some(model.to_string()),
-                fell_back: attempt_telemetry.fell_back,
-                attempts: attempt_telemetry.attempt,
-                latency_ms,
-                prompt_ms: None,
-                decode_ms: None,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                cache_creation_input_tokens,
-                fresh_input_tokens,
-                est_input_tokens: None,
-                tool_calls_count: response.tool_calls.len() as u32,
-                offered_tools: Vec::new(),
-                chosen_tools: Vec::new(),
-                build_ms: None,
-                prefix_hash_system: None,
-                prefix_hash_pre_boundary: None,
-                tool_defs_hash: None,
-                session_summary_hash: None,
-                tail_hash: None,
-                prefix_hash_archived: None,
-                boundary_pos: None,
-                message_count: None,
-                projected_source_message_ids: Vec::new(),
-                projected_source_turn_ids: Vec::new(),
-                force_text: false,
-                token_usage_present: response.usage.is_some(),
-                token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
-                failed: attempt_telemetry.validation_error.is_some(),
-                error: attempt_telemetry.validation_error,
-                provider_error_kind: None,
-                provider_status: None,
-            },
-            token_usage: response.usage.clone(),
-        },
-    )
-    .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn record_auxiliary_model_failure(
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
-    call_purpose: &str,
-    model: &str,
-    latency_ms: u64,
-    attempt: u32,
-    fell_back: bool,
-    est_input_tokens: Option<u32>,
-    provider_error_kind: Option<crate::providers::ProviderErrorKind>,
-    provider_status: Option<u16>,
-    error: impl Into<String>,
-) {
-    let Some(telemetry) = telemetry else {
-        return;
-    };
-    crate::events::record_model_call_telemetry(
-        telemetry.emitter,
-        telemetry.state,
-        crate::events::ModelCallTelemetryInput {
-            session_id: telemetry.session_id.to_string(),
-            task_id: telemetry.task_id.to_string(),
-            call_purpose: Some(call_purpose.to_string()),
-            iteration: Some(0),
-            llm_call: crate::events::LlmCallData {
-                call_id: None,
-                call_purpose: Some(call_purpose.to_string()),
-                task_id: telemetry.task_id.to_string(),
-                iteration: Some(0),
-                model: model.to_string(),
-                final_model: Some(model.to_string()),
-                fell_back,
-                attempts: attempt,
-                latency_ms,
-                prompt_ms: None,
-                decode_ms: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_input_tokens: None,
-                cache_creation_input_tokens: None,
-                fresh_input_tokens: None,
-                // Failed calls cannot report provider usage, but the message
-                // build already gives us a bounded cost estimate. Persist it
-                // as estimate-only telemetry so timeout/error calls are not
-                // invisible in cost reconciliation.
-                est_input_tokens,
-                tool_calls_count: 0,
-                offered_tools: Vec::new(),
-                chosen_tools: Vec::new(),
-                build_ms: None,
-                prefix_hash_system: None,
-                prefix_hash_pre_boundary: None,
-                tool_defs_hash: None,
-                session_summary_hash: None,
-                tail_hash: None,
-                prefix_hash_archived: None,
-                boundary_pos: None,
-                message_count: None,
-                projected_source_message_ids: Vec::new(),
-                projected_source_turn_ids: Vec::new(),
-                force_text: false,
-                token_usage_present: false,
-                token_usage_evidence: crate::events::TokenUsageEvidence::Unavailable,
-                failed: true,
-                error: Some(error.into()),
-                provider_error_kind,
-                provider_status,
-            },
-            token_usage: None,
-        },
-    )
-    .await;
-}
-
 /// Resolve only the typed dialogue edge. This deliberately cannot produce
 /// completion obligations, authority, tool policy, or execution mode. The
-/// caller still validates an exact antecedent against persisted dialogue state
-/// before committing it.
-#[cfg(test)]
+/// caller still validates an exact antecedent against persisted dialogue
+/// state before committing it.
+///
+/// One tool-less side call through the gateway, which picks the model chain,
+/// bounds every attempt by the spec's total deadline and records each one.
+/// Any failure, an unreadable reply or an invalid edge returns `None`: the
+/// turn is then treated as a new request.
 pub(crate) async fn generate_task_relationship(
-    provider: crate::llm_runtime::ModelBackend,
-    model: &str,
+    side_calls: &SideCallGateway,
     user_text: &str,
     conversation_context: &str,
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
-) -> Option<PlannedTaskShape> {
-    let models = [model.to_string()];
-    generate_task_relationship_candidates(
-        provider,
-        &models,
-        user_text,
-        conversation_context,
-        telemetry,
-    )
-    .await
-}
-
-/// Resolve a dialogue relationship through the configured model lane. This
-/// producer returns only a typed edge; it never installs a task contract or
-/// imports prior authority. Candidates are attempted in configured priority
-/// order, with a bounded fair share so a slow primary cannot starve every
-/// relationship attempt and a fast fallback cannot win by latency alone.
-pub(crate) async fn generate_task_relationship_candidates(
-    provider: crate::llm_runtime::ModelBackend,
-    model_candidates: &[String],
-    user_text: &str,
-    conversation_context: &str,
-    telemetry: Option<PlannerTelemetryCtx<'_>>,
 ) -> Option<PlannedTaskShape> {
     if conversation_context.trim().is_empty() {
         return None;
@@ -404,165 +196,66 @@ pub(crate) async fn generate_task_relationship_candidates(
         conversation_context = truncate_str(conversation_context, 6000),
         user_text = truncate_str(user_text, 4000),
     );
-    let messages = vec![
-        json!({ "role": "system", "content": system }),
-        json!({ "role": "user", "content": prompt }),
-    ];
-    let est_input_tokens = Some(
-        crate::context_budget::estimate_multimodal_message_tokens(&messages).min(u32::MAX as usize)
-            as u32,
-    );
-    let options = crate::traits::ChatOptions {
-        response_mode: typed_object_response_mode("task_relationship"),
-        tool_choice: crate::traits::ToolChoiceMode::None,
-        max_tokens_override: Some(1024),
-        reasoning_effort_override: Some("low".to_string()),
-        // Relationship routing is optional, but it must not hide provider
-        // retries inside its aggregate deadline. The model supplies only a
-        // typed edge; one physical attempt per candidate keeps timeout and
-        // cost telemetry attributable to the right candidate.
-        single_attempt_fail_closed: true,
-        ..crate::traits::ChatOptions::default()
+    let request = sdk::ModelRequest {
+        // The side call's spec picks the model.
+        model: String::new(),
+        messages: vec![sdk::Message::system(system), sdk::Message::user(prompt)],
+        max_output_tokens: Some(1024),
+        options: sdk::RequestOptions {
+            response_format: typed_object_response_format("task_relationship"),
+            reasoning_effort: Some("low".to_string()),
+            // Failover across the chain's models stays on: a used-up
+            // primary quota must not cost the turn its relationship edge.
+            single_attempt: false,
+        },
+        ..Default::default()
     };
-    let deadline = Instant::now() + TASK_RELATIONSHIP_TOTAL_TIMEOUT;
-    for (candidate_index, model) in model_candidates.iter().enumerate() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let Some(attempt_timeout) = relationship_attempt_timeout(
-            remaining,
-            model_candidates.len().saturating_sub(candidate_index),
-        ) else {
-            break;
-        };
-        let call_start = Instant::now();
-        let response = match tokio::time::timeout(
-            attempt_timeout,
-            provider.chat_with_options(model, &messages, &[], &options),
-        )
+    let response = match side_calls
+        .provider(SideCall::RelationshipRouter)
+        .complete(&request)
         .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                let provider_error = error.downcast_ref::<crate::providers::ProviderError>();
-                let prevents_model_fallback = provider_error
-                    .is_some_and(crate::providers::ProviderError::prevents_model_fallback);
-                record_auxiliary_model_failure(
-                    telemetry,
-                    "task_relationship",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
-                    (candidate_index + 1) as u32,
-                    candidate_index > 0,
-                    est_input_tokens,
-                    provider_error.map(|error| error.kind),
-                    provider_error.and_then(|error| error.status),
-                    format!("provider_error: {error}"),
-                )
-                .await;
-                warn!(%error, %model, "Task relationship fallback failed");
-                if prevents_model_fallback {
-                    break;
-                }
-                continue;
-            }
-            Err(_) => {
-                record_auxiliary_model_failure(
-                    telemetry,
-                    "task_relationship",
-                    model,
-                    call_start.elapsed().as_millis() as u64,
-                    (candidate_index + 1) as u32,
-                    candidate_index > 0,
-                    est_input_tokens,
-                    None,
-                    None,
-                    "timeout",
-                )
-                .await;
-                warn!(
-                    %model,
-                    timeout_ms = attempt_timeout.as_millis(),
-                    "Task relationship fallback timed out"
-                );
-                continue;
-            }
-        };
-        let latency_ms = call_start.elapsed().as_millis() as u64;
-        let Some(json) =
-            crate::utils::extract_json_object(response.content.as_deref().unwrap_or(""))
-        else {
-            record_auxiliary_model_call(
-                telemetry,
-                "task_relationship",
-                model,
-                &response,
-                latency_ms,
-                AuxiliaryAttemptTelemetry {
-                    attempt: (candidate_index + 1) as u32,
-                    fell_back: candidate_index > 0,
-                    validation_error: Some("missing_json_object".to_string()),
-                },
-            )
-            .await;
-            continue;
-        };
-        let parsed: TaskRelationshipResponse = match serde_json::from_str(&json) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                record_auxiliary_model_call(
-                    telemetry,
-                    "task_relationship",
-                    model,
-                    &response,
-                    latency_ms,
-                    AuxiliaryAttemptTelemetry {
-                        attempt: (candidate_index + 1) as u32,
-                        fell_back: candidate_index > 0,
-                        validation_error: Some(error.to_string()),
-                    },
-                )
-                .await;
-                continue;
-            }
-        };
-        let valid = parsed.schema_version == TASK_RELATIONSHIP_SCHEMA_VERSION
-            && matches!(parsed.confidence.as_str(), "low" | "medium" | "high")
-            && matches!(
-                parsed.request_relationship.as_str(),
-                "new_request" | "continuation" | "clarification_answer" | "courtesy"
-            );
-        let antecedent = parsed
-            .antecedent_user_message_id
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        // The model owns semantic classification, not graph identity. An exact
-        // message ID is useful evidence when it is available, but omission is
-        // not a classification failure: the state resolver can bind a
-        // continuation only when exactly one persisted request node is possible.
-        let valid =
-            valid && (parsed.request_relationship == "continuation" || antecedent.is_none());
-        record_auxiliary_model_call(
-            telemetry,
-            "task_relationship",
-            model,
-            &response,
-            latency_ms,
-            AuxiliaryAttemptTelemetry {
-                attempt: (candidate_index + 1) as u32,
-                fell_back: candidate_index > 0,
-                validation_error: (!valid).then(|| "invalid_typed_relationship".to_string()),
-            },
-        )
-        .await;
-        if !valid {
-            continue;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, "Task relationship router got no answer");
+            return None;
         }
-        return Some(PlannedTaskShape {
-            confidence: Some(parsed.confidence),
-            request_relationship: Some(parsed.request_relationship),
-            antecedent_user_message_id: antecedent,
-        });
+    };
+    let Some(json) = crate::utils::extract_json_object(&response.text) else {
+        warn!("Task relationship router reply held no JSON object");
+        return None;
+    };
+    let parsed: TaskRelationshipResponse = match serde_json::from_str(&json) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(%error, "Task relationship router reply did not parse");
+            return None;
+        }
+    };
+    let valid = parsed.schema_version == TASK_RELATIONSHIP_SCHEMA_VERSION
+        && matches!(parsed.confidence.as_str(), "low" | "medium" | "high")
+        && matches!(
+            parsed.request_relationship.as_str(),
+            "new_request" | "continuation" | "clarification_answer" | "courtesy"
+        );
+    let antecedent = parsed
+        .antecedent_user_message_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    // The model owns semantic classification, not graph identity. An exact
+    // message ID is useful evidence when it is available, but omission is
+    // not a classification failure: the state resolver can bind a
+    // continuation only when exactly one persisted request node is possible.
+    let valid = valid && (parsed.request_relationship == "continuation" || antecedent.is_none());
+    if !valid {
+        warn!("Task relationship router returned an invalid typed relationship");
+        return None;
     }
-    None
+    Some(PlannedTaskShape {
+        confidence: Some(parsed.confidence),
+        request_relationship: Some(parsed.request_relationship),
+        antecedent_user_message_id: antecedent,
+    })
 }
 
 /// Determine whether a turn bypasses the relationship router. Semantic
@@ -606,30 +299,8 @@ pub(crate) fn planning_skip_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_runtime::gateway::test_support::*;
     use std::sync::Arc;
-
-    #[derive(Default)]
-    struct ModelInvariantAuthFailureProvider {
-        calls: std::sync::Mutex<Vec<String>>,
-    }
-
-    crate::testing::chat_json_provider!(ModelInvariantAuthFailureProvider);
-
-    impl ModelInvariantAuthFailureProvider {
-        async fn respond(
-            &self,
-            model: &str,
-            _messages: &[serde_json::Value],
-            _tools: &[serde_json::Value],
-            _options: &crate::traits::ChatOptions,
-        ) -> anyhow::Result<ProviderResponse> {
-            self.calls.lock().unwrap().push(model.to_string());
-            Err(
-                crate::providers::ProviderError::from_status(401, "synthetic auth rejection")
-                    .into(),
-            )
-        }
-    }
 
     #[test]
     fn conversational_turn_reaches_the_relationship_router() {
@@ -757,65 +428,61 @@ mod tests {
         assert_eq!(planning_skip_reason(request, false), None);
     }
 
-    #[test]
-    fn relationship_attempt_budget_reserves_time_for_every_remaining_failover() {
-        let total = std::time::Duration::from_secs(45);
-        assert_eq!(relationship_attempt_timeout(total, 3), Some(total / 3));
+    const SETUP_CONTEXT: &str = "- [message_id=message-setup-1] USER: Synthetic setup\n\
+         - [message_id=message-reply-1] ASSISTANT: Acknowledged";
+
+    /// `None` is the router's safe default: the finalizer treats the turn as
+    /// a new request.
+    #[tokio::test]
+    async fn a_router_that_fails_treats_the_message_as_a_new_request() {
+        let (gateway, events) = gateway_with(provider_failing("503")).await;
+        let relation =
+            generate_task_relationship(&gateway, "and the second one?", SETUP_CONTEXT).await;
+        assert!(relation.is_none());
+        assert!(failed_calls(&events, SideCall::RelationshipRouter.spec().purpose).await >= 1);
         assert_eq!(
-            relationship_attempt_timeout(std::time::Duration::from_secs(30), 2),
-            Some(std::time::Duration::from_secs(15))
-        );
-        assert_eq!(
-            relationship_attempt_timeout(std::time::Duration::from_secs(14), 1),
-            Some(std::time::Duration::from_secs(14)),
-            "the final configured candidate receives all remaining time"
+            ok_calls(&events, SideCall::RelationshipRouter.spec().purpose).await,
+            0
         );
     }
 
     #[tokio::test]
-    async fn relationship_lane_does_not_amplify_model_invariant_auth_failure() {
-        let models = vec![
-            "synthetic-primary".to_string(),
-            "synthetic-fallback-a".to_string(),
-            "synthetic-fallback-b".to_string(),
-        ];
-        let provider = Arc::new(ModelInvariantAuthFailureProvider::default());
-        let relationship = generate_task_relationship_candidates(
-            provider.clone(),
-            &models,
-            "Continue the synthetic task.",
-            "- [message_id=synthetic-1] U: Start the synthetic task.",
-            None,
-        )
-        .await;
-
-        assert!(relationship.is_none());
-        assert_eq!(
-            provider.calls.lock().unwrap().as_slice(),
-            ["synthetic-primary"]
-        );
+    async fn a_router_reply_without_a_valid_edge_treats_the_message_as_a_new_request() {
+        for reply in [
+            "",
+            "sure, continuation",
+            r#"{"schema_version": 1, "confidence": "high"}"#,
+            r#"{"schema_version": 1, "confidence": "high", "request_relationship": "new_request", "antecedent_user_message_id": "message-setup-1"}"#,
+        ] {
+            let (gateway, _) = gateway_with(provider_answering(reply)).await;
+            let relation =
+                generate_task_relationship(&gateway, "and the second one?", SETUP_CONTEXT).await;
+            assert!(relation.is_none(), "reply {reply:?}");
+        }
     }
 
+    /// The gateway writes the router's row; the router writes none of its
+    /// own. The request keeps today's output cap and carries no tools.
     #[tokio::test]
     async fn relationship_fallback_returns_only_an_exact_typed_dialogue_edge() {
-        let response = crate::testing::MockProvider::text_response(
-            r#"{
-                "schema_version": 1,
-                "confidence": "high",
-                "request_relationship": "continuation",
-                "antecedent_user_message_id": "message-setup-1"
-            }"#,
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([]).then_repeat(
+                aidaemon_core::testing::text(
+                    r#"{
+                        "schema_version": 1,
+                        "confidence": "high",
+                        "request_relationship": "continuation",
+                        "antecedent_user_message_id": "message-setup-1"
+                    }"#,
+                ),
+            ),
         );
-        let provider =
-            crate::testing::MockProvider::new().with_relationship_assessments(vec![response]);
+        let (gateway, events) = gateway_with(scripted.clone()).await;
 
         let shape = generate_task_relationship(
-            Arc::new(provider),
-            "local-model",
+            &gateway,
             "Return the values from that setup.",
-            "- [message_id=message-setup-1] USER: Synthetic setup\n\
-             - [message_id=message-reply-1] ASSISTANT: Acknowledged",
-            None,
+            SETUP_CONTEXT,
         )
         .await
         .expect("typed relationship");
@@ -825,27 +492,32 @@ mod tests {
             shape.antecedent_user_message_id.as_deref(),
             Some("message-setup-1")
         );
+        let purpose = SideCall::RelationshipRouter.spec().purpose;
+        assert_eq!(purpose, "task_relationship");
+        assert_eq!(ok_calls(&events, purpose).await, 1);
+        assert_eq!(failed_calls(&events, purpose).await, 0);
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].max_output_tokens, Some(1024));
+        assert!(seen[0].tools.is_empty());
     }
 
     #[tokio::test]
     async fn relationship_fallback_leaves_missing_identity_to_state_resolver() {
-        let response = crate::testing::MockProvider::text_response(
+        let (gateway, _) = gateway_with(provider_answering(
             r#"{
                 "schema_version": 1,
                 "confidence": "high",
                 "request_relationship": "continuation",
                 "antecedent_user_message_id": null
             }"#,
-        );
-        let provider =
-            crate::testing::MockProvider::new().with_relationship_assessments(vec![response]);
+        ))
+        .await;
 
         let shape = generate_task_relationship(
-            Arc::new(provider),
-            "local-model",
+            &gateway,
             "Continue.",
             "- [message_id=message-setup-1] USER: Synthetic setup",
-            None,
         )
         .await
         .expect("semantic continuation should survive an omitted optional identity");

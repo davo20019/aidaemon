@@ -325,6 +325,8 @@ pub(crate) struct DaemonMemoryInner {
     store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     event_store: Arc<crate::events::EventStore>,
     llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+    /// Runs the conversation summarizer's model calls.
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
     context_window_config: crate::config::ContextWindowConfig,
     max_facts: usize,
     record_decision_points: bool,
@@ -342,6 +344,7 @@ impl DaemonMemory {
         store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
         event_store: Arc<crate::events::EventStore>,
         llm_runtime: crate::llm_runtime::SharedLlmRuntime,
+        side_calls: crate::llm_runtime::gateway::SideCallGateway,
         context_window_config: crate::config::ContextWindowConfig,
         max_facts: usize,
         record_decision_points: bool,
@@ -353,6 +356,7 @@ impl DaemonMemory {
                 store,
                 event_store,
                 llm_runtime,
+                side_calls,
                 context_window_config,
                 max_facts,
                 record_decision_points,
@@ -391,7 +395,7 @@ impl MemoryWrites for DaemonMemoryInner {
         let fast_model = fast_model(&snapshot, &turn.model);
         super::conversation_compaction::compact_after_reply(
             super::conversation_compaction::CompactionTarget {
-                runtime: self.llm_runtime.clone(),
+                side_calls: self.side_calls.clone(),
                 fast_model: &fast_model,
                 state: self.state.clone(),
                 event_store: self.event_store.clone(),

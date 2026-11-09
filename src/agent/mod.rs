@@ -687,6 +687,7 @@ impl Agent {
             self.memory_store.clone(),
             self.event_store.clone(),
             self.llm_runtime.clone(),
+            self.side_calls.clone(),
             self.context_window_config.clone(),
             0,
             false,

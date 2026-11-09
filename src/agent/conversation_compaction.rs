@@ -1,7 +1,7 @@
 //! The daemon on the SDK's conversation compaction: its event store as the
 //! [`sdk_policies::ConversationSource`], its summary table as the
-//! [`sdk_policies::SummaryStore`], and its model runtime behind the SDK's
-//! [`sdk_policies::ProviderSummarizer`]. Every decision (when to compact,
+//! [`sdk_policies::SummaryStore`], and the side-call gateway behind the
+//! SDK's [`sdk_policies::ProviderSummarizer`]. Every decision (when to compact,
 //! which turns to fold in, one pass per session, coalescing) is the SDK's
 //! [`sdk_policies::Compactor`].
 
@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::events::{EventStore, FetchedTurn};
-use crate::llm_runtime::SharedLlmRuntime;
+use crate::llm_runtime::gateway::SideCallGateway;
+use crate::llm_runtime::side_calls::SideCall;
 use crate::traits::StateStore;
 use crate::types::UserRole;
 
@@ -263,25 +264,17 @@ fn to_sdk_message(message: &crate::traits::Message) -> sdk::Message {
     }
 }
 
-/// The SDK compactor writing summaries with `fast_model` through the
-/// daemon's model runtime (its retries and fallback to the primary model),
-/// accounted as `background:summarization`.
+/// The SDK compactor writing summaries through the side-call gateway, which
+/// runs the summarization side call's model chain within its total deadline
+/// and records every attempt under `background:summarization`.
 fn compactor(
-    runtime: SharedLlmRuntime,
+    side_calls: SideCallGateway,
     fast_model: &str,
     state: Arc<dyn StateStore>,
-    event_store: Arc<EventStore>,
     tainted_seqs: TaintedSeqs,
 ) -> sdk_policies::Compactor {
-    let provider = super::sdk_provider::RuntimeProvider {
-        runtime,
-        accounting: Some(super::sdk_provider::ModelCallAccounting {
-            state: state.clone(),
-            event_store,
-            purpose: "summarization",
-        }),
-    };
-    let summarizer = sdk_policies::ProviderSummarizer::new(Arc::new(provider), fast_model)
+    let provider = side_calls.provider(SideCall::Summarization);
+    let summarizer = sdk_policies::ProviderSummarizer::new(provider, fast_model)
         .permits(SUMMARY_PERMITS.clone());
     sdk_policies::Compactor::new(
         summarizer,
@@ -306,7 +299,7 @@ fn limits(fast_model: &str, threshold: usize, recent: usize) -> sdk_policies::Co
 
 /// Where a compaction runs: the session and the daemon's handles.
 pub(crate) struct CompactionTarget<'a> {
-    pub runtime: SharedLlmRuntime,
+    pub side_calls: SideCallGateway,
     pub fast_model: &'a str,
     pub state: Arc<dyn StateStore>,
     pub event_store: Arc<EventStore>,
@@ -327,10 +320,9 @@ pub(crate) async fn compact_now(
         finished_turn_id: None,
     };
     compactor(
-        target.runtime,
+        target.side_calls,
         target.fast_model,
         target.state,
-        target.event_store,
         tainted_seqs,
     )
     .compact(
@@ -360,10 +352,9 @@ pub(crate) fn compact_after_reply(
         finished_turn_id: Some(finished_turn_id),
     });
     compactor(
-        target.runtime,
+        target.side_calls,
         target.fast_model,
         target.state,
-        target.event_store,
         tainted_seqs,
     )
     .spawn(
@@ -441,13 +432,19 @@ mod tests {
             .unwrap();
     }
 
-    fn runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
-        SharedLlmRuntime::new(
+    /// A gateway over `provider`, recording into `state` and `event_store`.
+    fn gateway(
+        provider: Arc<MockProvider>,
+        state: Arc<dyn StateStore>,
+        event_store: Arc<EventStore>,
+    ) -> SideCallGateway {
+        let runtime = crate::llm_runtime::SharedLlmRuntime::new(
             provider as crate::llm_runtime::ModelBackend,
             None,
             crate::config::ProviderKind::OpenaiCompatible,
             "mock-model".to_string(),
-        )
+        );
+        SideCallGateway::new(runtime, state, event_store)
     }
 
     /// Each pass builds on the stored summary, folds in only the turns after
@@ -464,7 +461,7 @@ mod tests {
         let state: Arc<dyn StateStore> = harness.state.clone();
         let session = "summary-cursor-session";
         let target = || CompactionTarget {
-            runtime: runtime(harness.provider.clone()),
+            side_calls: gateway(harness.provider.clone(), state.clone(), event_store.clone()),
             fast_model: "mock-model",
             state: state.clone(),
             event_store: event_store.clone(),
@@ -504,6 +501,68 @@ mod tests {
         assert!(second_prompt.contains("message u-4] user: question 4"));
         assert!(!second_prompt.contains("question 3"));
         assert!(!second_prompt.contains("question 6"));
+    }
+
+    /// A summarizer whose model fails leaves the history as it was: no
+    /// summary is stored, and the gateway records the failed attempt.
+    #[tokio::test]
+    async fn a_summarizer_that_fails_leaves_the_history_unsummarized() {
+        use crate::llm_runtime::gateway::test_support::*;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (side_calls, events) = gateway_with(provider_failing("503")).await;
+        let session = "failed-summary-session";
+        for number in 1..=4 {
+            seed_complete_turn(&events, session, number).await;
+        }
+        let result = compact_now(
+            CompactionTarget {
+                side_calls,
+                fast_model: "mock-model",
+                state: harness.state.clone(),
+                event_store: events.clone(),
+                session_id: session,
+            },
+            1,
+            1,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(harness
+            .state
+            .get_conversation_summary(session)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(failed_calls(&events, "summarization").await >= 1);
+        assert_eq!(ok_calls(&events, "summarization").await, 0);
+    }
+
+    /// One `summarization` row per summary, written by the gateway.
+    #[tokio::test]
+    async fn a_summary_is_recorded_once() {
+        use crate::llm_runtime::gateway::test_support::*;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (side_calls, events) = gateway_with(provider_answering("Synthetic summary.")).await;
+        let session = "recorded-summary-session";
+        for number in 1..=4 {
+            seed_complete_turn(&events, session, number).await;
+        }
+        compact_now(
+            CompactionTarget {
+                side_calls,
+                fast_model: "mock-model",
+                state: harness.state.clone(),
+                event_store: events.clone(),
+                session_id: session,
+            },
+            1,
+            1,
+        )
+        .await
+        .unwrap()
+        .expect("a summary");
+        assert_eq!(ok_calls(&events, "summarization").await, 1);
+        assert_eq!(failed_calls(&events, "summarization").await, 0);
     }
 
     /// The pass after a reply runs before the turn's `task_end` lands; told
@@ -547,7 +606,11 @@ mod tests {
 
         compact_after_reply(
             CompactionTarget {
-                runtime: runtime(harness.provider.clone()),
+                side_calls: gateway(
+                    harness.provider.clone(),
+                    harness.state.clone(),
+                    event_store.clone(),
+                ),
                 fast_model: "mock-model",
                 state: harness.state.clone(),
                 event_store: event_store.clone(),

@@ -37,47 +37,6 @@ impl GateFilterStage {
     }
 }
 
-/// The relationship router's candidate models: the router's priority order,
-/// but an owner `/model` pin goes first so the whole turn runs on that model
-/// (the router's models stay behind it as fallbacks).
-fn assessment_model_order(
-    router_models: Option<Vec<String>>,
-    turn_model: &str,
-    model_override_active: bool,
-) -> Vec<String> {
-    let mut models = router_models.unwrap_or_else(|| vec![turn_model.to_string()]);
-    if model_override_active {
-        models.retain(|candidate| candidate != turn_model);
-        models.insert(0, turn_model.to_string());
-    }
-    models
-}
-
-#[cfg(test)]
-mod assessment_model_order_tests {
-    use super::assessment_model_order;
-
-    #[test]
-    fn owner_model_pin_leads_the_assessment() {
-        let router = || {
-            Some(vec![
-                "sol".to_string(),
-                "luna".to_string(),
-                "terra".to_string(),
-            ])
-        };
-        assert_eq!(
-            assessment_model_order(router(), "terra", true),
-            ["terra", "sol", "luna"]
-        );
-        assert_eq!(
-            assessment_model_order(router(), "terra", false),
-            ["sol", "luna", "terra"]
-        );
-        assert_eq!(assessment_model_order(None, "terra", true), ["terra"]);
-    }
-}
-
 fn build_tool_filter_gate_telemetry(
     stages: &[GateFilterStage],
     initial_tool_count: usize,
@@ -951,31 +910,6 @@ pub(in crate::agent) async fn run_bootstrap(
     } else {
         super::task_planning::planning_skip_reason(user_text, false)
     };
-    let model_override_active =
-        tokio::time::timeout(Duration::from_secs(2), agent.model_override.read())
-            .await
-            .map(|guard| *guard)
-            .unwrap_or(false);
-    // The relationship router classifies the request; it does not need the
-    // strongest model. The primary's fast tier leads (an owner model pin still
-    // leads), and the failover providers' models follow, so a used-up primary
-    // quota does not cost the turn its relationship edge.
-    let mut cheap_first_models = vec![llm_runtime_snapshot.cheap_model()];
-    for candidate in llm_router
-        .as_ref()
-        .map(|router| router.all_models_ordered())
-        .unwrap_or_else(|| vec![model.clone()])
-    {
-        if !cheap_first_models.contains(&candidate) {
-            cheap_first_models.push(candidate);
-        }
-    }
-    let planner_models = llm_runtime_snapshot.with_failover_models(assessment_model_order(
-        Some(cheap_first_models),
-        &model,
-        model_override_active,
-    ));
-    let planner_backend = llm_runtime_snapshot.model_routed_backend();
     let planner_context = super::task_planning::relationship_conversation_context(
         initial_turn_context.followup_mode,
         session_summary
@@ -1000,12 +934,6 @@ pub(in crate::agent) async fn run_bootstrap(
         (Some(context), Some(owed)) => Some(format!("{context}\n\n{owed}")),
         (context, _) => context,
     };
-    let planner_telemetry = Some(super::task_planning::PlannerTelemetryCtx {
-        emitter: &emitter,
-        state: agent.state.as_ref(),
-        session_id,
-        task_id: &task_id,
-    });
     // Ingress already reduced an unresolved request to a typed
     // follow-up/clarification edge. Do not make that persisted topology depend
     // on a second language call; the finalizer resolves the exact graph node
@@ -1021,13 +949,15 @@ pub(in crate::agent) async fn run_bootstrap(
         None
     } else {
         match planner_context.as_deref() {
+            // The relationship router classifies the request; it does not
+            // need the strongest model. The gateway runs it on the fast tier
+            // with the failover providers behind it, so a used-up primary
+            // quota does not cost the turn its relationship edge.
             Some(context) => {
-                super::task_planning::generate_task_relationship_candidates(
-                    planner_backend.clone(),
-                    &planner_models,
+                super::task_planning::generate_task_relationship(
+                    &agent.side_calls,
                     user_text,
                     context,
-                    planner_telemetry,
                 )
                 .await
             }
@@ -1125,7 +1055,7 @@ pub(in crate::agent) async fn run_bootstrap(
             Duration::from_secs(30),
             crate::agent::conversation_compaction::compact_now(
                 crate::agent::conversation_compaction::CompactionTarget {
-                    runtime: agent.llm_runtime.clone(),
+                    side_calls: agent.side_calls.clone(),
                     fast_model: &compaction_model,
                     state: agent.state.clone(),
                     event_store: agent.event_store.clone(),

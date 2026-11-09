@@ -71,14 +71,6 @@ pub(crate) enum ProviderRecoveryRoute {
 }
 
 impl ProviderError {
-    /// Whether changing only the model cannot recover this failure. Candidate
-    /// lists in the agent are model alternatives behind one provider/account;
-    /// an account authentication rejection therefore applies to the whole
-    /// candidate domain and must fail fast instead of amplifying requests.
-    pub fn prevents_model_fallback(&self) -> bool {
-        self.kind == ProviderErrorKind::Auth
-    }
-
     pub(crate) fn recovery_route(&self, single_attempt_fail_closed: bool) -> ProviderRecoveryRoute {
         use ProviderRecoveryRoute::*;
 
