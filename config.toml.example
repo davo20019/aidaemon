@@ -350,6 +350,8 @@ health_port = 8080
 # max_depth = 3            # max nesting levels for sub-agents
 # max_iterations = 10      # agentic loop iterations per sub-agent
 # max_response_chars = 8000
+# max_concurrent = 4         # plain sub-agents one request may run at once
+# max_per_request = 12       # plain sub-agents one request may start in total
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
 # [files]
