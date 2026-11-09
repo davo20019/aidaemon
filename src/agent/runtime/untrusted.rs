@@ -130,6 +130,9 @@ pub(crate) async fn record_tainted_turn(
 pub(in crate::agent) struct VerifierVerdict {
     pub consistent: bool,
     pub reason: String,
+    /// The verifier judged the call. False when it failed or was cancelled,
+    /// which refuses the call without saying anything about it.
+    pub decided: bool,
 }
 
 /// Where the verifier's model call is recorded.
@@ -168,6 +171,7 @@ fn could_not_verify() -> VerifierVerdict {
     VerifierVerdict {
         consistent: false,
         reason: "could not verify".to_string(),
+        decided: false,
     }
 }
 
@@ -285,15 +289,24 @@ fn verifier_messages(
     ]
 }
 
-/// The refusal the working model gets for a call the verifier rejected; the
-/// verifier's reason is capped.
-fn denial_reason(tool: &str, reason: &str) -> String {
-    format!(
-        "{UNTRUSTED_BLOCKED} `{tool}` was not performed: a clean check found it is \
-         not what the request asked for ({}). Continue without it or tell the user \
-         what you would need.",
-        crate::utils::truncate_str(reason, DENIAL_REASON_CHARS)
-    )
+/// The refusal the working model gets for a call that did not pass; the
+/// verifier's reason is capped. A check that reached no verdict is reported
+/// as that, so the model does not treat a failure as a ruling on the call.
+fn denial_reason(tool: &str, verdict: &VerifierVerdict) -> String {
+    let reason = crate::utils::truncate_str(&verdict.reason, DENIAL_REASON_CHARS);
+    if verdict.decided {
+        format!(
+            "{UNTRUSTED_BLOCKED} `{tool}` was not performed: a clean check found it is \
+             not what the request asked for ({reason}). Continue without it or tell the \
+             user what you would need."
+        )
+    } else {
+        format!(
+            "{UNTRUSTED_BLOCKED} `{tool}` was not performed: the safety check reached no \
+             verdict ({reason}), which is not a ruling against this call. Retry it once; \
+             if the check fails again, tell the user it is unavailable."
+        )
+    }
 }
 
 /// The verdict in the verifier's reply; anything else fails closed.
@@ -307,6 +320,7 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
         Ok(wire) => VerifierVerdict {
             consistent: wire.consistent,
             reason: wire.reason.trim().to_string(),
+            decided: true,
         },
         Err(_) => could_not_verify(),
     }
@@ -353,6 +367,7 @@ pub(in crate::agent) async fn verify_untrusted_call(
             return VerifierVerdict {
                 consistent: false,
                 reason: "cancelled".to_string(),
+                decided: false,
             };
         }
     };
@@ -456,6 +471,7 @@ impl sdk::InterruptResolver for UntrustedVerifier<'_> {
                     "tool": tool,
                     "consistent": verdict.consistent,
                     "reason": verdict.reason,
+                    "decided": verdict.decided,
                 }),
             )
             .await;
@@ -463,7 +479,7 @@ impl sdk::InterruptResolver for UntrustedVerifier<'_> {
             sdk::Resolution::Approve
         } else {
             sdk::Resolution::Deny {
-                reason: denial_reason(tool, &verdict.reason),
+                reason: denial_reason(tool, &verdict),
             }
         })
     }
@@ -626,6 +642,7 @@ mod tests {
             VerifierVerdict {
                 consistent: false,
                 reason: "cancelled".to_string(),
+                decided: false,
             }
         );
     }
@@ -944,10 +961,31 @@ mod tests {
 
     #[test]
     fn the_denial_caps_the_verifier_reason() {
-        let denial = denial_reason("send_probe", &"r".repeat(1000));
+        let denial = denial_reason(
+            "send_probe",
+            &VerifierVerdict {
+                consistent: false,
+                reason: "r".repeat(1000),
+                decided: true,
+            },
+        );
         assert!(denial.starts_with("[UNTRUSTED BLOCKED] `send_probe` was not performed"));
         assert!(!denial.contains(&"r".repeat(201)), "{denial}");
         assert!(denial.ends_with("Continue without it or tell the user what you would need."));
+    }
+
+    #[test]
+    fn a_failed_check_is_not_reported_as_a_ruling() {
+        let denial = denial_reason("send_probe", &could_not_verify());
+        assert!(denial.starts_with("[UNTRUSTED BLOCKED] `send_probe` was not performed"));
+        assert!(
+            denial.contains("not a ruling against this call"),
+            "{denial}"
+        );
+        assert!(
+            !denial.contains("not what the request asked for"),
+            "{denial}"
+        );
     }
 
     #[test]
@@ -956,7 +994,8 @@ mod tests {
             parse_verdict(r#"{"consistent":true,"reason":"asked for"}"#),
             VerifierVerdict {
                 consistent: true,
-                reason: "asked for".to_string()
+                reason: "asked for".to_string(),
+                decided: true,
             }
         );
         for bad in ["not json", "", r#"{"consistent":"yes","reason":"x"}"#, "{}"] {

@@ -438,10 +438,33 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
     None
 }
 
+/// What the owner approves to reach a site on this computer, or `None` when
+/// `url` is not loopback-only (public, private network, metadata and malformed
+/// targets are never approvable). A dev site's name is its own key;
+/// `localhost` and IP literals are shared by every local service, so their key
+/// includes the port.
+pub fn local_site_key(url: &str) -> Option<String> {
+    if !resolves_only_to_loopback(url) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    let shared_name = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok();
+    if shared_name {
+        Some(format!("{host}:{}", parsed.port_or_known_default()?))
+    } else {
+        Some(host)
+    }
+}
+
 /// Whether `url` targets this computer and nothing else: blocked as loopback,
 /// with every address its host resolves to on loopback. A name that also maps
 /// to a private or metadata address is not loopback-only.
-pub fn resolves_only_to_loopback(url: &str) -> bool {
+fn resolves_only_to_loopback(url: &str) -> bool {
     if classify_blocked_host(url) != Some(BlockedHostClass::Loopback) {
         return false;
     }

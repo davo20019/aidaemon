@@ -1142,6 +1142,7 @@ impl HttpRequestTool {
         profile: Option<&HttpAuthProfile>,
         profiles_snapshot: &HashMap<String, HttpAuthProfile>,
         follow_redirects: bool,
+        local_site: Option<&str>,
     ) -> anyhow::Result<(reqwest::Response, usize)> {
         let mut current_url = url.to_string();
         let mut current_method = method.to_string();
@@ -1284,19 +1285,21 @@ impl HttpRequestTool {
                             .unwrap_or(location_str.to_string())
                     };
 
-                    if let Err(reason) = validate_url_for_ssrf(&next_url) {
-                        return Err(anyhow::anyhow!(
-                            "Redirect blocked (hop {}): {}",
-                            redirect_count,
-                            reason
-                        ));
-                    }
-
-                    if let Ok(next_parsed) = reqwest::Url::parse(&next_url) {
-                        if next_parsed.scheme() != "https" {
+                    if !Self::redirect_stays_on_local_site(local_site, &next_url) {
+                        if let Err(reason) = validate_url_for_ssrf(&next_url) {
                             return Err(anyhow::anyhow!(
-                                "Redirect blocked: redirected to non-HTTPS URL"
+                                "Redirect blocked (hop {}): {}",
+                                redirect_count,
+                                reason
                             ));
+                        }
+
+                        if let Ok(next_parsed) = reqwest::Url::parse(&next_url) {
+                            if next_parsed.scheme() != "https" {
+                                return Err(anyhow::anyhow!(
+                                    "Redirect blocked: redirected to non-HTTPS URL"
+                                ));
+                            }
                         }
                     }
 
@@ -1359,11 +1362,31 @@ impl HttpRequestTool {
         Some(parsed_url)
     }
 
+    /// The site on this computer `url` targets when only the owner can open
+    /// the way to it. Literal `localhost` needs no approval.
+    fn local_site_needing_owner(url: &str) -> Option<String> {
+        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_lowercase();
+        if matches!(
+            host.as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+        ) {
+            return None;
+        }
+        crate::tools::web_fetch::local_site_key(url)
+    }
+
+    fn redirect_stays_on_local_site(local_site: Option<&str>, next_url: &str) -> bool {
+        local_site.is_some_and(|site| {
+            crate::tools::web_fetch::local_site_key(next_url).as_deref() == Some(site)
+        })
+    }
+
     /// The owner approval a request needs (H7), from its arguments as the
     /// model wrote them: none for a GET, HEAD or OPTIONS without a body or a
-    /// method or authority override header; anything else asks, High risk,
-    /// with subject `"{METHOD} {url}"` (the canonical URL, so grants match
-    /// it exactly) and up to 500 characters of the body in the summary.
+    /// method or authority override header, unless it targets a local site
+    /// (one card per site, naming only the site); anything else asks, High
+    /// risk, with subject `"{METHOD} {url}"` (the canonical URL, so grants
+    /// match it exactly) and up to 500 characters of the body in the summary.
     pub(crate) fn owner_approval_request(
         args: &Value,
     ) -> Option<aidaemon_core::OwnerApprovalRequest> {
@@ -1387,8 +1410,18 @@ impl HttpRequestTool {
         let headers = args["headers"].as_object();
         let overrides = !Self::method_override_headers(headers).is_empty()
             || !Self::authority_override_headers(headers).is_empty();
+        let local_site = Self::local_site_needing_owner(&url);
         if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") && body.is_none() && !overrides {
-            return None;
+            return local_site.map(|site| aidaemon_core::OwnerApprovalRequest {
+                effects: Vec::new(),
+                summary: format!(
+                    "Let http_request reach {site}, a site on this computer? Approve only if \
+                     you asked for it."
+                ),
+                subject: format!("local site {site}"),
+                risk: aidaemon_core::ApprovalRisk::High,
+                warnings: Vec::new(),
+            });
         }
         let method = if method.is_empty() {
             "REQUEST".to_string()
@@ -1401,7 +1434,10 @@ impl HttpRequestTool {
             summary.push_str("\nBody: ");
             summary.extend(body.chars().take(500));
         }
-        let mut warnings = vec![format!("HTTP {method} request to external API")];
+        let mut warnings = vec![match &local_site {
+            Some(site) => format!("HTTP {method} request to {site}, a site on this computer"),
+            None => format!("HTTP {method} request to external API"),
+        }];
         if let Some(profile) = args["auth_profile"]
             .as_str()
             .filter(|profile| !profile.trim().is_empty())
@@ -1530,16 +1566,21 @@ impl HttpRequestTool {
         let is_localhost = parsed_url
             .host_str()
             .is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0");
-        if parsed_url.scheme() != "https" && !is_localhost {
+        // A site on this computer goes on to Step 7, which runs it only with
+        // the owner's approval. Mandates keep the plain public-network rule.
+        let local_site = (!mandate_execution)
+            .then(|| Self::local_site_needing_owner(&url))
+            .flatten();
+        if parsed_url.scheme() != "https" && !is_localhost && local_site.is_none() {
             return Ok((
-                "Request blocked: only HTTPS URLs are allowed (exception: localhost)".to_string(),
+                "Request blocked: only HTTPS URLs are allowed (exception: local sites)".to_string(),
                 None,
                 None,
             ));
         }
 
         // Step 2: SSRF validation (skip for localhost — local dev/testing)
-        if !is_localhost {
+        if !is_localhost && local_site.is_none() {
             if let Err(reason) = validate_url_for_ssrf(&url) {
                 return Ok((format!("Request blocked: {}", reason), None, None));
             }
@@ -1744,6 +1785,7 @@ impl HttpRequestTool {
                 profile.as_ref(),
                 &profiles_snapshot,
                 follow_redirects,
+                local_site.as_deref(),
             )
             .await?;
 
@@ -1778,6 +1820,7 @@ impl HttpRequestTool {
                                         Some(&refreshed_profile_value),
                                         &refreshed_profiles,
                                         follow_redirects,
+                                        None,
                                     )
                                     .await?;
                                 let retry_status = retry_response.status();
@@ -2017,7 +2060,7 @@ impl Tool for HttpRequestTool {
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost or a local dev site (a site on this computer by another name asks the owner first); each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2028,7 +2071,7 @@ impl Tool for HttpRequestTool {
                     },
                     "url": {
                         "type": "string",
-                        "description": "Full endpoint URL: HTTPS, or plain http only for localhost. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
+                        "description": "Full endpoint URL: HTTPS, or plain http only for localhost or an owner-approved local dev site. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
                     },
                     "auth_profile": {
                         "type": "string",
@@ -2411,6 +2454,113 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
 mod tests {
     use super::*;
     use crate::traits::ToolSemantics;
+
+    #[test]
+    fn a_local_site_read_asks_the_owner_naming_only_the_site() {
+        let request = HttpRequestTool::owner_approval_request(&json!({
+            "method": "GET",
+            "url": "https://shop.localhost/admin?token=SECRET",
+        }))
+        .expect("a local site asks");
+        assert_eq!(request.subject, "local site shop.localhost");
+        assert!(
+            request.summary.contains("shop.localhost"),
+            "{}",
+            request.summary
+        );
+        assert!(!request.summary.contains("SECRET"), "{}", request.summary);
+        assert!(!request.summary.contains("/admin"), "{}", request.summary);
+
+        let other_path = HttpRequestTool::owner_approval_request(&json!({
+            "method": "HEAD",
+            "url": "http://shop.localhost/other",
+        }))
+        .expect("a local site asks");
+        assert_eq!(other_path.subject, request.subject, "one card per site");
+    }
+
+    #[test]
+    fn literal_localhost_and_public_reads_still_need_no_card() {
+        for url in [
+            "http://localhost:3000/",
+            "http://127.0.0.1:8080/x",
+            "http://[::1]:8080/",
+        ] {
+            assert!(
+                HttpRequestTool::owner_approval_request(&json!({"method": "GET", "url": url}))
+                    .is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_site_write_keeps_its_exact_call_card() {
+        let request = HttpRequestTool::owner_approval_request(&json!({
+            "method": "POST",
+            "url": "https://shop.localhost/orders",
+            "body": "x",
+        }))
+        .expect("a write asks");
+        assert_eq!(request.subject, "POST https://shop.localhost/orders");
+        assert!(request.warnings[0].contains("a site on this computer"));
+    }
+
+    #[test]
+    fn redirects_stay_on_the_approved_local_site_only() {
+        let same = HttpRequestTool::redirect_stays_on_local_site;
+        assert!(same(Some("shop.localhost"), "http://shop.localhost/next"));
+        assert!(!same(Some("shop.localhost"), "http://other.localhost/next"));
+        assert!(!same(Some("shop.localhost"), "http://169.254.169.254/"));
+        assert!(!same(Some("shop.localhost"), "http://10.0.0.5/"));
+        assert!(!same(None, "http://shop.localhost/next"));
+    }
+
+    #[tokio::test]
+    async fn a_local_site_needs_the_owner_and_stays_closed_to_mandates() {
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())));
+        let args = json!({"method": "GET", "url": "http://shop.localhost/"}).to_string();
+
+        let unapproved = tool
+            .execute(&args, false, false, None)
+            .await
+            .expect_err("no approval, no request");
+        assert!(
+            unapproved.to_string().contains("requires approval"),
+            "{unapproved}"
+        );
+
+        let (mandate, _, _) = tool
+            .execute(&args, true, true, None)
+            .await
+            .expect("refused before any request");
+        assert!(mandate.contains("Request blocked"), "{mandate}");
+
+        // Approved calls get past the policy; the name may not resolve here.
+        let approved = tool
+            .execute(
+                &args,
+                false,
+                false,
+                Some(&crate::traits::ApprovalScope::Call),
+            )
+            .await;
+        match approved {
+            Ok((text, _, _)) => assert!(!text.contains("Request blocked"), "{text}"),
+            Err(error) => assert!(!error.to_string().contains("requires approval"), "{error}"),
+        }
+    }
+
+    #[test]
+    fn private_network_and_metadata_get_no_local_site_card() {
+        for url in ["http://10.0.0.5/", "http://169.254.169.254/latest"] {
+            assert_eq!(
+                HttpRequestTool::local_site_needing_owner(url),
+                None,
+                "{url}"
+            );
+        }
+    }
 
     /// The schema the model reads must state the localhost exception the
     /// URL check enforces; a mandate executor once refused an authorized

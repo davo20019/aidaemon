@@ -317,9 +317,10 @@ fn build_body(
     let legacy_thinking = takes_thinking_budget(&request.model);
     let budget = effort.filter(|_| legacy_thinking).map(thinking_budget);
     let mut max_tokens = request.max_output_tokens.unwrap_or(default_max_tokens);
-    if let Some(budget) = budget {
-        // The budget counts against max_tokens; keep room for the answer.
-        max_tokens = max_tokens.max(budget + 4_096);
+    if let Some(effort) = effort {
+        // Thinking counts against max_tokens, adaptive thinking included;
+        // keep room for the answer.
+        max_tokens = max_tokens.max(thinking_budget(effort) + 4_096);
     }
 
     let mut messages = wire_messages(&request.messages[leading..]);

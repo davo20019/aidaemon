@@ -2,7 +2,7 @@
 //! This module holds the daemon's configuration of the tool.
 
 pub use aidaemon_tools::web::{
-    build_browser_client, classify_blocked_host, resolves_only_to_loopback, validate_url_for_ssrf,
+    build_browser_client, classify_blocked_host, local_site_key, validate_url_for_ssrf,
     BlockedHostClass,
 };
 pub(crate) use aidaemon_tools::web::{read_body_capped, MAX_FETCH_BODY_BYTES};

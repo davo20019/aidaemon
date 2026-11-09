@@ -479,7 +479,8 @@ async fn thinking_blocks_are_kept_and_replayed() {
 
 /// Current models reject `budget_tokens` with a 400 (live: claude-haiku-5-5
 /// refused task assessment): effort becomes adaptive thinking with
-/// `output_config.effort`, and max_tokens is left alone.
+/// `output_config.effort`. Thinking still counts against max_tokens, so a small
+/// limit is raised to leave room for the answer.
 #[test]
 fn reasoning_effort_uses_adaptive_thinking_on_current_models() {
     let p = Anthropic::builder()
@@ -494,11 +495,21 @@ fn reasoning_effort_uses_adaptive_thinking_on_current_models() {
         let body = p.request_body(&req);
         assert_eq!(body["thinking"], json!({"type": "adaptive"}), "{model}");
         assert_eq!(body["output_config"], json!({"effort": "high"}), "{model}");
-        assert_eq!(body["max_tokens"], 1024, "{model}");
+        assert_eq!(body["max_tokens"], 16384 + 4096, "{model}");
         assert!(body["thinking"].get("budget_tokens").is_none());
+
+        req.options.reasoning_effort = Some("low".into());
+        req.max_output_tokens = Some(400);
+        let body = p.request_body(&req);
+        assert_eq!(body["max_tokens"], 2048 + 4096, "{model}");
+        req.max_output_tokens = None;
 
         req.options.reasoning_effort = Some("off".into());
         let body = p.request_body(&req);
         assert!(body.get("thinking").is_none() && body.get("output_config").is_none());
+        assert_eq!(
+            body["max_tokens"], 1024,
+            "{model}: no thinking, limit unchanged"
+        );
     }
 }
