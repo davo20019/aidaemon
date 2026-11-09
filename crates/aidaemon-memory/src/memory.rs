@@ -32,6 +32,13 @@ pub type AudienceResolver = Arc<dyn Fn(&str) -> RecallAudience + Send + Sync>;
 /// out afterwards, as a multiple of the limit.
 const FILTERED_SEARCH_OVERFETCH: usize = 4;
 
+/// The strongest query matches whose relations feed the graph signal.
+const MAX_GRAPH_SEEDS: usize = 6;
+
+/// A seed must match the query at least this well (semantic or lexical).
+/// The scorer is not asked, so a custom one sees each candidate once.
+const GRAPH_SEED_MIN_SIGNAL: f32 = 0.3;
+
 struct Inner {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
@@ -365,14 +372,46 @@ impl Memory {
                         .collect()
                 } else {
                     let lexical = self.lexical(store.fact_lexical_scores(scope, query).await);
-                    let mut scored: Vec<ScoredFact> = records
-                        .into_iter()
-                        .filter_map(|r| {
+                    let signals: Vec<(Option<f32>, f32)> = records
+                        .iter()
+                        .map(|r| {
                             let semantic =
                                 Self::semantic(query_embedding.as_ref(), r.embedding.as_ref());
                             let lex = lexical.get(&r.fact.id).copied().unwrap_or(0.0);
-                            let score =
-                                self.inner.scorer.score_fact(&r.fact, semantic, lex, now)?;
+                            (semantic, lex)
+                        })
+                        .collect();
+                    let mut seeds: Vec<(f32, String)> = records
+                        .iter()
+                        .zip(&signals)
+                        .map(|(r, &(semantic, lex))| {
+                            (semantic.unwrap_or(0.0).max(lex), r.fact.id.clone())
+                        })
+                        .filter(|(strength, _)| *strength > GRAPH_SEED_MIN_SIGNAL)
+                        .collect();
+                    seeds.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    seeds.truncate(MAX_GRAPH_SEEDS);
+                    let seed_ids: Vec<String> = seeds.into_iter().map(|(_, id)| id).collect();
+                    let graph = if seed_ids.is_empty() {
+                        HashMap::new()
+                    } else {
+                        store
+                            .fact_graph_scores(scope, &seed_ids)
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, "graph lookup failed; ranking without it");
+                                HashMap::new()
+                            })
+                    };
+                    let mut scored: Vec<ScoredFact> = records
+                        .into_iter()
+                        .zip(signals)
+                        .filter_map(|(r, (semantic, lex))| {
+                            let linked = graph.get(&r.fact.id).copied().unwrap_or(0.0);
+                            let score = self
+                                .inner
+                                .scorer
+                                .score_fact_with_graph(&r.fact, semantic, lex, linked, now)?;
                             Some(ScoredFact {
                                 fact: r.fact,
                                 score: score.value,

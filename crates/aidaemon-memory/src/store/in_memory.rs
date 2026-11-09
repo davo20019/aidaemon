@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::MemoryStore;
+use super::{related_fact_scores, MemoryStore};
 use crate::error::{MemoryError, Result};
 use crate::types::{
     new_id, normalize_category, normalize_key, same_value, DecayReport, Episode, EpisodeRecord,
@@ -174,6 +174,20 @@ impl MemoryStore for InMemoryMemoryStore {
             .filter(|r| r.fact.is_active() && r.fact.scope == scope)
             .cloned()
             .collect())
+    }
+
+    async fn fact_graph_scores(
+        &self,
+        scope: &str,
+        seed_ids: &[String],
+    ) -> Result<HashMap<String, f32>> {
+        let active: Vec<Fact> = self
+            .active_facts(scope)
+            .await?
+            .into_iter()
+            .map(|r| r.fact)
+            .collect();
+        Ok(related_fact_scores(&active, seed_ids))
     }
 
     async fn fact_history(&self, scope: &str, category: &str, key: &str) -> Result<Vec<Fact>> {

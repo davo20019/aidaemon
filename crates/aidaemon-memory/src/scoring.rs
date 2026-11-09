@@ -14,8 +14,8 @@ use crate::types::{Episode, Fact, Score, Signals};
 pub struct HybridWeights {
     pub semantic: f32,
     pub lexical: f32,
-    /// Entity-graph match. This crate has no graph yet, so the signal is 0
-    /// unless a custom store or scorer supplies one.
+    /// Entity-graph match, from [`crate::MemoryStore::fact_graph_scores`].
+    /// Stays 0 for a store with no graph.
     pub graph: f32,
     pub freshness: f32,
     pub confidence: f32,
@@ -97,6 +97,20 @@ pub trait Scorer: Send + Sync {
         now: DateTime<Utc>,
     ) -> Option<Score>;
 
+    /// [`Scorer::score_fact`] with the fact's graph relation to the query's
+    /// other hits (0.0-1.0). The default ignores it, so a scorer written
+    /// before this signal existed keeps ranking as it did.
+    fn score_fact_with_graph(
+        &self,
+        fact: &Fact,
+        semantic: Option<f32>,
+        lexical: f32,
+        _graph: f32,
+        now: DateTime<Utc>,
+    ) -> Option<Score> {
+        self.score_fact(fact, semantic, lexical, now)
+    }
+
     fn score_episode(
         &self,
         episode: &Episode,
@@ -138,13 +152,26 @@ impl Scorer for HybridScorer {
         lexical: f32,
         now: DateTime<Utc>,
     ) -> Option<Score> {
+        self.score_fact_with_graph(fact, semantic, lexical, 0.0, now)
+    }
+
+    /// The graph signal orders relevant facts; like freshness, it never lets
+    /// an irrelevant one through.
+    fn score_fact_with_graph(
+        &self,
+        fact: &Fact,
+        semantic: Option<f32>,
+        lexical: f32,
+        graph: f32,
+        now: DateTime<Utc>,
+    ) -> Option<Score> {
         if !self.relevant(semantic, lexical) {
             return None;
         }
         let signals = Signals {
             semantic: semantic.unwrap_or(0.0).clamp(0.0, 1.0),
             lexical: lexical.clamp(0.0, 1.0),
-            graph: 0.0,
+            graph: graph.clamp(0.0, 1.0),
             freshness: self.freshness(now, fact.updated_at),
             confidence: fact.confidence.clamp(0.0, 1.0),
             provenance: if fact.source.excerpt.is_some() {

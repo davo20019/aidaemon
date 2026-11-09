@@ -93,6 +93,10 @@ pub mod store_checks {
     /// the asked scope only. Restating a fact never widens its access, and a
     /// new version takes the access it was written with.
     pub const ACCESS_LEVELS_ROUND_TRIP: &str = "store.access_levels_round_trip";
+    /// `fact_graph_scores` is either empty for related facts (the trait
+    /// default: no graph signal; noted) or scores in `(0, 1]`, for active
+    /// facts of the asked scope only, and nothing for unknown seeds.
+    pub const GRAPH_SCORES_CONTRACT: &str = "store.graph_scores_contract";
 }
 
 /// Run every store check (see [`store_checks`]); each check uses a fresh
@@ -150,6 +154,16 @@ where
             ));
         }
         Err(e) => report.fail(ACCESS_LEVELS_ROUND_TRIP, e),
+    }
+    match graph_scores(make().await).await {
+        Ok(true) => report.pass(GRAPH_SCORES_CONTRACT),
+        Ok(false) => {
+            report.pass(GRAPH_SCORES_CONTRACT);
+            report.note(format!(
+                "{GRAPH_SCORES_CONTRACT}: the store has no graph, so the graph signal stays 0"
+            ));
+        }
+        Err(e) => report.fail(GRAPH_SCORES_CONTRACT, e),
     }
     report
 }
@@ -1122,6 +1136,74 @@ async fn access_levels(store: Arc<dyn MemoryStore>) -> Check<bool> {
     let other = call!("episode_access", store.episode_access(OTHER_SCOPE, &ids));
     ensure(other.is_empty(), || {
         format!("episode_access answered for another scope: {other:?}")
+    })?;
+    Ok(true)
+}
+
+/// `Ok(true)` when the store relates facts, `Ok(false)` for the trait default.
+async fn graph_scores(store: Arc<dyn MemoryStore>) -> Check<bool> {
+    let seed = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "sister_name", "Alice Rivera"),
+            None,
+            at(0)
+        )
+    );
+    let related = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_employer", "Acme Corp"),
+            None,
+            at(0)
+        )
+    );
+    let replaced = call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_city", "Lisbon"),
+            None,
+            at(0)
+        )
+    );
+    call!(
+        "upsert_fact",
+        store.upsert_fact(
+            fact(SCOPE, "person", "alice_rivera_city", "Porto"),
+            None,
+            at(10)
+        )
+    );
+    let theirs = call!(
+        "upsert_fact (other scope)",
+        store.upsert_fact(
+            fact(OTHER_SCOPE, "person", "alice_rivera_pet", "Biscuit"),
+            None,
+            at(0)
+        )
+    );
+    let seeds = [seed.id().to_string()];
+    let scores = call!("fact_graph_scores", store.fact_graph_scores(SCOPE, &seeds));
+    if scores.is_empty() {
+        return Ok(false);
+    }
+    ensure(scores.values().all(|s| *s > 0.0 && *s <= 1.0), || {
+        format!("graph scores must be in (0, 1]: {scores:?}")
+    })?;
+    ensure(scores.contains_key(related.id()), || {
+        format!("a fact naming the seed's subject got no score: {scores:?}")
+    })?;
+    ensure(
+        !scores.contains_key(replaced.id()) && !scores.contains_key(theirs.id()),
+        || format!("superseded or other-scope facts got a score: {scores:?}"),
+    )?;
+    let unknown = ["conformance-unknown-id".to_string()];
+    let none = call!(
+        "fact_graph_scores",
+        store.fact_graph_scores(SCOPE, &unknown)
+    );
+    ensure(none.is_empty(), || {
+        format!("an unknown seed produced scores: {none:?}")
     })?;
     Ok(true)
 }

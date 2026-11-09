@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
+use crate::neighborhood::{entity_mentioned_as_words, fact_namespace};
 use crate::scoring::term_overlap;
 use crate::types::{
     DecayReport, Episode, EpisodeRecord, Fact, FactAccess, FactRecord, MemoryStats, NewEpisode,
@@ -19,6 +20,58 @@ use crate::types::{
 pub use in_memory::InMemoryMemoryStore;
 pub use migrations::{latest_version, Migration, MIGRATIONS};
 pub use sqlite::SqliteMemoryStore;
+
+/// Strength of two facts sharing a key namespace (`alice_rivera:*`).
+const SAME_NAMESPACE_LINK: f32 = 1.0;
+/// Strength of one fact naming the other's subject.
+const MENTION_LINK: f32 = 0.6;
+/// A value longer than this reads as a sentence, not as something named.
+const MAX_ENTITY_WORDS: usize = 4;
+/// A fact whose subject turns up in more facts than this is not naming
+/// anything specific ("yes", a common city), so its mentions carry no signal.
+const MAX_MENTION_FANOUT: usize = 8;
+
+/// Key-namespace and co-mention links from each seed to the other active
+/// facts, by fact id: the graph a store gets without keeping edges. Purely
+/// structural (keys and whole-word mentions), so stores can share it.
+pub fn related_fact_scores(active: &[Fact], seed_ids: &[String]) -> HashMap<String, f32> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    let mut raise = |id: &str, score: f32| {
+        let entry = scores.entry(id.to_string()).or_insert(0.0);
+        *entry = entry.max(score);
+    };
+    for seed in active.iter().filter(|f| seed_ids.contains(&f.id)) {
+        let others = active.iter().filter(|f| f.id != seed.id);
+        let mut mentions = Vec::new();
+        for other in others {
+            if share_namespace(seed, other) {
+                raise(&other.id, SAME_NAMESPACE_LINK);
+            } else if names_subject_of(seed, other) || names_subject_of(other, seed) {
+                mentions.push(other.id.as_str());
+            }
+        }
+        if mentions.len() <= MAX_MENTION_FANOUT {
+            mentions.into_iter().for_each(|id| raise(id, MENTION_LINK));
+        }
+    }
+    scores
+}
+
+fn share_namespace(a: &Fact, b: &Fact) -> bool {
+    fact_namespace(&a.key)
+        .zip(fact_namespace(&b.key))
+        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// `other`'s key or value names what `fact` is about: its key namespace, or
+/// its value when that is short enough to be a name.
+fn names_subject_of(fact: &Fact, other: &Fact) -> bool {
+    let haystack = format!("{} {}", other.key, other.value);
+    let short_named_value = fact.value.split_whitespace().count() <= MAX_ENTITY_WORDS
+        && fact.value.chars().any(char::is_alphabetic);
+    fact_namespace(&fact.key).is_some_and(|ns| entity_mentioned_as_words(&haystack, ns))
+        || (short_named_value && entity_mentioned_as_words(&haystack, &fact.value))
+}
 
 /// Persistence for facts and episodes. **This is the extension point** for
 /// bringing your own backend (pgvector, Qdrant, a document store, ...).
@@ -110,6 +163,18 @@ pub trait MemoryStore: Send + Sync {
             })
             .filter(|(_, s)| *s > 0.0)
             .collect())
+    }
+
+    /// How related each active fact in `scope` is to the `seed_ids` (facts
+    /// that matched the query), 0.0-1.0 by fact id. The default has no graph:
+    /// an empty map leaves the graph signal at 0 and ranking as it was. A
+    /// store that keeps no edges can use [`related_fact_scores`].
+    async fn fact_graph_scores(
+        &self,
+        _scope: &str,
+        _seed_ids: &[String],
+    ) -> Result<HashMap<String, f32>> {
+        Ok(HashMap::new())
     }
 
     /// Native ranked search. Return `Some` to bypass the scorer: the result

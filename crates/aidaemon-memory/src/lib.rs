@@ -123,7 +123,8 @@ pub use scoring::{
     HybridScorer, HybridWeights, Scorer, ScoringConfig,
 };
 pub use store::{
-    latest_version, InMemoryMemoryStore, MemoryStore, Migration, SqliteMemoryStore, MIGRATIONS,
+    latest_version, related_fact_scores, InMemoryMemoryStore, MemoryStore, Migration,
+    SqliteMemoryStore, MIGRATIONS,
 };
 pub use system::ScopedMemory;
 pub use tools::{RecallTool, RememberTool};

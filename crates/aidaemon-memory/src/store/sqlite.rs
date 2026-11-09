@@ -11,7 +11,7 @@ use sqlx::sqlite::{
 };
 use sqlx::{Row, Sqlite, Transaction};
 
-use super::{migrations, MemoryStore};
+use super::{migrations, related_fact_scores, MemoryStore};
 use crate::embed::{decode_embedding, encode_embedding};
 use crate::error::{MemoryError, Result};
 use crate::scoring::{term_overlap, tokens};
@@ -427,6 +427,20 @@ impl MemoryStore for SqliteMemoryStore {
         );
         let rows = sqlx::query(&sql).bind(scope).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(row_to_fact).collect())
+    }
+
+    async fn fact_graph_scores(
+        &self,
+        scope: &str,
+        seed_ids: &[String],
+    ) -> Result<HashMap<String, f32>> {
+        let active: Vec<Fact> = self
+            .active_facts(scope)
+            .await?
+            .into_iter()
+            .map(|r| r.fact)
+            .collect();
+        Ok(related_fact_scores(&active, seed_ids))
     }
 
     async fn fact_history(&self, scope: &str, category: &str, key: &str) -> Result<Vec<Fact>> {

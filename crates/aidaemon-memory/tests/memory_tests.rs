@@ -929,3 +929,167 @@ async fn sqlite_v1_database_upgrades_and_keeps_its_rows() {
         1
     );
 }
+
+// ----------------------------------------------------------------- Graph
+
+fn facts_about_alice() -> [NewFact; 3] {
+    [
+        fact("person", "sister_name", "Alice Rivera"),
+        fact("person", "alice_rivera_employer", "Acme Corp"),
+        fact("preference", "coffee_order", "flat white"),
+    ]
+}
+
+#[tokio::test]
+async fn related_facts_get_a_graph_signal() {
+    for (name, memory) in memories().await {
+        for f in facts_about_alice() {
+            memory.remember(f).await.unwrap();
+        }
+        let hits = memory
+            .recall_facts(SCOPE, "name employer order", 5)
+            .await
+            .unwrap();
+        let graph = |key: &str| {
+            hits.iter()
+                .find(|h| h.fact.key == key)
+                .unwrap_or_else(|| panic!("{name}: {key} not recalled: {hits:?}"))
+                .signals
+                .graph
+        };
+        assert!(graph("sister_name") > 0.0, "{name}");
+        assert!(graph("alice_rivera_employer") > 0.0, "{name}");
+        assert_eq!(graph("coffee_order"), 0.0, "{name}: nothing relates to it");
+    }
+}
+
+#[tokio::test]
+async fn the_graph_signal_raises_the_score_but_never_admits_a_fact() {
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let memory = Memory::builder(store.clone(), Arc::new(HashEmbedder::new(512))).build();
+    for f in facts_about_alice() {
+        memory.remember(f).await.unwrap();
+    }
+    memory
+        .remember(fact("person", "alice_rivera_hobby", "pottery"))
+        .await
+        .unwrap();
+    // "pottery" shares no word with the query, and a relation alone does not
+    // make a fact relevant.
+    let hits = memory.recall_facts(SCOPE, "sister name", 5).await.unwrap();
+    assert!(hits.iter().all(|h| h.fact.key != "alice_rivera_hobby"));
+
+    let related = memory
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    let plain_scorer = Memory::builder(
+        Arc::new(common::VecStore::default()),
+        Arc::new(HashEmbedder::new(512)),
+    )
+    .build();
+    for f in facts_about_alice() {
+        plain_scorer.remember(f).await.unwrap();
+    }
+    let without_graph = plain_scorer
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    assert!(without_graph.iter().all(|h| h.signals.graph == 0.0));
+    let score =
+        |hits: &[ScoredFact], key: &str| hits.iter().find(|h| h.fact.key == key).unwrap().score;
+    for key in ["sister_name", "alice_rivera_employer"] {
+        assert!(
+            score(&related, key) > score(&without_graph, key),
+            "{key}: {related:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_store_without_a_graph_scores_exactly_as_before() {
+    let memory = Memory::new(common::VecStore::default(), HashEmbedder::new(512));
+    for f in facts_about_alice() {
+        memory.remember(f).await.unwrap();
+    }
+    let hits = memory
+        .recall_facts(SCOPE, "sister name employer", 5)
+        .await
+        .unwrap();
+    assert!(!hits.is_empty());
+    let weights = aidaemon_memory::HybridWeights::default();
+    for hit in &hits {
+        assert_eq!(hit.signals.graph, 0.0);
+        assert_eq!(hit.score, weights.fuse(&hit.signals));
+    }
+}
+
+/// A shared-channel recall takes no signal from a fact it cannot see.
+#[tokio::test]
+async fn hidden_facts_do_not_feed_the_graph_signal() {
+    for (name, memory) in memories().await {
+        memory
+            .remember_with(
+                fact("person", "sister_name", "Alice Rivera"),
+                &FactAccess::private(),
+            )
+            .await
+            .unwrap();
+        memory
+            .remember_with(
+                fact("person", "alice_rivera_employer", "Acme Corp"),
+                &FactAccess::global(),
+            )
+            .await
+            .unwrap();
+        let hits = memory
+            .recall_facts_for(SCOPE, "employer", 5, &group("c1"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{name}");
+        assert_eq!(hits[0].signals.graph, 0.0, "{name}");
+    }
+}
+
+#[test]
+fn graph_links_are_structural() {
+    use aidaemon_memory::related_fact_scores;
+    let now = Utc::now();
+    let row = |id: &str, key: &str, value: &str| aidaemon_memory::Fact {
+        id: id.into(),
+        scope: SCOPE.into(),
+        category: "note".into(),
+        key: key.into(),
+        value: value.into(),
+        confidence: 1.0,
+        source: Provenance::default(),
+        created_at: now,
+        updated_at: now,
+        superseded_at: None,
+        recall_count: 0,
+        last_recalled_at: None,
+    };
+    let facts = vec![
+        row("seed", "acme_corp:office", "Porto"),
+        row("same-namespace", "acme_corp:founder", "Jordan Lee"),
+        row("mentions-namespace", "supplier", "Acme Corp"),
+        row("substring-only", "note", "acme_corporate retreat"),
+        row("unrelated", "fruit", "mango"),
+    ];
+    let scores = related_fact_scores(&facts, &["seed".to_string()]);
+    assert_eq!(scores.get("same-namespace"), Some(&1.0));
+    assert!(scores.get("mentions-namespace").is_some_and(|s| *s < 1.0));
+    assert!(!scores.contains_key("substring-only"), "{scores:?}");
+    assert!(!scores.contains_key("unrelated"), "{scores:?}");
+    assert!(
+        !scores.contains_key("seed"),
+        "a fact does not relate to itself"
+    );
+
+    // A value that half the store shares names nothing in particular.
+    let mut crowded = vec![row("seed", "answer", "yes")];
+    for i in 0..12 {
+        crowded.push(row(&format!("n{i}"), &format!("note_{i}"), "yes"));
+    }
+    assert!(related_fact_scores(&crowded, &["seed".to_string()]).is_empty());
+}
