@@ -324,6 +324,78 @@ pub(in crate::agent) struct GateClearance {
     pub grant: Option<crate::traits::MandateAuthorityGrant>,
 }
 
+/// Stands in for a call's result between the tool returning and the
+/// after-tool hook writing what the model reads.
+const RESULT_PENDING: &str = "[tool result pending]";
+
+/// How a call ended, before its result is recorded.
+enum ExecutedOutcome {
+    Returned {
+        outcome: crate::traits::ToolCallOutcome,
+        status: crate::traits::ToolOutcomeStatus,
+    },
+    /// The tool returned `Err`: an explicit typed failure.
+    Raised {
+        metadata: crate::traits::ToolCallMetadata,
+        error_text: String,
+    },
+}
+
+impl ExecutedOutcome {
+    fn metadata(&self) -> &crate::traits::ToolCallMetadata {
+        match self {
+            Self::Returned { outcome, .. } => &outcome.metadata,
+            Self::Raised { metadata, .. } => metadata,
+        }
+    }
+
+    /// The same test the receipt makes.
+    fn failed(&self) -> bool {
+        match self {
+            Self::Returned { outcome, status } => {
+                status.is_failure() || outcome.metadata.contract_rejected
+            }
+            Self::Raised { .. } => true,
+        }
+    }
+}
+
+/// A call that ran, waiting for the after-tool hook to record it.
+pub(in crate::agent) struct ExecutedCall {
+    request: KernelCall,
+    arguments: String,
+    injected_dir: Option<String>,
+    facts: crate::traits::ToolDispatchFacts,
+    grant: Option<crate::traits::MandateAuthorityGrant>,
+    idempotency_key: Option<String>,
+    send_file_key: Option<String>,
+    duration_ms: u64,
+    trust: sdk::SourceTrust,
+    executed: ExecutedOutcome,
+}
+
+/// Calls that ran and are not recorded yet, by run and call id.
+#[derive(Clone, Default)]
+pub(in crate::agent) struct ExecutedCalls(
+    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), ExecutedCall>>>,
+);
+
+impl ExecutedCalls {
+    fn insert(&self, run: sdk::RunId, call_id: &str, call: ExecutedCall) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), call);
+    }
+
+    fn take(&self, run: sdk::RunId, call_id: &str) -> Option<ExecutedCall> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
+}
+
 /// Gate outcomes by run and call id. A call is gated once: the kernel may
 /// put a call to its hooks again, and gets the same decision.
 #[derive(Debug, Clone, Default)]
@@ -893,7 +965,7 @@ impl Agent {
                 let _ = status_tx.try_send(StatusUpdate::ToolStart { name, summary });
             }
         }
-        let (output, images, metadata, receipt, finish) = match self
+        let executed = match self
             .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
         {
@@ -913,6 +985,145 @@ impl Agent {
                     Some(arguments),
                     Some(&outcome.metadata),
                 );
+                ExecutedOutcome::Returned { outcome, status }
+            }
+            Err(error) => {
+                // A tool that returns `Err` made an explicit typed failure: it
+                // gets a `FailedPermanent` receipt, so the run ledger and the task outcome see it.
+                let prepared = self.turn_tool(scope, &request.name).and_then(|tool| {
+                    crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
+                });
+                let mut metadata = crate::traits::ToolCallMetadata {
+                    outcome_status: Some(
+                        if error
+                            .downcast_ref::<crate::traits::NothingSentError>()
+                            .is_some()
+                        {
+                            crate::traits::ToolOutcomeStatus::FailedRetryable
+                        } else {
+                            crate::traits::ToolOutcomeStatus::FailedPermanent
+                        },
+                    ),
+                    transport_error: Some(error.to_string()),
+                    invocation_stage: if error
+                        .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()
+                        .is_some()
+                    {
+                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch
+                    } else {
+                        crate::traits::ToolInvocationStage::Dispatched
+                    },
+                    ..crate::traits::ToolCallMetadata::default()
+                };
+                if let Some(prepared) = prepared {
+                    metadata.receipt_kind = prepared.receipt_kind;
+                    metadata.access_manifest = Some(prepared.access_manifest);
+                }
+                crate::agent::tool_execution::complete_tool_result_semantics(
+                    &request.name,
+                    arguments,
+                    &call_semantics,
+                    &mut metadata,
+                );
+                let error_text = format!("Error: {error}");
+                ExecutedOutcome::Raised {
+                    metadata,
+                    error_text,
+                }
+            }
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let failed = executed.failed();
+        let trust =
+            self.call_output_trust(scope, &request.name, arguments, Some(executed.metadata()));
+        // The first untrusted read records the turn as tainted at once, so a
+        // run that never finishes still taints later turns that see it.
+        if trust == sdk::SourceTrust::Untrusted {
+            self.read_untrusted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if trust == sdk::SourceTrust::Untrusted
+            && !scope
+                .untrusted_seen
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Err(error) = crate::agent::untrusted::record_tainted_turn(
+                self.state.as_ref(),
+                scope.session_id,
+                scope.turn_id,
+            )
+            .await
+            {
+                warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
+            }
+        }
+        scope.executed_calls.insert(
+            request.run_id,
+            &request.call_id,
+            ExecutedCall {
+                request: KernelCall {
+                    run_id: request.run_id,
+                    name: request.name.clone(),
+                    arguments: request.arguments.clone(),
+                    call_id: request.call_id.clone(),
+                },
+                arguments: arguments.to_string(),
+                injected_dir: injected_dir.map(str::to_string),
+                facts,
+                grant,
+                idempotency_key,
+                send_file_key,
+                duration_ms,
+                trust,
+                executed,
+            },
+        );
+        // The result itself is written by the after-tool hook
+        // (`AfterCallRecord`), which replaces this text.
+        sdk::ToolOutput {
+            is_error: failed,
+            ..sdk::ToolOutput::text(RESULT_PENDING)
+        }
+        .with_trust(trust)
+    }
+
+    /// What happens after a call returned, run from the kernel's `after_tool`
+    /// hook: the result is fitted for the model, the receipt, status line and
+    /// learning are written, and the kernel gets what the model will read.
+    pub(super) async fn finish_sdk_tool_call(&self, scope: &TurnScope<'_>, check: AfterCallCheck) {
+        let Some(call) = scope.executed_calls.take(check.run_id, &check.call_id) else {
+            let _ = check.reply.send(None);
+            return;
+        };
+        let output = self.record_sdk_tool_result(scope, call).await;
+        let _ = check.reply.send(Some(output));
+    }
+
+    async fn record_sdk_tool_result(
+        &self,
+        scope: &TurnScope<'_>,
+        call: ExecutedCall,
+    ) -> sdk::ToolOutput {
+        let ExecutedCall {
+            request,
+            arguments,
+            injected_dir,
+            facts,
+            grant,
+            idempotency_key,
+            send_file_key,
+            duration_ms,
+            trust,
+            executed,
+        } = call;
+        let arguments = arguments.as_str();
+        let injected_dir = injected_dir.as_deref();
+        let request = &request;
+        let (output, images, metadata, receipt, finish) = match executed {
+            ExecutedOutcome::Returned {
+                mut outcome,
+                status,
+            } => {
                 let evidence =
                     crate::agent::loop_utils::tool_outcome_evidence_source(&outcome.metadata);
                 // What the model sees: untrusted output wrapped, oversized
@@ -1079,45 +1290,10 @@ impl Agent {
                     finish,
                 )
             }
-            Err(error) => {
-                // A tool that returns `Err` made an explicit typed failure: it
-                // gets a `FailedPermanent` receipt, so the run ledger and the task outcome see it.
-                let prepared = self.turn_tool(scope, &request.name).and_then(|tool| {
-                    crate::traits::prepare_invocation(tool.as_ref(), arguments).ok()
-                });
-                let mut metadata = crate::traits::ToolCallMetadata {
-                    outcome_status: Some(
-                        if error
-                            .downcast_ref::<crate::traits::NothingSentError>()
-                            .is_some()
-                        {
-                            crate::traits::ToolOutcomeStatus::FailedRetryable
-                        } else {
-                            crate::traits::ToolOutcomeStatus::FailedPermanent
-                        },
-                    ),
-                    transport_error: Some(error.to_string()),
-                    invocation_stage: if error
-                        .downcast_ref::<crate::agent::tool_exec::UnknownToolError>()
-                        .is_some()
-                    {
-                        crate::traits::ToolInvocationStage::RejectedBeforeDispatch
-                    } else {
-                        crate::traits::ToolInvocationStage::Dispatched
-                    },
-                    ..crate::traits::ToolCallMetadata::default()
-                };
-                if let Some(prepared) = prepared {
-                    metadata.receipt_kind = prepared.receipt_kind;
-                    metadata.access_manifest = Some(prepared.access_manifest);
-                }
-                crate::agent::tool_execution::complete_tool_result_semantics(
-                    &request.name,
-                    arguments,
-                    &call_semantics,
-                    &mut metadata,
-                );
-                let error_text = format!("Error: {error}");
+            ExecutedOutcome::Raised {
+                mut metadata,
+                error_text,
+            } => {
                 // Oversized errors (cli_agent process output, stack traces)
                 // are capped like results.
                 let fitted = self
@@ -1169,7 +1345,6 @@ impl Agent {
             .as_ref()
             .map(|receipt| receipt.outcome_status.is_failure() || receipt.contract_rejected)
             .unwrap_or(true);
-        let duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(mut latest) = scope.latest_tool_output.lock() {
             *latest = Some(output.clone());
         }
@@ -1308,28 +1483,6 @@ impl Agent {
             duration_ms,
             "SDK engine tool call"
         );
-        let trust = self.call_output_trust(scope, &request.name, arguments, metadata.as_ref());
-        // The first untrusted read records the turn as tainted at once, so a
-        // run that never finishes still taints later turns that see it.
-        if trust == sdk::SourceTrust::Untrusted {
-            self.read_untrusted
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if trust == sdk::SourceTrust::Untrusted
-            && !scope
-                .untrusted_seen
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            if let Err(error) = crate::agent::untrusted::record_tainted_turn(
-                self.state.as_ref(),
-                scope.session_id,
-                scope.turn_id,
-            )
-            .await
-            {
-                warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
-            }
-        }
         let output = sdk::ToolOutput {
             is_error: failed,
             ..sdk::ToolOutput::text(model_view).with_images(images)

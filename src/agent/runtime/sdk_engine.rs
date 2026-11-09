@@ -315,6 +315,7 @@ enum KernelNotice {
 
 pub(super) enum DaemonCall {
     Tool(ToolRequest),
+    AfterCall(AfterCallCheck),
     Gate(GateRequest),
     Model(ModelCall),
     Stop(StopCheck),
@@ -501,6 +502,14 @@ pub(super) struct KernelCall {
     call_id: String,
 }
 
+/// A dispatched call came back to the kernel; record it.
+pub(super) struct AfterCallCheck {
+    run_id: sdk::RunId,
+    call_id: String,
+    /// What the model reads; `None` when the dispatcher ran no such call.
+    reply: oneshot::Sender<Option<sdk::ToolOutput>>,
+}
+
 /// One tool call handed from the SDK run to the daemon dispatcher.
 pub(super) struct ToolRequest {
     call: KernelCall,
@@ -650,6 +659,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// What the dispatcher's gates decided for each call, by run and call
     /// id (`DispatchGate`); execution takes a cleared call's grant here.
     gate_outcomes: tool_calls::GateOutcomes,
+    /// Calls that ran and wait for the after-tool hook to record them.
+    executed_calls: tool_calls::ExecutedCalls,
     /// The run's declines as the kernel last showed them to the approval
     /// rules: a child spawned from this turn starts with them.
     run_declines: super::approvals::RunDeclines,
@@ -1262,6 +1273,9 @@ impl Agent {
             dispatch: DispatchGate {
                 calls: calls_tx.clone(),
             },
+            after_call: AfterCallRecord {
+                calls: calls_tx.clone(),
+            },
         };
         for (_, hook) in hooks.chain() {
             builder = builder.hook_arc(hook);
@@ -1449,6 +1463,7 @@ impl Agent {
             judged_terminal_calls,
             canonical_calls,
             gate_outcomes: Default::default(),
+            executed_calls: Default::default(),
             run_declines,
             shared_declines,
             project_scope,
@@ -1579,6 +1594,9 @@ impl Agent {
                 Some(call) = calls_rx.recv() => match call {
                     DaemonCall::Tool(request) => {
                         in_flight.push(self.dispatch_sdk_tool_call(&scope, request).boxed());
+                    }
+                    DaemonCall::AfterCall(check) => {
+                        in_flight.push(self.finish_sdk_tool_call(&scope, check).boxed());
                     }
                     DaemonCall::Gate(request) => {
                         in_flight.push(self.serve_sdk_gate(&scope, request).boxed());

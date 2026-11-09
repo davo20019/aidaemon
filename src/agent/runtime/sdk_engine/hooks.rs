@@ -88,6 +88,7 @@ pub(super) fn read_only_tool_names<'a>(
 /// Where a hook sits in the turn's `before_tool` chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HookSlot {
+    AfterCall,
     Canonical,
     Authority,
     SameToolLimit,
@@ -133,11 +134,13 @@ pub(super) struct TurnHooks {
     pub(super) untrusted: sdk::UntrustedHook,
     pub(super) approval: aidaemon_policies::ApprovalPolicy,
     pub(super) dispatch: DispatchGate,
+    pub(super) after_call: AfterCallRecord,
 }
 
 impl TurnHooks {
     pub(super) fn chain(self) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
         let mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)> = vec![
+            (HookSlot::AfterCall, Arc::new(self.after_call)),
             (HookSlot::Canonical, Arc::new(self.canonical)),
             (HookSlot::Authority, Arc::new(self.authority)),
             (HookSlot::SameToolLimit, Arc::new(self.same_tool)),
@@ -384,6 +387,46 @@ impl sdk::Hook for DispatchGate {
             return stopped();
         }
         answer.await.unwrap_or_else(|_| stopped())
+    }
+}
+
+/// Records a call the dispatcher ran: result fitting, receipt, status line,
+/// learning and the checklist, on the turn's own task. It runs first among
+/// the after-tool hooks, so the others see what the model will read.
+pub(super) struct AfterCallRecord {
+    pub(super) calls: mpsc::Sender<DaemonCall>,
+}
+
+#[async_trait]
+impl sdk::Hook for AfterCallRecord {
+    fn timeout(&self) -> Option<std::time::Duration> {
+        Some(super::TOOL_TIMEOUT)
+    }
+
+    async fn after_tool(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        receipt: &sdk::Receipt,
+        output: &mut sdk::ToolOutput,
+    ) {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .calls
+            .send(DaemonCall::AfterCall(AfterCallCheck {
+                run_id: ctx.run_id,
+                call_id: receipt.call_id.clone(),
+                reply,
+            }))
+            .await;
+        match (sent, answer.await) {
+            (Ok(()), Ok(None)) => {}
+            (Ok(()), Ok(Some(recorded))) => *output = recorded,
+            _ => {
+                *output = sdk::ToolOutput::error(
+                    "the tool dispatcher stopped before recording this result",
+                );
+            }
+        }
     }
 }
 

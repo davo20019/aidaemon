@@ -1208,6 +1208,8 @@ impl<'a> Driver<'a> {
                 }
             }
         }
+        // A hook may have rewritten the result; the limit still holds.
+        output.content = truncate_middle(&output.content, self.agent.limits.max_tool_output_chars);
         self.state.messages.push(
             Message::tool_result(receipt.call_id.clone(), output.content.clone())
                 .with_images(output.images.iter().cloned())

@@ -316,9 +316,12 @@ Order:
       - `cb89795`: a call typed `FailedPermanent` never hands the run off.
       - `c4df424`: the closeout counts the turn's MCP tools as reachable.
       Remaining:
-      - after-call bookkeeping (result fitting, receipts, status line,
-        learning, taint) still runs inside the bridged tool's dispatch; it
-        needs daemon metadata the kernel does not carry;
+      - Done 2026-11-09: after-call bookkeeping (result fitting, receipts,
+        status line, learning, checklist) runs from the kernel's `after_tool`
+        hook (`AfterCallRecord`, first in the chain), on the turn's task. The
+        call step still classifies the outcome and marks taint: the kernel's
+        receipt is built before `after_tool`, and a later call in the same
+        batch must already see the turn as tainted;
       - Done 2026-11-09: the daemon `Tool` trait, `KernelTool` and
         `BridgedTool` are gone. Every daemon tool is an
         `aidaemon_tools::OutcomeTool` with one `execute(arguments, facts)`

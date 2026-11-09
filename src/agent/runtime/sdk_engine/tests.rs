@@ -3755,12 +3755,16 @@ fn hook_order_is_pinned() {
         dispatch: DispatchGate {
             calls: calls.clone(),
         },
+        after_call: AfterCallRecord {
+            calls: calls.clone(),
+        },
     };
     let chain = hooks.chain();
     let slots: Vec<HookSlot> = chain.iter().map(|(slot, _)| *slot).collect();
     assert_eq!(
         slots,
         [
+            HookSlot::AfterCall,
             HookSlot::Canonical,
             HookSlot::Authority,
             HookSlot::SameToolLimit,
