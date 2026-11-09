@@ -893,10 +893,17 @@ async fn recent_tool_turns(
     .fetch_all(pool)
     .await?;
     let mut recent = Vec::new();
+    // Messages merged into one turn share its id; the turn is listed once.
+    let mut listed = std::collections::HashSet::new();
     for (turns_ago, row) in rows.iter().enumerate().skip(1) {
         let turn_id: String = row.get("turn_id");
-        let names = sqlx::query(
-            "SELECT json_extract(data, '$.name') AS name FROM events
+        if !listed.insert(turn_id.clone()) {
+            continue;
+        }
+        let results = sqlx::query(
+            "SELECT json_extract(data, '$.name') AS name,
+                    json_extract(data, '$.receipt.invocation_stage') AS stage
+             FROM events
              WHERE session_id = ? AND turn_id = ? AND event_type = 'tool_result'
              ORDER BY id ASC",
         )
@@ -905,20 +912,28 @@ async fn recent_tool_turns(
         .fetch_all(pool)
         .await?;
         let mut tools: Vec<(String, usize)> = Vec::new();
-        for name in names {
-            let Some(name) = name.get::<Option<String>, _>("name") else {
+        let mut refused: Vec<(String, usize)> = Vec::new();
+        for result in results {
+            let Some(name) = result.get::<Option<String>, _>("name") else {
                 continue;
             };
-            match tools.iter_mut().find(|(known, _)| *known == name) {
+            let stage = result.get::<Option<String>, _>("stage");
+            let counts = if stage.as_deref() == Some("rejected_before_dispatch") {
+                &mut refused
+            } else {
+                &mut tools
+            };
+            match counts.iter_mut().find(|(known, _)| *known == name) {
                 Some((_, count)) => *count += 1,
-                None => tools.push((name, 1)),
+                None => counts.push((name, 1)),
             }
         }
-        if !tools.is_empty() {
+        if !tools.is_empty() || !refused.is_empty() {
             recent.push(RecentToolTurn {
                 turn_id,
                 turns_ago,
                 tools,
+                refused,
             });
         }
     }

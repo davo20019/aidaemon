@@ -345,6 +345,9 @@ pub struct RecentToolTurn {
     pub turns_ago: usize,
     /// Tool name and how many calls of it completed, in first-use order.
     pub tools: Vec<(String, usize)>,
+    /// Tool name and how many calls of it were refused before running, in
+    /// first-use order.
+    pub refused: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize)]

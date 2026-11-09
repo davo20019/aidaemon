@@ -939,6 +939,23 @@ fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.chars().any(|c| letters.contains(&c))
 }
 
+/// `date` only reads the clock with display flags and at most one `+format`.
+/// Any other positional is a new time to set, on BSD and GNU alike.
+fn date_args_observe(args: &[String]) -> bool {
+    let is_format = |arg: &String| arg.starts_with('+');
+    args.iter().filter(|arg| is_format(arg)).count() <= 1
+        && args.iter().all(|arg| {
+            is_format(arg)
+                || matches!(
+                    arg.as_str(),
+                    "-u" | "--utc" | "--universal" | "-R" | "--rfc-email"
+                )
+                || arg.starts_with("-I")
+                || arg == "--iso-8601"
+                || arg.starts_with("--iso-8601=")
+        })
+}
+
 fn observation_args_ok(program: &str, args: &[String]) -> bool {
     let any = |pred: &dyn Fn(&str) -> bool| args.iter().any(|arg| pred(arg));
     match program {
@@ -964,7 +981,7 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
                 < 2
         }
         "tree" => tree_args_ok(args),
-        "date" => args.is_empty() || (args.len() == 1 && args[0].starts_with('+')),
+        "date" => date_args_observe(args),
         "hostname" => args.is_empty(),
         "file" => !any(&|a| {
             a == "--compile" || a.starts_with("--magic-file") || short_cluster_has(a, &['C', 'm'])
@@ -2953,6 +2970,12 @@ mod tests {
             "git branch",
             "find . -name '*.rs'",
             "date +%Y",
+            "date -u",
+            "date -u +%H:%M",
+            "date --utc",
+            "date -R",
+            "date -Iseconds",
+            "date --iso-8601=seconds",
             "tree -a -L 2",
             "uniq -c f",
             "date",
@@ -3015,6 +3038,12 @@ mod tests {
             "cat </dev/tcp/example.invalid/80",
             "cat < f",
             "date -s 2020-01-01",
+            "date -u -s 2020-01-01",
+            "date -u 010112002020",
+            "date 010112002020",
+            "date +%Y 010112002020",
+            "date +%Y +%m",
+            "date -us 2020-01-01",
             "hostname evil",
             "file -C -m m",
             "sed -n p f",

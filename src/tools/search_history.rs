@@ -607,28 +607,41 @@ impl crate::traits::ToolSemantics for SearchHistoryTool {
         if turns.is_empty() {
             return None;
         }
+        let counted = |calls: &[(String, usize)]| {
+            calls
+                .iter()
+                .map(|(tool, count)| format!("{tool} x{count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let lines = turns
             .iter()
             .map(|turn| {
-                let tools = turn
-                    .tools
-                    .iter()
-                    .map(|(tool, count)| format!("{tool} x{count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 let ago = match turn.turns_ago {
                     1 => "previous turn".to_string(),
                     n => format!("{n} turns ago"),
                 };
-                format!("- {ago} (turn_id={}): {tools}", turn.turn_id)
+                let mut calls = Vec::new();
+                if !turn.tools.is_empty() {
+                    calls.push(counted(&turn.tools));
+                }
+                if !turn.refused.is_empty() {
+                    calls.push(format!(
+                        "refused before running: {}",
+                        counted(&turn.refused)
+                    ));
+                }
+                format!("- {ago} (turn_id={}): {}", turn.turn_id, calls.join("; "))
             })
             .collect::<Vec<_>>()
             .join("\n");
         Some(format!(
-            "Tools ran in these earlier turns of this conversation:\n{lines}\nThe event log records \
-             those calls, so they did run even when the reply was brief. If their output is not in \
-             your transcript and you need it, call search_history with action=open and that \
-             turn_id to read the exact calls and output."
+            "Tool calls from earlier turns of this conversation:\n{lines}\nThe event log records \
+             those calls. The ones not marked refused did run even when the reply was brief. A \
+             refused one was attempted and stopped before it ran, so a reply saying it was \
+             blocked was accurate. If their output is not in your transcript and you need it, \
+             call search_history with action=open and that turn_id to read the exact calls and \
+             output."
         ))
     }
 
@@ -819,6 +832,50 @@ mod tests {
         );
         assert!(!note.contains("synthetic-output-417"), "{note}");
         assert!(!note.contains("t9"), "{note}");
+    }
+
+    /// One tool result stamped with the typed stage its receipt carries.
+    async fn append_tool_result(events: &EventStore, turn: &str, call: &str, stage: &str) {
+        let mut event = Event::new(
+            "root-session",
+            EventType::ToolResult,
+            json!({"tool_call_id": call, "name": "terminal", "result": "", "success": false,
+                   "duration_ms": 0, "receipt": {"invocation_stage": stage}}),
+        );
+        event.turn_id = Some(turn.to_string());
+        events.append(event).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_note_says_a_refused_call_never_ran() {
+        let (tool, events, _db) = tool().await;
+        append_tool_turn(&events, "root-session", "t1", "m1", Some("output")).await;
+        append_tool_result(&events, "t1", "c2", "rejected_before_dispatch").await;
+        append_tool_turn(&events, "root-session", "t2", "m2", None).await;
+        append_tool_result(&events, "t2", "c3", "rejected_before_dispatch").await;
+        append_tool_turn(&events, "root-session", "t3", "m3", None).await;
+
+        let note = tool.session_context_note("root-session").await.unwrap();
+        assert!(
+            note.contains("(turn_id=t1): terminal x1; refused before running: terminal x1"),
+            "{note}"
+        );
+        assert!(
+            note.contains("(turn_id=t2): refused before running: terminal x1"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_note_lists_a_turn_of_merged_messages_once() {
+        let (tool, events, _db) = tool().await;
+        append_tool_turn(&events, "root-session", "t1", "m1", None).await;
+        append_tool_turn(&events, "root-session", "t1", "m2", Some("output")).await;
+        append_tool_turn(&events, "root-session", "t2", "m3", None).await;
+
+        let note = tool.session_context_note("root-session").await.unwrap();
+        assert_eq!(note.matches("turn_id=t1").count(), 1, "{note}");
+        assert!(note.contains("previous turn (turn_id=t1)"), "{note}");
     }
 
     #[tokio::test]
