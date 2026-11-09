@@ -421,14 +421,34 @@ Order:
            of `events/consolidation.rs` (procedures, error solutions,
            expertise, failure patterns, event episodes, the pruner) onto it.
         2. (was 3, below)
-        3. Move the SQLite implementation of the stores
-           (`state/sqlite/{facts,memory,structured_memory,episodes,people,
-           learning}.rs`) into the crate, add the memory half of retention
-           as a store method, and retire the crate's scope-keyed
-           `MemoryStore`, `Fact` and `Episode` (`ScopedMemory` runs on the
-           unified stores).
-        4. Migrate the owner's data, run live N-of-M against the current
-           daemon, then delete the old daemon modules.
+        3. Done 2026-11-09 (`159bee6`, `643a42d`): the SQLite stores are
+           `aidaemon_memory::sqlite::SqliteMemory`, and the crate creates
+           and upgrades the memory tables (`sqlite::migrate`). The state
+           store forwards the memory traits to it. Still open: the memory
+           half of retention as a store method.
+        4. Owner ruling (2026-11-09): people must be able to update and keep
+           their data, and memory must stay replaceable by other open source
+           systems. So:
+           - No data migration for the default backend. The crate owns the
+             same tables in the same database. Schema and row counts matched
+             before and after on a new database, an August install and the
+             live one.
+           - The scope-keyed `MemoryStore` is NOT retired for now. It is the
+             small contract an outside backend can implement.
+           - Replaceable means more than `MemorySystem`, which only covers
+             turn recall and extraction. Today these still go straight to
+             the SQLite stores whichever backend is configured:
+             the tools `manage_memories`, `share_memory`, `manage_people`,
+             `search_history`, `cli_agent` and the memory tool;
+             `agent/memory_plugin/recall.rs`; background work in
+             `memory/{manager,retention,history_source}.rs` and
+             `events/consolidation.rs`. `StateStore` also inherits every
+             memory trait. The crate's own SQL reads the host's `events`
+             table in three places. Next: callers hold the memory stores
+             directly, then the tools and background jobs go through the
+             seam, then an export/import so switching backends keeps data.
+        5. Live N-of-M against the current daemon, then delete what is left
+           of the old daemon modules.
         Not memory, noted on the way: `memory/context_window.rs` now holds
         only token budgeting, which belongs with the policies crate's
         `ContextWindow`; `memory/skill_promotion.rs` belongs to skills.
