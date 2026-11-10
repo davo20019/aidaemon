@@ -647,7 +647,15 @@ impl Tool for SpawnAgentTool {
         };
 
         // LLM-provided task_id takes priority; fall back to the call's task
-        let task_id_ref = args.task_id.or(facts.task_id.clone());
+        let task_id_ref = args.task_id.clone().or(facts.task_id.clone());
+        // The durable task this child works on, if any. A dispatcher call
+        // always carries its turn's own id, which names no durable task, so
+        // a plain child has one only when the caller named it.
+        let durable_task_id = if child_role == Some(AgentRole::Executor) {
+            task_id_ref.clone()
+        } else {
+            args.task_id.clone()
+        };
         let goal_id_ref = facts.goal_id.clone();
 
         // Plain children count against the request's tree. A task lead's
@@ -714,6 +722,7 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
+                    durable_task_id.as_deref(),
                     project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
@@ -748,6 +757,7 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
+                    durable_task_id.as_deref(),
                     project_scope.as_deref(),
                     args.specialist.as_deref(),
                     approval_session_id.as_deref(),
@@ -777,6 +787,7 @@ impl Tool for SpawnAgentTool {
                         child_role,
                         goal_id_ref.as_deref(),
                         task_id_ref.as_deref(),
+                        durable_task_id.as_deref(),
                         project_scope.as_deref(),
                         args.specialist.as_deref(),
                         approval_session_id.as_deref(),
@@ -890,7 +901,7 @@ impl Tool for SpawnAgentTool {
                 let trust = match &result {
                     Ok(run) => run.trust,
                     Err(error)
-                        if task_id_ref.is_none()
+                        if durable_task_id.is_none()
                             && error
                                 .downcast_ref::<ChildTimedOut>()
                                 .is_some_and(|t| !t.report.may_have_changed_something()) =>
@@ -926,7 +937,7 @@ impl Tool for SpawnAgentTool {
                             // The child may have persisted a terminal outcome
                             // before it was stopped — deliver that instead of a
                             // generic timeout failure.
-                            let salvaged = match task_id_ref.as_deref() {
+                            let salvaged = match durable_task_id.as_deref() {
                                 Some(task_id) => {
                                     agent
                                         .salvage_executor_task_outcome(task_id, timeout_secs)
@@ -937,7 +948,7 @@ impl Tool for SpawnAgentTool {
                             // Nothing to salvage: release the executor's claimed
                             // task, as a waited-on executor does.
                             if salvaged.is_none() && child_role == Some(AgentRole::Executor) {
-                                if let Some(task_id) = task_id_ref.as_deref() {
+                                if let Some(task_id) = durable_task_id.as_deref() {
                                     agent
                                         .mark_executor_task_timeout(task_id, timeout_secs)
                                         .await;
@@ -1094,6 +1105,7 @@ impl SpawnAgentTool {
         child_role: Option<AgentRole>,
         goal_id: Option<&str>,
         task_id: Option<&str>,
+        durable_task_id: Option<&str>,
         project_scope: Option<&str>,
         arg_specialist: Option<&str>,
         approval_session_id: Option<&str>,
@@ -1139,7 +1151,7 @@ impl SpawnAgentTool {
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
                 None => Err(anyhow::anyhow!("Specialist failed: {}", error)),
                 Some(timed_out) => {
-                    if let Some(task_id) = task_id {
+                    if let Some(task_id) = durable_task_id {
                         // The child may have persisted a terminal outcome (e.g.
                         // report_blocker) before it was stopped — use that
                         // instead of discarding the work.
@@ -1612,6 +1624,7 @@ mod child_runtime_tests {
         panics: std::sync::atomic::AtomicBool,
         /// Fails before the child begins running.
         fails_in_setup: std::sync::atomic::AtomicBool,
+        salvage_lookups: StdMutex<Vec<String>>,
     }
 
     impl ScriptedChild {
@@ -1626,6 +1639,7 @@ mod child_runtime_tests {
                 timed_out_tasks: StdMutex::new(Vec::new()),
                 panics: std::sync::atomic::AtomicBool::new(false),
                 fails_in_setup: std::sync::atomic::AtomicBool::new(false),
+                salvage_lookups: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -1681,9 +1695,13 @@ mod child_runtime_tests {
         }
         async fn salvage_executor_task_outcome(
             &self,
-            _task_id: &str,
+            task_id: &str,
             _timeout_secs: u64,
         ) -> Option<SalvagedTaskOutcome> {
+            self.salvage_lookups
+                .lock()
+                .unwrap()
+                .push(task_id.to_string());
             None
         }
         async fn mark_executor_task_timeout(&self, task_id: &str, _timeout_secs: u64) {
@@ -1867,6 +1885,75 @@ mod child_runtime_tests {
         })
         .await
         .expect("the record and the task claim are released");
+    }
+
+    fn timed_out_read_only() -> anyhow::Error {
+        ChildTimedOut {
+            limit_secs: 30,
+            report: ChildWorkReport::default(),
+        }
+        .into()
+    }
+
+    fn facts_on_a_turn() -> ToolCallContext {
+        ToolCallContext {
+            task_id: Some("task-turn-synthetic".to_string()),
+            ..facts()
+        }
+    }
+
+    /// The turn's own id says nothing about a plain child: a read-only
+    /// timeout stays trusted, and no durable task is looked up for it.
+    #[tokio::test]
+    async fn a_plain_background_childs_timeout_ignores_the_turns_task_id() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Read", "task": "t", "background": true}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+
+        assert!(!entry.untrusted);
+        assert!(child.salvage_lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plain_foreground_childs_timeout_looks_up_no_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Read", "task": "t"}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .expect_err("a read-only timeout stays retryable");
+
+        assert!(child.salvage_lookups.lock().unwrap().is_empty());
+    }
+
+    /// An executor's task is real, so its timeout is still looked up.
+    #[tokio::test]
+    async fn an_executors_timeout_still_looks_up_its_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        *child.failure.lock().unwrap() = Some(timed_out_read_only());
+        let tool = tool_for(&child);
+        let args =
+            json!({"mission": "Execute", "task": "t", "task_id": "task-synthetic-3"}).to_string();
+
+        tool.call_with_execution_context(&args, None, facts_on_a_turn())
+            .await
+            .expect_err("a read-only timeout stays retryable");
+
+        assert_eq!(
+            *child.salvage_lookups.lock().unwrap(),
+            vec!["task-synthetic-3".to_string()]
+        );
     }
 
     /// Children past the request's running limit are refused, not queued.
