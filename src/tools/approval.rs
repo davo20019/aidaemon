@@ -91,6 +91,9 @@ pub(crate) struct WorkDeadline {
     started: tokio::time::Instant,
     limit: std::time::Duration,
     owner_wait: OwnerWaitClock,
+    /// The clock's total when this deadline started: waits before then do
+    /// not extend it.
+    waited_at_start: std::time::Duration,
 }
 
 impl WorkDeadline {
@@ -98,6 +101,7 @@ impl WorkDeadline {
         Self {
             started: tokio::time::Instant::now(),
             limit,
+            waited_at_start: owner_wait.waited(),
             owner_wait,
         }
     }
@@ -106,12 +110,14 @@ impl WorkDeadline {
         self.limit
     }
 
-    /// Working time left.
+    /// Working time left: time since the start, less the owner waits since
+    /// the start.
     pub(crate) fn remaining(&self) -> std::time::Duration {
-        let worked = self
-            .started
-            .elapsed()
-            .saturating_sub(self.owner_wait.waited());
+        let waited_since_start = self
+            .owner_wait
+            .waited()
+            .saturating_sub(self.waited_at_start);
+        let worked = self.started.elapsed().saturating_sub(waited_since_start);
         self.limit.saturating_sub(worked)
     }
 
@@ -480,6 +486,43 @@ mod tests {
 
     /// A turn killed while its card is open must close the delivered card,
     /// so the channel expires it instead of leaving buttons nothing listens to.
+    /// Waits that ended before a deadline started do not extend it.
+    #[tokio::test(start_paused = true)]
+    async fn earlier_owner_waits_do_not_extend_a_later_deadline() {
+        let clock = OwnerWaitClock::default();
+        OwnerWaitClock::within(Some(clock.clone()), async {
+            let earlier = OwnerWaitClock::begin_waiting();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            drop(earlier);
+            let deadline = WorkDeadline::starting_now(Duration::from_secs(30), clock.clone());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(deadline.remaining(), Duration::from_secs(20));
+            let later = OwnerWaitClock::begin_waiting();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            drop(later);
+            assert_eq!(deadline.remaining(), Duration::from_secs(20));
+            tokio::time::advance(Duration::from_secs(20)).await;
+            assert!(deadline.remaining().is_zero());
+        })
+        .await;
+    }
+
+    /// A wait already open when a deadline starts counts only from then.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_owner_wait_counts_only_after_a_deadline_starts() {
+        let clock = OwnerWaitClock::default();
+        OwnerWaitClock::within(Some(clock.clone()), async {
+            let open = OwnerWaitClock::begin_waiting();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            let deadline = WorkDeadline::starting_now(Duration::from_secs(30), clock.clone());
+            tokio::time::advance(Duration::from_secs(5)).await;
+            drop(open);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(deadline.remaining(), Duration::from_secs(20));
+        })
+        .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn overlapping_owner_waits_count_once() {
         let clock = OwnerWaitClock::default();
