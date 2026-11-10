@@ -862,6 +862,13 @@ impl Tool for SpawnAgentTool {
                             }
                             None => None,
                         };
+                        // Nothing to salvage: release the executor's claimed
+                        // task, as a waited-on executor does.
+                        if salvaged.is_none() && child_role == Some(AgentRole::Executor) {
+                            if let Some(task_id) = task_id_ref.as_deref() {
+                                agent.mark_executor_task_timeout(task_id, timeout_secs).await;
+                            }
+                        }
                         match salvaged {
                             Some(outcome) if outcome.status == "completed" => (
                                 "completed",
@@ -1529,6 +1536,8 @@ mod child_runtime_tests {
         tasks: StdMutex<Vec<String>>,
         failure: StdMutex<Option<anyhow::Error>>,
         cancel: tokio_util::sync::CancellationToken,
+        role: StdMutex<AgentRole>,
+        timed_out_tasks: StdMutex<Vec<String>>,
     }
 
     impl ScriptedChild {
@@ -1539,6 +1548,8 @@ mod child_runtime_tests {
                 tasks: StdMutex::new(Vec::new()),
                 failure: StdMutex::new(None),
                 cancel: tokio_util::sync::CancellationToken::new(),
+                role: StdMutex::new(AgentRole::Orchestrator),
+                timed_out_tasks: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -1552,7 +1563,7 @@ mod child_runtime_tests {
             3
         }
         fn role(&self) -> AgentRole {
-            AgentRole::Orchestrator
+            *self.role.lock().unwrap()
         }
         fn specialist_descriptions(&self) -> Vec<(String, String)> {
             Vec::new()
@@ -1589,7 +1600,12 @@ mod child_runtime_tests {
         ) -> Option<SalvagedTaskOutcome> {
             None
         }
-        async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
+        async fn mark_executor_task_timeout(&self, task_id: &str, _timeout_secs: u64) {
+            self.timed_out_tasks
+                .lock()
+                .unwrap()
+                .push(task_id.to_string());
+        }
         async fn deliver_background_child_result(
             &self,
             _router: Option<&Weak<dyn OutboundRouter>>,
@@ -1683,6 +1699,41 @@ mod child_runtime_tests {
             .expect_err("nothing happened, so a retry is safe");
 
         assert!(error.to_string().contains("timed out after 30 seconds"));
+    }
+
+    /// A background executor that runs out of time releases its task the way
+    /// a waited-on one does.
+    #[tokio::test]
+    async fn a_timed_out_background_executor_releases_its_task() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        *child.failure.lock().unwrap() = Some(
+            ChildTimedOut {
+                limit_secs: 30,
+                report: ChildWorkReport::default(),
+            }
+            .into(),
+        );
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "mission": "Execute",
+            "task": "t",
+            "task_id": "task-synthetic-1",
+            "background": true,
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        wait_for_notification(&store).await;
+
+        assert_eq!(
+            *child.timed_out_tasks.lock().unwrap(),
+            vec!["task-synthetic-1".to_string()]
+        );
     }
 
     /// Children past the request's running limit are refused, not queued.
