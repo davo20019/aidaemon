@@ -367,6 +367,7 @@ enum OptionalToolId {
     NodeHealth,
     NodeSensors,
     NodeAudio,
+    NodeRestart,
     NodeMonitoring,
     #[cfg(feature = "browser")]
     Browser,
@@ -398,6 +399,10 @@ fn optional_enabled_node_audio(config: &AppConfig) -> bool {
     config.nodes.gateway.enabled
         && config.nodes.announcements.enabled
         && config.nodes.speech.enabled
+}
+
+fn optional_enabled_node_restart(config: &AppConfig) -> bool {
+    config.nodes.gateway.enabled
 }
 
 fn optional_enabled_node_monitoring(config: &AppConfig) -> bool {
@@ -446,6 +451,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::NodeAudio,
         name: "send_node_audio",
         enabled_if: optional_enabled_node_audio,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeRestart,
+        name: "node_restart",
+        enabled_if: optional_enabled_node_restart,
     },
     OptionalToolSpec {
         id: OptionalToolId::NodeMonitoring,
@@ -757,6 +767,16 @@ pub async fn register_optional_tools(
                     speech,
                 );
                 tools.push(Arc::new(SendNodeAudioTool::new(announcements)));
+            }
+            OptionalToolId::NodeRestart => {
+                if !config.tools.is_enabled("node_restart") {
+                    continue;
+                }
+                let store = Arc::new(crate::nodes::NodeStore::new(
+                    pool.clone(),
+                    crate::nodes::auth::load_or_create_instance_key()?,
+                ));
+                tools.push(Arc::new(crate::nodes::restart::NodeRestartTool::new(store)));
             }
             OptionalToolId::NodeMonitoring => {
                 if !config.tools.is_enabled("manage_node_monitors") {

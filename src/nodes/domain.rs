@@ -48,6 +48,7 @@ pub enum NodeAction {
     ReceiveDisplayCommand,
     ReceiveActuatorCommand,
     ReceiveOta,
+    DeviceRestart,
 }
 
 impl NodeAction {
@@ -62,6 +63,7 @@ impl NodeAction {
             "receive_display_command" => Self::ReceiveDisplayCommand,
             "receive_actuator_command" => Self::ReceiveActuatorCommand,
             "receive_ota" => Self::ReceiveOta,
+            "device_restart" => Self::DeviceRestart,
             _ => anyhow::bail!("unknown Node action: {value}"),
         })
     }

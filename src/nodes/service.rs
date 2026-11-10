@@ -378,6 +378,7 @@ impl NodeService {
                         | NodeAction::ReportSensor
                         | NodeAction::ReceiveAudio
                         | NodeAction::ReceiveOta
+                        | NodeAction::DeviceRestart
                 ),
                 "child companion policy forbids this action"
             );
@@ -415,8 +416,15 @@ impl NodeService {
             .and_then(|capability| capability.limits.get("sequence"))
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
+        let restart_capable = heartbeat.capabilities.iter().any(|capability| {
+            capability.capability_id == super::restart::RESTART_CAPABILITY
+                && capability.version >= 1
+        });
         let current_firmware_version = heartbeat.firmware_version.clone();
         self.store.record_heartbeat(context, &heartbeat).await?;
+        self.store
+            .advance_device_restart(&context.node_id, &heartbeat.boot_id, heartbeat.uptime_ms)
+            .await?;
         let outbox_poll_seconds = if self.config.announcements.enabled
             && audio_capable
             && self
@@ -445,6 +453,21 @@ impl NodeService {
         } else {
             None
         };
+        // A firmware offer means an update may be running, so the restart
+        // waits; if the offer outlasts the approval, the command expires.
+        let device_restart = if restart_capable
+            && firmware_update.is_none()
+            && self
+                .authorize(context, NodeAction::DeviceRestart)
+                .await
+                .is_ok()
+        {
+            self.store
+                .claim_device_restart(&context.node_id, &heartbeat.boot_id, heartbeat.uptime_ms)
+                .await?
+        } else {
+            None
+        };
         Ok(HeartbeatResponse {
             accepted: true,
             next_heartbeat_seconds: self.config.gateway.heartbeat_interval_seconds,
@@ -453,6 +476,7 @@ impl NodeService {
             outbox_poll_seconds,
             firmware_update,
             gateway_endpoints: self.config.gateway.advertised_endpoints.clone(),
+            device_restart,
         })
     }
 

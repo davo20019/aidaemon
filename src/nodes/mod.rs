@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod monitoring;
 pub mod ota;
 pub mod protocol;
+pub mod restart;
 pub mod service;
 pub mod simulator;
 pub mod speech;

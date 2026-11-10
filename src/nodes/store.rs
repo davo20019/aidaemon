@@ -170,6 +170,7 @@ fn action_name(action: NodeAction) -> &'static str {
         NodeAction::ReceiveDisplayCommand => "receive_display_command",
         NodeAction::ReceiveActuatorCommand => "receive_actuator_command",
         NodeAction::ReceiveOta => "receive_ota",
+        NodeAction::DeviceRestart => "device_restart",
     }
 }
 
@@ -436,6 +437,19 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             detail_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS node_restart_commands (
+            command_id TEXT PRIMARY KEY,
+            node_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            delivered_at TEXT,
+            delivered_boot_id TEXT,
+            delivered_uptime_ms INTEGER,
+            finished_at TEXT
+        )"#,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_node_restart_one_active ON node_restart_commands(node_id) WHERE state IN ('pending', 'delivered')",
         "CREATE INDEX IF NOT EXISTS idx_node_sessions_node_expiry ON node_sessions(node_id, expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_node_outbox_node_cursor ON node_outbox(node_id, cursor)",
         "CREATE INDEX IF NOT EXISTS idx_node_outbound_media_expiry ON node_outbound_media(expires_at, deleted_at)",
