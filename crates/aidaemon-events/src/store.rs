@@ -437,9 +437,20 @@ fn mandate_projection_from_tool_result(
         && evidence.is_some()
         && clean_transport
         && receipt.semantics.mutates_state();
+    // A server that answered with a 4xx refused the request, so the call
+    // changed nothing. Only a response that never arrived, or a 5xx, leaves
+    // the outcome unknown.
+    let http_refused = result.name == "http_request"
+        && receipt.schema_version == crate::ToolReceiptV1::SCHEMA_VERSION
+        && evidence.is_some()
+        && clean_transport
+        && receipt
+            .http_status
+            .is_some_and(|status| (400..500).contains(&status))
+        && receipt.semantics.mutates_state();
     let status = if strict_success {
         "succeeded"
-    } else if explicit_failure {
+    } else if explicit_failure || http_refused {
         "failed"
     } else {
         "ambiguous"
@@ -4013,6 +4024,74 @@ mod tests {
     use crate::{ToolOutcomeEvidenceSource, ToolReceiptV1};
     use chrono::Duration;
     use serde_json::json;
+
+    fn mandate_post_result(http_status: Option<u16>, timed_out: bool) -> ToolResultData {
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
+            semantics: crate::traits::ToolCallSemantics::mutation_with(
+                crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+            ),
+            http_status,
+            timed_out,
+            ..Default::default()
+        };
+        let mut receipt = ToolReceiptV1::from_metadata(
+            &metadata,
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            ToolOutcomeEvidenceSource::ToolReported,
+            None,
+        );
+        receipt.mandate_authority = Some(crate::traits::MandateAuthorityGrant {
+            mandate_id: "mandate-synthetic".to_string(),
+            mandate_version: 1,
+            owner_principal_id: "principal:telegram:synthetic-user-1".to_string(),
+            decision_cycle_id: "cycle-synthetic".to_string(),
+            action_digest: "a".repeat(64),
+            counts_toward_cycle_budget: true,
+            reserved_action_attempt: 1,
+            tool_call_id: Some("call-synthetic".to_string()),
+        });
+        ToolResultData {
+            message_id: None,
+            tool_call_id: "call-synthetic".to_string(),
+            name: "http_request".to_string(),
+            result: String::new(),
+            success: false,
+            duration_ms: 0,
+            error: None,
+            task_id: None,
+            receipt: Some(receipt),
+            ..serde_json::from_value(json!({
+                "tool_call_id": "call-synthetic",
+                "name": "http_request",
+                "result": "",
+                "success": false,
+                "duration_ms": 0
+            }))
+            .unwrap()
+        }
+    }
+
+    /// A 4xx answer is a refusal: the mandate ledger records it as failed,
+    /// not as an outcome that needs checking on the account.
+    #[test]
+    fn a_refused_mandate_post_is_failed_and_an_unanswered_one_stays_ambiguous() {
+        let status = |http_status, timed_out| {
+            mandate_projection_from_tool_result(
+                &mandate_post_result(http_status, timed_out),
+                "2026-11-10T00:00:00Z",
+            )
+            .unwrap()
+            .unwrap()
+            .status
+        };
+        assert_eq!(status(Some(400), false), "failed");
+        assert_eq!(status(Some(403), false), "failed");
+        assert_eq!(status(Some(503), false), "ambiguous");
+        assert_eq!(status(None, true), "ambiguous");
+        assert_eq!(status(Some(400), true), "ambiguous");
+    }
 
     async fn setup_store() -> (EventStore, tempfile::NamedTempFile) {
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
