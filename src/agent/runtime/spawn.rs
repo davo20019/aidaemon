@@ -104,6 +104,8 @@ const NESTED_REPORT_GRACE: Duration = Duration::from_secs(10);
 /// How many entries a stopped child's report lists per section.
 const MAX_REPORTED_ACTIONS: usize = 20;
 const REPORTED_ACTION_CHARS: usize = 160;
+/// How many tool records (calls and results) a stopped child's report reads.
+const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
 
 /// The working time a child gets. A child waited on by its parent must end
 /// inside the parent's own limit, or the parent is stopped first and the
@@ -119,14 +121,51 @@ fn child_time_limit(requested: ChildTimeLimit, parent_remaining: Option<Duration
 }
 
 /// What a stopped child had done, from its typed tool records: every call to
-/// a tool not known to be read-only, finished or not.
+/// a tool not known to be read-only, finished or not. The child's session is
+/// fresh per spawn, so its tool records are its whole run.
 async fn child_work_report(
     event_store: &crate::events::EventStore,
     child_session: &str,
     read_only_tools: &std::collections::HashSet<String>,
 ) -> ChildWorkReport {
-    let events = match event_store.query_recent_events(child_session, 400).await {
-        Ok(events) => events,
+    child_work_report_within(
+        event_store,
+        child_session,
+        read_only_tools,
+        MAX_REPORT_TOOL_RECORDS,
+    )
+    .await
+}
+
+/// Reads at most `max_records` tool records. When the run has more, the
+/// earliest ones were not seen, so the report is `unknown`: it cannot show
+/// that the child only read.
+async fn child_work_report_within(
+    event_store: &crate::events::EventStore,
+    child_session: &str,
+    read_only_tools: &std::collections::HashSet<String>,
+    max_records: usize,
+) -> ChildWorkReport {
+    let (events, saw_whole_run) = match event_store
+        .query_events_by_types(
+            child_session,
+            &[EventType::ToolCall, EventType::ToolResult],
+            max_records.saturating_add(1),
+        )
+        .await
+    {
+        Ok(mut events) => {
+            let saw_whole_run = events.len() <= max_records;
+            events.truncate(max_records);
+            events.sort_by_key(|event| event.id);
+            if !saw_whole_run {
+                warn!(
+                    child_session,
+                    max_records, "A stopped child's tool records exceed the report window"
+                );
+            }
+            (events, saw_whole_run)
+        }
         Err(error) => {
             warn!(child_session, %error, "Could not read a stopped child's tool records");
             return ChildWorkReport {
@@ -141,7 +180,10 @@ async fn child_work_report(
         .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
         .map(|data| (data.tool_call_id, data.success))
         .collect();
-    let mut report = ChildWorkReport::default();
+    let mut report = ChildWorkReport {
+        unknown: !saw_whole_run,
+        ..Default::default()
+    };
     for call in events
         .iter()
         .filter(|event| event.event_type == EventType::ToolCall)
@@ -3255,6 +3297,102 @@ mod tests {
             child_time_limit(requested, Some(Duration::from_secs(5))),
             Duration::from_secs(300)
         );
+    }
+
+    async fn synthetic_event_store() -> crate::events::EventStore {
+        use crate::events::EventStoreForTests;
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let path = db_file.into_temp_path().keep().expect("keep temp db path");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("connect sqlite");
+        crate::events::EventStore::new(pool)
+            .await
+            .expect("init event store")
+    }
+
+    async fn record_tool_call(
+        store: &crate::events::EventStore,
+        session: &str,
+        id: &str,
+        name: &str,
+        finished: bool,
+    ) {
+        store
+            .append(crate::events::Event::new(
+                session,
+                EventType::ToolCall,
+                json!({ "tool_call_id": id, "name": name, "arguments": {} }),
+            ))
+            .await
+            .expect("append tool call");
+        if finished {
+            store
+                .append(crate::events::Event::new(
+                    session,
+                    EventType::ToolResult,
+                    json!({
+                        "tool_call_id": id,
+                        "name": name,
+                        "result": "ok",
+                        "success": true,
+                        "duration_ms": 1,
+                    }),
+                ))
+                .await
+                .expect("append tool result");
+        }
+    }
+
+    /// An early change stays in the report however many read-only calls
+    /// follow it.
+    #[tokio::test]
+    async fn a_stopped_childs_report_covers_its_whole_run() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-1";
+        let read_only: std::collections::HashSet<String> =
+            ["read_file".to_string()].into_iter().collect();
+        record_tool_call(&store, session, "call-write", "write_file", true).await;
+        for n in 0..300 {
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-read-{n}"),
+                "read_file",
+                true,
+            )
+            .await;
+        }
+        let report = child_work_report(&store, session, &read_only).await;
+        assert!(report.may_have_changed_something());
+        assert_eq!(report.changed.len(), 1);
+        assert!(!report.unknown);
+    }
+
+    /// A report that cannot show it saw the run from its first record does
+    /// not claim the child only read.
+    #[tokio::test]
+    async fn a_report_that_cannot_see_the_whole_run_is_unknown() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-2";
+        let read_only: std::collections::HashSet<String> =
+            ["read_file".to_string()].into_iter().collect();
+        for n in 0..6 {
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-read-{n}"),
+                "read_file",
+                true,
+            )
+            .await;
+        }
+        let report = child_work_report_within(&store, session, &read_only, 10).await;
+        assert!(report.unknown);
+        assert!(report.may_have_changed_something());
+        let report = child_work_report_within(&store, session, &read_only, 13).await;
+        assert!(!report.unknown);
+        assert!(!report.may_have_changed_something());
     }
 
     #[test]

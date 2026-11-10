@@ -51,7 +51,8 @@ pub(crate) struct ChildWorkReport {
     pub changed: Vec<String>,
     /// Calls still running when the child was stopped.
     pub unfinished: Vec<String>,
-    /// The records could not be read, so nothing is known.
+    /// The records could not be read in full (unreadable, or more than the
+    /// report reads), so the lists may be missing actions.
     pub unknown: bool,
 }
 
@@ -93,7 +94,7 @@ impl ChildTimedOut {
             self.limit_secs
         );
         if self.report.unknown {
-            text.push_str("\n\nIts action records could not be read.");
+            text.push_str("\n\nIts action records could not be read in full.");
         }
         if !self.report.changed.is_empty() {
             text.push_str("\n\nActions it completed:");
