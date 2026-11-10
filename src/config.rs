@@ -2712,6 +2712,16 @@ pub struct SubagentsConfig {
     /// Plain sub-agents one request may start in total, across its whole tree.
     #[serde(default = "default_subagents_max_per_request")]
     pub max_per_request: usize,
+    /// Track what the agents of one request read and change, refuse writes
+    /// made from a stale view, and let children ask the top-level agent.
+    #[serde(default = "default_subagents_coordination")]
+    pub coordination: bool,
+    /// Questions one child may put to the top-level agent itself.
+    #[serde(default = "default_subagents_max_escalations_per_child")]
+    pub max_escalations_per_child: usize,
+    /// Escalations of any kind one request may make.
+    #[serde(default = "default_subagents_max_escalations_per_request")]
+    pub max_escalations_per_request: usize,
     /// Optional directory of user-override specialist `.md` files.
     /// Default: `~/.aidaemon/specialists/` (resolved at construction time if absent).
     #[serde(default)]
@@ -2754,6 +2764,9 @@ impl Default for SubagentsConfig {
             task_token_budget: default_task_token_budget(),
             max_concurrent: default_subagents_max_concurrent(),
             max_per_request: default_subagents_max_per_request(),
+            coordination: default_subagents_coordination(),
+            max_escalations_per_child: default_subagents_max_escalations_per_child(),
+            max_escalations_per_request: default_subagents_max_escalations_per_request(),
             specialists_override_dir: None,
         }
     }
@@ -2768,6 +2781,15 @@ fn default_subagents_max_concurrent() -> usize {
 }
 fn default_subagents_max_per_request() -> usize {
     DEFAULT_SUBAGENTS_MAX_PER_REQUEST
+}
+fn default_subagents_coordination() -> bool {
+    true
+}
+fn default_subagents_max_escalations_per_child() -> usize {
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD
+}
+fn default_subagents_max_escalations_per_request() -> usize {
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST
 }
 fn default_subagents_enabled() -> bool {
     true

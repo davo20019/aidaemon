@@ -867,4 +867,98 @@ mod coordination_tests {
             "{names:?}"
         );
     }
+
+    /// Two writers touched one file and the root never looked again: it is
+    /// asked once to check, and its read closes the demand.
+    #[tokio::test]
+    async fn a_file_with_two_writers_is_checked_before_the_root_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            write_call(p, "one\n"),
+            MockProvider::text_response("A done."),
+            read_call(p),
+            write_call(p, "two\n"),
+            MockProvider::text_response("B done."),
+            // The root tries to finish, is asked to check, reads, finishes.
+            MockProvider::text_response("All finished."),
+            read_call(p),
+            MockProvider::text_response("Checked and finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        let reply = turn(&mut harness, &family, ROOT_SESSION).await;
+        assert_eq!(reply, "Checked and finished.");
+        assert_eq!(
+            family.coordination().unverified_shared_files(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A root that already read the shared file after the last write is not
+    /// asked again.
+    #[tokio::test]
+    async fn a_root_that_already_looked_is_not_asked_to_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            write_call(p, "one\n"),
+            MockProvider::text_response("A done."),
+            read_call(p),
+            write_call(p, "two\n"),
+            MockProvider::text_response("B done."),
+            read_call(p),
+            MockProvider::text_response("Finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        let reply = turn(&mut harness, &family, ROOT_SESSION).await;
+        assert_eq!(reply, "Finished.");
+        assert_eq!(harness.provider.call_log.lock().await.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_shell_call_by_the_root_counts_as_checking() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness_with_shell(vec![
+            write_call(p, "one\n"),
+            MockProvider::text_response("A done."),
+            read_call(p),
+            write_call(p, "two\n"),
+            MockProvider::text_response("B done."),
+            MockProvider::tool_call_response("synthetic_shell", r#"{"command":"run the tests"}"#),
+            MockProvider::text_response("Finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        assert_eq!(turn(&mut harness, &family, ROOT_SESSION).await, "Finished.");
+    }
 }

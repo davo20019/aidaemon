@@ -352,6 +352,9 @@ health_port = 8080
 # max_response_chars = 8000
 # max_concurrent = 4         # plain sub-agents one request may run at once
 # max_per_request = 12       # plain sub-agents one request may start in total
+# coordination = true        # refuse stale file writes across one request's agents; false restores last-writer-wins
+# max_escalations_per_child = 3    # questions a child may put to the top-level agent itself
+# max_escalations_per_request = 12 # escalations of any kind in one request
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
 # [files]

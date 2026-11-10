@@ -142,6 +142,10 @@ struct TrackedFile {
     /// What each member last saw, by session.
     baselines: HashMap<String, FileState>,
     writers: BTreeSet<String>,
+    /// [`Ledger::clock`] at the last write and at the top-level agent's last
+    /// read or shell call.
+    last_write_at: u64,
+    verified_at: u64,
 }
 
 #[derive(Debug)]
@@ -163,6 +167,8 @@ struct Ledger {
     root: Option<RootFacts>,
     escalations: usize,
     voluntary: HashMap<String, usize>,
+    /// Advances with every write the ledger records.
+    clock: u64,
     roster_version: u64,
     /// What each coordinating member has been told: roster version and log
     /// length.
@@ -323,6 +329,24 @@ impl Coordination {
         Some(note)
     }
 
+    /// For a background child's completion, when its parent may be gone: the
+    /// files more than one member changed.
+    pub(crate) fn shared_files_note(&self) -> Option<String> {
+        let shared: Vec<String> = self
+            .ledger()
+            .files
+            .iter()
+            .filter(|(_, file)| file.writers.len() >= 2)
+            .map(|(path, _)| path.clone())
+            .collect();
+        (!shared.is_empty()).then(|| {
+            format!(
+                "\n\nMore than one agent changed: {}. Check the combined result.",
+                shared.join(", ")
+            )
+        })
+    }
+
     /// What the coordinator should read at the end of `session`'s result.
     pub(crate) fn result_trailer(&self, session: &str) -> Option<String> {
         let lines: Vec<String> = self
@@ -335,6 +359,27 @@ impl Coordination {
         (!lines.is_empty()).then(|| format!("\n\nCoordination:\n{}", lines.join("\n")))
     }
 
+    /// Files changed by two or more members that the top-level agent has
+    /// not read or run a command after the last such change.
+    pub(crate) fn unverified_shared_files(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .ledger()
+            .files
+            .iter()
+            .filter(|(_, file)| file.writers.len() >= 2 && file.last_write_at > file.verified_at)
+            .map(|(path, _)| path.clone())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    pub(crate) fn is_root(&self, session: &str) -> bool {
+        self.ledger()
+            .root
+            .as_ref()
+            .is_some_and(|root| root.session == session)
+    }
+
     pub(crate) fn roster(&self) -> Vec<Member> {
         self.ledger().roster.clone()
     }
@@ -344,14 +389,23 @@ impl Coordination {
         let state = file_state(Some(bytes));
         let mut ledger = self.ledger();
         ledger.retain(state, bytes);
+        let is_root = ledger
+            .root
+            .as_ref()
+            .is_some_and(|root| root.session == member);
+        let clock = ledger.clock;
         let file = ledger.files.entry(path.to_string()).or_default();
         if file.baselines.is_empty() && file.last_writer.is_none() {
             file.known = state;
         }
         file.baselines.insert(member.to_string(), state);
+        if is_root {
+            file.verified_at = clock;
+        }
     }
 
     /// What `member` last saw of `path`, if it has seen it.
+    #[cfg(test)]
     pub(crate) fn baseline(&self, member: &str, path: &str) -> Option<FileState> {
         self.ledger()
             .files
@@ -433,7 +487,10 @@ impl Coordination {
         if let Some(bytes) = bytes {
             ledger.retain(state, bytes);
         }
+        ledger.clock += 1;
+        let clock = ledger.clock;
         let file = ledger.files.entry(path.to_string()).or_default();
+        file.last_write_at = clock;
         file.known = state;
         file.last_writer = Some(Writer::Member(member.to_string()));
         file.baselines.insert(member.to_string(), state);
@@ -505,9 +562,12 @@ impl Coordination {
             if let Some(bytes) = bytes.as_deref() {
                 ledger.retain(state, bytes);
             }
+            ledger.clock += 1;
+            let clock = ledger.clock;
             let Some(file) = ledger.files.get_mut(&path) else {
                 continue;
             };
+            file.last_write_at = clock;
             file.known = state;
             file.last_writer = Some(if overlapped {
                 Writer::OverlappingShells
@@ -516,12 +576,24 @@ impl Coordination {
             });
             file.writers.insert(member.to_string());
         }
+        // A command the top-level agent ran is how it checks the whole.
+        if ledger
+            .root
+            .as_ref()
+            .is_some_and(|root| root.session == member)
+        {
+            let clock = ledger.clock;
+            for file in ledger.files.values_mut() {
+                file.verified_at = clock;
+            }
+        }
     }
 
     pub(crate) fn log(&self, entry: LogEntry) {
         self.ledger().log.push(entry);
     }
 
+    #[cfg(test)]
     pub(crate) fn log_entries(&self) -> Vec<LogEntry> {
         self.ledger().log.clone()
     }
@@ -1655,6 +1727,25 @@ mod tests {
         let trailer = c.result_trailer("a").unwrap();
         assert!(trailer.contains("/w/a") && !trailer.contains("/w/b"));
         assert_eq!(c.result_trailer("c"), None);
+    }
+
+    #[test]
+    fn a_file_needs_two_writers_and_no_later_look_to_be_unverified() {
+        let c = Coordination::default();
+        c.bind_root("root", "request", "turn");
+        c.commit_write("a", "/w/f", Some(b"1"));
+        assert!(c.unverified_shared_files().is_empty());
+        c.commit_write("b", "/w/f", Some(b"2"));
+        assert_eq!(c.unverified_shared_files(), vec!["/w/f".to_string()]);
+        assert!(c.shared_files_note().unwrap().contains("/w/f"));
+        c.record_read("root", "/w/f", b"2");
+        assert!(c.unverified_shared_files().is_empty());
+        c.commit_write("a", "/w/f", Some(b"3"));
+        assert_eq!(
+            c.unverified_shared_files().len(),
+            1,
+            "a later write reopens it"
+        );
     }
 
     #[test]

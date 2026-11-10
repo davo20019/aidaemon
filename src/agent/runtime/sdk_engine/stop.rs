@@ -171,6 +171,9 @@ impl Agent {
             decision = self.sdk_gui_click_check(scope).await;
         }
         if decision == sdk::StopDecision::Accept {
+            decision = self.sdk_combined_verification_check(scope).await;
+        }
+        if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text).await;
         }
         let _ = check.reply.send(decision);
@@ -214,6 +217,41 @@ impl Agent {
     #[cfg(not(feature = "computer_use"))]
     pub(super) async fn sdk_gui_click_check(&self, _scope: &TurnScope<'_>) -> sdk::StopDecision {
         sdk::StopDecision::Accept
+    }
+
+    /// A file more than one agent changed is checked once before the
+    /// top-level agent reports: a read or command after the last change,
+    /// recorded by the tree, closes it. Children are asked nothing.
+    pub(super) async fn sdk_combined_verification_check(
+        &self,
+        scope: &TurnScope<'_>,
+    ) -> sdk::StopDecision {
+        use crate::agent::closeout::{StopDemand, StopDemandVerdict};
+        let Some(coordination) = scope.spawn_family.active_coordination() else {
+            return sdk::StopDecision::Accept;
+        };
+        if !coordination.is_root(scope.session_id) {
+            return sdk::StopDecision::Accept;
+        }
+        let shared = coordination.unverified_shared_files();
+        if shared.is_empty() {
+            return sdk::StopDecision::Accept;
+        }
+        let demand = StopDemand::CombinedVerification;
+        let used = scope.combined_verification_demands.load(Ordering::Relaxed);
+        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+            return sdk::StopDecision::Accept;
+        }
+        scope
+            .combined_verification_demands
+            .fetch_add(1, Ordering::Relaxed);
+        sdk::StopDecision::Continue {
+            message: format!(
+                "More than one agent changed these files: {}. Read them or run a check on the \
+                 combined result before you report.",
+                shared.join(", ")
+            ),
+        }
     }
 
     /// A mandate task lead's prose is never its decision: a missing typed

@@ -920,6 +920,12 @@ impl Tool for SpawnAgentTool {
                             max_response_chars,
                         );
                         message.push_str(&coordination_trailer(tree_for_bg.as_ref(), &run.session));
+                        if let Some(note) = tree_for_bg
+                            .as_ref()
+                            .and_then(|family| family.coordination().shared_files_note())
+                        {
+                            message.push_str(&note);
+                        }
                         (kind, message)
                     }
                     Err(error) => match error.downcast_ref::<ChildTimedOut>() {

@@ -1676,7 +1676,11 @@ impl Agent {
             tools.push(spawn_tool.clone());
         }
         // A plain child in a tree can hand the coordinator a decision.
-        if inherited_authority.spawn_family.is_some() {
+        if inherited_authority
+            .spawn_family
+            .as_ref()
+            .is_some_and(|family| family.coordinates())
+        {
             tools.push(Arc::new(crate::tools::EscalateToParentTool));
         }
 

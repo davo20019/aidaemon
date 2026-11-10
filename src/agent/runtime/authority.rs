@@ -278,6 +278,11 @@ impl SpawnFamily {
         }))
     }
 
+    /// Whether this tree coordinates its members at all.
+    pub(crate) fn coordinates(&self) -> bool {
+        self.0.limits.coordination
+    }
+
     /// The tree's shared knowledge, whether or not it has a child yet.
     pub(crate) fn coordination(&self) -> super::coordination::Coordination {
         self.0.coordination.clone()

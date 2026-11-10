@@ -726,6 +726,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// The goal's effective daily budget after extensions, and their count.
     goal_daily_budget: std::sync::Mutex<Option<i64>>,
     goal_budget_extensions: std::sync::atomic::AtomicU32,
+    /// The one ask to check a file more than one member changed was made.
+    combined_verification_demands: std::sync::atomic::AtomicU32,
     /// Mandate decision correction turns used.
     mandate_commit_retries: std::sync::atomic::AtomicU32,
     /// Verify-before-claim demands for an unverified GUI coordinate click.
@@ -1517,6 +1519,7 @@ impl Agent {
             placed_directives: std::sync::Mutex::new(Vec::new()),
             compaction: std::sync::Mutex::new(None),
             sent_files: std::sync::Mutex::new(HashSet::new()),
+            combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "computer_use")]
             gui_verify_demands: std::sync::atomic::AtomicU32::new(0),

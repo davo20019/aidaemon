@@ -167,6 +167,9 @@ pub(in crate::agent) enum StopDemand {
     /// output, or written to a ledger demand that ended unmet); a rewrite
     /// needs no tool.
     ReplyRepair,
+    /// More than one member of the request's tree changed a file and the
+    /// top-level agent has not looked since; a read or command closes it.
+    CombinedVerification,
 }
 
 /// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
@@ -180,13 +183,14 @@ impl StopDemand {
             Self::MandateDecisionCommit => "mandate_decision_commit_missing",
             Self::GuiClickVerification => "gui_coordinate_click_unverified",
             Self::ReplyRepair => "final_reply_defect",
+            Self::CombinedVerification => "combined_changes_unverified",
         }
     }
 
     /// How many times one run may ask for this demand.
     pub(in crate::agent) fn budget(self) -> u32 {
         match self {
-            Self::MandateDecisionCommit | Self::ReplyRepair => 1,
+            Self::MandateDecisionCommit | Self::ReplyRepair | Self::CombinedVerification => 1,
             Self::GuiClickVerification => 3,
         }
     }
@@ -237,6 +241,7 @@ pub(in crate::agent) fn stop_demand_verdict(
         // read-only, so only a request that forbids tools outright blocks it.
         StopDemand::GuiClickVerification => !authority.forbids_tool_use,
         StopDemand::ReplyRepair => true,
+        StopDemand::CombinedVerification => !authority.forbids_tool_use,
     };
     if !reachable {
         StopDemandVerdict::Unreachable
@@ -336,6 +341,30 @@ mod stop_demand_tests {
             stop_demand_verdict(demand, 0, &open, &["http_request"], read_only, real_rule),
             StopDemandVerdict::Unreachable,
             "an unregistered decision tool cannot be demanded"
+        );
+    }
+
+    #[test]
+    fn combined_verification_is_asked_once_and_never_of_a_run_without_tools() {
+        let open = authority(&[], &[]);
+        let none = |_: &str| None;
+        let never = |_: &str, _: &str| false;
+        let demand = StopDemand::CombinedVerification;
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &open, &[], none, never),
+            StopDemandVerdict::Demand
+        );
+        assert_eq!(
+            stop_demand_verdict(demand, 1, &open, &[], none, never),
+            StopDemandVerdict::Exhausted
+        );
+        let forbidden = ClosingAuthority {
+            forbids_tool_use: true,
+            ..authority(&[], &[])
+        };
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &forbidden, &[], none, never),
+            StopDemandVerdict::Unreachable
         );
     }
 

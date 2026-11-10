@@ -243,7 +243,9 @@ pub async fn run(
         spawn_family: crate::agent::authority::SpawnFamilyLimits {
             max_concurrent: config.subagents.max_concurrent,
             max_total: config.subagents.max_per_request,
-            ..Default::default()
+            coordination: config.subagents.coordination,
+            max_escalations_per_child: config.subagents.max_escalations_per_child,
+            max_escalations_per_request: config.subagents.max_escalations_per_request,
         },
         llm_call_timeout_secs,
         mcp_registry: Some(mcp_registry.clone()),
