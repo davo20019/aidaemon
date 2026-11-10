@@ -278,6 +278,8 @@ impl Coordination {
             member.running = false;
             ledger.roster_version += 1;
         }
+        // A run stopped mid-shell never reports that shell's end.
+        ledger.open_shells.retain(|open| open.member != session);
     }
 
     /// Running siblings whose declared scope overlaps `scope`, with where.
@@ -543,6 +545,11 @@ impl Coordination {
         call_id: &str,
         observed: Vec<(String, Option<Vec<u8>>)>,
     ) {
+        // Hashing every tracked file must not hold the tree's lock.
+        let observed: Vec<(String, FileState, Option<Vec<u8>>)> = observed
+            .into_iter()
+            .map(|(path, bytes)| (path, file_state(bytes.as_deref()), bytes))
+            .collect();
         let mut ledger = self.ledger();
         let overlapped = ledger
             .open_shells
@@ -550,8 +557,7 @@ impl Coordination {
             .position(|open| open.member == member && open.call_id == call_id)
             .map(|at| ledger.open_shells.remove(at).overlapped)
             .unwrap_or(false);
-        for (path, bytes) in observed {
-            let state = file_state(bytes.as_deref());
+        for (path, state, bytes) in observed {
             if ledger
                 .files
                 .get(&path)
@@ -688,7 +694,8 @@ fn changed_range(base: &[u8], current: &[u8]) -> std::ops::Range<usize> {
         .take(longest)
         .take_while(|(a, b)| a == b)
         .count();
-    while suffix > 0 && current[current.len() - suffix] != b'\n' && {
+    // A suffix that is all of `current` already starts at a line start.
+    while suffix > 0 && suffix < current.len() && current[current.len() - suffix] != b'\n' && {
         current[current.len() - suffix - 1] != b'\n'
     } {
         suffix -= 1;
@@ -1366,6 +1373,31 @@ impl sdk::Hook for CoordinationHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sibling that deleted the start of a file leaves content that is an
+    /// exact suffix of what was read.
+    #[test]
+    fn a_change_that_removes_the_start_of_a_file_is_described() {
+        let base = b"line1\nline2\n";
+        let current = b"line2\n";
+        assert_eq!(changed_range(base, current), 0..0);
+        let change = describe_change(Some(base), current);
+        assert!(change.contains("- line1"), "{change}");
+    }
+
+    /// A member that ended mid-shell cannot keep overlapping later shells.
+    #[test]
+    fn a_finished_members_open_shell_stops_overlapping() {
+        let tree = Coordination::new(3, 12);
+        tree.shell_began("specialist:code:a", "call-a");
+        tree.finish_member("specialist:code:a");
+        tree.shell_began("specialist:code:b", "call-b");
+        assert!(tree
+            .ledger()
+            .open_shells
+            .iter()
+            .all(|open| !open.overlapped));
+    }
 
     #[test]
     fn a_read_becomes_that_members_baseline_only() {
