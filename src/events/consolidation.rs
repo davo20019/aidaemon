@@ -239,6 +239,7 @@ impl Consolidator {
             learner = learner.with_embedder(embeddings.clone());
         }
         if let Some(runtime) = &self.llm_runtime {
+            // The side-call gateway picks the model; this value is not sent.
             let model = runtime.snapshot().primary_model();
             let provider = self.side_calls.provider(SideCall::ProcedureEnhancement);
             learner = learner.with_enhancer(ProcedureEnhancer::new(provider, model));

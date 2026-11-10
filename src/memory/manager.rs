@@ -161,7 +161,7 @@ impl MemoryManager {
             return Ok(());
         };
         let snapshot = self.llm_runtime.snapshot();
-        // Background work does not need the strongest model.
+        // The side-call gateway picks the model; this value is not sent.
         let model = snapshot.cheap_model();
         let provider = self.side_calls.provider(SideCall::FactConsolidation);
         let report = aidaemon_memory::consolidation::FactConsolidator::new(provider, model)
@@ -221,7 +221,7 @@ impl MemoryManager {
             .map(|m| m.created_at)
             .unwrap_or_else(Utc::now);
         let snapshot = self.llm_runtime.snapshot();
-        // An episode is a short summary of a finished session: fast-tier work.
+        // The side-call gateway picks the model; this value is not sent.
         let model = snapshot.cheap_model();
         let provider = self.side_calls.provider(SideCall::SessionAnalysis);
         let (episode_id, analysis) =

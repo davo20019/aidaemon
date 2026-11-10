@@ -34,6 +34,7 @@ pub fn spawn_progressive_extraction(
         }
         let provider =
             side_calls.provider(crate::llm_runtime::side_calls::SideCall::ProgressiveExtraction);
+        // The side-call gateway picks the model; `fast_model` is not sent.
         let extractor = extractor(provider, &fast_model);
         let exchange = Exchange {
             user_text: &user_text,

@@ -262,6 +262,7 @@ pub(crate) async fn configured_memory(
                     return ConfiguredMemory::daemons_own();
                 }
             };
+            // The side-call gateway picks the model; this value is not sent.
             let fast_model = llm_runtime
                 .router()
                 .map(|router| router.select(crate::router::Tier::Fast).to_string())
@@ -367,6 +368,7 @@ impl MemoryWrites for DaemonMemoryInner {
         let snapshot = self.llm_runtime.snapshot();
         crate::memory::progressive::spawn_progressive_extraction(
             self.side_calls.clone(),
+            // The side-call gateway picks the model; this value is not sent.
             fast_model(&snapshot, &turn.model),
             self.store.clone(),
             self.event_store.clone(),
@@ -381,8 +383,9 @@ impl MemoryWrites for DaemonMemoryInner {
 
     fn summarize(&self, turn: &MemoryTurn) {
         let snapshot = self.llm_runtime.snapshot();
-        // The fast model writes the summary; the turn's model is the window
-        // the history has to fit.
+        // The side-call gateway picks the summary model; this value only sets
+        // the token-estimate correction. The turn's model is the window the
+        // history has to fit.
         let fast_model = fast_model(&snapshot, &turn.model);
         super::conversation_compaction::compact_after_reply(
             super::conversation_compaction::CompactionTarget {

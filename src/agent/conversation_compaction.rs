@@ -274,6 +274,9 @@ fn compactor(
     tainted_seqs: TaintedSeqs,
 ) -> sdk_policies::Compactor {
     let provider = side_calls.provider(SideCall::Summarization);
+    // The side-call gateway picks the model; `fast_model` is not sent (the
+    // summarizer only logs it). `limits` still uses it for the token-estimate
+    // correction.
     let summarizer = sdk_policies::ProviderSummarizer::new(provider, fast_model)
         .permits(SUMMARY_PERMITS.clone());
     sdk_policies::Compactor::new(
