@@ -2752,6 +2752,9 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
+        // Setup is done: from here the child counts toward its request's
+        // total even if it then fails.
+        crate::agent::authority::mark_child_began();
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
@@ -3417,13 +3420,17 @@ mod tests {
             .await
             .expect("append task end");
         for n in 0..40 {
-            record_tool_call(&store, session, &format!("call-late-{n}"), "read_file", false).await;
+            record_tool_call(
+                &store,
+                session,
+                &format!("call-late-{n}"),
+                "read_file",
+                false,
+            )
+            .await;
         }
         let record = latest_child_task_end(&store, session).await;
-        assert_eq!(
-            resolve_child_outcome(true, &record),
-            TaskOutcome::Succeeded
-        );
+        assert_eq!(resolve_child_outcome(true, &record), TaskOutcome::Succeeded);
     }
 
     #[test]

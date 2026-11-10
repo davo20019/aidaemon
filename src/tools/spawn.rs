@@ -702,8 +702,9 @@ impl Tool for SpawnAgentTool {
         let approval_session_id = facts.session().map(str::to_string);
 
         if !args.background {
-            let result = self
-                .run_sync(
+            let result = crate::agent::authority::within_permit(
+                family_permit.as_ref(),
+                self.run_sync(
                     agent,
                     &effective_mission,
                     &effective_task,
@@ -718,8 +719,9 @@ impl Tool for SpawnAgentTool {
                     approval_session_id.as_deref(),
                     parent_authority.clone(),
                     args.model_tier.map(Into::into),
-                )
-                .await;
+                ),
+            )
+            .await;
             if let Some(ref task_id) = executor_task_id {
                 self.finish_executor_task(task_id).await;
             }
@@ -734,8 +736,9 @@ impl Tool for SpawnAgentTool {
             info!(
                 "Background mode requested but no hub/state notification path is available, falling back to sync"
             );
-            let result = self
-                .run_sync(
+            let result = crate::agent::authority::within_permit(
+                family_permit.as_ref(),
+                self.run_sync(
                     agent,
                     &effective_mission,
                     &effective_task,
@@ -750,8 +753,9 @@ impl Tool for SpawnAgentTool {
                     approval_session_id.as_deref(),
                     parent_authority.clone(),
                     args.model_tier.map(Into::into),
-                )
-                .await;
+                ),
+            )
+            .await;
             if let Some(ref task_id) = executor_task_id {
                 self.finish_executor_task(task_id).await;
             }
@@ -761,8 +765,9 @@ impl Tool for SpawnAgentTool {
             Some(id) if !id.is_empty() => agent.background_delivery_session(id),
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
-                let result = self
-                    .run_sync(
+                let result = crate::agent::authority::within_permit(
+                    family_permit.as_ref(),
+                    self.run_sync(
                         agent,
                         &effective_mission,
                         &effective_task,
@@ -777,8 +782,9 @@ impl Tool for SpawnAgentTool {
                         approval_session_id.as_deref(),
                         parent_authority.clone(),
                         args.model_tier.map(Into::into),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 if let Some(ref task_id) = executor_task_id {
                     self.finish_executor_task(task_id).await;
                 }
@@ -812,7 +818,6 @@ impl Tool for SpawnAgentTool {
 
         tokio::spawn(async move {
             // The slot stays taken until this child has finished.
-            let _family_permit = family_permit;
             let delivery = BackgroundDelivery {
                 agent: agent.as_ref(),
                 hub: hub_for_parent_delivery.as_ref(),
@@ -831,22 +836,25 @@ impl Tool for SpawnAgentTool {
                 // Scoped so that leaving it drops the child's future, which stops
                 // the child.
                 let result: anyhow::Result<ChildAgentRun> = {
-                    let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
-                        mission: mission.clone(),
-                        task: task.clone(),
-                        status_tx: status_tx.clone(),
-                        channel_ctx,
-                        user_role,
-                        child_role,
-                        goal_id: goal_id_ref.clone(),
-                        task_id: task_id_ref.clone(),
-                        project_scope: project_scope.clone(),
-                        specialist: args.specialist.clone(),
-                        approval_session_id: Some(session_id.clone()),
-                        parent_authority: parent_authority.clone(),
-                        time_limit,
-                        model_tier: args.model_tier.map(Into::into),
-                    }),);
+                    let mut result_fut = std::pin::pin!(crate::agent::authority::within_permit(
+                        family_permit.as_ref(),
+                        agent.run_child(ChildAgentRequest {
+                            mission: mission.clone(),
+                            task: task.clone(),
+                            status_tx: status_tx.clone(),
+                            channel_ctx,
+                            user_role,
+                            child_role,
+                            goal_id: goal_id_ref.clone(),
+                            task_id: task_id_ref.clone(),
+                            project_scope: project_scope.clone(),
+                            specialist: args.specialist.clone(),
+                            approval_session_id: Some(session_id.clone()),
+                            parent_authority: parent_authority.clone(),
+                            time_limit,
+                            model_tier: args.model_tier.map(Into::into),
+                        })
+                    ),);
                     let owner_cancelled = async {
                         match cancel_token.as_ref() {
                             Some(token) => token.cancelled().await,
@@ -1602,6 +1610,8 @@ mod child_runtime_tests {
         role: StdMutex<AgentRole>,
         timed_out_tasks: StdMutex<Vec<String>>,
         panics: std::sync::atomic::AtomicBool,
+        /// Fails before the child begins running.
+        fails_in_setup: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedChild {
@@ -1615,6 +1625,7 @@ mod child_runtime_tests {
                 role: StdMutex::new(AgentRole::Orchestrator),
                 timed_out_tasks: StdMutex::new(Vec::new()),
                 panics: std::sync::atomic::AtomicBool::new(false),
+                fails_in_setup: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1641,6 +1652,13 @@ mod child_runtime_tests {
             Ok(())
         }
         async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
+            if self
+                .fails_in_setup
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("synthetic setup failure");
+            }
+            crate::agent::authority::mark_child_began();
             self.tasks.lock().unwrap().push(request.task);
             tokio::time::sleep(self.delay).await;
             if self.panics.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1888,6 +1906,95 @@ mod child_runtime_tests {
         let refused = usize::from(first.is_err()) + usize::from(second.is_err());
         assert_eq!(refused, 1);
         assert_eq!(child.tasks.lock().unwrap().len(), 1);
+    }
+
+    fn family_facts(max_total: usize) -> ToolCallContext {
+        let family =
+            crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+                max_concurrent: 5,
+                max_total,
+            });
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::read_only(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                spawn_family: Some(family),
+                parent_run: None,
+            });
+        call_facts
+    }
+
+    /// A spawn that fails before its child begins running does not use up
+    /// the request's total; one whose child ran does.
+    #[tokio::test]
+    async fn a_failed_setup_does_not_use_up_the_requests_total() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let tool = tool_for(&child);
+        let call_facts = family_facts(1);
+        let args = json!({"mission": "m", "task": "t"}).to_string();
+
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("setup failed");
+        child
+            .fails_in_setup
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect("the failed setup left its place");
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("the child that ran used the only place");
+        assert_eq!(child.tasks.lock().unwrap().len(), 1);
+    }
+
+    /// The same holds for a background spawn.
+    #[tokio::test]
+    async fn a_failed_background_setup_does_not_use_up_the_requests_total() {
+        let child = ScriptedChild::new("done", Duration::ZERO);
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let call_facts = family_facts(1);
+        let args = json!({"mission": "m", "task": "t", "background": true}).to_string();
+
+        child
+            .fails_in_setup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .unwrap();
+        wait_for_notification(&store).await;
+        child
+            .fails_in_setup
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tool
+                .call_with_execution_context(&args, None, call_facts.clone())
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the failed setup gives its place back once it ends");
+        tool.call_with_execution_context(&args, None, call_facts.clone())
+            .await
+            .expect_err("the child that ran used the only place");
     }
 
     async fn wait_for_notification(store: &SqliteStateStore) -> crate::traits::NotificationEntry {

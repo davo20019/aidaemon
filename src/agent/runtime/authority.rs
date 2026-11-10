@@ -201,14 +201,56 @@ impl PartialEq for SpawnFamily {
     }
 }
 
-/// Holds one running slot in a family until dropped.
+tokio::task_local! {
+    static SPAWN_BEGAN: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Holds one running slot in a family until dropped. Its place in the
+/// family's total is kept only once the child began running: a spawn that
+/// fails during setup gives it back.
 #[derive(Debug)]
-pub(crate) struct SpawnPermit(SpawnFamily);
+pub(crate) struct SpawnPermit {
+    family: SpawnFamily,
+    began: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SpawnPermit {
+    /// Run `future` (the child's setup and run) so that a
+    /// [`mark_child_began`] inside it marks this permit's child as begun.
+    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        SPAWN_BEGAN.scope(self.began.clone(), future).await
+    }
+}
+
+/// Run `future` inside `permit`'s scope when there is one.
+pub(crate) async fn within_permit<F: std::future::Future>(
+    permit: Option<&SpawnPermit>,
+    future: F,
+) -> F::Output {
+    match permit {
+        Some(permit) => permit.scope(future).await,
+        None => future.await,
+    }
+}
+
+/// The child of the enclosing [`SpawnPermit::scope`] has finished setup and
+/// begun running. Outside any scope it does nothing.
+pub(crate) fn mark_child_began() {
+    let _ = SPAWN_BEGAN.try_with(|began| began.store(true, std::sync::atomic::Ordering::SeqCst));
+}
 
 impl Drop for SpawnPermit {
     fn drop(&mut self) {
-        let mut counts = (self.0).0.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts = self
+            .family
+            .0
+            .counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         counts.active = counts.active.saturating_sub(1);
+        if !self.began.load(std::sync::atomic::Ordering::SeqCst) {
+            counts.started = counts.started.saturating_sub(1);
+        }
     }
 }
 
@@ -246,7 +288,10 @@ impl SpawnFamily {
         }
         counts.active += 1;
         counts.started += 1;
-        Ok(SpawnPermit(self.clone()))
+        Ok(SpawnPermit {
+            family: self.clone(),
+            began: std::sync::Arc::default(),
+        })
     }
 }
 
@@ -441,12 +486,34 @@ mod tests {
         assert!(family.try_admit().is_ok());
     }
 
-    #[test]
-    fn a_family_refuses_past_its_total_even_when_nothing_is_running() {
+    #[tokio::test]
+    async fn a_family_refuses_past_its_total_even_when_nothing_is_running() {
         let family = family(5, 2);
-        drop(family.try_admit().unwrap());
-        drop(family.try_admit().unwrap());
+        for _ in 0..2 {
+            let permit = family.try_admit().unwrap();
+            permit.scope(async { mark_child_began() }).await;
+        }
         assert!(family.try_admit().unwrap_err().contains("already started"));
+    }
+
+    /// A child that never began running gives its place in the total back;
+    /// one that began keeps it.
+    #[tokio::test]
+    async fn only_a_child_that_began_counts_toward_the_total() {
+        let family = family(5, 1);
+        let failed_setup = family.try_admit().unwrap();
+        failed_setup.scope(async {}).await;
+        drop(failed_setup);
+        let ran = family.try_admit().expect("a failed setup used no place");
+        ran.scope(async { mark_child_began() }).await;
+        drop(ran);
+        assert!(family.try_admit().unwrap_err().contains("already started"));
+    }
+
+    /// Marking outside any permit's scope changes nothing.
+    #[test]
+    fn marking_outside_a_spawn_is_a_no_op() {
+        mark_child_began();
     }
 
     #[test]
