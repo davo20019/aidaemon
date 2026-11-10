@@ -308,6 +308,24 @@ impl crate::semantics::ToolSemantics for WriteFile {
         })
     }
 
+    fn file_write_result(
+        &self,
+        arguments: &str,
+        current: Option<&[u8]>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let args: Value = serde_json::from_str(arguments).ok()?;
+        let content = ["content", "data", "text"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        let mut result = match args["mode"].as_str() {
+            Some("append") => current.unwrap_or_default().to_vec(),
+            Some("overwrite") | None => Vec::new(),
+            Some(_) => return None,
+        };
+        result.extend_from_slice(content.as_bytes());
+        Some(Ok(result))
+    }
+
     /// A write of the target path (absolute; a relative path resolves where
     /// the execution backend puts it, which is not known here).
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {

@@ -49,6 +49,76 @@ impl EditFile {
     }
 }
 
+/// One edit applied to a file's bytes.
+struct AppliedEdit {
+    new_content: String,
+    /// Occurrences of the text that were found.
+    count: usize,
+    effective_new_text: String,
+    used_newline_recovery: bool,
+}
+
+/// Apply one edit to `bytes`, or say why it cannot be applied. The tool and
+/// its `file_write_result` share this, so a predicted result is the one the
+/// call writes.
+fn apply_edit(
+    bytes: &[u8],
+    path_str: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+) -> anyhow::Result<AppliedEdit> {
+    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        anyhow::bail!("Cannot edit binary file: {}", path_str);
+    }
+    let content = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("Cannot edit non-UTF-8 file: {}", path_str))?;
+
+    // Count occurrences using exact match first.
+    let mut effective_old_text = old_text.to_string();
+    let mut effective_new_text = new_text.to_string();
+    let mut count = content.matches(&effective_old_text).count();
+
+    // Self-recovery path: tolerate newline-style mismatch (LF vs CRLF) while
+    // preserving strict exact matching otherwise.
+    if count == 0 {
+        let file_newline = detect_newline_style(content);
+        let normalized_old = normalize_newlines_for_style(old_text, file_newline);
+        if normalized_old != old_text {
+            let normalized_count = content.matches(&normalized_old).count();
+            if normalized_count > 0 {
+                effective_old_text = normalized_old;
+                effective_new_text = normalize_newlines_for_style(new_text, file_newline);
+                count = normalized_count;
+            }
+        }
+    }
+
+    if count == 0 {
+        anyhow::bail!("{}", build_not_found_message(path_str, content, old_text));
+    }
+
+    if count > 1 && !replace_all {
+        anyhow::bail!(
+            "Found {} occurrences of the text in {}. Set replace_all=true to replace all, or provide more context to make old_text unique.",
+            count,
+            path_str
+        );
+    }
+
+    let new_content = if replace_all {
+        content.replace(&effective_old_text, &effective_new_text)
+    } else {
+        content.replacen(&effective_old_text, &effective_new_text, 1)
+    };
+    Ok(AppliedEdit {
+        new_content,
+        count,
+        used_newline_recovery: effective_old_text != old_text,
+        effective_new_text,
+    })
+}
+
 #[async_trait]
 impl OutcomeTool for EditFile {
     fn name(&self) -> &str {
@@ -136,51 +206,12 @@ impl OutcomeTool for EditFile {
         };
 
         let bytes = backend.read(&path).await?;
-        if bytes.iter().take(8192).any(|byte| *byte == 0) {
-            anyhow::bail!("Cannot edit binary file: {}", path_str);
-        }
-
-        let content = String::from_utf8(bytes)
-            .map_err(|_| anyhow::anyhow!("Cannot edit non-UTF-8 file: {}", path_str))?;
-
-        // Count occurrences using exact match first.
-        let mut effective_old_text = old_text.to_string();
-        let mut effective_new_text = new_text.to_string();
-        let mut count = content.matches(&effective_old_text).count();
-
-        // Self-recovery path: tolerate newline-style mismatch (LF vs CRLF) while
-        // preserving strict exact matching otherwise.
-        if count == 0 {
-            let file_newline = detect_newline_style(&content);
-            let normalized_old = normalize_newlines_for_style(old_text, file_newline);
-            if normalized_old != old_text {
-                let normalized_count = content.matches(&normalized_old).count();
-                if normalized_count > 0 {
-                    effective_old_text = normalized_old;
-                    effective_new_text = normalize_newlines_for_style(new_text, file_newline);
-                    count = normalized_count;
-                }
-            }
-        }
-
-        if count == 0 {
-            anyhow::bail!("{}", build_not_found_message(path_str, &content, old_text));
-        }
-
-        if count > 1 && !replace_all {
-            anyhow::bail!(
-                "Found {} occurrences of the text in {}. Set replace_all=true to replace all, or provide more context to make old_text unique.",
-                count,
-                path_str
-            );
-        }
-
-        // Perform replacement
-        let new_content = if replace_all {
-            content.replace(&effective_old_text, &effective_new_text)
-        } else {
-            content.replacen(&effective_old_text, &effective_new_text, 1)
-        };
+        let AppliedEdit {
+            new_content,
+            count,
+            effective_new_text,
+            used_newline_recovery,
+        } = apply_edit(&bytes, path_str, old_text, new_text, replace_all)?;
 
         // Backup + atomic write
         self.policy.backup_before_overwrite(&backend, &path).await;
@@ -194,7 +225,6 @@ impl OutcomeTool for EditFile {
         // Show context around the change
         let replaced_count = if replace_all { count } else { 1 };
         let context = get_change_context(&new_content, &effective_new_text);
-        let used_newline_recovery = effective_old_text != old_text;
         let diagnostics = self
             .policy
             .post_write_diagnostics(&*backend, std::path::Path::new(path.as_str()))
@@ -303,6 +333,30 @@ impl crate::semantics::ToolSemantics for EditFile {
                 replace_all: args["replace_all"].as_bool().unwrap_or(false),
             },
         })
+    }
+
+    fn file_write_result(
+        &self,
+        arguments: &str,
+        current: Option<&[u8]>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let args: Value = serde_json::from_str(arguments).ok()?;
+        let path = path_arg(&args)?;
+        let old_text = ["old_text", "old_string", "search", "find"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        let new_text = ["new_text", "new_string", "replace", "replacement"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        let Some(current) = current else {
+            return Some(Err(format!("File not found: {path}")));
+        };
+        Some(
+            apply_edit(current, path, old_text, new_text, replace_all)
+                .map(|applied| applied.new_content.into_bytes())
+                .map_err(|why| why.to_string()),
+        )
     }
 
     /// A write of the target path (absolute; a relative path resolves where

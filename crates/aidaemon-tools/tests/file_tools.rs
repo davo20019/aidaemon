@@ -222,3 +222,60 @@ async fn edit_changes_nothing_when_ambiguous_and_validates_first() {
         .validate(&json!({"path": "a", "old_text": "y"}))
         .is_err());
 }
+
+/// What a write tool predicts for a call is what the call then writes, and
+/// a call that cannot apply is predicted as such, with the tool's reason.
+#[tokio::test]
+async fn a_predicted_write_is_the_one_the_call_makes() {
+    use aidaemon_tools::semantics::ToolSemantics;
+    let (dir, workspace) = workspace();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "one\r\ntwo\r\none\r\n").unwrap();
+    let edit = EditFile::new(workspace.clone());
+    let write = WriteFile::new(workspace);
+
+    let calls = [
+        json!({"path": "a.txt", "old_text": "two\n", "new_text": "TWO\n"}),
+        json!({"path": "a.txt", "old_text": "one", "new_text": "ONE", "replace_all": true}),
+    ];
+    for args in calls {
+        let current = std::fs::read(&file).unwrap();
+        let predicted = edit
+            .file_write_result(&args.to_string(), Some(&current))
+            .unwrap()
+            .unwrap();
+        let out = edit.call(args, &ctx()).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read(&file).unwrap(), predicted);
+    }
+    for args in [
+        json!({"path": "a.txt", "old_text": "absent", "new_text": "x"}),
+        json!({"path": "a.txt", "old_text": "ONE", "new_text": "x"}),
+    ] {
+        let current = std::fs::read(&file).unwrap();
+        let predicted = edit.file_write_result(&args.to_string(), Some(&current));
+        assert!(matches!(predicted, Some(Err(_))), "{args}");
+        assert!(edit.call(args, &ctx()).await.unwrap().is_error);
+    }
+    assert!(matches!(
+        edit.file_write_result(
+            &json!({"path": "gone.txt", "old_text": "a", "new_text": "b"}).to_string(),
+            None
+        ),
+        Some(Err(_))
+    ));
+
+    for args in [
+        json!({"path": "a.txt", "content": "more\n", "mode": "append"}),
+        json!({"path": "a.txt", "content": "all new\n"}),
+    ] {
+        let current = std::fs::read(&file).unwrap();
+        let predicted = write
+            .file_write_result(&args.to_string(), Some(&current))
+            .unwrap()
+            .unwrap();
+        let out = write.call(args, &ctx()).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read(&file).unwrap(), predicted);
+    }
+}

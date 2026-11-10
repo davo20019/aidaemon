@@ -2334,6 +2334,19 @@ pub trait ToolSemantics: Send + Sync {
         None
     }
 
+    /// What the file would hold after this exact call, were it holding
+    /// `current` now (`None`: no such file). `Err` is the tool's own reason
+    /// the call cannot apply to that content. A tool that cannot say returns
+    /// `None`, and a host that asks then treats the call as changing all of
+    /// the file.
+    fn file_write_result(
+        &self,
+        _arguments: &str,
+        _current: Option<&[u8]>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        None
+    }
+
     /// What this call carries out of the machine if it only reads.
     fn call_outbound(&self, _arguments: &str) -> aidaemon_core::Outbound {
         aidaemon_core::Outbound::Nothing
