@@ -718,6 +718,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         declined: Vec::new(),
         shared_declines: None,
         spawn_family: None,
+        child_declaration: None,
         parent_run: None,
     });
     assert_eq!(child.mode_session_for("sub_agent_synthetic_unit"), session);
@@ -741,6 +742,7 @@ async fn child_authority_is_the_narrower_of_parent_mode_and_inherited() {
         declined: Vec::new(),
         shared_declines: None,
         spawn_family: None,
+        child_declaration: None,
         parent_run: None,
     });
     let grandchild = child
@@ -978,6 +980,7 @@ async fn readonly_reaches_a_running_child_through_its_parent_chat() {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: None,
+            child_declaration: None,
             parent_run: None,
         });
     assert_eq!(harness.agent.mode_session_for(child_session), parent);

@@ -46,8 +46,13 @@ fn run_taint(
     }
 }
 
+/// How much of a mission the roster shows.
+const ROSTER_MISSION_CHARS: usize = 120;
+
 #[derive(Debug)]
 pub(crate) struct SpawnChildResult {
+    /// The child's own session.
+    pub session: String,
     pub response: String,
     pub outcome: TaskOutcome,
     /// `Untrusted` when the child's run read (or started with) untrusted
@@ -2380,6 +2385,7 @@ impl Agent {
             // root dispatch starts a family of its own.
             shared_declines: inherited.and_then(|inherited| inherited.shared_declines.clone()),
             spawn_family: inherited.and_then(|inherited| inherited.spawn_family.clone()),
+            child_declaration: None,
             parent_run: inherited.and_then(|inherited| inherited.parent_run),
         }
     }
@@ -2715,6 +2721,10 @@ impl Agent {
             .filter(|tool| tool.capabilities().read_only)
             .map(|tool| tool.name().to_string())
             .collect();
+        let roster_coordination = parent_authority.spawn_family.as_ref().and_then(|family| {
+            let declaration = parent_authority.child_declaration.clone()?;
+            Some((family.coordination(), declaration))
+        });
         let child = self
             .create_child_agent(
                 scoped_tools,
@@ -2738,6 +2748,17 @@ impl Agent {
             .await;
         let child_session_for_events = child_session.clone();
         let child_read_untrusted = child.read_untrusted.clone();
+        let roster_entry = roster_coordination.map(|(coordination, declaration)| {
+            coordination.add_member(crate::agent::coordination::Member {
+                session: child_session.clone(),
+                parent: declaration.parent_session,
+                mission: mission.chars().take(ROSTER_MISSION_CHARS).collect(),
+                specialist: arg_specialist.map(str::to_string),
+                scope: declaration.scope,
+                running: true,
+            });
+            crate::agent::coordination::RosterEntry::new(coordination, child_session.clone())
+        });
 
         // Run the child agent on its OWN tokio task instead of awaiting it
         // inline. An inline `.await` nests the child's (very large) agent-loop
@@ -2759,6 +2780,7 @@ impl Agent {
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
+        let _on_roster = roster_entry;
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
@@ -3009,6 +3031,7 @@ impl Agent {
 
         let trust = child_result_trust(child_flagged_untrusted, &child_tainted_turns);
         result.map(|response| SpawnChildResult {
+            session: child_session.clone(),
             response,
             outcome: child_outcome,
             trust,

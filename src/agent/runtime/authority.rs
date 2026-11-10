@@ -265,6 +265,11 @@ impl SpawnFamily {
         }))
     }
 
+    /// The tree's shared knowledge, whether or not it has a child yet.
+    pub(crate) fn coordination(&self) -> super::coordination::Coordination {
+        self.0.coordination.clone()
+    }
+
     /// The tree's shared knowledge, once it has a child: a lone agent has
     /// nobody to coordinate with.
     pub(crate) fn active_coordination(&self) -> Option<&super::coordination::Coordination> {
@@ -302,6 +307,14 @@ impl SpawnFamily {
             began: std::sync::Arc::default(),
         })
     }
+}
+
+/// What one `spawn_agent` call said about the child it starts.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ChildDeclaration {
+    pub parent_session: String,
+    /// Files or directories the child will change, resolved.
+    pub scope: Vec<String>,
 }
 
 /// What a spawned child inherits from the turn that spawned it: the turn's
@@ -346,6 +359,10 @@ pub(crate) struct InheritedAuthority {
     /// `None` starts a new tree. A runtime handle, never serialized.
     #[serde(skip)]
     pub spawn_family: Option<SpawnFamily>,
+    /// What the `spawn_agent` call that starts this child declared. A
+    /// runtime handle, never serialized.
+    #[serde(skip)]
+    pub child_declaration: Option<ChildDeclaration>,
     /// The kernel run that started this child, for tracing the family.
     #[serde(default)]
     pub parent_run: Option<aidaemon_core::RunId>,
@@ -872,6 +889,7 @@ mod tests {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: None,
+            child_declaration: None,
             parent_run: None,
         }
     }
@@ -982,6 +1000,7 @@ mod tests {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: None,
+            child_declaration: None,
             parent_run: None,
         };
         let own = resolve_authority(&AuthorityFacts {

@@ -33,6 +33,8 @@ pub(crate) fn file_state(bytes: Option<&[u8]>) -> FileState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Member {
     pub session: String,
+    /// The session that spawned it.
+    pub parent: String,
     pub mission: String,
     pub specialist: Option<String>,
     /// Files or directories it said it would change (resolved paths).
@@ -58,13 +60,46 @@ pub(crate) enum LogEntry {
         path: String,
         changed_by: Option<Writer>,
     },
+    /// A child was spawned to change something a running sibling also said
+    /// it would change.
+    ScopeOverlap {
+        member: String,
+        sibling: String,
+        path: String,
+    },
+    /// A member wrote outside the scope it declared.
+    WriteOutsideScope { member: String, path: String },
 }
 
 impl LogEntry {
+    /// One line for the coordinator; only paths, sessions and typed facts.
+    fn render(&self) -> String {
+        match self {
+            Self::StaleWriteRefused {
+                member,
+                path,
+                changed_by,
+            } => format!(
+                "{member}: a write to {path} was refused because {} had changed it.",
+                who(changed_by.as_ref())
+            ),
+            Self::ScopeOverlap {
+                member,
+                sibling,
+                path,
+            } => format!("{member}: its declared scope overlaps {sibling}'s at {path}."),
+            Self::WriteOutsideScope { member, path } => {
+                format!("{member}: wrote {path}, outside its declared scope.")
+            }
+        }
+    }
+
     /// The member this entry is about.
     pub(crate) fn member(&self) -> &str {
         match self {
-            Self::StaleWriteRefused { member, .. } => member,
+            Self::StaleWriteRefused { member, .. }
+            | Self::ScopeOverlap { member, .. }
+            | Self::WriteOutsideScope { member, .. } => member,
         }
     }
 }
@@ -95,6 +130,10 @@ struct Ledger {
     retained_bytes: usize,
     log: Vec<LogEntry>,
     open_shells: Vec<OpenShell>,
+    roster_version: u64,
+    /// What each coordinating member has been told: roster version and log
+    /// length.
+    told: HashMap<String, (u64, usize)>,
     /// The state each pending write was judged against, by member and call.
     judged: HashMap<(String, String), FileState>,
 }
@@ -127,21 +166,93 @@ impl Coordination {
         self.0.ledger.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Add a member to the roster.
+    /// Add a member to the roster, logging any declared overlap with a
+    /// running sibling (advisory: nothing is refused).
     pub(crate) fn add_member(&self, member: Member) {
-        self.ledger().roster.push(member);
+        let mut ledger = self.ledger();
+        for (sibling, path) in overlapping_scopes(&ledger.roster, &member.scope) {
+            ledger.log.push(LogEntry::ScopeOverlap {
+                member: member.session.clone(),
+                sibling,
+                path,
+            });
+        }
+        ledger.roster.push(member);
+        ledger.roster_version += 1;
     }
 
     /// `session` has finished working.
     pub(crate) fn finish_member(&self, session: &str) {
-        if let Some(member) = self
-            .ledger()
+        let mut ledger = self.ledger();
+        let found = ledger
             .roster
             .iter_mut()
-            .find(|member| member.session == session)
-        {
+            .find(|member| member.session == session);
+        if let Some(member) = found {
             member.running = false;
+            ledger.roster_version += 1;
         }
+    }
+
+    /// Running siblings whose declared scope overlaps `scope`, with where.
+    pub(crate) fn scope_overlaps(&self, scope: &[String]) -> Vec<(String, String)> {
+        overlapping_scopes(&self.ledger().roster, scope)
+    }
+
+    /// Roster and new log entries for an agent with children, once whenever
+    /// there is something new. `None` for anyone else, or when nothing changed.
+    pub(crate) fn parent_note(&self, session: &str) -> Option<String> {
+        let mut ledger = self.ledger();
+        if !ledger.roster.iter().any(|member| member.parent == session) {
+            return None;
+        }
+        let (told_version, told_log) = ledger.told.get(session).copied().unwrap_or((0, 0));
+        if told_version == ledger.roster_version && told_log == ledger.log.len() {
+            return None;
+        }
+        let mut note = String::from("Sub-agents in this request.");
+        let running: Vec<String> = ledger
+            .roster
+            .iter()
+            .filter(|member| member.running)
+            .map(|member| {
+                let scope = if member.scope.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [changing: {}]", member.scope.join(", "))
+                };
+                format!("\n- {} ({}){scope}", member.session, member.mission)
+            })
+            .collect();
+        if running.is_empty() {
+            note.push_str(" None are running now.");
+        } else {
+            note.push_str(" Running now:");
+            note.extend(running);
+        }
+        let new_entries = &ledger.log[told_log.min(ledger.log.len())..];
+        if !new_entries.is_empty() {
+            note.push_str("\nSince the last note:");
+            for entry in new_entries {
+                note.push_str("\n- ");
+                note.push_str(&entry.render());
+            }
+        }
+        let told = (ledger.roster_version, ledger.log.len());
+        ledger.told.insert(session.to_string(), told);
+        Some(note)
+    }
+
+    /// What the coordinator should read at the end of `session`'s result.
+    pub(crate) fn result_trailer(&self, session: &str) -> Option<String> {
+        let lines: Vec<String> = self
+            .ledger()
+            .log
+            .iter()
+            .filter(|entry| entry.member() == session)
+            .map(|entry| format!("- {}", entry.render()))
+            .collect();
+        (!lines.is_empty()).then(|| format!("\n\nCoordination:\n{}", lines.join("\n")))
     }
 
     pub(crate) fn roster(&self) -> Vec<Member> {
@@ -247,6 +358,18 @@ impl Coordination {
         file.last_writer = Some(Writer::Member(member.to_string()));
         file.baselines.insert(member.to_string(), state);
         file.writers.insert(member.to_string());
+        let outside = ledger.roster.iter().any(|known| {
+            known.session == member
+                && !known.scope.is_empty()
+                && !known.scope.iter().any(|scope| paths_overlap(scope, path))
+        });
+        let entry = LogEntry::WriteOutsideScope {
+            member: member.to_string(),
+            path: path.to_string(),
+        };
+        if outside && !ledger.log.contains(&entry) {
+            ledger.log.push(entry);
+        }
     }
 
     /// `member` started a shell call.
@@ -333,6 +456,45 @@ impl Coordination {
             .or_default()
             .clone()
     }
+}
+
+/// Marks a member finished when its run ends, however it ends.
+pub(crate) struct RosterEntry {
+    coordination: Coordination,
+    session: String,
+}
+
+impl RosterEntry {
+    pub(crate) fn new(coordination: Coordination, session: String) -> Self {
+        Self {
+            coordination,
+            session,
+        }
+    }
+}
+
+impl Drop for RosterEntry {
+    fn drop(&mut self) {
+        self.coordination.finish_member(&self.session);
+    }
+}
+
+/// One path contains the other, compared by whole components.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn overlapping_scopes(roster: &[Member], scope: &[String]) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for member in roster.iter().filter(|member| member.running) {
+        for theirs in &member.scope {
+            if let Some(mine) = scope.iter().find(|mine| paths_overlap(mine, theirs)) {
+                found.push((member.session.clone(), mine.clone()));
+            }
+        }
+    }
+    found
 }
 
 /// What the ledger says about a proposed write.
@@ -846,11 +1008,93 @@ mod tests {
         );
     }
 
+    fn member(session: &str, scope: &[&str]) -> Member {
+        Member {
+            session: session.to_string(),
+            parent: "root".to_string(),
+            mission: "Synthetic work".to_string(),
+            specialist: None,
+            scope: scope.iter().map(|path| path.to_string()).collect(),
+            running: true,
+        }
+    }
+
+    #[test]
+    fn a_scope_overlapping_a_running_sibling_is_logged_but_not_a_finished_one() {
+        let c = Coordination::default();
+        c.add_member(member("a", &["/w/src"]));
+        c.add_member(member("b", &["/w/src/lib.rs"]));
+        assert_eq!(c.scope_overlaps(&["/w/src/lib.rs".to_string()]).len(), 2);
+        assert_eq!(
+            c.log_entries(),
+            vec![LogEntry::ScopeOverlap {
+                member: "b".to_string(),
+                sibling: "a".to_string(),
+                path: "/w/src/lib.rs".to_string(),
+            }]
+        );
+        c.finish_member("a");
+        c.finish_member("b");
+        assert!(c.scope_overlaps(&["/w/src".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_write_outside_the_declared_scope_is_logged_once_and_still_lands() {
+        let c = Coordination::default();
+        c.add_member(member("a", &["/w/src"]));
+        c.commit_write("a", "/w/docs/x.md", Some(b"1"));
+        c.commit_write("a", "/w/docs/x.md", Some(b"2"));
+        c.commit_write("a", "/w/src/y.rs", Some(b"3"));
+        assert_eq!(
+            c.log_entries(),
+            vec![LogEntry::WriteOutsideScope {
+                member: "a".to_string(),
+                path: "/w/docs/x.md".to_string(),
+            }]
+        );
+    }
+
+    /// The note goes only to an agent with children, and only when something
+    /// changed since it was last told.
+    #[test]
+    fn the_parent_note_is_for_parents_and_only_when_something_is_new() {
+        let c = Coordination::default();
+        assert_eq!(c.parent_note("root"), None);
+        c.add_member(member("a", &[]));
+        assert!(c.parent_note("a").is_none(), "a child with no children");
+        let first = c.parent_note("root").unwrap();
+        assert!(first.contains("a (Synthetic work)"), "{first}");
+        assert_eq!(c.parent_note("root"), None);
+        c.log(LogEntry::WriteOutsideScope {
+            member: "a".to_string(),
+            path: "/w/x".to_string(),
+        });
+        let second = c.parent_note("root").unwrap();
+        assert!(second.contains("/w/x"), "{second}");
+    }
+
+    #[test]
+    fn the_result_trailer_holds_only_that_members_entries() {
+        let c = Coordination::default();
+        c.log(LogEntry::WriteOutsideScope {
+            member: "a".to_string(),
+            path: "/w/a".to_string(),
+        });
+        c.log(LogEntry::WriteOutsideScope {
+            member: "b".to_string(),
+            path: "/w/b".to_string(),
+        });
+        let trailer = c.result_trailer("a").unwrap();
+        assert!(trailer.contains("/w/a") && !trailer.contains("/w/b"));
+        assert_eq!(c.result_trailer("c"), None);
+    }
+
     #[test]
     fn the_roster_tracks_who_is_still_running() {
         let coordination = Coordination::default();
         coordination.add_member(Member {
             session: "child-a".to_string(),
+            parent: "root".to_string(),
             mission: "Update the synthetic notes".to_string(),
             specialist: None,
             scope: vec!["/w/notes.md".to_string()],

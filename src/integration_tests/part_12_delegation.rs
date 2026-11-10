@@ -999,6 +999,7 @@ async fn test_child_tokens_count_against_the_requests_tree() {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: Some(family.clone()),
+            child_declaration: None,
             parent_run: None,
         });
     harness

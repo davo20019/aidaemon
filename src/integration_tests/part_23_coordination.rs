@@ -22,6 +22,7 @@ mod coordination_tests {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: Some(family.clone()),
+            child_declaration: None,
             parent_run: None,
         }
     }
@@ -381,5 +382,71 @@ mod coordination_tests {
             [LogEntry::StaleWriteRefused { changed_by: Some(Writer::Member(by)), .. }]
                 if by == CHILD_B
         ));
+    }
+
+    /// The real child path enters the roster with what the spawn declared,
+    /// and leaves it running only until it finishes.
+    #[tokio::test]
+    async fn a_spawned_child_joins_the_roster_with_its_scope() {
+        use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime};
+        let (family, _permit) = tree();
+        let harness = harness(vec![MockProvider::text_response("Child done.")]).await;
+        let agent = Arc::new(harness.agent);
+        let mut parent = inherited(&family);
+        parent.child_declaration = Some(crate::agent::authority::ChildDeclaration {
+            parent_session: "telegram:synthetic-user-1".to_string(),
+            scope: vec!["/w/synthetic".to_string()],
+        });
+        let run = agent
+            .run_child(ChildAgentRequest {
+                mission: "Tidy the synthetic notes".to_string(),
+                task: "Tidy them.".to_string(),
+                status_tx: None,
+                channel_ctx: ChannelContext::private("test"),
+                user_role: UserRole::Owner,
+                child_role: None,
+                goal_id: None,
+                task_id: None,
+                project_scope: None,
+                specialist: None,
+                approval_session_id: None,
+                parent_authority: Some(parent),
+                time_limit: None,
+                model_tier: None,
+            })
+            .await
+            .unwrap();
+        let roster = family.active_coordination().unwrap().roster();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].session, run.session);
+        assert_eq!(roster[0].scope, vec!["/w/synthetic".to_string()]);
+        assert_eq!(roster[0].parent, "telegram:synthetic-user-1");
+        assert!(!roster[0].running, "it finished");
+    }
+
+    /// The parent's next model call carries the roster, after the transcript
+    /// it has already sent.
+    #[tokio::test]
+    async fn the_parent_is_told_who_is_running_at_the_tail() {
+        use crate::agent::coordination::Member;
+        const PARENT: &str = "telegram:synthetic-user-1";
+        let (family, _permit) = tree();
+        family.active_coordination().unwrap().add_member(Member {
+            session: CHILD_A.to_string(),
+            parent: PARENT.to_string(),
+            mission: "Tidy the synthetic notes".to_string(),
+            specialist: None,
+            scope: Vec::new(),
+            running: true,
+        });
+        let mut harness = harness(vec![MockProvider::text_response("Waiting.")]).await;
+        turn(&mut harness, &family, PARENT).await;
+        let log = harness.provider.call_log.lock().await;
+        let last = log.last().unwrap().messages.last().unwrap().clone();
+        assert_eq!(last["role"], "system", "{last}");
+        assert!(
+            last["content"].as_str().unwrap().contains(CHILD_A),
+            "{last}"
+        );
     }
 }

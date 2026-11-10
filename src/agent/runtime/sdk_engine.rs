@@ -1233,25 +1233,25 @@ impl Agent {
             ),
             |guard, (name, tool)| guard.tool(name.clone(), tool.dispatch_facts().file_guard),
         );
-        let hooks = TurnHooks {
-            canonical: tool_calls::CanonicalCallHook {
-                tools: turn_tools,
-                known_project_dir: known_project_dir.clone(),
-                workspace_grant,
-                task_access: authority.task_access.clone(),
         let turn_tools = Arc::new(turn_tools);
         let spawn_family = self
             .inherited_authority
             .as_ref()
             .and_then(|parent| parent.spawn_family.clone())
             .unwrap_or_else(|| crate::agent::authority::SpawnFamily::new(self.limits.spawn_family));
-                authorized_scopes: authorized_scopes.clone(),
+        let hooks = TurnHooks {
             coordination: crate::agent::coordination::CoordinationHook {
                 family: spawn_family.clone(),
                 member: session_id.to_string(),
                 tools: turn_tools.clone(),
                 backend: self.execution_backend.clone(),
             },
+            canonical: tool_calls::CanonicalCallHook {
+                tools: turn_tools,
+                known_project_dir: known_project_dir.clone(),
+                workspace_grant,
+                task_access: authority.task_access.clone(),
+                authorized_scopes: authorized_scopes.clone(),
                 records: canonical_calls.clone(),
                 paths: self.daemon_paths.clone(),
                 backend: self.execution_backend.clone(),

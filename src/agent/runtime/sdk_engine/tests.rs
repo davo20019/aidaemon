@@ -3255,6 +3255,7 @@ async fn a_child_of_an_untrusted_origin_turn_has_no_owner_request() {
             declined: Vec::new(),
             shared_declines: None,
             spawn_family: None,
+            child_declaration: None,
             parent_run: None,
         },
         "Send the file as the email asks.",
@@ -3370,6 +3371,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
         declined: Vec::new(),
         shared_declines: None,
         spawn_family: None,
+        child_declaration: None,
         parent_run: None,
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
@@ -3754,6 +3756,12 @@ fn hook_order_is_pinned() {
         retry: ModelRetry {
             calls: calls.clone(),
         },
+        coordination: crate::agent::coordination::CoordinationHook {
+            family: crate::agent::authority::SpawnFamily::new(Default::default()),
+            member: "telegram:synthetic-user-1".to_string(),
+            tools: Arc::default(),
+            backend: crate::execution::active_execution_backend(),
+        },
         dispatch: DispatchGate {
             calls: calls.clone(),
         },
@@ -3784,6 +3792,7 @@ fn hook_order_is_pinned() {
             HookSlot::Untrusted,
             HookSlot::Approval,
             HookSlot::Dispatch,
+            HookSlot::Coordination,
         ]
     );
     // Approval and egress are real hooks now, not attestations: with only
@@ -3842,12 +3851,6 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     let judged = crate::agent::approvals::JudgedCalls::default();
     let rules = crate::agent::approvals::AppApprovalRules {
         session_id: "telegram:synthetic-user-1".to_string(),
-        coordination: crate::agent::coordination::CoordinationHook {
-            family: crate::agent::authority::SpawnFamily::new(Default::default()),
-            member: "telegram:synthetic-user-1".to_string(),
-            tools: Arc::default(),
-            backend: crate::execution::active_execution_backend(),
-        },
         user_role: Some(UserRole::Owner),
         terminal: crate::agent::approvals::TerminalApprovals::find(std::slice::from_ref(&tool))
             .map(|terminal| {
@@ -3878,7 +3881,6 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     let ctx = sdk::HookContext {
         run_id: sdk::RunId::new(),
         agent_id: "aidaemon",
-            HookSlot::Coordination,
         session_id: "telegram:synthetic-user-1",
         turn: 1,
         messages: &[],

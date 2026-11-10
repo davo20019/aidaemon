@@ -438,6 +438,9 @@ struct SpawnArgs {
     /// `read_only` keeps the child from changing anything.
     #[serde(default)]
     access: Option<ChildAccess>,
+    /// Files or directories the child will change.
+    #[serde(default)]
+    scope: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -593,6 +596,11 @@ impl Tool for SpawnAgentTool {
                         "type": "string",
                         "enum": ["read_only", "write"],
                         "description": "Optional: read_only stops the child changing anything. It can never exceed your own access."
+                    },
+                    "scope": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional: the files or directories this child will change. When several children will write, give them disjoint scopes so they do not collide. Advisory: an overlap is reported, never refused."
                     }
                 },
                 "required": ["mission", "task"],
@@ -675,6 +683,36 @@ impl Tool for SpawnAgentTool {
             }
         };
 
+        // A plain child in a tree joins its roster, saying what it will change.
+        let mut scope_overlap_note = String::new();
+        let tree = family_permit
+            .is_some()
+            .then(|| {
+                parent_authority
+                    .as_ref()
+                    .and_then(|parent| parent.spawn_family.clone())
+            })
+            .flatten();
+        if let Some(family) = tree.as_ref() {
+            let scope = agent.resolve_child_scope(args.scope.clone()).await;
+            let overlaps = family.coordination().scope_overlaps(&scope);
+            if !overlaps.is_empty() {
+                let listed = overlaps
+                    .iter()
+                    .map(|(sibling, path)| format!("{path} (also {sibling})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                scope_overlap_note =
+                    format!("\n\nThis child's scope overlaps running sub-agents at: {listed}.");
+            }
+            if let Some(parent) = parent_authority.as_mut() {
+                parent.child_declaration = Some(crate::agent::authority::ChildDeclaration {
+                    parent_session: facts.session_id.clone(),
+                    scope,
+                });
+            }
+        }
+
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
         // are deduplicated per task_id so the same work is not launched twice.
         let executor_task_id = if child_role == Some(AgentRole::Executor) {
@@ -743,13 +781,17 @@ impl Tool for SpawnAgentTool {
                     approval_session_id.as_deref(),
                     parent_authority.clone(),
                     args.model_tier.map(Into::into),
+                    tree.as_ref(),
                 ),
             )
             .await;
             if let Some(ref task_id) = executor_task_id {
                 self.finish_executor_task(task_id).await;
             }
-            return result;
+            return result.map(|mut outcome| {
+                outcome.output.push_str(&scope_overlap_note);
+                outcome
+            });
         };
 
         let task = args.task.clone();
@@ -761,6 +803,7 @@ impl Tool for SpawnAgentTool {
         let executor_task_id_for_bg = executor_task_id;
         let notify_goal_id = goal_id_ref.clone().unwrap_or_else(|| "global".to_string());
         let notify_status_tx = status_tx.clone();
+        let tree_for_bg = tree.clone();
 
         let background_id = format!("background_spawn:{}", uuid::Uuid::new_v4());
         if let Some(state) = state.as_ref() {
@@ -869,12 +912,16 @@ impl Tool for SpawnAgentTool {
                             mission
                         ),
                     ),
-                    Ok(run) => format_background_completion(
-                        &mission,
-                        &run.response,
-                        run.outcome,
-                        max_response_chars,
-                    ),
+                    Ok(run) => {
+                        let (kind, mut message) = format_background_completion(
+                            &mission,
+                            &run.response,
+                            run.outcome,
+                            max_response_chars,
+                        );
+                        message.push_str(&coordination_trailer(tree_for_bg.as_ref(), &run.session));
+                        (kind, message)
+                    }
                     Err(error) => match error.downcast_ref::<ChildTimedOut>() {
                         None => (
                             "failed",
@@ -986,8 +1033,19 @@ impl Tool for SpawnAgentTool {
             }
         });
 
-        Ok(background_spawn_outcome(&args.mission))
+        let mut outcome = background_spawn_outcome(&args.mission);
+        outcome.output.push_str(&scope_overlap_note);
+        Ok(outcome)
     }
+}
+
+/// The coordination log's entries about one child, for the end of its result.
+fn coordination_trailer(
+    tree: Option<&crate::agent::authority::SpawnFamily>,
+    session: &str,
+) -> String {
+    tree.and_then(|family| family.coordination().result_trailer(session))
+        .unwrap_or_default()
 }
 
 /// A sub-agent now running in the background: the turn hands off to it, and
@@ -1061,6 +1119,7 @@ impl SpawnAgentTool {
         approval_session_id: Option<&str>,
         parent_authority: Option<crate::agent::authority::InheritedAuthority>,
         model_tier: Option<crate::router::Tier>,
+        tree: Option<&crate::agent::authority::SpawnFamily>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let result = agent
             .run_child(ChildAgentRequest {
@@ -1094,7 +1153,10 @@ impl SpawnAgentTool {
                 };
                 let (shown, truncation) =
                     bounded_child_response(&response, self.max_response_chars);
-                let mut outcome = reported(shown.to_string(), run.trust);
+                let mut outcome = reported(
+                    format!("{shown}{}", coordination_trailer(tree, &run.session)),
+                    run.trust,
+                );
                 outcome.metadata.truncation = truncation;
                 Ok(outcome)
             }
@@ -1347,6 +1409,7 @@ mod tests {
             )],
             shared_declines: None,
             spawn_family: None,
+            child_declaration: None,
             parent_run: None,
         };
         let mut facts = ToolCallContext::default();
@@ -1632,6 +1695,7 @@ mod child_runtime_tests {
                 return Err(failure);
             }
             Ok(ChildAgentRun {
+                session: "sub_agent_synthetic".to_string(),
                 response: self.response.clone(),
                 outcome: TaskOutcome::Succeeded,
                 trust: SourceTrust::Trusted,
@@ -1906,6 +1970,72 @@ mod child_runtime_tests {
         );
     }
 
+    fn facts_in_tree(family: &crate::agent::authority::SpawnFamily) -> ToolCallContext {
+        let mut call_facts = facts();
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority: aidaemon_core::Authority::full(),
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: false,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                spawn_family: Some(family.clone()),
+                child_declaration: None,
+                parent_run: None,
+            });
+        call_facts
+    }
+
+    /// An overlap with a running sibling is stated, never refused, and the
+    /// child's result ends with what the log says about it.
+    #[tokio::test]
+    async fn a_scope_overlap_and_the_childs_log_reach_the_spawn_result() {
+        use crate::agent::coordination::{LogEntry, Member};
+        let child = ScriptedChild::new("Finished.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let family = crate::agent::authority::SpawnFamily::new(Default::default());
+        family.coordination().add_member(Member {
+            session: "sub_agent_sibling".to_string(),
+            parent: "root".to_string(),
+            mission: "Other work".to_string(),
+            specialist: None,
+            scope: vec!["/w/src".to_string()],
+            running: true,
+        });
+        family.coordination().log(LogEntry::WriteOutsideScope {
+            member: "sub_agent_synthetic".to_string(),
+            path: "/w/elsewhere".to_string(),
+        });
+        let args = json!({"mission": "m", "task": "t", "scope": ["/w/src/lib.rs"]}).to_string();
+
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts_in_tree(&family))
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.output.starts_with("Finished."),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("/w/elsewhere"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("sub_agent_sibling"),
+            "{}",
+            outcome.output
+        );
+    }
+
     /// Children past the request's running limit are refused, not queued.
     #[tokio::test]
     async fn a_request_cannot_run_more_children_than_its_limit() {
@@ -1931,6 +2061,7 @@ mod child_runtime_tests {
                 declined: Vec::new(),
                 shared_declines: None,
                 spawn_family: Some(family),
+                child_declaration: None,
                 parent_run: None,
             });
         let args = json!({"mission": "m", "task": "t"}).to_string();
@@ -1966,6 +2097,7 @@ mod child_runtime_tests {
                 declined: Vec::new(),
                 shared_declines: None,
                 spawn_family: Some(family),
+                child_declaration: None,
                 parent_run: None,
             });
         call_facts

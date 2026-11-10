@@ -228,6 +228,17 @@ impl Agent {
         // Directives raised since the last call are pinned where the run
         // stands now, so the sent transcript only ever grows at its end.
         let run = to_daemon_messages_from(run);
+        // A parent hears about its children here: pinned at the run's end
+        // like any other directive, so the sent prefix never changes.
+        if let Some(note) = scope
+            .spawn_family
+            .active_coordination()
+            .and_then(|coordination| coordination.parent_note(scope.session_id))
+        {
+            if let Ok(mut extra) = scope.extra_system.lock() {
+                extra.push(note);
+            }
+        }
         let run = {
             let raised: Vec<String> = scope
                 .extra_system

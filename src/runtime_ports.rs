@@ -21,6 +21,8 @@ use crate::types::{
 /// Result returned by a delegated child-agent run.
 #[derive(Debug)]
 pub(crate) struct ChildAgentRun {
+    /// The child's own session.
+    pub session: String,
     pub response: String,
     pub outcome: TaskOutcome,
     /// `Untrusted` when the child's run read (or started with) content
@@ -151,6 +153,12 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
     ) -> anyhow::Result<()>;
 
     async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun>;
+
+    /// The paths a child's declared scope names, as the file tools resolve
+    /// them.
+    async fn resolve_child_scope(&self, scope: Vec<String>) -> Vec<String> {
+        scope
+    }
 
     /// A token that stops the background child `id` when the owner cancels.
     async fn background_cancel_token(

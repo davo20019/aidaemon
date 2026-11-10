@@ -880,6 +880,7 @@ impl Agent {
             // what the owner declined in the other, even after the spawn.
             shared_declines: Some(scope.shared_declines.clone()),
             spawn_family: Some(scope.spawn_family.clone()),
+            child_declaration: None,
             parent_run: Some(scope.run_id),
         }
     }
@@ -1513,8 +1514,8 @@ impl Agent {
                         crate::agent::coordination::CallFence {
                             coordination: coordination.clone(),
                             member: scope.session_id.to_string(),
-                            backend: self.execution_backend.clone(),
                             call_id: request.call_id.clone(),
+                            backend: self.execution_backend.clone(),
                         },
                     ))
                 }),

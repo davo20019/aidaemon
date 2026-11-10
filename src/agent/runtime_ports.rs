@@ -67,10 +67,23 @@ impl ChildAgentRuntime for Agent {
             )
             .await?;
         Ok(ChildAgentRun {
+            session: result.session,
             response: result.response,
             outcome: result.outcome,
             trust: result.trust,
         })
+    }
+
+    async fn resolve_child_scope(&self, scope: Vec<String>) -> Vec<String> {
+        let mut resolved = Vec::with_capacity(scope.len());
+        for path in scope {
+            resolved.push(
+                crate::agent::coordination::canonical_path(&self.execution_backend, &path)
+                    .await
+                    .unwrap_or(path),
+            );
+        }
+        resolved
     }
 
     async fn background_cancel_token(

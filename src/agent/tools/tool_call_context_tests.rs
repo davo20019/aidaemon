@@ -144,6 +144,7 @@ fn real_authority() -> crate::agent::authority::InheritedAuthority {
         declined: Vec::new(),
         shared_declines: None,
         spawn_family: None,
+        child_declaration: None,
         parent_run: None,
     }
 }
