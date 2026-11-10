@@ -777,7 +777,8 @@ impl Tool for SpawnAgentTool {
         let cancel_token = agent.background_cancel_token(&background_id).await;
 
         tokio::spawn(async move {
-            // The slot stays taken until this child has finished.
+            // This task owns `family_permit`, so the slot stays taken until
+            // the child has finished.
             let delivery = BackgroundDelivery {
                 agent: agent.as_ref(),
                 hub: hub_for_parent_delivery.as_ref(),
