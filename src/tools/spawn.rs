@@ -524,7 +524,7 @@ impl Tool for SpawnAgentTool {
         "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step \
          (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the \
          `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
-         benefits from a fresh context window, or can run in parallel with other work. Do NOT delegate \
+         benefits from a fresh context window, or should keep running while other work continues (background=true; foreground sub-agents run one at a time). Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
          The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist cannot delegate further), so reference files by path and \
          do not paste prior tool output."
@@ -536,8 +536,7 @@ impl Tool for SpawnAgentTool {
             "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work \
                 is multi-step (research → synthesize, code → test, fetch → analyze), matches a named \
                 specialist (see the `specialist` enum: code, browser_verifier, research, review, \
-                artifact_writer, comms_draft, ...), benefits from a fresh context window, or can run in \
-                parallel with other work. Do NOT delegate trivial one-shot reads (a single read_file, a \
+                artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while other work continues (background=true; foreground sub-agents run one at a time). Do NOT delegate trivial one-shot reads (a single read_file, a \
                 single web_search) — handle those directly. The sub-agent starts with a fresh context and \
                 the same tools unless its specialist narrows them (a named specialist cannot delegate \
                 further), so reference files by path and do not paste prior tool output.",

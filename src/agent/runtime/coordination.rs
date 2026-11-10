@@ -173,6 +173,8 @@ struct Ledger {
     /// What each coordinating member has been told: roster version and log
     /// length.
     told: HashMap<String, (u64, usize)>,
+    /// Paths each member had a write refused on and has not written since.
+    unlanded: HashMap<String, BTreeSet<String>>,
     /// The state each pending write was judged against, by member and call.
     judged: HashMap<(String, String), FileState>,
 }
@@ -475,6 +477,23 @@ impl Coordination {
         }
     }
 
+    /// `member` was refused a write to `path`, so that change has not happened.
+    pub(crate) fn note_unlanded(&self, member: &str, path: &str) {
+        self.ledger()
+            .unlanded
+            .entry(member.to_string())
+            .or_default()
+            .insert(path.to_string());
+    }
+
+    /// `member` ended with a refused write it never made.
+    pub(crate) fn has_unlanded_write(&self, member: &str) -> bool {
+        self.ledger()
+            .unlanded
+            .get(member)
+            .is_some_and(|paths| !paths.is_empty())
+    }
+
     /// `member`'s pending call was allowed against `state`.
     pub(crate) fn note_judged(&self, member: &str, call_id: &str, state: FileState) {
         self.ledger()
@@ -488,6 +507,9 @@ impl Coordination {
         let mut ledger = self.ledger();
         if let Some(bytes) = bytes {
             ledger.retain(state, bytes);
+        }
+        if let Some(paths) = ledger.unlanded.get_mut(member) {
+            paths.remove(path);
         }
         ledger.clock += 1;
         let clock = ledger.clock;
@@ -833,6 +855,7 @@ impl FileFence for CallFence {
         if let Some(judged) = judged {
             let current = read_current(&self.backend, raw).await;
             if file_state(current.as_deref()) != judged {
+                self.coordination.note_unlanded(&self.member, &path);
                 return Err(format!(
                     "{raw} changed while this write was waiting. Nothing was written. \
                      Read the file again, then retry against what is there now."
@@ -1273,6 +1296,7 @@ impl sdk::Hook for CoordinationHook {
                         path: path.clone(),
                         changed_by: stale.changed_by.clone(),
                     });
+                    coordination.note_unlanded(&self.member, &path);
                     return sdk::ToolDecision::Deny {
                         reason: stale_refusal(&write.path, &stale, None),
                     };
@@ -1316,6 +1340,7 @@ impl sdk::Hook for CoordinationHook {
                     }
                 }
                 ParentDecision::Reread => {
+                    coordination.note_unlanded(&self.member, &path);
                     return sdk::ToolDecision::Deny {
                         reason: stale_refusal(&write.path, &stale, Some(&answer.note)),
                     };
@@ -1330,12 +1355,14 @@ impl sdk::Hook for CoordinationHook {
                     };
                 }
                 ParentDecision::Stop | ParentDecision::NoAnswer => {
+                    coordination.note_unlanded(&self.member, &path);
                     return sdk::ToolDecision::Deny {
                         reason: stop_refusal(&write.path, &answer),
                     };
                 }
             }
         }
+        coordination.note_unlanded(&self.member, &path);
         sdk::ToolDecision::Deny {
             reason: stop_refusal(
                 &write.path,
@@ -1383,6 +1410,21 @@ mod tests {
         assert_eq!(changed_range(base, current), 0..0);
         let change = describe_change(Some(base), current);
         assert!(change.contains("- line1"), "{change}");
+    }
+
+    /// A write refused and never redone is work the member did not do; one
+    /// that lands after the refusal is ordinary.
+    #[test]
+    fn a_refused_write_stays_open_until_it_lands() {
+        let tree = Coordination::new(3, 12);
+        let member = "specialist:code:a";
+        tree.note_unlanded(member, "/tmp/synthetic/notes.md");
+        assert!(tree.has_unlanded_write(member));
+        assert!(!tree.has_unlanded_write("specialist:code:b"));
+        tree.commit_write(member, "/tmp/synthetic/other.md", Some(b"x"));
+        assert!(tree.has_unlanded_write(member));
+        tree.commit_write(member, "/tmp/synthetic/notes.md", Some(b"y"));
+        assert!(!tree.has_unlanded_write(member));
     }
 
     /// A member that ended mid-shell cannot keep overlapping later shells.

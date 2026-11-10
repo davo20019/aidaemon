@@ -109,6 +109,16 @@ fn resolve_child_outcome(
     }
 }
 
+/// A child that ended with a refused write it never made did not do that
+/// work, whatever its own run concluded.
+fn settle_coordinated_outcome(outcome: TaskOutcome, unlanded_write: bool) -> TaskOutcome {
+    if outcome == TaskOutcome::Succeeded && unlanded_write {
+        TaskOutcome::Partial
+    } else {
+        outcome
+    }
+}
+
 /// How often a running child checks its working-time limit.
 const CHILD_LIMIT_CHECK: Duration = Duration::from_millis(250);
 /// Time left for a nested child's report to reach its parent before the
@@ -2756,6 +2766,9 @@ impl Agent {
             .await;
         let child_session_for_events = child_session.clone();
         let child_read_untrusted = child.read_untrusted.clone();
+        let outcome_coordination = roster_coordination
+            .as_ref()
+            .map(|(coordination, _)| coordination.clone());
         let roster_entry = roster_coordination.map(|(coordination, declaration)| {
             coordination.add_member(crate::agent::coordination::Member {
                 session: child_session.clone(),
@@ -2902,7 +2915,12 @@ impl Agent {
 
         let child_end_record =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
-        let child_outcome = resolve_child_outcome(result.is_ok(), &child_end_record);
+        let child_outcome = settle_coordinated_outcome(
+            resolve_child_outcome(result.is_ok(), &child_end_record),
+            outcome_coordination
+                .as_ref()
+                .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events)),
+        );
         let child_task_end = match child_end_record {
             Ok(record) => record,
             Err(error) => {
@@ -3466,6 +3484,22 @@ mod tests {
         }
         let record = latest_child_task_end(&store, session).await;
         assert_eq!(resolve_child_outcome(true, &record), TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn a_child_with_a_refused_write_it_never_made_is_incomplete() {
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Succeeded, true),
+            TaskOutcome::Partial
+        );
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Succeeded, false),
+            TaskOutcome::Succeeded
+        );
+        assert_eq!(
+            settle_coordinated_outcome(TaskOutcome::Failed, true),
+            TaskOutcome::Failed
+        );
     }
 
     #[test]
