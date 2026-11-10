@@ -153,6 +153,10 @@ impl sdk::Provider for LoggedProvider {
 /// caller gets [`SideCallError::Deadline`], never the judge's own timeout.
 const JUDGE_BUDGET_SLACK: Duration = Duration::from_secs(1);
 
+/// How long the gateway waits for a side call's telemetry rows after the
+/// model call ended, so a stuck event store never holds the caller.
+const RECORD_DEADLINE: Duration = Duration::from_secs(2);
+
 impl SideCallGateway {
     pub fn new(
         runtime: SharedLlmRuntime,
@@ -240,8 +244,21 @@ impl SideCallGateway {
                 Ok(result) => result,
                 Err(_) => Err(SideCallError::Deadline(spec.deadline)),
             };
-        self.record(&spec, &request.model, &log, &result, started.elapsed())
-            .await;
+        let elapsed = started.elapsed();
+        // An attempt leaves the log before its row is written, so a write
+        // cut off here is not written again by the guard.
+        if tokio::time::timeout(
+            RECORD_DEADLINE,
+            self.record(&spec, &request.model, &log, &result, elapsed),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                purpose = spec.purpose,
+                "side call telemetry write timed out; rows not written"
+            );
+        }
         guard.disarm();
         result
     }
@@ -570,6 +587,26 @@ pub(crate) mod test_support {
         )
     }
 
+    /// A gateway whose event store writes wait forever: its one pooled
+    /// connection is held by the returned handle. Keep the handle alive.
+    pub(crate) async fn gateway_with_stuck_event_store(
+        provider: ModelBackend,
+    ) -> (SideCallGateway, sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(3600))
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let events = Arc::new(EventStore::new(pool.clone()).await.unwrap());
+        let held = pool.acquire().await.unwrap();
+        let state: Arc<dyn StateStore> = state().await;
+        (
+            SideCallGateway::new(runtime(vec![provider]), state, events),
+            held,
+        )
+    }
+
     fn runtime(targets: Vec<ModelBackend>) -> SharedLlmRuntime {
         let mut targets = targets.into_iter();
         let primary = targets.next().expect("at least one provider");
@@ -740,6 +777,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer.text, "fine");
+    }
+
+    /// A telemetry write that never finishes does not hold the caller: the
+    /// answer comes back once the write's own deadline passes.
+    #[tokio::test]
+    async fn a_stuck_telemetry_write_does_not_hold_the_answer() {
+        let (gateway, _held) = gateway_with_stuck_event_store(provider_answering("fine")).await;
+        tokio::time::pause();
+        let deadline = SideCall::BackgroundInterpretation.spec().deadline;
+        let started = tokio::time::Instant::now();
+        let answer = gateway
+            .ask(
+                SideCall::BackgroundInterpretation,
+                &user("hello"),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer.text, "fine");
+        assert!(started.elapsed() <= deadline + RECORD_DEADLINE);
     }
 
     #[tokio::test]
