@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -354,6 +355,59 @@ async fn enqueue_background_notification(
             error = %e,
             "{context}: enqueue failed"
         );
+    }
+}
+
+/// Where a background child's result goes: straight to the parent session
+/// through the hub, else the queue.
+struct BackgroundDelivery<'a> {
+    agent: &'a dyn ChildAgentRuntime,
+    hub: Option<&'a Weak<dyn OutboundRouter>>,
+    state: Option<&'a Arc<dyn StateStore>>,
+    session_id: &'a str,
+    goal_id: &'a str,
+}
+
+impl BackgroundDelivery<'_> {
+    async fn deliver(&self, notification_type: &str, message: &str, trust: SourceTrust) {
+        // Without a hub the queue delivers it (and the heartbeat records
+        // it in the parent session then), so it is recorded once.
+        let direct = match self.hub {
+            Some(hub) => {
+                self.agent
+                    .deliver_background_child_result(Some(hub), self.session_id, message, trust)
+                    .await
+            }
+            None => Ok(false),
+        };
+        let delivered = match direct {
+            Ok(sent) => sent,
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    goal_id = %self.goal_id,
+                    notification_type = %notification_type,
+                    error = %e,
+                    "spawn_agent background completion notifier: parent delivery failed"
+                );
+                false
+            }
+        };
+
+        if !delivered {
+            // The queued copy carries the child's taint into whichever
+            // parent turn records it.
+            enqueue_background_notification(
+                self.state,
+                self.goal_id,
+                self.session_id,
+                notification_type,
+                message,
+                "spawn_agent background completion notifier",
+                trust == SourceTrust::Untrusted,
+            )
+            .await;
+        }
     }
 }
 
@@ -759,187 +813,196 @@ impl Tool for SpawnAgentTool {
         tokio::spawn(async move {
             // The slot stays taken until this child has finished.
             let _family_permit = family_permit;
-            let started_at = std::time::Instant::now();
-            let mut progress_interval =
-                tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
-            progress_interval.tick().await; // consume immediate tick
-            let mut cancelled_by_owner = false;
-            // Scoped so that leaving it drops the child's future, which stops
-            // the child.
-            let result: anyhow::Result<ChildAgentRun> = {
-                let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
-                    mission: mission.clone(),
-                    task: task.clone(),
-                    status_tx: status_tx.clone(),
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id: goal_id_ref.clone(),
-                    task_id: task_id_ref.clone(),
-                    project_scope: project_scope.clone(),
-                    specialist: args.specialist.clone(),
-                    approval_session_id: Some(session_id.clone()),
-                    parent_authority: parent_authority.clone(),
-                    time_limit,
-                    model_tier: args.model_tier.map(Into::into),
-                }),);
-                let owner_cancelled = async {
-                    match cancel_token.as_ref() {
-                        Some(token) => token.cancelled().await,
-                        None => std::future::pending().await,
+            let delivery = BackgroundDelivery {
+                agent: agent.as_ref(),
+                hub: hub_for_parent_delivery.as_ref(),
+                state: state.as_ref(),
+                session_id: &session_id,
+                goal_id: &notify_goal_id,
+            };
+            // A panic in the child or in its delivery must not skip the
+            // cleanup below, and the parent session still hears it failed.
+            let finished = std::panic::AssertUnwindSafe(async {
+                let started_at = std::time::Instant::now();
+                let mut progress_interval =
+                    tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
+                progress_interval.tick().await; // consume immediate tick
+                let mut cancelled_by_owner = false;
+                // Scoped so that leaving it drops the child's future, which stops
+                // the child.
+                let result: anyhow::Result<ChildAgentRun> = {
+                    let mut result_fut = std::pin::pin!(agent.run_child(ChildAgentRequest {
+                        mission: mission.clone(),
+                        task: task.clone(),
+                        status_tx: status_tx.clone(),
+                        channel_ctx,
+                        user_role,
+                        child_role,
+                        goal_id: goal_id_ref.clone(),
+                        task_id: task_id_ref.clone(),
+                        project_scope: project_scope.clone(),
+                        specialist: args.specialist.clone(),
+                        approval_session_id: Some(session_id.clone()),
+                        parent_authority: parent_authority.clone(),
+                        time_limit,
+                        model_tier: args.model_tier.map(Into::into),
+                    }),);
+                    let owner_cancelled = async {
+                        match cancel_token.as_ref() {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::pin!(owner_cancelled);
+                    loop {
+                        tokio::select! {
+                            res = &mut result_fut => break res,
+                            _ = &mut owner_cancelled => {
+                                cancelled_by_owner = true;
+                                break Err(anyhow::anyhow!("cancelled by the owner"));
+                            }
+                            _ = progress_interval.tick() => {
+                                let elapsed_secs = started_at.elapsed().as_secs();
+                                if let Some(ref tx) = notify_status_tx {
+                                    let _ = tx.try_send(StatusUpdate::ToolProgress {
+                                        name: "spawn_agent".to_string(),
+                                        chunk: format!(
+                                            "Background sub-agent still running ({}s): {}",
+                                            elapsed_secs, mission
+                                        ),
+                                    });
+                                }
+                            }
+                        }
                     }
                 };
-                tokio::pin!(owner_cancelled);
-                loop {
-                    tokio::select! {
-                        res = &mut result_fut => break res,
-                        _ = &mut owner_cancelled => {
-                            cancelled_by_owner = true;
-                            break Err(anyhow::anyhow!("cancelled by the owner"));
-                        }
-                        _ = progress_interval.tick() => {
-                            let elapsed_secs = started_at.elapsed().as_secs();
-                            if let Some(ref tx) = notify_status_tx {
-                                let _ = tx.try_send(StatusUpdate::ToolProgress {
-                                    name: "spawn_agent".to_string(),
-                                    chunk: format!(
-                                        "Background sub-agent still running ({}s): {}",
-                                        elapsed_secs, mission
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            };
 
-            // Only a finished child's own record decides; any other result
-            // may carry child-written text and counts as untrusted.
-            let trust = match &result {
-                Ok(run) => run.trust,
-                Err(error)
-                    if task_id_ref.is_none()
-                        && error
-                            .downcast_ref::<ChildTimedOut>()
-                            .is_some_and(|t| !t.report.may_have_changed_something()) =>
-                {
-                    SourceTrust::Trusted
-                }
-                Err(_) => SourceTrust::Untrusted,
-            };
-            let (notification_type, message) = match result {
-                _ if cancelled_by_owner => (
-                    "failed",
-                    format!(
-                        "\u{23f9}\u{fe0f} Background task cancelled\nMission: {}\n\n\
-                         It may have done part of the work.",
-                        mission
-                    ),
-                ),
-                Ok(run) => format_background_completion(
-                    &mission,
-                    &run.response,
-                    run.outcome,
-                    max_response_chars,
-                ),
-                Err(error) => match error.downcast_ref::<ChildTimedOut>() {
-                    None => (
+                // Only a finished child's own record decides; any other result
+                // may carry child-written text and counts as untrusted.
+                let trust = match &result {
+                    Ok(run) => run.trust,
+                    Err(error)
+                        if task_id_ref.is_none()
+                            && error
+                                .downcast_ref::<ChildTimedOut>()
+                                .is_some_and(|t| !t.report.may_have_changed_something()) =>
+                    {
+                        SourceTrust::Trusted
+                    }
+                    Err(_) => SourceTrust::Untrusted,
+                };
+                let (notification_type, message) = match result {
+                    _ if cancelled_by_owner => (
                         "failed",
                         format!(
-                            "\u{274c} Background task failed\nMission: {}\nError: {}",
-                            mission, error
+                            "\u{23f9}\u{fe0f} Background task cancelled\nMission: {}\n\n\
+                         It may have done part of the work.",
+                            mission
                         ),
                     ),
-                    Some(timed_out) => {
-                        // The child may have persisted a terminal outcome
-                        // before it was stopped — deliver that instead of a
-                        // generic timeout failure.
-                        let salvaged = match task_id_ref.as_deref() {
-                            Some(task_id) => {
-                                agent
-                                    .salvage_executor_task_outcome(task_id, timeout_secs)
-                                    .await
-                            }
-                            None => None,
-                        };
-                        // Nothing to salvage: release the executor's claimed
-                        // task, as a waited-on executor does.
-                        if salvaged.is_none() && child_role == Some(AgentRole::Executor) {
-                            if let Some(task_id) = task_id_ref.as_deref() {
-                                agent.mark_executor_task_timeout(task_id, timeout_secs).await;
-                            }
-                        }
-                        match salvaged {
-                            Some(outcome) if outcome.status == "completed" => (
-                                "completed",
-                                format!(
-                                    "\u{2705} Background task complete\nMission: {}\n\n{}",
-                                    mission, outcome.details
-                                ),
+                    Ok(run) => format_background_completion(
+                        &mission,
+                        &run.response,
+                        run.outcome,
+                        max_response_chars,
+                    ),
+                    Err(error) => match error.downcast_ref::<ChildTimedOut>() {
+                        None => (
+                            "failed",
+                            format!(
+                                "\u{274c} Background task failed\nMission: {}\nError: {}",
+                                mission, error
                             ),
-                            Some(outcome) if outcome.status == "blocked" => (
-                                "blocked",
-                                format!(
+                        ),
+                        Some(timed_out) => {
+                            // The child may have persisted a terminal outcome
+                            // before it was stopped — deliver that instead of a
+                            // generic timeout failure.
+                            let salvaged = match task_id_ref.as_deref() {
+                                Some(task_id) => {
+                                    agent
+                                        .salvage_executor_task_outcome(task_id, timeout_secs)
+                                        .await
+                                }
+                                None => None,
+                            };
+                            // Nothing to salvage: release the executor's claimed
+                            // task, as a waited-on executor does.
+                            if salvaged.is_none() && child_role == Some(AgentRole::Executor) {
+                                if let Some(task_id) = task_id_ref.as_deref() {
+                                    agent
+                                        .mark_executor_task_timeout(task_id, timeout_secs)
+                                        .await;
+                                }
+                            }
+                            match salvaged {
+                                Some(outcome) if outcome.status == "completed" => (
+                                    "completed",
+                                    format!(
+                                        "\u{2705} Background task complete\nMission: {}\n\n{}",
+                                        mission, outcome.details
+                                    ),
+                                ),
+                                Some(outcome) if outcome.status == "blocked" => (
+                                    "blocked",
+                                    format!(
                                     "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
                                     mission, outcome.details
                                 ),
-                            ),
-                            Some(outcome) => (
-                                "failed",
-                                format!(
-                                    "\u{274c} Background task failed\nMission: {}\n\n{}",
-                                    mission, outcome.details
                                 ),
-                            ),
-                            None => (
-                                "failed",
-                                format!(
-                                    "\u{23f1} Background task timed out\nMission: {}\n\n{}",
-                                    mission,
-                                    timed_out.render()
+                                Some(outcome) => (
+                                    "failed",
+                                    format!(
+                                        "\u{274c} Background task failed\nMission: {}\n\n{}",
+                                        mission, outcome.details
+                                    ),
                                 ),
-                            ),
+                                None => (
+                                    "failed",
+                                    format!(
+                                        "\u{23f1} Background task timed out\nMission: {}\n\n{}",
+                                        mission,
+                                        timed_out.render()
+                                    ),
+                                ),
+                            }
                         }
-                    }
-                },
-            };
-            // Without a hub the queue delivers it (and the heartbeat records
-            // it in the parent session then), so it is recorded once.
-            let direct = match hub_for_parent_delivery.as_ref() {
-                Some(hub) => {
-                    agent
-                        .deliver_background_child_result(Some(hub), &session_id, &message, trust)
-                        .await
-                }
-                None => Ok(false),
-            };
-            let delivered = match direct {
-                Ok(sent) => sent,
-                Err(e) => {
-                    warn!(
-                        session_id = %session_id,
-                        goal_id = %notify_goal_id,
-                        notification_type = %notification_type,
-                        error = %e,
-                        "spawn_agent background completion notifier: parent delivery failed"
-                    );
-                    false
-                }
-            };
-
-            if !delivered {
-                // The queued copy carries the child's taint into whichever
-                // parent turn records it.
-                enqueue_background_notification(
-                    state.as_ref(),
-                    &notify_goal_id,
-                    &session_id,
-                    notification_type,
+                    },
+                };
+                delivery.deliver(notification_type, &message, trust).await;
+            })
+            .catch_unwind()
+            .await;
+            if finished.is_err() {
+                warn!(
+                    session_id = %session_id,
+                    %background_id,
+                    "Background sub-agent panicked; reporting it as failed"
+                );
+                let message = format!(
+                    "\u{274c} Background task failed\nMission: {}\n\nIt stopped unexpectedly.",
+                    mission
+                );
+                // The note is the daemon's own text, so it is trusted.
+                let delivered = std::panic::AssertUnwindSafe(delivery.deliver(
+                    "failed",
                     &message,
-                    "spawn_agent background completion notifier",
-                    trust == SourceTrust::Untrusted,
-                )
+                    SourceTrust::Trusted,
+                ))
+                .catch_unwind()
                 .await;
+                if delivered.is_err() {
+                    enqueue_background_notification(
+                        state.as_ref(),
+                        &notify_goal_id,
+                        &session_id,
+                        "failed",
+                        &message,
+                        "spawn_agent background completion notifier",
+                        false,
+                    )
+                    .await;
+                }
             }
 
             if let Some(state) = state.as_ref() {
@@ -1538,6 +1601,7 @@ mod child_runtime_tests {
         cancel: tokio_util::sync::CancellationToken,
         role: StdMutex<AgentRole>,
         timed_out_tasks: StdMutex<Vec<String>>,
+        panics: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedChild {
@@ -1550,6 +1614,7 @@ mod child_runtime_tests {
                 cancel: tokio_util::sync::CancellationToken::new(),
                 role: StdMutex::new(AgentRole::Orchestrator),
                 timed_out_tasks: StdMutex::new(Vec::new()),
+                panics: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1578,6 +1643,9 @@ mod child_runtime_tests {
         async fn run_child(&self, request: ChildAgentRequest) -> anyhow::Result<ChildAgentRun> {
             self.tasks.lock().unwrap().push(request.task);
             tokio::time::sleep(self.delay).await;
+            if self.panics.load(std::sync::atomic::Ordering::SeqCst) {
+                panic!("synthetic child panic");
+            }
             if let Some(failure) = self.failure.lock().unwrap().take() {
                 return Err(failure);
             }
@@ -1734,6 +1802,53 @@ mod child_runtime_tests {
             *child.timed_out_tasks.lock().unwrap(),
             vec!["task-synthetic-1".to_string()]
         );
+    }
+
+    /// A background child that panics still clears its record, frees its
+    /// task, and tells the parent session it failed.
+    #[tokio::test]
+    async fn a_panicking_background_child_is_cleaned_up_and_reported() {
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        child
+            .panics
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *child.role.lock().unwrap() = AgentRole::TaskLead;
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({
+            "mission": "Execute",
+            "task": "t",
+            "task_id": "task-synthetic-2",
+            "background": true,
+        })
+        .to_string();
+
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+        assert_eq!(entry.notification_type, "failed");
+        assert_eq!(entry.session_id, "telegram:synthetic-user-1");
+        assert!(!entry.untrusted, "the failure note carries no child text");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store
+                .background_spawns_for_session("telegram:synthetic-user-1")
+                .await
+                .unwrap()
+                .is_empty()
+                || tool
+                    .executor_task_runs
+                    .lock()
+                    .await
+                    .contains("task-synthetic-2")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the record and the task claim are released");
     }
 
     /// Children past the request's running limit are refused, not queued.
