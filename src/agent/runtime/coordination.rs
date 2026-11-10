@@ -18,6 +18,9 @@ use aidaemon_tools::semantics::{FileFence, FileWriteGuard, FileWriteKind};
 /// Whole-file content hash; `None` is a file that does not exist.
 pub(crate) type FileState = Option<[u8; 32]>;
 
+/// The most tracked files one shell call re-hashes.
+const SHELL_RECHECK_PATHS: usize = 2_000;
+
 /// How much baseline content one tree keeps for showing what changed. Past
 /// it, baselines are hashes only and a change cannot be shown as a diff.
 const RETAINED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
@@ -76,6 +79,14 @@ struct TrackedFile {
     writers: BTreeSet<String>,
 }
 
+#[derive(Debug)]
+struct OpenShell {
+    member: String,
+    call_id: String,
+    /// Another member's shell call ran at the same time as this one.
+    overlapped: bool,
+}
+
 #[derive(Debug, Default)]
 struct Ledger {
     roster: Vec<Member>,
@@ -83,6 +94,7 @@ struct Ledger {
     contents: HashMap<[u8; 32], Arc<[u8]>>,
     retained_bytes: usize,
     log: Vec<LogEntry>,
+    open_shells: Vec<OpenShell>,
     /// The state each pending write was judged against, by member and call.
     judged: HashMap<(String, String), FileState>,
 }
@@ -235,6 +247,72 @@ impl Coordination {
         file.last_writer = Some(Writer::Member(member.to_string()));
         file.baselines.insert(member.to_string(), state);
         file.writers.insert(member.to_string());
+    }
+
+    /// `member` started a shell call.
+    pub(crate) fn shell_began(&self, member: &str, call_id: &str) {
+        let mut ledger = self.ledger();
+        let mut overlapped = false;
+        for open in ledger.open_shells.iter_mut().filter(|o| o.member != member) {
+            open.overlapped = true;
+            overlapped = true;
+        }
+        ledger.open_shells.push(OpenShell {
+            member: member.to_string(),
+            call_id: call_id.to_string(),
+            overlapped,
+        });
+    }
+
+    /// The tracked paths a finished shell call must look at again.
+    fn paths_to_recheck(&self) -> Vec<String> {
+        self.ledger()
+            .files
+            .keys()
+            .take(SHELL_RECHECK_PATHS)
+            .cloned()
+            .collect()
+    }
+
+    /// `member`'s shell call ended and the tracked files now hold `observed`:
+    /// whatever differs from the ledger is that call's doing, or the window's
+    /// if another member's shell ran alongside it.
+    fn shell_finished(
+        &self,
+        member: &str,
+        call_id: &str,
+        observed: Vec<(String, Option<Vec<u8>>)>,
+    ) {
+        let mut ledger = self.ledger();
+        let overlapped = ledger
+            .open_shells
+            .iter()
+            .position(|open| open.member == member && open.call_id == call_id)
+            .map(|at| ledger.open_shells.remove(at).overlapped)
+            .unwrap_or(false);
+        for (path, bytes) in observed {
+            let state = file_state(bytes.as_deref());
+            if ledger
+                .files
+                .get(&path)
+                .is_none_or(|file| file.known == state)
+            {
+                continue;
+            }
+            if let Some(bytes) = bytes.as_deref() {
+                ledger.retain(state, bytes);
+            }
+            let Some(file) = ledger.files.get_mut(&path) else {
+                continue;
+            };
+            file.known = state;
+            file.last_writer = Some(if overlapped {
+                Writer::OverlappingShells
+            } else {
+                Writer::Member(member.to_string())
+            });
+            file.writers.insert(member.to_string());
+        }
     }
 
     pub(crate) fn log(&self, entry: LogEntry) {
@@ -497,6 +575,10 @@ impl sdk::Hook for CoordinationHook {
         let Some(tool) = self.tools.get(&call.name) else {
             return sdk::ToolDecision::Allow;
         };
+        if tool.dispatch_facts().shell_command_line {
+            coordination.shell_began(&self.member, &call.id);
+            return sdk::ToolDecision::Allow;
+        }
         let Some(write) = tool.call_file_write(&call.arguments.to_string()) else {
             return sdk::ToolDecision::Allow;
         };
@@ -522,6 +604,31 @@ impl sdk::Hook for CoordinationHook {
                 }
             }
         }
+    }
+
+    /// A shell can change any file, so a tracked file is re-hashed after one.
+    async fn after_tool(
+        &self,
+        _ctx: &sdk::HookContext<'_>,
+        receipt: &sdk::Receipt,
+        _output: &mut sdk::ToolOutput,
+    ) {
+        let Some(coordination) = self.family.active_coordination() else {
+            return;
+        };
+        let is_shell = self
+            .tools
+            .get(&receipt.tool)
+            .is_some_and(|tool| tool.dispatch_facts().shell_command_line);
+        if !is_shell {
+            return;
+        }
+        let mut observed = Vec::new();
+        for path in coordination.paths_to_recheck() {
+            let bytes = read_current(&self.backend, &path).await;
+            observed.push((path, bytes));
+        }
+        coordination.shell_finished(&self.member, &receipt.call_id, observed);
     }
 }
 
@@ -650,6 +757,43 @@ mod tests {
         assert!(matches!(verdict, WriteVerdict::Allow { .. }));
         let verdict = c.judge_write("b", "/w/new", &FileWriteKind::Replace, None);
         assert_eq!(verdict, WriteVerdict::Allow { judged: None });
+    }
+
+    #[test]
+    fn overlapping_shells_of_different_members_are_blamed_on_the_window() {
+        let c = Coordination::default();
+        c.record_read("a", "/w/f", b"one\n");
+        c.shell_began("a", "1");
+        c.shell_began("b", "2");
+        c.shell_finished(
+            "a",
+            "1",
+            vec![("/w/f".to_string(), Some(b"two\n".to_vec()))],
+        );
+        assert_eq!(
+            c.ledger().files["/w/f"].last_writer,
+            Some(Writer::OverlappingShells)
+        );
+        assert!(matches!(
+            c.judge_write("a", "/w/f", &FileWriteKind::Replace, Some(b"two\n")),
+            WriteVerdict::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn a_shell_with_no_overlap_owns_what_it_changed() {
+        let c = Coordination::default();
+        c.record_read("a", "/w/f", b"one\n");
+        c.shell_began("a", "1");
+        c.shell_finished(
+            "a",
+            "1",
+            vec![("/w/f".to_string(), Some(b"two\n".to_vec()))],
+        );
+        assert!(matches!(
+            c.judge_write("a", "/w/f", &FileWriteKind::Replace, Some(b"two\n")),
+            WriteVerdict::Allow { .. }
+        ));
     }
 
     fn fence(c: &Coordination, member: &str, call: &str) -> CallFence {

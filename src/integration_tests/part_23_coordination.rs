@@ -249,4 +249,137 @@ mod coordination_tests {
         turn(&mut harness, &family, CHILD_A).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "last\n");
     }
+
+    /// A shell whose command rewrites a file, as the real terminal might.
+    struct SyntheticShell;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Tool for SyntheticShell {
+        fn name(&self) -> &str {
+            "synthetic_shell"
+        }
+        fn description(&self) -> &str {
+            "Runs a synthetic command"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({
+                "name": "synthetic_shell",
+                "description": "Runs a synthetic command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            })
+        }
+        async fn execute(
+            &self,
+            arguments: &str,
+            _facts: &crate::traits::ToolCallContext,
+        ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+            let args: serde_json::Value = serde_json::from_str(arguments)?;
+            if let (Some(path), Some(content)) = (args["path"].as_str(), args["content"].as_str()) {
+                std::fs::write(path, content)?;
+            }
+            Ok(crate::traits::ToolCallOutcome::from_output(
+                "ran".to_string(),
+            ))
+        }
+    }
+
+    impl crate::traits::ToolSemantics for SyntheticShell {
+        fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+            crate::traits::ToolDispatchFacts {
+                shell_command_line: true,
+                ..Default::default()
+            }
+        }
+        fn capabilities(&self) -> crate::traits::ToolCapabilities {
+            crate::traits::ToolCapabilities {
+                read_only: true,
+                idempotent: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn harness_with_shell(responses: Vec<crate::traits::ProviderResponse>) -> TestHarness {
+        let backend = crate::execution::active_execution_backend;
+        let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+            Arc::new(crate::tools::ReadFileTool::new(backend())),
+            Arc::new(crate::tools::WriteFileTool::new(backend())),
+            Arc::new(crate::tools::EditFileTool::new(backend())),
+            Arc::new(SyntheticShell),
+        ];
+        setup_test_agent_with_extra_tools_and_llm_timeout(
+            MockProvider::with_responses(responses),
+            tools,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn shell_call(path: &str, content: &str) -> crate::traits::ProviderResponse {
+        MockProvider::tool_call_response(
+            "synthetic_shell",
+            &json!({"command": "rewrite", "path": path, "content": content}).to_string(),
+        )
+    }
+
+    /// An agent's own shell change does not make its own next write stale.
+    #[tokio::test]
+    async fn a_members_own_shell_change_keeps_its_write_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        let p = file.to_str().unwrap();
+        std::fs::write(&file, "alpha\n").unwrap();
+        let (family, _permit) = tree();
+        let mut harness = harness_with_shell(vec![
+            read_call(p),
+            shell_call(p, "from shell\n"),
+            edit_call(p, "from shell", "edited"),
+            MockProvider::text_response("Done."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited\n");
+        assert_eq!(stale_refusals(&family, CHILD_A), 0);
+    }
+
+    /// A shell change is a sibling's change for everyone else.
+    #[tokio::test]
+    async fn a_siblings_shell_change_is_attributed_and_stops_a_stale_write() {
+        use crate::agent::coordination::{LogEntry, Writer};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        let p = file.to_str().unwrap();
+        std::fs::write(&file, "alpha\nbeta\n").unwrap();
+        let (family, _permit) = tree();
+        let mut harness = harness_with_shell(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            read_call(p),
+            shell_call(p, "ALPHA\nbeta\n"),
+            MockProvider::text_response("B done."),
+            edit_call(p, "beta", "BETA"),
+            MockProvider::text_response("A stopped."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA\nbeta\n");
+        let log = family.active_coordination().unwrap().log_entries();
+        assert!(matches!(
+            &log[..],
+            [LogEntry::StaleWriteRefused { changed_by: Some(Writer::Member(by)), .. }]
+                if by == CHILD_B
+        ));
+    }
 }
