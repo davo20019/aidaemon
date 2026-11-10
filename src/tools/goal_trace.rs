@@ -296,7 +296,7 @@ impl GoalTraceTool {
                 mandate.id,
                 mandate.status,
                 mandate.version,
-                mandate.next_review_at,
+                mandate.scheduled_next_review().unwrap_or("none, not active"),
                 admission,
                 goal.budget_per_check,
                 goal.budget_daily,

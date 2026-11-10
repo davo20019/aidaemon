@@ -496,8 +496,9 @@ impl ScheduledGoalRunsTool {
                 "latest_run_outcome": latest_run_outcome,
                 "schedule_count": schedules.len(),
                 "active_schedule_count": active_schedule_count,
-                "schedule_state": status.schedule_state,
-                "next_run_at": status.next_run_at,
+                "schedule_state": status.wake.state(),
+                "wake_source": status.wake.source(),
+                "next_run_at": status.wake.next_at(),
                 "last_run_at": last_run_at,
                 "latest_run": latest_run,
                 "objective_control":

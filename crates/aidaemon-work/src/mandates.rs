@@ -265,6 +265,12 @@ impl Mandate {
         }
     }
 
+    /// When the next review will wake this mandate; `None` unless it is
+    /// active, because only active mandates are ever claimed.
+    pub fn scheduled_next_review(&self) -> Option<&str> {
+        self.is_active().then_some(self.next_review_at.as_str())
+    }
+
     pub fn is_active(&self) -> bool {
         if self.status != MandateStatus::Active || self.confirmed_at.is_none() {
             return false;

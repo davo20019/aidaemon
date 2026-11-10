@@ -356,10 +356,8 @@ impl ObjectivePortfolio {
 /// Typed lifecycle snapshot for one goal-backed objective.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectiveStatus {
-    /// "active", "paused", or "missing".
-    pub schedule_state: &'static str,
-    /// Earliest next occurrence among active schedules.
-    pub next_run_at: Option<String>,
+    /// What wakes this objective next.
+    pub wake: ObjectiveWake,
     /// Latest goal run: (status, finished-or-started timestamp, summary).
     pub latest_run: Option<(String, String, Option<String>)>,
     /// Recovery ledger: (disposition, consecutive_failures, failure_budget).
@@ -371,6 +369,79 @@ pub(crate) struct ObjectiveStatus {
     /// goal, which every surface must render as an explicit "control absent"
     /// rather than leaving the question unanswerable.
     pub control: Option<ObjectiveControlFacet>,
+}
+
+/// What wakes an objective. A mandate wakes from its own review clock and
+/// never uses `goal_schedules`, so an empty schedule list says nothing about
+/// a mandate controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectiveWake {
+    GoalSchedule {
+        /// Earliest next occurrence among active schedules; `None` when all
+        /// are paused.
+        next_run_at: Option<String>,
+    },
+    MandateClock {
+        next_review_at: String,
+    },
+    /// A mandate that is not active: nothing will wake it.
+    MandateHalted {
+        status: String,
+        /// The typed suspension reason, when it is suspended.
+        reason: Option<String>,
+    },
+    None,
+}
+
+impl ObjectiveWake {
+    /// `wake_source` on structured surfaces.
+    pub(crate) fn source(&self) -> &'static str {
+        match self {
+            Self::GoalSchedule { .. } => "goal_schedule",
+            Self::MandateClock { .. } => "mandate_clock",
+            Self::MandateHalted { .. } | Self::None => "none",
+        }
+    }
+
+    /// `schedule_state` on structured surfaces.
+    pub(crate) fn state(&self) -> &'static str {
+        match self {
+            Self::GoalSchedule {
+                next_run_at: Some(_),
+            } => "active",
+            Self::GoalSchedule { next_run_at: None } => "paused",
+            Self::MandateClock { .. } => "mandate_clock",
+            Self::MandateHalted { .. } => "mandate_halted",
+            Self::None => "missing",
+        }
+    }
+
+    /// When the objective wakes next, whatever wakes it.
+    pub(crate) fn next_at(&self) -> Option<&str> {
+        match self {
+            Self::GoalSchedule { next_run_at } => next_run_at.as_deref(),
+            Self::MandateClock { next_review_at } => Some(next_review_at),
+            Self::MandateHalted { .. } | Self::None => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::GoalSchedule {
+                next_run_at: Some(next),
+            } => format!("schedule active (next {next})"),
+            Self::GoalSchedule { next_run_at: None } => "schedule paused".to_string(),
+            Self::MandateClock { next_review_at } => {
+                format!("mandate clock (next review {next_review_at})")
+            }
+            Self::MandateHalted {
+                reason: Some(reason),
+                ..
+            } => format!("suspended ({reason}), no review scheduled"),
+            Self::MandateHalted { status, .. } => format!("{status}, no review scheduled"),
+            Self::None => "schedule missing".to_string(),
+        }
+    }
 }
 
 /// Typed delegation/control readout for one goal-backed objective, derived
@@ -495,22 +566,30 @@ pub(crate) fn objective_portfolio_row(
     // collection-membership claim.
     let source_membership = BTreeSet::from([enumerated_from]);
 
-    let active_count = schedules
-        .iter()
-        .filter(|schedule| !schedule.is_paused)
-        .count();
-    let schedule_state = if schedules.is_empty() {
-        "missing"
-    } else if active_count > 0 {
-        "active"
-    } else {
-        "paused"
+    let wake = match mandate {
+        Some(mandate) => match mandate.scheduled_next_review() {
+            Some(next_review_at) => ObjectiveWake::MandateClock {
+                next_review_at: next_review_at.to_string(),
+            },
+            None => ObjectiveWake::MandateHalted {
+                status: mandate.status.to_string(),
+                reason: mandate.suspension.as_ref().map(|suspension| {
+                    suspension
+                        .reason_code
+                        .clone()
+                        .unwrap_or_else(|| suspension.kind.as_str().to_string())
+                }),
+            },
+        },
+        None if schedules.is_empty() => ObjectiveWake::None,
+        None => ObjectiveWake::GoalSchedule {
+            next_run_at: schedules
+                .iter()
+                .filter(|schedule| !schedule.is_paused)
+                .map(|schedule| schedule.next_run_at.clone())
+                .min(),
+        },
     };
-    let next_run_at = schedules
-        .iter()
-        .filter(|schedule| !schedule.is_paused)
-        .map(|schedule| schedule.next_run_at.clone())
-        .min();
     let latest_run = runs.first().map(|run| {
         (
             run.status.clone(),
@@ -536,8 +615,7 @@ pub(crate) fn objective_portfolio_row(
         goal_id: goal_id.to_string(),
         source_membership,
         status: ObjectiveStatus {
-            schedule_state,
-            next_run_at,
+            wake,
             latest_run,
             recovery,
             runs_completed,
@@ -549,10 +627,7 @@ pub(crate) fn objective_portfolio_row(
 
 /// Render the snapshot as a single plain-text line for list surfaces.
 pub(crate) fn render_objective_status_line(status: &ObjectiveStatus) -> String {
-    let mut line = format!("schedule {}", status.schedule_state);
-    if let Some(next) = &status.next_run_at {
-        line.push_str(&format!(" (next {next})"));
-    }
+    let mut line = status.wake.describe();
     match &status.latest_run {
         Some((run_status, at, summary)) => {
             line.push_str(&format!("; last run {run_status} at {at}"));
@@ -660,11 +735,8 @@ mod tests {
         )
         .unwrap()
         .status;
-        assert_eq!(status.schedule_state, "active");
-        assert_eq!(
-            status.next_run_at.as_deref(),
-            Some("2026-09-01T10:00:00+00:00")
-        );
+        assert_eq!(status.wake.state(), "active");
+        assert_eq!(status.wake.next_at(), Some("2026-09-01T10:00:00+00:00"));
         let (run_status, _, summary) = status.latest_run.as_ref().unwrap();
         assert_eq!(run_status, "completed");
         assert_eq!(
@@ -735,8 +807,8 @@ mod tests {
         )
         .unwrap()
         .status;
-        assert_eq!(status.schedule_state, "paused");
-        assert_eq!(status.next_run_at, None);
+        assert_eq!(status.wake.state(), "paused");
+        assert_eq!(status.wake.next_at(), None);
         let (disposition, failures, _) = status.recovery.unwrap();
         assert_eq!(disposition, "escalated");
         assert_eq!(failures, 3);
@@ -863,6 +935,60 @@ mod tests {
         );
     }
 
+    /// A mandate controller has no goal schedule by design: it wakes from its
+    /// own clock while active, and from nothing once it is not.
+    #[test]
+    fn a_mandate_wakes_from_its_own_clock_or_not_at_all() {
+        let mut mandate = crate::traits::Mandate::new(
+            "goal-controller",
+            None,
+            "Keep the Acme Corp account useful",
+            "telegram:synthetic-user-1",
+            crate::traits::MandateAuthority::default(),
+            900,
+            3600,
+            1800,
+        );
+        mandate.confirmed_at = Some(chrono::Utc::now().to_rfc3339());
+        let status = |mandate: &crate::traits::Mandate| {
+            objective_portfolio_row(
+                "goal-controller",
+                ObjectiveCollection::MandateControllers,
+                &[],
+                &[],
+                None,
+                Some(mandate),
+                0,
+            )
+            .unwrap()
+            .status
+        };
+
+        let active = status(&mandate);
+        assert_eq!(active.wake.source(), "mandate_clock");
+        assert_eq!(active.wake.next_at(), Some(mandate.next_review_at.as_str()));
+        let line = render_objective_status_line(&active);
+        assert!(line.starts_with("mandate clock (next review"), "{line}");
+        assert!(!line.contains("missing"), "{line}");
+
+        mandate.status = crate::traits::MandateStatus::AwaitingInput;
+        mandate.suspension = Some(crate::traits::MandateSuspension::new(
+            crate::traits::MandateSuspensionKind::ReconciliationRequired,
+            Some("act_blocked_before_dispatch:untrusted_content_check".to_string()),
+        ));
+        let suspended = status(&mandate);
+        assert_eq!(suspended.wake.source(), "none");
+        assert_eq!(suspended.wake.next_at(), None);
+        assert_eq!(mandate.scheduled_next_review(), None);
+        let line = render_objective_status_line(&suspended);
+        assert!(
+            line.starts_with(
+                "suspended (act_blocked_before_dispatch:untrusted_content_check), no review scheduled"
+            ),
+            "{line}"
+        );
+    }
+
     #[test]
     fn portfolio_keeps_unrelated_collection_subjects_distinct_and_scopes_absence() {
         let mut scheduled_goal =
@@ -938,10 +1064,10 @@ mod tests {
 
         assert_eq!(portfolio.subjects().count(), 2);
         let scheduled = portfolio.subject(&scheduled_goal.id).unwrap();
-        assert_eq!(scheduled.status.schedule_state, "active");
+        assert_eq!(scheduled.status.wake.state(), "active");
         assert!(scheduled.status.control.is_none());
         let controller = portfolio.subject(&controller_goal.id).unwrap();
-        assert_eq!(controller.status.schedule_state, "missing");
+        assert_eq!(controller.status.wake.state(), "mandate_clock");
         assert_eq!(
             controller
                 .status

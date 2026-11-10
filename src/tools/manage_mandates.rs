@@ -1054,7 +1054,7 @@ impl ManageMandatesTool {
                 mandate.autonomy_mode,
                 mandate.version,
                 mandate.objective,
-                mandate.next_review_at,
+                mandate.scheduled_next_review().unwrap_or("none, not active"),
                 admission,
                 mandate.authority.max_mutating_actions_per_cycle,
                 mandate.authority.max_mutating_actions_per_rolling_24h
@@ -1286,7 +1286,7 @@ impl ManageMandatesTool {
                         "version": mandate.version,
                         "confirmed_at": mandate.confirmed_at,
                         "expires_at": mandate.expires_at,
-                        "next_review_at": mandate.next_review_at,
+                        "next_review_at": mandate.scheduled_next_review(),
                         "review_lease_active": mandate.review_lease_token.is_some(),
                         "review_lease_expires_at": mandate.review_lease_expires_at,
                         "suspension": mandate.suspension,
@@ -3703,7 +3703,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            output.contains("objective status: schedule active"),
+            output.contains("objective status: mandate clock (next review"),
             "{output}"
         );
         assert!(output.contains("last run completed"), "{output}");
