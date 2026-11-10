@@ -396,6 +396,8 @@ mod coordination_tests {
         parent.child_declaration = Some(crate::agent::authority::ChildDeclaration {
             parent_session: "telegram:synthetic-user-1".to_string(),
             scope: vec!["/w/synthetic".to_string()],
+            precedence: None,
+            claim: None,
         });
         let run = agent
             .run_child(ChildAgentRequest {
@@ -456,8 +458,9 @@ mod coordination_tests {
         MockProvider::text_response(&json!({"decision": decision, "note": note}).to_string())
     }
 
-    /// A tree whose top-level agent is ready, a shared file both children
-    /// have read, and a sibling's overwrite on top of it.
+    /// A tree whose top-level agent is ready, a file a sibling overwrote,
+    /// and a writer that has read the sibling's version and still wants to
+    /// replace it: a contest, put to the coordinator.
     async fn collision(
         answer: crate::traits::ProviderResponse,
     ) -> (
@@ -482,6 +485,7 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(&p, "from b\n"),
             MockProvider::text_response("B done."),
+            read_call(&p),
             write_call(&p, "from a\n"),
             answer,
             MockProvider::text_response("A finished."),
@@ -504,25 +508,41 @@ mod coordination_tests {
             .collect()
     }
 
-    /// The parent lifts the stale check for this one write.
+    /// The coordinator lets the change through: it lands, and the side that
+    /// lost cannot quietly put its own back.
     #[tokio::test]
-    async fn proceed_lets_the_contested_write_land() {
+    async fn apply_lets_the_contested_write_land_and_binds_the_other_side() {
         use crate::agent::coordination::ParentDecision;
         let (_dir, file, family, _permit, mut harness) =
-            collision(parent_says("proceed", "Yours is the right version.")).await;
+            collision(parent_says("apply", "Yours is the right version.")).await;
         turn(&mut harness, &family, CHILD_A).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "from a\n");
-        assert_eq!(decisions(&family), vec![ParentDecision::Proceed]);
+        assert_eq!(decisions(&family), vec![ParentDecision::Apply]);
         assert_eq!(
             latest_task_outcome(&harness, CHILD_A).await,
             crate::events::TaskOutcome::Succeeded
         );
+        // B reads A's version and tries to restore its own: refused by the
+        // ruling, with no second question.
+        let p = file.to_str().unwrap().to_string();
+        harness
+            .provider
+            .push_responses(vec![
+                read_call(&p),
+                write_call(&p, "from b\n"),
+                MockProvider::text_response("B gave way."),
+            ])
+            .await;
+        turn(&mut harness, &family, CHILD_B).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from a\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Apply]);
     }
 
-    /// `proceed` only lifts the check. An edit that then cannot apply did not
-    /// happen, and the child's run must not read as if it had.
+    /// The live failure this replaces: the text an edit targets is gone. The
+    /// writer is refused and reads again, sees for itself, and the
+    /// coordinator is never asked.
     #[tokio::test]
-    async fn proceed_on_an_edit_that_then_fails_stays_open() {
+    async fn an_edit_whose_text_is_gone_never_reaches_the_coordinator() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.md");
         std::fs::write(&file, "alpha\n").unwrap();
@@ -539,21 +559,31 @@ mod coordination_tests {
             read_call(p),
             edit_call(p, "alpha", "ALPHA"),
             MockProvider::text_response("B done."),
+            // Refused as stale; then, after reading, the tool's own error.
             edit_call(p, "alpha", "OMEGA"),
-            parent_says("proceed", "Go ahead."),
-            MockProvider::text_response("A finished."),
+            read_call(p),
+            edit_call(p, "alpha", "OMEGA"),
+            MockProvider::text_response("A saw the line was already changed."),
         ])
         .await;
         turn(&mut harness, &family, CHILD_A).await;
         turn(&mut harness, &family, CHILD_B).await;
         turn(&mut harness, &family, CHILD_A).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA\n");
-        assert!(family.coordination().has_unlanded_write(CHILD_A));
+        assert_eq!(decisions(&family), Vec::new());
+        assert_eq!(stale_refusals(&family, CHILD_A), 1);
+        harness
+            .provider
+            .assert_response_script_consumed()
+            .await
+            .unwrap();
     }
 
-    /// Reread sends the child back to the file; the run is an ordinary one.
+    /// Reading again does not make a sibling's change the reader's to
+    /// replace: the overwrite is put to the coordinator, who keeps the
+    /// sibling's, and a second try is refused without a second question.
     #[tokio::test]
-    async fn reread_refuses_the_write_and_the_retry_lands() {
+    async fn an_overwrite_after_a_reread_is_contested_and_keep_holds() {
         use crate::agent::coordination::ParentDecision;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.md");
@@ -570,8 +600,51 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(p, "from b\n"),
             MockProvider::text_response("B done."),
+            // Stale: refused with no question.
             write_call(p, "from a\n"),
-            parent_says("reread", "Keep theirs and add yours."),
+            // Read, then the same overwrite: a contest.
+            read_call(p),
+            write_call(p, "from a\n"),
+            parent_says("keep", "B's version is the one we want."),
+            // Trying again changes nothing and asks nobody.
+            edit_call(p, "from b", "from a"),
+            MockProvider::text_response("A left it."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Keep]);
+        harness
+            .provider
+            .assert_response_script_consumed()
+            .await
+            .unwrap();
+        // What makes the child's run `Partial` when it reports to its parent.
+        assert!(family.coordination().has_unlanded_write(CHILD_A));
+    }
+
+    /// A retry that keeps the sibling's lines and adds its own is ordinary:
+    /// it lands, nobody is asked, and the run is a success.
+    #[tokio::test]
+    async fn a_retry_that_only_adds_its_own_lines_lands_without_a_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            write_call(p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(p, "from a\n"),
             read_call(p),
             write_call(p, "from b\nfrom a\n"),
             MockProvider::text_response("A finished."),
@@ -581,11 +654,113 @@ mod coordination_tests {
         turn(&mut harness, &family, CHILD_B).await;
         turn(&mut harness, &family, CHILD_A).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\nfrom a\n");
-        assert_eq!(decisions(&family), vec![ParentDecision::Reread]);
+        assert_eq!(decisions(&family), Vec::new());
         assert_eq!(
             latest_task_outcome(&harness, CHILD_A).await,
             crate::events::TaskOutcome::Succeeded
         );
+    }
+
+    /// The coordinator said who wins when it started the second child: a
+    /// contest in the overlap is settled by that, both ways, with no
+    /// question, and the coordinator is told.
+    #[tokio::test]
+    async fn precedence_given_at_spawn_settles_the_contest_without_a_question() {
+        use crate::agent::coordination::{Member, Precedence};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\nbeta\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        for (session, said) in [(CHILD_A, None), (CHILD_B, Some(Precedence::ThisChild))] {
+            family.coordination().add_declared_member(
+                Member {
+                    session: session.to_string(),
+                    parent: ROOT_SESSION.to_string(),
+                    mission: "Update the synthetic notes".to_string(),
+                    specialist: None,
+                    scope: vec![real(&file)],
+                    running: true,
+                },
+                None,
+                said,
+            );
+        }
+        let mut harness = harness(vec![
+            // A changes the first line.
+            read_call(p),
+            edit_call(p, "alpha", "ALPHA-A"),
+            MockProvider::text_response("A done."),
+            // B, who has precedence, changes A's line and its own.
+            read_call(p),
+            edit_call(p, "ALPHA-A", "ALPHA-B"),
+            edit_call(p, "beta", "BETA-B"),
+            MockProvider::text_response("B done."),
+            // A reads and tries to take both back: refused by the rule.
+            read_call(p),
+            write_call(p, "ALPHA-A\nBETA-A\n"),
+            MockProvider::text_response("A gave way."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ALPHA-B\nBETA-B\n"
+        );
+        assert_eq!(decisions(&family), Vec::new());
+        let note = family.coordination().parent_note(ROOT_SESSION).unwrap();
+        assert!(
+            note.contains("takes precedence there") && note.contains("was refused under"),
+            "{note}"
+        );
+    }
+
+    /// "Instead" refuses the write and hands the child the coordinator's
+    /// instruction; the run is not held open for it.
+    #[tokio::test]
+    async fn instead_refuses_the_write_and_passes_the_instruction_on() {
+        use crate::agent::coordination::ParentDecision;
+        let (_dir, file, family, _permit, mut harness) =
+            collision(parent_says("instead", "Append your line under theirs.")).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Instead]);
+        assert!(!family.coordination().has_unlanded_write(CHILD_A));
+    }
+
+    /// What the coordinator is put, and what it may answer: the lines as
+    /// they were, are and would be, and only decisions that can happen.
+    #[tokio::test]
+    async fn the_coordinator_is_shown_the_lines_and_only_possible_decisions() {
+        let (_dir, _file, family, _permit, mut harness) =
+            collision(parent_says("keep", "Leave it.")).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        let log = harness.provider.call_log.lock().await;
+        let asked = log
+            .iter()
+            .find(|call| {
+                call.messages[0]["content"]
+                    .as_str()
+                    .is_some_and(|system| system.starts_with("You coordinate a team"))
+            })
+            .expect("the coordinator was asked");
+        let system = asked.messages[0]["content"].as_str().unwrap();
+        for offered in ["\"apply\"", "\"keep\"", "\"stop\"", "\"instead\""] {
+            assert!(system.contains(offered), "{offered}: {system}");
+        }
+        assert!(!system.contains("reread"), "{system}");
+        let packet = asked.messages[1]["content"].as_str().unwrap();
+        for fact in ["| alpha", "| from b", "| from a", CHILD_B] {
+            assert!(packet.contains(fact), "{fact}: {packet}");
+        }
+        assert!(asked.tools.is_empty());
     }
 
     /// Stop means the work did not happen, and a run that did other work
@@ -608,7 +783,7 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(p, "from b\n"),
             MockProvider::text_response("B done."),
-            read_call("/tmp/aidaemon-test/absent-synthetic-file"),
+            read_call(p),
             write_call(p, "from a\n"),
             parent_says("stop", "Another agent owns this."),
             MockProvider::text_response("A stopped."),
@@ -650,6 +825,7 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(p, "from b\n"),
             MockProvider::text_response("B done."),
+            read_call(p),
             write_call(p, "from a\n"),
             MockProvider::text_response("A stopped."),
         ])
@@ -683,6 +859,7 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(p, "from b\n"),
             MockProvider::text_response("B done."),
+            read_call(p),
             write_call(p, "from a\n"),
             MockProvider::text_response("A stopped."),
         ])
@@ -694,10 +871,10 @@ mod coordination_tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
     }
 
-    /// The file moved again while the parent answered: `proceed` covered
+    /// The file moved again while the parent answered: `apply` covered
     /// what the parent saw, so the write is judged afresh and does not land.
     #[tokio::test]
-    async fn proceed_does_not_cover_a_file_that_changed_during_the_wait() {
+    async fn apply_does_not_cover_a_file_that_changed_during_the_wait() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.md");
         std::fs::write(&file, "alpha\n").unwrap();
@@ -715,11 +892,13 @@ mod coordination_tests {
                 MockProvider::text_response("Read."),
                 write_call(&p, "from b\n"),
                 MockProvider::text_response("B done."),
+                read_call(&p),
                 write_call(&p, "from a\n"),
-                parent_says("proceed", "Go."),
+                parent_says("apply", "Go."),
                 MockProvider::text_response("A finished."),
             ],
             vec![
+                zero,
                 zero,
                 zero,
                 zero,
@@ -774,8 +953,9 @@ mod coordination_tests {
             MockProvider::text_response("Read."),
             write_call(&p, "from b\n"),
             MockProvider::text_response("B done."),
+            read_call(&p),
             write_call(&p, "from a\n"),
-            parent_says("reread", "secret-marker-note"),
+            parent_says("keep", "secret-marker-note"),
             MockProvider::text_response("A finished."),
         ])
         .await;
@@ -918,7 +1098,7 @@ mod coordination_tests {
             write_call(p, "one\n"),
             MockProvider::text_response("A done."),
             read_call(p),
-            write_call(p, "two\n"),
+            write_call(p, "one\ntwo\n"),
             MockProvider::text_response("B done."),
             // The root tries to finish, is asked to check, reads, finishes.
             MockProvider::text_response("All finished."),
@@ -954,7 +1134,7 @@ mod coordination_tests {
             write_call(p, "one\n"),
             MockProvider::text_response("A done."),
             read_call(p),
-            write_call(p, "two\n"),
+            write_call(p, "one\ntwo\n"),
             MockProvider::text_response("B done."),
             read_call(p),
             MockProvider::text_response("Finished."),
@@ -983,7 +1163,7 @@ mod coordination_tests {
             write_call(p, "one\n"),
             MockProvider::text_response("A done."),
             read_call(p),
-            write_call(p, "two\n"),
+            write_call(p, "one\ntwo\n"),
             MockProvider::text_response("B done."),
             MockProvider::tool_call_response("synthetic_shell", r#"{"command":"run the tests"}"#),
             MockProvider::text_response("Finished."),

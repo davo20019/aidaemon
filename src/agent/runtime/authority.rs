@@ -333,6 +333,10 @@ pub(crate) struct ChildDeclaration {
     pub parent_session: String,
     /// Files or directories the child will change, resolved.
     pub scope: Vec<String>,
+    /// Who wins where that scope overlaps a running sibling's, if stated.
+    pub precedence: Option<super::coordination::Precedence>,
+    /// The child's place in spawn order, held until it joins the roster.
+    pub claim: Option<std::sync::Arc<super::coordination::ScopeClaim>>,
 }
 
 /// What a spawned child inherits from the turn that spawned it: the turn's

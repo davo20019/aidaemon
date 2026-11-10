@@ -799,10 +799,13 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| format!("`{}` was refused before it ran", receipt.tool));
         let semantics = self.sdk_call_semantics(scope, &call.name, &call.arguments);
-        // Stale writes are retried by the writer and land: a failed attempt,
-        // not work the owner asked for and did not get.
+        // Stale writes are retried by the writer and land, and a write kept
+        // off a sibling's lines is the tree settling its own work: a failed
+        // attempt, not something the owner refused. A child that never makes
+        // the change ends `Partial` through the tree's own record.
         let retryable_collision = receipt.status == sdk::ReceiptStatus::Denied
-            && reason.starts_with(crate::agent::coordination::STALE_WRITE);
+            && (reason.starts_with(crate::agent::coordination::STALE_WRITE)
+                || reason.starts_with(crate::agent::coordination::CONTESTED_WRITE));
         let recorded = if receipt.status == sdk::ReceiptStatus::Denied && !retryable_collision {
             // Deny hooks and resolutions on SDK turns: the authority hook,
             // whose refusals carry its fixed marker, the untrusted-content

@@ -35,8 +35,8 @@ impl Tool for EscalateToParentTool {
             "name": "escalate_to_parent",
             "description": "Ask the agent coordinating this request to decide something you should \
                 not decide alone: work another sub-agent may already be doing, or a conflict with \
-                its changes. Use it sparingly; the answer is one of proceed, reread, stop or \
-                reassign, with a note.",
+                its changes. Use it sparingly; the answer is one of proceed, stop or instead \
+                (do what the note says), with a note.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -73,8 +73,9 @@ impl Tool for EscalateToParentTool {
                     subject: "a question".to_string(),
                     recent_actions: args.findings,
                     proposed_call: String::new(),
-                    sibling_change: String::new(),
+                    facts: String::new(),
                     question: args.question,
+                    options: crate::agent::coordination::QUESTION_OPTIONS.to_vec(),
                     untrusted: call.untrusted_seen,
                     voluntary: true,
                 },

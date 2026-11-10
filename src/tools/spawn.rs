@@ -441,6 +441,9 @@ struct SpawnArgs {
     /// Files or directories the child will change.
     #[serde(default)]
     scope: Vec<String>,
+    /// Who wins where that scope overlaps a running sibling's.
+    #[serde(default)]
+    precedence: Option<crate::agent::coordination::Precedence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -599,7 +602,12 @@ impl Tool for SpawnAgentTool {
                     "scope": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional: the files or directories this child will change. When several children will write, give them disjoint scopes so they do not collide. Advisory: an overlap is reported, never refused."
+                        "description": "Optional: the files or directories this child will change. When several children will write, give them disjoint scopes so they do not collide. If a scope must overlap a running child's, say who wins there with precedence."
+                    },
+                    "precedence": {
+                        "type": "string",
+                        "enum": ["this_child", "running_siblings", "shared"],
+                        "description": "Give this whenever scope overlaps a running child's: whose change stands if both change the same lines there. this_child: this child's. running_siblings: the children already running. shared: neither, and each such change is put to you to decide. Omitted, it is shared. No child ever overwrites another's lines without one of these deciding it."
                     }
                 },
                 "required": ["mission", "task"],
@@ -693,21 +701,45 @@ impl Tool for SpawnAgentTool {
             })
             .flatten();
         if let Some(family) = tree.as_ref() {
+            use crate::agent::coordination::Precedence;
             let scope = agent.resolve_child_scope(args.scope.clone()).await;
-            let overlaps = family.coordination().scope_overlaps(&scope);
+            let (claim, overlaps) = family.coordination().declare_scope(&args.mission, &scope);
             if !overlaps.is_empty() {
                 let listed = overlaps
                     .iter()
                     .map(|(sibling, path)| format!("{path} (also {sibling})"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                scope_overlap_note =
-                    format!("\n\nThis child's scope overlaps running sub-agents at: {listed}.");
+                let rule = match args.precedence {
+                    Some(Precedence::ThisChild) => {
+                        "This child takes precedence there: its change to lines the other \
+                         changed is made, and the other's change to its lines is refused."
+                    }
+                    Some(Precedence::RunningSiblings) => {
+                        "The running sub-agents take precedence there: this child's change to \
+                         lines they changed is refused."
+                    }
+                    Some(Precedence::Shared) => {
+                        "The area is shared: a change either makes to the other's lines there \
+                         is put to you to decide."
+                    }
+                    None => {
+                        "You gave no precedence, so the area is shared: a change either makes \
+                         to the other's lines there is put to you to decide, one at a time. \
+                         When you start children whose scopes overlap, pass precedence \
+                         (this_child, running_siblings or shared) to settle it up front."
+                    }
+                };
+                scope_overlap_note = format!(
+                    "\n\nThis child's scope overlaps running sub-agents at: {listed}. {rule}"
+                );
             }
             if let Some(parent) = parent_authority.as_mut() {
                 parent.child_declaration = Some(crate::agent::authority::ChildDeclaration {
                     parent_session: facts.session_id.clone(),
                     scope,
+                    precedence: args.precedence,
+                    claim: Some(Arc::new(claim)),
                 });
             }
         }
@@ -1643,6 +1675,8 @@ mod child_runtime_tests {
         /// Fails before the child begins running.
         fails_in_setup: std::sync::atomic::AtomicBool,
         salvage_lookups: StdMutex<Vec<String>>,
+        /// What each spawn declared about its child.
+        declarations: StdMutex<Vec<crate::agent::authority::ChildDeclaration>>,
     }
 
     impl ScriptedChild {
@@ -1657,6 +1691,7 @@ mod child_runtime_tests {
                 timed_out_tasks: StdMutex::new(Vec::new()),
                 panics: std::sync::atomic::AtomicBool::new(false),
                 fails_in_setup: std::sync::atomic::AtomicBool::new(false),
+                declarations: StdMutex::new(Vec::new()),
                 salvage_lookups: StdMutex::new(Vec::new()),
             })
         }
@@ -1691,6 +1726,13 @@ mod child_runtime_tests {
                 anyhow::bail!("synthetic setup failure");
             }
             crate::agent::authority::mark_child_began();
+            if let Some(declaration) = request
+                .parent_authority
+                .as_ref()
+                .and_then(|parent| parent.child_declaration.clone())
+            {
+                self.declarations.lock().unwrap().push(declaration);
+            }
             self.tasks.lock().unwrap().push(request.task);
             tokio::time::sleep(self.delay).await;
             if self.panics.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1995,6 +2037,40 @@ mod child_runtime_tests {
                 parent_run: None,
             });
         call_facts
+    }
+
+    /// What the coordinator says about an overlap at spawn travels with the
+    /// child as typed state, in spawn order, even when the sibling it
+    /// overlaps has not joined the roster yet.
+    #[tokio::test]
+    async fn precedence_and_spawn_order_travel_with_the_child() {
+        use crate::agent::coordination::Precedence;
+        let child = ScriptedChild::new("Finished.", Duration::ZERO);
+        let tool = tool_for(&child);
+        let family = crate::agent::authority::SpawnFamily::new(Default::default());
+        let first = json!({"mission": "m1", "task": "t", "scope": ["/w/src"]}).to_string();
+        let second = json!({
+            "mission": "m2", "task": "t", "scope": ["/w/src/lib.rs"],
+            "precedence": "this_child"
+        })
+        .to_string();
+        for args in [&first, &second] {
+            tool.call_with_execution_context(args, None, facts_in_tree(&family))
+                .await
+                .unwrap();
+        }
+        let declared = child.declarations.lock().unwrap().clone();
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].precedence, None);
+        assert_eq!(declared[1].precedence, Some(Precedence::ThisChild));
+        let order = |at: usize| declared[at].claim.as_ref().unwrap().order();
+        assert!(order(0) < order(1));
+
+        let unknown = json!({"mission": "m", "task": "t", "precedence": "mine"}).to_string();
+        assert!(tool
+            .call_with_execution_context(&unknown, None, facts_in_tree(&family))
+            .await
+            .is_err());
     }
 
     /// An overlap with a running sibling is stated, never refused, and the

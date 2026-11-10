@@ -2770,14 +2770,18 @@ impl Agent {
             .as_ref()
             .map(|(coordination, _)| coordination.clone());
         let roster_entry = roster_coordination.map(|(coordination, declaration)| {
-            coordination.add_member(crate::agent::coordination::Member {
-                session: child_session.clone(),
-                parent: declaration.parent_session,
-                mission: mission.chars().take(ROSTER_MISSION_CHARS).collect(),
-                specialist: arg_specialist.map(str::to_string),
-                scope: declaration.scope,
-                running: true,
-            });
+            coordination.add_declared_member(
+                crate::agent::coordination::Member {
+                    session: child_session.clone(),
+                    parent: declaration.parent_session,
+                    mission: mission.chars().take(ROSTER_MISSION_CHARS).collect(),
+                    specialist: arg_specialist.map(str::to_string),
+                    scope: declaration.scope,
+                    running: true,
+                },
+                declaration.claim.as_ref().map(|claim| claim.order()),
+                declaration.precedence,
+            );
             crate::agent::coordination::RosterEntry::new(coordination, child_session.clone())
         });
 
