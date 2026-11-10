@@ -38,6 +38,7 @@ mod conversation;
 mod egress;
 mod grants;
 mod instructions;
+pub mod line_ownership;
 mod loop_guard;
 mod memory;
 #[cfg(feature = "otel")]
