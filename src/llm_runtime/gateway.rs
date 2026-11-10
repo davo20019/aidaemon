@@ -211,8 +211,8 @@ impl SideCallGateway {
     fn model_for(&self, spec: &SideCallSpec, supplied: Option<&str>) -> Option<String> {
         let snapshot = self.runtime.snapshot();
         match spec.model {
-            ModelChoice::StrongestFirst | ModelChoice::Primary => Some(snapshot.primary_model()),
-            ModelChoice::Fast | ModelChoice::Cheap => Some(snapshot.cheap_model()),
+            ModelChoice::Primary => Some(snapshot.primary_model()),
+            ModelChoice::Cheap => Some(snapshot.cheap_model()),
             ModelChoice::CallerSupplied => supplied.map(str::to_string),
         }
     }

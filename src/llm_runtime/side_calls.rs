@@ -38,7 +38,9 @@ pub enum SideCall {
 /// What a side call's answer is used for; this sets how it may fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideCallClass {
-    /// Its answer decides whether an action may happen.
+    /// Its answer decides whether an action may happen. A judge tries the
+    /// strongest model (the primary) first, then the failover models, and
+    /// moves on only after an infrastructure failure.
     SafetyJudge,
     /// Its answer shapes the input the agent loop sees.
     InputShaper,
@@ -53,13 +55,10 @@ pub enum SideCallClass {
 /// Which model a side call runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
-    /// The strongest available model, then weaker ones if it fails.
-    StrongestFirst,
-    /// The configured primary model.
+    /// The configured primary model. For a safety judge, the first model
+    /// it tries.
     Primary,
-    /// The configured fast model.
-    Fast,
-    /// The configured cheap model for background work.
+    /// The configured cheap model (the router's fast tier).
     Cheap,
     /// The caller passes the model in.
     CallerSupplied,
@@ -119,24 +118,14 @@ impl SideCall {
         use OnFailure::*;
         use SideCallClass::*;
         let (purpose, class, model, secs, _on_failure) = match self {
-            SideCall::UntrustedVerifier => (
-                "untrusted_call_verifier",
-                SafetyJudge,
-                StrongestFirst,
-                20,
-                Refuse,
-            ),
-            SideCall::CommandRisk => (
-                "terminal_command_risk",
-                SafetyJudge,
-                StrongestFirst,
-                15,
-                Refuse,
-            ),
-            SideCall::RelationshipRouter => {
-                ("task_relationship", InputShaper, Fast, 45, SafeDefault)
+            SideCall::UntrustedVerifier => {
+                ("untrusted_call_verifier", SafetyJudge, Primary, 20, Refuse)
             }
-            SideCall::Summarization => ("summarization", InputShaper, Fast, 60, SafeDefault),
+            SideCall::CommandRisk => ("terminal_command_risk", SafetyJudge, Primary, 15, Refuse),
+            SideCall::RelationshipRouter => {
+                ("task_relationship", InputShaper, Cheap, 45, SafeDefault)
+            }
+            SideCall::Summarization => ("summarization", InputShaper, Cheap, 60, SafeDefault),
             SideCall::BackgroundInterpretation => (
                 "background_interpretation",
                 Presentation,
@@ -145,9 +134,9 @@ impl SideCall {
                 RawFallback,
             ),
             SideCall::ProgressiveExtraction => {
-                ("progressive_extraction", MemoryJob, Fast, 120, Skip)
+                ("progressive_extraction", MemoryJob, Cheap, 120, Skip)
             }
-            SideCall::FactExtraction => ("sdk_memory_extraction", MemoryJob, Fast, 120, Skip),
+            SideCall::FactExtraction => ("sdk_memory_extraction", MemoryJob, Cheap, 120, Skip),
             SideCall::TaskLearning => ("task_learning", MemoryJob, CallerSupplied, 120, Skip),
             SideCall::FactConsolidation => ("memory_consolidation", MemoryJob, Cheap, 120, Skip),
             SideCall::SessionAnalysis => ("episode_creation", MemoryJob, Cheap, 120, Skip),
@@ -179,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn safety_judges_refuse_and_try_the_strongest_model_first() {
+    fn safety_judges_refuse_and_start_from_the_primary_model() {
         for call in SideCall::ALL {
             let spec = call.spec();
             assert_eq!(
@@ -187,7 +176,7 @@ mod tests {
                 spec.on_failure == OnFailure::Refuse
             );
             if spec.class == SideCallClass::SafetyJudge {
-                assert_eq!(spec.model, ModelChoice::StrongestFirst);
+                assert_eq!(spec.model, ModelChoice::Primary);
             }
         }
     }
