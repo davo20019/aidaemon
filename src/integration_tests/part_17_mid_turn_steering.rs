@@ -102,6 +102,10 @@ async fn test_sdk_message_sent_mid_turn_reaches_the_next_model_call() {
         .find(|text| text.contains(steer))
         .expect("the next model call sees the mid-turn message");
     assert!(steered.starts_with("[The user sent this while you were working."));
+    assert!(
+        !steered.contains("track_requirements"),
+        "no checklist was declared, so there is none to revise: {steered}"
+    );
     drop(log);
 
     // Taken, so the channel will not run it again as its own turn.
@@ -111,6 +115,73 @@ async fn test_sdk_message_sent_mid_turn_reaches_the_next_model_call() {
     assert!(history
         .iter()
         .any(|m| m.role == "user" && m.content.as_deref() == Some(steer)));
+}
+
+/// Once the run has declared a checklist, a message taken mid-turn tells the
+/// model to revise it when the message changes the work: the checklist is the
+/// run's statement of what it will do, and only the model can restate it.
+#[tokio::test]
+async fn test_sdk_mid_turn_message_points_at_a_declared_checklist() {
+    let session = "tg_mid_turn_checklist";
+    let channel_ctx = ChannelContext::private("telegram");
+    let registry = Arc::new(crate::tasks::TaskRegistry::new(10));
+    let steer = "Also add a gallery page.";
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(QueueOnCall {
+        registry: registry.clone(),
+        session: session.to_string(),
+        message: crate::tasks::QueuedMessage::new(
+            steer,
+            UserRole::Owner,
+            channel_ctx.clone(),
+            Vec::new(),
+        ),
+    });
+    let checklist = serde_json::json!({"items": [
+        {"text": "Create the rooms page", "status": "in_progress"}
+    ]})
+    .to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &checklist),
+        MockProvider::tool_call_response("slow_step", "{}"),
+        MockProvider::text_response("Done."),
+        MockProvider::text_response("Done."),
+        MockProvider::text_response("Done."),
+    ]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    harness.agent.set_task_registry(registry.clone());
+
+    harness
+        .agent
+        .handle_message(
+            session,
+            "Create the rooms page",
+            None,
+            UserRole::Owner,
+            channel_ctx,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let log = harness.provider.call_log.lock().await;
+    let steered = log[2]
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .find(|text| text.contains(steer))
+        .expect("the call after the step sees the mid-turn message");
+    assert!(steered.starts_with("[The user sent this while you were working."));
+    assert!(
+        steered.contains("track_requirements"),
+        "the declared checklist is named: {steered}"
+    );
+    assert!(
+        steered.ends_with(steer),
+        "the user's words stay last: {steered}"
+    );
 }
 
 #[tokio::test]

@@ -413,6 +413,8 @@ impl Tool for TrackRequirementsTool {
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
          Mark items 'completed' as you finish them, or 'deferred' if you will not do one: the run \
          may then end, but a deferred or removed item is reported as not done, never as done. \
+         If the user adds, changes or cancels work while you are working, pass the revised list \
+         before continuing. \
          Skip this only for a single read-only lookup, a plain answer or conversation, or when \
          the user forbids it."
     }

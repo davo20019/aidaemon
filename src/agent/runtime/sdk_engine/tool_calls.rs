@@ -1466,6 +1466,7 @@ impl Agent {
                 scope
                     .open_checklist_items
                     .store(open as u64, Ordering::Relaxed);
+                scope.checklist_declared.store(true, Ordering::Relaxed);
                 if let Err(error) = scope
                     .emitter
                     .emit(EventType::ExecutorExpectationsDeclared, declared)

@@ -25,6 +25,14 @@ pub(super) const STEERING_MARKER: &str =
      still answer or finish everything they asked before it, unless this message \
      changes or cancels that.]";
 
+/// Follows [`STEERING_MARKER`] once the run has declared a checklist. Only
+/// the model can tell whether a message changes the work, and the checklist
+/// is its own statement of that work, so this asks and nothing enforces it.
+pub(super) const STEERING_CHECKLIST_NOTE: &str =
+    "[You declared a checklist for this request. If this message adds, changes or cancels \
+     work, call track_requirements with the full revised list before continuing. If it only \
+     clarifies or grants permission, leave the list as it is.]";
+
 /// The output ceiling a thinking cutoff raises to.
 pub(super) const MAX_RAISED_OUTPUT_TOKENS: u32 = 32_768;
 
@@ -538,6 +546,11 @@ impl Agent {
         let taken = registry
             .take_steering_messages(scope.session_id, scope.user_role, scope.channel_ctx)
             .await;
+        let header = if scope.checklist_declared.load(Ordering::Relaxed) {
+            format!("{STEERING_MARKER}\n{STEERING_CHECKLIST_NOTE}")
+        } else {
+            STEERING_MARKER.to_string()
+        };
         let mut messages = Vec::with_capacity(taken.len());
         for queued in taken {
             let mut message =
@@ -563,7 +576,7 @@ impl Agent {
             );
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": format!("{STEERING_MARKER}\n{}", queued.text),
+                "content": format!("{header}\n{}", queued.text),
             }));
         }
         messages

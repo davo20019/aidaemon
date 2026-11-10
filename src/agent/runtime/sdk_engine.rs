@@ -628,6 +628,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// Checklist items the model has not finished or set aside, as last
     /// declared through `track_requirements`.
     open_checklist_items: AtomicU64,
+    /// The model has declared a checklist in this run, finished or not.
+    checklist_declared: AtomicBool,
     status_tx: Option<mpsc::Sender<StatusUpdate>>,
     channel_ctx: &'a ChannelContext,
     user_role: UserRole,
@@ -1544,6 +1546,7 @@ impl Agent {
             recovery_demanded: AtomicBool::new(false),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
+            checklist_declared: AtomicBool::new(false),
         };
         // A parent or goal cancellation stops the run at its next check.
         let cancel = self
