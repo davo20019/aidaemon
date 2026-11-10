@@ -206,7 +206,7 @@ pub enum ToolCallEffect {
 pub struct ToolMutationEffects(u32);
 
 impl ToolMutationEffects {
-    pub const PROTOCOL_NAMES: [&str; 12] = [
+    pub const PROTOCOL_NAMES: [&str; 13] = [
         "local_source_write",
         "local_workspace_write",
         "local_derived_write",
@@ -219,6 +219,7 @@ impl ToolMutationEffects {
         "destructive",
         "unspecified",
         "scheduled_work",
+        "memory_write",
     ];
     pub const NONE: Self = Self(0);
     /// A write to user-authored files through a path-aware editing tool.
@@ -248,6 +249,9 @@ impl ToolMutationEffects {
     /// Creating or changing the daemon's own goals, schedules and reminders.
     /// Nothing leaves the machine; the work it sets up is judged when it runs.
     pub const SCHEDULED_WORK: Self = Self(1 << 11);
+    /// Saving to the daemon's own long-term memory. Nothing leaves the
+    /// machine and no workspace file changes.
+    pub const MEMORY_WRITE: Self = Self(1 << 12);
 
     /// Stable bit representation retained for durable telemetry and audits.
     /// Human-readable names are emitted alongside it; consumers must never
@@ -279,6 +283,7 @@ impl ToolMutationEffects {
             (Self::DESTRUCTIVE, "destructive"),
             (Self::UNSPECIFIED, "unspecified"),
             (Self::SCHEDULED_WORK, "scheduled_work"),
+            (Self::MEMORY_WRITE, "memory_write"),
         ]
         .into_iter()
         .filter_map(|(effect, name)| self.intersects(effect).then_some(name))
@@ -288,7 +293,10 @@ impl ToolMutationEffects {
     /// Machine-readable telemetry projection that keeps unknown future bits
     /// visible instead of silently dropping them.
     pub fn telemetry_value(self) -> serde_json::Value {
-        let known_bits = Self::SCHEDULED_WORK.bits() | Self::UNSPECIFIED.bits() | ((1 << 10) - 1);
+        let known_bits = Self::MEMORY_WRITE.bits()
+            | Self::SCHEDULED_WORK.bits()
+            | Self::UNSPECIFIED.bits()
+            | ((1 << 10) - 1);
         serde_json::json!({
             "bits": self.bits(),
             "names": self.protocol_names(),
@@ -323,6 +331,7 @@ impl ToolMutationEffects {
             "destructive" => Some(Self::DESTRUCTIVE),
             "unspecified" => Some(Self::UNSPECIFIED),
             "scheduled_work" => Some(Self::SCHEDULED_WORK),
+            "memory_write" => Some(Self::MEMORY_WRITE),
             _ => None,
         }
     }
@@ -372,6 +381,13 @@ impl ToolMutationEffects {
         // to report, so those plans must be able to close.
         let widened = if widened.intersects(Self::SCHEDULED_WORK) {
             Self(widened.0 | Self::CONFIGURATION.0 | Self::PROCESS_STATE.0)
+        } else {
+            widened
+        };
+        // A saved memory is what a model means by a derived write when it
+        // plans one. Added after the workspace widening: it is not a file.
+        let widened = if widened.intersects(Self::MEMORY_WRITE) {
+            Self(widened.0 | Self::LOCAL_DERIVED_WRITE.0)
         } else {
             widened
         };

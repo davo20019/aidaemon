@@ -481,10 +481,14 @@ impl crate::traits::ToolSemantics for RememberFactTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         if call_deletes_facts(arguments) {
             ToolCallSemantics::mutation_with(
-                ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::DESTRUCTIVE),
+                ToolMutationEffects::CONFIGURATION
+                    .union(ToolMutationEffects::MEMORY_WRITE)
+                    .union(ToolMutationEffects::DESTRUCTIVE),
             )
         } else {
-            ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION)
+            ToolCallSemantics::mutation_with(
+                ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::MEMORY_WRITE),
+            )
         }
     }
 
@@ -618,6 +622,14 @@ mod tests {
         }));
         assert!(store.satisfies(ToolMutationEffects::CONFIGURATION));
         assert!(!store.satisfies(ToolMutationEffects::DESTRUCTIVE));
+        // A plan that calls saving a fact a derived write can close, but a
+        // saved fact is never a workspace file, and a config change alone is
+        // not a saved fact.
+        assert!(store.satisfies(ToolMutationEffects::LOCAL_DERIVED_WRITE));
+        assert!(!store.satisfies(ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+        assert!(
+            !ToolMutationEffects::CONFIGURATION.satisfies(ToolMutationEffects::LOCAL_DERIVED_WRITE)
+        );
         // An empty key/value pair names nothing to delete.
         assert!(
             !effects(json!({"key": "", "value": ""})).satisfies(ToolMutationEffects::DESTRUCTIVE)
