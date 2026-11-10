@@ -2185,12 +2185,52 @@ pub struct MandateRunProofCounts {
     pub ambiguous_or_reserved_mutations: u32,
 }
 
+/// The gate that refused a mandate worker's mutation before dispatch, read
+/// from the typed denial on the worker's receipt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateDispatchGate {
+    UntrustedContentCheck,
+    MandateAuthority,
+    OwnerDeclined,
+    SecretScan,
+    Other,
+}
+
+impl MandateDispatchGate {
+    /// The gate named by a receipt's `access_denial.reason_code`.
+    pub fn from_reason_code(code: &str) -> Self {
+        match code {
+            "untrusted_egress_denied" => Self::UntrustedContentCheck,
+            "authority_hook_denied" => Self::MandateAuthority,
+            aidaemon_events::OWNER_APPROVAL_DECLINED => Self::OwnerDeclined,
+            "egress_secret_blocked" => Self::SecretScan,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn owner_label(self) -> &'static str {
+        match self {
+            Self::UntrustedContentCheck => "the untrusted-content safety check",
+            Self::MandateAuthority => "the limits of this mandate",
+            Self::OwnerDeclined => "an earlier decline of yours",
+            Self::SecretScan => "the outbound secret scan",
+            Self::Other => "a safety gate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MandateReconciliationReason {
     RootTaskNotSuccessful,
     ActMissingIntention,
     ActMissingWorkTask,
+    /// A gate refused the worker's mutation before dispatch, and the run
+    /// reserved nothing: no external change exists to reconcile.
+    ActBlockedBeforeDispatch {
+        gate: MandateDispatchGate,
+    },
     WorkTasksIncomplete,
     ActMissingVerifiedMutation,
     ActionLedgerMismatch,
@@ -2206,6 +2246,17 @@ impl MandateReconciliationReason {
             Self::RootTaskNotSuccessful => "root_task_not_successful",
             Self::ActMissingIntention => "act_missing_intention",
             Self::ActMissingWorkTask => "act_missing_work_task",
+            Self::ActBlockedBeforeDispatch { gate } => match gate {
+                MandateDispatchGate::UntrustedContentCheck => {
+                    "act_blocked_before_dispatch:untrusted_content_check"
+                }
+                MandateDispatchGate::MandateAuthority => {
+                    "act_blocked_before_dispatch:mandate_authority"
+                }
+                MandateDispatchGate::OwnerDeclined => "act_blocked_before_dispatch:owner_declined",
+                MandateDispatchGate::SecretScan => "act_blocked_before_dispatch:secret_scan",
+                MandateDispatchGate::Other => "act_blocked_before_dispatch:other",
+            },
             Self::WorkTasksIncomplete => "work_tasks_incomplete",
             Self::ActMissingVerifiedMutation => "act_missing_verified_mutation",
             Self::ActionLedgerMismatch => "action_ledger_mismatch",
@@ -2475,6 +2526,12 @@ impl MandateRunNotification {
             },
             MandateRunNotificationKind::Stopped => format!(
                 "{label} has stopped. Ask me why if you want the details. {reference}"
+            ),
+            MandateRunNotificationKind::ReconciliationRequired {
+                reason: MandateReconciliationReason::ActBlockedBeforeDispatch { gate },
+            } => format!(
+                "{label} is paused: it decided to act, but {} refused the action before it ran, so nothing was published or changed. Ask me for the details, then resume it when you're ready. {reference}",
+                gate.owner_label(),
             ),
             MandateRunNotificationKind::ReconciliationRequired { reason } => {
                 let detail = if unresolved > 0 {
