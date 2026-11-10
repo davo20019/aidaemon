@@ -13,32 +13,36 @@ struct TaskLeadSpec {
     input_text: String,
 }
 
-/// Who authored a child's result: `Untrusted` when the child read (or
-/// started with) untrusted content, by its in-memory flag or by its own
-/// record of tainted turns (its session is fresh per spawn). An unreadable
-/// record counts as tainted, and so does a taint the child saw but could not
-/// record.
+/// Whether a child's run saw no untrusted content: its in-memory flag is
+/// unset and its record of tainted turns (its session is fresh per spawn) is
+/// readable and empty. An unreadable record counts as tainted, and so does a
+/// taint the child saw but could not record.
+fn child_run_is_clean(read_untrusted: bool, record: &anyhow::Result<Vec<String>>) -> bool {
+    !read_untrusted && matches!(record, Ok(turns) if turns.is_empty())
+}
+
+/// Who authored a child's result: `Untrusted` unless its run was clean.
 fn child_result_trust(
     read_untrusted: bool,
-    record: anyhow::Result<Vec<String>>,
+    record: &anyhow::Result<Vec<String>>,
 ) -> aidaemon_core::SourceTrust {
-    match record {
-        Ok(turns) if turns.is_empty() && !read_untrusted => aidaemon_core::SourceTrust::Trusted,
-        _ => aidaemon_core::SourceTrust::Untrusted,
+    if child_run_is_clean(read_untrusted, record) {
+        aidaemon_core::SourceTrust::Trusted
+    } else {
+        aidaemon_core::SourceTrust::Untrusted
     }
 }
 
-/// Whether a child's run may teach durable memory: tainted when its
-/// in-memory flag says it read untrusted content (a failed record write only
-/// warns) or its record of tainted turns is non-empty or unreadable.
+/// Whether a child's run may teach durable memory: only a clean run does.
 fn run_taint(
     read_untrusted: bool,
-    read: &anyhow::Result<Vec<String>>,
+    record: &anyhow::Result<Vec<String>>,
 ) -> crate::memory::task_learning::RunTaint {
     use crate::memory::task_learning::RunTaint;
-    match read {
-        Ok(turns) if turns.is_empty() && !read_untrusted => RunTaint::Clean,
-        _ => RunTaint::Tainted,
+    if child_run_is_clean(read_untrusted, record) {
+        RunTaint::Clean
+    } else {
+        RunTaint::Tainted
     }
 }
 
@@ -3003,7 +3007,7 @@ impl Agent {
             }
         }
 
-        let trust = child_result_trust(child_flagged_untrusted, child_tainted_turns);
+        let trust = child_result_trust(child_flagged_untrusted, &child_tainted_turns);
         result.map(|response| SpawnChildResult {
             response,
             outcome: child_outcome,
@@ -3533,14 +3537,14 @@ mod tests {
     #[test]
     fn a_childs_unrecorded_or_unreadable_taint_fails_closed() {
         use aidaemon_core::SourceTrust::{Trusted, Untrusted};
-        assert_eq!(super::child_result_trust(false, Ok(Vec::new())), Trusted);
-        assert_eq!(super::child_result_trust(true, Ok(Vec::new())), Untrusted);
+        assert_eq!(super::child_result_trust(false, &Ok(Vec::new())), Trusted);
+        assert_eq!(super::child_result_trust(true, &Ok(Vec::new())), Untrusted);
         assert_eq!(
-            super::child_result_trust(false, Ok(vec!["turn-a".to_string()])),
+            super::child_result_trust(false, &Ok(vec!["turn-a".to_string()])),
             Untrusted
         );
         assert_eq!(
-            super::child_result_trust(false, Err(anyhow::anyhow!("unreadable"))),
+            super::child_result_trust(false, &Err(anyhow::anyhow!("unreadable"))),
             Untrusted
         );
     }
