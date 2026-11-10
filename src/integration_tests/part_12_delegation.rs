@@ -36,12 +36,15 @@ impl crate::traits::Tool for StructuredPatchTool {
         })
     }
 
-    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-let output: anyhow::Result<String> = async move {
-        Ok(format!("Synthetic patch applied: {arguments}"))
-    }.await;
-output.map(crate::traits::ToolCallOutcome::from_output)
-}
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> =
+            async move { Ok(format!("Synthetic patch applied: {arguments}")) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
 }
 
 impl crate::traits::ToolSemantics for StructuredPatchTool {
@@ -91,12 +94,15 @@ impl crate::traits::Tool for HighImpactCliAgentMock {
         })
     }
 
-    async fn execute(&self, _arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-let output: anyhow::Result<String> = async move {
-        Ok("cli agent executed".to_string())
-    }.await;
-output.map(crate::traits::ToolCallOutcome::from_output)
-}
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> =
+            async move { Ok("cli agent executed".to_string()) }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
 }
 
 impl crate::traits::ToolSemantics for HighImpactCliAgentMock {
@@ -1042,4 +1048,61 @@ async fn test_cancel_stops_a_sessions_background_children() {
         cancelled,
         vec!["background task: Publish the synthetic report".to_string()]
     );
+}
+
+/// Through the real agent: a spawn whose setup fails (here, a task lead
+/// with no goal) gives its place back, and a child that ran keeps it.
+#[tokio::test]
+async fn only_a_child_that_reached_its_run_counts_toward_the_requests_total() {
+    use crate::agent::authority::{within_permit, SpawnFamily, SpawnFamilyLimits};
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("done")]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let agent = Arc::new(harness.agent);
+    let family = SpawnFamily::new(SpawnFamilyLimits {
+        max_concurrent: 5,
+        max_total: 1,
+    });
+    let permit = family.try_admit().unwrap();
+    within_permit(
+        Some(&permit),
+        agent.spawn_child(
+            "synthetic mission",
+            "synthetic task",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            Some(AgentRole::TaskLead),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect_err("a task lead with no goal stops during setup");
+    drop(permit);
+
+    let permit = family.try_admit().expect("the failed setup used no place");
+    within_permit(
+        Some(&permit),
+        agent.spawn_child(
+            "synthetic mission",
+            "synthetic task",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    drop(permit);
+
+    assert!(family.try_admit().is_err(), "the child that ran kept it");
 }
