@@ -1459,8 +1459,12 @@ impl Agent {
         // the open request a follow-up advances, or the unfinished earlier
         // request a short continuation may refer to. Judging the bare current
         // message is how "Try again" lost the request it was about.
+        // A mandate run's request is the mandate the owner confirmed: its
+        // session is the owner's chat, whose open request is about something
+        // else, and its task text is the runtime's own.
         let inherited = self.inherited_authority.as_ref();
-        let lineage_request = if inherited.is_none() {
+        let mandate_origin = self.mandate_origin().await;
+        let lineage_request = if inherited.is_none() && mandate_origin.is_none() {
             let dialogue =
                 super::dialogue_state::get_or_rebuild_dialogue_state(self, session_id).await;
             super::dialogue_state::owner_request_for_verifier(
@@ -1471,13 +1475,16 @@ impl Agent {
         } else {
             None
         };
-        let origin_request: &str = inherited
-            .and_then(|parent| parent.origin_request.as_deref())
+        let origin_request: &str = mandate_origin
+            .as_ref()
+            .map(|origin| origin.request.as_str())
+            .or_else(|| inherited.and_then(|parent| parent.origin_request.as_deref()))
             .or(lineage_request.as_deref())
             .unwrap_or(user_text);
         let origin_trusted =
             crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
-                && inherited.is_none_or(|parent| parent.origin_trusted);
+                && inherited.is_none_or(|parent| parent.origin_trusted)
+                && mandate_origin.as_ref().is_none_or(|origin| origin.trusted);
         let scope = TurnScope {
             daemon_paths: &self.daemon_paths,
             execution_backend: &*self.execution_backend,

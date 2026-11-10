@@ -143,6 +143,156 @@ async fn test_tool_execution() {
     assert_eq!(response, "Here is your system info.");
 }
 
+/// A chat-created mandate claimed for review, its ACT recorded, and one
+/// executor task claimed under it: what a fenced executor run starts from.
+struct MandateExecutorFixture {
+    mandate: crate::traits::Mandate,
+    run: crate::traits::GoalRun,
+    root_task_id: String,
+    root_attempt: crate::traits::TaskAttempt,
+    worker_task_id: String,
+    worker_attempt: crate::traits::TaskAttempt,
+}
+
+async fn claim_mandate_executor(harness: &crate::testing::TestHarness) -> MandateExecutorFixture {
+    let claimed =
+        retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "e2e-heartbeat", 300))
+            .await
+            .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let mandate = claimed.into_iter().next().unwrap();
+    let root_task_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let root_task = crate::traits::Task {
+        id: root_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Review the chat-created stewardship mandate".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    let goal_run_id = uuid::Uuid::new_v4().to_string();
+    let run = retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_review_run(
+            &mandate.id,
+            mandate.review_lease_token.as_deref().unwrap(),
+            &goal_run_id,
+            &root_task,
+        )
+    })
+    .await
+    .unwrap();
+    let root_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_task_with_lease(
+            &root_task_id,
+            "e2e-task-lead",
+            Some("profile-task-lead"),
+            7_200,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let decision = crate::traits::MandateDecisionCycle::new(
+        &mandate.id,
+        &run.id,
+        crate::traits::MandateDecisionOutcome::Act,
+        "A useful bounded update is warranted",
+        mandate.version,
+    );
+    let mut intention = crate::traits::Intention::new(
+        &mandate.id,
+        &decision.id,
+        &run.id,
+        "Post one bounded stewardship update",
+        "It is within the confirmed target and quota",
+    );
+    intention.value_criterion = Some(mandate.success_criteria[0].clone());
+    intention.expected_benefit =
+        Some("The grounded update gives the audience useful current information.".to_string());
+    intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
+    intention.invalidation_criteria = Some(
+        "Do not post if the supporting information is stale, duplicated, or unverified."
+            .to_string(),
+    );
+    retry_test_sqlite_busy(|| {
+        harness
+            .state
+            .record_mandate_decision(&decision, Some(&intention), Some(&root_attempt.id))
+    })
+    .await
+    .unwrap();
+    let worker_task_id = uuid::Uuid::new_v4().to_string();
+    let worker_task = crate::traits::Task {
+        id: worker_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Send the exact fake-X update".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    assert!(retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_task_from_attempt(
+            &worker_task,
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            8,
+        )
+    })
+    .await
+    .unwrap());
+    let worker_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_mandate_task_from_attempt(
+            &worker_task_id,
+            "e2e-executor",
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            7_200,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    MandateExecutorFixture {
+        mandate,
+        run,
+        root_task_id,
+        root_attempt,
+        worker_task_id,
+        worker_attempt,
+    }
+}
+
 async fn retry_test_sqlite_busy<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
@@ -298,134 +448,14 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     );
     drop(calls);
 
-    let claimed =
-        retry_test_sqlite_busy(|| harness.state.claim_due_mandates(1, "e2e-heartbeat", 300))
-            .await
-            .unwrap();
-    assert_eq!(claimed.len(), 1);
-    let mandate = claimed.into_iter().next().unwrap();
-    let root_task_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let root_task = crate::traits::Task {
-        id: root_task_id.clone(),
-        goal_id: mandate.goal_id.clone(),
-        description: "Review the chat-created stewardship mandate".to_string(),
-        status: "pending".to_string(),
-        priority: "high".to_string(),
-        task_order: 0,
-        parallel_group: None,
-        depends_on: None,
-        agent_id: None,
-        context: None,
-        result: None,
-        error: None,
-        blocker: None,
-        idempotent: false,
-        retry_count: 0,
-        max_retries: 0,
-        created_at: now.clone(),
-        started_at: None,
-        completed_at: None,
-    };
-    let goal_run_id = uuid::Uuid::new_v4().to_string();
-    let run = retry_test_sqlite_busy(|| {
-        harness.state.create_mandate_review_run(
-            &mandate.id,
-            mandate.review_lease_token.as_deref().unwrap(),
-            &goal_run_id,
-            &root_task,
-        )
-    })
-    .await
-    .unwrap();
-    let root_attempt = retry_test_sqlite_busy(|| {
-        harness.state.claim_task_with_lease(
-            &root_task_id,
-            "e2e-task-lead",
-            Some("profile-task-lead"),
-            7_200,
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    let decision = crate::traits::MandateDecisionCycle::new(
-        &mandate.id,
-        &run.id,
-        crate::traits::MandateDecisionOutcome::Act,
-        "A useful bounded update is warranted",
-        mandate.version,
-    );
-    let mut intention = crate::traits::Intention::new(
-        &mandate.id,
-        &decision.id,
-        &run.id,
-        "Post one bounded stewardship update",
-        "It is within the confirmed target and quota",
-    );
-    intention.value_criterion = Some(mandate.success_criteria[0].clone());
-    intention.expected_benefit =
-        Some("The grounded update gives the audience useful current information.".to_string());
-    intention.risk = Some("A low-volume factual update has limited reputational risk.".to_string());
-    intention.invalidation_criteria = Some(
-        "Do not post if the supporting information is stale, duplicated, or unverified."
-            .to_string(),
-    );
-    retry_test_sqlite_busy(|| {
-        harness
-            .state
-            .record_mandate_decision(&decision, Some(&intention), Some(&root_attempt.id))
-    })
-    .await
-    .unwrap();
-    let worker_task_id = uuid::Uuid::new_v4().to_string();
-    let worker_task = crate::traits::Task {
-        id: worker_task_id.clone(),
-        goal_id: mandate.goal_id.clone(),
-        description: "Send the exact fake-X update".to_string(),
-        status: "pending".to_string(),
-        priority: "high".to_string(),
-        task_order: 1,
-        parallel_group: None,
-        depends_on: None,
-        agent_id: None,
-        context: None,
-        result: None,
-        error: None,
-        blocker: None,
-        idempotent: false,
-        retry_count: 0,
-        max_retries: 0,
-        created_at: now,
-        started_at: None,
-        completed_at: None,
-    };
-    assert!(retry_test_sqlite_busy(|| {
-        harness.state.create_mandate_task_from_attempt(
-            &worker_task,
-            &mandate.id,
-            mandate.version,
-            &run.id,
-            &root_attempt.id,
-            8,
-        )
-    })
-    .await
-    .unwrap());
-    let worker_attempt = retry_test_sqlite_busy(|| {
-        harness.state.claim_mandate_task_from_attempt(
-            &worker_task_id,
-            "e2e-executor",
-            &mandate.id,
-            mandate.version,
-            &run.id,
-            &root_attempt.id,
-            7_200,
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let MandateExecutorFixture {
+        mandate,
+        run,
+        root_task_id,
+        root_attempt,
+        worker_task_id,
+        worker_attempt,
+    } = claim_mandate_executor(&harness).await;
 
     harness
         .agent

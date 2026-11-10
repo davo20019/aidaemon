@@ -870,3 +870,139 @@ async fn queued_background_result(
         .unwrap();
     (queued.untrusted, history[0].turn_id.clone(), tainted)
 }
+
+/// The clean check judges a mandate worker's post against the mandate the
+/// owner confirmed. The runtime's own task text ("run one bounded review")
+/// authorizes nothing, and judging against it refused every post.
+#[tokio::test]
+async fn a_mandate_workers_egress_is_judged_against_the_confirmed_mandate() {
+    let target = "http://127.0.0.1:9/2/tweets";
+    let objective = "Steward @aidaemon_ai as an authentic proactive presence";
+    let scopes = json!([{
+        "tool": "http_request",
+        "operation": "POST",
+        "kind": "mutation",
+        "target_prefixes": [target],
+        "mutation_effects": ["remote_mutation", "external_delivery"]
+    }]);
+    let mandate_args = |action: &str| {
+        json!({
+            "action": action,
+            "objective": objective,
+            "operation_scopes": scopes,
+            "max_mutating_actions_per_cycle": 1,
+            "max_mutating_actions_per_rolling_24h": 4,
+            "min_seconds_between_mutations": 900,
+            "constraints": ["No fabrication, spam, or engagement bait"],
+            "success_criteria": ["Each post is useful to the audience"],
+            "stop_conditions": ["Authentication is revoked"]
+        })
+        .to_string()
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("manage_mandates", &mandate_args("draft")),
+        MockProvider::tool_call_response("manage_mandates", &mandate_args("create")),
+        MockProvider::text_response("The mandate is active."),
+        MockProvider::tool_call_response(
+            "http_request",
+            &json!({"method": "POST", "url": target, "body": "{\"text\":\"an update\"}"})
+                .to_string(),
+        ),
+        MockProvider::text_response(DENY),
+        MockProvider::text_response("The post was refused."),
+    ]);
+    let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
+    harness
+        .agent
+        .handle_message(
+            "owner-chat",
+            "Manage my X account as an ongoing authentic presence.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let fixture = claim_mandate_executor(&harness).await;
+    harness
+        .agent
+        .push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(Arc::new(
+            tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        ))));
+    harness.agent.set_test_mandate_execution(
+        &fixture.mandate.id,
+        fixture.mandate.version,
+        fixture.mandate.authority.clone(),
+        &fixture.mandate.goal_id,
+        &fixture.root_task_id,
+        &fixture.root_attempt.id,
+        &fixture.worker_attempt,
+    );
+    // As in production: the executor inherits a tainted turn from its lead.
+    let boilerplate = "Run one bounded autonomous review for mandate synthetic.";
+    harness
+        .agent
+        .set_test_inherited_authority(crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::full(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: None,
+            untrusted_context: true,
+            origin_request: Some(boilerplate.to_string()),
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: Vec::new(),
+            shared_declines: None,
+            spawn_family: None,
+            child_declaration: None,
+            parent_run: None,
+        });
+
+    harness
+        .agent
+        .handle_message(
+            "specialist:mandate-verifier",
+            "Execute the current committed intention.",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await;
+    let verifier = calls
+        .iter()
+        .find(|call| {
+            call.messages[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(VERIFIER_SYSTEM_PREFIX))
+        })
+        .expect("the check still runs for a mandate worker");
+    let seen = verifier.messages[1]["content"].as_str().unwrap();
+    assert!(seen.contains(objective), "{seen}");
+    assert!(seen.contains("No fabrication, spam"), "{seen}");
+    assert!(seen.contains(target), "{seen}");
+    assert!(seen.contains("Owner's request"), "{seen}");
+    assert!(!seen.contains(boilerplate), "{seen}");
+    drop(calls);
+
+    // The check's refusal still binds a mandate worker.
+    let attempts = harness
+        .state
+        .list_mandate_mutation_attempts_for_run(&fixture.run.id)
+        .await
+        .unwrap();
+    assert!(attempts.is_empty(), "{attempts:?}");
+    let code: String = sqlx::query_scalar(
+        "SELECT json_extract(data, '$.receipt.access_denial.reason_code') FROM events
+         WHERE event_type = 'tool_result' AND json_extract(data, '$.task_id') = ?",
+    )
+    .bind(&fixture.worker_task_id)
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(code, "untrusted_egress_denied");
+}

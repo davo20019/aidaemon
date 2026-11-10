@@ -24,6 +24,38 @@ pub(crate) fn is_non_delegable(tool: &dyn crate::traits::Tool) -> bool {
     tool.dispatch_facts().opaque_execution || is_non_delegable_tool(tool.name())
 }
 
+/// How much of a confirmed strategy's body the clean check reads.
+const VERIFIER_STRATEGY_CHARS: usize = 2_000;
+
+/// The owner's request for a mandate run, as the untrusted-call verifier reads
+/// it. Built only from the owner-confirmed policy row: the runtime's task text
+/// authorizes nothing, and late owner guidance never widens a mandate.
+pub(crate) fn verifier_request(mandate: &crate::traits::Mandate) -> String {
+    let strategy = mandate.strategy.as_ref().map(|strategy| {
+        serde_json::json!({
+            "description": strategy.description,
+            "body": crate::utils::truncate_str(&strategy.body, VERIFIER_STRATEGY_CHARS),
+        })
+    });
+    let statement = serde_json::json!({
+        "objective": mandate.objective,
+        "autonomy_mode": mandate.autonomy_mode,
+        "authority": mandate.authority,
+        "strategy": strategy,
+        "constraints": mandate.constraints,
+        "success_criteria": mandate.success_criteria,
+        "stop_conditions": mandate.stop_conditions,
+    });
+    format!(
+        "The owner confirmed this standing mandate (policy version {}). The assistant \
+         carries it out on its own over repeated reviews, so the owner does not ask for \
+         each action separately. An operation listed under authority, on a listed target, \
+         that serves the objective and respects the constraints is what the owner asked \
+         for; anything else is not. Mandate: {statement}",
+        mandate.version
+    )
+}
+
 /// Extract only explicit owner guidance from a controller goal's otherwise
 /// mixed context. This is the sole controller-context field allowed into a
 /// mandate child prompt. Keep both entry count and aggregate prompt size
@@ -272,6 +304,43 @@ pub(crate) fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'st
 mod tests {
     use super::*;
     use crate::traits::ToolMutationEffects;
+
+    /// The verifier reads the confirmed policy and nothing the run wrote.
+    #[test]
+    fn verifier_request_states_the_confirmed_policy() {
+        let mut mandate = crate::traits::Mandate::new(
+            "goal-synthetic",
+            None,
+            "Keep the Acme Corp account useful",
+            "telegram:synthetic-user-1",
+            MandateAuthority {
+                allowed_target_prefixes: vec!["https://api.example.invalid/posts".to_string()],
+                max_mutating_actions_per_cycle: 1,
+                ..Default::default()
+            },
+            900,
+            3600,
+            1800,
+        );
+        mandate.constraints = vec!["No engagement bait".to_string()];
+        mandate.strategy = Some(crate::traits::MandateStrategySnapshot {
+            skill_name: "voice".to_string(),
+            snapshot_version: 1,
+            content_sha256: String::new(),
+            description: "Plain factual voice".to_string(),
+            body: "b".repeat(9_000),
+            source: None,
+        });
+
+        let request = verifier_request(&mandate);
+
+        assert!(request.contains("The owner confirmed this standing mandate"));
+        assert!(request.contains("Keep the Acme Corp account useful"));
+        assert!(request.contains("https://api.example.invalid/posts"));
+        assert!(request.contains("No engagement bait"));
+        assert!(request.contains("Plain factual voice"));
+        assert!(!request.contains(&"b".repeat(2_001)), "the body is capped");
+    }
 
     #[test]
     fn mandate_denial_next_step_offers_only_what_the_role_can_do() {

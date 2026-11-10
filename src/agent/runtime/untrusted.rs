@@ -188,6 +188,44 @@ pub(in crate::agent) fn origin_is_owner_authored(user_role: UserRole, session_id
     user_role == UserRole::Owner && !crate::agent::loop_utils::is_trigger_session(session_id)
 }
 
+/// What a mandate run's egress is judged against.
+pub(in crate::agent) struct MandateOrigin {
+    pub request: String,
+    pub trusted: bool,
+}
+
+impl Agent {
+    /// The confirmed mandate as this run's owner request; `None` outside a
+    /// mandate run. A run whose fence no longer matches an owner-confirmed
+    /// policy has no owner request at all, so its egress is refused.
+    pub(in crate::agent) async fn mandate_origin(&self) -> Option<MandateOrigin> {
+        let fence = self.mandate_execution.as_ref()?;
+        let mandate = match self.state.get_mandate(&fence.mandate_id).await {
+            Ok(mandate) => mandate,
+            Err(error) => {
+                warn!(mandate_id = %fence.mandate_id, %error, "Mandate unreadable for the egress check");
+                None
+            }
+        };
+        Some(
+            match mandate.filter(|mandate| {
+                mandate.version == fence.mandate_version
+                    && mandate.authority == fence.authority
+                    && mandate.confirmed_at.is_some()
+            }) {
+                Some(mandate) => MandateOrigin {
+                    request: crate::mandates::verifier_request(&mandate),
+                    trusted: true,
+                },
+                None => MandateOrigin {
+                    request: format!("Stale or unconfirmed mandate {}.", fence.mandate_id),
+                    trusted: false,
+                },
+            },
+        )
+    }
+}
+
 fn string_lengths(value: &Value, lengths: &mut Vec<usize>) {
     match value {
         Value::String(text) => lengths.push(text.chars().count()),
@@ -527,6 +565,44 @@ mod tests {
 
     /// A provider that cannot serve must not disable the check while another
     /// provider can still judge the call.
+    /// A fence with no matching owner-confirmed policy has no owner request.
+    #[tokio::test]
+    async fn a_mandate_run_without_a_confirmed_policy_has_no_owner_request() {
+        use crate::testing::MockProvider;
+        let mut harness = crate::testing::setup_test_agent(MockProvider::new())
+            .await
+            .unwrap();
+        assert!(harness.agent.mandate_origin().await.is_none());
+        let attempt: crate::traits::TaskAttempt = serde_json::from_value(json!({
+            "id": "attempt-synthetic",
+            "task_id": "task-synthetic",
+            "goal_run_id": "run-synthetic",
+            "worker_profile_id": null,
+            "worker_instance_id": "worker-synthetic",
+            "lease_token": "lease-synthetic",
+            "status": "running",
+            "lease_expires_at": "2026-11-10T00:00:00Z",
+            "last_heartbeat_at": "2026-11-10T00:00:00Z",
+            "workspace_id": null,
+            "started_at": "2026-11-10T00:00:00Z",
+            "completed_at": null,
+        }))
+        .unwrap();
+        harness.agent.set_test_mandate_execution(
+            "mandate-that-does-not-exist",
+            1,
+            crate::traits::MandateAuthority::default(),
+            "goal-synthetic",
+            "root-synthetic",
+            "root-attempt-synthetic",
+            &attempt,
+        );
+
+        let origin = harness.agent.mandate_origin().await.unwrap();
+
+        assert!(!origin.trusted);
+    }
+
     #[test]
     fn the_verifier_judges_a_delegated_step_like_any_other_call() {
         let messages = verifier_messages(
