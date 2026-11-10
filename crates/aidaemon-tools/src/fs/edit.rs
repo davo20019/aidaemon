@@ -92,7 +92,7 @@ impl OutcomeTool for EditFile {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &ToolCallContext,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -123,6 +123,17 @@ impl OutcomeTool for EditFile {
         if backend.metadata(&path).await.is_err() {
             anyhow::bail!("File not found: {}", path_str);
         }
+
+        // Held from before the read until the write has landed.
+        let write_guard = match crate::semantics::file_fence(facts) {
+            Some(fence) => Some(
+                fence
+                    .begin_write(path_str)
+                    .await
+                    .map_err(|why| anyhow::anyhow!(why))?,
+            ),
+            None => None,
+        };
 
         let bytes = backend.read(&path).await?;
         if bytes.iter().take(8192).any(|byte| *byte == 0) {
@@ -176,6 +187,9 @@ impl OutcomeTool for EditFile {
         backend
             .write(&path, new_content.as_bytes(), WriteMode::Overwrite, false)
             .await?;
+        if let Some(write_guard) = write_guard {
+            write_guard.committed().await;
+        }
 
         // Show context around the change
         let replaced_count = if replace_all { count } else { 1 };

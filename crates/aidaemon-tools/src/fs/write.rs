@@ -94,7 +94,7 @@ impl OutcomeTool for WriteFile {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &ToolCallContext,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         // Parameter aliasing: models often use "file_path" or "file" instead of "path"
@@ -151,6 +151,17 @@ impl OutcomeTool for WriteFile {
             );
         }
 
+        // Held until the write has landed.
+        let write_guard = match crate::semantics::file_fence(facts) {
+            Some(fence) => Some(
+                fence
+                    .begin_write(path_str)
+                    .await
+                    .map_err(|why| anyhow::anyhow!(why))?,
+            ),
+            None => None,
+        };
+
         if mode == "append" {
             let existing_size = backend
                 .metadata(&path)
@@ -160,6 +171,9 @@ impl OutcomeTool for WriteFile {
             backend
                 .write(&path, content.as_bytes(), WriteMode::Append, create_dirs)
                 .await?;
+            if let Some(write_guard) = write_guard {
+                write_guard.committed().await;
+            }
 
             let appended = content.len();
             let appended_lines = content.lines().count();
@@ -193,6 +207,9 @@ impl OutcomeTool for WriteFile {
         backend
             .write(&path, content.as_bytes(), WriteMode::Overwrite, create_dirs)
             .await?;
+        if let Some(write_guard) = write_guard {
+            write_guard.committed().await;
+        }
 
         let new_size = content.len();
         let line_count = content.lines().count();

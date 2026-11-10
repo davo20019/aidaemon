@@ -1513,6 +1513,7 @@ impl Agent {
                             coordination: coordination.clone(),
                             member: scope.session_id.to_string(),
                             backend: self.execution_backend.clone(),
+                            call_id: request.call_id.clone(),
                         },
                     ))
                 }),

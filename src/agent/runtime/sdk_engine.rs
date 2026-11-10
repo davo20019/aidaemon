@@ -791,7 +791,11 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| format!("`{}` was refused before it ran", receipt.tool));
         let semantics = self.sdk_call_semantics(scope, &call.name, &call.arguments);
-        let recorded = if receipt.status == sdk::ReceiptStatus::Denied {
+        // Stale writes are retried by the writer and land: a failed attempt,
+        // not work the owner asked for and did not get.
+        let retryable_collision = receipt.status == sdk::ReceiptStatus::Denied
+            && reason.starts_with(crate::agent::coordination::STALE_WRITE);
+        let recorded = if receipt.status == sdk::ReceiptStatus::Denied && !retryable_collision {
             // Deny hooks and resolutions on SDK turns: the authority hook,
             // whose refusals carry its fixed marker, the untrusted-content
             // verifier (its own marker), the owner's declines (the kernel's
@@ -853,7 +857,11 @@ impl Agent {
                 &call,
                 &call.arguments,
                 reason,
-                crate::traits::ToolOutcomeStatus::FailedPermanent,
+                if retryable_collision {
+                    crate::traits::ToolOutcomeStatus::FailedRetryable
+                } else {
+                    crate::traits::ToolOutcomeStatus::FailedPermanent
+                },
                 crate::traits::ToolInvocationStage::RejectedBeforeDispatch,
                 false,
                 semantics,
@@ -1225,11 +1233,23 @@ impl Agent {
         );
         let hooks = TurnHooks {
             canonical: tool_calls::CanonicalCallHook {
-                tools: Arc::new(turn_tools),
+                tools: turn_tools,
                 known_project_dir: known_project_dir.clone(),
                 workspace_grant,
                 task_access: authority.task_access.clone(),
+        let turn_tools = Arc::new(turn_tools);
+        let spawn_family = self
+            .inherited_authority
+            .as_ref()
+            .and_then(|parent| parent.spawn_family.clone())
+            .unwrap_or_else(|| crate::agent::authority::SpawnFamily::new(self.limits.spawn_family));
                 authorized_scopes: authorized_scopes.clone(),
+            coordination: crate::agent::coordination::CoordinationHook {
+                family: spawn_family.clone(),
+                member: session_id.to_string(),
+                tools: turn_tools.clone(),
+                backend: self.execution_backend.clone(),
+            },
                 records: canonical_calls.clone(),
                 paths: self.daemon_paths.clone(),
                 backend: self.execution_backend.clone(),
@@ -1377,11 +1397,6 @@ impl Agent {
             .as_ref()
             .and_then(|parent| parent.shared_declines.clone())
             .unwrap_or_default();
-        let spawn_family = self
-            .inherited_authority
-            .as_ref()
-            .and_then(|parent| parent.spawn_family.clone())
-            .unwrap_or_else(|| crate::agent::authority::SpawnFamily::new(self.limits.spawn_family));
         let mut state = state.share_declines(shared_declines.clone());
         state.parent_run = self
             .inherited_authority

@@ -106,6 +106,7 @@ pub(super) enum HookSlot {
     Untrusted,
     Approval,
     Dispatch,
+    Coordination,
 }
 
 /// The turn's hooks, registered in the pinned order: the canonical form of
@@ -113,9 +114,10 @@ pub(super) enum HookSlot {
 /// daemon's loop guard and ledger stop; memory; the outbound secret scan,
 /// so no secret reaches the untrusted-content verifier or an approval card;
 /// the untrusted-content rule; and owner approval last, so the owner is
-/// asked only about calls every other hook allows. No hook after
-/// `UntrustedHook` may rewrite a call. The kernel's decline check runs
-/// before all of them.
+/// asked only about calls every other hook allows. Stale writes are judged
+/// after everything else, against the file as it is when the call would run.
+/// No hook after `UntrustedHook` may rewrite a call. The kernel's decline
+/// check runs before all of them.
 pub(super) struct TurnHooks {
     pub(super) canonical: super::tool_calls::CanonicalCallHook,
     pub(super) authority: sdk::AuthorityHook,
@@ -134,6 +136,7 @@ pub(super) struct TurnHooks {
     pub(super) untrusted: sdk::UntrustedHook,
     pub(super) approval: aidaemon_policies::ApprovalPolicy,
     pub(super) dispatch: DispatchGate,
+    pub(super) coordination: crate::agent::coordination::CoordinationHook,
     pub(super) after_call: AfterCallRecord,
 }
 
@@ -159,6 +162,7 @@ impl TurnHooks {
         chain.push((HookSlot::Untrusted, Arc::new(self.untrusted)));
         chain.push((HookSlot::Approval, Arc::new(self.approval)));
         chain.push((HookSlot::Dispatch, Arc::new(self.dispatch)));
+        chain.push((HookSlot::Coordination, Arc::new(self.coordination)));
         chain
     }
 }
