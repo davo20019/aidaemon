@@ -810,6 +810,8 @@ impl Agent {
             let untrusted_denial = reason.starts_with(crate::agent::untrusted::UNTRUSTED_BLOCKED);
             let owner_declined = reason.starts_with(sdk::OWNER_DECLINED);
             let egress_blocked = reason.starts_with(sdk::EGRESS_BLOCKED);
+            let coordination_stop =
+                reason.starts_with(crate::agent::coordination::COORDINATION_STOP);
             if authority_denial {
                 if !receipt.read_only {
                     self.with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
@@ -829,7 +831,7 @@ impl Agent {
                     }),
                 )
                 .await;
-            } else if !untrusted_denial && !owner_declined {
+            } else if !untrusted_denial && !owner_declined && !coordination_stop {
                 self.with_harness_eval(|eval| eval.record_repetition_guard())
                     .await;
             }
@@ -848,6 +850,8 @@ impl Agent {
                     crate::events::OWNER_APPROVAL_DECLINED
                 } else if egress_blocked {
                     "egress_secret_blocked"
+                } else if coordination_stop {
+                    "coordination_stopped"
                 } else {
                     "kernel_hook_denied"
                 },
@@ -1243,12 +1247,21 @@ impl Agent {
             .as_ref()
             .and_then(|parent| parent.spawn_family.clone())
             .unwrap_or_else(|| crate::agent::authority::SpawnFamily::new(self.limits.spawn_family));
+        if self.inherited_authority.is_none() {
+            spawn_family
+                .coordination()
+                .bind_root(session_id, user_text, &turn_id);
+        }
         let hooks = TurnHooks {
             coordination: crate::agent::coordination::CoordinationHook {
                 family: spawn_family.clone(),
                 member: session_id.to_string(),
                 tools: turn_tools.clone(),
                 backend: self.execution_backend.clone(),
+                escalator: crate::agent::coordination::Escalator::new(
+                    self.side_calls.clone(),
+                    self.state.clone(),
+                ),
             },
             canonical: tool_calls::CanonicalCallHook {
                 tools: turn_tools,

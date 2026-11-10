@@ -53,7 +53,9 @@ pub use cli_agent::CliAgentTool;
 #[cfg(feature = "computer_use")]
 pub use computer_use::ComputerUseTool;
 pub use config_manager::ConfigManagerTool;
+mod escalate;
 pub use diagnose::DiagnoseTool;
+pub use escalate::EscalateToParentTool;
 pub use goal_trace::GoalTraceTool;
 pub use health_probe::HealthProbeTool;
 pub use image_generation::GenerateImageTool;

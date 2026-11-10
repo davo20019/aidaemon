@@ -133,7 +133,7 @@ async fn call_scoped_builtin_file_tool(
 
 pub(super) struct ToolExecCtx<'a> {
     /// The tree's file fence for this call, when agents share the workspace.
-    pub file_fence: Option<aidaemon_tools::semantics::CallFileFence>,
+    pub file_fence: Option<Arc<crate::agent::coordination::CallFence>>,
     pub session_id: &'a str,
     pub task_id: Option<&'a str>,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -748,6 +748,9 @@ impl Agent {
             ..Default::default()
         };
         if let Some(fence) = ctx.file_fence.clone() {
+            facts
+                .extensions
+                .insert(aidaemon_tools::semantics::CallFileFence(fence.clone()));
             facts.extensions.insert(fence);
         }
         let dispatch = self.exec_dispatch_facts(name, ctx);

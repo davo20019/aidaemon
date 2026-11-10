@@ -1675,6 +1675,10 @@ impl Agent {
         if let Some(ref spawn_tool) = spawn_tool {
             tools.push(spawn_tool.clone());
         }
+        // A plain child in a tree can hand the coordinator a decision.
+        if inherited_authority.spawn_family.is_some() {
+            tools.push(Arc::new(crate::tools::EscalateToParentTool));
+        }
 
         let effective_max_iterations =
             max_iterations_override.unwrap_or(self.limits.max_iterations);

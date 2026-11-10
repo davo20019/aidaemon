@@ -165,6 +165,12 @@ pub(crate) struct SpawnFamilyLimits {
     pub max_concurrent: usize,
     /// In total, across the whole tree.
     pub max_total: usize,
+    /// The tree tracks files and collisions; off restores unfenced writes.
+    pub coordination: bool,
+    /// Questions one child may put to the top-level agent itself.
+    pub max_escalations_per_child: usize,
+    /// Escalations of any kind in the whole tree.
+    pub max_escalations_per_request: usize,
 }
 
 impl Default for SpawnFamilyLimits {
@@ -172,6 +178,10 @@ impl Default for SpawnFamilyLimits {
         Self {
             max_concurrent: crate::config::DEFAULT_SUBAGENTS_MAX_CONCURRENT,
             max_total: crate::config::DEFAULT_SUBAGENTS_MAX_PER_REQUEST,
+            coordination: true,
+            max_escalations_per_child: crate::config::DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD,
+            max_escalations_per_request:
+                crate::config::DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST,
         }
     }
 }
@@ -261,7 +271,10 @@ impl SpawnFamily {
             limits,
             counts: std::sync::Mutex::default(),
             tokens: std::sync::Arc::default(),
-            coordination: Default::default(),
+            coordination: super::coordination::Coordination::new(
+                limits.max_escalations_per_child,
+                limits.max_escalations_per_request,
+            ),
         }))
     }
 
@@ -274,7 +287,7 @@ impl SpawnFamily {
     /// nobody to coordinate with.
     pub(crate) fn active_coordination(&self) -> Option<&super::coordination::Coordination> {
         let counts = self.0.counts.lock().unwrap_or_else(|e| e.into_inner());
-        (counts.started > 0).then_some(&self.0.coordination)
+        (self.0.limits.coordination && counts.started > 0).then_some(&self.0.coordination)
     }
 
     /// The tree's token counter, charged by every run in it.
@@ -500,6 +513,7 @@ mod tests {
         SpawnFamily::new(SpawnFamilyLimits {
             max_concurrent,
             max_total,
+            ..Default::default()
         })
     }
 

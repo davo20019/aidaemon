@@ -3793,8 +3793,11 @@ impl sdk::Tool for NoopTool {
     }
 }
 
-#[test]
-fn hook_order_is_pinned() {
+#[tokio::test]
+async fn hook_order_is_pinned() {
+    let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+        .await
+        .unwrap();
     let (calls, _rx) = mpsc::channel(1);
     let hooks = TurnHooks {
         canonical: super::tool_calls::CanonicalCallHook {
@@ -3849,6 +3852,10 @@ fn hook_order_is_pinned() {
             member: "telegram:synthetic-user-1".to_string(),
             tools: Arc::default(),
             backend: crate::execution::active_execution_backend(),
+            escalator: crate::agent::coordination::Escalator::new(
+                harness.agent.side_calls.clone(),
+                harness.state.clone(),
+            ),
         },
         dispatch: DispatchGate {
             calls: calls.clone(),

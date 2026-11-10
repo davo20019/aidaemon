@@ -1064,6 +1064,7 @@ async fn only_a_child_that_reached_its_run_counts_toward_the_requests_total() {
     let family = SpawnFamily::new(SpawnFamilyLimits {
         max_concurrent: 5,
         max_total: 1,
+        ..Default::default()
     });
     let permit = family.try_admit().unwrap();
     within_permit(

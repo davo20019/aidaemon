@@ -449,4 +449,422 @@ mod coordination_tests {
             "{last}"
         );
     }
+
+    const ROOT_SESSION: &str = "telegram:synthetic-user-1";
+
+    fn parent_says(decision: &str, note: &str) -> crate::traits::ProviderResponse {
+        MockProvider::text_response(&json!({"decision": decision, "note": note}).to_string())
+    }
+
+    /// A tree whose top-level agent is ready, a shared file both children
+    /// have read, and a sibling's overwrite on top of it.
+    async fn collision(
+        answer: crate::traits::ProviderResponse,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        SpawnFamily,
+        SpawnPermit,
+        TestHarness,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap().to_string();
+        let (family, permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(&p),
+            MockProvider::text_response("Read."),
+            write_call(&p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(&p, "from a\n"),
+            answer,
+            MockProvider::text_response("A finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        (dir, file, family, permit, harness)
+    }
+
+    fn decisions(family: &SpawnFamily) -> Vec<crate::agent::coordination::ParentDecision> {
+        family
+            .coordination()
+            .log_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::agent::coordination::LogEntry::Escalated { decision, .. } => Some(*decision),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The parent lifts the stale check for this one write.
+    #[tokio::test]
+    async fn proceed_lets_the_contested_write_land() {
+        use crate::agent::coordination::ParentDecision;
+        let (_dir, file, family, _permit, mut harness) =
+            collision(parent_says("proceed", "Yours is the right version.")).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from a\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Proceed]);
+        assert_eq!(
+            latest_task_outcome(&harness, CHILD_A).await,
+            crate::events::TaskOutcome::Succeeded
+        );
+    }
+
+    /// Reread sends the child back to the file; the run is an ordinary one.
+    #[tokio::test]
+    async fn reread_refuses_the_write_and_the_retry_lands() {
+        use crate::agent::coordination::ParentDecision;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            write_call(p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(p, "from a\n"),
+            parent_says("reread", "Keep theirs and add yours."),
+            read_call(p),
+            write_call(p, "from b\nfrom a\n"),
+            MockProvider::text_response("A finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\nfrom a\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Reread]);
+        assert_eq!(
+            latest_task_outcome(&harness, CHILD_A).await,
+            crate::events::TaskOutcome::Succeeded
+        );
+    }
+
+    /// Stop means the work did not happen, and a run that did other work
+    /// says so.
+    #[tokio::test]
+    async fn stop_refuses_and_the_run_is_not_a_success() {
+        use crate::agent::coordination::ParentDecision;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            write_call(p, "from b\n"),
+            MockProvider::text_response("B done."),
+            read_call("/tmp/aidaemon-test/absent-synthetic-file"),
+            write_call(p, "from a\n"),
+            parent_says("stop", "Another agent owns this."),
+            MockProvider::text_response("A stopped."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::Stop]);
+        assert_ne!(
+            latest_task_outcome(&harness, CHILD_A).await,
+            crate::events::TaskOutcome::Succeeded
+        );
+    }
+
+    /// An answer that is not the strict JSON is no answer.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_no_answer() {
+        use crate::agent::coordination::ParentDecision;
+        let (_dir, file, family, _permit, mut harness) =
+            collision(MockProvider::text_response("Go ahead, I suppose.")).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
+        assert_eq!(decisions(&family), vec![ParentDecision::NoAnswer]);
+    }
+
+    /// With no top-level agent to ask nothing is put to any model.
+    #[tokio::test]
+    async fn no_top_level_agent_is_no_answer() {
+        use crate::agent::coordination::ParentDecision;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            write_call(p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(p, "from a\n"),
+            MockProvider::text_response("A stopped."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(decisions(&family), vec![ParentDecision::NoAnswer]);
+    }
+
+    /// Past the tree's cap a collision is refused without a side call.
+    #[tokio::test]
+    async fn the_tree_cap_answers_no_answer_without_asking() {
+        use crate::agent::coordination::ParentDecision;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let family = SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+            max_escalations_per_request: 0,
+            ..Default::default()
+        });
+        let _permit = family.try_admit().unwrap();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            write_call(p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(p, "from a\n"),
+            MockProvider::text_response("A stopped."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(decisions(&family), vec![ParentDecision::NoAnswer]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from b\n");
+    }
+
+    /// The file moved again while the parent answered: `proceed` covered
+    /// what the parent saw, so the write is judged afresh and does not land.
+    #[tokio::test]
+    async fn proceed_does_not_cover_a_file_that_changed_during_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap().to_string();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let zero = std::time::Duration::ZERO;
+        let provider = MockProvider::with_delayed_responses(
+            vec![
+                read_call(&p),
+                MockProvider::text_response("Read."),
+                write_call(&p, "from b\n"),
+                MockProvider::text_response("B done."),
+                write_call(&p, "from a\n"),
+                parent_says("proceed", "Go."),
+                MockProvider::text_response("A finished."),
+            ],
+            vec![
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                std::time::Duration::from_millis(600),
+                zero,
+            ],
+        );
+        let backend = crate::execution::active_execution_backend;
+        let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+            Arc::new(crate::tools::ReadFileTool::new(backend())),
+            Arc::new(crate::tools::WriteFileTool::new(backend())),
+            Arc::new(crate::tools::EditFileTool::new(backend())),
+        ];
+        let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+            .await
+            .unwrap();
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        let writer = {
+            let file = file.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                std::fs::write(&file, "changed during the wait\n").unwrap();
+            })
+        };
+        turn(&mut harness, &family, CHILD_A).await;
+        writer.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "changed during the wait\n"
+        );
+    }
+
+    /// A tainted child's escalation marks the top-level session tainted
+    /// before the question is used, and its note stays out of the log's view.
+    #[tokio::test]
+    async fn a_tainted_childs_escalation_taints_the_root_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap().to_string();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(&p),
+            MockProvider::text_response("Read."),
+            write_call(&p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(&p, "from a\n"),
+            parent_says("reread", "secret-marker-note"),
+            MockProvider::text_response("A finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        let mut parent = inherited(&family);
+        parent.untrusted_context = true;
+        harness.agent.set_test_inherited_authority(parent);
+        harness
+            .agent
+            .handle_message(
+                CHILD_A,
+                "Finish the synthetic notes.",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tainted = crate::agent::untrusted::tainted_turns(harness.state.as_ref(), ROOT_SESSION)
+            .await
+            .unwrap();
+        assert_eq!(tainted, vec!["synthetic-turn".to_string()]);
+        let note = family.coordination().parent_note(ROOT_SESSION);
+        assert!(note.is_none_or(|note| !note.contains("secret-marker-note")));
+    }
+
+    /// `coordination = false` restores the last-writer-wins behaviour.
+    #[tokio::test]
+    async fn coordination_off_leaves_writes_unjudged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap().to_string();
+        let family = SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
+            coordination: false,
+            ..Default::default()
+        });
+        let _permit = family.try_admit().unwrap();
+        let mut harness = harness(vec![
+            read_call(&p),
+            MockProvider::text_response("Read."),
+            write_call(&p, "from b\n"),
+            MockProvider::text_response("B done."),
+            write_call(&p, "from a\n"),
+            MockProvider::text_response("A done."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "from a\n");
+    }
+
+    /// A child's own question comes back as the tool result, and spends its
+    /// allowance.
+    #[tokio::test]
+    async fn a_childs_question_is_answered_as_its_tool_result() {
+        use crate::agent::coordination::ParentDecision;
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let backend = crate::execution::active_execution_backend;
+        let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+            Arc::new(crate::tools::ReadFileTool::new(backend())),
+            Arc::new(crate::tools::EscalateToParentTool),
+        ];
+        let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+            MockProvider::with_responses(vec![
+                MockProvider::tool_call_response(
+                    "escalate_to_parent",
+                    r#"{"question":"Is the header mine to change?"}"#,
+                ),
+                parent_says("stop", "That is not yours."),
+                MockProvider::text_response("Understood."),
+            ]),
+            tools,
+            None,
+        )
+        .await
+        .unwrap();
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(decisions(&family), vec![ParentDecision::Stop]);
+    }
+
+    /// A plain child is offered the way to escalate.
+    #[tokio::test]
+    async fn only_a_plain_child_gets_the_way_to_escalate() {
+        use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime};
+        let (family, _permit) = tree();
+        let harness = harness(vec![MockProvider::text_response("Child done.")]).await;
+        let provider = harness.provider.clone();
+        let agent = Arc::new(harness.agent);
+        agent
+            .run_child(ChildAgentRequest {
+                mission: "Tidy the synthetic notes".to_string(),
+                task: "Tidy them.".to_string(),
+                status_tx: None,
+                channel_ctx: ChannelContext::private("test"),
+                user_role: UserRole::Owner,
+                child_role: None,
+                goal_id: None,
+                task_id: None,
+                project_scope: None,
+                specialist: None,
+                approval_session_id: None,
+                parent_authority: Some(inherited(&family)),
+                time_limit: None,
+                model_tier: None,
+            })
+            .await
+            .unwrap();
+        let log = provider.call_log.lock().await;
+        let names = extract_tool_names(&log.last().unwrap().tools);
+        assert!(
+            names.contains(&"escalate_to_parent".to_string()),
+            "{names:?}"
+        );
+    }
 }

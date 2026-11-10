@@ -1510,14 +1510,17 @@ impl Agent {
                 .spawn_family
                 .active_coordination()
                 .map(|coordination| {
-                    aidaemon_tools::semantics::CallFileFence(Arc::new(
-                        crate::agent::coordination::CallFence {
-                            coordination: coordination.clone(),
-                            member: scope.session_id.to_string(),
-                            call_id: request.call_id.clone(),
-                            backend: self.execution_backend.clone(),
-                        },
-                    ))
+                    Arc::new(crate::agent::coordination::CallFence {
+                        coordination: coordination.clone(),
+                        member: scope.session_id.to_string(),
+                        call_id: request.call_id.clone(),
+                        backend: self.execution_backend.clone(),
+                        escalator: crate::agent::coordination::Escalator::new(
+                            self.side_calls.clone(),
+                            self.state.clone(),
+                        ),
+                        untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),
+                    })
                 }),
             // The MCP tool bridged and judged at turn start, if this is one.
             mcp_tool: scope

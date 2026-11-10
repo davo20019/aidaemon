@@ -2045,6 +2045,7 @@ mod child_runtime_tests {
             crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
                 max_concurrent: 1,
                 max_total: 10,
+                ..Default::default()
             });
         let mut call_facts = facts();
         call_facts
@@ -2081,6 +2082,7 @@ mod child_runtime_tests {
             crate::agent::authority::SpawnFamily::new(crate::agent::authority::SpawnFamilyLimits {
                 max_concurrent: 5,
                 max_total,
+                ..Default::default()
             });
         let mut call_facts = facts();
         call_facts

@@ -33,6 +33,8 @@ pub enum SideCall {
     ProcedureEnhancement,
     /// Writes a skill from a procedure that earned promotion.
     SkillPromotion,
+    /// Answers a sub-agent's escalation, as its request's top-level agent.
+    ParentCoordination,
 }
 
 /// What a side call's answer is used for; this sets how it may fail.
@@ -97,7 +99,7 @@ pub struct SideCallSpec {
 impl SideCall {
     /// Every side call, in registry order.
     #[cfg(test)]
-    pub const ALL: [SideCall; 12] = [
+    pub const ALL: [SideCall; 13] = [
         SideCall::UntrustedVerifier,
         SideCall::CommandRisk,
         SideCall::RelationshipRouter,
@@ -110,6 +112,7 @@ impl SideCall {
         SideCall::SessionAnalysis,
         SideCall::ProcedureEnhancement,
         SideCall::SkillPromotion,
+        SideCall::ParentCoordination,
     ];
 
     /// This call's spec.
@@ -144,6 +147,9 @@ impl SideCall {
                 ("consolidation", ExecutableProducer, Primary, 180, Skip)
             }
             SideCall::SkillPromotion => ("skill_promotion", ExecutableProducer, Cheap, 180, Skip),
+            SideCall::ParentCoordination => {
+                ("parent_coordination", SafetyJudge, Primary, 90, Refuse)
+            }
         };
         SideCallSpec {
             purpose,

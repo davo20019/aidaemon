@@ -2761,6 +2761,8 @@ impl Default for SubagentsConfig {
 
 pub(crate) const DEFAULT_SUBAGENTS_MAX_CONCURRENT: usize = 4;
 pub(crate) const DEFAULT_SUBAGENTS_MAX_PER_REQUEST: usize = 12;
+pub(crate) const DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD: usize = 3;
+pub(crate) const DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST: usize = 12;
 fn default_subagents_max_concurrent() -> usize {
     DEFAULT_SUBAGENTS_MAX_CONCURRENT
 }
