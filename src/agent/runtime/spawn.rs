@@ -57,9 +57,9 @@ pub(crate) struct SalvagedTaskOutcome {
     pub details: String,
 }
 
-/// The child's own end record, retrying briefly on SQLite contention. An
-/// error means the record could not be read, which is not the same as the
-/// child having succeeded.
+/// The child's own latest end record, however many records follow it,
+/// retrying briefly on SQLite contention. An error means the record could
+/// not be read, which is not the same as the child having succeeded.
 async fn latest_child_task_end(
     event_store: &crate::events::EventStore,
     child_session: &str,
@@ -67,7 +67,10 @@ async fn latest_child_task_end(
     const MAX_BUSY_RETRIES: usize = 3;
     let mut busy_retries = 0_usize;
     let events = loop {
-        match event_store.query_recent_events(child_session, 30).await {
+        match event_store
+            .query_recent_task_ends(child_session, false, 1)
+            .await
+        {
             Ok(events) => break events,
             Err(error) if busy_retries < MAX_BUSY_RETRIES && is_sqlite_busy(&error) => {
                 tokio::time::sleep(Duration::from_millis(25_u64 << busy_retries)).await;
@@ -76,11 +79,12 @@ async fn latest_child_task_end(
             Err(error) => return Err(error),
         }
     };
-    Ok(events.iter().rev().find_map(|event| {
-        (event.event_type == EventType::TaskEnd)
-            .then(|| event.parse_data::<TaskEndData>().ok())
-            .flatten()
-    }))
+    // A record that is there but cannot be parsed is unreadable, never a
+    // missing (and so never a successful) end.
+    events
+        .first()
+        .map(|event| event.parse_data::<TaskEndData>())
+        .transpose()
 }
 
 /// A child's outcome comes from its own end record. A reply with no readable
@@ -3393,6 +3397,33 @@ mod tests {
         let report = child_work_report_within(&store, session, &read_only, 13).await;
         assert!(!report.unknown);
         assert!(!report.may_have_changed_something());
+    }
+
+    /// A child's end record is found however many records follow it.
+    #[tokio::test]
+    async fn a_childs_end_record_is_found_behind_later_records() {
+        let store = synthetic_event_store().await;
+        let session = "specialist:executor:synthetic-3";
+        store
+            .append(crate::events::Event::new(
+                session,
+                EventType::TaskEnd,
+                json!({
+                    "task_id": "task-synthetic-3",
+                    "status": "completed",
+                    "outcome": "succeeded",
+                }),
+            ))
+            .await
+            .expect("append task end");
+        for n in 0..40 {
+            record_tool_call(&store, session, &format!("call-late-{n}"), "read_file", false).await;
+        }
+        let record = latest_child_task_end(&store, session).await;
+        assert_eq!(
+            resolve_child_outcome(true, &record),
+            TaskOutcome::Succeeded
+        );
     }
 
     #[test]
