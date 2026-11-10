@@ -2221,6 +2221,35 @@ impl Tool for HttpRequestTool {
 
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for HttpRequestTool {
+    /// A body declared as JSON must parse. Rejected here, before any grant is
+    /// reserved or byte is sent, the caller can fix it and call again.
+    fn validate_arguments(
+        &self,
+        arguments: &str,
+    ) -> Result<(), crate::traits::ToolArgumentContractViolation> {
+        let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+            return Ok(());
+        };
+        let Some(content_type) = args["content_type"]
+            .as_str()
+            .filter(|content_type| Self::content_type_is_json(content_type))
+        else {
+            return Ok(());
+        };
+        let Some(body) = args["body"].as_str().filter(|body| !body.trim().is_empty()) else {
+            return Ok(());
+        };
+        match serde_json::from_str::<Value>(body) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(crate::traits::ToolArgumentContractViolation::new(format!(
+                "`body` is not valid JSON ({error}) although content_type is {content_type}; nothing was sent"
+            ))
+            .with_recovery_hint(
+                "Fix the JSON in `body` (for example a missing closing brace or quote) and make the same call again.",
+            )),
+        }
+    }
+
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             always_offered: true,
@@ -2440,6 +2469,33 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
 
 #[cfg(test)]
 mod tests {
+    /// A body declared as JSON that does not parse never leaves the machine,
+    /// so a mandate's action slot is not spent on it.
+    #[test]
+    fn a_json_body_that_does_not_parse_is_rejected_before_dispatch() {
+        let tool = HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )));
+        let call = |body: &str, content_type: Option<&str>| {
+            let mut args =
+                json!({"method": "POST", "url": "https://api.example.invalid/posts", "body": body});
+            if let Some(content_type) = content_type {
+                args["content_type"] = json!(content_type);
+            }
+            crate::traits::prepare_invocation(&tool, &args.to_string())
+        };
+        let rejected = call("{\"text\":\"hello\"", Some("application/json")).unwrap_err();
+        assert!(
+            rejected.reason.contains("not valid JSON"),
+            "{}",
+            rejected.reason
+        );
+        assert!(rejected.recovery_hint.is_some());
+        assert!(call("{\"text\":\"hello\"}", Some("application/json")).is_ok());
+        assert!(call("{\"text\":\"hello\"", Some("text/plain")).is_ok());
+        assert!(call("a=1&b=2", None).is_ok());
+    }
+
     use super::*;
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
