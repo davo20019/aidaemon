@@ -1335,6 +1335,9 @@ impl sdk::Hook for CoordinationHook {
                     let now = read_current(&self.backend, &write.path).await;
                     let now = file_state(now.as_deref());
                     if now == shown {
+                        // Open until the write actually lands: `proceed` only
+                        // lifts this check, and the edit can still fail.
+                        coordination.note_unlanded(&self.member, &path);
                         coordination.note_judged(&self.member, &call.id, now);
                         return sdk::ToolDecision::Allow;
                     }

@@ -519,6 +519,38 @@ mod coordination_tests {
         );
     }
 
+    /// `proceed` only lifts the check. An edit that then cannot apply did not
+    /// happen, and the child's run must not read as if it had.
+    #[tokio::test]
+    async fn proceed_on_an_edit_that_then_fails_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        family.coordination().bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        let mut harness = harness(vec![
+            read_call(p),
+            MockProvider::text_response("Read."),
+            read_call(p),
+            edit_call(p, "alpha", "ALPHA"),
+            MockProvider::text_response("B done."),
+            edit_call(p, "alpha", "OMEGA"),
+            parent_says("proceed", "Go ahead."),
+            MockProvider::text_response("A finished."),
+        ])
+        .await;
+        turn(&mut harness, &family, CHILD_A).await;
+        turn(&mut harness, &family, CHILD_B).await;
+        turn(&mut harness, &family, CHILD_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA\n");
+        assert!(family.coordination().has_unlanded_write(CHILD_A));
+    }
+
     /// Reread sends the child back to the file; the run is an ordinary one.
     #[tokio::test]
     async fn reread_refuses_the_write_and_the_retry_lands() {
