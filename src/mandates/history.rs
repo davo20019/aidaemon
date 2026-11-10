@@ -177,7 +177,6 @@ fn objective_value(
             "mandate_version": measurement.mandate_version,
             "value_micros": measurement.value_micros,
             "confidence_bps": measurement.confidence_bps,
-            "evidence_receipt_ids": measurement.evidence_receipt_ids,
             "attributed_intention_ids": measurement.attributed_intention_ids,
             "observed_at": measurement.observed_at,
         })).collect::<Vec<_>>(),
@@ -193,7 +192,6 @@ fn decision_value(decision: &MandateDecisionCycle, intentions: &[Intention]) -> 
         "outcome": decision.outcome,
         "activity_level": decision.activity_level,
         "action_attempts": decision.action_attempts,
-        "evidence_receipt_ids": decision.evidence_receipt_ids,
         "termination_kind": decision.termination_kind,
         "termination_match": decision.termination_match,
         "value_criterion": intention.and_then(|intention| intention.value_criterion.as_deref()),
@@ -243,7 +241,6 @@ fn render_bounded_history(
             "advisory_learning_notes": learning_notes.iter().map(|note| json!({
                 "mandate_version": note.mandate_version,
                 "summary": note.summary,
-                "evidence_receipt_ids": note.evidence_receipt_ids,
                 "created_at": note.created_at,
             })).collect::<Vec<_>>(),
             "adaptive_operating_strategy": strategy_nodes.iter().map(|revision| json!({
@@ -252,7 +249,6 @@ fn render_bounded_history(
                 "kind": revision.kind,
                 "guidance": revision.guidance,
                 "confidence_bps": revision.confidence_bps,
-                "evidence_receipt_ids": revision.evidence_receipt_ids,
                 "created_at": revision.created_at,
             })).collect::<Vec<_>>(),
             "mutation_quota": quota,
