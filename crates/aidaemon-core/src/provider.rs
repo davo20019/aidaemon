@@ -54,6 +54,10 @@ pub struct RequestOptions {
     /// [`Retry`] and [`crate::Failover`] give up at the first error. For a
     /// call that must not run twice.
     pub single_attempt: bool,
+    /// Identifies the conversation for providers that route prompt-cache
+    /// lookups by key, so its calls reach the same cache. Only a routing
+    /// hint: providers that do not route by key ignore it.
+    pub cache_key: Option<String>,
 }
 
 /// One provider call. Hooks may edit it in [`crate::Hook::before_model`].

@@ -207,6 +207,7 @@ pub(crate) async fn generate_task_relationship(
             // Failover across the chain's models stays on: a used-up
             // primary quota must not cost the turn its relationship edge.
             single_attempt: false,
+            cache_key: None,
         },
         ..Default::default()
     };

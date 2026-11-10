@@ -341,6 +341,7 @@ pub(crate) async fn assess_command(
         },
         reasoning_effort: Some("low".to_string()),
         single_attempt: true,
+        cache_key: None,
     };
     let answer = gateway
         .ask(SideCall::CommandRisk, &messages, &options, None)

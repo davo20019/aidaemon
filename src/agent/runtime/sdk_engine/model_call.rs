@@ -268,6 +268,7 @@ impl Agent {
         let messages = fit_run_values(&prefix, run, budget);
         crate::otel_export::observe_sent(scope.run_id, &messages);
         let mut options = to_chat_options(request);
+        options.cache_key = Some(scope.session_id.to_string());
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
         // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
         // `None` and use the provider's background slot.

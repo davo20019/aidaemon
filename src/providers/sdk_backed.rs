@@ -145,6 +145,7 @@ pub(crate) fn to_sdk_request(
             },
             reasoning_effort: options.reasoning_effort_override.clone(),
             single_attempt: options.single_attempt_fail_closed,
+            cache_key: options.cache_key.clone(),
         },
     }
 }
@@ -326,6 +327,7 @@ pub(crate) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
         max_tokens_override: request.max_output_tokens,
         reasoning_effort_override: request.options.reasoning_effort.clone(),
         single_attempt_fail_closed: request.options.single_attempt,
+        cache_key: request.options.cache_key.clone(),
         ..Default::default()
     }
 }

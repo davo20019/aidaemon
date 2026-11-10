@@ -1846,6 +1846,7 @@ impl Escalator {
             },
             reasoning_effort: None,
             single_attempt: true,
+            cache_key: None,
         };
         match self
             .gateway

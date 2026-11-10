@@ -1006,3 +1006,31 @@ async fn a_mandate_workers_egress_is_judged_against_the_confirmed_mandate() {
     .unwrap();
     assert_eq!(code, "untrusted_egress_denied");
 }
+
+/// Every call of a conversation carries the same routing key, so a provider
+/// that routes its prompt cache by key keeps the conversation on one cache.
+#[tokio::test]
+async fn a_conversations_model_calls_carry_its_cache_key() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Done.")]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    harness
+        .agent
+        .handle_message(
+            "telegram:synthetic-user-1",
+            "Say done.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let calls = harness.provider.call_log.lock().await;
+    assert!(!calls.is_empty());
+    for call in calls.iter() {
+        assert_eq!(
+            call.options.cache_key.as_deref(),
+            Some("telegram:synthetic-user-1")
+        );
+    }
+}

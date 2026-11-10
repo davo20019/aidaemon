@@ -613,6 +613,7 @@ mod tests {
                 response_format: sdk::ResponseFormat::JsonObject,
                 reasoning_effort: Some("low".into()),
                 single_attempt: true,
+                cache_key: None,
             },
             ..Default::default()
         };

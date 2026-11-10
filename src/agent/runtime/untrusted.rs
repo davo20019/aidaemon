@@ -369,6 +369,7 @@ fn verifier_options() -> sdk::RequestOptions {
         },
         reasoning_effort: Some("low".to_string()),
         single_attempt: true,
+        cache_key: None,
     }
 }
 

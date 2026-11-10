@@ -107,7 +107,9 @@ impl ChatGptAuth for StaticChatGptAuth {
 ///   `prompt_cache_key` derived from them so requests sharing them land on
 ///   the same cache shard; later system messages (hook notes, mid-run
 ///   directives) stay in place as `developer` input.
-/// - `store` is always false: the app owns the history.
+/// - `store` is always false: the app owns the history, so the encrypted
+///   reasoning of a tool-calling reply rides on its first tool call
+///   ([`REASONING_ITEMS_KEY`]) and is replayed beside it.
 /// - No output cap is sent: the backend rejects `max_output_tokens`.
 /// - A 401 refreshes the token once and replays the request (inference is
 ///   side-effect free); a second 401 is reported to the [`ChatGptAuth`].
@@ -240,7 +242,7 @@ impl ChatGpt {
     async fn open(&self, request: &ModelRequest) -> Result<reqwest::Response, ProviderError> {
         let auth_error = |error: String| ProviderError::Auth(error);
         let mut credentials = self.auth.credentials().await.map_err(auth_error)?;
-        let body = build_body(request, self.reasoning_effort.as_deref());
+        let mut body = build_body(request, self.reasoning_effort.as_deref());
         let mut response = self.send(&credentials, &body).await?;
         // The backend is authoritative about token validity: a token can be
         // revoked before its expiry.
@@ -260,6 +262,16 @@ impl ChatGpt {
                     .await;
                 return Err(ProviderError::Auth(detail));
             }
+        }
+        // Encrypted reasoning is bound to the model that wrote it, so a
+        // transcript that crossed models can be refused. It is an optimization:
+        // the request stands without it.
+        if response.status().as_u16() == 400
+            && !request.options.single_attempt
+            && strip_reasoning(&mut body)
+        {
+            let _ = response.bytes().await;
+            response = self.send(&credentials, &body).await?;
         }
         let status = response.status();
         if !status.is_success() {
@@ -382,10 +394,14 @@ fn plan_limit(
     })
 }
 
-/// A stable cache-routing key for a set of instructions.
-fn prompt_cache_key(instructions: &str) -> String {
+/// The [`ToolCall::provider_data`] key holding a reply's encrypted reasoning.
+pub const REASONING_ITEMS_KEY: &str = "chatgpt_reasoning_items";
+
+/// A stable cache-routing key. The seed is hashed so a conversation id never
+/// leaves the machine.
+fn prompt_cache_key(seed: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(instructions.as_bytes());
+    let digest = Sha256::digest(seed.as_bytes());
     let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
     format!("aidaemon-{hex}")
 }
@@ -427,6 +443,16 @@ fn build_input(messages: &[Message]) -> (String, Vec<Value>) {
                 }));
             }
             Role::Assistant => {
+                input.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .filter_map(|call| call.provider_data.as_ref())
+                        .filter_map(|data| data.get(REASONING_ITEMS_KEY))
+                        .filter_map(Value::as_array)
+                        .flatten()
+                        .cloned(),
+                );
                 if !message.content.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -500,7 +526,13 @@ fn build_body(request: &ModelRequest, default_effort: Option<&str>) -> Value {
     if !instructions.is_empty() {
         body.insert(
             "prompt_cache_key".into(),
-            json!(prompt_cache_key(&instructions)),
+            json!(prompt_cache_key(
+                request
+                    .options
+                    .cache_key
+                    .as_deref()
+                    .unwrap_or(&instructions)
+            )),
         );
         body.insert("instructions".into(), json!(instructions));
     }
@@ -520,6 +552,9 @@ fn build_body(request: &ModelRequest, default_effort: Option<&str>) -> Value {
         // The backend spells "reasoning off" `none`.
         let effort = if effort == "off" { "none" } else { effort };
         body.insert("reasoning".into(), json!({"effort": effort}));
+        if effort != "none" {
+            body.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        }
     }
     match &request.options.response_format {
         ResponseFormat::Text => {}
@@ -543,6 +578,16 @@ fn build_body(request: &ModelRequest, default_effort: Option<&str>) -> Value {
         }
     }
     Value::Object(body)
+}
+
+/// Removes replayed reasoning from a request body; true when there was any.
+fn strip_reasoning(body: &mut Value) -> bool {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = input.len();
+    input.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+    input.len() != before
 }
 
 /// Accumulates the Responses event stream.
@@ -693,6 +738,7 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
 fn parse_output(items: &[Value]) -> ModelResponse {
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_items = Vec::new();
     let mut tool_calls = Vec::new();
     let parts = |item: &Value, field: &str| -> Vec<String> {
         item.get(field)
@@ -708,7 +754,17 @@ fn parse_output(items: &[Value]) -> ModelResponse {
     for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => text.push_str(&parts(item, "content").concat()),
-            Some("reasoning") => reasoning.push_str(&parts(item, "summary").concat()),
+            Some("reasoning") => {
+                reasoning.push_str(&parts(item, "summary").concat());
+                if let Some(encrypted) = item.get("encrypted_content").filter(|v| v.is_string()) {
+                    // No `id`: with `store` false the backend has no such item.
+                    reasoning_items.push(json!({
+                        "type": "reasoning",
+                        "summary": item.get("summary").cloned().unwrap_or_else(|| json!([])),
+                        "encrypted_content": encrypted,
+                    }));
+                }
+            }
             Some("function_call") => {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                 if name.is_empty() {
@@ -727,6 +783,12 @@ fn parse_output(items: &[Value]) -> ModelResponse {
             }
             _ => {}
         }
+    }
+    if let Some(first) = tool_calls
+        .first_mut()
+        .filter(|_| !reasoning_items.is_empty())
+    {
+        first.provider_data = Some(json!({ REASONING_ITEMS_KEY: reasoning_items }));
     }
     ModelResponse {
         text,
@@ -880,6 +942,73 @@ mod tests {
         );
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn a_reasoning_request_asks_for_encrypted_reasoning_unless_reasoning_is_off() {
+        let mut req = request(vec![Message::user("hi")]);
+        assert_eq!(
+            build_body(&req, Some("medium"))["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert!(build_body(&req, None).get("include").is_none());
+        req.options.reasoning_effort = Some("off".into());
+        assert!(build_body(&req, Some("medium")).get("include").is_none());
+    }
+
+    #[test]
+    fn a_conversation_key_routes_the_cache_and_is_not_sent_raw() {
+        let mut req = request(vec![Message::system("sys 12:01"), Message::user("hi")]);
+        req.options.cache_key = Some("telegram:synthetic-user-1".into());
+        let first = build_body(&req, None);
+        req.messages[0] = Message::system("sys 12:02");
+        let second = build_body(&req, None);
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert!(!first["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic-user-1"));
+    }
+
+    /// The reasoning that led to a tool call goes back just before that call,
+    /// without its server-side id (nothing is stored under `store: false`).
+    #[test]
+    fn encrypted_reasoning_is_replayed_before_the_call_it_produced() {
+        let response = decode(&[
+            json!({"type": "response.output_item.done", "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "sealed"}}),
+            json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "c1", "name": "terminal", "arguments": "{}"}}),
+            json!({"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        .unwrap();
+        let (_, input) = build_input(&[
+            Message::user("go"),
+            Message::assistant(String::new(), response.tool_calls),
+            Message::tool_result("c1", "done"),
+        ]);
+        let kinds: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(input[1]["encrypted_content"], "sealed");
+        assert!(input[1].get("id").is_none());
+    }
+
+    #[test]
+    fn reasoning_without_a_tool_call_is_not_kept() {
+        let response = decode(&[
+            json!({"type": "response.output_item.done", "item": {"type": "reasoning", "summary": [], "encrypted_content": "sealed"}}),
+            json!({"type": "response.output_item.done", "item": {"type": "message", "content": [{"text": "Hi"}]}}),
+            json!({"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        .unwrap();
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.text, "Hi");
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub struct ChatOptions {
     /// The interactive generation loop sets `Some(interactive_slot)` to keep the
     /// conversation's KV cache warm against background-task eviction.
     pub id_slot: Option<u32>,
+    /// The conversation this call belongs to, for providers that route
+    /// prompt-cache lookups by key.
+    pub cache_key: Option<String>,
 }
 
 /// Token usage statistics from an LLM API response.

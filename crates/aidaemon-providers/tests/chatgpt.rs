@@ -140,3 +140,65 @@ async fn a_plan_limit_is_a_rate_limit_with_an_explanation() {
         }
     ));
 }
+
+fn reasoned_request() -> ModelRequest {
+    let call = aidaemon_core::ToolCall::new("c1", "terminal", json!({})).with_provider_data(
+        json!({ "chatgpt_reasoning_items": [{"type": "reasoning", "summary": [], "encrypted_content": "sealed"}] }),
+    );
+    ModelRequest {
+        model: "gpt-6-sol".into(),
+        messages: vec![
+            Message::user("go"),
+            Message::assistant(String::new(), vec![call]),
+            Message::tool_result("c1", "done"),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Reasoning written by another model can be refused; the call must survive.
+#[tokio::test]
+async fn refused_reasoning_is_dropped_and_the_request_resent_once() {
+    let server = MockServer::start(vec![
+        MockResponse::status(400, r#"{"error":{"message":"could not be verified"}}"#),
+        reply("recovered"),
+    ])
+    .await;
+    let provider = provider(&server, Arc::new(RotatingAuth::default()));
+
+    let response = provider.complete(&reasoned_request()).await.unwrap();
+
+    assert_eq!(response.text, "recovered");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].body.to_string().contains("sealed"));
+    assert!(!requests[1].body.to_string().contains("sealed"));
+}
+
+#[tokio::test]
+async fn a_bad_request_with_no_reasoning_to_drop_is_not_resent() {
+    let server = MockServer::start(vec![MockResponse::status(
+        400,
+        r#"{"error":{"message":"bad"}}"#,
+    )])
+    .await;
+    let provider = provider(&server, Arc::new(RotatingAuth::default()));
+
+    assert!(provider.complete(&request()).await.is_err());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_single_attempt_call_is_never_resent() {
+    let server = MockServer::start(vec![MockResponse::status(
+        400,
+        r#"{"error":{"message":"no"}}"#,
+    )])
+    .await;
+    let provider = provider(&server, Arc::new(RotatingAuth::default()));
+    let mut request = reasoned_request();
+    request.options.single_attempt = true;
+
+    assert!(provider.complete(&request).await.is_err());
+    assert_eq!(server.requests().len(), 1);
+}
