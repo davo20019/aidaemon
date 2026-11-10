@@ -224,11 +224,18 @@ impl SideCallGateway {
         spec: SideCallSpec,
         mut request: sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, SideCallError> {
-        // No side call gets tools, whichever door the request came through.
-        // `None`, not the default `Auto`: with no tools, `Auto` lets a
-        // backend add its own (Google turns on search grounding).
-        request.tools.clear();
-        request.tool_choice = sdk::ToolChoice::None;
+        // No side call runs tools, whichever door the request came through.
+        // A forced call to one named tool stays: it is how a caller asks for
+        // structured output, and the call only comes back to the caller.
+        // Otherwise `None`, not the default `Auto`: with no tools, `Auto`
+        // lets a backend add its own (Google turns on search grounding).
+        match &request.tool_choice {
+            sdk::ToolChoice::Specific(name) => request.tools.retain(|tool| tool.name == *name),
+            _ => request.tools.clear(),
+        }
+        if request.tools.is_empty() {
+            request.tool_choice = sdk::ToolChoice::None;
+        }
         let log = AttemptLog::default();
         // A caller that drops this future (its own timeout, a cancelled
         // `select!` arm) still gets a row for every attempt.
@@ -882,6 +889,69 @@ mod tests {
             .unwrap();
         let seen = scripted.requests();
         assert_eq!(seen.len(), 1);
+        assert!(seen[0].tools.is_empty());
+        assert_eq!(seen[0].tool_choice, sdk::ToolChoice::None);
+    }
+
+    fn tool_named(name: &str) -> sdk::ToolSpec {
+        sdk::ToolSpec {
+            name: name.to_string(),
+            description: "Records something.".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// A forced call to one named tool is how a caller asks for structured
+    /// output: that tool stays, every other is removed, and the call comes
+    /// back to the caller with nothing having run it.
+    #[tokio::test]
+    async fn a_forced_tool_call_keeps_only_that_tool() {
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([]).then_repeat(
+                aidaemon_core::testing::tool_calls([aidaemon_core::testing::call(
+                    "call-1",
+                    "record_facts",
+                    serde_json::json!({"facts": []}),
+                )]),
+            ),
+        );
+        let (gateway, _events) = gateway_with(scripted.clone()).await;
+        let mut request = request_for("any-model", "hello");
+        request.tools = vec![tool_named("send_probe"), tool_named("record_facts")];
+        request.tool_choice = sdk::ToolChoice::Specific("record_facts".to_string());
+        let response = gateway
+            .provider(SideCall::FactExtraction)
+            .complete(&request)
+            .await
+            .unwrap();
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].tools.len(), 1);
+        assert_eq!(seen[0].tools[0].name, "record_facts");
+        assert_eq!(
+            seen[0].tool_choice,
+            sdk::ToolChoice::Specific("record_facts".to_string())
+        );
+        assert_eq!(response.tool_calls[0].name, "record_facts");
+    }
+
+    /// Forcing a tool the request does not define leaves nothing to call.
+    #[tokio::test]
+    async fn forcing_an_undefined_tool_sends_no_tools() {
+        let scripted = Arc::new(
+            aidaemon_core::testing::ScriptedProvider::new([])
+                .then_repeat(aidaemon_core::testing::text("fine")),
+        );
+        let (gateway, _events) = gateway_with(scripted.clone()).await;
+        let mut request = request_for("any-model", "hello");
+        request.tools = vec![tool_named("send_probe")];
+        request.tool_choice = sdk::ToolChoice::Specific("record_facts".to_string());
+        gateway
+            .provider(SideCall::FactExtraction)
+            .complete(&request)
+            .await
+            .unwrap();
+        let seen = scripted.requests();
         assert!(seen[0].tools.is_empty());
         assert_eq!(seen[0].tool_choice, sdk::ToolChoice::None);
     }

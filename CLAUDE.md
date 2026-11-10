@@ -408,8 +408,10 @@ library code that takes a provider. Do not hold a raw provider or record a
 call by hand anywhere else; `llm_runtime::door_tests` fails if you do.
 
 A safety judge refuses on any failure. A memory job skips, and never writes
-from a tainted run. A side call has no tools; work that needs tools or a
-second pass is a kernel agent, not a side call.
+from a tainted run. A side call runs no tools. A request that forces one
+named tool keeps that tool, because that is how it asks for structured output:
+the call comes back to the caller and nothing executes it. Work that needs
+tools to run or a second pass is a kernel agent, not a side call.
 
 ## Test & Fixture Data Hygiene
 

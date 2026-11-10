@@ -776,6 +776,9 @@ impl Memory {
             .map(|r| (r.fact.category, r.fact.key))
             .collect();
         let extraction = extractor.extract(turn, &known).await?;
+        if let Some(reason) = &extraction.parse_error {
+            tracing::warn!(%reason, "fact extraction reply was unreadable; no facts stored");
+        }
         report.usage.add(extraction.usage);
         report.rejected = extraction.rejected;
         let default_excerpt = truncate_chars(messages[start].content.trim(), 300);
