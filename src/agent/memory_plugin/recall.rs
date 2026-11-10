@@ -476,7 +476,7 @@ mod tests {
             .expect("recalled memory note");
         assert!(note > tail, "note follows the tail");
         let current_user = messages.iter().rposition(|m| m["role"] == "user").unwrap();
-        assert!(note < current_user, "note precedes the current request");
+        assert!(note > current_user, "note stays out of the cached prefix");
     }
 
     #[tokio::test]

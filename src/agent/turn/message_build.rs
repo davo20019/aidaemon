@@ -16,10 +16,9 @@ pub(super) struct MessageBuildCtx<'a> {
     /// Pillar A: message-zero bytes (session-static CORE prompt). Byte-stable
     /// across the within-task loop so the prefix cache reuses it.
     pub core_prompt: &'a str,
-    /// Pillar A: the per-task volatile context tail. Inserted at boundary − 1
-    /// immediately before the structurally preserved preceding exchange (or
-    /// before the current user when there is no prior exchange). The SAME string
-    /// is reused every iteration of the within-task loop.
+    /// Pillar A: the per-task volatile context tail, inserted right after the
+    /// current user message. The SAME string is reused every iteration of the
+    /// within-task loop.
     pub task_context_tail: &'a str,
     /// Whether archived conversation turns belong to this request's semantic
     /// thread. A typed new-task boundary starts a fresh transcript floor;
@@ -1183,30 +1182,23 @@ pub(super) async fn build_turn_messages(
                                     turn is the current request; user messages marked as sent while \
                                     you were working add to it. Earlier messages remain conversation context."
                     });
-                    let continuity_boundary = messages
-                        .iter()
-                        .position(|message| {
-                            message
-                                .get(ADJACENT_EXCHANGE_LOCATOR_KEY)
-                                .and_then(Value::as_bool)
-                                == Some(true)
-                        })
-                        .unwrap_or(current_pos);
-                    messages.insert(continuity_boundary, marker);
+                    // After the user message, like the task context tail:
+                    // anywhere earlier it would move every turn and end the
+                    // prefix a provider cache can reuse.
+                    messages.insert(current_pos + 1, marker);
                     info!(
                         session_id,
                         iteration,
                         user_messages = user_positions.len(),
-                        "Current task marker injected before preserved preceding exchange"
+                        "Current task marker injected after the current user message"
                     );
                 }
             }
         }
     }
 
-    // Phase 0 stage hash: the `[Current Task]` marker is a system message in the
-    // pre-boundary region. When a preceding exchange exists it sits before that
-    // exchange, never between its assistant answer and the current user.
+    // Phase 0 stage hash: the `[Current Task]` marker follows the current user
+    // message, so it never sits between a prior answer and that message.
     tracing::debug!(
         session_id,
         iteration,
@@ -1402,43 +1394,26 @@ pub(super) async fn build_turn_messages(
         );
     }
 
-    // Pillar A: replace the internal adjacency locator with the per-task context
-    // TAIL. The locator never reaches the provider: the assistant message ID is
-    // used only by deterministic assembly code. This leaves the adjacent prior
-    // exchange directly before the raw user message, with summaries and volatile
-    // system data earlier in the transcript. This continuity invariant applies
-    // regardless of the heuristic follow-up label.
-    //
-    // This insertion happens BEFORE message zero is inserted, so the boundary is
-    // located against the current `messages` (no leading system prompt yet).
-    let adjacency_locator_pos = messages.iter().position(|message| {
+    // The adjacency locator never reaches the provider: it only places the
+    // adjacent prior exchange directly before the raw user message.
+    if let Some(position) = messages.iter().position(|message| {
         message
             .get(ADJACENT_EXCHANGE_LOCATOR_KEY)
             .and_then(Value::as_bool)
             == Some(true)
-    });
-    if let Some(position) = adjacency_locator_pos {
+    }) {
         messages.remove(position);
-        if !task_context_tail.is_empty() {
-            messages.insert(
-                position,
-                json!({
-                    "role": "system",
-                    "content": task_context_tail,
-                }),
-            );
-        }
-    } else if !task_context_tail.is_empty() {
-        let current_user_pos = find_current_user_position(&messages, user_text);
-        let parent_start_pos = current_user_pos.map(|current_pos| {
-            messages[..current_pos]
-                .iter()
-                .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-                .unwrap_or(current_pos)
-        });
-        let tail_insert_pos = parent_start_pos
-            .or(current_user_pos)
-            .unwrap_or(messages.len());
+    }
+
+    // Pillar A: the per-task context tail goes right after the current user
+    // message. Everything before it is then the same bytes the next turn will
+    // send, so a provider cache reuses the whole conversation; inside the turn
+    // the position is fixed and tool calls append after it. Before the user
+    // message it would split the prior exchange from the reply to it, and in
+    // the leading system block it would invalidate the core prompt.
+    if !task_context_tail.is_empty() {
+        let tail_insert_pos = find_current_user_position(&messages, user_text)
+            .map_or(messages.len(), |position| position + 1);
         messages.insert(
             tail_insert_pos,
             json!({
@@ -1460,12 +1435,9 @@ pub(super) async fn build_turn_messages(
         }),
     );
 
-    // Phase 0 stage hash: the task context tail sits at boundary − 1 (inside the
-    // pre-boundary region). Message zero is the core prompt;
-    // `stage_pre_boundary_hash` skips that leading system message, so the tail is
-    // included in the pre-boundary hash and tail churn is attributable. (The
-    // session-summary stage was retired with the index-1 summary insertion; the
-    // provider-call `tail_hash` covers tail attribution at the call boundary.)
+    // Phase 0 stage hash. Message zero is the core prompt, which
+    // `stage_pre_boundary_hash` skips; the tail now sits after the boundary, so
+    // the provider-call `tail_hash` covers tail attribution.
     tracing::debug!(
         session_id,
         iteration,
@@ -2633,13 +2605,6 @@ mod tests {
                     .is_some_and(|content| content.starts_with("[Current Task]"))
             })
             .unwrap();
-        let parent_user_pos = messages
-            .iter()
-            .position(|message| {
-                message.get("content").and_then(Value::as_str)
-                    == Some("Remind me what we have been working on together.")
-            })
-            .unwrap();
         let parent_answer = "We have mainly been working on your AI job preparation.";
         let parent_answer_pos = messages
             .iter()
@@ -2648,8 +2613,8 @@ mod tests {
             })
             .unwrap();
         let current_user_pos = find_current_user_position(&messages, current_user).unwrap();
-        assert!(task_marker_pos < tail_pos);
-        assert!(tail_pos < parent_user_pos);
+        assert!(task_marker_pos > current_user_pos);
+        assert_eq!(tail_pos, current_user_pos + 1, "{serialized}");
         assert_eq!(parent_answer_pos + 1, current_user_pos, "{serialized}");
         assert_eq!(messages[current_user_pos]["role"], "user");
     }
@@ -2886,7 +2851,7 @@ mod tests {
     /// ONLY inside the tail.
     /// Test 3: message zero equals the core bytes exactly (no volatile suffix).
     #[tokio::test]
-    async fn tail_precedes_current_turn_and_summary_lives_only_in_tail() {
+    async fn tail_follows_current_turn_and_summary_lives_only_in_tail() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
@@ -2979,9 +2944,9 @@ mod tests {
             })
             .expect("current user message present");
         assert_eq!(
-            tail_pos + 1,
-            current_user_pos,
-            "tail must sit immediately before the current user message (boundary − 1)"
+            tail_pos,
+            current_user_pos + 1,
+            "tail must sit immediately after the current user message"
         );
 
         // Test 2: no standalone `[Session Summary]` message; summary only in tail.
@@ -3005,6 +2970,56 @@ mod tests {
             summary_msgs, 1,
             "summary appears exactly once, inside the tail"
         );
+    }
+
+    /// What a provider cache needs across turns: the next turn resends the
+    /// previous request byte for byte through its user message.
+    #[tokio::test]
+    async fn the_next_turn_repeats_the_previous_request_through_its_user_message() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "before",
+            "t1",
+            "first question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "before", "t1").await;
+        let first = build_payload(&harness, "before", "first question", 1).await;
+
+        seed_turn(
+            &store,
+            "after",
+            "t1",
+            "first question",
+            None,
+            "first answer",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "after",
+            "t2",
+            "second question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "after", "t2").await;
+        let second = build_payload(&harness, "after", "second question", 1).await;
+
+        let through_user = first
+            .iter()
+            .position(|m| m["content"].as_str() == Some("first question"))
+            .expect("first question")
+            + 1;
+        assert_eq!(second[..through_user], first[..through_user], "{second:?}");
     }
 
     /// Test 4: within-task tail reuse — two consecutive build iterations of the
@@ -3787,13 +3802,9 @@ mod tests {
         assert_eq!(tail_positions.len(), 1, "exactly one tail marker");
         let tail_idx = tail_positions[0];
         assert_eq!(
-            messages[tail_idx + 1]["role"].as_str(),
-            Some("user"),
-            "tail must sit immediately before the parent exchange"
-        );
-        assert_eq!(
-            messages[tail_idx + 1]["content"].as_str(),
-            Some("old question")
+            messages[tail_idx - 1]["content"].as_str(),
+            Some("current question"),
+            "tail must sit immediately after the current user message"
         );
         let parent_answer_idx = messages
             .iter()
