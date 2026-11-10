@@ -132,6 +132,8 @@ async fn call_scoped_builtin_file_tool(
 }
 
 pub(super) struct ToolExecCtx<'a> {
+    /// The tree's file fence for this call, when agents share the workspace.
+    pub file_fence: Option<aidaemon_tools::semantics::CallFileFence>,
     pub session_id: &'a str,
     pub task_id: Option<&'a str>,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -745,6 +747,9 @@ impl Agent {
             workspace_collaboration_root: workspace_grant.map(|grant| grant.project_root.clone()),
             ..Default::default()
         };
+        if let Some(fence) = ctx.file_fence.clone() {
+            facts.extensions.insert(fence);
+        }
         let dispatch = self.exec_dispatch_facts(name, ctx);
         // Only a tool that records it gets the trust its launch was judged
         // with (the terminal).

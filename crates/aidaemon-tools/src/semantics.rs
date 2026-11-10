@@ -2132,6 +2132,56 @@ pub enum ApprovalResponse {
     Deny,
 }
 
+/// How one call changes a file (see [`ToolSemantics::call_file_write`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileWriteKind {
+    /// Replaces this exact text.
+    Edit { old_text: String, replace_all: bool },
+    /// Replaces the whole file.
+    Replace,
+    /// Adds to the end of the file.
+    Append,
+}
+
+/// The file one call writes, as the tool's arguments name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWrite {
+    pub path: String,
+    pub kind: FileWriteKind,
+}
+
+/// A write in progress under a [`FileFence`]. Dropping it records nothing.
+#[async_trait]
+pub trait FileWriteGuard: Send {
+    /// The write landed.
+    async fn committed(self: Box<Self>);
+}
+
+/// Handed to a file tool by a host whose agents share a workspace. Without
+/// one the tool behaves as it would alone.
+#[async_trait]
+pub trait FileFence: Send + Sync {
+    /// The call read these exact bytes of `path`.
+    async fn observed(&self, path: &str, bytes: &[u8]);
+
+    /// Hold `path` for this write, or say why the write must not happen.
+    /// Taken before the tool reads the file it is about to change, and held
+    /// until the write has landed.
+    async fn begin_write(&self, path: &str) -> Result<Box<dyn FileWriteGuard>, String>;
+}
+
+/// This call's [`FileFence`], carried in [`ToolCallContext::extensions`].
+#[derive(Clone)]
+pub struct CallFileFence(pub std::sync::Arc<dyn FileFence>);
+
+/// The call's file fence, if its host gave it one.
+pub fn file_fence(facts: &ToolCallContext) -> Option<&std::sync::Arc<dyn FileFence>> {
+    facts
+        .extensions
+        .get::<CallFileFence>()
+        .map(|fence| &fence.0)
+}
+
 /// What a tool says about a call without executing it: its capabilities,
 /// typed semantics, access manifest, receipt protocol, effects and trust.
 /// Every method has a conservative default; a tool overrides only what it
@@ -2276,6 +2326,12 @@ pub trait ToolSemantics: Send + Sync {
     /// receipt can carry. The default advertises nothing.
     fn stable_observation_subjects(&self) -> Vec<StableObservationSubject> {
         Vec::new()
+    }
+
+    /// The file this exact call writes and how, read from its arguments. A
+    /// tool that does not declare one is invisible to stale-write checks.
+    fn call_file_write(&self, _arguments: &str) -> Option<FileWrite> {
+        None
     }
 
     /// What this call carries out of the machine if it only reads.

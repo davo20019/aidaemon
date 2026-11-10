@@ -279,6 +279,18 @@ impl crate::semantics::ToolSemantics for WriteFile {
             .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
+    fn call_file_write(&self, arguments: &str) -> Option<crate::semantics::FileWrite> {
+        let args: Value = serde_json::from_str(arguments).ok()?;
+        Some(crate::semantics::FileWrite {
+            path: path_arg(&args)?.to_string(),
+            kind: if args["mode"].as_str() == Some("append") {
+                crate::semantics::FileWriteKind::Append
+            } else {
+                crate::semantics::FileWriteKind::Replace
+            },
+        })
+    }
+
     /// A write of the target path (absolute; a relative path resolves where
     /// the execution backend puts it, which is not known here).
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {

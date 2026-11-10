@@ -1504,6 +1504,18 @@ impl Agent {
         turn_authority: Option<&'s crate::agent::authority::InheritedAuthority>,
     ) -> ToolExecCtx<'s> {
         ToolExecCtx {
+            file_fence: scope
+                .spawn_family
+                .active_coordination()
+                .map(|coordination| {
+                    aidaemon_tools::semantics::CallFileFence(Arc::new(
+                        crate::agent::coordination::CallFence {
+                            coordination: coordination.clone(),
+                            member: scope.session_id.to_string(),
+                            backend: self.execution_backend.clone(),
+                        },
+                    ))
+                }),
             // The MCP tool bridged and judged at turn start, if this is one.
             mcp_tool: scope
                 .mcp_tools

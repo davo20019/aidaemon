@@ -128,6 +128,8 @@ mod completion_checks;
 #[path = "runtime/completion_contract.rs"]
 mod completion_contract;
 pub(crate) mod conversation_compaction;
+#[path = "runtime/coordination.rs"]
+pub(crate) mod coordination;
 #[path = "runtime/core_prompt.rs"]
 mod core_prompt;
 #[path = "runtime/deferred_retry.rs"]

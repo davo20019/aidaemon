@@ -187,6 +187,7 @@ struct SpawnFamilyState {
     limits: SpawnFamilyLimits,
     counts: std::sync::Mutex<SpawnCounts>,
     tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    coordination: super::coordination::Coordination,
 }
 
 /// One request's tree of plain sub-agents: its running count, how many it
@@ -260,7 +261,15 @@ impl SpawnFamily {
             limits,
             counts: std::sync::Mutex::default(),
             tokens: std::sync::Arc::default(),
+            coordination: Default::default(),
         }))
+    }
+
+    /// The tree's shared knowledge, once it has a child: a lone agent has
+    /// nobody to coordinate with.
+    pub(crate) fn active_coordination(&self) -> Option<&super::coordination::Coordination> {
+        let counts = self.0.counts.lock().unwrap_or_else(|e| e.into_inner());
+        (counts.started > 0).then_some(&self.0.coordination)
     }
 
     /// The tree's token counter, charged by every run in it.
@@ -811,6 +820,7 @@ mod tests {
         .await
         .unwrap();
         let ctx = crate::agent::tool_exec::ToolExecCtx {
+            file_fence: None,
             mcp_tool: None,
             owner_approval_by_kernel: false,
             session_id: "guest-session",

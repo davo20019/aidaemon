@@ -107,9 +107,10 @@ impl OutcomeTool for ReadFile {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &ToolCallContext,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.read_outcome(arguments).await
+        self.read_outcome(arguments, crate::semantics::file_fence(facts))
+            .await
     }
 }
 
@@ -179,7 +180,11 @@ impl crate::semantics::ToolSemantics for ReadFile {
 }
 
 impl ReadFile {
-    pub(crate) async fn read_outcome(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
+    pub(crate) async fn read_outcome(
+        &self,
+        arguments: &str,
+        fence: Option<&Arc<dyn crate::semantics::FileFence>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         // Parameter aliasing: models often use "file_path" or "file" instead of "path"
         let path_str = args["path"]
@@ -230,6 +235,9 @@ impl ReadFile {
         let file_size = metadata.len;
         let modified = format_modified_rfc3339(&metadata);
         let bytes = backend.read(&path).await?;
+        if let Some(fence) = fence {
+            fence.observed(path_str, &bytes).await;
+        }
 
         if let Some(mime_type) =
             sniff_file_image_mime(&bytes).filter(|_| self.policy.attaches_images())

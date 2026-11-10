@@ -277,6 +277,20 @@ impl crate::semantics::ToolSemantics for EditFile {
             .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
+    fn call_file_write(&self, arguments: &str) -> Option<crate::semantics::FileWrite> {
+        let args: Value = serde_json::from_str(arguments).ok()?;
+        let old_text = ["old_text", "old_string", "search", "find"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        Some(crate::semantics::FileWrite {
+            path: path_arg(&args)?.to_string(),
+            kind: crate::semantics::FileWriteKind::Edit {
+                old_text: old_text.to_string(),
+                replace_all: args["replace_all"].as_bool().unwrap_or(false),
+            },
+        })
+    }
+
     /// A write of the target path (absolute; a relative path resolves where
     /// the execution backend puts it, which is not known here).
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {

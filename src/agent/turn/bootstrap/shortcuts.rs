@@ -38,6 +38,7 @@ pub(super) async fn maybe_handle_stop_command(
             "cli_agent",
             r#"{"action": "cancel_all"}"#,
             &tool_exec::ToolExecCtx {
+                file_fence: None,
                 mcp_tool: None,
                 owner_approval_by_kernel: false,
                 session_id,
