@@ -704,53 +704,33 @@ impl Tool for SpawnAgentTool {
             None
         };
 
-        let effective_mission = args.mission.clone();
-        let effective_task = args.task.clone();
-
         let approval_session_id = facts.session().map(str::to_string);
 
-        if !args.background {
-            let result = crate::agent::authority::within_permit(
-                family_permit.as_ref(),
-                self.run_sync(
-                    agent,
-                    &effective_mission,
-                    &effective_task,
-                    status_tx,
-                    channel_ctx,
-                    user_role,
-                    child_role,
-                    goal_id_ref.as_deref(),
-                    task_id_ref.as_deref(),
-                    durable_task_id.as_deref(),
-                    project_scope.as_deref(),
-                    args.specialist.as_deref(),
-                    approval_session_id.as_deref(),
-                    parent_authority.clone(),
-                    args.model_tier.map(Into::into),
-                ),
-            )
-            .await;
-            if let Some(ref task_id) = executor_task_id {
-                self.finish_executor_task(task_id).await;
-            }
-            return result;
-        }
-
-        // Background mode: need at least one completion delivery path.
+        // Background needs a way to deliver the result and a session to
+        // deliver it to; without either the child runs in the foreground.
         let hub = self.get_hub();
         let state = self.state.clone();
         let hub_for_parent_delivery = hub.as_ref().map(Arc::downgrade);
-        if hub.is_none() && state.is_none() {
+        let background_session = if !args.background {
+            None
+        } else if hub.is_none() && state.is_none() {
             info!(
                 "Background mode requested but no hub/state notification path is available, falling back to sync"
             );
+            None
+        } else if let Some(id) = approval_session_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(agent.background_delivery_session(id))
+        } else {
+            info!("Background mode requested but no session_id, falling back to sync");
+            None
+        };
+        let Some(session_id) = background_session else {
             let result = crate::agent::authority::within_permit(
                 family_permit.as_ref(),
                 self.run_sync(
                     agent,
-                    &effective_mission,
-                    &effective_task,
+                    &args.mission,
+                    &args.task,
                     status_tx,
                     channel_ctx,
                     user_role,
@@ -770,41 +750,10 @@ impl Tool for SpawnAgentTool {
                 self.finish_executor_task(task_id).await;
             }
             return result;
-        }
-        let session_id = match approval_session_id.as_deref() {
-            Some(id) if !id.is_empty() => agent.background_delivery_session(id),
-            _ => {
-                info!("Background mode requested but no session_id, falling back to sync");
-                let result = crate::agent::authority::within_permit(
-                    family_permit.as_ref(),
-                    self.run_sync(
-                        agent,
-                        &effective_mission,
-                        &effective_task,
-                        status_tx,
-                        channel_ctx,
-                        user_role,
-                        child_role,
-                        goal_id_ref.as_deref(),
-                        task_id_ref.as_deref(),
-                        durable_task_id.as_deref(),
-                        project_scope.as_deref(),
-                        args.specialist.as_deref(),
-                        approval_session_id.as_deref(),
-                        parent_authority.clone(),
-                        args.model_tier.map(Into::into),
-                    ),
-                )
-                .await;
-                if let Some(ref task_id) = executor_task_id {
-                    self.finish_executor_task(task_id).await;
-                }
-                return result;
-            }
         };
 
-        let task = effective_task.clone();
-        let mission = effective_mission.clone();
+        let task = args.task.clone();
+        let mission = args.mission.clone();
         let timeout_secs = self.timeout_secs;
         let time_limit = self.time_limit(true);
         let max_response_chars = self.max_response_chars;
