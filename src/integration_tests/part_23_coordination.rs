@@ -1173,4 +1173,301 @@ mod coordination_tests {
         turn(&mut harness, &family, CHILD_B).await;
         assert_eq!(turn(&mut harness, &family, ROOT_SESSION).await, "Finished.");
     }
+
+    /// One seeded conflict between two children over one file.
+    struct Seeded {
+        name: &'static str,
+        /// What the coordinator said when it started the second child.
+        rule: Option<crate::agent::coordination::Precedence>,
+        /// The sessions' turns in order, and the model's replies across them.
+        turns: &'static [&'static str],
+        script: fn(&str) -> Vec<crate::traits::ProviderResponse>,
+        /// The file at the end.
+        end: &'static str,
+        /// The coordinator's answers, in order.
+        asked: &'static [&'static str],
+    }
+
+    /// What one run of a seeded conflict did, from the tree's typed record.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct Tally {
+        end: String,
+        /// The coordinator's answers, in order.
+        asked: Vec<&'static str>,
+        stale_refusals: usize,
+        settled_without_asking: usize,
+        /// Changes to a sibling's lines by a shell, seen only afterwards.
+        shell_overwrites: usize,
+        /// Children left with a refused change they never made.
+        unlanded: usize,
+        /// A sibling's change replaced by a file tool with no ruling, rule
+        /// or answer behind it. Must be zero.
+        undecided_overwrites: usize,
+    }
+
+    const SEED: &str = "alpha\nbeta\ngamma\n";
+
+    async fn run_seeded(seeded: &Seeded) -> Tally {
+        use crate::agent::coordination::{LogEntry, Member, ParentDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, SEED).unwrap();
+        let p = file.to_str().unwrap();
+        let (family, _permit) = tree();
+        let coordination = family.coordination();
+        coordination.bind_root(
+            ROOT_SESSION,
+            "Update the synthetic notes.",
+            "synthetic-turn",
+        );
+        for (session, said) in [(CHILD_A, None), (CHILD_B, seeded.rule)] {
+            coordination.add_declared_member(
+                Member {
+                    session: session.to_string(),
+                    parent: ROOT_SESSION.to_string(),
+                    mission: "Update the synthetic notes".to_string(),
+                    specialist: None,
+                    scope: vec![real(&file)],
+                    running: true,
+                },
+                None,
+                said,
+            );
+        }
+        let mut harness = harness_with_shell((seeded.script)(p)).await;
+        for session in seeded.turns {
+            turn(&mut harness, &family, session).await;
+        }
+        harness
+            .provider
+            .assert_response_script_consumed()
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", seeded.name));
+        let log = coordination.log_entries();
+        let count = |wanted: fn(&LogEntry) -> bool| log.iter().filter(|e| wanted(e)).count();
+        let end = std::fs::read_to_string(&file).unwrap();
+        let asked: Vec<&'static str> = decisions(&family)
+            .into_iter()
+            .map(ParentDecision::as_str)
+            .collect();
+        let decided = asked.contains(&"apply")
+            || count(|e| matches!(e, LogEntry::ContestSettled { landed: true, .. })) > 0;
+        let shell_overwrites = count(|e| matches!(e, LogEntry::ShellOverwrote { .. }));
+        // Every scenario has B put "-B" on a line; it is gone only if
+        // something replaced it.
+        let replaced = !end.contains("-B");
+        Tally {
+            asked,
+            stale_refusals: count(|e| matches!(e, LogEntry::StaleWriteRefused { .. })),
+            settled_without_asking: count(|e| matches!(e, LogEntry::ContestSettled { .. })),
+            shell_overwrites,
+            unlanded: [CHILD_A, CHILD_B]
+                .iter()
+                .filter(|child| coordination.has_unlanded_write(child))
+                .count(),
+            undecided_overwrites: usize::from(replaced && !decided && shell_overwrites == 0),
+            end,
+        }
+    }
+
+    fn seeded_conflicts() -> Vec<Seeded> {
+        use crate::agent::coordination::Precedence;
+        vec![
+            Seeded {
+                name: "non_overlapping_edits",
+                rule: None,
+                turns: &[CHILD_A, CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        MockProvider::text_response("Read."),
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        edit_call(p, "gamma", "GAMMA-A"),
+                        read_call(p),
+                        edit_call(p, "gamma", "GAMMA-A"),
+                        MockProvider::text_response("Done."),
+                    ]
+                },
+                end: "alpha\nBETA-B\nGAMMA-A\n",
+                asked: &[],
+            },
+            Seeded {
+                name: "same_line_edits",
+                rule: None,
+                turns: &[CHILD_A, CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        MockProvider::text_response("Read."),
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        edit_call(p, "beta", "BETA-A"),
+                        read_call(p),
+                        MockProvider::text_response("B already changed it."),
+                    ]
+                },
+                end: "alpha\nBETA-B\ngamma\n",
+                asked: &[],
+            },
+            Seeded {
+                name: "edit_after_reread_onto_a_siblings_line",
+                rule: None,
+                turns: &[CHILD_A, CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        MockProvider::text_response("Read."),
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        edit_call(p, "beta", "BETA-A"),
+                        read_call(p),
+                        edit_call(p, "BETA-B", "BETA-A"),
+                        parent_says("keep", "B's line stands."),
+                        MockProvider::text_response("Left it."),
+                    ]
+                },
+                end: "alpha\nBETA-B\ngamma\n",
+                asked: &["keep"],
+            },
+            Seeded {
+                name: "full_overwrite",
+                rule: None,
+                turns: &[CHILD_A, CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        MockProvider::text_response("Read."),
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        write_call(p, "all from a\n"),
+                        read_call(p),
+                        write_call(p, "all from a\n"),
+                        parent_says("apply", "Replace it."),
+                        MockProvider::text_response("Done."),
+                    ]
+                },
+                end: "all from a\n",
+                asked: &["apply"],
+            },
+            Seeded {
+                name: "shell_write_over_a_siblings_line",
+                rule: None,
+                turns: &[CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        read_call(p),
+                        shell_call(p, "alpha\nfrom a shell\ngamma\n"),
+                        MockProvider::text_response("Done."),
+                    ]
+                },
+                end: "alpha\nfrom a shell\ngamma\n",
+                asked: &[],
+            },
+            Seeded {
+                name: "target_text_gone",
+                rule: None,
+                turns: &[CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        read_call(p),
+                        edit_call(p, "beta\n", "BETA-A\n"),
+                        MockProvider::text_response("The line is not there."),
+                    ]
+                },
+                end: "alpha\nBETA-B\ngamma\n",
+                asked: &[],
+            },
+            Seeded {
+                name: "rule_resolved_contest",
+                rule: Some(Precedence::RunningSiblings),
+                turns: &[CHILD_B, CHILD_A, CHILD_B],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        // A has precedence: its change to B's line lands.
+                        read_call(p),
+                        edit_call(p, "BETA-B", "BETA-A"),
+                        MockProvider::text_response("Done."),
+                        // B's attempt to take it back is refused.
+                        read_call(p),
+                        edit_call(p, "BETA-A", "BETA-B"),
+                        MockProvider::text_response("Left it."),
+                    ]
+                },
+                end: "alpha\nBETA-A\ngamma\n",
+                asked: &[],
+            },
+            Seeded {
+                name: "unruled_contest",
+                rule: Some(Precedence::Shared),
+                turns: &[CHILD_B, CHILD_A],
+                script: |p| {
+                    vec![
+                        read_call(p),
+                        edit_call(p, "beta", "BETA-B"),
+                        MockProvider::text_response("Done."),
+                        read_call(p),
+                        edit_call(p, "BETA-B", "BETA-A"),
+                        parent_says("instead", "Add your line under B's."),
+                        edit_call(p, "gamma", "BETA-A\ngamma"),
+                        MockProvider::text_response("Done."),
+                    ]
+                },
+                end: "alpha\nBETA-B\nBETA-A\ngamma\n",
+                asked: &["instead"],
+            },
+        ]
+    }
+
+    /// Every seeded conflict, several times over: the same seed is settled
+    /// the same way each run, the coordinator is asked only about informed
+    /// changes to a sibling's lines, and no file tool ever replaces a
+    /// sibling's change without a ruling, a rule or an answer behind it.
+    /// Run with `--nocapture` for the table.
+    #[tokio::test]
+    async fn seeded_conflicts_are_settled_the_same_way_every_run() {
+        const RUNS: usize = 3;
+        let mut asked_total = 0usize;
+        let mut conflicts = 0usize;
+        println!("scenario | asked | stale refused | settled unasked | shell overwrites | unlanded | undecided overwrites | agreement");
+        for seeded in seeded_conflicts() {
+            let mut runs = Vec::new();
+            for _ in 0..RUNS {
+                runs.push(run_seeded(&seeded).await);
+            }
+            let first = runs[0].clone();
+            let agreeing = runs.iter().filter(|run| **run == first).count();
+            println!(
+                "{} | {:?} | {} | {} | {} | {} | {} | {agreeing}/{RUNS}",
+                seeded.name,
+                first.asked,
+                first.stale_refusals,
+                first.settled_without_asking,
+                first.shell_overwrites,
+                first.unlanded,
+                first.undecided_overwrites,
+            );
+            assert_eq!(agreeing, RUNS, "{}: {runs:?}", seeded.name);
+            assert_eq!(first.end, seeded.end, "{}", seeded.name);
+            assert_eq!(first.asked, seeded.asked, "{}", seeded.name);
+            assert_eq!(first.undecided_overwrites, 0, "{}", seeded.name);
+            asked_total += first.asked.len();
+            conflicts += 1;
+        }
+        println!("coordinator calls per seeded conflict: {asked_total}/{conflicts}");
+        assert_eq!(asked_total, 3, "only the three informed contests with no rule");
+    }
 }

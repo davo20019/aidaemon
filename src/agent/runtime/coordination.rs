@@ -135,6 +135,13 @@ pub(crate) enum LogEntry {
     },
     /// A member wrote outside the scope it declared.
     WriteOutsideScope { member: String, path: String },
+    /// A shell command changed lines someone else had changed. A shell is
+    /// only seen afterwards, so nobody decided this.
+    ShellOverwrote {
+        member: String,
+        path: String,
+        holders: Vec<Writer>,
+    },
 }
 
 impl LogEntry {
@@ -212,6 +219,15 @@ impl LogEntry {
             Self::WriteOutsideScope { member, path } => {
                 format!("{member}: wrote {path}, outside its declared scope.")
             }
+            Self::ShellOverwrote {
+                member,
+                path,
+                holders,
+            } => format!(
+                "{member}: a shell command changed lines of {path} that {} had changed. Nobody \
+                 decided that; check the result.",
+                holders_named(holders)
+            ),
         }
     }
 
@@ -222,7 +238,8 @@ impl LogEntry {
             | Self::Escalated { member, .. }
             | Self::ContestSettled { member, .. }
             | Self::ScopeOverlap { member, .. }
-            | Self::WriteOutsideScope { member, .. } => member,
+            | Self::WriteOutsideScope { member, .. }
+            | Self::ShellOverwrote { member, .. } => member,
         }
     }
 }
@@ -439,6 +456,24 @@ impl Ledger {
         file.known = state;
         file.changed.insert(claim.owner, clock);
         true
+    }
+
+    /// Whose lines a change of the tracked file at `path` to `state` by
+    /// `owner` alters, other than `owner`'s own.
+    fn held_by_others(&self, path: &str, state: FileState, owner: OwnerId) -> Vec<Writer> {
+        let Some(file) = self.files.get(path).filter(|file| file.known != state) else {
+            return Vec::new();
+        };
+        let (before, after) = (self.content(file.known), self.content(state));
+        let holders: BTreeSet<OwnerId> = file
+            .ownership
+            .contested(before.as_deref(), after.as_deref(), owner)
+            .map(|found| found.claims.iter().map(|claim| claim.owner).collect())
+            .unwrap_or_default();
+        holders
+            .into_iter()
+            .filter_map(|holder| self.writer(holder))
+            .collect()
     }
 
     /// The id of the ruling that `keeper`'s change stands over `losers`.
@@ -1115,8 +1150,16 @@ impl Coordination {
             if let Some(bytes) = bytes.as_deref() {
                 ledger.retain(state, bytes);
             }
+            let overwritten = ledger.held_by_others(&path, state, owner);
             if !ledger.absorb(&path, state, Claim::by(owner)) {
                 continue;
+            }
+            if !overwritten.is_empty() {
+                ledger.log.push(LogEntry::ShellOverwrote {
+                    member: member.to_string(),
+                    path: path.clone(),
+                    holders: overwritten,
+                });
             }
             let clock = ledger.clock;
             if let Some(file) = ledger.files.get_mut(&path) {
@@ -2478,6 +2521,34 @@ mod tests {
             judge(&c, "b", b"two\n", b"mine\n"),
             WriteVerdict::Contested(_)
         ));
+    }
+
+    /// A shell is seen only after it ran: when it changed a sibling's lines
+    /// the coordinator is told nobody decided that.
+    #[test]
+    fn a_shell_that_changed_a_siblings_lines_is_reported() {
+        let c = after_a_siblings_change(b"one\ntwo\n", b"ONE\ntwo\n");
+        c.shell_began("a", "1");
+        c.shell_finished(
+            "a",
+            "1",
+            vec![(F.to_string(), Some(b"ONE\nTWO\n".to_vec()))],
+        );
+        assert_eq!(c.log_entries(), Vec::new(), "its own line");
+        c.shell_began("a", "2");
+        c.shell_finished(
+            "a",
+            "2",
+            vec![(F.to_string(), Some(b"mine\nTWO\n".to_vec()))],
+        );
+        assert_eq!(
+            c.log_entries(),
+            vec![LogEntry::ShellOverwrote {
+                member: "a".to_string(),
+                path: F.to_string(),
+                holders: vec![Writer::Member("b".to_string())],
+            }]
+        );
     }
 
     /// A file a reader sees changed while one member's shell runs is put
