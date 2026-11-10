@@ -15,6 +15,10 @@ pub(super) enum ReplyDefect {
     InternalMarkers,
     /// A pasted file page, raw data dump, or a copy of the latest tool output.
     ToolOutputPaste,
+    /// A well-formed reply written after a closeout demand that ended unmet
+    /// (`closeout_ended_unmet`): judged from the run's state, never from the
+    /// reply's words, it answers the daemon's demand rather than the user.
+    AnswersUnmetDemand,
 }
 
 /// Reply shape checks, all structural (sanitizer
@@ -113,6 +117,14 @@ pub(super) fn closeout_demands_work(facts: &StopFacts) -> bool {
         .any(|id| id.contains("/obligation:checklist:"))
         && facts.executor_demanded_at != Some(facts.completed_results);
     facts.completed_results == 0 || executor_demands
+}
+
+/// Whether a stop the closeout accepted ends a demand unmet: the ledger
+/// demanded more work earlier in the run and still holds expectations an
+/// admissible tool could satisfy. The model's reply then answers the
+/// daemon's demand, not the user's request.
+pub(super) fn closeout_ended_unmet(facts: &StopFacts, demands_made: u32) -> bool {
+    demands_made > 0 && !facts.reachable_obligation_ids.is_empty()
 }
 
 /// The tools the closeout may count as reachable: the registered daemon
@@ -324,8 +336,8 @@ impl Agent {
     }
 
     /// One shared retry for a reply that must not ship (empty, only internal
-    /// markers, pasted tool output); after it, the finalizer's honest
-    /// fallback applies.
+    /// markers, pasted tool output, or written to a closeout demand that
+    /// ended unmet); after it, the finalizer's honest fallback applies.
     pub(super) async fn sdk_reply_check(
         &self,
         scope: &TurnScope<'_>,
@@ -336,7 +348,13 @@ impl Agent {
             .lock()
             .ok()
             .and_then(|latest| latest.clone());
-        let Some(defect) = reply_defect(final_text, latest.as_deref()) else {
+        let defect = reply_defect(final_text, latest.as_deref()).or_else(|| {
+            scope
+                .closeout_ended_unmet
+                .load(Ordering::Relaxed)
+                .then_some(ReplyDefect::AnswersUnmetDemand)
+        });
+        let Some(defect) = defect else {
             return sdk::StopDecision::Accept;
         };
         let used = u32::from(scope.reply_retry_used.load(Ordering::Relaxed));
@@ -370,6 +388,15 @@ impl Agent {
             }
             ReplyDefect::ToolOutputPaste => {
                 crate::agent::system_directives::SystemDirective::FinalAnswerWasFilePaste
+            }
+            // The work is over: the rewrite answers the user from what the
+            // run already holds, and an empty rewrite ships this reply.
+            ReplyDefect::AnswersUnmetDemand => {
+                scope
+                    .verdict
+                    .record_interrupted_answer(final_text.to_string());
+                scope.text_only_next_call.store(true, Ordering::Relaxed);
+                crate::agent::system_directives::SystemDirective::FinalAnswerAfterUnmetCloseout
             }
         };
         sdk::StopDecision::Continue {
@@ -441,8 +468,10 @@ impl Agent {
         )
         .await;
         let demanded_at = scope.executor_demanded_at.load(Ordering::Relaxed);
+        // Delivering a capture to the chat changes nothing an observation
+        // could verify, so it does not earn the verify-once pass.
         let mutation_succeeded = aggregate.operations.values().any(|operation| {
-            operation.mutating
+            operation.changes_verifiable_state()
                 && operation.outcome == Some(crate::traits::ToolOutcomeStatus::Succeeded)
         });
         let observation_reachable = reachable.iter().any(|id| {
@@ -473,8 +502,13 @@ impl Agent {
         if !closeout_demands_work(&facts)
             || scope.closeout_demands.load(Ordering::Relaxed) >= MAX_CLOSEOUT_DEMANDS
         {
+            scope.closeout_ended_unmet.store(
+                closeout_ended_unmet(&facts, scope.closeout_demands.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
             return sdk::StopDecision::Accept;
         }
+        scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
         let demands = scope.closeout_demands.fetch_add(1, Ordering::Relaxed) + 1;
         if verification_after_mutation {
             scope.verification_demanded.store(true, Ordering::Relaxed);

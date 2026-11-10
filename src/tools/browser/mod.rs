@@ -452,6 +452,9 @@ fn screenshot_oversize_reason(bytes: &[u8]) -> Option<String> {
 struct DispatchResult {
     text: String,
     attachments: Vec<MessageAttachment>,
+    /// What the action turned out to do, when that is more than its
+    /// arguments declared (`call_semantics`).
+    semantics: Option<ToolCallSemantics>,
 }
 
 impl DispatchResult {
@@ -459,6 +462,7 @@ impl DispatchResult {
         Self {
             text,
             attachments: Vec::new(),
+            semantics: None,
         }
     }
 }
@@ -1165,9 +1169,15 @@ impl BrowserTool {
             }
         };
 
+        // Reaching here means the channel confirmed the image arrived, so the
+        // receipt says so: a delivery of the saved capture. A checklist item
+        // to send a screenshot is closed by this call, not by sending the
+        // same file a second time.
+        let semantics = delivered_screenshot_semantics(&saved_attachment.local_path);
         Ok(DispatchResult {
             text,
             attachments: vec![saved_attachment],
+            semantics: Some(semantics),
         })
     }
 
@@ -1326,6 +1336,7 @@ impl BrowserTool {
                 output_path.display()
             ),
             attachments,
+            semantics: None,
         })
     }
 
@@ -2369,6 +2380,7 @@ impl Tool for BrowserTool {
             output: result.text,
             metadata: ToolCallMetadata {
                 attachments: result.attachments,
+                semantics: result.semantics.unwrap_or_default(),
                 ..ToolCallMetadata::default()
             },
             finish: None,
@@ -2508,6 +2520,13 @@ fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
         ) => aidaemon_core::CallEffects::none(),
         _ => aidaemon_core::CallEffects::unknown(),
     }
+}
+
+/// The receipt of a screenshot the chat confirmed receiving: the page was
+/// observed and its capture, saved at `local_path`, was delivered.
+fn delivered_screenshot_semantics(local_path: &str) -> ToolCallSemantics {
+    ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+        .with_target_hint(ToolTargetHintKind::Path, local_path)
 }
 
 fn browser_call_semantics(

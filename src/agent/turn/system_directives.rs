@@ -57,9 +57,15 @@ pub(in crate::agent) enum SystemDirective {
     /// controller only requires one evidence-seeking pass.
     /// The run ledger still holds expectations that some admissible tool could
     /// satisfy. Rendered from typed obligations, never from reply wording.
+    /// The model's next text-only reply goes to the user, so the notice says
+    /// that reply is the final answer to the original request.
     LedgerExpectationsRequired {
         expectations: Vec<String>,
     },
+    /// A ledger demand ended unmet and the model's reply answered the
+    /// demand. One tool-less rewrite addressed to the user, judged by the
+    /// run's state (`ReplyDefect::AnswersUnmetDemand`), never by wording.
+    FinalAnswerAfterUnmetCloseout,
     /// Material evidence obligations remain open. This is rendered from typed
     /// inquiry state, never inferred from the wording of a draft response.
     InquiryEvidenceRequired {
@@ -191,7 +197,7 @@ impl SystemDirective {
                 old_budget, new_budget
             ),
             Self::LedgerExpectationsRequired { expectations } => format!(
-                "[SYSTEM] The durable run ledger still has unmet expectations that an available tool could satisfy: {}. No recorded tool result has matched them yet. Use the most relevant available tool to satisfy them, or state the exact live limitation you observed. Do not repeat a side effect you already performed (creating, sending, cancelling, deleting): if that work is done, say so. After this bounded pass, report the concrete result honestly.",
+                "[SYSTEM] Internal check, not shown to the user: no recorded tool result proves these steps yet: {}. If a step is still undone, do it now with the most relevant available tool. If it is already done, do not redo it and do not repeat a side effect (creating, sending, starting, cancelling, deleting, deploying); a check of its result is enough. Your next reply without tool calls is sent to the user as your final answer to their original request: give them what they asked for (the URLs, file paths, values and results), say plainly what is not done or not verified, and do not mention this check, the checklist, receipts or the ledger.",
                 if expectations.is_empty() {
                     "(unspecified)".to_string()
                 } else {
@@ -242,6 +248,7 @@ impl SystemDirective {
             ),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
+            Self::FinalAnswerAfterUnmetCloseout => "[SYSTEM] The work on this request is over and tools are disabled. Your previous reply answered an internal check instead of the user. Write your final reply to the user now: answer their original request directly with what you did and the concrete results they asked for (URLs, file paths, values), and say plainly anything that is not done or not verified. This reply is sent to the user as is: do not mention internal checks, system notices, the checklist, receipts or the ledger.".to_string(),
             Self::GuiCoordinateClickUnverified => "[SYSTEM] You are about to report a GUI action done, but your last click was a COORDINATE click at a raw point — it has no element identity, so it is NOT verified: it may have hit empty space, not the target. Do NOT claim success yet. Call computer_use get_app_state (or screenshot) NOW, look at the fresh screen, and confirm the intended change actually happened (e.g. the Like heart is filled/red, the count changed). If it did not, click again; if the target now shows a stable element_title, click by title (auto-verified). Only report done after you have visually confirmed the change.".to_string(),                                }
     }
 }
@@ -272,6 +279,27 @@ mod tests {
             SystemDirective::DuplicateSendFileAlreadySent.render(),
             "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only."
         );
+    }
+
+    /// Both texts the model sees around an unmet ledger demand say its next
+    /// reply is the user's final answer, forbid redoing finished work and
+    /// keep the internal check out of that reply.
+    #[test]
+    fn ledger_demand_directives_make_the_next_reply_the_user_s_answer() {
+        let demand = SystemDirective::LedgerExpectationsRequired {
+            expectations: vec!["checklist item 1: start the tunnel".to_string()],
+        }
+        .render();
+        assert!(demand.contains("checklist item 1: start the tunnel"));
+        assert!(demand.contains("not shown to the user"));
+        assert!(demand.contains("final answer to their original request"));
+        assert!(demand.contains("do not redo it"));
+        assert!(demand.contains("do not mention this check"));
+        let rewrite = SystemDirective::FinalAnswerAfterUnmetCloseout.render();
+        assert!(rewrite.contains("tools are disabled"));
+        assert!(rewrite.contains("original request"));
+        assert!(rewrite.contains("URLs"));
+        assert!(rewrite.contains("do not mention internal checks"));
     }
 
     #[test]

@@ -395,8 +395,8 @@ async fn test_autonomous_zero_tool_denial_requires_evidence_before_limitation() 
             .get("content")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|content| {
-                content.contains("durable run ledger still has unmet expectations")
-                    && content.contains("Use the most relevant available tool")
+                content.contains("no recorded tool result proves these steps yet")
+                    && content.contains("most relevant available tool")
             })
     }));
 }

@@ -164,7 +164,8 @@ pub(in crate::agent) enum StopDemand {
     #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
     GuiClickVerification,
     /// The final reply cannot ship (empty, internal markers, pasted tool
-    /// output); a rewrite needs no tool.
+    /// output, or written to a ledger demand that ended unmet); a rewrite
+    /// needs no tool.
     ReplyRepair,
 }
 

@@ -1005,6 +1005,40 @@ async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
     assert!(std::path::Path::new(&attachment.local_path).exists());
 }
 
+/// A confirmed delivery is typed on the receipt, with the saved capture as
+/// its subject, so "send a screenshot" is proven by the screenshot call.
+#[tokio::test]
+async fn delivered_screenshot_receipt_is_a_delivery_of_the_saved_capture() {
+    use crate::traits::{ToolMutationEffects, ToolTargetHintKind};
+
+    let (tool, _backend, rx) = mock_tool();
+    let _media = spawn_media_responder(rx, Ok(()));
+
+    let arguments = json!({ "action": "screenshot" }).to_string();
+    assert!(
+        super::browser_call_semantics(Some("screenshot"), "", "", "", "")
+            .mutation_effects
+            .is_empty(),
+        "nothing is delivered until the channel confirms it"
+    );
+    let outcome = tool
+        .call_with_execution_context(&arguments, None, crate::testing::call_facts("sess-a"))
+        .await
+        .unwrap();
+    let semantics = &outcome.metadata.semantics;
+    assert!(semantics.observes_state());
+    assert_eq!(
+        semantics.mutation_effects,
+        ToolMutationEffects::EXTERNAL_DELIVERY
+    );
+    assert_eq!(semantics.target_hints.len(), 1);
+    assert_eq!(semantics.target_hints[0].kind, ToolTargetHintKind::Path);
+    assert_eq!(
+        semantics.target_hints[0].value,
+        outcome.metadata.attachments[0].local_path
+    );
+}
+
 /// OVERSIZED (over photo caps, under doc cap): delivered as a DOCUMENT using the
 /// persisted inbox copy (also used for agent vision context).
 #[tokio::test]

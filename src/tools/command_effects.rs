@@ -675,6 +675,10 @@ struct Scan {
     /// Targets of output redirects into files, as written (not
     /// descriptor duplications or the null and standard-stream devices).
     output_targets: Vec<String>,
+    /// The character that ended each segment but the last, in order: `;`,
+    /// `|`, `&`, `(`, `)` or a newline. `&&` and `||` are two characters
+    /// with an empty segment between them.
+    separators: Vec<char>,
 }
 
 fn redirect_target(chars: &[char], mut j: usize) -> String {
@@ -695,6 +699,7 @@ fn scan(command: &str) -> Scan {
     let mut writes_file = false;
     let mut input_targets = Vec::new();
     let mut output_targets = Vec::new();
+    let mut separators = Vec::new();
     let (mut in_single, mut in_double) = (false, false);
     let mut i = 0;
     while i < chars.len() {
@@ -718,6 +723,7 @@ fn scan(command: &str) -> Scan {
             '\n' => {
                 unsafe_syntax = true;
                 segments.push(std::mem::take(&mut cur));
+                separators.push(c);
             }
             '\'' if !in_double => {
                 in_single = true;
@@ -746,10 +752,13 @@ fn scan(command: &str) -> Scan {
                     unsafe_syntax = true;
                 }
                 segments.push(std::mem::take(&mut cur));
+                separators.push(c);
             }
-            '|' => segments.push(std::mem::take(&mut cur)),
-            '&' if next == Some('>') => cur.push(c),
-            '&' => segments.push(std::mem::take(&mut cur)),
+            '|' | '&' if !(c == '&' && next == Some('>')) => {
+                segments.push(std::mem::take(&mut cur));
+                separators.push(c);
+            }
+            '&' => cur.push(c),
             '<' => {
                 let target = redirect_target(&chars, i + 1);
                 // `N<` opens a file on descriptor N, which the command may
@@ -817,6 +826,7 @@ fn scan(command: &str) -> Scan {
         writes_file,
         input_targets,
         output_targets,
+        separators,
     }
 }
 
@@ -2173,6 +2183,68 @@ fn wget(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
     if !names_output && !spider {
         out.unresolved();
     }
+}
+
+/// The URLs a command is proven to have fetched when it exits 0, as written:
+/// the whole command is `curl` or `wget` invocations joined only by `&&`,
+/// each naming exactly one strict URL in a shape the option tables
+/// understand. With `&&` the exit status is the last invocation's and every
+/// earlier one had to succeed for it to run, so status 0 proves every fetch
+/// completed (for curl: a response arrived; with `-f` also a non-error
+/// status). `None` for anything a later step could mask or that could run
+/// something else: `;`, `||`, a pipe, a background `&`, a newline, a
+/// subshell or substitution, an expansion, a launcher or variable
+/// assignment, an unlisted option, or a second URL in one invocation (curl
+/// reports only its last transfer).
+pub(crate) fn proven_fetch_urls(command: &str) -> Option<Vec<String>> {
+    let scanned = scan(command);
+    if scanned.unsafe_syntax || !scanned.separators.len().is_multiple_of(2) {
+        return None;
+    }
+    // `&&` scans as two `&` with an empty segment between them.
+    for (pair, between) in scanned
+        .separators
+        .chunks(2)
+        .zip(scanned.segments.iter().skip(1).step_by(2))
+    {
+        if pair != ['&', '&'] || !between.is_empty() {
+            return None;
+        }
+    }
+    let mut urls = Vec::new();
+    for segment in scanned.segments.iter().step_by(2) {
+        if has_expansion(segment) {
+            return None;
+        }
+        let tokens = strip_redirections(shell_words::split(segment).ok()?);
+        let (program, args) = tokens.split_first()?;
+        let path_ok = !program.contains('/')
+            || program
+                .rsplit_once('/')
+                .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
+        if !path_ok {
+            return None;
+        }
+        let spec = match basename(program) {
+            "curl" => &CURL,
+            "wget" => &WGET,
+            _ => return None,
+        };
+        let parsed = parse_options(spec, args)?;
+        let mut named = parsed.positionals.iter().chain(
+            parsed
+                .values
+                .iter()
+                .filter(|(role, _)| *role == OptionValue::Url)
+                .map(|(_, value)| value),
+        );
+        let url = named.next()?;
+        if named.next().is_some() || strict_url(url).is_none() {
+            return None;
+        }
+        urls.push(url.clone());
+    }
+    Some(urls)
 }
 
 const HTTPIE: OptionSpec = OptionSpec {
@@ -3881,5 +3953,59 @@ mod tests {
                 .keys
                 .is_empty()
         );
+    }
+
+    /// A fetch is proven only when the exit status vouches for it: curl or
+    /// wget alone, or joined by `&&`, one strict URL each, kept as written.
+    #[test]
+    fn proven_fetch_urls_only_when_exit_status_vouches_for_every_fetch() {
+        let url = "https://synthetic-tunnel.example/";
+        let other = "http://127.0.0.1:8080/wp-login.php";
+        assert_eq!(
+            proven_fetch_urls(&format!("curl -sSfL {url}")),
+            Some(vec![url.to_string()])
+        );
+        assert_eq!(
+            proven_fetch_urls(&format!("curl -s -o /dev/null -w '%{{http_code}}' '{url}'")),
+            Some(vec![url.to_string()])
+        );
+        assert_eq!(
+            proven_fetch_urls(&format!("wget -q -O - {other} 2>&1")),
+            Some(vec![other.to_string()])
+        );
+        assert_eq!(
+            proven_fetch_urls(&format!("curl -sI {url} && /usr/bin/wget --spider {other}")),
+            Some(vec![url.to_string(), other.to_string()])
+        );
+        assert_eq!(
+            proven_fetch_urls(&format!("curl --url {url}")),
+            Some(vec![url.to_string()])
+        );
+
+        // A later step, or the shell itself, can mask a failed fetch.
+        for masked in [
+            format!("curl -s {url}; true"),
+            format!("curl -s {url} || echo down"),
+            format!("curl -s {url} | head -5"),
+            format!("curl -s {url} |& tee /tmp/out"),
+            format!("curl -s {url} & wait"),
+            format!("(curl -s {url})"),
+            format!("curl -s {url}\necho done"),
+            format!("curl -s {url} && echo ok"),
+            format!("echo start && curl -s {url}"),
+            format!("curl -s $(cat /tmp/url)"),
+            format!("curl -s \"$URL\""),
+            format!("URL={url} curl -s {url}"),
+            format!("sudo curl -s {url}"),
+            format!("curl -s {url} {other}"),
+            format!("curl -K /tmp/curlrc {url}"),
+            format!("/tmp/bin/curl -s {url}"),
+            "curl -s synthetic-tunnel.example".to_string(),
+            "curl -s 'https://synthetic-tunnel.example/{a,b}'".to_string(),
+            "curl -s".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(proven_fetch_urls(&masked), None, "{masked}");
+        }
     }
 }

@@ -156,6 +156,11 @@ pub struct RunOperation {
     /// Effect revision after this operation's terminal receipt was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_revision: Option<u64>,
+    /// Position of this operation's latest receipt among the run's receipts.
+    /// Unlike `result_revision` it orders a launch receipt and observations
+    /// that changed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +178,36 @@ impl RunOperation {
     fn has_terminal_receipt(&self) -> bool {
         self.result_id.is_some() && !self.is_background_in_flight()
     }
+
+    /// The operation's mutation is a change a later observation could
+    /// verify: anything but the delivery of the call's own local capture
+    /// (see [`delivers_own_capture`]).
+    pub fn changes_verifiable_state(&self) -> bool {
+        self.mutating && !delivers_own_capture(self.observes, self.mutation_effects, &self.targets)
+    }
+}
+
+/// A call that observed something and delivered its own local capture of it
+/// (a screenshot the chat confirmed receiving): its only effect is the
+/// delivery, it names only local files, and its receipt already carries
+/// what it observed and that the delivery arrived. The captured file is
+/// unchanged and no observation can read the chat back, so the delivery is
+/// no change that needs verifying and leaves earlier observations current.
+/// A delivery that names no local file (a node restart request, a message
+/// to a remote service), a plain delivery that observed nothing
+/// (`send_file`), and any delivery combined with another effect (a click
+/// that posts) still count as changes.
+pub fn delivers_own_capture(
+    observes: bool,
+    effects: crate::traits::ToolMutationEffects,
+    targets: &[ToolTargetHint],
+) -> bool {
+    observes
+        && effects == crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY
+        && !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| target.kind == ToolTargetHintKind::Path)
 }
 
 /// End-to-end lifecycle projection. Execution completion and user-visible
@@ -285,6 +320,9 @@ pub struct RunAggregate {
     pub contract_fingerprint: Option<String>,
     #[serde(default)]
     pub effect_revision: u64,
+    /// Receipts recorded so far; stamps each operation's `receipt_sequence`.
+    #[serde(default)]
+    pub receipt_sequence: u64,
     #[serde(default)]
     pub obligations: BTreeMap<String, RunObligation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,6 +382,7 @@ impl RunAggregate {
             verification_targets: Vec::new(),
             contract_fingerprint: None,
             effect_revision: 0,
+            receipt_sequence: 0,
             obligations: BTreeMap::new(),
             response_contract: None,
             allowed_tool_names: BTreeSet::new(),
@@ -695,6 +734,33 @@ impl RunAggregate {
                     && obligation.required_target == required_target
                     && obligation.observation_targets == observation_targets
             });
+            // Naming where already-proven work lives narrows the item; it is
+            // not a different item. The executor adds an item's target when
+            // it ticks the item, after the receipts that proved it, and that
+            // edit must not turn accomplished work into unperformed work.
+            // The proof is dropped only when it contradicts the new target:
+            // its receipts name subjects of that kind and none is the target.
+            let same_contract = same_contract
+                || existing.is_some_and(|obligation| {
+                    class == RunObligationClass::Achieve
+                        && obligation.class == class
+                        && obligation.required_effect == required_effect
+                        && obligation.required_target.is_none()
+                        && obligation.state == RunObligationState::Satisfied
+                        && required_target.as_ref().is_none_or(|target| {
+                            let named: Vec<&ToolTargetHint> = obligation
+                                .satisfying_receipt_ids
+                                .iter()
+                                .filter_map(|id| self.operations.get(id))
+                                .flat_map(|operation| operation.targets.iter())
+                                .filter(|hint| hint_is_of_target_kind(target.kind, hint.kind))
+                                .collect();
+                            named.is_empty()
+                                || named
+                                    .iter()
+                                    .any(|hint| hint_matches_target(&self.paths, target, hint))
+                        })
+                });
             let existing_proof = existing
                 .filter(|_| same_contract)
                 .map(|o| o.satisfying_receipt_ids.clone())
@@ -723,7 +789,12 @@ impl RunAggregate {
                 required_effect,
                 satisfied_at_revision: existing_revision,
                 satisfying_receipt_ids: existing_proof,
-                summary: Some(executor_item_summary(item, class, required_effect)),
+                summary: Some(executor_item_summary(
+                    item,
+                    class,
+                    required_effect,
+                    required_target.as_ref(),
+                )),
                 required_target,
                 observation_targets,
                 prerequisite: class == RunObligationClass::Observe
@@ -745,10 +816,18 @@ impl RunAggregate {
         self.close_remote_effect_obligations_on_verified_remote_observation();
     }
 
-    /// Re-verify still-pending checklist obligations against receipts that
-    /// were recorded before the item (or its exact targets) was declared.
-    /// Receipts remain the only thing that can close an obligation; this
-    /// only removes the declaration-order dependency.
+    /// Verify still-pending checklist obligations against every receipt the
+    /// run has recorded, whether it landed before or after the item (or its
+    /// exact targets) was declared. Receipts remain the only thing that can
+    /// close an obligation.
+    ///
+    /// An `Achieve` item is proven by the receipts together, the way the
+    /// work is done: its effects may be spread over several succeeded
+    /// receipts on its target, and a launch receipt proves the process-state
+    /// change it declared while that process is still running. Work whose
+    /// receipts cannot name the item's target (a local process behind a
+    /// public URL) is proven by the effect plus a later completed
+    /// observation of that target.
     fn recredit_checklist_obligations_from_recorded_receipts(&mut self) {
         struct RecordedReceipt {
             operation_id: String,
@@ -756,38 +835,62 @@ impl RunAggregate {
             completed_observation: bool,
             dispatched: bool,
             mutation_effects: crate::traits::ToolMutationEffects,
+            /// What this receipt proves happened: all its effects once it
+            /// succeeded, only the process-state change while in flight.
+            proven_effects: crate::traits::ToolMutationEffects,
             observes: bool,
             targets: Vec<ToolTargetHint>,
             observations: Vec<ToolObservationEvidence>,
             collection_observations: Vec<ToolCollectionObservation>,
             revision: u64,
+            sequence: u64,
         }
-        let receipts: Vec<RecordedReceipt> = self
+        let mut receipts: Vec<RecordedReceipt> = self
             .operations
             .values()
-            .filter(|operation| operation.has_terminal_receipt())
-            .map(|operation| RecordedReceipt {
-                operation_id: operation.operation_id.clone(),
-                succeeded: matches!(operation.outcome, Some(ToolOutcomeStatus::Succeeded)),
-                completed_observation: matches!(
-                    operation.outcome,
-                    Some(
-                        ToolOutcomeStatus::Succeeded
-                            | ToolOutcomeStatus::CompletedWithNegativeResult
-                    )
-                ),
-                dispatched: operation.dispatched,
-                mutation_effects: operation.mutation_effects,
-                observes: operation.observes,
-                targets: operation.targets.clone(),
-                observations: operation.observations.clone(),
-                collection_observations: operation.collection_observations.clone(),
-                revision: operation.result_revision.unwrap_or(self.effect_revision),
+            .filter(|operation| operation.result_id.is_some())
+            .map(|operation| {
+                let terminal = operation.has_terminal_receipt();
+                let succeeded =
+                    terminal && matches!(operation.outcome, Some(ToolOutcomeStatus::Succeeded));
+                let proven_effects = if !operation.dispatched {
+                    crate::traits::ToolMutationEffects::NONE
+                } else if succeeded {
+                    operation.mutation_effects
+                } else if operation.is_background_in_flight() {
+                    operation
+                        .mutation_effects
+                        .intersect(crate::traits::ToolMutationEffects::PROCESS_STATE)
+                } else {
+                    crate::traits::ToolMutationEffects::NONE
+                };
+                RecordedReceipt {
+                    operation_id: operation.operation_id.clone(),
+                    succeeded,
+                    completed_observation: terminal
+                        && matches!(
+                            operation.outcome,
+                            Some(
+                                ToolOutcomeStatus::Succeeded
+                                    | ToolOutcomeStatus::CompletedWithNegativeResult
+                            )
+                        ),
+                    dispatched: operation.dispatched,
+                    mutation_effects: operation.mutation_effects,
+                    proven_effects,
+                    observes: operation.observes,
+                    targets: operation.targets.clone(),
+                    observations: operation.observations.clone(),
+                    collection_observations: operation.collection_observations.clone(),
+                    revision: operation.result_revision.unwrap_or(self.effect_revision),
+                    sequence: operation.receipt_sequence.unwrap_or(0),
+                }
             })
             .collect();
         if receipts.is_empty() {
             return;
         }
+        receipts.sort_by_key(|receipt| receipt.sequence);
         for (id, obligation) in self.obligations.iter_mut() {
             if !id.contains("/obligation:checklist:")
                 || !matches!(
@@ -798,43 +901,105 @@ impl RunAggregate {
             {
                 continue;
             }
+            if obligation.class == RunObligationClass::Achieve {
+                let required = obligation.required_effect;
+                if required.is_empty() {
+                    continue;
+                }
+                let target = obligation.required_target.as_ref();
+                // The earliest receipts that together carry the effect. A
+                // receipt counts only when it adds to what is proven so far.
+                let covering = |on_target: bool| {
+                    let mut proven = crate::traits::ToolMutationEffects::NONE;
+                    let mut proof = Vec::new();
+                    for receipt in &receipts {
+                        if receipt.proven_effects.is_empty()
+                            || (on_target
+                                && target.is_some_and(|target| {
+                                    !hints_touch_target(&self.paths, target, &receipt.targets)
+                                }))
+                        {
+                            continue;
+                        }
+                        let widened = proven.union(receipt.proven_effects);
+                        // Judged per required effect through `satisfies`, so
+                        // a more specific receipt (a source-file write for a
+                        // workspace write) counts as the progress it is.
+                        let adds = (0..u32::BITS)
+                            .map(|bit| {
+                                crate::traits::ToolMutationEffects::from_bits(
+                                    required.bits() & (1 << bit),
+                                )
+                            })
+                            .any(|part| {
+                                !part.is_empty()
+                                    && widened.satisfies(part)
+                                    && !proven.satisfies(part)
+                            });
+                        if !adds {
+                            continue;
+                        }
+                        proven = widened;
+                        proof.push(receipt);
+                        if proven.satisfies(required) {
+                            return Some(proof);
+                        }
+                    }
+                    None
+                };
+                let proof = covering(true).or_else(|| {
+                    let target = target?;
+                    let mut proof = covering(false)?;
+                    let done_at = proof.iter().map(|receipt| receipt.sequence).max()?;
+                    let observed = receipts.iter().find(|receipt| {
+                        receipt.sequence > done_at
+                            && receipt.completed_observation
+                            && receipt.dispatched
+                            && receipt.observes
+                            && hints_touch_target(&self.paths, target, &receipt.targets)
+                    })?;
+                    proof.push(observed);
+                    Some(proof)
+                });
+                let Some(proof) = proof else {
+                    continue;
+                };
+                for receipt in &proof {
+                    if !obligation
+                        .satisfying_receipt_ids
+                        .contains(&receipt.operation_id)
+                    {
+                        obligation
+                            .satisfying_receipt_ids
+                            .push(receipt.operation_id.clone());
+                    }
+                }
+                obligation.state = RunObligationState::Satisfied;
+                obligation.satisfied_at_revision =
+                    proof.iter().map(|receipt| receipt.revision).max();
+                continue;
+            }
+            if obligation.class != RunObligationClass::Observe {
+                continue;
+            }
             for receipt in &receipts {
-                let target_compatible = match obligation.class {
-                    RunObligationClass::Observe => observation_targets_supported(
+                let proven = receipt.completed_observation
+                    && receipt.dispatched
+                    && receipt.observes
+                    && observation_targets_supported(
                         &self.paths,
                         &obligation.observation_targets,
                         &receipt.targets,
                         &receipt.observations,
                         &receipt.collection_observations,
-                    ),
-                    _ => obligation.required_target.as_ref().is_none_or(|target| {
-                        hints_touch_target(&self.paths, target, &receipt.targets)
-                    }),
-                };
-                let proven = match obligation.class {
-                    RunObligationClass::Achieve => {
-                        !obligation.required_effect.is_empty()
-                            && receipt.succeeded
-                            && receipt
-                                .mutation_effects
-                                .satisfies(obligation.required_effect)
-                            && target_compatible
-                    }
-                    RunObligationClass::Observe => {
-                        receipt.completed_observation
-                            && receipt.dispatched
-                            && receipt.observes
-                            && target_compatible
-                    }
-                    _ => false,
-                };
+                    );
                 if !proven {
                     continue;
                 }
                 // Mirror the live staleness rule: an observation credited at
                 // an older revision is stale only when a later mutation could
                 // have changed the observed state.
-                if obligation.class == RunObligationClass::Observe && !obligation.prerequisite {
+                if !obligation.prerequisite {
                     let stale = receipts.iter().any(|later| {
                         later.succeeded
                             && !later.mutation_effects.is_empty()
@@ -1003,6 +1168,7 @@ impl RunAggregate {
                 mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 observes: false,
                 result_revision: None,
+                receipt_sequence: None,
                 result_id: None,
                 operation_lineage: call.operation_lineage,
             },
@@ -1145,6 +1311,7 @@ impl RunAggregate {
                 mutation_effects: crate::traits::ToolMutationEffects::NONE,
                 observes: false,
                 result_revision: None,
+                receipt_sequence: None,
                 result_id: None,
                 operation_lineage: None,
             });
@@ -1176,6 +1343,8 @@ impl RunAggregate {
             .union(receipt.semantics.mutation_effects);
         operation.observes = operation.observes || receipt.semantics.observes_state();
         operation.result_id = Some(result_id.clone());
+        self.receipt_sequence = self.receipt_sequence.saturating_add(1);
+        operation.receipt_sequence = Some(self.receipt_sequence);
         let claimed_obligation_ids = operation.obligation_ids.clone();
         // Cardinality is about distinct durable invocations, not distinct
         // output bytes. Two real calls may legitimately return identical (or
@@ -1203,8 +1372,11 @@ impl RunAggregate {
         // handed its still-running lifecycle to a durable notifier. Retain the
         // provisional receipt for replay/idempotence and cardinality, but do
         // not credit completion evidence, advance effect revision, or exhaust
-        // the run while its terminal result is outstanding.
+        // the run while its terminal result is outstanding. The one thing a
+        // launch does prove is the process-state change it declared, which
+        // the checklist re-credit reads from the recorded operation.
         if receipt.outcome_status == ToolOutcomeStatus::Backgrounded {
+            self.recredit_checklist_obligations_from_recorded_receipts();
             self.reconcile_cardinality();
             // The call proposal may have looked cardinality-exhausted before
             // its first receipt arrived. The handoff reopens it as in-flight,
@@ -1217,7 +1389,12 @@ impl RunAggregate {
         let completed_mutation = !is_durable_replay
             && result.succeeded()
             && receipt.invocation_stage.reached_dispatch()
-            && receipt.semantics.mutates_state();
+            && receipt.semantics.mutates_state()
+            && !delivers_own_capture(
+                receipt.semantics.observes_state(),
+                receipt.semantics.mutation_effects,
+                &receipt_targets(receipt),
+            );
         if completed_mutation {
             self.effect_revision = self.effect_revision.saturating_add(1);
         }
@@ -1329,6 +1506,9 @@ impl RunAggregate {
                 }
             }
         }
+        // One receipt rarely carries a whole checklist item; let the recorded
+        // receipts prove it together.
+        self.recredit_checklist_obligations_from_recorded_receipts();
         self.close_remote_effect_obligations_on_verified_remote_observation();
         self.reconcile_cardinality();
         // Keep the last operation that advanced an open aggregate. Once the
@@ -2232,6 +2412,23 @@ fn hint_matches_target(
     }
 }
 
+/// Whether a receipt subject of `hint` kind could have been a target of
+/// `target` kind (a path target is named by a path or by a root over it).
+fn hint_is_of_target_kind(target: RequestVerificationTargetKind, hint: ToolTargetHintKind) -> bool {
+    matches!(
+        (target, hint),
+        (RequestVerificationTargetKind::Url, ToolTargetHintKind::Url)
+            | (
+                RequestVerificationTargetKind::Path,
+                ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+            )
+            | (
+                RequestVerificationTargetKind::ResourceId,
+                ToolTargetHintKind::ResourceId
+            )
+    )
+}
+
 fn facets_cover(observed: &[ToolSemanticFacet], required: &[ToolSemanticFacet]) -> bool {
     required.iter().all(|facet| observed.contains(facet))
 }
@@ -2328,6 +2525,7 @@ fn executor_item_summary(
     item: &ExecutorExpectationItem,
     class: RunObligationClass,
     required_effect: ToolMutationEffects,
+    required_target: Option<&crate::traits::RequestVerificationTarget>,
 ) -> String {
     let target = item
         .targets
@@ -2335,15 +2533,36 @@ fn executor_item_summary(
         .map(|target| format!(" on {target}"))
         .unwrap_or_default();
     match class {
-        RunObligationClass::Achieve => format!(
-            "checklist item {}: {} — needs a succeeded receipt carrying {}{} (declare the path as write access)",
-            item.index + 1,
-            item.description,
-            required_effect
-                .protocol_names()
-                .join("|"),
-            target
-        ),
+        RunObligationClass::Achieve => {
+            // How a receipt names this kind of target, then the other proof
+            // `recredit_checklist_obligations_from_recorded_receipts` accepts.
+            let how = match required_target.map(|target| target.kind) {
+                None => String::new(),
+                Some(RequestVerificationTargetKind::Path) => {
+                    " (declare the path as write access); or the effect, then a later completed \
+                     observation of the path"
+                        .to_string()
+                }
+                Some(RequestVerificationTargetKind::Url) => {
+                    " that names the URL; or the effect, then a later completed observation of \
+                     the URL (an HTTP request, browser load or successful curl/wget of it)"
+                        .to_string()
+                }
+                Some(RequestVerificationTargetKind::ResourceId) => {
+                    " that names the resource; or the effect, then a later completed \
+                     observation of the resource"
+                        .to_string()
+                }
+            };
+            format!(
+                "checklist item {}: {} — needs a succeeded receipt carrying {}{}{}",
+                item.index + 1,
+                item.description,
+                required_effect.protocol_names().join("|"),
+                target,
+                how
+            )
+        }
         _ => format!(
             "checklist item {}: {} — needs a completed observation receipt{}",
             item.index + 1,
@@ -5618,6 +5837,527 @@ mod tests {
             aggregate.obligations["task:task-1/obligation:checklist:1"].state,
             RunObligationState::Invalidated,
             "a write to the observed path must stale that observation"
+        );
+    }
+
+    fn effect_semantics(
+        effects: ToolMutationEffects,
+        hint: Option<(crate::traits::ToolTargetHintKind, &str)>,
+    ) -> ToolCallSemantics {
+        let semantics = ToolCallSemantics {
+            effect: ToolCallEffect::ObservationAndMutation,
+            mutation_effects: effects,
+            ..ToolCallSemantics::default()
+        };
+        match hint {
+            Some((kind, value)) => semantics.with_target_hint(kind, value),
+            None => semantics,
+        }
+    }
+
+    /// The shape of a real run: build a site, send a screenshot of it, start
+    /// a long-lived tunnel and check its public URL. The executor names each
+    /// item's target only when it ticks the item, the site is written by
+    /// several commands, the screenshot tool delivers its own capture, the
+    /// tunnel is still running (its success state) when the run ends, and
+    /// its URL is checked by a shell command whose receipt names no URL.
+    #[test]
+    fn site_setup_checklist_closes_on_the_receipts_of_the_work_that_did_it() {
+        const SITE: &str = "/tmp/proj/site";
+        const SHOT: &str = "/tmp/inbox/shot.png";
+        const TUNNEL: &str = "https://synthetic-tunnel.example/";
+        let site_effects =
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE.union(ToolMutationEffects::PROCESS_STATE);
+        let items = |site: &[&str], shot: &[&str], tunnel: &[&str]| {
+            executor_expectations(vec![
+                checklist_item(0, site_effects, false, site, "completed"),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::EXTERNAL_DELIVERY,
+                    false,
+                    shot,
+                    "completed",
+                ),
+                checklist_item(
+                    2,
+                    ToolMutationEffects::PROCESS_STATE,
+                    false,
+                    tunnel,
+                    "completed",
+                ),
+            ])
+        };
+        let mut events = vec![
+            items(&[], &[], &[]),
+            call("install", "terminal"),
+            result(
+                "install",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                workspace_write_semantics("/tmp/proj/site/wp-config.php"),
+            ),
+            items(&[SITE], &[], &[]),
+            call("shot", "browser"),
+            result(
+                "shot",
+                "browser",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                effect_semantics(
+                    ToolMutationEffects::EXTERNAL_DELIVERY,
+                    Some((crate::traits::ToolTargetHintKind::Path, SHOT)),
+                ),
+            ),
+            items(&[SITE], &[SHOT], &[]),
+            call("tunnel", "terminal"),
+            result(
+                "tunnel",
+                "terminal",
+                ToolOutcomeStatus::Backgrounded,
+                0,
+                effect_semantics(
+                    site_effects,
+                    Some((
+                        crate::traits::ToolTargetHintKind::Path,
+                        "/tmp/proj/site/tunnel.log",
+                    )),
+                ),
+            ),
+            call("probe", "terminal"),
+            result(
+                "probe",
+                "terminal",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+            items(&[SITE], &[SHOT], &[TUNNEL]),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        for index in 0..3 {
+            assert_eq!(
+                aggregate.obligations[&format!("task:task-1/obligation:checklist:{index}")].state,
+                RunObligationState::Satisfied,
+                "checklist item {index}"
+            );
+        }
+        assert_eq!(aggregate.open_executor_expectations(), 0);
+    }
+
+    /// Naming the target of a proven item keeps its proof; a target the
+    /// proving receipts contradict, or a move to another target, does not.
+    #[test]
+    fn narrowing_a_proven_effect_item_keeps_its_proof_and_retargeting_reopens_it() {
+        let item = |targets: &[&str]| {
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                false,
+                targets,
+                "completed",
+            )])
+        };
+        let state = |declarations: Vec<Event>| {
+            let mut events = vec![
+                item(&[]),
+                call("write", "write_file"),
+                result(
+                    "write",
+                    "write_file",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    workspace_write_semantics("/tmp/proj/a.txt"),
+                ),
+            ];
+            events.extend(declarations);
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state
+        };
+        assert_eq!(
+            state(vec![item(&["/tmp/proj"])]),
+            RunObligationState::Satisfied,
+            "the write was proven before the item named its folder"
+        );
+        assert_eq!(
+            state(vec![item(&["https://synthetic-site.example/"])]),
+            RunObligationState::Satisfied,
+            "a file write says nothing against a URL the item now names"
+        );
+        assert_eq!(
+            state(vec![item(&["/tmp/elsewhere/b.txt"])]),
+            RunObligationState::Pending,
+            "the proving write was to another file"
+        );
+        assert_eq!(
+            state(vec![
+                item(&["/tmp/proj/a.txt"]),
+                item(&["/tmp/elsewhere/b.txt"])
+            ]),
+            RunObligationState::Pending,
+            "moving a targeted item to another target is a different item"
+        );
+    }
+
+    /// A launch receipt proves that a process was started and nothing else:
+    /// the files the command will write are not written yet.
+    #[test]
+    fn background_launch_proves_process_state_but_not_the_command_s_writes() {
+        let mut events = vec![
+            executor_expectations(vec![
+                checklist_item(0, ToolMutationEffects::PROCESS_STATE, false, &[], "pending"),
+                checklist_item(
+                    1,
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+                    false,
+                    &[],
+                    "pending",
+                ),
+            ]),
+            call("build", "terminal"),
+            result(
+                "build",
+                "terminal",
+                ToolOutcomeStatus::Backgrounded,
+                0,
+                effect_semantics(
+                    ToolMutationEffects::LOCAL_WORKSPACE_WRITE
+                        .union(ToolMutationEffects::PROCESS_STATE),
+                    None,
+                ),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Satisfied
+        );
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Pending,
+            "the build has not finished writing"
+        );
+    }
+
+    /// A launch that was never declared as a process-state change (a status
+    /// check on a running process) proves nothing.
+    #[test]
+    fn background_receipt_without_a_process_effect_proves_nothing() {
+        let mut events = vec![
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::PROCESS_STATE,
+                false,
+                &[],
+                "pending",
+            )]),
+            call("check", "terminal"),
+            result(
+                "check",
+                "terminal",
+                ToolOutcomeStatus::Backgrounded,
+                0,
+                terminal_observation_semantics(None),
+            ),
+        ];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Pending
+        );
+    }
+
+    /// An effect whose receipts do not touch the item's target is credited
+    /// only when the target was observed after the work, never by an
+    /// observation that predates it or by one of another target.
+    #[test]
+    fn effect_away_from_its_target_needs_a_later_observation_of_that_target() {
+        const TUNNEL: &str = "https://synthetic-tunnel.example/";
+        let item = || {
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::PROCESS_STATE,
+                false,
+                &[TUNNEL],
+                "completed",
+            )])
+        };
+        let launch = || {
+            [
+                call("tunnel", "terminal"),
+                result(
+                    "tunnel",
+                    "terminal",
+                    ToolOutcomeStatus::Backgrounded,
+                    0,
+                    effect_semantics(ToolMutationEffects::PROCESS_STATE, None),
+                ),
+            ]
+        };
+        let probe = |id: &str, url: &str| {
+            [
+                call(id, "terminal"),
+                result(
+                    id,
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    url_observation_semantics(url),
+                ),
+            ]
+        };
+        let state = |mut events: Vec<Event>| {
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state
+        };
+
+        let unobserved = [vec![item()], launch().to_vec()].concat();
+        assert_eq!(state(unobserved), RunObligationState::Pending);
+
+        let observed_before = [
+            vec![item()],
+            probe("early", TUNNEL).to_vec(),
+            launch().to_vec(),
+        ]
+        .concat();
+        assert_eq!(state(observed_before), RunObligationState::Pending);
+
+        let other_target = [
+            vec![item()],
+            launch().to_vec(),
+            probe("other", "https://elsewhere.example/").to_vec(),
+        ]
+        .concat();
+        assert_eq!(state(other_target), RunObligationState::Pending);
+
+        let no_effect = [vec![item()], probe("only", TUNNEL).to_vec()].concat();
+        assert_eq!(state(no_effect), RunObligationState::Pending);
+
+        let observed_after = [
+            vec![item()],
+            launch().to_vec(),
+            probe("late", TUNNEL).to_vec(),
+        ]
+        .concat();
+        assert_eq!(state(observed_after), RunObligationState::Satisfied);
+    }
+
+    /// Two receipts that each carry part of an item's effects prove it
+    /// together, but only receipts on the item's target count.
+    #[test]
+    fn several_receipts_on_the_target_jointly_cover_a_multi_effect_item() {
+        let both =
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE.union(ToolMutationEffects::CONFIGURATION);
+        let config = |path: &str| {
+            effect_semantics(
+                ToolMutationEffects::CONFIGURATION,
+                Some((crate::traits::ToolTargetHintKind::Path, path)),
+            )
+        };
+        let run = |config_path: &str| {
+            let mut events = vec![
+                executor_expectations(vec![checklist_item(
+                    0,
+                    both,
+                    false,
+                    &["/tmp/proj/site"],
+                    "pending",
+                )]),
+                call("write", "write_file"),
+                result(
+                    "write",
+                    "write_file",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    workspace_write_semantics("/tmp/proj/site/index.php"),
+                ),
+                call("config", "terminal"),
+                result(
+                    "config",
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    config(config_path),
+                ),
+            ];
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .clone()
+        };
+        let joint = run("/tmp/proj/site/settings.php");
+        assert_eq!(joint.state, RunObligationState::Satisfied);
+        assert_eq!(joint.satisfying_receipt_ids, vec!["write", "config"]);
+        let source_write = |effects| {
+            let mut events = vec![
+                executor_expectations(vec![checklist_item(0, both, false, &[], "pending")]),
+                call("edit", "edit_file"),
+                result(
+                    "edit",
+                    "edit_file",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    effect_semantics(ToolMutationEffects::LOCAL_SOURCE_WRITE, None),
+                ),
+                call("config", "terminal"),
+                result(
+                    "config",
+                    "terminal",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    effect_semantics(effects, None),
+                ),
+            ];
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .state
+        };
+        assert_eq!(
+            source_write(ToolMutationEffects::CONFIGURATION),
+            RunObligationState::Satisfied,
+            "a source-file write is a workspace write"
+        );
+        assert_eq!(
+            source_write(ToolMutationEffects::EXTERNAL_DELIVERY),
+            RunObligationState::Pending
+        );
+        assert_eq!(
+            run("/tmp/other/settings.php").state,
+            RunObligationState::Pending,
+            "configuration somewhere else is not this item's work"
+        );
+    }
+
+    /// An effect item's demand names how its target kind is proven, never
+    /// the path advice for a URL target.
+    #[test]
+    fn effect_item_summary_matches_its_target_kind() {
+        let summary = |target: &str| {
+            let mut events = vec![executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::PROCESS_STATE,
+                false,
+                &[target],
+                "pending",
+            )])];
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events).obligations
+                ["task:task-1/obligation:checklist:0"]
+                .summary
+                .clone()
+                .unwrap()
+        };
+        let url = summary("https://synthetic-tunnel.example/");
+        assert!(url.contains("names the URL"), "{url}");
+        assert!(url.contains("later completed observation"), "{url}");
+        assert!(!url.contains("declare the path"), "{url}");
+        let path = summary("/tmp/proj/site");
+        assert!(path.contains("declare the path as write access"), "{path}");
+        assert!(path.contains("later completed observation"), "{path}");
+    }
+
+    /// Delivering a call's own capture to the chat is no change an
+    /// observation could verify: it neither advances the effect revision nor
+    /// stales an earlier observation, and it still proves a delivery item.
+    /// A plain delivery, a delivery to something other than a local file
+    /// and a delivery with another effect stay changes.
+    #[test]
+    fn delivering_an_own_capture_is_not_a_change_to_verify() {
+        const SHOT: &str = "/tmp/inbox/shot.png";
+        let path = crate::traits::ToolTargetHintKind::Path;
+        let run = |delivery: ToolCallSemantics| {
+            let mut events = vec![
+                executor_expectations(vec![
+                    checklist_item(0, ToolMutationEffects::NONE, true, &[], "pending"),
+                    checklist_item(
+                        1,
+                        ToolMutationEffects::EXTERNAL_DELIVERY,
+                        false,
+                        &[],
+                        "pending",
+                    ),
+                ]),
+                call("look", "browser"),
+                result(
+                    "look",
+                    "browser",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    terminal_observation_semantics(None),
+                ),
+                call("deliver", "browser"),
+                result(
+                    "deliver",
+                    "browser",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    delivery,
+                ),
+            ];
+            renumber(&mut events);
+            RunAggregate::replay("task-1", &events)
+        };
+
+        let capture = run(effect_semantics(
+            ToolMutationEffects::EXTERNAL_DELIVERY,
+            Some((path, SHOT)),
+        ));
+        assert_eq!(capture.effect_revision, 0);
+        assert!(!capture.operations["deliver"].changes_verifiable_state());
+        assert_eq!(
+            capture.obligations["task:task-1/obligation:checklist:0"].satisfied_at_revision,
+            Some(0),
+            "the earlier observation stays current"
+        );
+        assert_eq!(
+            capture.obligations["task:task-1/obligation:checklist:1"].state,
+            RunObligationState::Satisfied,
+            "the delivery still proves the delivery item"
+        );
+
+        let send_file = ToolCallSemantics {
+            effect: ToolCallEffect::Mutation,
+            mutation_effects: ToolMutationEffects::EXTERNAL_DELIVERY,
+            ..ToolCallSemantics::default()
+        }
+        .with_target_hint(path, SHOT);
+        let remote = effect_semantics(
+            ToolMutationEffects::EXTERNAL_DELIVERY,
+            Some((
+                crate::traits::ToolTargetHintKind::Url,
+                "https://chat.example/",
+            )),
+        );
+        let untargeted = effect_semantics(ToolMutationEffects::EXTERNAL_DELIVERY, None);
+        let post = effect_semantics(
+            ToolMutationEffects::EXTERNAL_DELIVERY.union(ToolMutationEffects::REMOTE_MUTATION),
+            Some((path, SHOT)),
+        );
+        for (name, semantics) in [
+            ("plain delivery", send_file.clone()),
+            ("remote target", remote),
+            ("no target", untargeted),
+            ("delivery with another effect", post),
+        ] {
+            let aggregate = run(semantics);
+            assert_eq!(aggregate.effect_revision, 1, "{name}");
+            assert!(
+                aggregate.operations["deliver"].changes_verifiable_state(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            run(send_file).obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Invalidated,
+            "a plain delivery still stales an untargeted observation"
         );
     }
 }

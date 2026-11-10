@@ -5319,6 +5319,17 @@ impl TerminalTool {
                             semantics.effect =
                                 crate::traits::ToolCallEffect::ObservationAndMutation;
                         }
+                    }
+                    // Type the URLs a fetch-only command proved it reached:
+                    // its exit status vouches for every fetch, so the receipt
+                    // is an observation of each URL, as written.
+                    let fetched = crate::tools::command_effects::proven_fetch_urls(command)
+                        .unwrap_or_default();
+                    for url in &fetched {
+                        semantics =
+                            semantics.with_target_hint(crate::traits::ToolTargetHintKind::Url, url);
+                    }
+                    if observed_deletion || !fetched.is_empty() {
                         metadata.semantics = semantics;
                     }
                 }
@@ -10713,6 +10724,88 @@ mod tests {
             .mutation_effects
             .contains(ToolMutationEffects::DESTRUCTIVE));
         let _ = std::fs::remove_dir_all(&keep);
+    }
+
+    /// A successful fetch-only command names the URL it reached on its
+    /// receipt, as written; a failed fetch, or one a later step could mask,
+    /// names none.
+    #[tokio::test]
+    async fn fetch_run_receipt_names_the_url_only_when_the_fetch_is_proven() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx_raw),
+            30,
+            4000,
+            PermissionMode::Yolo,
+            state.pool(),
+        )
+        .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/synthetic");
+        let run = |command: String| {
+            let tool = &tool;
+            async move {
+                let args = serde_json::json!({
+                    "action": "run",
+                    "command": command,
+                    "network": true,
+                });
+                tool.call_with_execution_context(
+                    &args.to_string(),
+                    None,
+                    crate::testing::call_facts("sess_fetch_receipt"),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let url_hints = |outcome: &ToolCallOutcome| -> Vec<String> {
+            outcome
+                .metadata
+                .semantics
+                .target_hints
+                .iter()
+                .filter(|hint| hint.kind == ToolTargetHintKind::Url)
+                .map(|hint| hint.value.clone())
+                .collect()
+        };
+
+        let fetched = run(format!("curl -sSf {url}")).await;
+        assert_eq!(fetched.metadata.exit_code, Some(0), "{}", fetched.output);
+        assert_eq!(url_hints(&fetched), vec![url.clone()]);
+        assert!(fetched.metadata.semantics.observes_state());
+
+        let masked = run(format!("curl -sSf {url} | head -c 1")).await;
+        assert_eq!(masked.metadata.exit_code, Some(0), "{}", masked.output);
+        assert!(url_hints(&masked).is_empty());
+
+        // Nothing listens on port 9 of the loopback: curl fails.
+        let failed = run("curl -sSf http://127.0.0.1:9/synthetic".to_string()).await;
+        assert_ne!(failed.metadata.exit_code, Some(0), "{}", failed.output);
+        assert!(url_hints(&failed).is_empty());
     }
 
     #[test]

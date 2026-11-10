@@ -623,6 +623,10 @@ pub(in crate::agent) struct TurnScope<'a> {
     recovery_demanded: AtomicBool,
     /// Extra passes the ledger demanded so far.
     closeout_demands: std::sync::atomic::AtomicU32,
+    /// The latest closeout let the run stop after a demand while the ledger
+    /// still held reachable expectations: the reply in hand was written to
+    /// the daemon's demand, not to the user.
+    closeout_ended_unmet: AtomicBool,
     /// `completed_results` at the last checklist demand (`u64::MAX`: none).
     executor_demanded_at: AtomicU64,
     /// Checklist items the model has not finished or set aside, as last
@@ -1542,6 +1546,7 @@ impl Agent {
             budget_goal,
             model_calls: AtomicU64::new(0),
             closeout_demands: std::sync::atomic::AtomicU32::new(0),
+            closeout_ended_unmet: AtomicBool::new(false),
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
             executor_demanded_at: AtomicU64::new(u64::MAX),

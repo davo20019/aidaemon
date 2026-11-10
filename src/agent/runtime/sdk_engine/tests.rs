@@ -605,6 +605,94 @@ async fn empty_reply_after_a_closeout_demand_ships_the_interrupted_answer() {
     assert_eq!(response, answer);
 }
 
+/// A ledger demand that ends unmet leaves the model's reply answering the
+/// demand. The run's state, not the reply's words, earns one tool-less
+/// rewrite addressed to the user, and that rewrite is what ships. An empty
+/// rewrite ships the reply it replaced.
+#[tokio::test]
+async fn reply_after_an_unmet_closeout_demand_is_rewritten_for_the_user() {
+    use crate::testing::MockProvider;
+    let run = |rewrite: &'static str| async move {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace
+            .path()
+            .join("never-read.txt")
+            .to_string_lossy()
+            .to_string();
+        let checklist_args = serde_json::json!({
+            "items": [
+                {"text": "check the tunnel log", "status": "pending",
+                 "requires_observation": true, "targets": [file]}
+            ]
+        })
+        .to_string();
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("track_requirements", &checklist_args),
+            MockProvider::text_response("The site is up."),
+            MockProvider::text_response("The remaining item is a bookkeeping mismatch."),
+            MockProvider::text_response(rewrite),
+        ])
+        .with_strict_responses();
+        let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plans = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+        let track = Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plans));
+        let harness = crate::testing::setup_full_stack_test_agent_with_extra_tools(
+            provider,
+            vec![track as Arc<dyn crate::traits::Tool>],
+        )
+        .await
+        .unwrap();
+        let response = harness
+            .agent
+            .handle_message(
+                "unmet_closeout_reply",
+                "Start the site and send me its public URL.",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .unwrap();
+        harness
+            .provider
+            .assert_response_script_consumed()
+            .await
+            .unwrap();
+        let calls = harness.provider.call_log.lock().await;
+        let last = calls.last().expect("calls").clone();
+        (response, calls.len(), last)
+    };
+
+    let final_answer = "The site is up at https://synthetic-tunnel.example/.";
+    let (response, calls, last) = run(final_answer).await;
+    assert_eq!(response, final_answer);
+    assert_eq!(calls, 4);
+    assert_eq!(
+        last.options.tool_choice,
+        crate::traits::ToolChoiceMode::None,
+        "the rewrite runs without tools"
+    );
+    let directive =
+        crate::agent::system_directives::SystemDirective::FinalAnswerAfterUnmetCloseout.render();
+    assert!(last.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.contains(&directive))
+    }));
+
+    let (response, _, _) = run("").await;
+    assert_eq!(
+        response, "The remaining item is a bookkeeping mismatch.",
+        "an empty rewrite ships the reply it replaced"
+    );
+}
+
 #[tokio::test]
 async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
     use crate::testing::MockProvider;
