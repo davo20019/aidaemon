@@ -961,6 +961,16 @@ impl OwnerApprovalResolver<'_> {
         self.ask(run, interruption, request, kind).await
     }
 
+    /// The call declares no effect beyond the agent's own state (its memory,
+    /// people store, checklist): a refusal of it goes back to the model, not
+    /// to the owner as a card. Such a call is never worth holding the turn
+    /// for an answer, and refusing it is the stricter outcome.
+    fn only_changes_agent_state(&self, call: &sdk::ToolCall) -> bool {
+        self.rules.tool(&call.name).is_some_and(|tool| {
+            effects_only_agent_state(&tool.call_effects(&call.arguments.to_string()))
+        })
+    }
+
     /// Put a call the clean check would not pass to the owner, for this one
     /// call only. The owner's Deny binds the run like any other decline. A
     /// card nobody answered leaves the check's own refusal standing: no owner
@@ -1118,7 +1128,8 @@ impl sdk::InterruptResolver for DaemonInterruptResolver<'_> {
                 let verdict = self.untrusted.judge(interruption).await?;
                 let owner_can_answer =
                     refused_check_may_ask_owner(&self.owner.rules, self.untrusted.origin_trusted)
-                        && !self.untrusted.cancel.is_cancelled();
+                        && !self.untrusted.cancel.is_cancelled()
+                        && !self.owner.only_changes_agent_state(&interruption.call);
                 Some(if verdict.consistent || !owner_can_answer {
                     crate::agent::untrusted::verdict_resolution(&interruption.call.name, &verdict)
                 } else {
@@ -1130,6 +1141,12 @@ impl sdk::InterruptResolver for DaemonInterruptResolver<'_> {
             _ => Some(unknown_interrupt_kind(interruption)),
         }
     }
+}
+
+/// Declared as touching nothing outside the agent (`CallEffects::none()`);
+/// undeclared effects (`unknown()`) may do anything and do not qualify.
+fn effects_only_agent_state(effects: &aidaemon_core::CallEffects) -> bool {
+    effects.complete && effects.keys.is_empty()
 }
 
 /// Whether a call the clean check would not pass can go to the owner: only
@@ -1204,6 +1221,12 @@ mod tests {
             ..Default::default()
         };
         assert!(refused_check_may_ask_owner(&owner_dm(), true));
+        // A refused memory write goes back to the model, never to a card;
+        // a call with undeclared effects still may.
+        assert!(effects_only_agent_state(&aidaemon_core::CallEffects::none()));
+        assert!(!effects_only_agent_state(
+            &aidaemon_core::CallEffects::unknown()
+        ));
         assert!(!refused_check_may_ask_owner(&owner_dm(), false));
         let barred = [
             AppApprovalRules {
