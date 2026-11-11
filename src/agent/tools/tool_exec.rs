@@ -1360,7 +1360,7 @@ mod scoped_workspace_tests {
                 _ => GoalContext::None,
             };
             assert_eq!(facts.goal_context, goal, "{name}");
-            assert!(!facts.manages_own_timeout, "{name}");
+            assert_eq!(facts.manages_own_timeout, name == "spawn_agent", "{name}");
             assert!(!facts.records_launch_trust, "{name}");
             assert!(!facts.needs_live_model, "{name}");
         }

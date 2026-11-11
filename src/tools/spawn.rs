@@ -1291,6 +1291,11 @@ impl crate::traits::ToolSemantics for SpawnAgentTool {
         crate::traits::ToolDispatchFacts {
             task_lead_delegation: true,
             spawns_child_agents: true,
+            // Each child runs under its own deadline, which pauses while the
+            // owner is asked and ends in a salvaged work report. The generic
+            // watchdog would drop that report, and the results of children
+            // that already finished, the moment it fired.
+            manages_own_timeout: true,
             goal_context: crate::traits::GoalContext::Goal,
             ..Default::default()
         }

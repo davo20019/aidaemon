@@ -143,6 +143,68 @@ fn child_time_limit(requested: ChildTimeLimit, parent_remaining: Option<Duration
     }
 }
 
+/// The status channel a child reports through. The parent's live card shows
+/// the parent's own checklist: a child's checklist is the child's plan, so it
+/// reaches the card as one progress line naming that child instead of
+/// replacing the parent's plan (two parallel children used to overwrite it in
+/// turn, leaving whichever wrote last looking like the whole task). Every other
+/// update passes through unchanged.
+fn child_status_sender(
+    parent: Option<mpsc::Sender<StatusUpdate>>,
+    mission: &str,
+) -> Option<mpsc::Sender<StatusUpdate>> {
+    let parent = parent?;
+    let label = child_status_label(mission);
+    let (tx, mut rx) = mpsc::channel::<StatusUpdate>(64);
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            let update = match update {
+                StatusUpdate::Checklist { text } => {
+                    let Some(progress) = checklist_progress_line(&text) else {
+                        continue;
+                    };
+                    StatusUpdate::ToolProgress {
+                        name: "spawn_agent".to_string(),
+                        chunk: format!("{label}: {progress}"),
+                    }
+                }
+                other => other,
+            };
+            if parent.send(update).await.is_err() {
+                break;
+            }
+        }
+    });
+    Some(tx)
+}
+
+/// A short name for a child on the parent's status card: its mission's first
+/// line, cut to a phone-width length.
+fn child_status_label(mission: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let line = mission.lines().next().unwrap_or("").trim();
+    let line = if line.is_empty() { "Sub-agent" } else { line };
+    if line.chars().count() <= MAX_CHARS {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MAX_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The step count of a rendered checklist (`Step 2 of 5` while working,
+/// `5 of 5 steps complete` once done), as the child's progress.
+fn checklist_progress_line(rendered: &str) -> Option<String> {
+    rendered
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            (line.starts_with("Step ") && line.contains(" of "))
+                || (line.starts_with(|c: char| c.is_ascii_digit())
+                    && line.ends_with(" steps complete"))
+        })
+        .map(str::to_string)
+}
+
 /// What a stopped child had done, from its typed tool records: every call to
 /// a tool not known to be read-only, finished or not. The child's session is
 /// fresh per spawn, so its tool records are its whole run.
@@ -2833,6 +2895,7 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
+        let status_tx = child_status_sender(status_tx, mission);
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
@@ -3363,6 +3426,94 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_checklist(done: usize, total: usize) -> String {
+        let steps = (0..total).map(|i| format!("synthetic step {i}")).collect();
+        let mut plan = crate::plans::TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            steps,
+            "track_requirements",
+        );
+        for step in plan.steps.iter_mut().take(done) {
+            step.status = crate::plans::StepStatus::Completed;
+        }
+        if done == total {
+            plan.status = crate::plans::PlanStatus::Completed;
+        } else {
+            plan.current_step = done;
+        }
+        plan.render_compact_checklist()
+    }
+
+    /// Two parallel children each declare a checklist. Neither reaches the
+    /// parent's card as a checklist (which would replace the parent's plan);
+    /// each becomes a progress line naming its own child.
+    #[tokio::test]
+    async fn a_childs_checklist_never_replaces_the_parents_plan() {
+        let (parent_tx, mut parent_rx) = mpsc::channel(16);
+        let wordpress = child_status_sender(
+            Some(parent_tx.clone()),
+            "Build the WordPress demo site for Acme Corp",
+        )
+        .unwrap();
+        let drupal =
+            child_status_sender(Some(parent_tx), "Build the Drupal demo site for Acme Corp")
+                .unwrap();
+        wordpress
+            .send(StatusUpdate::Checklist {
+                text: rendered_checklist(5, 5),
+            })
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::Checklist {
+                text: rendered_checklist(1, 4),
+            })
+            .await
+            .unwrap();
+        drupal
+            .send(StatusUpdate::ToolStart {
+                name: "terminal".into(),
+                summary: "ddev start".into(),
+            })
+            .await
+            .unwrap();
+        drop((wordpress, drupal));
+
+        let mut lines = Vec::new();
+        let mut passed_through = 0;
+        while let Some(update) = parent_rx.recv().await {
+            match update {
+                StatusUpdate::Checklist { .. } => panic!("child checklist reached the parent card"),
+                StatusUpdate::ToolProgress { name, chunk } => {
+                    assert_eq!(name, "spawn_agent");
+                    lines.push(chunk);
+                }
+                StatusUpdate::ToolStart { .. } => passed_through += 1,
+                other => panic!("unexpected update {other:?}"),
+            }
+        }
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                "Build the Drupal demo site for Acme Corp: Step 2 of 4".to_string(),
+                "Build the WordPress demo site for Acme Corp: 5 of 5 steps complete".to_string(),
+            ]
+        );
+        assert_eq!(passed_through, 1);
+    }
+
+    #[test]
+    fn a_child_status_label_fits_a_phone() {
+        assert_eq!(child_status_label("  \n"), "Sub-agent");
+        let long = "x".repeat(200);
+        let label = child_status_label(&long);
+        assert_eq!(label.chars().count(), 60);
+        assert!(label.ends_with('…'));
+    }
 
     /// A child that saw untrusted content but could not record it, or
     /// whose record cannot be read, returns an untrusted result.

@@ -504,6 +504,44 @@ impl crate::traits::ToolSemantics for SendFileTool {
             semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
         }
     }
+
+    /// Delivering a file reads it; it never writes the path. The default
+    /// manifest would file a mutation's path under writes, so a sub-agent
+    /// confined to its project could not send even the screenshot its own
+    /// browser call had just taken.
+    fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
+        let read_targets = self
+            .call_semantics(arguments)
+            .target_hints
+            .into_iter()
+            .filter(|hint| hint.kind == ToolTargetHintKind::Path)
+            .collect();
+        crate::traits::ToolCallAccessManifest {
+            read_targets,
+            ..Default::default()
+        }
+    }
+
+    /// The inbox is the daemon's own staging directory: tool observations
+    /// such as browser screenshots land there, and delivery stages through
+    /// it. Reading it is this adapter's capability, not a task data grant.
+    /// The outbox directories are not: they default to the home directory, so
+    /// a path there stays judged by the task's own read scope.
+    fn adapter_owned_access_manifest(
+        &self,
+        _arguments: &str,
+    ) -> crate::traits::ToolCallAccessManifest {
+        let adapter_read_targets = crate::traits::ToolTargetHint::new(
+            ToolTargetHintKind::ProjectScope,
+            self.inbox_dir.to_string_lossy().to_string(),
+        )
+        .into_iter()
+        .collect();
+        crate::traits::ToolCallAccessManifest {
+            adapter_read_targets,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(test)]
