@@ -503,6 +503,56 @@ impl SqliteMemory {
         }
         scores
     }
+
+    /// Ends the active copies of a fact the owner just changed or forgot:
+    /// facts in any category that hold the same value under a key whose words
+    /// contain, or are contained in, those of `key` (`favorite_tea` beside `test_favorite_tea`,
+    /// `user/marker` beside `personal/marker`). Background extraction stores
+    /// such copies; left active, the old value survived the change.
+    async fn supersede_copies(
+        &self,
+        changed_id: i64,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(());
+        }
+        let canonical = canonicalize_fact_key(key);
+        let tokens: std::collections::HashSet<&str> =
+            canonical.split('_').filter(|t| !t.is_empty()).collect();
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, key FROM facts
+             WHERE superseded_at IS NULL AND id <> ? AND LOWER(TRIM(value)) = LOWER(?)",
+        )
+        .bind(changed_id)
+        .bind(value)
+        .fetch_all(&self.pool)
+        .await?;
+        let now = Utc::now().to_rfc3339();
+        for (id, other_key) in rows {
+            let other = canonicalize_fact_key(&other_key);
+            let other: std::collections::HashSet<&str> =
+                other.split('_').filter(|t| !t.is_empty()).collect();
+            // One key must name the other with modifiers added: a shared
+            // word alone (`pet_name`, `daughter_name`) is a different fact.
+            if !(tokens.is_subset(&other) || other.is_subset(&tokens)) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
+            )
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            if let Err(error) = self.project_fact_memory(id).await {
+                tracing::warn!(%error, fact_id = id, "Deferred superseded-copy projection");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1070,6 +1120,10 @@ impl FactStore for SqliteMemory {
                         }
                     }
                     Err(e) => return Err(e.into()),
+                }
+                if !automated_source {
+                    self.supersede_copies(*old_id, &key_for_write, old_value)
+                        .await?;
                 }
             } else {
                 // Same value — update timestamp and backfill embedding.
@@ -1796,7 +1850,21 @@ impl FactStore for SqliteMemory {
     }
 
     async fn delete_fact(&self, fact_id: i64) -> anyhow::Result<()> {
+        // A canonical personal-memory record reaches the model under a
+        // synthetic negative id; forgetting it retracts that record.
+        if fact_id < 0 {
+            self.retract_canonical_projection(fact_id, "owner_forget")
+                .await?;
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
+        let forgotten: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT LOWER(TRIM(category)), LOWER(TRIM(key)), value FROM facts
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await?;
         sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
             .bind(&now)
             .bind(fact_id)
@@ -1804,6 +1872,12 @@ impl FactStore for SqliteMemory {
             .await?;
         if let Err(error) = self.project_fact_memory(fact_id).await {
             tracing::warn!(%error, fact_id, "Deferred deleted-fact projection");
+        }
+        if let Some((category, key, value)) = forgotten {
+            self.supersede_copies(fact_id, &key, &value).await?;
+            if is_owner_profile_category(&category) {
+                self.retract_owner_profile_key(&key, "owner_forget").await?;
+            }
         }
         Ok(())
     }
@@ -1813,13 +1887,14 @@ impl FactStore for SqliteMemory {
         // Canonicalize: lowercase, trim, strip [brackets]
         let cat_clean = category.trim().to_lowercase();
         let key_clean = key.trim().to_lowercase();
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM facts WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+        let deleted: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, key, value FROM facts WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
         )
         .bind(&cat_clean)
         .bind(&key_clean)
         .fetch_all(&self.pool)
         .await?;
+        let ids: Vec<i64> = deleted.iter().map(|(id, _, _)| *id).collect();
         let result = sqlx::query(
             "UPDATE facts SET superseded_at = ? WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
         )
@@ -1833,7 +1908,17 @@ impl FactStore for SqliteMemory {
                 tracing::warn!(%error, fact_id = id, "Deferred deleted-fact projection");
             }
         }
-        Ok(result.rows_affected() > 0)
+        // The owner's profile also lives in the canonical store, which the
+        // prompt renders as its own block: forgetting the legacy row alone
+        // left the old value in front of the model.
+        for (id, key, value) in &deleted {
+            self.supersede_copies(*id, key, value).await?;
+        }
+        let canonical = is_owner_profile_category(&cat_clean)
+            && self
+                .retract_owner_profile_key(&key_clean, "owner_forget")
+                .await?;
+        Ok(result.rows_affected() > 0 || canonical)
     }
 
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
@@ -1913,4 +1998,10 @@ impl FactStore for SqliteMemory {
             NeighborhoodCaps::default(),
         ))
     }
+}
+
+/// Legacy categories whose keys describe the owner, as the canonical store
+/// projects them (`user`) and as writers name them.
+fn is_owner_profile_category(category: &str) -> bool {
+    matches!(category, "user" | "personal" | "profile")
 }

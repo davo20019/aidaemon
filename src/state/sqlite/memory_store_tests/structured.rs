@@ -376,10 +376,13 @@ async fn confirmed_conflicts_and_ambiguous_aliases_require_review() {
         correction: false,
         ..Default::default()
     };
+    // An extraction pass contradicting the owner's own statement is parked
+    // for review; the owner restating it replaces it (see
+    // `owner_restatement_replaces_without_correction_flag`).
     let conflict_result = store
         .reconcile_structured_personal_memory(
             &conflict,
-            "agent",
+            "progressive",
             Some("synthetic conflicting statement"),
             None,
             FactPrivacy::Private,
@@ -707,4 +710,218 @@ async fn legacy_full_names_promote_short_owner_and_child_names_idempotently() {
     assert_eq!(zo_alias_count, 1);
     assert_eq!(zoe_birth_date, "2015-04-12");
     assert_eq!(child_lives_with_owner, 1);
+}
+
+fn owner(predicate: &str, value: &str) -> PersonalMemoryWrite {
+    PersonalMemoryWrite {
+        entities: vec![entity("owner", "Owner", false)],
+        facts: vec![fact("owner", predicate, value)],
+        direct_user_statement: true,
+        ..Default::default()
+    }
+}
+
+async fn write(store: &SqliteStateStore, write: &PersonalMemoryWrite) {
+    store
+        .reconcile_structured_personal_memory(write, "agent", None, None, FactPrivacy::Private)
+        .await
+        .unwrap();
+}
+
+async fn canonical(store: &SqliteStateStore) -> Vec<String> {
+    store
+        .get_canonical_memory_facts()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| format!("{}={}", f.key, f.value))
+        .collect()
+}
+
+#[tokio::test]
+async fn forgetting_a_profile_key_retracts_the_canonical_record() {
+    let (_dir, store) = store().await;
+    write(&store, &owner("residence", "Springfield")).await;
+    write(&store, &owner("birthplace", "Shelbyville")).await;
+    assert!(canonical(&store)
+        .await
+        .contains(&"residence=Springfield".to_string()));
+
+    // remember_fact's delete path: no legacy row exists, the canonical one does.
+    assert!(store.delete_fact_by_key("user", "residence").await.unwrap());
+    let rows = canonical(&store).await;
+    assert!(
+        !rows.iter().any(|row| row.contains("Springfield")),
+        "{rows:?}"
+    );
+    assert!(rows.contains(&"birthplace=Shelbyville".to_string()));
+
+    // manage_memories forget by the projected id.
+    let birthplace = store
+        .get_canonical_memory_facts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.key == "birthplace")
+        .unwrap();
+    store.delete_fact(birthplace.id).await.unwrap();
+    assert!(canonical(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_delete_marker_value_forgets_instead_of_being_stored() {
+    let (_dir, store) = store().await;
+    write(&store, &owner("birthplace", "Shelbyville")).await;
+    write(&store, &owner("birthplace", "delete")).await;
+    assert!(canonical(&store).await.is_empty());
+
+    // An extraction pass emitting "none" forgets nothing.
+    write(&store, &owner("residence", "Springfield")).await;
+    store
+        .reconcile_structured_personal_memory(
+            &owner("residence", "none"),
+            "progressive",
+            None,
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    assert_eq!(canonical(&store).await, vec!["residence=Springfield"]);
+}
+
+#[tokio::test]
+async fn owner_restatement_replaces_without_correction_flag() {
+    let (_dir, store) = store().await;
+    write(&store, &owner("birth_date", "1990-04-12")).await;
+    write(&store, &owner("birth_date", "1990-05-12")).await;
+    assert_eq!(canonical(&store).await, vec!["birth_date=1990-05-12"]);
+}
+
+#[tokio::test]
+async fn blank_validity_bounds_mean_no_bound() {
+    let (_dir, store) = store().await;
+    let mut blank = owner("current_employer", "Initech");
+    blank.facts[0].valid_from = Some(String::new());
+    blank.facts[0].valid_to = Some("  ".to_string());
+    write(&store, &blank).await;
+    write(&store, &blank).await;
+    // Visible to the prompt, and the second identical write confirmed it.
+    assert_eq!(canonical(&store).await, vec!["current_employer=Initech"]);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_entity_facts")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn startup_repairs_blank_bounds_and_their_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repair.db");
+    let embeddings = Arc::new(EmbeddingService::new().unwrap());
+    {
+        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings.clone())
+            .await
+            .unwrap();
+        write(&store, &owner("residence", "Springfield")).await;
+        // What older builds wrote: the same fact twice with blank bounds.
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO memory_entity_facts
+                 (subject_entity_id, predicate, value, normalized_value, display_value,
+                  source, asserted_at, created_at, updated_at, valid_from, valid_to)
+                 SELECT subject_entity_id, 'birthplace', 'shelbyville', 'shelbyville',
+                        'Shelbyville', 'agent', asserted_at, created_at, updated_at, '', ''
+                 FROM memory_entity_facts LIMIT 1",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(canonical(&store).await, vec!["residence=Springfield"]);
+    }
+    let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+        .await
+        .unwrap();
+    let mut rows = canonical(&store).await;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec!["birthplace=Shelbyville", "residence=Springfield"]
+    );
+}
+
+#[tokio::test]
+async fn changing_or_forgetting_a_fact_ends_its_copies() {
+    let (_dir, store) = store().await;
+    for (category, key) in [
+        ("preferences", "favorite_tea"),
+        ("user", "test_favorite_tea"),
+        ("family", "daughter_tea"),
+    ] {
+        store
+            .upsert_fact(
+                category,
+                key,
+                "Jasmine",
+                "agent",
+                None,
+                FactPrivacy::Private,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_fact(
+            "preferences",
+            "favorite_tea",
+            "Rooibos",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    let active: Vec<(String, String)> = store
+        .get_facts(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.key, f.value))
+        .collect();
+    assert!(active.contains(&("favorite_tea".into(), "Rooibos".into())));
+    assert!(!active.contains(&("test_favorite_tea".into(), "Jasmine".into())));
+    // A key that merely shares a word is a different fact.
+    assert!(active.contains(&("daughter_tea".into(), "Jasmine".into())));
+
+    store
+        .upsert_fact(
+            "user",
+            "office",
+            "Building 9",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "personal",
+            "office",
+            "Building 9",
+            "progressive",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    assert!(store.delete_fact_by_key("user", "office").await.unwrap());
+    assert!(!store
+        .get_facts(None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|f| f.value == "Building 9"));
 }

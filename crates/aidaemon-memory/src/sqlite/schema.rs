@@ -626,6 +626,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query(statement).execute(pool).await?;
     }
 
+    repair_blank_validity_bounds(pool).await?;
+
     // FTS5 is present in standard SQLite and bundled SQLCipher builds. Keep the
     // daemon usable on custom SQLite builds without it; semantic and lexical
     // fallback retrieval remain available.
@@ -633,6 +635,61 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         tracing::warn!(%error, "SQLite FTS5 unavailable; memory full-text index disabled");
     }
 
+    Ok(())
+}
+
+/// Canonical rows written with a blank validity bound (`""` from extraction,
+/// meaning "no bound") were invisible to every `valid_to IS NULL` read: the
+/// prompt never showed them and the next identical write inserted a
+/// duplicate. Ends the later duplicate of each such row, then stores the
+/// remaining blank bounds as NULL. Idempotent: a clean database matches
+/// nothing.
+async fn repair_blank_validity_bounds(pool: &SqlitePool) -> anyhow::Result<()> {
+    // A twin that already has a NULL bound wins whatever its id; between two
+    // blank twins the older one does.
+    let twin = |alias: &str, row: &str| {
+        format!(
+            "({alias}.valid_to IS NULL OR (TRIM({alias}.valid_to) = '' AND {alias}.id < {row}.id))"
+        )
+    };
+    let statements = [
+        format!(
+            "UPDATE memory_entity_facts AS f SET status = 'superseded', valid_to = f.updated_at
+             WHERE f.status = 'active' AND TRIM(f.valid_to) = ''
+               AND EXISTS (SELECT 1 FROM memory_entity_facts o
+                           WHERE o.subject_entity_id = f.subject_entity_id
+                             AND o.predicate = f.predicate
+                             AND o.normalized_value = f.normalized_value
+                             AND o.status = 'active' AND o.id <> f.id AND {})",
+            twin("o", "f")
+        ),
+        format!(
+            "UPDATE memory_relationships AS r SET status = 'superseded', valid_to = r.updated_at
+             WHERE r.status = 'active' AND TRIM(r.valid_to) = ''
+               AND EXISTS (SELECT 1 FROM memory_relationships o
+                           WHERE o.source_entity_id = r.source_entity_id
+                             AND o.relationship_type = r.relationship_type
+                             AND o.target_entity_id = r.target_entity_id
+                             AND o.status = 'active' AND o.id <> r.id AND {})",
+            twin("o", "r")
+        ),
+    ];
+    for statement in &statements {
+        sqlx::query(statement).execute(pool).await?;
+    }
+    for table in [
+        "memory_entity_facts",
+        "memory_relationships",
+        "memory_aliases",
+    ] {
+        for column in ["valid_from", "valid_to"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = NULL WHERE TRIM({column}) = ''"
+            ))
+            .execute(pool)
+            .await?;
+        }
+    }
     Ok(())
 }
 

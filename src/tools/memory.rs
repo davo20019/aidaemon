@@ -324,7 +324,9 @@ impl Tool for RememberFactTool {
                         | "birthplace"
                         | "place_of_birth"
                 );
-                if !supported || entry.value.trim().is_empty() {
+                // A deletion marker is a forget, not a value: it takes the
+                // delete path below, which also retracts the canonical record.
+                if !supported || is_deletion_marker(&entry.value) {
                     continue;
                 }
                 if !owner_added {

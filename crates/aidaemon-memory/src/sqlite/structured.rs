@@ -22,6 +22,17 @@ fn token(value: &str) -> String {
     words(value).replace(' ', "_")
 }
 
+/// A validity bound as stored: a blank one (extraction emits `""` for "no
+/// bound") is no bound. Stored as `""` it hid the row from every
+/// `valid_to IS NULL` read, so the fact never reached the prompt and the
+/// next identical write inserted a duplicate.
+fn period(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|bound| !bound.is_empty())
+}
+
 fn alias_value(value: &str, alias_type: &str) -> String {
     if matches!(
         token(alias_type).as_str(),
@@ -145,6 +156,17 @@ fn split_legacy_people(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// A value that asks to forget rather than state something.
+fn is_retraction_value(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || [
+            "none", "null", "n/a", "delete", "remove", "deleted", "removed", "forget",
+        ]
+        .iter()
+        .any(|marker| value.eq_ignore_ascii_case(marker))
+}
+
 fn confidence(source: &str, direct: bool) -> f32 {
     if direct {
         1.0
@@ -174,6 +196,53 @@ fn normalized_fact(predicate: &str, value: &str) -> anyhow::Result<(String, &'st
     } else {
         Ok((words(value), "text"))
     }
+}
+
+/// Ends `ids` in `table` as retracted (the owner asked to forget them) and
+/// audits each one. Returns how many active rows it ended.
+async fn retract(
+    tx: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    record_type: &str,
+    ids: &[i64],
+    source: &str,
+) -> anyhow::Result<u64> {
+    let now = Utc::now().to_rfc3339();
+    let mut retracted = 0;
+    for &id in ids {
+        let entity_column = match table {
+            "memory_entity_facts" => "subject_entity_id",
+            "memory_aliases" => "entity_id",
+            _ => "source_entity_id",
+        };
+        let sql = format!(
+            "UPDATE {table} SET status = 'retracted', valid_to = ?, updated_at = ?
+             WHERE id = ? AND status IN ('active', 'disputed') AND valid_to IS NULL
+             RETURNING {entity_column}"
+        );
+        let Some(entity_id) = sqlx::query_scalar::<_, i64>(&sql)
+            .bind(&now)
+            .bind(&now)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+        else {
+            continue;
+        };
+        retracted += 1;
+        audit(
+            tx,
+            "retract",
+            Some(entity_id),
+            record_type,
+            Some(id),
+            serde_json::json!({"status": "retracted"}),
+            source,
+            None,
+        )
+        .await?;
+    }
+    Ok(retracted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,6 +663,27 @@ async fn write_fact(
     result: &mut PersonalMemoryWriteResult,
 ) -> anyhow::Result<()> {
     let pred = predicate(&candidate.predicate);
+    if is_retraction_value(&candidate.value) {
+        // "delete"/"none" is the writer asking to forget the predicate, not
+        // a value to store: stored, it rendered as `residence = delete` and
+        // left the old value active beside it. Only the owner's own word
+        // forgets; an extraction pass reading "none" changes nothing.
+        if !direct || low_authority(source) {
+            return Ok(());
+        }
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entity_facts
+             WHERE subject_entity_id = ? AND predicate = ?
+               AND status IN ('active', 'disputed') AND valid_to IS NULL",
+        )
+        .bind(entity_id)
+        .bind(&pred)
+        .fetch_all(&mut **tx)
+        .await?;
+        let retracted = retract(tx, "memory_entity_facts", "fact", &ids, source).await?;
+        result.superseded_facts += retracted as usize;
+        return Ok(());
+    }
     let (normalized, value_type) = normalized_fact(&pred, &candidate.value)?;
     let display = candidate
         .display_value
@@ -647,7 +737,14 @@ async fn write_fact(
         let old_id: i64 = row.get("id");
         let old_source: String = row.get("source");
         let old_confidence = row.get::<f64, _>("confidence") as f32;
-        if direct && (correction || old_confidence < 0.9 || low_authority(&old_source)) {
+        // The owner is the authority on themselves: an owner statement made
+        // now (not one an extraction pass inferred) replaces the earlier one
+        // whether or not the writer flagged it as a correction. Parking it as
+        // disputed left the old value active with nobody to resolve it.
+        let owner_restates = direct && !low_authority(source);
+        if direct
+            && (owner_restates || correction || old_confidence < 0.9 || low_authority(&old_source))
+        {
             sqlx::query(
                 "UPDATE memory_entity_facts SET status = 'superseded', valid_to = ?,
                  updated_at = ? WHERE id = ?",
@@ -696,8 +793,8 @@ async fn write_fact(
             .bind(&now)
             .bind(direct)
             .bind(&now)
-            .bind(candidate.valid_from.as_deref())
-            .bind(candidate.valid_to.as_deref())
+            .bind(period(&candidate.valid_from))
+            .bind(period(&candidate.valid_to))
             .bind(&now)
             .bind(&now)
             .execute(&mut **tx)
@@ -744,8 +841,8 @@ async fn write_fact(
     .bind(&now)
     .bind(direct)
     .bind(&now)
-    .bind(candidate.valid_from.as_deref())
-    .bind(candidate.valid_to.as_deref())
+    .bind(period(&candidate.valid_from))
+    .bind(period(&candidate.valid_to))
     .bind(supersedes)
     .bind(&now)
     .bind(&now)
@@ -887,8 +984,8 @@ async fn write_edge(
         direct,
         privacy,
         channel,
-        candidate.valid_from.as_deref(),
-        candidate.valid_to.as_deref(),
+        period(&candidate.valid_from),
+        period(&candidate.valid_to),
         result,
     )
     .await?;
@@ -904,8 +1001,8 @@ async fn write_edge(
             direct,
             privacy,
             channel,
-            candidate.valid_from.as_deref(),
-            candidate.valid_to.as_deref(),
+            period(&candidate.valid_from),
+            period(&candidate.valid_to),
             result,
         )
         .await?;
@@ -1140,6 +1237,79 @@ impl SqliteMemory {
             });
         }
         Ok(output)
+    }
+
+    /// Retracts the canonical record behind a projected id from
+    /// [`Self::canonical_personal_facts`] (owner and people facts, aliases and
+    /// relationship edges carry synthetic negative ids there). Returns whether
+    /// an active record was retracted.
+    pub async fn retract_canonical_projection(
+        &self,
+        projected_id: i64,
+        source: &str,
+    ) -> anyhow::Result<bool> {
+        let (table, record_type, id) = match projected_id {
+            id if id <= -3_000_000_000 => {
+                ("memory_relationships", "relationship", -3_000_000_000 - id)
+            }
+            id if id <= -2_000_000_000 => ("memory_aliases", "alias", -2_000_000_000 - id),
+            id if id <= -1_000_000_000 => ("memory_entity_facts", "fact", -1_000_000_000 - id),
+            _ => return Ok(false),
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut ids = vec![id];
+        if record_type == "relationship" {
+            // An edge is stored with its inverse; forgetting one forgets both.
+            let inverse: Option<i64> = sqlx::query_scalar(
+                "SELECT inverse_relationship_id FROM memory_relationships WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            ids.extend(inverse);
+        }
+        let retracted = retract(&mut tx, table, record_type, &ids, source).await?;
+        tx.commit().await?;
+        Ok(retracted > 0)
+    }
+
+    /// Retracts the owner's canonical facts and aliases a profile key names
+    /// (`residence`, `birthday`, `name`, ...): forgetting `[user] residence`
+    /// must reach the store the owner block is rendered from, not only the
+    /// legacy row. Returns whether anything was retracted.
+    pub async fn retract_owner_profile_key(&self, key: &str, source: &str) -> anyhow::Result<bool> {
+        let pred = predicate(key);
+        let kind = match token(key).as_str() {
+            "name" => "legal_name_variant".to_string(),
+            "username" | "handle" | "online_handle" | "online_nickname" => {
+                "online_handle".to_string()
+            }
+            other => alias_type(other),
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let facts: Vec<i64> = sqlx::query_scalar(
+            "SELECT f.id FROM memory_entity_facts f
+             JOIN memory_entities e ON e.id = f.subject_entity_id
+             WHERE e.is_owner = 1 AND f.predicate = ?
+               AND f.status IN ('active', 'disputed') AND f.valid_to IS NULL",
+        )
+        .bind(&pred)
+        .fetch_all(&mut *tx)
+        .await?;
+        let aliases: Vec<i64> = sqlx::query_scalar(
+            "SELECT a.id FROM memory_aliases a
+             JOIN memory_entities e ON e.id = a.entity_id
+             WHERE e.is_owner = 1 AND a.alias_type = ?
+               AND a.status = 'active' AND a.valid_to IS NULL",
+        )
+        .bind(&kind)
+        .fetch_all(&mut *tx)
+        .await?;
+        let retracted = retract(&mut tx, "memory_entity_facts", "fact", &facts, source).await?
+            + retract(&mut tx, "memory_aliases", "alias", &aliases, source).await?;
+        tx.commit().await?;
+        Ok(retracted > 0)
     }
 
     /// Conservatively dual-writes only unambiguous owner-profile legacy keys.
