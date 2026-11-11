@@ -27,7 +27,6 @@ use crate::traits::{ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind};
 
 /// How many runs, and how deep a spawn tree, one handoff reads.
 const MAX_HANDOFF_TASKS: usize = 24;
-const MAX_HANDOFF_DEPTH: usize = 3;
 
 /// At most this many resources travel; the most recent win.
 pub(crate) const MAX_KNOWN_RESOURCES: usize = 16;
@@ -244,15 +243,19 @@ impl super::Agent {
         // Each task with the runs it spawned, depth first: what a child
         // established returns to its parent's context through the typed
         // `spawned_by` link, not through the prose of its reply.
+        // As deep as spawning allowed (`subagents.max_depth`); the walk
+        // bounds only how many runs it reads.
         let mut pending = task_ids
             .into_iter()
             .rev()
-            .map(|task_id| (session_id.to_string(), task_id, 0usize))
+            .map(|task_id| (session_id.to_string(), task_id))
             .collect::<Vec<_>>();
-        let mut visited = 0usize;
-        while let Some((task_session, task_id, depth)) = pending.pop() {
-            visited += 1;
-            if visited > MAX_HANDOFF_TASKS {
+        let mut seen = std::collections::HashSet::new();
+        while let Some((task_session, task_id)) = pending.pop() {
+            if !seen.insert(task_id.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_HANDOFF_TASKS {
                 break;
             }
             if let Ok(run) = self
@@ -262,11 +265,9 @@ impl super::Agent {
             {
                 known.extend_from_run(&run);
             }
-            if depth < MAX_HANDOFF_DEPTH {
-                if let Ok(children) = self.event_store.spawned_children(&task_id).await {
-                    for child in children.into_iter() {
-                        pending.push((child.session_id, child.task_id, depth + 1));
-                    }
+            if let Ok(children) = self.event_store.spawned_children(&task_id).await {
+                for child in children.into_iter() {
+                    pending.push((child.session_id, child.task_id));
                 }
             }
         }

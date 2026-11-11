@@ -1765,26 +1765,21 @@ impl EventStore {
         task_id: &str,
         events: &mut Vec<Event>,
     ) -> anyhow::Result<()> {
+        // The tree is as deep as spawning allowed (`subagents.max_depth`,
+        // enforced where children start); this walk bounds only how many
+        // runs it reads, never how deep it looks.
         const MAX_DELEGATED_RUNS: usize = 24;
-        const MAX_DELEGATION_DEPTH: usize = 3;
-        let mut pending = self
-            .spawned_children(task_id)
-            .await?
-            .into_iter()
-            .map(|child| (child, 1usize))
-            .collect::<Vec<_>>();
-        let mut visited = 0usize;
+        let mut pending = self.spawned_children(task_id).await?;
+        let mut seen = std::collections::HashSet::from([task_id.to_string()]);
         let mut adopted = Vec::new();
-        while let Some((child, depth)) = pending.pop() {
-            visited += 1;
-            if visited > MAX_DELEGATED_RUNS {
+        while let Some(child) = pending.pop() {
+            if !seen.insert(child.task_id.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_DELEGATED_RUNS + 1 {
                 break;
             }
-            if depth < MAX_DELEGATION_DEPTH {
-                for grandchild in self.spawned_children(&child.task_id).await? {
-                    pending.push((grandchild, depth + 1));
-                }
-            }
+            pending.extend(self.spawned_children(&child.task_id).await?);
             let child_events = self
                 .query_task_events_for_session(&child.session_id, &child.task_id)
                 .await?;
@@ -5153,6 +5148,42 @@ mod tests {
             .targets
             .iter()
             .any(|hint| hint.value == "/srv/app/tests"));
+    }
+
+    /// The walk follows the tree as deep as spawning allowed it to grow:
+    /// a run four levels down still credits the root.
+    #[tokio::test]
+    async fn delegated_evidence_reaches_any_depth() {
+        let (store, _database) = setup_store().await;
+        append_spawn_task_start(&store, "root", "task-0", "turn-0", None).await;
+        for level in 1..=4 {
+            append_spawn_task_start(
+                &store,
+                &format!("specialist:{level}"),
+                &format!("task-{level}"),
+                &format!("turn-{level}"),
+                Some(crate::TaskRef {
+                    session_id: if level == 1 {
+                        "root".to_string()
+                    } else {
+                        format!("specialist:{}", level - 1)
+                    },
+                    task_id: format!("task-{}", level - 1),
+                }),
+            )
+            .await;
+        }
+        append_child_receipt(
+            &store,
+            "specialist:4",
+            "task-4",
+            "call-deep",
+            "/srv/app/deep",
+            crate::traits::ToolOutcomeStatus::Succeeded,
+        )
+        .await;
+        let run = store.task_run_aggregate("root", "task-0").await.unwrap();
+        assert!(run.operations.contains_key("call-deep"));
     }
 
     #[tokio::test]
