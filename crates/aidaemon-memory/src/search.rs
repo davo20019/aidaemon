@@ -398,6 +398,41 @@ pub fn rank(
     }
 }
 
+/// Rank expansion-eligible facts with the same scores as the main hits and
+/// cap them at `cfg.related_max`. `scores` holds `(position in neighbors,
+/// score)`; a neighbor with no score is left out, as is one below `floor`.
+/// Ties break by `recall_count`, then lowest id: recall frequency is never a
+/// relevance signal, only a tie breaker.
+pub fn rank_related(
+    neighbors: &[&Fact],
+    scores: &[(usize, f32)],
+    floor: Option<f32>,
+    cfg: &FactSearchConfig,
+) -> Vec<SearchHit> {
+    let mut seen = HashSet::new();
+    let mut scored: Vec<(&Fact, f32)> = scores
+        .iter()
+        .filter(|(position, _)| seen.insert(*position))
+        .filter_map(|(position, score)| neighbors.get(*position).map(|f| (*f, *score)))
+        .filter(|(_, score)| floor.is_none_or(|floor| *score >= floor))
+        .collect();
+    scored.sort_by(|(a, a_score), (b, b_score)| {
+        b_score
+            .total_cmp(a_score)
+            .then(b.recall_count.cmp(&a.recall_count))
+            .then(a.id.cmp(&b.id))
+    });
+    scored
+        .into_iter()
+        .take(cfg.related_max)
+        .map(|(fact, score)| SearchHit {
+            fact: fact.clone(),
+            score,
+            kind: MatchKind::Semantic,
+        })
+        .collect()
+}
+
 fn rrf_score(candidate: &Candidate, k: f32) -> f32 {
     [candidate.lexical_rank, candidate.semantic_rank]
         .into_iter()
@@ -591,6 +626,49 @@ mod tests {
         let ids = hit_ids(&report);
         assert!(ids.contains(&fx::HOME_CITY), "{ids:?}");
         assert!(!ids.contains(&fx::HOME_CITY_PROJECTION), "{ids:?}");
+    }
+
+    #[test]
+    fn hot_cluster_does_not_win_on_recall_count() {
+        let facts = corpus();
+        let cfg = FactSearchConfig::default();
+        let neighbors: Vec<&Fact> = facts
+            .iter()
+            .filter(|f| fx::HOT_CLUSTER.contains(&f.id) || f.id == fx::FATHER_NAME)
+            .collect();
+        let scores: Vec<(usize, f32)> = neighbors
+            .iter()
+            .enumerate()
+            .map(|(p, f)| (p, if f.id == fx::FATHER_NAME { 0.4 } else { -1.0 }))
+            .collect();
+        let related = rank_related(&neighbors, &scores, Some(0.0), &cfg);
+        let ids: Vec<i64> = related.iter().map(|h| h.fact.id).collect();
+        assert_eq!(ids, vec![fx::FATHER_NAME]);
+    }
+
+    #[test]
+    fn related_is_capped() {
+        let facts = filler(30);
+        let cfg = FactSearchConfig::default();
+        let neighbors: Vec<&Fact> = facts.iter().collect();
+        let scores: Vec<(usize, f32)> = (0..30).map(|p| (p, 0.5 + p as f32 / 100.0)).collect();
+        let related = rank_related(&neighbors, &scores, Some(0.0), &cfg);
+        assert_eq!(related.len(), 5);
+        assert_eq!(related[0].fact.id, 30, "best score first");
+    }
+
+    #[test]
+    fn related_ties_break_on_recall_count() {
+        let a = fx::fact(1, "user", "a", "x", 2);
+        let b = fx::fact(2, "user", "b", "x", 9);
+        let neighbors = vec![&a, &b];
+        let related = rank_related(
+            &neighbors,
+            &[(0, 0.5), (1, 0.5)],
+            None,
+            &FactSearchConfig::default(),
+        );
+        assert_eq!(related[0].fact.id, 2);
     }
 
     #[test]

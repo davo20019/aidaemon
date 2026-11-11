@@ -1938,8 +1938,8 @@ impl FactStore for SqliteMemory {
         initial_ids: &std::collections::HashSet<i64>,
     ) -> anyhow::Result<Vec<Fact>> {
         use crate::neighborhood::{
-            entity_mentioned_as_words, is_relationship_key, select_neighborhood_facts,
-            NeighborhoodCaps,
+            eligible_neighbors, entity_mentioned_as_words, is_relationship_key,
+            normalize_namespace, Seed,
         };
         use PeopleStore;
 
@@ -1990,13 +1990,23 @@ impl FactStore for SqliteMemory {
             }
         }
 
-        Ok(select_neighborhood_facts(
-            &all,
-            &resolved,
-            owner_relationship,
-            initial_ids,
-            NeighborhoodCaps::default(),
-        ))
+        // Transitional until `search_facts` replaces this method.
+        let seeds: Vec<Seed> = resolved
+            .iter()
+            .take(6)
+            .flat_map(|name| {
+                [
+                    Seed::Namespace(normalize_namespace(name)),
+                    Seed::Person(name.clone()),
+                ]
+            })
+            .collect();
+        let mut out: Vec<Fact> = eligible_neighbors(&all, &seeds, owner_relationship, initial_ids)
+            .into_iter()
+            .cloned()
+            .collect();
+        out.truncate(16);
+        Ok(out)
     }
 }
 

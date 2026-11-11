@@ -1,14 +1,19 @@
-//! Pure neighborhood selection over already-fetched flat facts.
+//! Pure expansion over already-loaded flat facts.
 //!
-//! Given the entities a query resolved to, assemble their connected fact
-//! clusters so the model can derive relational answers. Three rules:
-//! namespace (`X:*`), co-mention (entity name appears in key/value), and the
-//! owner-relationship cluster (relationship-typed facts travel together —
-//! this is what connects `Caro` to `Frank`, who never co-occur in one fact).
-//! Pure and synchronous so it is unit-testable without a DB.
-
-// Not yet called by production code — wired in Task 5.
-#![allow(dead_code)]
+//! Given the hits a search actually returned, decide which other facts may
+//! travel with them. Rules are typed by seed kind:
+//!
+//! - a namespace seed (`X:attr` keys) makes eligible only facts in the same
+//!   normalized namespace, never facts that merely mention the word;
+//! - a person seed (the value of a relationship-keyed hit, or a known
+//!   person's name in a hit) makes eligible facts that mention that name as
+//!   whole words;
+//! - a returned relationship-keyed hit makes the owner's relationship
+//!   cluster eligible, which is what connects a mother to a father who never
+//!   co-occur in one fact.
+//!
+//! Eligibility only: [`crate::search::rank_related`] scores the neighbors
+//! against the query and caps them.
 
 use crate::records::Fact;
 use std::collections::HashSet;
@@ -35,21 +40,6 @@ const RELATIONSHIP_ROOTS: &[&str] = &[
     "grandmother",
     "grandfather",
 ];
-
-#[derive(Debug, Clone, Copy)]
-pub struct NeighborhoodCaps {
-    pub max_entities: usize,
-    pub max_facts: usize,
-}
-
-impl Default for NeighborhoodCaps {
-    fn default() -> Self {
-        Self {
-            max_entities: 6,
-            max_facts: 16,
-        }
-    }
-}
 
 /// The namespace prefix of a key (`"X:attr" -> "X"`), or `None` for flat keys.
 pub fn fact_namespace(key: &str) -> Option<&str> {
@@ -99,66 +89,111 @@ pub fn entity_mentioned_as_words(haystack: &str, entity: &str) -> bool {
     significant.iter().all(|w| haystack_tokens.contains(*w))
 }
 
-/// Salience used to rank additions when over the cap. Higher = keep.
-fn salience(f: &Fact) -> i64 {
-    // recall_count dominates; recency as a weak tiebreaker via updated_at secs.
-    (f.recall_count as i64) * 1_000_000 + f.updated_at.timestamp()
+/// One namespace however it is spelled: lowercase with every
+/// non-alphanumeric character removed (`Acme.Blog`, `acme_blog` and
+/// `acmeblog` are one namespace).
+pub fn normalize_namespace(ns: &str) -> String {
+    ns.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
-/// Select the neighborhood facts to append to the initial matches.
-pub fn select_neighborhood_facts(
-    all_facts: &[Fact],
-    resolved_names: &[String],
-    owner_relationship: bool,
-    initial_ids: &HashSet<i64>,
-    caps: NeighborhoodCaps,
-) -> Vec<Fact> {
-    if resolved_names.is_empty() {
-        return Vec::new();
+/// Where an expansion starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seed {
+    /// A normalized namespace.
+    Namespace(String),
+    /// A person's name.
+    Person(String),
+}
+
+/// Most seeds one search expands from.
+const MAX_SEEDS: usize = 6;
+
+/// Seeds from the hits actually returned, in hit order, at most six.
+/// `known_people` are names and aliases from the people store; pass an
+/// empty slice when there is none.
+pub fn seeds_from_hits(hits: &[Fact], known_people: &[String]) -> Vec<Seed> {
+    let mut seeds: Vec<Seed> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |seed: Seed, seeds: &mut Vec<Seed>| {
+        let identity = match &seed {
+            Seed::Namespace(ns) => format!("ns:{ns}"),
+            Seed::Person(name) => format!("person:{}", name.to_lowercase()),
+        };
+        if seen.insert(identity) {
+            seeds.push(seed);
+        }
+    };
+    for hit in hits {
+        if let Some(ns) = fact_namespace(&hit.key) {
+            let normalized = normalize_namespace(ns);
+            if !normalized.is_empty() {
+                push(Seed::Namespace(normalized), &mut seeds);
+            }
+        }
+        if is_relationship_key(&hit.key) {
+            let name = hit.value.trim();
+            if !name.is_empty() {
+                push(Seed::Person(name.to_string()), &mut seeds);
+            }
+        }
+        for person in known_people {
+            if entity_mentioned_as_words(&hit.key, person)
+                || entity_mentioned_as_words(&hit.value, person)
+            {
+                push(Seed::Person(person.clone()), &mut seeds);
+            }
+        }
     }
-    let names: Vec<String> = resolved_names
-        .iter()
-        .take(caps.max_entities)
-        .cloned()
-        .collect();
+    seeds.truncate(MAX_SEEDS);
+    seeds
+}
 
-    // Namespaces named by the resolved entities (exact, case-insensitive).
-    let target_ns: HashSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
-
-    let mut picked: Vec<Fact> = all_facts
+/// Facts eligible for expansion, excluding `exclude_ids`; unranked and
+/// uncapped. `relationship_cluster` makes relationship-keyed facts eligible
+/// and should be true only when a returned hit has a relationship key.
+pub fn eligible_neighbors<'a>(
+    all: &'a [Fact],
+    seeds: &[Seed],
+    relationship_cluster: bool,
+    exclude_ids: &HashSet<i64>,
+) -> Vec<&'a Fact> {
+    let namespaces: HashSet<&str> = seeds
         .iter()
-        .filter(|f| !initial_ids.contains(&f.id))
-        .filter(|f| {
-            // Rule 1 — namespace cluster.
-            let ns_hit = fact_namespace(&f.key)
-                .map(|ns| target_ns.contains(&ns.to_ascii_lowercase()))
-                .unwrap_or(false);
-            // Rule 2 — co-mention (entity name as whole words in key or value).
-            let mention_hit = names.iter().any(|n| {
-                entity_mentioned_as_words(&f.key, n) || entity_mentioned_as_words(&f.value, n)
-            });
-            // Rule 3 — owner relationship cluster.
-            let rel_hit = owner_relationship && is_relationship_key(&f.key);
-            ns_hit || mention_hit || rel_hit
+        .filter_map(|seed| match seed {
+            Seed::Namespace(ns) => Some(ns.as_str()),
+            Seed::Person(_) => None,
         })
-        .cloned()
         .collect();
-
-    // Dedupe by id (a fact can match more than one rule).
+    let people: Vec<&str> = seeds
+        .iter()
+        .filter_map(|seed| match seed {
+            Seed::Person(name) => Some(name.as_str()),
+            Seed::Namespace(_) => None,
+        })
+        .collect();
     let mut seen: HashSet<i64> = HashSet::new();
-    picked.retain(|f| seen.insert(f.id));
-
-    // Salience-rank and cap.
-    picked.sort_by_key(|f| std::cmp::Reverse(salience(f)));
-    picked.truncate(caps.max_facts);
-    picked
+    all.iter()
+        .filter(|f| !exclude_ids.contains(&f.id))
+        .filter(|f| {
+            let in_namespace = fact_namespace(&f.key)
+                .is_some_and(|ns| namespaces.contains(normalize_namespace(ns).as_str()));
+            let mentions_person = people.iter().any(|name| {
+                entity_mentioned_as_words(&f.key, name) || entity_mentioned_as_words(&f.value, name)
+            });
+            let in_cluster = relationship_cluster && is_relationship_key(&f.key);
+            in_namespace || mentions_person || in_cluster
+        })
+        .filter(|f| seen.insert(f.id))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::Fact;
-    use std::collections::HashSet;
+    use crate::search_fixture::{self as fx, corpus};
 
     fn fact(id: i64, category: &str, key: &str, value: &str) -> Fact {
         Fact {
@@ -196,115 +231,93 @@ mod tests {
         assert!(!is_relationship_key("LearnEnglishSounds:path"));
     }
 
+    fn ids(facts: &[&Fact]) -> HashSet<i64> {
+        facts.iter().map(|f| f.id).collect()
+    }
+
+    fn by_id(all: &[Fact], id: i64) -> Fact {
+        all.iter().find(|f| f.id == id).unwrap().clone()
+    }
+
     #[test]
-    fn owner_relationship_query_pulls_the_whole_family_cluster() {
-        // The Caro/Frank shape: query resolved to "Caro"; Frank never co-occurs
-        // with Caro, but is in the owner's relationship set.
-        let all = vec![
-            fact(1, "user", "mother_name", "Carol Mendez"), // initial match
-            fact(2, "user", "father", "Frank Mendez"),
-            fact(3, "user", "partner_name", "Alice Rivera"),
-            fact(4, "project", "LearnEnglishSounds:path", "~/projects/LES"),
+    fn generic_namespace_does_not_co_mention() {
+        let all = corpus();
+        let hit = by_id(&all, fx::WORKFLOW_RELEASE_CHECKLIST);
+        let seeds = seeds_from_hits(std::slice::from_ref(&hit), &[]);
+        assert_eq!(seeds, vec![Seed::Namespace("workflow".into())]);
+        let exclude: HashSet<i64> = [hit.id].into_iter().collect();
+        let out = ids(&eligible_neighbors(&all, &seeds, false, &exclude));
+        assert_eq!(out.len(), 29);
+        assert!(out.iter().all(|id| fx::WORKFLOW_NS.contains(id)));
+        assert!(!out.iter().any(|id| fx::GENERIC_MENTIONS.contains(id)));
+    }
+
+    #[test]
+    fn namespace_variants_are_one_namespace() {
+        let all = corpus();
+        let hit = by_id(&all, 4000); // Acme.Blog:
+        let seeds = seeds_from_hits(std::slice::from_ref(&hit), &[]);
+        let exclude: HashSet<i64> = [hit.id].into_iter().collect();
+        let out = ids(&eligible_neighbors(&all, &seeds, false, &exclude));
+        for id in (4001..4005).chain(4010..4015).chain(4020..4025) {
+            assert!(out.contains(&id), "{id} missing: {out:?}");
+        }
+        assert_eq!(out.len(), 14);
+    }
+
+    #[test]
+    fn seeds_only_from_returned_hits() {
+        let hits = vec![
+            fact(1, "user", "birth_date", "1990-04-12"),
+            fact(2, "preference", "reply_style", "short"),
         ];
-        let initial: HashSet<i64> = [1].into_iter().collect();
-        let out = select_neighborhood_facts(
-            &all,
-            &["Carol".into()],
-            true, // owner_relationship
-            &initial,
-            NeighborhoodCaps::default(),
-        );
-        let ids: HashSet<i64> = out.iter().map(|f| f.id).collect();
-        assert!(
-            ids.contains(&2),
-            "father=Frank must be pulled into the cluster"
-        );
-        assert!(
-            ids.contains(&3),
-            "partner is part of the owner relationship set"
-        );
-        assert!(!ids.contains(&1), "initial match is deduped out");
-        assert!(!ids.contains(&4), "unrelated project fact is not pulled");
+        assert!(seeds_from_hits(&hits, &[]).is_empty());
     }
 
     #[test]
-    fn namespace_query_pulls_the_concept_cluster() {
-        let all = vec![
-            fact(10, "project", "LearnEnglishSounds:path", "~/p/LES"),
-            fact(11, "technical", "LearnEnglishSounds:tech_stack", "Next.js"),
-            fact(12, "user", "partner_name", "Alice"),
-        ];
-        let initial: HashSet<i64> = [10].into_iter().collect();
-        let out = select_neighborhood_facts(
-            &all,
-            &["LearnEnglishSounds".into()],
-            false,
-            &initial,
-            NeighborhoodCaps::default(),
-        );
-        let ids: HashSet<i64> = out.iter().map(|f| f.id).collect();
-        assert!(ids.contains(&11), "same-namespace fact pulled");
-        assert!(!ids.contains(&12), "unrelated fact not pulled");
+    fn family_cluster_still_travels() {
+        let all = corpus();
+        let hit = by_id(&all, fx::MOTHER_NAME);
+        let seeds = seeds_from_hits(std::slice::from_ref(&hit), &[]);
+        assert_eq!(seeds, vec![Seed::Person("Maria Rivera".into())]);
+        let exclude: HashSet<i64> = [hit.id].into_iter().collect();
+        let out = ids(&eligible_neighbors(&all, &seeds, true, &exclude));
+        assert!(out.contains(&fx::FATHER_NAME));
+        assert!(out.contains(&fx::PARTNER_NAME));
+        assert!(!out.iter().any(|id| fx::HOT_CLUSTER.contains(id)));
     }
 
     #[test]
-    fn empty_resolved_names_returns_empty() {
-        let all = vec![fact(1, "user", "partner_name", "Alice")];
-        let empty: HashSet<i64> = HashSet::new();
-        let out = select_neighborhood_facts(&all, &[], false, &empty, NeighborhoodCaps::default());
-        assert!(out.is_empty(), "no resolved entities -> no expansion");
+    fn known_person_in_a_hit_is_a_seed() {
+        let hits = vec![fact(1, "general", "gift_idea", "a kettle for Jordan Lee")];
+        let seeds = seeds_from_hits(&hits, &["Jordan Lee".into(), "Ana".into()]);
+        assert_eq!(seeds, vec![Seed::Person("Jordan Lee".into())]);
     }
 
     #[test]
-    fn cap_is_enforced() {
-        // Seed 20 facts that all qualify as relationship facts (owner_relationship=true).
-        let all: Vec<Fact> = (1..=20)
-            .map(|i| fact(i, "user", "partner_name", &format!("Person {i}")))
+    fn seeds_are_capped() {
+        let hits: Vec<Fact> = (0..10)
+            .map(|i| fact(i, "project", &format!("ns{i}:attr"), "x"))
             .collect();
-        // None of them are in initial_ids so all 20 are candidates.
-        let empty: HashSet<i64> = HashSet::new();
-        let caps = NeighborhoodCaps::default(); // max_facts = 16
-        let out = select_neighborhood_facts(&all, &["someone".into()], true, &empty, caps);
-        assert_eq!(
-            out.len(),
-            caps.max_facts,
-            "output must be capped at max_facts even when more facts qualify"
-        );
+        assert_eq!(seeds_from_hits(&hits, &[]).len(), 6);
     }
 
     #[test]
     fn co_mention_is_word_boundary_not_substring() {
-        // "Ana" must NOT match a value containing "banana".
-        let banana_fact = fact(1, "food", "preference", "I like banana bread");
-        // "Frank" MUST match a value that is exactly "Frank Mendez".
-        let frank_fact = fact(2, "user", "father", "Frank Mendez");
+        let all = vec![
+            fact(1, "food", "preference", "I like banana bread"),
+            fact(2, "user", "father", "Frank Mendez"),
+        ];
+        let none: HashSet<i64> = HashSet::new();
+        let ana = eligible_neighbors(&all, &[Seed::Person("Ana".into())], false, &none);
+        assert!(ana.is_empty(), "'Ana' must not match 'banana'");
+        let frank = eligible_neighbors(&all, &[Seed::Person("Frank".into())], false, &none);
+        assert_eq!(ids(&frank), [2].into_iter().collect());
+    }
 
-        let empty: HashSet<i64> = HashSet::new();
-
-        // Test: "Ana" should not pull the banana fact.
-        let out_ana = select_neighborhood_facts(
-            std::slice::from_ref(&banana_fact),
-            &["Ana".into()],
-            false,
-            &empty,
-            NeighborhoodCaps::default(),
-        );
-        assert!(
-            out_ana.is_empty(),
-            "'Ana' must not match 'banana' via substring — word boundary required"
-        );
-
-        // Test: "Frank" should pull the frank fact.
-        let out_frank = select_neighborhood_facts(
-            std::slice::from_ref(&frank_fact),
-            &["Frank".into()],
-            false,
-            &empty,
-            NeighborhoodCaps::default(),
-        );
-        assert!(
-            out_frank.iter().any(|f| f.id == 2),
-            "'Frank' must match 'Frank Mendez' as a whole word"
-        );
+    #[test]
+    fn known_person_match_is_word_boundary() {
+        let hits = vec![fact(1, "user", "best_friend_note", "Banana Doe likes tea")];
+        assert!(seeds_from_hits(&hits, &["Ana".into()]).is_empty());
     }
 }
