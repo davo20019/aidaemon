@@ -1038,6 +1038,8 @@ CREATE TABLE mandate_decision_cycles (
             goal_run_id TEXT NOT NULL UNIQUE REFERENCES goal_runs(id) ON DELETE CASCADE,
             mandate_version INTEGER NOT NULL,
             outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
+            origin TEXT NOT NULL DEFAULT 'deliberator'
+                CHECK (origin IN ('deliberator', 'runtime_fallback')),
             activity_level TEXT NOT NULL DEFAULT 'quiet'
                 CHECK (activity_level IN ('quiet', 'active', 'urgent')),
             rationale TEXT NOT NULL,
@@ -1474,6 +1476,12 @@ CREATE INDEX idx_history_channel_event ON history_message_index(channel_id, even
 index idx_history_source_event on history_message_index
 CREATE INDEX idx_history_source_event ON history_message_index(source_kind, event_id)
 
+table history_projection_state on history_projection_state
+CREATE TABLE history_projection_state (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )
+
 table state_schema_versions on state_schema_versions
 CREATE TABLE state_schema_versions (
             version INTEGER PRIMARY KEY,
@@ -1558,5 +1566,6 @@ rows prompt_snapshots = 0
 rows background_spawns = 0
 rows task_dependencies = 0
 rows history_message_index = 0
+rows history_projection_state = 0
 rows state_schema_versions = 1
 version 1 unversioned_baseline

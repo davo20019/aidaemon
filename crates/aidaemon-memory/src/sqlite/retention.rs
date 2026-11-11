@@ -200,13 +200,21 @@ impl MemoryRetention {
         deleted += sqlx::query(
             "DELETE FROM memory_embeddings
              WHERE (owner_type = 'claim' AND NOT EXISTS (
-                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
+                       SELECT 1 FROM memory_claims c
+                       WHERE c.id = CAST(owner_id AS INTEGER)
+                         AND CAST(c.id AS TEXT) = owner_id))
                 OR (owner_type = 'span' AND NOT EXISTS (
-                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))
+                       SELECT 1 FROM memory_spans s
+                       WHERE s.id = CAST(owner_id AS INTEGER)
+                         AND CAST(s.id AS TEXT) = owner_id))
                 OR (owner_type = 'procedure' AND NOT EXISTS (
-                       SELECT 1 FROM procedures p WHERE CAST(p.id AS TEXT) = owner_id))
+                       SELECT 1 FROM procedures p
+                       WHERE p.id = CAST(owner_id AS INTEGER)
+                         AND CAST(p.id AS TEXT) = owner_id))
                 OR (owner_type = 'error_solution' AND NOT EXISTS (
-                       SELECT 1 FROM error_solutions e WHERE CAST(e.id AS TEXT) = owner_id))
+                       SELECT 1 FROM error_solutions e
+                       WHERE e.id = CAST(owner_id AS INTEGER)
+                         AND CAST(e.id AS TEXT) = owner_id))
                 OR (stale_at IS NOT NULL AND stale_at < datetime('now', '-30 days'))",
         )
         .execute(&self.pool)
@@ -236,9 +244,13 @@ impl MemoryRetention {
         deleted += sqlx::query(
             "DELETE FROM memory_embeddings
              WHERE (owner_type = 'claim' AND NOT EXISTS (
-                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
+                       SELECT 1 FROM memory_claims c
+                       WHERE c.id = CAST(owner_id AS INTEGER)
+                         AND CAST(c.id AS TEXT) = owner_id))
                 OR (owner_type = 'span' AND NOT EXISTS (
-                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))",
+                       SELECT 1 FROM memory_spans s
+                       WHERE s.id = CAST(owner_id AS INTEGER)
+                         AND CAST(s.id AS TEXT) = owner_id))",
         )
         .execute(&self.pool)
         .await?

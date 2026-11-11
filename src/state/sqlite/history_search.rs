@@ -131,6 +131,16 @@ pub(crate) async fn migrate_history_search(pool: &SqlitePool) -> anyhow::Result<
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
+    // Progress markers for one-pass repairs, so they do not rescan rows they
+    // have already examined.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS history_projection_state (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     create_fts(pool).await
 }
 
@@ -426,12 +436,64 @@ pub(crate) async fn repair_and_backfill(
     Ok(stats)
 }
 
+/// Key in `history_projection_state` holding the highest episode id the
+/// provenance repair has already examined.
+const EPISODE_PROVENANCE_CHECKED_THROUGH: &str = "episode_provenance_checked_through";
+
+/// Fill in missing channel and event-span provenance on episodes, repairing at
+/// most about `limit` of them per call.
+///
+/// Every episode is examined once: the highest id examined is persisted, and
+/// later calls start after it. Episodes are written with their provenance, so
+/// only legacy rows lack it, and a row that cannot be repaired when examined
+/// (its events are gone or never carried a channel) never becomes repairable.
+/// Re-examining those on every hourly pass cost seconds of event scans each
+/// time and repaired nothing.
 async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Result<u64> {
+    let chunk = limit.max(1);
+    let mut checked_through: i64 =
+        sqlx::query_scalar("SELECT value FROM history_projection_state WHERE key = ?")
+            .bind(EPISODE_PROVENANCE_CHECKED_THROUGH)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(0);
+    let mut repaired = 0;
+    while repaired < chunk as u64 {
+        let Some(chunk_end) = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(id) FROM (SELECT id FROM episodes WHERE id > ? ORDER BY id LIMIT ?)",
+        )
+        .bind(checked_through)
+        .bind(chunk)
+        .fetch_one(pool)
+        .await?
+        else {
+            break;
+        };
+        repaired += repair_episode_provenance_through(pool, checked_through, chunk_end).await?;
+        checked_through = chunk_end;
+        sqlx::query(
+            "INSERT INTO history_projection_state(key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(EPISODE_PROVENANCE_CHECKED_THROUGH)
+        .bind(checked_through)
+        .execute(pool)
+        .await?;
+    }
+    Ok(repaired)
+}
+
+/// Repair the episodes with `after < id <= through`.
+async fn repair_episode_provenance_through(
+    pool: &SqlitePool,
+    after: i64,
+    through: i64,
+) -> anyhow::Result<u64> {
     let rows = sqlx::query(
         "SELECT id, session_id, start_time, end_time, channel_id,
                 start_event_id, end_event_id
          FROM episodes ep
-         WHERE
+         WHERE ep.id > ? AND ep.id <= ? AND (
            (ep.channel_id IS NULL AND (
               instr(ep.session_id, 'slack:') > 0
               OR instr(ep.session_id, 'discord:') > 0
@@ -451,10 +513,11 @@ async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Res
                 AND e.event_type IN ('user_message', 'assistant_response')
                 AND julianday(e.created_at) >= julianday(ep.start_time)
                 AND julianday(e.created_at) <= julianday(ep.end_time)
-           ))
-         ORDER BY id LIMIT ?",
+           )))
+         ORDER BY id",
     )
-    .bind(limit)
+    .bind(after)
+    .bind(through)
     .fetch_all(pool)
     .await?;
     let mut repaired = 0;
@@ -1465,5 +1528,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(untouched, (None, None, None));
+
+        // Both rows were examined once; neither is scanned again.
+        let checked_through: i64 =
+            sqlx::query_scalar("SELECT value FROM history_projection_state WHERE key = ?")
+                .bind(EPISODE_PROVENANCE_CHECKED_THROUGH)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checked_through, 2);
+
+        // An episode recorded later is still examined.
+        sqlx::query(
+            "INSERT INTO episodes(session_id,start_time,end_time)
+             VALUES ('slack:C1', '2026-01-01T11:59:00Z', '2026-01-01T12:01:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repair_episode_provenance(&pool, 10).await.unwrap(), 1);
+        assert_eq!(repair_episode_provenance(&pool, 10).await.unwrap(), 0);
     }
 }

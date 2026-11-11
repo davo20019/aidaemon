@@ -399,23 +399,11 @@ impl MemoryManager {
         // uncaptured events (events newer than the latest episode, or no episode
         // at all) and at least 5 such events.
         let latest_episode_ends = self.latest_episode_ends_json().await?;
-        let idle_sessions: Vec<String> = sqlx::query_scalar(
-            "SELECT ev.session_id
-             FROM events ev
-             LEFT JOIN (
-                 SELECT json_extract(value, '$[0]') AS session_id,
-                        json_extract(value, '$[1]') AS latest_end
-                 FROM json_each(?)
-             ) ep ON ep.session_id = ev.session_id
-             WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
-               AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
-               AND ev.created_at < ?
-             GROUP BY ev.session_id
-             HAVING COUNT(ev.id) >= 5
-               AND MAX(ev.created_at) < ?",
-        )
+        let idle_sessions: Vec<String> = sqlx::query_scalar(&uncaptured_sessions_sql(
+            "AND ev.created_at < ?2",
+            "HAVING COUNT(ev.id) >= 5 AND MAX(ev.created_at) < ?2",
+        ))
         .bind(&latest_episode_ends)
-        .bind(&thirty_mins_ago)
         .bind(&thirty_mins_ago)
         .fetch_all(&self.pool)
         .await?;
@@ -467,22 +455,11 @@ impl MemoryManager {
         // Find sessions with 20+ events since their last episode (or no episode
         // at all). These sessions risk losing context as the message window rotates.
         let latest_episode_ends = self.latest_episode_ends_json().await?;
-        let session_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT ev.session_id
-             FROM events ev
-             LEFT JOIN (
-                 SELECT json_extract(value, '$[0]') AS session_id,
-                        json_extract(value, '$[1]') AS latest_end
-                 FROM json_each(?)
-             ) ep ON ep.session_id = ev.session_id
-             WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
-               AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
-             GROUP BY ev.session_id
-             HAVING COUNT(ev.id) >= 20",
-        )
-        .bind(&latest_episode_ends)
-        .fetch_all(&self.pool)
-        .await?;
+        let session_ids: Vec<String> =
+            sqlx::query_scalar(&uncaptured_sessions_sql("", "HAVING COUNT(ev.id) >= 20"))
+                .bind(&latest_episode_ends)
+                .fetch_all(&self.pool)
+                .await?;
         let session_ids = self
             .history
             .exclude_memory_isolated_sessions(session_ids)
@@ -907,6 +884,42 @@ impl MemoryManager {
 
         Ok(messages)
     }
+}
+
+/// Sessions whose conversation events since their latest episode end pass
+/// `having`. `?1` is the JSON list of `[session_id, latest_end]` pairs from
+/// `latest_episode_ends_json`; `filter` narrows the events further.
+///
+/// The list has no index, so it is never the inner side of a join over
+/// events: sessions without an episode are found with `NOT IN` (SQLite builds
+/// a lookup table for it), and sessions with one are driven from the list into
+/// `idx_events_session_time`. A `LEFT JOIN` against `json_each` re-read the
+/// whole list for every event row, which grew with every session and episode.
+fn uncaptured_sessions_sql(filter: &str, having: &str) -> String {
+    format!(
+        "SELECT ev.session_id
+         FROM events ev
+         WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+           AND ev.session_id NOT IN (
+               SELECT json_extract(value, '$[0]') FROM json_each(?1)
+           )
+           {filter}
+         GROUP BY ev.session_id
+         {having}
+         UNION ALL
+         SELECT ep.session_id
+         FROM (
+             SELECT json_extract(value, '$[0]') AS session_id,
+                    json_extract(value, '$[1]') AS latest_end
+             FROM json_each(?1)
+         ) ep
+         JOIN events ev
+           ON ev.session_id = ep.session_id AND ev.created_at > ep.latest_end
+         WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+           {filter}
+         GROUP BY ep.session_id
+         {having}"
+    )
 }
 
 /// A session's messages as episode transcript entries. Internal
@@ -1719,5 +1732,105 @@ mod tests {
             vec![MessageAnnotation::AppendedSystemNotice]
         );
         assert_eq!(annotated.primary_content().as_deref(), Some("cargo test"));
+    }
+
+    /// The pre-rewrite query: a `LEFT JOIN` against the unindexed JSON list.
+    /// Kept only to prove the indexed form selects the same sessions.
+    fn legacy_uncaptured_sessions_sql(filter: &str, having: &str) -> String {
+        format!(
+            "SELECT ev.session_id
+             FROM events ev
+             LEFT JOIN (
+                 SELECT json_extract(value, '$[0]') AS session_id,
+                        json_extract(value, '$[1]') AS latest_end
+                 FROM json_each(?1)
+             ) ep ON ep.session_id = ev.session_id
+             WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+               AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
+               {filter}
+             GROUP BY ev.session_id
+             {having}"
+        )
+    }
+
+    #[tokio::test]
+    async fn uncaptured_session_scan_matches_the_left_join_it_replaced() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::db::migrations::migrate_events(&pool).await.unwrap();
+        let at = |minute: u32| format!("2026-01-01T10:{minute:02}:00+00:00");
+        // (session, conversation events at minutes, latest episode end)
+        let sessions: [(&str, &[u32], Option<u32>); 6] = [
+            ("no-episode-many", &[1, 2, 3, 4, 5, 6], None),
+            ("no-episode-few", &[1, 2], None),
+            ("episode-then-many", &[1, 2, 11, 12, 13, 14, 15], Some(10)),
+            ("episode-then-few", &[1, 2, 3, 4, 5, 11], Some(10)),
+            ("episode-covers-all", &[1, 2, 3, 4, 5, 6], Some(30)),
+            ("recent-no-episode", &[50, 51, 52, 53, 54], None),
+        ];
+        let mut ends = Vec::new();
+        for (session, minutes, end) in sessions {
+            for (i, minute) in minutes.iter().enumerate() {
+                let kind = ["user_message", "assistant_response", "tool_result"][i % 3];
+                sqlx::query(
+                    "INSERT INTO events(session_id, event_type, data, created_at)
+                     VALUES (?, ?, '{}', ?)",
+                )
+                .bind(session)
+                .bind(kind)
+                .bind(at(*minute))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            // Bookkeeping events never count toward a session.
+            sqlx::query(
+                "INSERT INTO events(session_id, event_type, data, created_at)
+                 VALUES (?, 'task_start', '{}', ?)",
+            )
+            .bind(session)
+            .bind(at(59))
+            .execute(&pool)
+            .await
+            .unwrap();
+            if let Some(end) = end {
+                ends.push((session.to_string(), at(end)));
+            }
+        }
+        let ends = serde_json::to_string(&ends).unwrap();
+        let cutoff = at(40);
+
+        let cases = [
+            (
+                "AND ev.created_at < ?2",
+                "HAVING COUNT(ev.id) >= 5 AND MAX(ev.created_at) < ?2",
+            ),
+            ("", "HAVING COUNT(ev.id) >= 5"),
+        ];
+        for (filter, having) in cases {
+            let mut got: Vec<String> = sqlx::query_scalar(&uncaptured_sessions_sql(filter, having))
+                .bind(&ends)
+                .bind(&cutoff)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let mut want: Vec<String> =
+                sqlx::query_scalar(&legacy_uncaptured_sessions_sql(filter, having))
+                    .bind(&ends)
+                    .bind(&cutoff)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "filter={filter:?} having={having:?}");
+            assert!(got.contains(&"no-episode-many".to_string()));
+            assert!(got.contains(&"episode-then-many".to_string()));
+            assert!(!got.contains(&"episode-then-few".to_string()));
+            assert!(!got.contains(&"episode-covers-all".to_string()));
+        }
     }
 }
