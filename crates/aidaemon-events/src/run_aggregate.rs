@@ -1906,6 +1906,21 @@ impl RunAggregate {
             .count()
     }
 
+    /// Refused operations that leave work the request asked for undone: a
+    /// refused mutation, or a refused operation bound to one of the run's
+    /// obligations. A refused read bound to nothing (the model probing a
+    /// path it guessed) owes nothing; whether the request was met is
+    /// judged by the obligations and receipts.
+    pub fn owed_policy_denials(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|operation| {
+                operation.policy_denied
+                    && (operation.mutating || !operation.obligation_ids.is_empty())
+            })
+            .count()
+    }
+
     /// Operations whose adapter actually ran.
     pub fn dispatched_operations(&self) -> usize {
         self.operations

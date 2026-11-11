@@ -1366,7 +1366,7 @@ fn task_end_decision_and_outcome(
             crate::events::RunTerminalDecision::Succeeded
             | crate::events::RunTerminalDecision::SucceededByEvidence,
         ) if outcome == crate::events::TaskOutcome::Succeeded
-            && run_aggregate.policy_denied_operations() > 0 =>
+            && run_aggregate.owed_policy_denials() > 0 =>
         {
             crate::events::TaskOutcome::Partial
         }
@@ -1409,7 +1409,7 @@ fn task_end_decision_and_outcome(
         // Same refusal rule for runs whose contract expected nothing.
         (_, crate::events::RunTerminalDecision::Unspecified)
             if outcome == crate::events::TaskOutcome::Succeeded
-                && run_aggregate.policy_denied_operations() > 0 =>
+                && run_aggregate.owed_policy_denials() > 0 =>
         {
             crate::events::TaskOutcome::Partial
         }
