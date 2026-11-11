@@ -302,6 +302,30 @@ impl HttpRequestTool {
         blocked
     }
 
+    /// Whether a call with these arguments may change something remotely.
+    /// Only a plain GET, HEAD or OPTIONS with no body and no method or
+    /// authority override observes; anything else, including arguments
+    /// that do not parse, counts as a change.
+    fn mutates(args: Option<&Value>) -> bool {
+        let method = args
+            .and_then(|value| value.get("method"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        let headers = args
+            .and_then(|value| value.get("headers"))
+            .and_then(|value| value.as_object());
+        let overrides = headers.is_some_and(|headers| {
+            !Self::method_override_headers(Some(headers)).is_empty()
+                || !Self::authority_override_headers(Some(headers)).is_empty()
+        });
+        let has_body = args
+            .and_then(|value| value.get("body"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|body| !body.is_empty());
+        overrides || has_body || !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+    }
+
     fn method_override_headers(headers: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
         let mut overrides: Vec<String> = headers
             .into_iter()
@@ -2410,22 +2434,6 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty() && value.trim() == *value)
             .map(Self::account_resource_id);
-        let has_method_override = args
-            .as_ref()
-            .and_then(|value| value.get("headers"))
-            .and_then(|value| value.as_object())
-            .is_some_and(|headers| !Self::method_override_headers(Some(headers)).is_empty());
-        let has_authority_override = args
-            .as_ref()
-            .and_then(|value| value.get("headers"))
-            .and_then(|value| value.as_object())
-            .is_some_and(|headers| !Self::authority_override_headers(Some(headers)).is_empty());
-        let observation_method_with_body = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
-            && args
-                .as_ref()
-                .and_then(|value| value.get("body"))
-                .and_then(|value| value.as_str())
-                .is_some_and(|body| !body.is_empty());
         let carries_external_body = args
             .as_ref()
             .and_then(|value| value.get("body"))
@@ -2437,23 +2445,14 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
             ToolMutationEffects::REMOTE_MUTATION
         };
 
-        let mut semantics =
-            if has_method_override || has_authority_override || observation_method_with_body {
-                ToolCallSemantics::mutation_with(mutation_effects)
-                    .with_target_hint(ToolTargetHintKind::Url, url.clone())
-            } else {
-                match method.as_str() {
-                    "GET" | "HEAD" | "OPTIONS" => ToolCallSemantics::observation()
-                        .with_verification_mode(ToolVerificationMode::ResultContent)
-                        .with_target_hint(ToolTargetHintKind::Url, url.clone()),
-                    "POST" | "PUT" | "PATCH" | "DELETE" => {
-                        ToolCallSemantics::mutation_with(mutation_effects)
-                            .with_target_hint(ToolTargetHintKind::Url, url.clone())
-                    }
-                    _ => ToolCallSemantics::mutation_with(mutation_effects)
-                        .with_target_hint(ToolTargetHintKind::Url, url.clone()),
-                }
-            };
+        let mut semantics = if Self::mutates(args.as_ref()) {
+            ToolCallSemantics::mutation_with(mutation_effects)
+                .with_target_hint(ToolTargetHintKind::Url, url.clone())
+        } else {
+            ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent)
+                .with_target_hint(ToolTargetHintKind::Url, url.clone())
+        };
         if let Some(operation) = crate::traits::ToolCallOperation::from_http_method(&method) {
             semantics = semantics.with_operation(operation);
         }

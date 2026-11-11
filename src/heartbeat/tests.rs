@@ -2318,20 +2318,6 @@ async fn closed_scheduled_run_children_are_neither_retried_nor_dispatched() {
     assert_eq!(pending_after.max_retries, 0);
 }
 
-#[test]
-fn mutating_http_method_detection() {
-    assert!(is_mutating_http_method(r#"{"method":"POST","url":"x"}"#));
-    assert!(is_mutating_http_method(r#"{"method":"post","url":"x"}"#));
-    assert!(is_mutating_http_method(r#"{"method":"DELETE","url":"x"}"#));
-    assert!(!is_mutating_http_method(r#"{"method":"GET","url":"x"}"#));
-    assert!(!is_mutating_http_method(r#"{"method":"HEAD","url":"x"}"#));
-    // Missing method / malformed JSON must fail closed (not mutating),
-    // never block dispatch on a parse miss.
-    assert!(!is_mutating_http_method(r#"{"url":"x"}"#));
-    assert!(!is_mutating_http_method("not json"));
-    assert!(!is_mutating_http_method(""));
-}
-
 /// Live repro (goal 9a744834, 2026-07-04): a scheduled "post one tweet"
 /// goal posted 5 real duplicate tweets in one cycle because orphaned
 /// pending tasks kept getting redispatched after the tweet had already
@@ -2403,7 +2389,7 @@ async fn test_dispatch_skips_redispatch_after_mutating_success_this_cycle() {
         .log_task_activity(&TaskActivity {
             id: 0,
             task_id: posted_task.id.clone(),
-            activity_type: "tool_call".to_string(),
+            activity_type: crate::traits::REMOTE_CHANGE_ACTIVITY.to_string(),
             tool_name: Some("http_request".to_string()),
             tool_args: Some(r#"{"method":"POST","url":"https://api.x.com/2/tweets"}"#.to_string()),
             result: Some("HTTP 201 Created".to_string()),
@@ -2564,7 +2550,7 @@ async fn test_manual_run_is_not_suppressed_by_prior_run_mutating_success() {
         .log_task_activity(&TaskActivity {
             id: 0,
             task_id: first_task.id.clone(),
-            activity_type: "tool_call".to_string(),
+            activity_type: crate::traits::REMOTE_CHANGE_ACTIVITY.to_string(),
             tool_name: Some("http_request".to_string()),
             tool_args: Some(r#"{"method":"POST","url":"https://api.x.com/2/tweets"}"#.to_string()),
             result: Some("HTTP 201 Created".to_string()),

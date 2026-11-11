@@ -135,24 +135,6 @@ fn timestamp_is_at_or_after(value: &str, lower_bound: &str) -> bool {
     }
 }
 
-/// Best-effort check that a logged `http_request` tool-call's args used a
-/// mutating HTTP method (anything but GET/HEAD/OPTIONS). `tool_args` is a
-/// (possibly truncated) JSON string; returns `false` — i.e. "not mutating" —
-/// if it can't be parsed or has no `method` field, so a truncated/odd
-/// payload never blocks dispatch on a parse miss.
-fn is_mutating_http_method(tool_args_json: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_args_json) else {
-        return false;
-    };
-    let Some(method) = value.get("method").and_then(|m| m.as_str()) else {
-        return false;
-    };
-    !matches!(
-        method.to_ascii_uppercase().as_str(),
-        "GET" | "HEAD" | "OPTIONS"
-    )
-}
-
 /// Whether a goal's daily token budget is exhausted *for today*. Only usage
 /// recorded on the current UTC day counts: stale `tokens_used_today` from a
 /// previous day (before the daily reset has run) must NOT block a goal, or an

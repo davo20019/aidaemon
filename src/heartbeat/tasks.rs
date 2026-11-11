@@ -802,21 +802,13 @@ impl HeartbeatCoordinator {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            for activity in activities {
-                if activity.tool_name.as_deref() != Some("http_request") {
-                    continue;
-                }
-                if activity.success != Some(true) {
-                    continue;
-                }
-                if activity
-                    .tool_args
-                    .as_deref()
-                    .is_some_and(is_mutating_http_method)
-                {
-                    successful_task_ids.push(task.id.clone());
-                    break;
-                }
+            // The dispatcher's typed record of an external change, made
+            // from the call's own effects whatever the tool.
+            if activities.iter().any(|activity| {
+                activity.activity_type == crate::traits::REMOTE_CHANGE_ACTIVITY
+                    && activity.success == Some(true)
+            }) {
+                successful_task_ids.push(task.id.clone());
             }
         }
         successful_task_ids

@@ -723,6 +723,11 @@ pub struct WorkTaskSummary {
     pub updated_at: String,
 }
 
+/// `TaskActivity::activity_type` of a call that changed something outside
+/// the machine (a post, a remote write, a deploy), recorded from its typed
+/// effects. The heartbeat reads it so a goal run never repeats one.
+pub const REMOTE_CHANGE_ACTIVITY: &str = "remote_change";
+
 /// A task activity log entry — records tool calls and results within a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Used in Phase 2; StateStore methods and SQLite impl ready

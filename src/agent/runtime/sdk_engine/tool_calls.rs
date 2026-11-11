@@ -557,6 +557,23 @@ pub(super) fn replay_notice(previous_result: &str) -> String {
     )
 }
 
+/// A call that succeeded and changed something outside this machine, by its
+/// typed effects: a remote write, a deploy or a delivery.
+pub(super) fn changed_remotely(
+    metadata: &crate::traits::ToolCallMetadata,
+    status: crate::traits::ToolOutcomeStatus,
+) -> bool {
+    use crate::traits::ToolMutationEffects as Effects;
+    let external = Effects::REMOTE_MUTATION.bits()
+        | Effects::REMOTE_DEPLOY.bits()
+        | Effects::EXTERNAL_DELIVERY.bits();
+    metadata.semantics.mutates_state()
+        && metadata.semantics.mutation_effects.bits() & external != 0
+        && metadata.invocation_stage.performed_io()
+        && !metadata.receipt_replayed
+        && status.satisfies_requested_condition()
+}
+
 /// Credit one receipt to the contract obligations it proves: a satisfied
 /// mutation marks its effects, and a
 /// verifiable observation marks the evidence requirements it matches.
@@ -1118,6 +1135,40 @@ impl Agent {
         let _ = check.reply.send(Some(output));
     }
 
+    /// A durable task's call that changed something outside this machine
+    /// (a post, a remote write, a deploy) is logged on the task as
+    /// `remote_change`, from its typed effects whatever the tool: the
+    /// heartbeat reads it so a goal run never repeats an external action
+    /// that already happened.
+    async fn record_remote_change(
+        &self,
+        tool: &str,
+        arguments: &str,
+        metadata: &crate::traits::ToolCallMetadata,
+        status: crate::traits::ToolOutcomeStatus,
+    ) {
+        let Some(task_id) = self.task_id.as_deref() else {
+            return;
+        };
+        if !changed_remotely(metadata, status) {
+            return;
+        }
+        let activity = crate::traits::TaskActivity {
+            id: 0,
+            task_id: task_id.to_string(),
+            activity_type: crate::traits::REMOTE_CHANGE_ACTIVITY.to_string(),
+            tool_name: Some(tool.to_string()),
+            tool_args: Some(arguments.to_string()),
+            result: None,
+            success: Some(true),
+            tokens_used: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(error) = self.state.log_task_activity(&activity).await {
+            warn!(task_id, %error, "Could not record a remote change on its task");
+        }
+    }
+
     async fn record_sdk_tool_result(
         &self,
         scope: &TurnScope<'_>,
@@ -1188,6 +1239,8 @@ impl Agent {
                     idempotency_key.clone(),
                 );
                 receipt.mandate_authority = grant.clone();
+                self.record_remote_change(&request.name, arguments, &outcome.metadata, status)
+                    .await;
                 if let Ok(mut progress) = scope.progress.lock() {
                     receipt.completion_obligation_ids = bind_receipt_to_contract(
                         &mut progress,

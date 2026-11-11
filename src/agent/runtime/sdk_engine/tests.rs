@@ -4954,3 +4954,37 @@ async fn the_owners_deny_of_a_refused_check_binds_the_run() {
         "{results:?}"
     );
 }
+
+/// A remote change is recognized from the call's typed effects, whatever
+/// the tool: a successful remote write or delivery counts; a read, a local
+/// write, a failure or a replayed receipt does not.
+#[test]
+fn a_remote_change_is_judged_by_its_typed_effects() {
+    use crate::traits::{
+        ToolCallMetadata, ToolCallSemantics, ToolInvocationStage, ToolMutationEffects,
+        ToolOutcomeStatus::{FailedPermanent, Succeeded},
+    };
+    let call = |semantics: ToolCallSemantics| ToolCallMetadata {
+        semantics,
+        invocation_stage: ToolInvocationStage::Dispatched,
+        ..Default::default()
+    };
+    let post = call(ToolCallSemantics::mutation_with(
+        ToolMutationEffects::REMOTE_MUTATION,
+    ));
+    let delivery = call(ToolCallSemantics::mutation_with(
+        ToolMutationEffects::EXTERNAL_DELIVERY,
+    ));
+    let local = call(ToolCallSemantics::mutation_with(
+        ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+    ));
+    let read = call(ToolCallSemantics::observation());
+    assert!(super::tool_calls::changed_remotely(&post, Succeeded));
+    assert!(super::tool_calls::changed_remotely(&delivery, Succeeded));
+    assert!(!super::tool_calls::changed_remotely(&post, FailedPermanent));
+    assert!(!super::tool_calls::changed_remotely(&local, Succeeded));
+    assert!(!super::tool_calls::changed_remotely(&read, Succeeded));
+    let mut replayed = post.clone();
+    replayed.receipt_replayed = true;
+    assert!(!super::tool_calls::changed_remotely(&replayed, Succeeded));
+}

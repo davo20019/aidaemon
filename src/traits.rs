@@ -39,7 +39,7 @@ pub use aidaemon_work::goals::{
     NotificationEntry, ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState,
     ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
     TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
-    WorkerProfile, DEFAULT_PROJECT_ID,
+    WorkerProfile, DEFAULT_PROJECT_ID, REMOTE_CHANGE_ACTIVITY,
 };
 #[allow(unused_imports)]
 pub use aidaemon_work::mandates::{
