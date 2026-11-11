@@ -96,10 +96,10 @@ pub(super) struct CanonFacts<'a> {
     pub paths: &'a crate::tools::DaemonPaths,
 }
 
-/// THE canonical form of a call, used by both the kernel's terminal
-/// approval rules (which judge it) and the dispatcher (which executes it),
-/// so the judged call is the executed call:
-/// - terminal: the model's `_` keys and unset optional arguments dropped,
+/// THE canonical form of a call, used by both the kernel's approval rules
+/// (which judge it) and the dispatcher (which executes it), so the judged
+/// call is the executed call:
+/// - every tool: the model's `_` keys and unset optional arguments dropped,
 ///   exactly as the dispatcher drops them (`tool_exec::strip_model_arguments`);
 /// - a call without a directory is anchored to the turn's project
 ///   directory: a scheduled goal's terminal command runs in its bound
@@ -116,16 +116,12 @@ pub(super) fn canonicalize_call(
     facts: &CanonFacts<'_>,
 ) -> crate::agent::approvals::CanonicalCall {
     let terminal = tool.is_some_and(|tool| tool.dispatch_facts().runs_as_judged);
-    let mut call = if terminal {
-        crate::agent::approvals::CanonicalCall::stripped(tool, raw)
-    } else {
-        crate::agent::approvals::CanonicalCall {
-            arguments: raw.clone(),
-            explicit_dir: None,
-            injected_dir: None,
-            stripped_read_roots: Vec::new(),
-        }
-    };
+    // Every tool, not only the terminal: the dispatcher strips the model's
+    // `_` keys and unset optional arguments before any tool runs, so a later
+    // hook (an approval card, the untrusted verifier) judging the raw
+    // arguments would judge a call that never runs. A tool that binds the
+    // owner's answer to the exact call (`browser`) then never finds it.
+    let mut call = crate::agent::approvals::CanonicalCall::stripped(tool, raw);
     let mut known = facts.known_project_dir.map(str::to_string);
     if !facts.workspace_grant {
         if let Ok(text) = serde_json::to_string(&call.arguments) {

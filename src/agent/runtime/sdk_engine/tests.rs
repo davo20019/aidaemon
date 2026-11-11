@@ -4743,6 +4743,54 @@ async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Every tool's call reaches the later hooks (approval, untrusted verifier)
+/// in the form the dispatcher executes, not only the terminal's: a model that
+/// fills each declared field with `""` would otherwise get an approval card
+/// judged on arguments that never run, and a tool binding the owner's answer
+/// to the exact call would never find it.
+#[tokio::test]
+async fn canonical_hook_strips_unset_arguments_for_every_tool() {
+    use sdk::Hook;
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(PageProbe);
+    let hook = super::tool_calls::CanonicalCallHook {
+        backend: crate::execution::active_execution_backend(),
+        paths: Default::default(),
+        tools: Arc::new(
+            [(tool.name().to_string(), tool.clone())]
+                .into_iter()
+                .collect(),
+        ),
+        known_project_dir: Arc::new(std::sync::Mutex::new(None)),
+        workspace_grant: false,
+        task_access: None,
+        authorized_scopes: Vec::new(),
+        records: super::tool_calls::CanonicalCalls::default(),
+    };
+    let run = sdk::RunId::new();
+    let ctx = judged_hook_ctx(run);
+    let raw = sdk::ToolCall {
+        id: "call-unset".to_string(),
+        name: tool.name().to_string(),
+        arguments: serde_json::json!({"url": "", "_session": "x"}),
+        provider_data: Default::default(),
+    };
+    let decision = hook.before_tool(&ctx, &raw, &unknown_effects_info()).await;
+    let sdk::ToolDecision::Rewrite { arguments } = decision else {
+        panic!("unset optional arguments are dropped before judging, got {decision:?}");
+    };
+    assert_eq!(arguments, serde_json::json!({}));
+
+    let set = sdk::ToolCall {
+        id: "call-set".to_string(),
+        arguments: serde_json::json!({"url": "https://example.com"}),
+        ..raw
+    };
+    assert!(matches!(
+        hook.before_tool(&ctx, &set, &unknown_effects_info()).await,
+        sdk::ToolDecision::Allow
+    ));
+}
+
 /// A file tool whose manifest names the paths in its arguments.
 struct ScopeFileTool(&'static str);
 

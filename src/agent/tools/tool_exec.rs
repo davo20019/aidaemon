@@ -1051,9 +1051,9 @@ impl std::error::Error for UnknownToolError {}
 /// The model's arguments as the dispatcher reads them: any `_`-prefixed key
 /// the model sent is dropped (no tool reads one: the dispatcher's facts
 /// reach a tool as its typed `ToolCallContext`), and optional arguments the
-/// model left unset are dropped against the tool's schema. The kernel's terminal approval rules judge a call after
-/// this same step (`sdk_engine::tool_calls::canonicalize_call`), so the
-/// judged call is the executed one.
+/// model left unset are dropped against the tool's schema. Every kernel hook
+/// judges a call after this same step (`sdk_engine::tool_calls::canonicalize_call`),
+/// so the judged call is the executed one.
 pub(crate) fn strip_model_arguments(
     map: &mut serde_json::Map<String, Value>,
     tool: Option<&dyn crate::traits::Tool>,
