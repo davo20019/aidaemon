@@ -38,7 +38,11 @@ impl Agent {
             .await
     }
 
-    /// `turn_id` stamps the note; `None` joins the session's current turn.
+    /// `turn_id` stamps the note; `None` joins the session's current turn, or
+    /// opens a turn of its own when none is running. History is fetched by
+    /// turn, so a note with no turn would never reach the model: a goal
+    /// notification delivered overnight must still be what "tell me more"
+    /// refers to the next morning.
     async fn record_auxiliary_assistant_note_in_turn(
         &self,
         session_id: &str,
@@ -49,6 +53,16 @@ impl Agent {
         if trimmed.is_empty() {
             return Ok(());
         }
+        let turn_id = match turn_id {
+            Some(turn_id) => turn_id.to_string(),
+            None => self
+                .current_turn_ids
+                .read()
+                .await
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        };
 
         let emitter = crate::events::EventEmitter::new(self.event_store.clone(), session_id);
         let msg = Message {
@@ -61,7 +75,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.2,
-            turn_id: turn_id.map(str::to_string),
+            turn_id: Some(turn_id),
             ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(&emitter, &msg, "system", None, None)
@@ -198,6 +212,86 @@ mod tests {
             history
         );
     }
+    /// A notification delivered while no turn is running (a scheduled goal at
+    /// night) must still be in the conversation the owner's next message
+    /// sees. The history fetch is turn-anchored, so a note stamped with no
+    /// turn would never reach the model, and "tell me more" would be answered
+    /// from whatever came before it.
+    #[tokio::test]
+    async fn idle_goal_notification_reaches_the_next_turn() {
+        use super::super::parent_delivery::ParentDeliveryKind;
+        use crate::testing::MockProvider;
+
+        // Top-level chat agent (depth 0): the default harness is a delegated
+        // worker, whose transcript keeps no earlier dialogue at all.
+        let harness = crate::testing::setup_test_agent_with_models(
+            MockProvider::new(),
+            "mock-model",
+            "mock-model",
+        )
+        .await
+        .expect("setup harness");
+        let session_id = "telegram:test_bot:synthetic-owner-2";
+
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                "Count the routes in the demo module.",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .expect("earlier unrelated turn");
+        assert!(
+            harness
+                .agent
+                .current_turn_ids
+                .read()
+                .await
+                .get(session_id)
+                .is_none(),
+            "no turn may be running when the notification lands"
+        );
+
+        let notice = "Your automation \"Grow the synthetic newsletter\": a review failed \
+                      before it finished (usage limit reached).";
+        let outcome = harness
+            .agent
+            .deliver_parent_text_result(
+                None,
+                session_id,
+                notice,
+                ParentDeliveryKind::GoalNotification,
+            )
+            .await
+            .expect("record notification");
+        assert!(outcome.recorded);
+
+        let before = harness.provider.call_log.lock().await.len();
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                "What happened there?",
+                None,
+                crate::types::UserRole::Owner,
+                crate::types::ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .expect("follow-up turn");
+
+        let calls = harness.provider.call_log.lock().await;
+        let prompt = serde_json::to_string(&calls[before].messages).expect("serialize prompt");
+        assert!(
+            prompt.contains("Grow the synthetic newsletter"),
+            "the idle notification must be in the next turn's conversation: {prompt}"
+        );
+    }
+
     #[tokio::test]
     async fn parent_text_result_does_not_record_on_dropped_hub() {
         use super::super::parent_delivery::ParentDeliveryKind;
