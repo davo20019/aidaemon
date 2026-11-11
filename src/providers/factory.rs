@@ -17,7 +17,7 @@ pub(crate) struct ProviderRouterBundle {
     pub failover_targets: Vec<ProviderRuntimeTarget>,
 }
 
-const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 
 fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> {
     let trimmed = config.base_url.trim();

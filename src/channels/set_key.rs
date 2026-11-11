@@ -13,7 +13,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_KEY_CHARS: usize = 1024;
 /// Sent to endpoints that may not check keys at all, to find out.
 const CONTROL_KEY: &str = "aidaemon-control-key-not-valid";
-const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 
 /// One provider entry's place in the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

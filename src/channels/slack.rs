@@ -26,7 +26,9 @@ use crate::types::{
 };
 use aidaemon_channels::Channel as _;
 
-/// Maximum message length for Slack (actual limit is 40,000 but leave margin).
+/// Longest plain-text message posted here (Slack's text limit is 40,000;
+/// leave margin). Text in a Block Kit section is limited to the adapter's
+/// [`aidaemon_channel_slack::SECTION_TEXT_LIMIT`].
 const MAX_MESSAGE_LEN: usize = 39_000;
 const SLACK_API: &str = "https://slack.com/api";
 const DEFAULT_WORKSPACE_GRANT_HOURS: i64 = 24;
@@ -1779,7 +1781,14 @@ impl SlackChannel {
                     .await
             };
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
-            let chunks = split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN);
+            // The last chunk goes in a section block when it carries
+            // buttons, so every chunk then fits one.
+            let limit = if buttons.is_empty() {
+                MAX_MESSAGE_LEN
+            } else {
+                aidaemon_channel_slack::SECTION_TEXT_LIMIT
+            };
+            let chunks = split_mrkdwn(&mrkdwn, limit);
             let last_idx = chunks.len().saturating_sub(1);
             for (i, chunk) in chunks.into_iter().enumerate() {
                 // Attach buttons to the last chunk only

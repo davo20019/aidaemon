@@ -28,8 +28,8 @@ use crate::traits::{ChannelCapabilities, HubChannel};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
-/// Longest Discord message.
-const MAX_MESSAGE_LEN: usize = 2000;
+/// Longest Discord message: the adapter's limit.
+const MAX_MESSAGE_LEN: usize = aidaemon_channel_discord::MAX_MESSAGE_LEN;
 
 /// Commands available in the Discord channel (shared Core only).
 fn discord_commands() -> Vec<CommandDef> {

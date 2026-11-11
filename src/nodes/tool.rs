@@ -15,7 +15,9 @@ use crate::traits::{
 };
 
 const FRESH_READING_SECONDS: i64 = 90;
-const FRESH_NODE_SECONDS: i64 = 90;
+/// A Node seen within this many seconds counts as recently connected (a
+/// restart is confirmed by the same test).
+pub(crate) const FRESH_NODE_SECONDS: i64 = 90;
 
 pub struct ReadNodeSensorsTool {
     pool: SqlitePool,

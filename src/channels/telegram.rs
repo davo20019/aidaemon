@@ -120,7 +120,7 @@ use crate::cli_agent_flags::{self, AGENT_FLAGS_CACHE_TTL_SECS, SUPPORTED_TERMINA
 
 const DEFAULT_TERMINAL_AGENT: &str = "codex";
 const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
-const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+const TELEGRAM_MAX_MESSAGE_LEN: usize = aidaemon_channel_telegram::TELEGRAM_MAX_MESSAGE_LEN;
 const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
 const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
 const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";

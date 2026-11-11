@@ -17,7 +17,9 @@ const MAX_DECISION_OBSERVATION_TEXT: usize = 750;
 const MAX_DECISION_OBSERVATIONS_JSON: usize = 6 * 1024;
 const MAX_DECISION_QUESTION_TEXT: usize = 500;
 const MAX_INTENTION_DESCRIPTION_TEXT: usize = 1024;
-const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
+/// Longest intention metadata a mandate stores; the tool that writes it
+/// checks against the same limit.
+pub const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
 const MAX_MANDATE_STRATEGY_BODY_TEXT: usize = 16 * 1024;
 const MAX_MANDATE_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_MANDATE_EVIDENCE_REFS: usize = 16;

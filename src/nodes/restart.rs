@@ -38,7 +38,7 @@ const PENDING_TTL_SECONDS: i64 = 300;
 const CONFIRM_TIMEOUT_SECONDS: i64 = 180;
 /// Minimum time between deliveries, so restarts cannot loop.
 const COOLDOWN_SECONDS: i64 = 900;
-const FRESH_NODE_SECONDS: i64 = 90;
+use super::tool::FRESH_NODE_SECONDS;
 /// Declining one restart binds the run for every Node restart.
 const RESTART_EFFECT_KEY: &str = "node_restart";
 

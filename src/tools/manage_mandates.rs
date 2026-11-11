@@ -41,7 +41,7 @@ const MAX_OBSERVATION_TEXT: usize = 750;
 const MAX_OBSERVATIONS_JSON: usize = 6 * 1024;
 const MAX_QUESTION_TEXT: usize = 500;
 const MAX_INTENTION_TEXT: usize = 1024;
-const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
+use aidaemon_work::mandates::MAX_INTENTION_METADATA_TEXT;
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
