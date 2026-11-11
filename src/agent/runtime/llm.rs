@@ -1164,4 +1164,57 @@ mod tests {
         assert_eq!((ok, primary, alternate), (false, 1, 0));
         assert!(!spent_nothing, "a server error may have been paid for");
     }
+
+    /// Mandate reviews are postponed only while no configured model can
+    /// answer: one used-up account is not enough when another can.
+    #[tokio::test]
+    async fn no_model_can_answer_only_when_every_account_is_cooling_down() {
+        use aidaemon_core::Provider as _;
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let used_up = |reset: std::time::SystemTime| {
+            Arc::new(aidaemon_core::QuotaGuard::new(
+                aidaemon_core::testing::ScriptedProvider::with_results(vec![Err(
+                    aidaemon_core::ProviderError::QuotaExhausted {
+                        message: "limit".into(),
+                        resets_at: Some(reset),
+                        per_model: false,
+                        in_stream: false,
+                    },
+                )]),
+            ))
+        };
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let later = soon + std::time::Duration::from_secs(600);
+        let primary = used_up(later);
+        let alternate = used_up(soon);
+        harness.agent.llm_runtime.swap(
+            primary.clone() as crate::llm_runtime::ModelBackend,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+        );
+        let request = |model: &str| aidaemon_core::ModelRequest {
+            model: model.into(),
+            ..Default::default()
+        };
+        assert_eq!(harness.agent.next_model_answer_at(), None);
+        let _ = primary.complete(&request("primary-model")).await;
+        assert_eq!(
+            harness.agent.next_model_answer_at(),
+            None,
+            "the alternate can"
+        );
+        let _ = alternate.complete(&request("secondary-model")).await;
+        let at = harness.agent.next_model_answer_at().expect("nobody can");
+        assert!(at <= soon && at > soon - std::time::Duration::from_secs(5));
+    }
 }

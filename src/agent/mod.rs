@@ -522,6 +522,11 @@ pub(crate) use construct::{AgentConstruction, AgentRuntimeDependencies};
 
 // impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
+    /// When some configured model can next answer, if none can now.
+    pub(crate) fn next_model_answer_at(&self) -> Option<std::time::SystemTime> {
+        self.llm_runtime.snapshot().next_answer_at()
+    }
+
     /// Revalidate the immutable mandate run and exact task-attempt lease. This
     /// runs before grant issuance and again at the final adapter boundary.
     pub(crate) async fn require_live_mandate_execution(

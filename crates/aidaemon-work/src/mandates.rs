@@ -1388,6 +1388,14 @@ impl MandateDecisionOrigin {
     }
 }
 
+/// Whether the owner hears about a failed review: the first failure of a
+/// streak, then each time the streak doubles (1, 2, 4, 8, …). A streak ends
+/// with the next review that succeeds. The mandate retries either way; a
+/// provider outage no longer sends one critical notice per review.
+pub fn review_failure_is_notified(consecutive_failures: i64) -> bool {
+    consecutive_failures > 0 && (consecutive_failures as u64).is_power_of_two()
+}
+
 /// Rationale of the WAIT the runtime records when a mandate deliberator exits
 /// without committing a decision. Display text only: what makes it a
 /// fallback is its [`MandateDecisionOrigin::RuntimeFallback`].
@@ -3246,5 +3254,13 @@ mod tests {
         intention.risk = Some("r".repeat(2_000));
         intention.invalidation_criteria = Some("i".repeat(97));
         assert!(intention.validate_content_bounds().is_err());
+    }
+
+    #[test]
+    fn failed_reviews_notify_at_the_start_and_each_doubling_of_a_streak() {
+        let notified: Vec<i64> = (0..=20)
+            .filter(|failures| super::review_failure_is_notified(*failures))
+            .collect();
+        assert_eq!(notified, vec![1, 2, 4, 8, 16]);
     }
 }

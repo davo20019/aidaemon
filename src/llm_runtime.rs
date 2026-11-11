@@ -126,6 +126,31 @@ impl LlmRuntimeSnapshot {
         self.failover_targets.clone()
     }
 
+    /// When some configured model (the primary provider's, then every
+    /// failover provider's) can next answer: `None` when one may answer
+    /// now, otherwise the earliest time a known cooldown ends.
+    pub fn next_answer_at(&self) -> Option<std::time::SystemTime> {
+        let primary_models = self
+            .router
+            .as_ref()
+            .map(|router| router.all_models_ordered())
+            .filter(|models| !models.is_empty())
+            .unwrap_or_else(|| vec![self.primary_model.clone()]);
+        let candidates = std::iter::once((self.provider.clone(), primary_models)).chain(
+            self.failover_targets
+                .iter()
+                .map(|target| (target.provider(), target.all_models_ordered())),
+        );
+        let mut earliest: Option<std::time::SystemTime> = None;
+        for (provider, models) in candidates {
+            for model in models {
+                let until = provider.unavailable_until(&model)?;
+                earliest = Some(earliest.map_or(until, |at| at.min(until)));
+            }
+        }
+        earliest
+    }
+
     /// The chain a background side call runs on: `first_model`, the primary
     /// provider's other models (the router's fallbacks), then every failover
     /// provider's models, under the SDK's default policy, which moves on after

@@ -32,6 +32,34 @@ impl HeartbeatCoordinator {
         }
 
         info!(count = due.len(), "Found due mandate reviews");
+        // A review no model can answer would only fail. When every
+        // configured model is in a known cooldown (a used-up quota, a
+        // rejected credential), move the reviews to when one ends.
+        let unavailable_until = self
+            .agent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|agent| agent.next_model_answer_at());
+        if let Some(until) = unavailable_until {
+            let retry_at = chrono::DateTime::<chrono::Utc>::from(until).to_rfc3339();
+            for mandate in due {
+                info!(
+                    mandate_id = %mandate.id,
+                    retry_at,
+                    "No configured model can answer; mandate review moved to when one can"
+                );
+                if let Some(token) = mandate.review_lease_token.as_deref() {
+                    if let Err(error) = self
+                        .state
+                        .release_mandate_review_lease(&mandate.id, token, &retry_at)
+                        .await
+                    {
+                        warn!(mandate_id = %mandate.id, %error, "Failed to defer mandate review");
+                    }
+                }
+            }
+            return;
+        }
         for mandate in due {
             let mandate_id = mandate.id.clone();
             let lease_token = mandate.review_lease_token.clone();

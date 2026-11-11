@@ -1160,18 +1160,23 @@ async fn retry_orphaned_mandate_review_without_dispatch(
         .execute(&mut *connection)
         .await?;
 
-    let notice = crate::traits::MandateRunNotification::new(
-        mandate_id,
-        mandate_version,
-        goal_id,
-        goal_run_id,
-        owner_session_id,
-        crate::traits::MandateRunNotificationKind::ReviewFailed { reason },
-        MandateRunProofCounts::default(),
-        now,
-    );
-    super::notifications::enqueue_mandate_run_notification_on_connection(&mut *connection, &notice)
+    if crate::mandates::review_failure_is_notified(i64::from(next_review_failures)) {
+        let notice = crate::traits::MandateRunNotification::new(
+            mandate_id,
+            mandate_version,
+            goal_id,
+            goal_run_id,
+            owner_session_id,
+            crate::traits::MandateRunNotificationKind::ReviewFailed { reason },
+            MandateRunProofCounts::default(),
+            now,
+        );
+        super::notifications::enqueue_mandate_run_notification_on_connection(
+            &mut *connection,
+            &notice,
+        )
         .await?;
+    }
     Ok(())
 }
 
@@ -4441,21 +4446,23 @@ impl<S: WorkDatabase> MandateStore for S {
                 .bind(&goal_id)
                 .execute(&mut *tx)
                 .await?;
-                let notice = crate::traits::MandateRunNotification::new(
-                    &request.mandate_id,
-                    request.expected_mandate_version,
-                    &goal_id,
-                    &request.goal_run_id,
-                    &owner_session_id,
-                    crate::traits::MandateRunNotificationKind::ReviewFailed { reason },
-                    crate::traits::MandateRunProofCounts::default(),
-                    &request.finalized_at,
-                );
-                super::notifications::enqueue_mandate_run_notification_on_connection(
-                    &mut *tx,
-                    &notice,
-                )
-                .await?;
+                if crate::mandates::review_failure_is_notified(i64::from(next_review_failures)) {
+                    let notice = crate::traits::MandateRunNotification::new(
+                        &request.mandate_id,
+                        request.expected_mandate_version,
+                        &goal_id,
+                        &request.goal_run_id,
+                        &owner_session_id,
+                        crate::traits::MandateRunNotificationKind::ReviewFailed { reason },
+                        crate::traits::MandateRunProofCounts::default(),
+                        &request.finalized_at,
+                    );
+                    super::notifications::enqueue_mandate_run_notification_on_connection(
+                        &mut *tx,
+                        &notice,
+                    )
+                    .await?;
+                }
                 tx.commit().await?;
                 return Ok(MandateRunFinalizationResult::Rejected { reason });
             }};

@@ -223,6 +223,13 @@ pub trait Provider: Send + Sync {
             self.complete(request).await.map(StreamEvent::Done)
         }))
     }
+
+    /// When `model` can next be asked, if this provider already knows it
+    /// cannot answer now (a used-up quota, a rejected credential, no
+    /// credit; see [`crate::QuotaGuard`]). `None`: it may answer now.
+    fn unavailable_until(&self, _model: &str) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 /// Drain a stream into its final response. Useful for implementing

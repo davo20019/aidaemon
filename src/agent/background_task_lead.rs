@@ -1057,13 +1057,28 @@ async fn finalize_mandate_review(
                 );
                 None
             }
-            MandateFinalizationRejectReason::DecisionMissing
-            | MandateFinalizationRejectReason::InvalidDecisionState
-            | MandateFinalizationRejectReason::DeliberatorFailed
-            | MandateFinalizationRejectReason::ActChangedNothing => Some(notice(
+            MandateFinalizationRejectReason::InvalidDecisionState => Some(notice(
                 MandateRunNotificationKind::ReviewFailed { reason },
                 Default::default(),
             )),
+            // Retried reviews: the finalizer queued a notice only for the
+            // failures the owner hears about; deliver no other.
+            MandateFinalizationRejectReason::DecisionMissing
+            | MandateFinalizationRejectReason::DeliberatorFailed
+            | MandateFinalizationRejectReason::ActChangedNothing => {
+                let failures = state
+                    .get_goal(&goal.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or(1, |goal| i64::from(goal.dispatch_failures));
+                crate::traits::review_failure_is_notified(failures).then(|| {
+                    notice(
+                        MandateRunNotificationKind::ReviewFailed { reason },
+                        Default::default(),
+                    )
+                })
+            }
         },
     }
 }

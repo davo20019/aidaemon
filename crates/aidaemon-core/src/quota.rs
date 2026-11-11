@@ -149,6 +149,20 @@ impl Provider for QuotaGuard {
         result
     }
 
+    fn unavailable_until(&self, model: &str) -> Option<SystemTime> {
+        let now = SystemTime::now();
+        let mut cooldowns = self.lock();
+        cooldowns.retain(|_, cooldown| cooldown.until > now);
+        [
+            cooldowns.get(&None),
+            cooldowns.get(&Some(model.to_string())),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|cooldown| cooldown.until)
+        .max()
+    }
+
     fn stream<'a>(
         &'a self,
         request: &'a ModelRequest,
@@ -310,5 +324,29 @@ mod tests {
         let response = chain.complete(&request("plan-a")).await.unwrap();
         assert_eq!(response.text, "from the other provider");
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A used-up account says until when every model of it cannot answer;
+    /// one that has not failed may answer now.
+    #[tokio::test]
+    async fn a_cooldown_says_until_when_the_model_cannot_answer() {
+        let reset = SystemTime::now() + Duration::from_secs(3_600);
+        let guard = QuotaGuard::new(ScriptedProvider::with_results(vec![Err(
+            ProviderError::QuotaExhausted {
+                message: "limit".into(),
+                resets_at: Some(reset),
+                per_model: false,
+                in_stream: true,
+            },
+        )]));
+        assert_eq!(guard.unavailable_until("any-model"), None);
+        let _ = guard.complete(&request("model-a")).await;
+        let until = guard
+            .unavailable_until("model-b")
+            .expect("account cooldown");
+        assert!(until >= reset - Duration::from_secs(1) && until <= reset);
+        // A blocked call is refused before it is sent: provably unspent.
+        let refusal = guard.complete(&request("model-b")).await.unwrap_err();
+        assert!(refusal.proves_nothing_spent(), "{refusal:?}");
     }
 }

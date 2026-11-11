@@ -43,9 +43,9 @@ pub use aidaemon_work::goals::{
 };
 #[allow(unused_imports)]
 pub use aidaemon_work::mandates::{
-    mandate_owner_label, owner_question_excerpt, Intention, IntentionStatus, Mandate,
-    MandateActivityLevel, MandateAuthority, MandateAuthorityGrant, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOrigin, MandateDecisionOutcome,
+    mandate_owner_label, owner_question_excerpt, review_failure_is_notified, Intention,
+    IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority, MandateAuthorityGrant,
+    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin, MandateDecisionOutcome,
     MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
     MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
     MandateMutationEvidence, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
