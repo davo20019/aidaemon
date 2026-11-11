@@ -265,21 +265,25 @@ fn caller_granted_spawn(parent: Option<&crate::agent::authority::InheritedAuthor
 
 /// The system prompt of a plain child: the parent's prompt, the mission and,
 /// when the caller named one, the specialist's own profile.
+/// `can_spawn` is [`child_can_spawn`]'s decision, the one that also decides
+/// whether the child gets `spawn_agent`: the prompt never states a rule of
+/// its own about delegation.
 fn plain_child_prompt(
     parent_prompt: &str,
     child_depth: usize,
     max_depth: usize,
     mission: &str,
     specialist_prompt: Option<&str>,
+    can_spawn: bool,
 ) -> String {
     const NO_SPAWN: &str = "You CANNOT spawn further sub-agents; the `spawn_agent` tool is not \
          available to you. Complete the task directly.";
-    let depth_note = if child_depth >= max_depth {
-        format!("\nYou are at the maximum sub-agent depth. {NO_SPAWN}")
-    } else if specialist_prompt.is_some() {
-        format!("\n{NO_SPAWN}")
-    } else {
+    let depth_note = if can_spawn {
         String::new()
+    } else if child_depth >= max_depth {
+        format!("\nYou are at the maximum sub-agent depth. {NO_SPAWN}")
+    } else {
+        format!("\n{NO_SPAWN}")
     };
     let mut prompt = format!(
         "{parent_prompt}\n\n## Sub-Agent Context\n\
@@ -1918,6 +1922,16 @@ impl Agent {
         let full_tools = self.collect_full_child_tools();
 
         // Apply role-based tool scoping when child_role is specified.
+        // One decision for whether the child may delegate: it decides both
+        // the tool and what the child's prompt says about delegating.
+        let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
+        let can_spawn = child_can_spawn(
+            child_depth,
+            self.limits.max_depth,
+            effective_role,
+            child_role.is_none() && named_specialist(arg_specialist).is_some(),
+            caller_granted_spawn(parent_authority.as_ref()),
+        );
         let (scoped_tools, child_system_prompt, child_root_tools) = if let Some(role) = child_role {
             match role {
                 AgentRole::TaskLead => {
@@ -2256,18 +2270,10 @@ impl Agent {
                 self.limits.max_depth,
                 mission,
                 specialist_prompt.as_deref(),
+                can_spawn,
             );
             (full_tools, prompt, None)
         };
-
-        let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
-        let can_spawn = child_can_spawn(
-            child_depth,
-            self.limits.max_depth,
-            effective_role,
-            child_role.is_none() && named_specialist(arg_specialist).is_some(),
-            caller_granted_spawn(parent_authority.as_ref()),
-        );
 
         // For TaskLead, pass goal_id; other roles get no goal context injection.
         let goal_for_child = if effective_role == AgentRole::TaskLead {
@@ -3538,6 +3544,18 @@ mod tests {
         );
         assert_eq!(resolve_child_outcome(true, &Ok(None)), TaskOutcome::Partial);
         assert_eq!(resolve_child_outcome(false, &Ok(None)), TaskOutcome::Failed);
+    }
+
+    /// The child's prompt says what `child_can_spawn` decided: a specialist
+    /// its caller made a coordinator is not told it cannot delegate.
+    #[test]
+    fn the_child_prompt_follows_the_spawn_decision() {
+        let coordinator = plain_child_prompt("P", 1, 3, "Coordinate", Some("profile"), true);
+        assert!(!coordinator.contains("CANNOT spawn"));
+        let leaf = plain_child_prompt("P", 1, 3, "Count", Some("profile"), false);
+        assert!(leaf.contains("CANNOT spawn"));
+        let deepest = plain_child_prompt("P", 3, 3, "Count", None, false);
+        assert!(deepest.contains("maximum sub-agent depth"));
     }
 
     #[test]
