@@ -11,7 +11,7 @@
 //! | [`tools`] | `tools` (default) | Workspace file tools, search, sandboxed shell, web fetch, checklist |
 //! | [`policies`] | `policies` (default) | Approvals, scope guard, completion check, redaction, instructions, context window, conversation compaction, memory, tracing |
 //! | [`agents`] | `agents` (default) | Agents as tools, child budgets |
-//! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries |
+//! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries, upkeep (`store::maintenance`: planner statistics, live snapshots) |
 //! | [`mcp`] | `mcp` | MCP servers as tools |
 //! | [`eval`] | `eval` | YAML scenarios, N-of-M pass rates, baseline comparison |
 //! | [`memory`] | `memory` (+ `fastembed`) | Long-term memory: facts, episodes, hybrid recall; every part swappable |

@@ -1698,6 +1698,13 @@ pub struct StateConfig {
     /// Retention policies for automatic cleanup of old data.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Snapshots of the database kept from before an upgrade: when a new
+    /// aidaemon version starts on an existing database, it first writes a
+    /// consistent copy (`VACUUM INTO`, encrypted like the database) to
+    /// `backups/` next to it and keeps this many of them, newest first.
+    /// `0` turns it off.
+    #[serde(default = "default_upgrade_backups")]
+    pub upgrade_backups: usize,
     /// Context window management (trimming, summarization, progressive facts).
     #[serde(default)]
     pub context_window: ContextWindowConfig,
@@ -1783,6 +1790,7 @@ impl fmt::Debug for StateConfig {
             .field("max_facts", &self.max_facts)
             .field("daily_token_budget", &self.daily_token_budget)
             .field("retention", &self.retention)
+            .field("upgrade_backups", &self.upgrade_backups)
             .field("context_window", &self.context_window)
             .finish()
     }
@@ -1798,9 +1806,14 @@ impl Default for StateConfig {
             max_facts: default_max_facts(),
             daily_token_budget: None,
             retention: RetentionConfig::default(),
+            upgrade_backups: default_upgrade_backups(),
             context_window: ContextWindowConfig::default(),
         }
     }
+}
+
+fn default_upgrade_backups() -> usize {
+    2
 }
 
 fn default_db_path() -> String {

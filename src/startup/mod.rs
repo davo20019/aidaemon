@@ -1,5 +1,6 @@
 pub mod channels;
 pub mod db_security;
+pub mod db_upkeep;
 pub mod mcp;
 pub mod memory_pipeline;
 pub(crate) mod migrations;

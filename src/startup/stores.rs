@@ -35,6 +35,8 @@ pub async fn build_stores(
     );
     info!("Embedding service initialized (AllMiniLML6V2)");
 
+    // Before the migrations in `SqliteStateStore::new` change the schema.
+    super::db_upkeep::snapshot_before_upgrade(&config.state).await;
     let state = Arc::new(
         SqliteStateStore::new(
             &config.state.db_path,
@@ -45,6 +47,8 @@ pub async fn build_stores(
         .await?,
     );
     info!("State store initialized ({})", config.state.db_path);
+    super::db_upkeep::record_started_version(&state.pool()).await;
+    super::db_upkeep::optimize_at_open(&state.pool()).await;
 
     // Another memory system leaves the daemon's tables as they are.
     let own_memory = config.memory.backend == crate::config::MemoryBackend::Daemon;

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A snapshot of the database before each upgrade.** The first time a new aidaemon version starts on an existing database, it writes a consistent, compacted copy (`VACUUM INTO`, encrypted with the same key) to `backups/` next to the database before any migration runs, and keeps the newest two (`[state] upgrade_backups`, `0` turns it off). Upgrading still needs no manual step: every schema change in this release is applied by the startup migrations.
+
+- **SQLite upkeep.** The query planner's statistics are refreshed after startup migrations and every six hours (`PRAGMA optimize`, bounded per index); a database that was never analyzed gets them on its first start. SDK users get the same through `aidaemon_store_sqlite::maintenance::{optimize, snapshot}`, and `SqliteStore::open` now applies the daemon's cache, mmap and temp-store settings and optimizes at open.
+
 - **Used-up quotas fall over to other providers at once.** A ChatGPT plan's usage limit, a Gemini daily quota, an account out of credit (OpenAI `insufficient_quota`, Anthropic "credit balance is too low") or a rejected key now skips that account's other models without sending them and moves to the next `[[provider.fallbacks]]` entry, instead of retrying each model with backoff (about 90 seconds on a capped ChatGPT plan). The account stays skipped by every caller until the quota's stated reset (a few minutes when none is stated). When every provider fails, the reply names the limit and when it resets instead of the last fallback's error.
 
 - **Swappable long-term memory.** Agent turns reach memory only through a memory plugin: recall is injected by a `before_model` hook, extraction and learning run at run end, and the plugin owns its tools. `[memory] backend = "sdk"` (with the `sdk-memory` cargo feature) uses the `aidaemon-memory` crate instead of the daemon's own memory (`remember` / `recall` tools, a separate SQLite file at `[memory] path`). Default `daemon`. Background memory jobs (consolidation, retention, people intelligence, `/memory`) still use the daemon store.
@@ -32,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
 
 ### Fixed
+
+- **"Database is locked" under concurrent writes.** 38 write transactions began deferred; under WAL one that reads before it writes fails at once when another connection commits first, and the busy timeout cannot help. Every write transaction now takes the write lock when it begins (`BEGIN IMMEDIATE`), and a test rejects a new deferred one. In a contention benchmark with eight writers, deferred transactions lost 85% of their commits and immediate ones none.
+
+- **Faster memory recall.** Fact recall over 4,000 facts went from 178 ms to 39 ms (p95 241 ms to 43 ms): decoded embedding vectors stay in memory until the table changes (tracked by a trigger-maintained counter, so writes from anywhere invalidate them), the per-hit lookups that ran one query per fact are batched, and recall no longer loads every fact's embedding blob. The counter and triggers are created by the startup migration.
 
 - **SDK turns keep the legacy tool boundary.** Behavior the old dispatcher owned is back on every turn:
   - Untrusted tool output (web, MCP, terminal, channel history) is wrapped as data and sanitized again before the model sees it, and an oversized result is paged, spilled to a file, or compressed to the per-model cap.

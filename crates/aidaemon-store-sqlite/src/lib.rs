@@ -10,6 +10,13 @@
 //! [`SqliteStore::in_flight_runs`] (stopped mid tool batch, continue with
 //! `Agent::run_from`).
 //!
+//! [`maintenance`] keeps a long-lived database healthy: planner statistics
+//! ([`maintenance::optimize`]) and consistent live copies
+//! ([`maintenance::snapshot`]). Write transactions on a shared database
+//! should begin with `BEGIN IMMEDIATE` (`pool.begin_with("BEGIN IMMEDIATE")`):
+//! under WAL a deferred one that reads first fails when another connection
+//! commits before it writes.
+//!
 //! ```no_run
 //! # async fn demo() -> Result<(), aidaemon_store_sqlite::Error> {
 //! use std::sync::Arc;
@@ -23,6 +30,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod maintenance;
 mod migrations;
 
 use std::path::Path;
@@ -95,7 +103,8 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Open (creating if needed) a database file. Uses WAL,
-    /// `synchronous=NORMAL`, foreign keys and a busy timeout, then migrates.
+    /// `synchronous=NORMAL`, foreign keys and a busy timeout, then migrates
+    /// and refreshes planner statistics ([`maintenance::optimize`]).
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -103,12 +112,19 @@ impl SqliteStore {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(10));
+            .busy_timeout(Duration::from_secs(10))
+            // A 64 MiB page cache, memory-mapped reads and in-memory temp
+            // B-trees: the settings the aidaemon daemon runs with.
+            .pragma("cache_size", "-65536")
+            .pragma("mmap_size", "268435456")
+            .pragma("temp_store", "MEMORY");
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(options)
             .await?;
-        Self::from_pool(pool).await
+        let store = Self::from_pool(pool).await?;
+        maintenance::optimize(&store.pool, maintenance::Optimize::AtOpen).await?;
+        Ok(store)
     }
 
     /// A private in-memory database (one connection, lives as long as the

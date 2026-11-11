@@ -309,6 +309,25 @@ pub(crate) async fn init_heartbeat_coordinator(
             },
         );
 
+        // SQLite planner statistics (every 6 hours): only tables whose size
+        // changed a lot are re-analyzed, so a quiet database costs nothing.
+        let optimize_pool = pool.clone();
+        heartbeat.register_job(
+            "sqlite_optimize",
+            Duration::from_secs(6 * 3600),
+            move || {
+                let pool = optimize_pool.clone();
+                async move {
+                    aidaemon_store_sqlite::maintenance::optimize(
+                        &pool,
+                        aidaemon_store_sqlite::maintenance::Optimize::Periodic,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                }
+            },
+        );
+
         // Skill promotion (every 12 hours)
         if let Some(sd) = skills_dir {
             let promoter = Arc::new(crate::skills::promotion::SkillPromoter::new(
