@@ -473,6 +473,17 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// How many calls of this tool may run together in one batch although
+    /// the tool is not read-only: 0 (the default) runs each call alone. A
+    /// tool returns more only when it coordinates the shared state its
+    /// concurrent calls touch itself (sub-agents whose writes a coordination
+    /// ledger arbitrates). Calls queued this way still run after every
+    /// earlier call in the batch has been judged, and before any later call
+    /// that is not concurrent-safe.
+    fn concurrent_peers(&self) -> usize {
+        0
+    }
+
     /// Whether this tool may answer with [`ToolOutput::suspended`]. A call
     /// of such a tool always runs alone, because a run pauses on one call at
     /// a time.

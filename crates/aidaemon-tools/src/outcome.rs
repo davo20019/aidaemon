@@ -191,6 +191,9 @@ impl<T: OutcomeTool + ?Sized> KernelAdapter<T> {
     }
 }
 
+/// How many sub-agents one batch may run at once.
+pub const MAX_CONCURRENT_CHILDREN: usize = 3;
+
 #[async_trait]
 impl<T: OutcomeTool + ?Sized + 'static> aidaemon_core::Tool for KernelAdapter<T> {
     fn spec(&self) -> ToolSpec {
@@ -209,6 +212,17 @@ impl<T: OutcomeTool + ?Sized + 'static> aidaemon_core::Tool for KernelAdapter<T>
                 idempotent: false,
                 egress: true,
             }
+        }
+    }
+
+    /// Sub-agents spawned in one batch run together, up to
+    /// [`MAX_CONCURRENT_CHILDREN`]: the coordination ledger arbitrates what
+    /// they write. Every other non-read-only tool runs alone.
+    fn concurrent_peers(&self) -> usize {
+        if self.tool.dispatch_facts().spawns_child_agents {
+            MAX_CONCURRENT_CHILDREN
+        } else {
+            0
         }
     }
 

@@ -360,6 +360,60 @@ async fn mutating_calls_run_one_at_a_time() {
     assert_eq!(peak.load(Ordering::SeqCst), 1);
 }
 
+/// A mutating tool that coordinates its own shared state: up to two of its
+/// calls may run together.
+struct CoordinatedWriter {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CoordinatedWriter {
+    fn spec(&self) -> ToolSpec {
+        spec("coordinated", "coordinated writes", &[])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::WRITE
+    }
+    fn concurrent_peers(&self) -> usize {
+        2
+    }
+    async fn call(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text(format!("done {}", args["n"])))
+    }
+}
+
+#[tokio::test]
+async fn coordinated_calls_run_together_up_to_their_peer_limit() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let agent = base(ScriptedProvider::new([
+        tool_calls((0..5).map(|i| call(&format!("c{i}"), "coordinated", json!({"n": i})))),
+        text("done"),
+    ]))
+    .tool(CoordinatedWriter {
+        active: active.clone(),
+        peak: peak.clone(),
+    })
+    .build()
+    .unwrap();
+
+    let out = agent.run("s", "go").await.unwrap();
+    assert_eq!(peak.load(Ordering::SeqCst), 2, "two at a time, never more");
+    // Results stay in call order.
+    assert_eq!(
+        tool_messages(&out.state)
+            .into_iter()
+            .map(|(id, content)| format!("{id}:{content}"))
+            .collect::<Vec<_>>(),
+        (0..5).map(|i| format!("c{i}:done {i}")).collect::<Vec<_>>()
+    );
+}
+
 /// Worst case WRITE, but every call is declared read-only per call.
 struct RelaxedWriter {
     active: Arc<AtomicUsize>,

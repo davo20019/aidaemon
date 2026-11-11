@@ -616,7 +616,8 @@ impl<'a> Driver<'a> {
             // scheduling uses only the tool's worst case, since a per-call
             // relaxation is a statement about authority, not isolation.
             let suspends = tool.suspends();
-            let may_run_concurrently = tool.annotations().read_only && !suspends;
+            let peers = tool.concurrent_peers();
+            let may_run_concurrently = (tool.annotations().read_only || peers > 0) && !suspends;
             let mut info = ToolInfo {
                 annotations,
                 access: tool.access(&call.arguments),
@@ -689,6 +690,20 @@ impl<'a> Driver<'a> {
 
             match verdict {
                 Verdict::Allow if may_run_concurrently => {
+                    // A coordinated tool runs at most `peers` of its calls at
+                    // once: a full share flushes the queue before this one.
+                    let queued_peers = group
+                        .iter()
+                        .filter(|queued| queued.call.name == call.name)
+                        .count();
+                    if peers > 0 && queued_peers >= peers {
+                        if let Some(end) = self
+                            .flush_or_stop(&mut group, &mut nudge, &mut stop, &calls[index..])
+                            .await?
+                        {
+                            return Ok(end);
+                        }
+                    }
                     group.push(Approved { call, annotations });
                 }
                 Verdict::Allow if suspends => {
