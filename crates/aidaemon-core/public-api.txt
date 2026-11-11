@@ -79,6 +79,7 @@ pub aidaemon_core::AccessLevel::Write
 #[non_exhaustive] pub enum aidaemon_core::ApprovalRisk
 pub aidaemon_core::ApprovalRisk::Critical
 pub aidaemon_core::ApprovalRisk::High
+pub aidaemon_core::ApprovalRisk::Low
 pub aidaemon_core::ApprovalRisk::Medium
 #[non_exhaustive] pub enum aidaemon_core::BuildError
 pub aidaemon_core::BuildError::DuplicateTool(alloc::string::String)
@@ -593,6 +594,7 @@ pub fn aidaemon_core::FnTool<F, Fut>::access(&self, &serde_json::value::Value) -
 pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnTool<F, Fut>::concurrent_peers(&self) -> usize
 pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::FnTool<F, Fut>::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::FnTool<F, Fut>::resume_child<'life0, 'life1, 'async_trait>(&'life0 self, aidaemon_core::RunState, aidaemon_core::Resolution, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -735,6 +737,7 @@ pub aidaemon_core::Receipt::turn: u32
 impl aidaemon_core::Receipt
 pub fn aidaemon_core::Receipt::succeeded(&self) -> bool
 pub struct aidaemon_core::RequestOptions
+pub aidaemon_core::RequestOptions::cache_key: core::option::Option<alloc::string::String>
 pub aidaemon_core::RequestOptions::reasoning_effort: core::option::Option<alloc::string::String>
 pub aidaemon_core::RequestOptions::response_format: aidaemon_core::ResponseFormat
 pub aidaemon_core::RequestOptions::single_attempt: bool
@@ -1070,6 +1073,7 @@ pub fn aidaemon_core::Tool::access(&self, &serde_json::value::Value) -> aidaemon
 pub fn aidaemon_core::Tool::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::Tool::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::Tool::concurrent_peers(&self) -> usize
 pub fn aidaemon_core::Tool::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::Tool::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::Tool::resume_child<'life0, 'life1, 'async_trait>(&'life0 self, aidaemon_core::RunState, aidaemon_core::Resolution, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -1083,6 +1087,7 @@ pub fn aidaemon_core::FnTool<F, Fut>::access(&self, &serde_json::value::Value) -
 pub fn aidaemon_core::FnTool<F, Fut>::annotations(&self) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::annotations_for(&self, &serde_json::value::Value) -> aidaemon_core::ToolAnnotations
 pub fn aidaemon_core::FnTool<F, Fut>::call<'life0, 'life1, 'async_trait>(&'life0 self, serde_json::value::Value, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn aidaemon_core::FnTool<F, Fut>::concurrent_peers(&self) -> usize
 pub fn aidaemon_core::FnTool<F, Fut>::effects(&self, &serde_json::value::Value) -> aidaemon_core::CallEffects
 pub fn aidaemon_core::FnTool<F, Fut>::outbound(&self, &serde_json::value::Value) -> aidaemon_core::Outbound
 pub fn aidaemon_core::FnTool<F, Fut>::resume_child<'life0, 'life1, 'async_trait>(&'life0 self, aidaemon_core::RunState, aidaemon_core::Resolution, &'life1 aidaemon_core::ToolContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = aidaemon_core::ToolResult> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait

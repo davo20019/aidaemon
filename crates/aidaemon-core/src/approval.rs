@@ -194,6 +194,8 @@ impl CallEffects {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ApprovalRisk {
+    /// A call new to the owner with nothing known to be at stake.
+    Low,
     Medium,
     High,
     Critical,

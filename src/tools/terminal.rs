@@ -3977,11 +3977,7 @@ impl TerminalTool {
             effects: Vec::new(),
             summary: subject.clone(),
             subject,
-            risk: match ask.risk {
-                RiskLevel::Critical => aidaemon_core::ApprovalRisk::Critical,
-                RiskLevel::High => aidaemon_core::ApprovalRisk::High,
-                _ => aidaemon_core::ApprovalRisk::Medium,
-            },
+            risk: crate::agent::approvals::approval_risk(ask.risk),
             warnings,
         }))
     }

@@ -809,16 +809,30 @@ fn sub_agent_card_summary(mission: &str, summary: &str) -> String {
 }
 
 /// The card's risk level for a kernel request.
+/// The card's risk level for a kernel approval request: the inverse of
+/// [`approval_risk`], so a level survives the round trip.
 pub(crate) fn card_risk(risk: sdk::ApprovalRisk) -> RiskLevel {
     match risk {
+        sdk::ApprovalRisk::Low => RiskLevel::Safe,
         sdk::ApprovalRisk::Medium => RiskLevel::Medium,
         sdk::ApprovalRisk::Critical => RiskLevel::Critical,
         _ => RiskLevel::High,
     }
 }
 
+/// A tool's risk level as a kernel approval request's risk.
+pub(crate) fn approval_risk(risk: RiskLevel) -> sdk::ApprovalRisk {
+    match risk {
+        RiskLevel::Safe => sdk::ApprovalRisk::Low,
+        RiskLevel::Medium => sdk::ApprovalRisk::Medium,
+        RiskLevel::High => sdk::ApprovalRisk::High,
+        RiskLevel::Critical => sdk::ApprovalRisk::Critical,
+    }
+}
+
 fn risk_name(risk: sdk::ApprovalRisk) -> &'static str {
     match risk {
+        sdk::ApprovalRisk::Low => "low",
         sdk::ApprovalRisk::Medium => "medium",
         sdk::ApprovalRisk::Critical => "critical",
         _ => "high",
@@ -1912,6 +1926,15 @@ mod tests {
         assert_eq!(card_risk(sdk::ApprovalRisk::Medium), RiskLevel::Medium);
         assert_eq!(card_risk(sdk::ApprovalRisk::High), RiskLevel::High);
         assert_eq!(card_risk(sdk::ApprovalRisk::Critical), RiskLevel::Critical);
+        // Every tool risk level survives the trip through the kernel.
+        for level in [
+            RiskLevel::Safe,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ] {
+            assert_eq!(card_risk(approval_risk(level)), level);
+        }
     }
 
     #[test]
