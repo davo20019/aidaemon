@@ -37,7 +37,7 @@ const OBSERVATION_PROGRAMS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "stat", "file",
     "pwd", "echo", "printf", "which", "whoami", "id", "uname", "date", "du", "df", "tree", "sort",
     "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "jq", "ps",
-    "hostname", "sw_vers", "true", "git",
+    "hostname", "sw_vers", "true", "git", "test", "[",
 ];
 
 const SYSTEM_BIN_DIRS: &[&str] = &[
@@ -3068,6 +3068,9 @@ mod tests {
             "rg -n foo src",
             "sort -u f",
             "cat < /dev/null",
+            "test ! -e restart-check.txt",
+            "[ -f Cargo.toml ]",
+            "test -d src && ls src",
         ] {
             assert!(
                 command_effects(observing).observation_only,
