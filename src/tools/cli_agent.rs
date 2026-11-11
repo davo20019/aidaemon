@@ -1225,6 +1225,23 @@ impl CliAgentTool {
         names.into_iter().next()
     }
 
+    /// The agent to retry a delegated run with after the one picked was
+    /// unavailable (and quarantined out of `tools`). It obeys the first
+    /// pick's adapter rule: a read/write run under an enforced access
+    /// contract falls back only to an agent with a native split adapter,
+    /// since any other is refused the moment it starts.
+    fn fallback_tool_name(
+        &self,
+        enforce_native_access: bool,
+        read_only_run: bool,
+    ) -> Option<String> {
+        if enforce_native_access && !read_only_run {
+            self.scoped_read_write_tool_name(None)
+        } else {
+            self.default_tool_name()
+        }
+    }
+
     fn configured_tool(&self, name: &str) -> Option<String> {
         self.tools
             .read()
@@ -4954,7 +4971,9 @@ impl CliAgentTool {
                             };
                             unavailable.push((failure.tool_name.clone(), failure.message.clone()));
 
-                            let Some(next_tool) = self.default_tool_name() else {
+                            let Some(next_tool) =
+                                self.fallback_tool_name(enforce_native_access, read_only_run)
+                            else {
                                 let mut message = String::from(
                                     "ERROR: CLI agent recovery exhausted before task execution. \
                                      No configured CLI agent was able to start the delegated task.",
@@ -5833,6 +5852,20 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("test"), "got: {result}");
+    }
+
+    /// After the picked agent is quarantined, an enforced read/write run
+    /// does not fall back to an agent without a native split adapter (it
+    /// would be refused on start); a read-only run may use any agent.
+    #[tokio::test]
+    async fn fallback_after_unavailable_agent_keeps_the_adapter_rule() {
+        let (tool, _db) = setup_echo_tool().await;
+        assert_eq!(tool.fallback_tool_name(true, false), None);
+        assert_eq!(tool.fallback_tool_name(true, true).as_deref(), Some("echo"));
+        assert_eq!(
+            tool.fallback_tool_name(false, false).as_deref(),
+            Some("echo")
+        );
     }
 
     #[tokio::test]
