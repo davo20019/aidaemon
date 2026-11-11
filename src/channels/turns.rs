@@ -597,6 +597,10 @@ pub(crate) fn status_line(update: &StatusUpdate) -> String {
             "💰 Auto-extended token budget {old_budget} → {new_budget} ({extension}/{max_extensions}) — continuing."
         )),
         StatusUpdate::Checklist { text } => text.clone(),
+        StatusUpdate::SubAgentProgress {
+            label,
+            progress: step,
+        } => progress(format!("🤖 {label}: {step}")),
     }
 }
 

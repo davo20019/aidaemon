@@ -145,7 +145,7 @@ fn child_time_limit(requested: ChildTimeLimit, parent_remaining: Option<Duration
 
 /// The status channel a child reports through. The parent's live card shows
 /// the parent's own checklist: a child's checklist is the child's plan, so it
-/// reaches the card as one progress line naming that child instead of
+/// reaches the card as one `SubAgentProgress` line naming that child instead of
 /// replacing the parent's plan (two parallel children used to overwrite it in
 /// turn, leaving whichever wrote last looking like the whole task). Every other
 /// update passes through unchanged.
@@ -163,9 +163,9 @@ fn child_status_sender(
                     let Some(progress) = checklist_progress_line(&text) else {
                         continue;
                     };
-                    StatusUpdate::ToolProgress {
-                        name: "spawn_agent".to_string(),
-                        chunk: format!("{label}: {progress}"),
+                    StatusUpdate::SubAgentProgress {
+                        label: label.clone(),
+                        progress,
                     }
                 }
                 other => other,
@@ -3487,9 +3487,8 @@ mod tests {
         while let Some(update) = parent_rx.recv().await {
             match update {
                 StatusUpdate::Checklist { .. } => panic!("child checklist reached the parent card"),
-                StatusUpdate::ToolProgress { name, chunk } => {
-                    assert_eq!(name, "spawn_agent");
-                    lines.push(chunk);
+                StatusUpdate::SubAgentProgress { label, progress } => {
+                    lines.push(format!("{label}: {progress}"));
                 }
                 StatusUpdate::ToolStart { .. } => passed_through += 1,
                 other => panic!("unexpected update {other:?}"),

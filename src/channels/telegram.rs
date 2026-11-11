@@ -5305,6 +5305,13 @@ async fn run_status_consumer(
                     .set_activity(sink_ref, description.clone())
                     .await;
             }
+            StatusUpdate::SubAgentProgress { label, progress } => {
+                owner
+                    .lock()
+                    .await
+                    .set_activity(sink_ref, format!("🤖 {label}: {progress}"))
+                    .await;
+            }
             _ => {
                 continue; // other Plan*/Thinking variants: no separate message
             }
@@ -5489,6 +5496,9 @@ async fn run_legacy_status_consumer(
                 )
             }
             StatusUpdate::Checklist { text } => text.clone(),
+            StatusUpdate::SubAgentProgress { label, progress } => {
+                format!("🤖 {label}: {progress}")
+            }
         };
         let _ = bot.send_message(chat_id, text).await;
         dm_status_count += 1;
