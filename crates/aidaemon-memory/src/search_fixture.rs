@@ -401,4 +401,54 @@ mod tests {
         assert!(!partner.value.to_lowercase().contains("wife"));
         assert!(!partner.value.to_lowercase().contains("spouse"));
     }
+
+    /// Every labelled query through the pure pipeline (fake cosine, no
+    /// reranker): the answer is returned within its limit, and no forbidden
+    /// fact appears in the hits or the related list.
+    #[test]
+    fn ranking_metrics_meet_bar() {
+        use crate::neighborhood::{eligible_neighbors, is_relationship_key, seeds_from_hits};
+        use crate::retrieval_eval::evaluate_ranked;
+        use crate::search::{candidates, rank, rank_related, FactSearchConfig, LexicalIndex};
+
+        let facts = corpus();
+        let cfg = FactSearchConfig::default();
+        let index = LexicalIndex::build(&facts);
+        for q in queries() {
+            let lexical = index.score(q.query);
+            let cosine: Vec<(usize, f32)> = facts
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, fake_cosine(q.query, f)))
+                .collect();
+            let pool = candidates(&facts, &lexical, &cosine, &cfg);
+            let report = rank(&facts, &pool, None, None, q.limit, &cfg);
+            let hits: Vec<Fact> = report.hits.iter().map(|h| h.fact.clone()).collect();
+
+            let ranked: Vec<String> = hits.iter().map(|f| f.id.to_string()).collect();
+            let relevant: HashSet<String> = q.relevant.iter().map(i64::to_string).collect();
+            let metrics = evaluate_ranked(&ranked, &relevant, q.limit);
+            assert_eq!(metrics.recall_at_k, 1.0, "{}: {ranked:?}", q.query);
+
+            let seeds = seeds_from_hits(&hits, &[]);
+            let cluster = hits.iter().any(|f| is_relationship_key(&f.key));
+            let exclude: HashSet<i64> = hits.iter().map(|f| f.id).collect();
+            let neighbors = eligible_neighbors(&facts, &seeds, cluster, &exclude);
+            let scores: Vec<(usize, f32)> = neighbors
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, fake_cosine(q.query, f)))
+                .collect();
+            let related = rank_related(&neighbors, &scores, None, &cfg);
+            assert!(related.len() <= cfg.related_max);
+            for hit in report.hits.iter().chain(&related) {
+                assert!(
+                    !q.forbidden_related.contains(&hit.fact.id),
+                    "{}: forbidden fact {}",
+                    q.query,
+                    hit.fact.id
+                );
+            }
+        }
+    }
 }

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Explicit memory search ranks one list.** `manage_memories` `search` now pools keyword and semantic candidates and orders them by one score: the reranker's, or reciprocal rank fusion without one. Keyword matches are weighted by how rare each word is, exact-key matches always come first, and results below the reranker's relevance floor are dropped (`Reranker::relevance_floor`, off by default). "Related context" lists at most five facts, drawn only from the namespaces, people and family facts of the results actually shown and ranked against the query. The header reports how many facts were shown, relevant and considered. SDK stores get this through `FactStore::search_facts` and `aidaemon_memory::search`; `search_facts_semantic` and `assemble_neighborhood` are removed.
+
 - **A tool must now explicitly signal that it has finished.** A phrase like "Moved to background" in its output no longer ends a run.
 
 - **A request that fails on the provider is queued again.** Since every turn moved to the SDK kernel, a turn that failed on the model provider before any tool ran was no longer queued for an automatic re-run. It is again, for a person's own request (not goal runs, sub-agents or automated triggers). After a plan's usage limit, the re-run waits until just after the stated reset, as long as that is within 12 hours, and the reply says when.
