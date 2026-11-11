@@ -91,6 +91,8 @@ mod recall;
 pub mod records;
 pub mod retrieval_eval;
 mod scoring;
+#[cfg(test)]
+mod search_fixture;
 pub mod sqlite;
 mod store;
 pub mod stores;
