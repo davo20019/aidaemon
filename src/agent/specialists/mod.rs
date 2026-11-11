@@ -39,6 +39,9 @@ pub struct SpecialistRenderContext {
     /// caller picks the right paragraph and passes it here, so the template
     /// stays a flat string substitution.
     pub execution_mode: String,
+    /// The spawn decision (`child_can_spawn`) that also decides whether the
+    /// child gets `spawn_agent`; `{{delegation_rule}}` states it.
+    pub can_spawn: bool,
 }
 
 // Keep the parsed representation faithful to the on-disk schema. Some fields

@@ -44,6 +44,7 @@ fn fixtures() -> Vec<FixtureCtx> {
                         is_scheduled,
                         parent_session_id: "telegram:bot:42".to_string(),
                         execution_mode: task_lead_execution_mode(is_scheduled).to_string(),
+                        can_spawn: false,
                     },
                     has_cli_agent,
                 });
@@ -112,6 +113,7 @@ fn executor_md_renders_byte_equal_to_legacy_builder() {
             fx.has_cli_agent,
             None, // task_id — keep test grid simple
             None, // project_scope
+            false,
         );
         let legacy = Agent::build_executor_prompt(
             &ctx.task,
@@ -189,6 +191,7 @@ fn executor_flavored_kinds_open_with_their_tagline_and_include_shared_base() {
             false, // has_cli_agent
             None,  // task_id
             None,  // project_scope
+            false, // can_spawn
         );
         assert!(
             prompt.starts_with(tagline_prefix),
@@ -229,5 +232,35 @@ fn executor_flavored_kinds_open_with_their_tagline_and_include_shared_base() {
                 placeholder
             );
         }
+    }
+}
+
+/// A specialist the caller made a coordinator is told it may delegate: its
+/// prompt follows the spawn decision, not a rule in the shared template.
+#[test]
+fn a_specialist_that_can_spawn_is_not_told_it_cannot() {
+    let registry = SpecialistRegistry::load(None);
+    for (can_spawn, says) in [
+        (
+            true,
+            crate::agent::specialists::render::delegation_rule(true),
+        ),
+        (false, "- Do NOT spawn sub-agents."),
+    ] {
+        let prompt = Agent::compose_executor_prompt_from_registry(
+            &registry,
+            SpecialistKind::Research,
+            "t",
+            "m",
+            1,
+            3,
+            false,
+            None,
+            None,
+            can_spawn,
+        );
+        assert!(prompt.contains(says), "{prompt}");
+        assert_eq!(prompt.contains("Do NOT spawn"), !can_spawn, "{prompt}");
+        assert!(!prompt.contains("{{delegation_rule}}"));
     }
 }

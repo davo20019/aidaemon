@@ -627,6 +627,7 @@ impl Agent {
             is_scheduled,
             parent_session_id: String::new(),
             execution_mode,
+            can_spawn: depth < max_depth,
         };
         let mut prompt = registry.render(SpecialistKind::TaskLead, &ctx);
         // Markdown templates conventionally end in a newline while the legacy
@@ -684,6 +685,7 @@ impl Agent {
         has_cli_agent: bool,
         task_id: Option<&str>,
         project_scope: Option<&str>,
+        can_spawn: bool,
     ) -> String {
         let mut all_dirs = Self::extract_directory_paths(parent_mission);
         for dir in Self::extract_directory_paths(task_description) {
@@ -704,6 +706,7 @@ impl Agent {
             is_scheduled: false,
             parent_session_id: String::new(),
             execution_mode: String::new(),
+            can_spawn,
         };
         // Markdown source files conventionally end with a newline, while the
         // dynamic suffix below owns its leading separator. Normalize that
@@ -1988,7 +1991,7 @@ impl Agent {
                             AgentRole::TaskLead,
                             Some(AgentRole::TaskLead),
                             arg_specialist,
-                            true,
+                            can_spawn,
                             task_id.map(str::to_string),
                             task_attempt,
                             Some(goal_id.to_string()),
@@ -2126,6 +2129,7 @@ impl Agent {
                         } else {
                             inherited_project_scope
                         },
+                        can_spawn,
                     );
                     if let Some(tid) = task_id {
                         let journal = self
@@ -2229,21 +2233,13 @@ impl Agent {
                         .await;
                 }
                 AgentRole::Orchestrator => {
-                    // Orchestrator: full loop with spawn available (unless at max depth)
-                    let at_max_depth = child_depth >= self.limits.max_depth;
-                    let depth_note = if at_max_depth {
-                        "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
-                        the `spawn_agent` tool is not available to you. Complete the task directly."
-                    } else {
-                        ""
-                    };
-                    let prompt = format!(
-                        "{}\n\n## Sub-Agent Context\n\
-                        You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
-                        **Mission:** {}\n\n\
-                        Focus exclusively on this mission. Be concise. Return your findings/results \
-                        directly — they will be consumed by the parent agent.{}",
-                        self.system_prompt, child_depth, self.limits.max_depth, mission, depth_note
+                    let prompt = plain_child_prompt(
+                        &self.system_prompt,
+                        child_depth,
+                        self.limits.max_depth,
+                        mission,
+                        None,
+                        can_spawn,
                     );
                     (full_tools, prompt, None)
                 }
@@ -2262,6 +2258,7 @@ impl Agent {
                     false,
                     None,
                     inherited_project_scope,
+                    can_spawn,
                 )
             });
             let prompt = plain_child_prompt(

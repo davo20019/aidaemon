@@ -26,6 +26,17 @@ pub fn render_template(template: &str, ctx: &SpecialistRenderContext) -> String 
         .replace("{{is_scheduled}}", bools(ctx.is_scheduled))
         .replace("{{parent_session_id}}", &ctx.parent_session_id)
         .replace("{{execution_mode}}", &ctx.execution_mode)
+        .replace("{{delegation_rule}}", delegation_rule(ctx.can_spawn))
+}
+
+/// What a specialist's prompt says about delegating: exactly what the
+/// spawn decision gave it, never a rule of the template's own.
+pub fn delegation_rule(can_spawn: bool) -> &'static str {
+    if can_spawn {
+        "- You may delegate independent parts of this task with `spawn_agent` (several at once as `tasks`); do the rest yourself."
+    } else {
+        "- Do NOT spawn sub-agents."
+    }
 }
 
 #[cfg(test)]
@@ -44,6 +55,7 @@ mod tests {
             is_scheduled: true,
             parent_session_id: "telegram:bot:1".to_string(),
             execution_mode: "EXEC".to_string(),
+            can_spawn: false,
         }
     }
 

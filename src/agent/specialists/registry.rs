@@ -182,6 +182,7 @@ mod tests {
             is_scheduled: false,
             parent_session_id: "s".to_string(),
             execution_mode: "exec".to_string(),
+            can_spawn: false,
         };
         for kind in SpecialistKind::all() {
             let rendered = registry.render(*kind, &ctx);
