@@ -19,6 +19,10 @@ pub struct ProviderError {
     pub resets_at: Option<std::time::SystemTime>,
     /// What each other model answered when this error ended a failover chain.
     pub fallback_failures: Vec<ModelFailure>,
+    /// The provider refused the call before doing any work, so it used no
+    /// tokens (`aidaemon_core::ProviderError::proves_nothing_spent`). False
+    /// whenever that is not proven.
+    pub spent_nothing: bool,
 }
 
 /// One model's failure during a failover chain.
@@ -135,6 +139,7 @@ impl ProviderError {
             affordable_tokens,
             resets_at: None,
             fallback_failures: Vec::new(),
+            spent_nothing: false,
         }
     }
 
@@ -149,6 +154,7 @@ impl ProviderError {
             affordable_tokens: None,
             resets_at: None,
             fallback_failures: Vec::new(),
+            spent_nothing: false,
         }
     }
 
@@ -162,6 +168,7 @@ impl ProviderError {
             affordable_tokens: None,
             resets_at: None,
             fallback_failures: Vec::new(),
+            spent_nothing: false,
         }
     }
 

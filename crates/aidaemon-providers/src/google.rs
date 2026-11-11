@@ -247,6 +247,7 @@ fn gemini_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Provider
             message: format!("Gemini daily quota used up: {}", body_excerpt(body)),
             resets_at: None,
             per_model,
+            in_stream: false,
         };
     }
     match status.as_u16() {

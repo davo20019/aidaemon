@@ -54,6 +54,13 @@ pub struct RequestOptions {
     /// [`Retry`] and [`crate::Failover`] give up at the first error. For a
     /// call that must not run twice.
     pub single_attempt: bool,
+    /// With `single_attempt`, lets a [`crate::Failover`] chain move on to
+    /// its next step after an error that proves the attempt used nothing
+    /// ([`ProviderError::proves_nothing_spent`]) or after the policy
+    /// refused the attempt before sending it. Any other error still ends
+    /// the chain, and no step is retried. For a call charged against a
+    /// fixed budget, where unknown spend must not be repeated.
+    pub fallback_when_unspent: bool,
     /// Identifies the conversation for providers that route prompt-cache
     /// lookups by key, so its calls reach the same cache. Only a routing
     /// hint: providers that do not route by key ignore it.
@@ -144,12 +151,16 @@ pub enum ProviderError {
     /// used up until `resets_at`, when the provider says. Unlike
     /// [`ProviderError::RateLimited`], waiting seconds does not help.
     /// `per_model` is true when the quota covers only the requested model;
-    /// otherwise it covers every model on the account.
+    /// otherwise it covers every model on the account. `in_stream` is true
+    /// when the provider reported it inside a response it had already
+    /// started, so the request was admitted and may have used tokens;
+    /// false when the request was refused before any answer.
     #[error("quota exhausted: {message}")]
     QuotaExhausted {
         message: String,
         resets_at: Option<std::time::SystemTime>,
         per_model: bool,
+        in_stream: bool,
     },
     /// The model or endpoint does not exist here.
     #[error("not found: {0}")]
@@ -168,6 +179,19 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// The provider refused the request before doing any work, so the call
+    /// used no tokens: bad credentials, an unknown model, no credit, or a
+    /// used-up quota reported as a refusal. Anything else (a timeout, a
+    /// server error, a cut-off or malformed reply, a quota reported inside
+    /// an answer already started) may have been paid for.
+    pub fn proves_nothing_spent(&self) -> bool {
+        match self {
+            Self::Auth(_) | Self::NotFound(_) | Self::Billing { .. } => true,
+            Self::QuotaExhausted { in_stream, .. } => !in_stream,
+            _ => false,
+        }
+    }
+
     /// Worth another attempt at the same provider.
     pub fn is_retryable(&self) -> bool {
         matches!(

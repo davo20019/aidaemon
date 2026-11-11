@@ -359,6 +359,17 @@ impl Agent {
                         warn!(task_id = scope.task_id, %error, "SDK engine: could not settle mandate spend");
                     }
                 }
+                // Every model refused before doing any work: nothing was
+                // spent, so nothing is charged.
+                Err(error) if spent_nothing(error) => {
+                    if let Err(error) = self
+                        .state
+                        .settle_mandate_run_token_lease(&lease.goal_run_id, &lease.lease_token, 0)
+                        .await
+                    {
+                        warn!(task_id = scope.task_id, %error, "SDK engine: could not settle mandate spend");
+                    }
+                }
                 Err(_) => {
                     crate::agent::mandate_run::exhaust_mandate_run_token_lease_after_ambiguous_call(
                         self,
@@ -520,6 +531,7 @@ impl Agent {
                         message: error.to_string(),
                         resets_at: quota.resets_at,
                         per_model: false,
+                        in_stream: !quota.spent_nothing,
                     });
                 }
                 return Err(sdk::ProviderError::Other(error.to_string()));
@@ -632,6 +644,9 @@ impl Agent {
                         .map_or(ceiling, |configured| configured.min(ceiling)),
                 );
                 options.single_attempt_fail_closed = true;
+                // A model that refused before doing any work spent nothing,
+                // so the next model may answer; anything else stays one shot.
+                options.fallback_when_unspent = true;
                 // Durably mark the reservation dispatched before the provider
                 // sees the request, so an interrupted call settles fail-closed.
                 let fence = self
@@ -659,4 +674,14 @@ impl Agent {
             }
         }
     }
+}
+
+/// The failed call provably used no tokens. A failover chain only moves
+/// past such errors on a fenced call and stops at any other, so the error
+/// it ends with speaks for every attempt.
+fn spent_nothing(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::providers::ProviderError>())
+        .is_some_and(|error| error.spent_nothing)
 }

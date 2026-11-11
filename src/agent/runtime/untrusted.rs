@@ -369,6 +369,9 @@ fn verifier_options() -> sdk::RequestOptions {
         },
         reasoning_effort: Some("low".to_string()),
         single_attempt: true,
+        // A model that refused the call before doing any work leaves the
+        // judgment to the next one; any other failure still refuses.
+        fallback_when_unspent: true,
         cache_key: None,
     }
 }

@@ -145,6 +145,7 @@ pub(crate) fn to_sdk_request(
             },
             reasoning_effort: options.reasoning_effort_override.clone(),
             single_attempt: options.single_attempt_fail_closed,
+            fallback_when_unspent: options.fallback_when_unspent,
             cache_key: options.cache_key.clone(),
         },
     }
@@ -327,6 +328,7 @@ pub(crate) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
         max_tokens_override: request.max_output_tokens,
         reasoning_effort_override: request.options.reasoning_effort.clone(),
         single_attempt_fail_closed: request.options.single_attempt,
+        fallback_when_unspent: request.options.fallback_when_unspent,
         cache_key: request.options.cache_key.clone(),
         ..Default::default()
     }
@@ -514,6 +516,7 @@ pub(crate) fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
             message: detail,
             resets_at: error.resets_at,
             per_model: false,
+            in_stream: false,
         },
         ProviderErrorKind::Timeout => {
             sdk::ProviderError::Transient(format!("request timed out: {}", error.message))
@@ -542,6 +545,7 @@ pub(crate) fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
     let mut out = ProviderError::from_status(status.unwrap_or(0), &text);
     out.status = status;
     out.message = text.clone();
+    out.spent_nothing = error.proves_nothing_spent();
     out.kind = match &error {
         sdk::ProviderError::RateLimited { retry_after } => {
             out.retry_after_secs = retry_after.map(|d| d.as_secs().max(1));
@@ -695,6 +699,7 @@ mod tests {
                 message: "HTTP 429: plan cap".into(),
                 resets_at: None,
                 per_model: false,
+                in_stream: false,
             }),
             Route::Fallback
         );
@@ -731,6 +736,7 @@ mod tests {
             message: "HTTP 429: plan cap".into(),
             resets_at: Some(reset),
             per_model: false,
+            in_stream: false,
         });
         assert_eq!(capped.kind, ProviderErrorKind::QuotaExhausted);
         assert_eq!(capped.resets_at, Some(reset));

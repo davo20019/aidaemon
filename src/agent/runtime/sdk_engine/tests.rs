@@ -1647,6 +1647,7 @@ fn a_used_up_quota_reply_names_the_limit_and_its_reset() {
             .into(),
         resets_at: None,
         per_model: false,
+        in_stream: false,
     };
     let outcome = sdk::RunOutcome {
         status: sdk::RunStatus::ProviderFailed {

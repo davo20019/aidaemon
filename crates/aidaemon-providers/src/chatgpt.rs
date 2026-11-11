@@ -391,6 +391,7 @@ fn plan_limit(
         message: format!("ChatGPT usage limit reached{plan}: {message}"),
         resets_at,
         per_model: false,
+        in_stream: false,
     })
 }
 
@@ -724,6 +725,7 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
             message,
             resets_at,
             per_model: false,
+            in_stream: true,
         };
     }
     match status {
@@ -1083,7 +1085,9 @@ mod tests {
                 message,
                 resets_at,
                 per_model,
+                in_stream,
             } => {
+                assert!(!in_stream, "a refused request used nothing");
                 assert_eq!(
                     resets_at,
                     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
@@ -1155,8 +1159,11 @@ mod tests {
             capped,
             Err(ProviderError::QuotaExhausted {
                 resets_at: Some(_),
+                in_stream: true,
                 ..
             })
         ));
+        // Reported inside an answer already started: not proof of no spend.
+        assert!(!capped.unwrap_err().proves_nothing_spent());
     }
 }

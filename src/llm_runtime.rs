@@ -432,6 +432,7 @@ mod tests {
                 message: "usage limit reached".into(),
                 resets_at: None,
                 per_model: false,
+                in_stream: false,
             },
         )]));
         let failover = Arc::new(ScriptedProvider::new([text("consolidated")]));

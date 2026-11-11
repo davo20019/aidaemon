@@ -444,6 +444,8 @@ fn quota_failure(
     failures: Vec<crate::providers::ModelFailure>,
 ) -> anyhow::Error {
     let mut quota = crate::providers::sdk_backed::to_daemon_error(quota);
+    // The call spent nothing only if its last attempt did too.
+    quota.spent_nothing &= last.spent_nothing;
     quota.fallback_failures = failures
         .into_iter()
         .filter(|failure| failure.kind != ProviderErrorKind::QuotaExhausted)
@@ -1083,5 +1085,83 @@ mod tests {
         assert!(result.is_err());
         assert!(primary.models_called().await.is_empty());
         assert!(alternate.models_called().await.is_empty());
+    }
+
+    /// A budget-fenced call (one physical attempt per model) still reaches
+    /// the configured fallback when the primary refused before doing any
+    /// work; an error that may have been paid for still ends the call.
+    #[tokio::test]
+    async fn fenced_call_falls_back_only_past_an_unspent_refusal() {
+        async fn run(primary_error: ProviderError) -> (bool, usize, usize, bool) {
+            let harness = setup_test_agent(MockProvider::new())
+                .await
+                .expect("build test harness");
+            // The primary account's other models answer the same way.
+            let primary = Arc::new(ScriptedProvider::with_results(
+                (0..8)
+                    .map(|_| Err(primary_error.clone().into()))
+                    .collect::<Vec<_>>(),
+            ));
+            let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+                MockProvider::text_response("from the fallback"),
+            )]));
+            harness.agent.llm_runtime.swap(
+                primary.clone() as crate::llm_runtime::ModelBackend,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "primary-model".to_string(),
+                vec![ProviderRuntimeTarget::new(
+                    alternate.clone() as crate::llm_runtime::ModelBackend,
+                    None,
+                    crate::config::ProviderKind::Anthropic,
+                    "secondary-model".to_string(),
+                )],
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            );
+            let options = ChatOptions {
+                max_tokens_override: Some(100),
+                single_attempt_fail_closed: true,
+                fallback_when_unspent: true,
+                ..ChatOptions::default()
+            };
+            let mut telemetry = super::LlmCallTelemetry::default();
+            let result = harness
+                .agent
+                .call_llm_with_recovery(
+                    primary.clone() as crate::llm_runtime::ModelBackend,
+                    None,
+                    "primary-model",
+                    &[],
+                    &[],
+                    &options,
+                    &mut telemetry,
+                    None,
+                    std::time::Duration::from_secs(60),
+                )
+                .await;
+            let spent_nothing = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<ProviderError>())
+                .is_some_and(|error| error.spent_nothing);
+            (
+                result.is_ok(),
+                primary.models_called().await.len().min(1),
+                alternate.models_called().await.len(),
+                spent_nothing,
+            )
+        }
+
+        let mut quota = ProviderError::from_status(429, "usage limit reached");
+        quota.kind = crate::providers::ProviderErrorKind::QuotaExhausted;
+        assert_eq!(run(quota).await, (true, 1, 1, false));
+        assert_eq!(
+            run(ProviderError::from_status(401, "bad key")).await,
+            (true, 1, 1, false)
+        );
+        let (ok, primary, alternate, spent_nothing) =
+            run(ProviderError::from_status(503, "overloaded")).await;
+        assert_eq!((ok, primary, alternate), (false, 1, 0));
+        assert!(!spent_nothing, "a server error may have been paid for");
     }
 }

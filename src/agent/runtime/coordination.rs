@@ -1863,6 +1863,9 @@ impl Escalator {
             },
             reasoning_effort: None,
             single_attempt: true,
+            // A model that refused the call before doing any work leaves the
+            // judgment to the next one; any other failure still refuses.
+            fallback_when_unspent: true,
             cache_key: None,
         };
         match self

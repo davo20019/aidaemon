@@ -103,6 +103,11 @@ pub struct ChatOptions {
     /// cascading, or stripping controls; otherwise failed attempts can consume
     /// unknowable tokens outside a hard aggregate budget.
     pub single_attempt_fail_closed: bool,
+    /// With `single_attempt_fail_closed`, a failover chain may still move to
+    /// its next model after an error that proves the attempt used nothing
+    /// (a refused quota, bad credentials, an unknown model, no credit).
+    /// Anything that may have been paid for still ends the call.
+    pub fallback_when_unspent: bool,
     /// True when the current request has committed no tool work yet. A
     /// transient provider outage at that point costs nothing to wait out, so
     /// the recovery ladder may use a longer bounded backoff window before it

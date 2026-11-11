@@ -838,6 +838,7 @@ async fn test_live_capped_plan_falls_over_to_other_providers() {
                     std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                 ),
                 per_model: false,
+                in_stream: false,
             })],
         ));
         let capped: Arc<dyn Provider> = Arc::new(QuotaGuard::from_arc(capped_inner.clone()));

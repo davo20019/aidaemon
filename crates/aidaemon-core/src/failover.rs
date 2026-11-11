@@ -121,7 +121,9 @@ pub enum FailoverAction {
 /// not-found and other errors, and stops on an invalid request, a context
 /// overflow (the caller must shrink it) and a wrongly shaped reply.
 /// A request with [`crate::RequestOptions::single_attempt`] stops at its
-/// first error whatever the policy says.
+/// first error whatever the policy says, unless it also sets
+/// [`crate::RequestOptions::fallback_when_unspent`] and the error proves
+/// the attempt used nothing: then it moves on to the next step.
 pub trait FailoverPolicy: Send + Sync {
     /// Whether to send `request` on this step at all. An error skips the
     /// attempt and is handled as its failure (for example, a model the app
@@ -232,9 +234,14 @@ impl Failover {
         sent: &ModelRequest,
         step: &FailoverStep,
         attempt: u32,
+        dispatched: bool,
         error: ProviderError,
     ) -> Result<Option<(Duration, Option<ModelRequest>)>, ProviderError> {
         if sent.options.single_attempt {
+            let unspent = !dispatched || error.proves_nothing_spent();
+            if sent.options.fallback_when_unspent && unspent {
+                return Ok(None);
+            }
             return Err(error);
         }
         match self
@@ -282,8 +289,12 @@ impl Provider for Failover {
             let mut attempt = 0;
             let error = loop {
                 attempt += 1;
+                let mut dispatched = true;
                 let error = match self.policy.before_attempt(&step_request) {
-                    Err(error) => error,
+                    Err(error) => {
+                        dispatched = false;
+                        error
+                    }
                     Ok(()) => match tokio::time::timeout(
                         step.deadline,
                         step.provider.complete(&step_request),
@@ -301,7 +312,7 @@ impl Provider for Failover {
                         Err(_) => timed_out(step.deadline),
                     },
                 };
-                match self.next_move(&step_request, step, attempt, error.clone())? {
+                match self.next_move(&step_request, step, attempt, dispatched, error.clone())? {
                     Some((delay, rewritten)) => {
                         tokio::time::sleep(delay).await;
                         if let Some(rewritten) = rewritten {
@@ -330,8 +341,12 @@ impl Provider for Failover {
                 let mut attempt = 0;
                 let error = loop {
                     attempt += 1;
+                    let mut dispatched = true;
                     let error = match self.policy.before_attempt(&step_request) {
-                        Err(error) => error,
+                        Err(error) => {
+                            dispatched = false;
+                            error
+                        }
                         Ok(()) => {
                             let mut events = step.provider.stream(&step_request);
                             match tokio::time::timeout(step.deadline, events.next()).await {
@@ -361,7 +376,7 @@ impl Provider for Failover {
                             }
                         }
                     };
-                    match self.next_move(&step_request, step, attempt, error.clone()) {
+                    match self.next_move(&step_request, step, attempt, dispatched, error.clone()) {
                         Ok(Some((delay, rewritten))) => {
                             tokio::time::sleep(delay).await;
                             if let Some(rewritten) = rewritten {
@@ -656,6 +671,53 @@ mod tests {
             events.as_slice(),
             [Err(ProviderError::Transient(_))]
         ));
+    }
+
+    /// A budget-fenced call moves on only past an error that proves the
+    /// attempt used nothing; anything else still ends the chain.
+    #[tokio::test]
+    async fn a_fenced_call_moves_on_only_past_an_unspent_error() {
+        let fenced = || {
+            let mut request = request();
+            request.options.single_attempt = true;
+            request.options.fallback_when_unspent = true;
+            request
+        };
+        let chain = |first: ProviderError| {
+            Failover::new(vec![
+                FailoverStep::new(ScriptedProvider::with_results(vec![Err(first)])),
+                FailoverStep::new(ScriptedProvider::new(vec![text("fallback")])),
+            ])
+        };
+        let refused = ProviderError::QuotaExhausted {
+            message: "limit".into(),
+            resets_at: None,
+            per_model: false,
+            in_stream: false,
+        };
+        for unspent in [
+            refused.clone(),
+            ProviderError::Auth("bad key".into()),
+            ProviderError::NotFound("gone".into()),
+        ] {
+            let events: Vec<_> = chain(unspent).stream(&fenced()).collect().await;
+            assert!(
+                matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "fallback")
+            );
+        }
+        for spent in [
+            ProviderError::QuotaExhausted {
+                message: "limit".into(),
+                resets_at: None,
+                per_model: false,
+                in_stream: true,
+            },
+            ProviderError::Transient("503".into()),
+            ProviderError::RateLimited { retry_after: None },
+        ] {
+            let events: Vec<_> = chain(spent).stream(&fenced()).collect().await;
+            assert!(matches!(events.as_slice(), [Err(_)]), "{events:?}");
+        }
     }
 
     #[test]

@@ -115,12 +115,18 @@ impl QuotaGuard {
             ProviderError::Auth(_) => (None, AUTH_COOLDOWN),
             _ => return,
         };
+        // Every call the cooldown blocks is refused here, before it is
+        // sent, whatever the original answer was.
+        let mut refusal = error.clone();
+        if let ProviderError::QuotaExhausted { in_stream, .. } = &mut refusal {
+            *in_stream = false;
+        }
         self.lock().insert(
             key.clone(),
             Cooldown {
                 model: key,
                 until: now + lasts,
-                error: error.clone(),
+                error: refusal,
             },
         );
     }
@@ -180,6 +186,7 @@ mod tests {
             message: "plan cap".into(),
             resets_at,
             per_model,
+            in_stream: false,
         }
     }
 
