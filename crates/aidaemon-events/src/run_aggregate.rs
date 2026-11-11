@@ -982,25 +982,12 @@ impl RunAggregate {
             if obligation.class != RunObligationClass::Observe {
                 continue;
             }
-            for receipt in &receipts {
-                let proven = receipt.completed_observation
-                    && receipt.dispatched
-                    && receipt.observes
-                    && observation_targets_supported(
-                        &self.paths,
-                        &obligation.observation_targets,
-                        &receipt.targets,
-                        &receipt.observations,
-                        &receipt.collection_observations,
-                    );
-                if !proven {
-                    continue;
-                }
-                // Mirror the live staleness rule: an observation credited at
-                // an older revision is stale only when a later mutation could
-                // have changed the observed state.
-                if !obligation.prerequisite {
-                    let stale = receipts.iter().any(|later| {
+            // Mirror the live staleness rule: an observation credited at an
+            // older revision is stale only when a later mutation could have
+            // changed the observed state.
+            let fresh = |receipt: &RecordedReceipt| {
+                obligation.prerequisite
+                    || !receipts.iter().any(|later| {
                         later.succeeded
                             && !later.mutation_effects.is_empty()
                             && later.revision > receipt.revision
@@ -1009,11 +996,53 @@ impl RunAggregate {
                                 obligation,
                                 &later.targets,
                             )
-                    });
-                    if stale {
-                        continue;
-                    }
-                }
+                    })
+            };
+            let observes = |receipt: &RecordedReceipt| {
+                receipt.completed_observation && receipt.dispatched && receipt.observes
+            };
+            // Each target needs one fresh observation that supports it; one
+            // receipt may cover several, and an item naming two files is
+            // observed by reading each, not only by one call touching both.
+            let proof: Option<Vec<&RecordedReceipt>> = if obligation.observation_targets.is_empty()
+            {
+                receipts
+                    .iter()
+                    .find(|receipt| {
+                        observes(receipt)
+                            && observation_targets_supported(
+                                &self.paths,
+                                &[],
+                                &receipt.targets,
+                                &receipt.observations,
+                                &receipt.collection_observations,
+                            )
+                            && fresh(receipt)
+                    })
+                    .map(|receipt| vec![receipt])
+            } else {
+                obligation
+                    .observation_targets
+                    .iter()
+                    .map(|target| {
+                        receipts.iter().find(|receipt| {
+                            observes(receipt)
+                                && observation_target_supported(
+                                    &self.paths,
+                                    target,
+                                    &receipt.targets,
+                                    &receipt.observations,
+                                    &receipt.collection_observations,
+                                )
+                                && fresh(receipt)
+                        })
+                    })
+                    .collect()
+            };
+            let Some(proof) = proof else {
+                continue;
+            };
+            for receipt in &proof {
                 if !obligation
                     .satisfying_receipt_ids
                     .contains(&receipt.operation_id)
@@ -1022,10 +1051,11 @@ impl RunAggregate {
                         .satisfying_receipt_ids
                         .push(receipt.operation_id.clone());
                 }
-                obligation.state = RunObligationState::Satisfied;
-                obligation.satisfied_at_revision = Some(receipt.revision);
-                break;
             }
+            obligation.state = RunObligationState::Satisfied;
+            // The oldest observation bounds it: a later mutation of what any
+            // of them saw invalidates the item.
+            obligation.satisfied_at_revision = proof.iter().map(|receipt| receipt.revision).min();
         }
     }
 
@@ -4625,6 +4655,59 @@ mod tests {
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
         }
+    }
+
+    /// An item that observes two resources is done when each was observed,
+    /// by separate calls (two reads, or two sub-agents' reads); one read
+    /// leaves it owed.
+    #[test]
+    fn multi_target_observation_item_is_closed_by_one_read_per_target() {
+        let item = || {
+            executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &["/tmp/proj/routes.yml", "/tmp/proj/tests"],
+                "pending",
+            )])
+        };
+        let read = |id: &str, path: &str| {
+            [
+                call(id, "read_file"),
+                result(
+                    id,
+                    "read_file",
+                    ToolOutcomeStatus::Succeeded,
+                    0,
+                    terminal_observation_semantics(Some(path)),
+                ),
+            ]
+        };
+        let obligation = "task:task-1/obligation:checklist:0";
+
+        let mut one = vec![item()];
+        one.extend(read("routes", "/tmp/proj/routes.yml"));
+        renumber(&mut one);
+        assert_eq!(
+            RunAggregate::replay("task-1", &one).obligations[obligation].state,
+            RunObligationState::Pending,
+            "the tests folder was never observed"
+        );
+
+        let mut both = vec![item()];
+        both.extend(read("routes", "/tmp/proj/routes.yml"));
+        both.extend(read("tests", "/tmp/proj/tests"));
+        renumber(&mut both);
+        let aggregate = RunAggregate::replay("task-1", &both);
+        assert_eq!(
+            aggregate.obligations[obligation].state,
+            RunObligationState::Satisfied
+        );
+        let mut proof = aggregate.obligations[obligation]
+            .satisfying_receipt_ids
+            .clone();
+        proof.sort();
+        assert_eq!(proof, vec!["routes".to_string(), "tests".to_string()]);
     }
 
     /// A checklist item scoped to a folder is done by writes to files in
