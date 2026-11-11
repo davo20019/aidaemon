@@ -1096,10 +1096,29 @@ impl Agent {
             .get_goals_for_session(session_id)
             .await
             .unwrap_or_default();
-        let active: Vec<&crate::traits::Goal> = goals
+        let mut active: Vec<&crate::traits::Goal> = Vec::new();
+        for goal in goals
             .iter()
             .filter(|goal| session_goal_is_finite_work(goal))
-            .collect();
+        {
+            // A scheduled one-shot (a reminder) is future work the owner
+            // asked for, not work in flight: a stop or /clear ends it only
+            // while its run is executing.
+            let scheduled = self
+                .state
+                .get_schedules_for_goal(&goal.id)
+                .await
+                .map(|schedules| !schedules.is_empty())
+                .unwrap_or(false);
+            let running = self
+                .goal_token_registry
+                .as_ref()
+                .is_some_and(|registry| registry.is_run_active(&goal.id));
+            if scheduled && !running {
+                continue;
+            }
+            active.push(goal);
+        }
         if active.is_empty() {
             return Vec::new();
         }

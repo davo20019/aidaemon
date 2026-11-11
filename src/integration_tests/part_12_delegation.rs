@@ -1054,6 +1054,52 @@ async fn test_cancel_stops_a_sessions_background_children() {
     );
 }
 
+/// A stop or /clear ends work in flight, not a reminder the owner scheduled:
+/// a finite goal waiting on its schedule survives, an unscheduled one does not.
+#[tokio::test]
+async fn cancel_keeps_a_scheduled_reminder_that_is_not_running() {
+    let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), Vec::new())
+        .await
+        .unwrap();
+    let session = "telegram:synthetic-user-1";
+    let reminder = crate::traits::Goal::new_finite("Remind me to water the plants", session);
+    let in_flight = crate::traits::Goal::new_finite("Summarize the synthetic report", session);
+    harness.state.create_goal(&reminder).await.unwrap();
+    harness.state.create_goal(&in_flight).await.unwrap();
+    let now = chrono::Utc::now();
+    harness
+        .state
+        .create_goal_schedule(&crate::traits::GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: reminder.id.clone(),
+            cron_expr: "30 15 12 11 *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("in one hour".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: true,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        })
+        .await
+        .unwrap();
+
+    let cancelled = harness
+        .agent
+        .cancel_active_finite_work_for_session(session)
+        .await;
+
+    assert_eq!(cancelled, vec!["Summarize the synthetic report".to_string()]);
+    let kept = harness.state.get_goal(&reminder.id).await.unwrap().unwrap();
+    assert_eq!(kept.status, reminder.status);
+    assert_eq!(
+        harness.state.get_schedules_for_goal(&reminder.id).await.unwrap().len(),
+        1
+    );
+}
+
 /// Through the real agent: a spawn whose setup fails (here, a task lead
 /// with no goal) gives its place back, and a child that ran keeps it.
 #[tokio::test]

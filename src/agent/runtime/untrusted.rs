@@ -445,7 +445,7 @@ impl UntrustedVerifier<'_> {
             .tools
             .iter()
             .find(|candidate| candidate.name() == tool)
-            .map(|candidate| candidate.description().to_string())
+            .map(|candidate| tool_contract(candidate.description(), &candidate.schema()))
             .unwrap_or_default();
         let verdict = verify_untrusted_call(
             &self.agent.side_calls,
@@ -474,6 +474,23 @@ impl UntrustedVerifier<'_> {
             )
             .await;
         Some(verdict)
+    }
+}
+
+/// Longest parameter documentation the verifier is shown.
+const TOOL_PARAMETERS_CHARS: usize = 4_000;
+
+/// The tool's documented contract for the verifier: its description and its
+/// parameter docs. The one-line description alone hid what an argument
+/// means (`remember_fact` value `"delete"` removes a fact), so a valid
+/// forget read as storing a junk fact and was refused.
+fn tool_contract(description: &str, schema: &Value) -> String {
+    match schema.get("parameters") {
+        Some(parameters) => format!(
+            "{description}\nParameters (JSON Schema): {}",
+            crate::utils::truncate_str(&parameters.to_string(), TOOL_PARAMETERS_CHARS)
+        ),
+        None => description.to_string(),
     }
 }
 
@@ -605,6 +622,33 @@ mod tests {
         let origin = harness.agent.mandate_origin().await.unwrap();
 
         assert!(!origin.trusted);
+    }
+
+    /// The verifier sees what the arguments mean, not only the tool's
+    /// one-line description: `remember_fact` documents `"delete"` as a forget.
+    #[test]
+    fn the_verifier_sees_the_tools_parameter_docs() {
+        let schema = json!({
+            "name": "remember_fact",
+            "description": "Store a fact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "description": "Value; empty or 'delete' removes it."}
+                }
+            }
+        });
+        let contract = tool_contract("Store a fact.", &schema);
+        let messages = verifier_messages(
+            "Forget my synthetic office.",
+            true,
+            "remember_fact",
+            &contract,
+            &json!({"category": "user", "key": "office", "value": "delete"}),
+        );
+        let user = messages[1]["content"].as_str().unwrap();
+        assert!(user.contains("Parameters (JSON Schema)"), "{user}");
+        assert!(user.contains("'delete' removes it"), "{user}");
     }
 
     #[test]
