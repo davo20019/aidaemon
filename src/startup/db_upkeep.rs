@@ -507,6 +507,22 @@ mod upkeep_bench {
             std::fs::metadata(&copy).unwrap().len()
         );
 
+        // Start from no statistics, as a database that was never analyzed
+        // (the live file may already have them), then reopen so the planner
+        // forgets any it loaded.
+        let pool = open(&copy, key.as_deref()).await.unwrap();
+        let had_stats: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        if had_stats.is_some() {
+            sqlx::query("DELETE FROM sqlite_stat1")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
         let pool = open(&copy, key.as_deref()).await.unwrap();
         let model: String = sqlx::query_scalar(
             "SELECT embedding_model FROM memory_embeddings GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1",
