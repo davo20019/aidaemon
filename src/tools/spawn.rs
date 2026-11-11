@@ -1124,6 +1124,26 @@ impl crate::traits::ToolSemantics for SpawnAgentTool {
         }
     }
 
+    /// A spawn whose child is held to read-only access changes nothing: the
+    /// child's authority is narrowed to it (never wider than requested), so
+    /// the call is read-only, and a read-only agent may delegate read-only
+    /// work. Any other spawn keeps the tool's worst case.
+    fn call_annotations_in(
+        &self,
+        arguments: &str,
+        _roots: &crate::traits::TrustRoots<'_>,
+    ) -> aidaemon_core::ToolAnnotations {
+        let read_only_child = serde_json::from_str::<SpawnArgs>(arguments)
+            .is_ok_and(|args| matches!(args.access, Some(ChildAccess::ReadOnly)));
+        if read_only_child {
+            return aidaemon_core::ToolAnnotations::READ_ONLY;
+        }
+        crate::traits::default_call_annotations(
+            self.capabilities(),
+            &self.call_semantics(arguments),
+        )
+    }
+
     /// A child's result carries the child's taint; anything the call does
     /// not report (errors) counts as untrusted.
     fn output_trust(
@@ -1915,6 +1935,22 @@ mod child_runtime_tests {
             *child.timed_out_tasks.lock().unwrap(),
             vec!["task-synthetic-1".to_string()]
         );
+    }
+
+    /// A spawn holding its child to read-only access is itself read-only, so
+    /// a read-only coordinator may delegate; a writing spawn is not.
+    #[test]
+    fn a_read_only_spawn_is_a_read_only_call() {
+        use crate::traits::ToolSemantics;
+        let child = ScriptedChild::new("unused", Duration::ZERO);
+        let tool = tool_for(&child);
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let read = json!({"mission": "m", "task": "t", "access": "read_only"}).to_string();
+        let write = json!({"mission": "m", "task": "t", "access": "write"}).to_string();
+        let unset = json!({"mission": "m", "task": "t"}).to_string();
+        assert!(tool.call_annotations_in(&read, &roots).read_only);
+        assert!(!tool.call_annotations_in(&write, &roots).read_only);
+        assert!(!tool.call_annotations_in(&unset, &roots).read_only);
     }
 
     /// A child whose run succeeded is a succeeded receipt even when its

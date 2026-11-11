@@ -240,16 +240,27 @@ fn named_specialist(arg_specialist: Option<&str>) -> Option<SpecialistKind> {
         .filter(|kind| *kind != SpecialistKind::TaskLead)
 }
 
-/// Whether a child gets its own `spawn_agent`. A named specialist is a leaf:
-/// its allowlist would not otherwise cover the tool, which is added after
-/// the allowlist is applied.
+/// Whether a child gets its own `spawn_agent`. A named specialist is a leaf
+/// (its allowlist would not otherwise cover the tool, which is added after
+/// the allowlist is applied) unless the caller's explicit tool grant for the
+/// child names `spawn_agent`: the caller asked for a coordinator.
 fn child_can_spawn(
     child_depth: usize,
     max_depth: usize,
     role: AgentRole,
     named_specialist: bool,
+    caller_granted_spawn: bool,
 ) -> bool {
-    child_depth < max_depth && role != AgentRole::Executor && !named_specialist
+    child_depth < max_depth
+        && role != AgentRole::Executor
+        && (!named_specialist || caller_granted_spawn)
+}
+
+/// The caller's explicit tool grant for the child includes `spawn_agent`.
+fn caller_granted_spawn(parent: Option<&crate::agent::authority::InheritedAuthority>) -> bool {
+    parent
+        .and_then(|parent| parent.authority.tools.as_ref())
+        .is_some_and(|tools| tools.contains("spawn_agent"))
 }
 
 /// The system prompt of a plain child: the parent's prompt, the mission and,
@@ -2255,6 +2266,7 @@ impl Agent {
             self.limits.max_depth,
             effective_role,
             child_role.is_none() && named_specialist(arg_specialist).is_some(),
+            caller_granted_spawn(parent_authority.as_ref()),
         );
 
         // For TaskLead, pass goal_id; other roles get no goal context injection.
@@ -3530,10 +3542,21 @@ mod tests {
 
     #[test]
     fn a_named_specialist_is_a_leaf_and_a_plain_child_is_not() {
-        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, false));
-        assert!(!child_can_spawn(1, 3, AgentRole::Orchestrator, true));
-        assert!(!child_can_spawn(3, 3, AgentRole::Orchestrator, false));
-        assert!(!child_can_spawn(1, 3, AgentRole::Executor, false));
+        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, false, false));
+        assert!(!child_can_spawn(1, 3, AgentRole::Orchestrator, true, false));
+        assert!(!child_can_spawn(
+            3,
+            3,
+            AgentRole::Orchestrator,
+            false,
+            false
+        ));
+        assert!(!child_can_spawn(1, 3, AgentRole::Executor, false, false));
+        // A caller that grants `spawn_agent` asked for a coordinator, within
+        // the depth limit and never for an executor.
+        assert!(child_can_spawn(1, 3, AgentRole::Orchestrator, true, true));
+        assert!(!child_can_spawn(3, 3, AgentRole::Orchestrator, true, true));
+        assert!(!child_can_spawn(1, 3, AgentRole::Executor, true, true));
     }
 
     #[test]
