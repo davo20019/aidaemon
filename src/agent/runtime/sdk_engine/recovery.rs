@@ -55,10 +55,16 @@ pub(super) fn not_done_note(not_done: &[String]) -> Option<String> {
     if not_done.len() > MAX_ITEMS {
         listed.push(format!("and {} more", not_done.len() - MAX_ITEMS));
     }
+    let listed = listed.join("; ");
+    // A question keeps its own mark; only an unpunctuated list gets a period.
+    let stop = if listed.ends_with(['?', '.', '!', '\u{2026}']) {
+        ""
+    } else {
+        "."
+    };
     Some(format!(
         "\u{26a0}\u{fe0f} The daemon restarted while an approval was waiting for you, so it was \
-         not done (you declined nothing): {}. Ask again if you still want it.",
-        listed.join("; ")
+         not done (you declined nothing): {listed}{stop} Ask again if you still want it."
     ))
 }
 
@@ -249,6 +255,7 @@ mod tests {
         assert!(note.contains("Let the browser open demo.example.test, a site on this computer?"));
         assert!(!note.contains("Approve only"), "{note}");
         assert!(note.contains("you declined nothing"), "{note}");
+        assert!(!note.contains("?."), "{note}");
         assert!(note.chars().count() < 400, "{note}");
         assert!(not_done_note(&[]).is_none());
     }
