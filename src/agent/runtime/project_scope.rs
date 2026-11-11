@@ -71,7 +71,16 @@ pub(in crate::agent) fn token_looks_like_filesystem_path(
     backend: &dyn crate::execution::ExecutionBackend,
     token: &str,
 ) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference(backend, token, &[]).is_some()
+    // A shape hint for classifying a message, not a resolution of the user's
+    // project: the process cwd is acceptable evidence of shape here.
+    let cwd = std::env::current_dir().ok();
+    crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        backend,
+        token,
+        &[],
+        cwd.as_deref(),
+    )
+    .is_some()
 }
 
 fn token_looks_like_project_scope_path(

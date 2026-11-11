@@ -1439,9 +1439,8 @@ pub(super) async fn build_turn_messages(
     // the transcript holds, so they carry no taint the turn lacks.
     let known_resources = if ctx.share_known_resources {
         agent
-            .known_resources(session_id, None, &peek_projected_turn_ids(&messages))
+            .handoff_section(session_id, &peek_projected_turn_ids(&messages))
             .await
-            .render()
     } else {
         None
     };

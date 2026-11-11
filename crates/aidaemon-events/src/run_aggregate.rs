@@ -4485,6 +4485,7 @@ mod tests {
                     parent_task_id: None,
                     user_message: None,
                     turn_id: None,
+                    spawned_by: None,
                 },
             ),
             contract_with_response(Vec::new(), Some(Box::new(response))),

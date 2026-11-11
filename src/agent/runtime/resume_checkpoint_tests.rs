@@ -38,6 +38,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 parent_task_id: None,
                 user_message: Some("Build website and deploy".to_string()),
                 turn_id: None,
+                spawned_by: None,
             },
         )
         .await
@@ -316,6 +317,7 @@ async fn recovery_task_end_uses_checkpoint_turn_id_not_resume_turn() {
                 parent_task_id: None,
                 user_message: Some("do the work".to_string()),
                 turn_id: Some("turn-old".to_string()),
+                spawned_by: None,
             },
         )
         .await

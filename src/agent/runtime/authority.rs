@@ -394,6 +394,15 @@ pub(crate) struct InheritedAuthority {
     /// A planning fact, never a grant.
     #[serde(default)]
     pub known_resources: super::known_resources::KnownResources,
+    /// The missions from the root delegation down to this child, outermost
+    /// first: what each level was delegated to do, so a child knows the
+    /// work its own task is part of.
+    #[serde(default)]
+    pub lineage: Vec<String>,
+    /// The run that spawns this child, recorded on the child's task start so
+    /// the parent can fold the child's results back into its own context.
+    #[serde(default)]
+    pub parent_task: Option<aidaemon_events::TaskRef>,
 }
 
 /// The parent turn's authority the dispatcher handed `spawn_agent`: an
@@ -921,6 +930,8 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
         }
     }
 
@@ -1033,6 +1044,8 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,

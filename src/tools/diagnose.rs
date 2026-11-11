@@ -1822,6 +1822,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some(task_id),
         )
@@ -2000,6 +2001,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t1"),
         )
@@ -2044,6 +2046,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t1"),
         )
@@ -2106,6 +2109,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t-replay"),
         )
@@ -2226,6 +2230,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t1"),
         )
@@ -2332,6 +2337,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t-ctx"),
         )
@@ -2393,6 +2399,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: None,
                 turn_id: None,
+                spawned_by: None,
             },
             Some("t1"),
         )
@@ -2535,6 +2542,7 @@ mod tests {
                 parent_task_id: None,
                 user_message: Some("Build website and deploy".to_string()),
                 turn_id: None,
+                spawned_by: None,
             },
             Some("parent-1"),
         )
@@ -2612,6 +2620,7 @@ mod tests {
                 parent_task_id: Some("parent-1".to_string()),
                 user_message: Some("continue".to_string()),
                 turn_id: None,
+                spawned_by: None,
             },
             Some("child-1"),
         )

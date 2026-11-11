@@ -1002,6 +1002,8 @@ async fn test_child_tokens_count_against_the_requests_tree() {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
         });
     harness
         .agent

@@ -1699,6 +1699,26 @@ impl EventStore {
         Ok(ids)
     }
 
+    /// The runs a task spawned as sub-agents (any session), oldest first.
+    pub async fn spawned_children(&self, task_id: &str) -> anyhow::Result<Vec<crate::TaskRef>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT session_id, task_id FROM events \
+             WHERE event_type = 'task_start' AND task_id IS NOT NULL \
+               AND json_extract(data, '$.spawned_by.task_id') = ? \
+             ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(session_id, task_id)| crate::TaskRef {
+                session_id,
+                task_id,
+            })
+            .collect())
+    }
+
     /// The aggregate of a run with no readable history.
     pub fn empty_run_aggregate(&self, task_id: &str) -> RunAggregate {
         RunAggregate::on_paths(task_id, self.paths.clone())
@@ -4128,6 +4148,95 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    async fn append_spawn_task_start(
+        store: &EventStore,
+        session: &str,
+        task: &str,
+        turn: &str,
+        spawned_by: Option<crate::TaskRef>,
+    ) {
+        let mut event = Event::new(
+            session,
+            EventType::TaskStart,
+            serde_json::to_value(crate::TaskStartData {
+                task_id: task.to_string(),
+                description: "synthetic".to_string(),
+                parent_task_id: None,
+                user_message: None,
+                turn_id: Some(turn.to_string()),
+                spawned_by,
+            })
+            .unwrap(),
+        );
+        event.task_id = Some(task.to_string());
+        event.turn_id = Some(turn.to_string());
+        store.append(event).await.expect("append task start");
+    }
+
+    /// A parent finds the runs it spawned through the typed link, across
+    /// sessions, and turns map to the tasks they started.
+    #[tokio::test]
+    async fn spawned_children_and_turn_tasks_follow_typed_links() {
+        let (store, _database) = setup_store().await;
+        let parent = crate::TaskRef {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            task_id: "task-parent".to_string(),
+        };
+        append_spawn_task_start(&store, &parent.session_id, "task-parent", "turn-1", None).await;
+        append_spawn_task_start(
+            &store,
+            "specialist:a",
+            "task-child-a",
+            "turn-a",
+            Some(parent.clone()),
+        )
+        .await;
+        append_spawn_task_start(
+            &store,
+            "specialist:b",
+            "task-child-b",
+            "turn-b",
+            Some(parent.clone()),
+        )
+        .await;
+        append_spawn_task_start(&store, "specialist:c", "task-unrelated", "turn-c", None).await;
+
+        let children = store.spawned_children("task-parent").await.unwrap();
+        assert_eq!(
+            children,
+            vec![
+                crate::TaskRef {
+                    session_id: "specialist:a".to_string(),
+                    task_id: "task-child-a".to_string(),
+                },
+                crate::TaskRef {
+                    session_id: "specialist:b".to_string(),
+                    task_id: "task-child-b".to_string(),
+                },
+            ]
+        );
+        assert!(store
+            .spawned_children("task-child-a")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .task_ids_for_turns(
+                    &parent.session_id,
+                    &["turn-1".to_string(), "turn-x".to_string()]
+                )
+                .await
+                .unwrap(),
+            vec!["task-parent".to_string()]
+        );
+        assert!(store
+            .task_ids_for_turns("specialist:a", &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

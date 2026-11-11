@@ -539,6 +539,10 @@ pub(in crate::agent) async fn run_bootstrap(
                     .or_else(|| ctx.parent_task_id.map(str::to_string)),
                 user_message: Some(user_text.to_string()),
                 turn_id: Some(user_msg_id.clone()),
+                spawned_by: agent
+                    .inherited_authority
+                    .as_ref()
+                    .and_then(|inherited| inherited.parent_task.clone()),
             },
         )
         .await;

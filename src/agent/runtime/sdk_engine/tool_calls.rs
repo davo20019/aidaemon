@@ -888,6 +888,16 @@ impl Agent {
             child_declaration: None,
             parent_run: Some(scope.run_id),
             known_resources,
+            // The spawn tool appends the child's own mission.
+            lineage: self
+                .inherited_authority
+                .as_ref()
+                .map(|parent| parent.lineage.clone())
+                .unwrap_or_default(),
+            parent_task: Some(aidaemon_events::TaskRef {
+                session_id: scope.session_id.to_string(),
+                task_id: scope.task_id.to_string(),
+            }),
         }
     }
 

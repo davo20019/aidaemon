@@ -1,5 +1,13 @@
-//! The exact resources a conversation's own tool calls already reached.
+//! The context that crosses a handoff: parent to child, child back to
+//! parent, and one turn to the next.
 //!
+//! Every boundary used to pass prose only, and the receiving side rebuilt
+//! what the sending side already knew. What the work has established is
+//! typed: the request it serves, the missions delegated on the way down, and
+//! the exact resources its successful calls reached. This module carries
+//! those as data, in one form for every boundary.
+//!
+//! Resources:
 //! A run learns concrete identities as it works: the directory a command ran
 //! in, the files it read or wrote, the URLs it called. They are recorded as
 //! typed target hints on each receipt. Without carrying them across a
@@ -16,6 +24,10 @@
 
 use crate::events::RunAggregate;
 use crate::traits::{ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind};
+
+/// How many runs, and how deep a spawn tree, one handoff reads.
+const MAX_HANDOFF_TASKS: usize = 24;
+const MAX_HANDOFF_DEPTH: usize = 3;
 
 /// At most this many resources travel; the most recent win.
 pub(crate) const MAX_KNOWN_RESOURCES: usize = 16;
@@ -69,24 +81,95 @@ impl KnownResources {
         }
     }
 
-    /// The task-context section, or `None` when nothing is known.
+    /// The directory the work runs in: the most recent project scope its
+    /// calls established, else the repository root around the most recent
+    /// known path (an existing `.git` marker, never a guess).
+    pub(crate) fn working_dir(&self) -> Option<String> {
+        if let Some(scope) = self
+            .0
+            .iter()
+            .find(|hint| hint.kind == ToolTargetHintKind::ProjectScope)
+        {
+            return Some(scope.value.clone());
+        }
+        self.0
+            .iter()
+            .filter(|hint| hint.kind == ToolTargetHintKind::Path)
+            .find_map(|hint| {
+                std::path::Path::new(&hint.value)
+                    .ancestors()
+                    .find(|dir| dir.join(".git").exists())
+                    .map(|dir| dir.to_string_lossy().to_string())
+            })
+    }
+}
+
+/// What one boundary hands over, rendered into the receiving agent's task
+/// context. It informs; it never grants (authority is enforced separately).
+#[derive(Debug)]
+pub(crate) struct Handoff<'a> {
+    /// The owner's own request the work serves (a child of an owner-authored
+    /// request only; another author's words are never relayed as the owner's).
+    pub origin_request: Option<&'a str>,
+    /// Missions delegated from the root down to this agent, outermost first.
+    pub lineage: &'a [String],
+    pub resources: &'a KnownResources,
+}
+
+static NO_RESOURCES: KnownResources = KnownResources(Vec::new());
+
+impl Default for Handoff<'_> {
+    fn default() -> Self {
+        Self {
+            origin_request: None,
+            lineage: &[],
+            resources: &NO_RESOURCES,
+        }
+    }
+}
+
+/// At most this much of the root request is relayed.
+const HANDOFF_REQUEST_CHARS: usize = 1500;
+
+impl Handoff<'_> {
     pub(crate) fn render(&self) -> Option<String> {
-        if self.0.is_empty() {
+        let mut lines = Vec::new();
+        if let Some(request) = self.origin_request.map(str::trim).filter(|r| !r.is_empty()) {
+            let request: String = request.chars().take(HANDOFF_REQUEST_CHARS).collect();
+            lines.push(format!(
+                "Request this work serves (the owner's words):\n{request}"
+            ));
+        }
+        if !self.lineage.is_empty() {
+            lines.push(format!(
+                "Delegated as: {} (your task is the last step)",
+                self.lineage.join(" -> ")
+            ));
+        }
+        if let Some(dir) = self.resources.working_dir() {
+            lines.push(format!(
+                "Working directory: {dir}. Relative paths in the task refer to it."
+            ));
+        }
+        if !self.resources.0.is_empty() {
+            let mut known = String::from(
+                "Known resources (reached by earlier successful tool calls, most recent first; \
+                 use these exact values rather than rebuilding a path or URL from the wording):",
+            );
+            for hint in &self.resources.0 {
+                let kind = match hint.kind {
+                    ToolTargetHintKind::Url => "url",
+                    ToolTargetHintKind::ProjectScope => "project",
+                    _ => "path",
+                };
+                known.push_str(&format!("\n- {kind}: {}", hint.value));
+            }
+            lines.push(known);
+        }
+        if lines.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "[Known resources]\nExact resources this work already reached through successful \
-             tool calls, most recent first. When the task refers to one of them, use the exact \
-             value here rather than rebuilding a path or URL from the wording:",
-        );
-        for hint in &self.0 {
-            let kind = match hint.kind {
-                ToolTargetHintKind::Url => "url",
-                _ => "path",
-            };
-            out.push_str(&format!("\n- {kind}: {}", hint.value));
-        }
-        Some(out)
+        Some(format!("[Handoff context]\n{}", lines.join("\n")))
     }
 }
 
@@ -94,10 +177,10 @@ impl KnownResources {
 fn exact_identity(hint: &ToolTargetHint) -> Option<ToolTargetHint> {
     let value = hint.value.trim();
     match hint.kind {
-        ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope => {
+        kind @ (ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope) => {
             let absolute = std::path::Path::new(value).is_absolute();
             (absolute && !value.contains('\n'))
-                .then(|| ToolTargetHint::new(ToolTargetHintKind::Path, value))
+                .then(|| ToolTargetHint::new(kind, value))
                 .flatten()
         }
         ToolTargetHintKind::Url => {
@@ -158,19 +241,63 @@ impl super::Agent {
                 tracing::warn!(session_id, %error, "Could not read earlier tasks' resources");
             }
         }
-        for task_id in task_ids {
+        // Each task with the runs it spawned, depth first: what a child
+        // established returns to its parent's context through the typed
+        // `spawned_by` link, not through the prose of its reply.
+        let mut pending = task_ids
+            .into_iter()
+            .rev()
+            .map(|task_id| (session_id.to_string(), task_id, 0usize))
+            .collect::<Vec<_>>();
+        let mut visited = 0usize;
+        while let Some((task_session, task_id, depth)) = pending.pop() {
+            visited += 1;
+            if visited > MAX_HANDOFF_TASKS {
+                break;
+            }
             if let Ok(run) = self
                 .event_store
-                .task_run_aggregate(session_id, &task_id)
+                .task_run_aggregate(&task_session, &task_id)
                 .await
             {
                 known.extend_from_run(&run);
+            }
+            if depth < MAX_HANDOFF_DEPTH {
+                if let Ok(children) = self.event_store.spawned_children(&task_id).await {
+                    for child in children.into_iter() {
+                        pending.push((child.session_id, child.task_id, depth + 1));
+                    }
+                }
             }
         }
         if let Some(inherited) = self.inherited_authority.as_ref() {
             known.extend(inherited.known_resources.as_slice());
         }
         known
+    }
+
+    /// The `[Handoff context]` section for this agent's turn: for a child,
+    /// the owner's request and the mission chain it inherited; for every
+    /// agent, the working directory and resources the work has reached.
+    pub(in crate::agent) async fn handoff_section(
+        &self,
+        session_id: &str,
+        projected_turn_ids: &[String],
+    ) -> Option<String> {
+        let resources = self
+            .known_resources(session_id, None, projected_turn_ids)
+            .await;
+        let inherited = self.inherited_authority.as_ref();
+        Handoff {
+            origin_request: inherited
+                .filter(|inherited| inherited.origin_trusted)
+                .and_then(|inherited| inherited.origin_request.as_deref()),
+            lineage: inherited
+                .map(|inherited| inherited.lineage.as_slice())
+                .unwrap_or_default(),
+            resources: &resources,
+        }
+        .render()
     }
 }
 
@@ -200,13 +327,20 @@ mod tests {
         assert_eq!(
             known.as_slice(),
             &[
-                hint(ToolTargetHintKind::Path, "/srv/synthetic-app"),
+                hint(ToolTargetHintKind::ProjectScope, "/srv/synthetic-app"),
                 hint(ToolTargetHintKind::Url, "https://api.example.com/v1/items"),
+                hint(ToolTargetHintKind::Path, "/srv/synthetic-app"),
             ]
         );
-        let rendered = known.render().unwrap();
-        assert!(rendered.starts_with("[Known resources]"));
-        assert!(rendered.contains("- path: /srv/synthetic-app"));
+        let rendered = Handoff {
+            resources: &known,
+            ..Default::default()
+        }
+        .render()
+        .unwrap();
+        assert!(rendered.starts_with("[Handoff context]"));
+        assert!(rendered.contains("- project: /srv/synthetic-app"));
+        assert!(rendered.contains("Working directory: /srv/synthetic-app."));
         assert!(rendered.contains("- url: https://api.example.com/v1/items"));
         assert!(!rendered.contains("token"));
     }
@@ -255,6 +389,46 @@ mod tests {
         );
     }
 
+    /// A child's handoff names the owner's request, the missions delegated
+    /// down to it, its working directory and the exact resources.
+    #[test]
+    fn handoff_renders_request_lineage_and_working_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let file = repo.path().join("src").join("lib.rs");
+        let mut known = KnownResources::default();
+        known.push(&hint(ToolTargetHintKind::Path, &file.to_string_lossy()));
+        known.push(&hint(
+            ToolTargetHintKind::Url,
+            "https://api.example.com/v1/items",
+        ));
+        let lineage = vec![
+            "Ship the items API".to_string(),
+            "Write its tests".to_string(),
+        ];
+        let rendered = Handoff {
+            origin_request: Some("Add an items endpoint and test it."),
+            lineage: &lineage,
+            resources: &known,
+        }
+        .render()
+        .unwrap();
+        let root = repo.path().to_string_lossy();
+        assert!(rendered.contains("(the owner's words):\nAdd an items endpoint and test it."));
+        assert!(rendered.contains("Delegated as: Ship the items API -> Write its tests"));
+        assert!(rendered.contains(&format!("Working directory: {root}.")));
+        assert!(rendered.contains(&format!("- path: {}", file.to_string_lossy())));
+        assert!(rendered.contains("- url: https://api.example.com/v1/items"));
+
+        // No repository and no project scope: no working directory is guessed.
+        let mut loose = KnownResources::default();
+        loose.push(&hint(
+            ToolTargetHintKind::Url,
+            "https://api.example.com/v1/items",
+        ));
+        assert_eq!(loose.working_dir(), None);
+    }
+
     #[test]
     fn is_bounded() {
         let mut known = KnownResources::default();
@@ -262,6 +436,6 @@ mod tests {
             known.push(&hint(ToolTargetHintKind::Path, &format!("/srv/f{index}")));
         }
         assert_eq!(known.as_slice().len(), MAX_KNOWN_RESOURCES);
-        assert_eq!(KnownResources::default().render(), None);
+        assert_eq!(Handoff::default().render(), None);
     }
 }

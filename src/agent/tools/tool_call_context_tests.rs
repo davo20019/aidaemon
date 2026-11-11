@@ -147,6 +147,8 @@ fn real_authority() -> crate::agent::authority::InheritedAuthority {
         child_declaration: None,
         parent_run: None,
         known_resources: Default::default(),
+        lineage: Vec::new(),
+        parent_task: None,
     }
 }
 

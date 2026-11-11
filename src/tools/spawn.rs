@@ -744,6 +744,12 @@ impl Tool for SpawnAgentTool {
             }
         }
 
+        // The child learns the chain of work it belongs to: its parent's
+        // lineage plus the mission this call delegates.
+        if let Some(parent) = parent_authority.as_mut() {
+            parent.lineage.push(args.mission.clone());
+        }
+
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
         // are deduplicated per task_id so the same work is not launched twice.
         let executor_task_id = if child_role == Some(AgentRole::Executor) {
@@ -1449,6 +1455,8 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
         };
         let mut facts = ToolCallContext::default();
         assert!(crate::agent::authority::parent_authority(&facts).is_none());
@@ -2037,6 +2045,8 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                lineage: Vec::new(),
+                parent_task: None,
             });
         call_facts
     }
@@ -2148,6 +2158,8 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                lineage: Vec::new(),
+                parent_task: None,
             });
         let args = json!({"mission": "m", "task": "t"}).to_string();
 
@@ -2186,6 +2198,8 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                lineage: Vec::new(),
+                parent_task: None,
             });
         call_facts
     }

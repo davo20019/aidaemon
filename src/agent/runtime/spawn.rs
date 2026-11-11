@@ -2410,6 +2410,11 @@ impl Agent {
             known_resources: inherited
                 .map(|inherited| inherited.known_resources.clone())
                 .unwrap_or_default(),
+            lineage: inherited
+                .map(|inherited| inherited.lineage.clone())
+                .unwrap_or_default(),
+            // A dispatch outside any running turn has no spawning run.
+            parent_task: None,
         }
     }
 

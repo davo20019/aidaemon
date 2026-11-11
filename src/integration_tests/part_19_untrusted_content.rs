@@ -958,6 +958,8 @@ async fn a_mandate_workers_egress_is_judged_against_the_confirmed_mandate() {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
         });
 
     harness

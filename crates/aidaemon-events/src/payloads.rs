@@ -1136,6 +1136,19 @@ pub struct TaskStartData {
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// The run that spawned this one as a sub-agent. Distinct from
+    /// `parent_task_id` (the task a continuation resumes): this is the
+    /// delegation link a parent follows to fold its children's results back
+    /// into its own context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<TaskRef>,
+}
+
+/// One task in one session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRef {
+    pub session_id: String,
+    pub task_id: String,
 }
 
 /// Typed audit record for a tool attempt that conflicts with a grounded
@@ -2127,6 +2140,7 @@ mod tests {
             parent_task_id: None,
             user_message: None,
             turn_id: Some("t1".to_string()),
+            spawned_by: None,
         };
         let back: TaskStartData =
             serde_json::from_value(serde_json::to_value(&ts).unwrap()).unwrap();

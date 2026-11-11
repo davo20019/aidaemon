@@ -298,6 +298,18 @@ pub fn resolve_structural_filesystem_reference_from(
         return resolve_projects_folder_alias(backend, token, alias_roots);
     }
 
+    // A relative reference means something only against a workspace the run
+    // was given. Without one, the daemon's own working directory is not the
+    // user's project: `src/Controller` in a request about another repository
+    // resolved into the daemon's checkout. Only the configured project roots
+    // (below) may then resolve it.
+    if workspace_anchor.is_none() && !explicit {
+        return if has_separator {
+            resolve_under_alias_roots(backend, token, alias_roots)
+        } else {
+            None
+        };
+    }
     let base = relative_reference_base(workspace_anchor)?;
     let direct = join_normalized(&base, token)?;
     // A path-shaped token in prose names this machine's filesystem only when
@@ -340,6 +352,25 @@ pub fn resolve_structural_filesystem_reference_from(
         return None;
     }
 
+    resolve_under_alias_roots(backend, token, alias_roots)
+}
+
+/// A relative reference whose first component exists under a configured
+/// project root (`[path_aliases] projects`), joined to that root.
+fn resolve_under_alias_roots(
+    backend: &dyn ExecutionBackend,
+    token: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    if let Some(alias_path) = resolve_projects_folder_alias(backend, token, alias_roots) {
+        return Some(alias_path);
+    }
+    let first_component = Path::new(token)
+        .components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })?;
     for raw_root in alias_roots {
         let Ok(root) = validate_path(backend, raw_root) else {
             continue;
@@ -349,7 +380,6 @@ pub fn resolve_structural_filesystem_reference_from(
         }
         return Some(root.join(token.replace('\\', "/")));
     }
-
     None
 }
 
@@ -1381,13 +1411,14 @@ mod tests {
         assert_eq!(resolved, workspace.join("src/content/posts"));
         assert!(!resolved.starts_with(&cwd));
 
+        // Without a workspace the run was given, the daemon's own cwd is not
+        // an anchor: the reference names nothing.
         let unanchored = resolve_structural_filesystem_reference(
             &*crate::execution::active_execution_backend(),
             "src/content/posts",
             &[],
-        )
-        .expect("cwd-anchored reference resolves against the process cwd");
-        assert!(unanchored.starts_with(&cwd));
+        );
+        assert_eq!(unanchored, None);
     }
 
     /// Under an anchor, a reference the workspace cannot ground must not be

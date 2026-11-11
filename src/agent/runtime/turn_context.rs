@@ -470,7 +470,17 @@ impl Agent {
                 None => (None, None),
             },
         };
-        let workspace_anchor = bound_workspace.as_deref().map(std::path::Path::new);
+        // Relative references in a delegated request mean the directory the
+        // parent's work ran in (its handoff), not the daemon's own. Only
+        // resolution is anchored: the binding, and so confinement, is unchanged.
+        let handed_over_dir = self
+            .inherited_authority
+            .as_ref()
+            .and_then(|inherited| inherited.known_resources.working_dir());
+        let workspace_anchor = bound_workspace
+            .as_deref()
+            .or(handed_over_dir.as_deref())
+            .map(std::path::Path::new);
 
         // For the current user message, only extract explicit filesystem paths
         // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents

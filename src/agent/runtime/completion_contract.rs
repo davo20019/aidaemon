@@ -3077,6 +3077,22 @@ mod tests {
         );
     }
 
+    /// Without a workspace the run was given, a relative reference is not
+    /// resolved against the daemon's own working directory (the test runs in
+    /// this repository, which has `src/`).
+    #[test]
+    fn relative_references_never_resolve_against_the_daemon_cwd() {
+        assert!(std::path::Path::new("src").is_dir());
+        let targets = extract_verification_targets(
+            "Check src/Controller for the vocabulary controller.",
+            &[],
+        );
+        assert!(
+            targets.is_empty(),
+            "resolved into the daemon checkout: {targets:?}"
+        );
+    }
+
     #[test]
     fn verification_targets_preserve_exact_structurally_anchored_paths() {
         let root = tempfile::tempdir().expect("tempdir");
