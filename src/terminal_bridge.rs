@@ -118,7 +118,9 @@ struct KeyMaterial {
 struct RuntimeConfig {
     ws_url: String,
     user_id: String,
-    device_id: String,
+    /// The configured device id, if any; otherwise one is derived from this
+    /// install's bridge key once it is loaded (`default_device_id`).
+    device_id: Option<String>,
     shell: String,
     default_cwd: PathBuf,
     inbox_dir: PathBuf,
@@ -692,10 +694,7 @@ pub fn spawn_if_configured(config: &AppConfig, state: std::sync::Arc<dyn StateSt
         0
     };
     let max_upload_bytes = usize::try_from(max_upload_bytes_u64).unwrap_or(usize::MAX);
-    let device_id = config
-        .terminal
-        .effective_daemon_device_id()
-        .unwrap_or_else(default_device_id);
+    let device_id = config.terminal.effective_daemon_device_id();
 
     let bot_tokens = resolve_daemon_bot_tokens(config);
     let static_token = config.terminal.effective_daemon_connect_token();
@@ -747,7 +746,7 @@ pub fn spawn_if_configured(config: &AppConfig, state: std::sync::Arc<dyn StateSt
     let runtime = RuntimeConfig {
         ws_url,
         user_id: user_id.to_string(),
-        device_id: sanitize_device_id(&device_id),
+        device_id: device_id.as_deref().map(sanitize_device_id),
         shell,
         default_cwd,
         inbox_dir,
@@ -967,13 +966,22 @@ fn daemon_connect_token_mint_url(ws_url: &str) -> anyhow::Result<String> {
     Ok(url.to_string())
 }
 
-fn default_device_id() -> String {
+/// The device id used when none is configured: the host name plus a prefix
+/// of this install's bridge key fingerprint.
+///
+/// It must stay the same across restarts. The broker lets a reconnect replace
+/// a still-registered daemon socket only when the device id matches, and
+/// refuses a different one with 409 Conflict. An id that changed on every
+/// restart (it used to include the process id) left the bridge refused for as
+/// long as the broker held the previous process's socket.
+fn default_device_id(key_fingerprint: &str) -> String {
     let host = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "local".to_string());
-    format!("{}-{}", host, std::process::id())
+    let key: String = key_fingerprint.chars().take(12).collect();
+    sanitize_device_id(&format!("{host}-{key}"))
 }
 
 fn sanitize_device_id(value: &str) -> String {
@@ -3654,6 +3662,7 @@ async fn handle_local_attach_socket(
 struct TerminalBridge {
     cfg: RuntimeConfig,
     key_material: KeyMaterial,
+    device_id: String,
     sessions: HashMap<String, ActiveSession>,
     state: std::sync::Arc<dyn StateStore>,
     http_client: reqwest::Client,
@@ -3670,6 +3679,10 @@ impl TerminalBridge {
         state: std::sync::Arc<dyn StateStore>,
     ) -> anyhow::Result<Self> {
         let key_material = load_or_create_key_material().await?;
+        let device_id = cfg
+            .device_id
+            .clone()
+            .unwrap_or_else(|| default_device_id(&key_material.fingerprint));
         let http_client = reqwest::Client::builder()
             .user_agent("aidaemon-terminal-bridge/1.0")
             .timeout(Duration::from_secs(12))
@@ -3690,11 +3703,13 @@ impl TerminalBridge {
         info!(
             fingerprint = %key_material.fingerprint,
             user_id = %cfg.user_id,
+            device_id = %device_id,
             "Terminal bridge initialized"
         );
         Ok(Self {
             cfg,
             key_material,
+            device_id,
             sessions: HashMap::new(),
             state,
             http_client,
@@ -3730,6 +3745,7 @@ impl TerminalBridge {
                     } else {
                         error!(
                             error = %err,
+                            broker_response = %Self::broker_rejection_body(&err).unwrap_or_default(),
                             ran_for_secs = started.elapsed().as_secs(),
                             "Terminal bridge connection failed"
                         );
@@ -3789,11 +3805,22 @@ impl TerminalBridge {
         }
     }
 
+    /// The body of an HTTP rejection of the websocket upgrade, which says why
+    /// the broker refused (for a 409, which other device holds the slot).
+    fn broker_rejection_body(err: &anyhow::Error) -> Option<String> {
+        use tokio_tungstenite::tungstenite::Error as WsError;
+        let Some(WsError::Http(response)) = err.downcast_ref::<WsError>() else {
+            return None;
+        };
+        let body = response.body().as_deref()?;
+        Some(String::from_utf8_lossy(body).chars().take(300).collect())
+    }
+
     async fn connect_once(&mut self) -> anyhow::Result<()> {
         let connect_token = {
             let auth = self.cfg.auth.clone();
             let user_id = self.cfg.user_id.clone();
-            let device_id = self.cfg.device_id.clone();
+            let device_id = self.device_id.clone();
             let http_client = self.http_client.clone();
             let state = self.state.clone();
             resolve_connect_token(auth, state, user_id, device_id, http_client).await?
@@ -3802,7 +3829,7 @@ impl TerminalBridge {
         ws_url
             .query_pairs_mut()
             .append_pair("user_id", &self.cfg.user_id)
-            .append_pair("device_id", &self.cfg.device_id);
+            .append_pair("device_id", &self.device_id);
 
         let mut req = ws_url.as_str().into_client_request()?;
         req.headers_mut().insert(
@@ -6403,6 +6430,18 @@ fn run_local_attach_interactive(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn default_device_id_is_stable_per_key() {
+        let fingerprint = "0123456789abcdef0123456789abcdef";
+        let id = default_device_id(fingerprint);
+        // A restart keeps the id, so the broker lets it replace the old socket.
+        assert_eq!(id, default_device_id(fingerprint));
+        assert!(id.ends_with("-0123456789ab"), "{id}");
+        assert_eq!(id, sanitize_device_id(&id));
+        // A different install (different key) gets a different id.
+        assert_ne!(id, default_device_id("fedcba9876543210fedcba9876543210"));
+    }
 
     #[test]
     fn test_daemon_connect_token_mint_url_from_wss() {
