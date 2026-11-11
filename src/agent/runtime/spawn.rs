@@ -1991,6 +1991,7 @@ impl Agent {
                             AgentRole::TaskLead,
                             Some(AgentRole::TaskLead),
                             arg_specialist,
+                            None,
                             can_spawn,
                             task_id.map(str::to_string),
                             task_attempt,
@@ -2099,12 +2100,9 @@ impl Agent {
                             )));
                         }
                     }
-                    // Resolve the specialist kind here so the prompt reflects
-                    // the role-specific tagline (Code/Research/Review/etc.)
-                    // instead of always rendering the generic Executor body.
-                    // `spawn_child_inner` resolves the same kind again from the
-                    // same inputs for tool/budget application — both calls are
-                    // idempotent.
+                    // The kind resolved here writes the prompt and is passed
+                    // to `spawn_child_inner`, which applies its tools and
+                    // budget: one resolution for both.
                     let mandate_specialists = mandate
                         .as_ref()
                         .map(|_| crate::agent::specialists::SpecialistRegistry::load(None));
@@ -2218,7 +2216,8 @@ impl Agent {
                             role,
                             Some(role),
                             arg_specialist,
-                            false, // no spawn tool
+                            Some(specialist_kind),
+                            can_spawn,
                             task_id.map(|s| s.to_string()),
                             task_attempt,
                             goal_id.map(|s| s.to_string()),
@@ -2292,6 +2291,7 @@ impl Agent {
             effective_role,
             child_role,
             arg_specialist,
+            None,
             can_spawn,
             None,             // task_id (executor activity tracking)
             None,             // task_attempt
@@ -2458,6 +2458,7 @@ impl Agent {
         role: AgentRole,
         original_child_role: Option<AgentRole>,
         arg_specialist: Option<&str>,
+        resolved_kind: Option<SpecialistKind>,
         add_spawn_tool: bool,
         task_id: Option<String>,
         task_attempt: Option<crate::traits::TaskAttempt>,
@@ -2481,16 +2482,21 @@ impl Agent {
                 task_attempt.as_ref(),
             )
             .await?;
+        // A caller that already resolved the kind (and wrote the prompt from
+        // it) passes it, so the prompt and the toolset describe one
+        // specialist; only a mandate fence overrides it.
         let mut specialist_kind = if mandate_execution.is_some() {
             match role {
                 AgentRole::TaskLead => SpecialistKind::TaskLead,
                 AgentRole::Executor => SpecialistKind::Executor,
                 AgentRole::Orchestrator => SpecialistKind::Generic,
             }
+        } else if let Some(kind) = resolved_kind {
+            kind
         } else {
             Self::resolve_specialist_kind(original_child_role, arg_specialist, mission, task)
         };
-        if mandate_execution.is_none() {
+        if mandate_execution.is_none() && resolved_kind.is_none() {
             if let Some(profile_id) = task_attempt
                 .as_ref()
                 .and_then(|attempt| attempt.worker_profile_id.as_deref())

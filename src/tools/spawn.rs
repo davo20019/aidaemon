@@ -1344,6 +1344,17 @@ impl crate::traits::ToolSemantics for SpawnAgentTool {
     }
 }
 
+/// A child's typed outcome as its spawn receipt's outcome: only a child
+/// that succeeded makes the spawn a success, never its reply's wording.
+fn child_receipt_status(outcome: TaskOutcome) -> crate::traits::ToolOutcomeStatus {
+    match outcome {
+        TaskOutcome::Succeeded => crate::traits::ToolOutcomeStatus::Succeeded,
+        TaskOutcome::Partial | TaskOutcome::Failed => {
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+        }
+    }
+}
+
 /// A spawn result with the trust of its content stamped for the dispatcher.
 fn reported(output: String, trust: SourceTrust) -> ToolCallOutcome {
     let mut outcome = ToolCallOutcome::from_output(output);
@@ -1448,10 +1459,7 @@ impl SpawnAgentTool {
                 // The child's run already closed with a typed outcome: that,
                 // not a scan of its reply's wording (a review listing "Bugs"
                 // read as a failure), is the receipt's outcome.
-                outcome.metadata.outcome_status = Some(match run.outcome {
-                    TaskOutcome::Succeeded => crate::traits::ToolOutcomeStatus::Succeeded,
-                    _ => crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
-                });
+                outcome.metadata.outcome_status = Some(child_receipt_status(run.outcome));
                 Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
@@ -1465,17 +1473,23 @@ impl SpawnAgentTool {
                             .salvage_executor_task_outcome(task_id, self.timeout_secs)
                             .await
                         {
-                            let prefix = match salvaged.status.as_str() {
-                                "completed" => "\u{2705} Sub-agent complete",
-                                "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
-                                _ => "\u{274c} Sub-agent failed",
+                            let (prefix, outcome) = match salvaged.status.as_str() {
+                                "completed" => {
+                                    ("\u{2705} Sub-agent complete", TaskOutcome::Succeeded)
+                                }
+                                "blocked" => {
+                                    ("\u{26a0}\u{fe0f} Sub-agent blocked", TaskOutcome::Partial)
+                                }
+                                _ => ("\u{274c} Sub-agent failed", TaskOutcome::Failed),
                             };
                             // The child wrote these details; its taint is
                             // unknown after a timeout.
-                            return Ok(reported(
-                                format!("{prefix}\n\n{}", salvaged.details),
+                            let mut result = reported(
+                                format!("{prefix}\n\n{}\n\n{window}", salvaged.details),
                                 SourceTrust::Untrusted,
-                            ));
+                            );
+                            result.metadata.outcome_status = Some(child_receipt_status(outcome));
+                            return Ok(result);
                         }
                         if child_role == Some(AgentRole::Executor) {
                             agent
