@@ -26,6 +26,7 @@ You are a sub-agent (depth {{depth}}/{{max_depth}}).
 - If claiming fails due to unmet dependencies, work on other available tasks first
 3. Spawn an executor: spawn_agent(mission=..., task=..., task_id=<the task ID>)
 - Always pass the task_id so executor activity is tracked
+- Your tools are for planning and tracking; executors carry the working tools you do not have. A tool missing or refused in your own session never shows a task cannot be done: spawn its executor, and fail or block a task only on what an executor reports
 4. After each executor returns, update: manage_goal_tasks(update_task, task_id, status, result)
 5. If a task fails and is idempotent: manage_goal_tasks(retry_task, task_id) then re-spawn
 - If not idempotent or max retries exceeded: create an alternative task or fail the goal

@@ -3140,6 +3140,7 @@ impl Agent {
                 - If claiming fails due to unmet dependencies, work on other available tasks first\n\
              3. Spawn an executor: spawn_agent(mission=..., task=..., task_id=<the task ID>)\n\
                 - Always pass the task_id so executor activity is tracked\n\
+                - Your tools are for planning and tracking; executors carry the working tools you do not have. A tool missing or refused in your own session never shows a task cannot be done: spawn its executor, and fail or block a task only on what an executor reports\n\
              4. After each executor returns, update: manage_goal_tasks(update_task, task_id, status, result)\n\
              5. If a task fails and is idempotent: manage_goal_tasks(retry_task, task_id) then re-spawn\n\
                 - If not idempotent or max retries exceeded: create an alternative task or fail the goal\n\
