@@ -573,13 +573,7 @@ impl Tool for SpawnAgentTool {
     fn schema(&self) -> Value {
         json!({
             "name": "spawn_agent",
-            "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work \
-                is multi-step (research → synthesize, code → test, fetch → analyze), matches a named \
-                specialist (see the `specialist` enum: code, browser_verifier, research, review, \
-                artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). Several spawn_agent calls in one response run in parallel (up to 3) and you receive every result. Do NOT delegate trivial one-shot reads (a single read_file, a \
-                single web_search) — handle those directly. The sub-agent starts with a fresh context and \
-                the same tools unless its specialist narrows them (a named specialist cannot delegate \
-                further), so reference files by path and do not paste prior tool output.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {
