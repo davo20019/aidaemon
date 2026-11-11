@@ -910,7 +910,7 @@ impl Agent {
                      You are responding in a public channel visible to many people. Rules:\n\
                      - Your reply is posted directly to this channel — all members can see it. You cannot send separate messages.\n\
                      - When asked to respond to or address another user, include that response directly in your reply (e.g. \"@User, hello!\").\n\
-                     - Facts shown above are safe to reference here (they are from this channel or global).\n\
+                     - Facts shown above are safe to reference here (they belong to this channel).\n\
                      - Do NOT reference personal goals, habits, or profile preferences.\n\
                      - If you have relevant info from another conversation, mention you have it and ask if they want you to share.\n\
                      - Be professional and concise. Assume others are reading.{}",

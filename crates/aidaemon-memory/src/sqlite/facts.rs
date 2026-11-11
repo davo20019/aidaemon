@@ -1587,25 +1587,22 @@ impl FactStore for SqliteMemory {
         .fetch_all(&self.pool)
         .await?;
 
-        // Build facts and track which indices pass the privacy filter
+        // One visibility rule for every surface that shows a fact
+        // (`memory_visible`): what the prompt is given here is what a
+        // memory search would show this audience.
         let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
         let filtered_indices: Vec<usize> = all_facts
             .iter()
             .enumerate()
-            .filter(|(_, f)| match f.privacy {
-                FactPrivacy::Private => false,
-                FactPrivacy::Global => {
-                    if matches!(visibility, ChannelVisibility::PublicExternal) {
-                        !matches!(f.category.as_str(), "personal" | "health" | "finance")
-                    } else {
-                        true
-                    }
-                }
-                FactPrivacy::Channel => match (channel_id, &f.channel_id) {
-                    (Some(current), Some(fact_ch)) => self.channels.same_channel(fact_ch, current),
-                    (None, None) => true,
-                    _ => false,
-                },
+            .filter(|(_, f)| {
+                super::memory_visible(
+                    self.channels.as_ref(),
+                    f.privacy,
+                    f.channel_id.as_deref(),
+                    channel_id,
+                    visibility,
+                    requester_is_owner,
+                )
             })
             .map(|(i, _)| i)
             .collect();

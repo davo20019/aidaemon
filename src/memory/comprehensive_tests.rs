@@ -521,6 +521,70 @@ async fn test_global_fact_accessible_everywhere() {
     );
 }
 
+/// The prompt's facts follow the one visibility rule a memory search uses:
+/// a public channel gets only its own channel's facts, never global ones,
+/// and a channel fact with no channel is shown nowhere.
+#[tokio::test]
+async fn a_public_channel_gets_only_its_own_facts() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "user",
+            "city",
+            "Springfield",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "project",
+            "launch",
+            "Launch is Friday",
+            "test",
+            Some("slack:synthetic-channel-1"),
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "project",
+            "orphan",
+            "No channel",
+            "test",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    let public = store
+        .get_relevant_facts_for_channel(
+            "",
+            10,
+            Some("slack:synthetic-channel-1"),
+            crate::types::ChannelVisibility::Public,
+            true,
+        )
+        .await
+        .unwrap();
+    let keys: Vec<&str> = public.iter().map(|fact| fact.key.as_str()).collect();
+    assert_eq!(keys, vec!["launch"]);
+    let group = store
+        .get_relevant_facts_for_channel(
+            "",
+            10,
+            None,
+            crate::types::ChannelVisibility::PrivateGroup,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(group.iter().all(|fact| fact.key != "orphan"));
+}
+
 /// Verify Private facts are only accessible in OwnerDm context.
 #[tokio::test]
 async fn test_private_fact_dm_only() {
