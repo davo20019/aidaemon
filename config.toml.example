@@ -559,3 +559,23 @@ provider = "macos_say"
 voice = "Samantha"
 sample_rate_hz = 22050
 timeout_seconds = 20
+
+# Optional decision layer: a backend that answers small closed questions
+# (how a message relates to earlier ones, which recalled facts matter, which
+# model tier a request needs) with a confidence. Off by default; with it off,
+# or on any failure, the daemon behaves exactly as without it.
+# Backends: "off", "provider" (your configured chat model, asked for JSON;
+# its confidence is self-reported, so decisions that need an honest
+# confidence stay in shadow) or "gemini" (Google's Decisions API,
+# calibrated confidence; input is sent to Google, and its free tier may use
+# it to improve Google's products).
+# [decisions]
+# backend = "gemini"
+# # Empty: the key of the first google_genai provider in [provider].
+# api_key = ""
+# [decisions.mode]   # off | shadow (record, never act) | on
+# turn_digest = "shadow"
+# resume = "shadow"
+# recall_filter = "shadow"
+# model_route = "off"
+# command_risk_second = "off"

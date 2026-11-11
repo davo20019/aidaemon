@@ -50,6 +50,20 @@ impl Agent {
     /// for the root agent and the agent's own model for sub-agents.
     ///
     /// `routed` is true when the router chose it.
+    /// Whether the owner pinned a model for this agent (a `/model` switch).
+    pub(in crate::agent) async fn model_override_active(&self, session_id: &str) -> bool {
+        match tokio::time::timeout(Duration::from_secs(2), self.model_override.read()).await {
+            Ok(guard) => *guard,
+            Err(_) => {
+                warn!(
+                    session_id,
+                    "Timed out acquiring model_override lock; treating the model as pinned"
+                );
+                true
+            }
+        }
+    }
+
     pub(in crate::agent) async fn select_turn_model(
         &self,
         snapshot: &crate::llm_runtime::LlmRuntimeSnapshot,

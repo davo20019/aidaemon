@@ -42,6 +42,10 @@ pub enum MessageAnnotation {
         mime_type: String,
         size_bytes: u64,
     },
+    /// A decision backend judged this user message to state or ask about
+    /// who the owner, the assistant or their family are. Archived
+    /// rendering keeps it verbatim. Set after the message was stored.
+    IdentityCritical,
 }
 
 pub use aidaemon_tools::semantics::{AttachmentProvenance, MessageAttachment};
@@ -167,7 +171,8 @@ fn annotation_appended_marker(annotation: &MessageAnnotation) -> Option<&'static
         MessageAnnotation::InternalContinuation
         | MessageAnnotation::EntireSystemNotice
         | MessageAnnotation::WrappedUntrustedExternalData { .. }
-        | MessageAnnotation::InboundFileAttachment { .. } => None,
+        | MessageAnnotation::InboundFileAttachment { .. }
+        | MessageAnnotation::IdentityCritical => None,
     }
 }
 

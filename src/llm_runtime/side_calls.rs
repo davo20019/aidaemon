@@ -35,6 +35,9 @@ pub enum SideCall {
     SkillPromotion,
     /// Answers a sub-agent's escalation, as its request's top-level agent.
     ParentCoordination,
+    /// Answers a decision's closed questions on a chat model, when the
+    /// decision backend is `provider` (see `llm_runtime::decisions`).
+    DecisionAsk,
 }
 
 /// What a side call's answer is used for; this sets how it may fail.
@@ -99,7 +102,7 @@ pub struct SideCallSpec {
 impl SideCall {
     /// Every side call, in registry order.
     #[cfg(test)]
-    pub const ALL: [SideCall; 13] = [
+    pub const ALL: [SideCall; 14] = [
         SideCall::UntrustedVerifier,
         SideCall::CommandRisk,
         SideCall::RelationshipRouter,
@@ -113,6 +116,7 @@ impl SideCall {
         SideCall::ProcedureEnhancement,
         SideCall::SkillPromotion,
         SideCall::ParentCoordination,
+        SideCall::DecisionAsk,
     ];
 
     /// This call's spec.
@@ -150,6 +154,9 @@ impl SideCall {
             SideCall::ParentCoordination => {
                 ("parent_coordination", SafetyJudge, Primary, 90, Refuse)
             }
+            // The decision's own deadline bounds it too; whoever asked
+            // falls back to its default on failure.
+            SideCall::DecisionAsk => ("decision_ask", InputShaper, CallerSupplied, 10, SafeDefault),
         };
         SideCallSpec {
             purpose,

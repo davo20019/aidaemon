@@ -75,3 +75,30 @@ fn the_scan_sees_the_gateway() {
     assert!(rust_files_under("src")
         .any(|path| path == "src/llm_runtime/gateway.rs" && reaches_a_provider(&path)));
 }
+
+/// What reaches a decision backend directly. Callers ask through
+/// `SideCallGateway::decide`, which applies modes, deadlines, thresholds
+/// and telemetry.
+const RAW_DECIDER: &[&str] = &[
+    "GeminiDecider",
+    "ProviderDecider",
+    "dyn Decider",
+    "impl Decider",
+    "Decider::decide",
+];
+
+#[test]
+fn nothing_outside_the_gateway_holds_a_decider() {
+    let offenders = rust_files_under("src")
+        .filter(|path| !path.starts_with("src/llm_runtime/"))
+        .filter(|path| {
+            let text =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
+            RAW_DECIDER.iter().any(|needle| text.contains(needle))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        offenders.is_empty(),
+        "ask decisions through SideCallGateway::decide: {offenders:?}"
+    );
+}

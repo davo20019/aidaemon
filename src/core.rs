@@ -96,6 +96,15 @@ pub async fn run(
         state.clone(),
         event_store.clone(),
     );
+    // The optional decision layer; off unless `[decisions]` configures it.
+    // A Gemini decision backend with no key of its own uses the key of a
+    // configured `google_genai` provider.
+    side_calls.set_decisions(
+        crate::llm_runtime::decide::DecisionLayer::from_config_with_key(
+            &config.decisions,
+            config.gemini_provider_api_key().as_deref(),
+        ),
+    );
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,

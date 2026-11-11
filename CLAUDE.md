@@ -335,6 +335,12 @@ deadline, failure policy) and make it through `SideCallGateway`
 library code that takes a provider. Do not hold a raw provider or record a
 call by hand anywhere else; `llm_runtime::door_tests` fails if you do.
 
+A closed question for the optional decision backend (`[decisions]`,
+`aidaemon_decisions::Decider`) is a `Decision` in
+`src/llm_runtime/decisions.rs`, asked through `SideCallGateway::decide`; it
+may skip optional work, pick between equal-authority paths or make a check
+stricter, never grant authority or decide completion.
+
 A safety judge refuses on any failure. A memory job skips, and never writes
 from a tainted run. A side call runs no tools. A request that forces one
 named tool keeps that tool, because that is how it asks for structured output:
@@ -374,6 +380,9 @@ to synthetic equivalents before writing tests or docs.
   status. Check it before calling a gate "too strict" or "working".
 - `--cache-reuse`: prompt-cache reuse by model, first vs later calls. Check it
   before and after changing message assembly or provider request building.
+- `--decisions`: decision-layer calls per decision and backend (latency,
+  outcomes, answers over threshold and acted on), and the turn digest's
+  relationship against the committed one by confidence band.
 
 When using browser inspection tools, prefer screenshots over full accessibility
 snapshots unless element IDs are needed for interaction.

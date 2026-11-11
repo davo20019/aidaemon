@@ -485,10 +485,15 @@ fn render_archived(
         // normal transform for that message). Assistant text is never
         // exempted: an assistant "I am …" is not identity evidence, and the
         // pinned values come from typed facts.
+        // A decision backend's typed identity flag pins too; the keyword
+        // check still covers messages stored without one.
         if m.role == "user"
-            && m.content
-                .as_deref()
-                .is_some_and(text_relates_to_critical_identity)
+            && (m
+                .annotations
+                .contains(&crate::traits::MessageAnnotation::IdentityCritical)
+                || m.content
+                    .as_deref()
+                    .is_some_and(text_relates_to_critical_identity))
         {
             let mut obj = json!({
                 "role": m.role,

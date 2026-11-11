@@ -1022,6 +1022,150 @@ fn refusal_gate_label(tool: &str, message: &str) -> String {
 /// model, split into a run's first call and its later ones. Later calls
 /// resend an append-only transcript, so their reuse should approach the
 /// share of input that the previous call already sent.
+async fn print_decisions(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Decision Layer (Last {} Hours) ==\n", hours);
+    let rows = sqlx::query(
+        "SELECT task_id, json_extract(data, '$.metadata') AS metadata
+         FROM events
+         WHERE event_type = 'decision_point' AND created_at >= ?
+           AND json_extract(data, '$.metadata.condition') = 'decision_layer'
+         ORDER BY id",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    // decision/backend -> (outcomes, latencies, per question (asked, trusted, acted))
+    type Questions = std::collections::BTreeMap<String, (u64, u64, u64)>;
+    type Group = (std::collections::BTreeMap<String, u64>, Vec<u64>, Questions);
+    let mut groups: std::collections::BTreeMap<(String, String), Group> = Default::default();
+    let mut digest_relationship: std::collections::HashMap<String, (String, f64)> =
+        Default::default();
+    for row in &rows {
+        let raw: String = row.try_get("metadata").unwrap_or_default();
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let text = |key: &str| {
+            meta.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let entry = groups
+            .entry((
+                format!("{} ({})", text("decision"), text("mode")),
+                text("backend"),
+            ))
+            .or_default();
+        *entry.0.entry(text("outcome")).or_default() += 1;
+        if let Some(ms) = meta.get("latency_ms").and_then(|v| v.as_u64()) {
+            entry.1.push(ms);
+        }
+        if let Some(answers) = meta.get("answers").and_then(|v| v.as_object()) {
+            for (key, answer) in answers {
+                // Per-fact keys (f0, f1, ...) are one question kind.
+                let name = if text("decision") == "recall_filter" {
+                    "fact".to_string()
+                } else {
+                    key.clone()
+                };
+                let counts = entry.2.entry(name).or_default();
+                counts.0 += 1;
+                counts.1 += answer
+                    .get("trusted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                counts.2 += answer
+                    .get("acted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                if text("decision") == "turn_digest" && key == "relationship" {
+                    let task: String = row.try_get("task_id").unwrap_or_default();
+                    let value = answer.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let class = if value.starts_with("continuation") {
+                        "continuation"
+                    } else {
+                        value
+                    };
+                    let confidence = answer
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    digest_relationship.insert(task, (class.to_string(), confidence));
+                }
+            }
+        }
+    }
+    if groups.is_empty() {
+        println!("No decision-layer calls recorded.");
+        return Ok(());
+    }
+    for ((decision, backend), (outcomes, mut latencies, questions)) in groups {
+        latencies.sort_unstable();
+        let pct = |q: f64| {
+            latencies
+                .get(((latencies.len() as f64 - 1.0) * q).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        let total: u64 = outcomes.values().sum();
+        println!(
+            "{decision} on {backend}: {total} calls, p50 {} ms, p95 {} ms",
+            pct(0.5),
+            pct(0.95)
+        );
+        println!(
+            "  outcomes: {}",
+            outcomes
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (question, (asked, trusted, acted)) in questions {
+            println!(
+                "  {question:<22} asked {asked:>5}  over threshold {trusted:>5}  acted {acted:>5}"
+            );
+        }
+    }
+    // Shadow comparison: the digest's relationship class against the
+    // relationship the turn actually committed.
+    if !digest_relationship.is_empty() {
+        let finalized = sqlx::query(
+            "SELECT task_id, json_extract(data, '$.metadata.relationship') AS relationship
+             FROM events
+             WHERE event_type = 'decision_point' AND created_at >= ?
+               AND json_extract(data, '$.metadata.condition') = 'task_relationship_finalized'",
+        )
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await?;
+        let mut bands: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+        for row in finalized {
+            let task: String = row.try_get("task_id").unwrap_or_default();
+            let committed: String = row.try_get("relationship").unwrap_or_default();
+            if let Some((class, confidence)) = digest_relationship.get(&task) {
+                let band = if *confidence >= 0.9 {
+                    ">=0.9"
+                } else if *confidence >= 0.6 {
+                    "0.6-0.9"
+                } else {
+                    "<0.6"
+                };
+                let entry = bands.entry(band).or_default();
+                entry.0 += 1;
+                entry.1 += (class == &committed) as u64;
+            }
+        }
+        println!("\nturn_digest relationship vs committed relationship, by confidence:");
+        for (band, (n, agree)) in bands {
+            println!("  {band:<8} {agree}/{n} agree");
+        }
+    }
+    Ok(())
+}
+
 async fn print_cache_reuse(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
     let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
     println!("== Prompt-Cache Reuse (Last {} Hours) ==", hours);
@@ -1467,6 +1611,7 @@ async fn main() -> anyhow::Result<()> {
     let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
     let gate_outcomes = args.iter().any(|arg| arg == "--gate-outcomes");
     let cache_reuse = args.iter().any(|arg| arg == "--cache-reuse");
+    let decisions = args.iter().any(|arg| arg == "--decisions");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -1750,6 +1895,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if cache_reuse {
         print_cache_reuse(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if decisions {
+        print_decisions(&pool, eval_hours).await?;
         return Ok(());
     }
     if gate_outcomes {

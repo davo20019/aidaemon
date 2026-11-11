@@ -76,6 +76,7 @@ dependencies = [
  "aidaemon-channel-telegram",
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-decisions",
  "aidaemon-eval",
  "aidaemon-events",
  "aidaemon-mcp",
@@ -243,6 +244,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "aidaemon-decisions"
+version = "0.0.1"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-decisions",
+ "async-trait",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

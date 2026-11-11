@@ -48,6 +48,82 @@ impl crate::traits::MessageStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn annotate_user_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        annotation: crate::traits::MessageAnnotation,
+    ) -> anyhow::Result<()> {
+        // Stored annotations replace inferred ones, so the first added
+        // annotation starts from what would have been inferred.
+        fn add(
+            annotations: &mut Vec<crate::traits::MessageAnnotation>,
+            content: Option<&str>,
+            annotation: &crate::traits::MessageAnnotation,
+        ) {
+            if annotations.is_empty() {
+                *annotations =
+                    crate::traits::infer_message_annotations(content.unwrap_or_default());
+            }
+            if !annotations.contains(annotation) {
+                annotations.push(annotation.clone());
+            }
+        }
+        {
+            let mut wm = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.write(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("annotate_user_message: working_memory write lock timed out")
+            })?;
+            if let Some(message) = wm.get_mut(session_id).and_then(|deque| {
+                deque
+                    .iter_mut()
+                    .find(|m| m.id == message_id && m.role == "user")
+            }) {
+                add(
+                    &mut message.annotations,
+                    message.content.as_deref(),
+                    &annotation,
+                );
+            }
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT id, data FROM events WHERE session_id = ?1 AND event_type = 'user_message' AND turn_id = ?2 ORDER BY id LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let event_id: i64 = row.get("id");
+        let raw: String = row.get("data");
+        let mut data: serde_json::Value = serde_json::from_str(&raw)?;
+        let mut annotations: Vec<crate::traits::MessageAnnotation> = data
+            .get("annotations")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let content = data
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        add(&mut annotations, content.as_deref(), &annotation);
+        data["annotations"] = serde_json::to_value(&annotations)?;
+        sqlx::query("UPDATE events SET data = ?1 WHERE id = ?2")
+            .bind(serde_json::to_string(&data)?)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         // Check working memory first
         {

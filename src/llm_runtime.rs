@@ -4,6 +4,8 @@ use crate::config::{ModelsConfig, ProviderKind};
 use crate::providers::sdk_backed::ModelList;
 use crate::router::Router;
 
+pub mod decide;
+pub mod decisions;
 #[cfg(test)]
 mod door_tests;
 pub mod gateway;

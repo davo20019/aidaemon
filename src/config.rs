@@ -437,6 +437,120 @@ pub struct AppConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub authority: AuthorityConfig,
+    #[serde(default)]
+    pub decisions: DecisionsConfig,
+}
+
+/// `[decisions]`: an optional backend that answers small closed questions
+/// (how a message relates to earlier ones, which recalled facts matter,
+/// which model tier a request needs) with a confidence. Off by default;
+/// with it off, or on any failure, the daemon behaves as without it.
+#[derive(Deserialize, Clone, Default)]
+pub struct DecisionsConfig {
+    #[serde(default)]
+    pub backend: DecisionBackendKind,
+    /// For `backend = "provider"`: the model to ask; empty means the
+    /// configured cheap (fast-tier) model. For `backend = "gemini"`: the
+    /// decision model; empty means `gemini-decision-1`.
+    #[serde(default)]
+    pub model: String,
+    /// For `backend = "gemini"`: the API key, or `"keychain"` to read
+    /// `decisions_api_key` from the OS credential store. Empty means the key
+    /// of the first `google_genai` provider in `[provider]`, if any.
+    #[serde(default)]
+    pub api_key: String,
+    /// Per decision: `off`, `shadow` (ask and record, never act) or `on`.
+    #[serde(default)]
+    pub mode: DecisionModes,
+}
+
+impl fmt::Debug for DecisionsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecisionsConfig")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    ""
+                } else {
+                    "[redacted]"
+                },
+            )
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl AppConfig {
+    /// The API key of the first Gemini (`google_genai`) provider in the
+    /// provider chain (primary, then fallbacks in order), so one Gemini key
+    /// serves both model calls and the decision backend.
+    pub fn gemini_provider_api_key(&self) -> Option<String> {
+        fn find(provider: &ProviderConfig) -> Option<String> {
+            if provider.kind == ProviderKind::GoogleGenai && !provider.api_key.trim().is_empty() {
+                return Some(provider.api_key.trim().to_string());
+            }
+            provider.fallbacks.iter().find_map(find)
+        }
+        find(&self.provider)
+    }
+}
+
+/// Which decision backend answers.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionBackendKind {
+    #[default]
+    Off,
+    /// The configured chat provider, asked for JSON. Its confidence is
+    /// self-reported, so decisions that need an honest confidence stay off.
+    Provider,
+    /// Google's Decisions API (calibrated confidence).
+    Gemini,
+}
+
+/// Whether a decision runs, and whether it may act.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionMode {
+    #[default]
+    Off,
+    Shadow,
+    On,
+}
+
+/// The mode of each decision. Unset decisions are shadowed when a backend
+/// is configured, except model routing and the command second opinion,
+/// which stay off until asked for.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionModes {
+    #[serde(default = "decision_mode_shadow")]
+    pub turn_digest: DecisionMode,
+    #[serde(default = "decision_mode_shadow")]
+    pub resume: DecisionMode,
+    #[serde(default = "decision_mode_shadow")]
+    pub recall_filter: DecisionMode,
+    #[serde(default)]
+    pub model_route: DecisionMode,
+    #[serde(default)]
+    pub command_risk_second: DecisionMode,
+}
+
+fn decision_mode_shadow() -> DecisionMode {
+    DecisionMode::Shadow
+}
+
+impl Default for DecisionModes {
+    fn default() -> Self {
+        Self {
+            turn_digest: DecisionMode::Shadow,
+            resume: DecisionMode::Shadow,
+            recall_filter: DecisionMode::Shadow,
+            model_route: DecisionMode::Off,
+            command_risk_second: DecisionMode::Off,
+        }
+    }
 }
 
 /// How much the owner may do by default. Both levels act the same at the
@@ -4366,6 +4480,15 @@ impl AppConfig {
         }
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
+        }
+        if self.decisions.api_key == "keychain" {
+            // A missing key turns the optional decision layer off; it never
+            // stops the daemon from starting.
+            self.decisions.api_key =
+                resolve_from_keychain("decisions_api_key").unwrap_or_else(|error| {
+                    tracing::warn!(%error, "decisions api key not found; decision layer disabled");
+                    String::new()
+                });
         }
         if self.terminal.daemon_connect_token.as_deref() == Some("keychain") {
             self.terminal.daemon_connect_token =

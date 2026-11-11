@@ -437,6 +437,102 @@ async fn build_isolated_mandate_bootstrap(
     })))
 }
 
+/// Whether an owner message asks to resume an interrupted task. The
+/// keyword check decides unless the decision layer is on, an interrupted
+/// task exists, and the backend answers with a calibrated confidence of 0.8
+/// or more. In shadow mode the decision runs beside the turn, recorded only.
+async fn wants_resume(agent: &Agent, session_id: &str, user_text: &str) -> bool {
+    use crate::llm_runtime::decisions::Decision;
+    let keyword = is_resume_request(user_text);
+    let mode = agent.side_calls.decision_mode(Decision::Resume);
+    if mode == crate::config::DecisionMode::Off {
+        return keyword;
+    }
+    // Typed state first: with no interrupted task there is nothing to ask.
+    let Some(active) = agent
+        .event_store
+        .get_active_task(session_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return keyword;
+    };
+    let description = active
+        .parse_data::<crate::events::TaskStartData>()
+        .ok()
+        .map(|data| data.description)
+        .unwrap_or_default();
+    let request = aidaemon_decisions::DecisionRequest::new(format!(
+        "An earlier task was interrupted before it finished:\n{}\n\nCurrent user message:\n{}",
+        crate::utils::truncate_str(&description, 2000),
+        crate::utils::truncate_str(user_text, 2000)
+    ))
+    .ask(
+        "resume",
+        aidaemon_decisions::Question::yes_no_described(
+            "Does the current user message ask to resume or continue the interrupted task?",
+            "Yes: it asks to pick the interrupted task back up, in any language.",
+            "No: it is about something else, or asks a new question.",
+        ),
+    );
+    if mode == crate::config::DecisionMode::Shadow {
+        let side_calls = agent.side_calls.clone();
+        let session = session_id.to_string();
+        tokio::spawn(async move {
+            side_calls
+                .decide(
+                    Decision::Resume,
+                    request,
+                    crate::llm_runtime::decide::DecisionContext {
+                        session_id: Some(&session),
+                        task_id: None,
+                    },
+                )
+                .await;
+        });
+        return keyword;
+    }
+    let outcome = agent
+        .side_calls
+        .decide(
+            Decision::Resume,
+            request,
+            crate::llm_runtime::decide::DecisionContext {
+                session_id: Some(session_id),
+                task_id: None,
+            },
+        )
+        .await;
+    outcome
+        .acted("resume")
+        .and_then(aidaemon_decisions::Answer::p_yes)
+        .map_or(keyword, |p| p >= 0.5)
+}
+
+/// Stores the turn digest's identity flag on the user message, so
+/// archived rendering keeps it verbatim. Advisory: a failure is logged.
+async fn annotate_identity(
+    state: &dyn crate::traits::StateStore,
+    session_id: &str,
+    message_id: &str,
+    outcome: &crate::llm_runtime::decisions::DecisionOutcome,
+) {
+    if !super::task_planning::digest_identity(outcome) {
+        return;
+    }
+    if let Err(error) = state
+        .annotate_user_message(
+            session_id,
+            message_id,
+            crate::traits::MessageAnnotation::IdentityCritical,
+        )
+        .await
+    {
+        warn!(session_id, %error, "Could not store the identity flag");
+    }
+}
+
 pub(in crate::agent) async fn run_bootstrap(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &BootstrapCtx<'_>,
@@ -470,22 +566,24 @@ pub(in crate::agent) async fn run_bootstrap(
     // Resume checkpoints can contain prior tool arguments/results and broader
     // owner authority. A collaborator starts a fresh scoped turn instead of
     // inheriting an interrupted owner task from the shared session.
-    let resume_checkpoint =
-        if !is_mandate_execution && user_role == UserRole::Owner && is_resume_request(user_text) {
-            match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
-                Ok(checkpoint) => checkpoint,
-                Err(e) => {
-                    warn!(
-                        session_id,
-                        error = %e,
-                        "Failed to build resume checkpoint; continuing without resume context"
-                    );
-                    None
-                }
+    let resume_checkpoint = if !is_mandate_execution
+        && user_role == UserRole::Owner
+        && wants_resume(agent, session_id, user_text).await
+    {
+        match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
+            Ok(checkpoint) => checkpoint,
+            Err(e) => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "Failed to build resume checkpoint; continuing without resume context"
+                );
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     let resumed_from_task_id = resume_checkpoint.as_ref().map(|c| c.task_id.clone());
 
     // Generate task ID for this request
@@ -942,22 +1040,46 @@ pub(in crate::agent) async fn run_bootstrap(
     // follow-up/clarification edge. Do not make that persisted topology depend
     // on a second language call; the finalizer resolves the exact graph node
     // (or fails closed on ambiguity).
-    let relationship_fallback = if planner_skip_reason.is_some()
+    let relationship_needed = !(planner_skip_reason.is_some()
         || matches!(
             initial_turn_context.followup_mode,
             Some(
                 crate::agent::followup::FollowupMode::Followup
                     | crate::agent::followup::FollowupMode::ClarificationAnswer
             )
-        ) {
-        None
-    } else {
+        ))
+        && planner_context.is_some();
+    // The optional turn digest (decision layer): one call that can stand in
+    // for the relationship router and flags identity messages and the
+    // model tier. It runs only on turns a person wrote. It is awaited only
+    // when an answer of it is acted on this turn; otherwise it runs beside
+    // the turn and its identity flag lands on the stored message.
+    let digest_mode = agent
+        .side_calls
+        .decision_mode(crate::llm_runtime::decisions::Decision::TurnDigest);
+    let digest = (digest_mode != crate::config::DecisionMode::Off && planner_skip_reason.is_none())
+        .then(|| {
+            super::task_planning::turn_digest_request(
+                user_text,
+                relationship_needed
+                    .then_some(planner_context.as_deref())
+                    .flatten(),
+            )
+        });
+    let digest_awaited = digest.is_some()
+        && digest_mode == crate::config::DecisionMode::On
+        && (relationship_needed
+            || agent
+                .side_calls
+                .decision_mode(crate::llm_runtime::decisions::Decision::ModelRoute)
+                == crate::config::DecisionMode::On);
+    let router = async {
         match planner_context.as_deref() {
             // The relationship router classifies the request; it does not
             // need the strongest model. The gateway runs it on the fast tier
             // with the failover providers behind it, so a used-up primary
             // quota does not cost the turn its relationship edge.
-            Some(context) => {
+            Some(context) if relationship_needed => {
                 super::task_planning::generate_task_relationship(
                     &agent.side_calls,
                     user_text,
@@ -965,8 +1087,94 @@ pub(in crate::agent) async fn run_bootstrap(
                 )
                 .await
             }
-            None => None,
+            _ => None,
         }
+    };
+    let (relationship_fallback, digest_outcome) = match digest {
+        Some(digest) if digest_awaited => {
+            let outcome = agent
+                .side_calls
+                .decide(
+                    crate::llm_runtime::decisions::Decision::TurnDigest,
+                    digest.request,
+                    crate::llm_runtime::decide::DecisionContext::turn(session_id, &task_id),
+                )
+                .await;
+            let decided = super::task_planning::digest_relationship(&outcome, &digest.antecedents);
+            let relationship = match decided {
+                Some(shape) => {
+                    info!(
+                        session_id,
+                        relationship = ?shape.request_relationship,
+                        "Turn digest decided the relationship; router skipped"
+                    );
+                    Some(shape)
+                }
+                // Below threshold, failed or timed out: today's router.
+                None => router.await,
+            };
+            (relationship, Some(outcome))
+        }
+        Some(digest) => {
+            let side_calls = agent.side_calls.clone();
+            let state = agent.state.clone();
+            let session = session_id.to_string();
+            let task = task_id.clone();
+            let message_id = user_msg_id.clone();
+            tokio::spawn(async move {
+                let outcome = side_calls
+                    .decide(
+                        crate::llm_runtime::decisions::Decision::TurnDigest,
+                        digest.request,
+                        crate::llm_runtime::decide::DecisionContext::turn(&session, &task),
+                    )
+                    .await;
+                annotate_identity(&*state, &session, &message_id, &outcome).await;
+            });
+            (router.await, None)
+        }
+        None => (router.await, None),
+    };
+    if let Some(outcome) = digest_outcome.as_ref() {
+        annotate_identity(&*agent.state, session_id, &user_msg_id, outcome).await;
+    }
+    // Model routing (decision layer): only a turn that starts a new
+    // request, on the default model choice (no owner override, no policy
+    // route), moves to the fast or smart tier, and only on an answer
+    // confident enough for that direction. A continuation stays put.
+    let model = match (digest_outcome.as_ref(), llm_router.as_ref()) {
+        (Some(outcome), Some(router))
+            if !routed
+                && agent
+                    .side_calls
+                    .decision_mode(crate::llm_runtime::decisions::Decision::ModelRoute)
+                    == crate::config::DecisionMode::On
+                && relationship_fallback.as_ref().is_none_or(|shape| {
+                    shape.request_relationship.as_deref() == Some("new_request")
+                })
+                && !agent.model_override_active(session_id).await =>
+        {
+            match outcome
+                .acted(crate::llm_runtime::decisions::digest_keys::TIER)
+                .and_then(crate::llm_runtime::decisions::model_route_tier)
+            {
+                Some(tier) if !router.select(tier).trim().is_empty() => {
+                    let routed_model = router.select(tier).to_string();
+                    if routed_model != model {
+                        info!(
+                            session_id,
+                            %tier,
+                            from = %model,
+                            to = %routed_model,
+                            "Turn digest routed the new request to another model tier"
+                        );
+                    }
+                    routed_model
+                }
+                _ => model,
+            }
+        }
+        _ => model,
     };
     let turn_context = finalize_turn_assessment(
         agent,

@@ -13,6 +13,19 @@ pub trait MessageStore: Send + Sync {
     /// Canonical persistence is handled via emitted events.
     async fn append_message(&self, msg: &super::Message) -> anyhow::Result<()>;
 
+    /// Add `annotation` to a stored user message (identified by its id,
+    /// which is also its turn id), in the hot window and in the canonical
+    /// event. A store that cannot annotate ignores it: annotations added
+    /// this way are advisory rendering hints.
+    async fn annotate_user_message(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _annotation: super::MessageAnnotation,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get recent messages for a session from working memory.
     async fn get_history(
         &self,

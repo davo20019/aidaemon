@@ -23,6 +23,7 @@ members = [
     "crates/aidaemon-mcp",
     "crates/aidaemon-agents",
     "crates/aidaemon-policies",
+    "crates/aidaemon-decisions",
     "crates/aidaemon-eval",
     "crates/aidaemon-memory",
     "crates/aidaemon-events",
@@ -110,6 +111,7 @@ aidaemon-core = { path = "crates/aidaemon-core" }
 # The kernel's run journal and checkpoints, on the daemon's own pool.
 aidaemon-store-sqlite = { path = "crates/aidaemon-store-sqlite" }
 aidaemon-policies = { path = "crates/aidaemon-policies" }
+aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { path = "crates/aidaemon-tools" }
@@ -175,6 +177,7 @@ aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] 
 aidaemon-eval = { path = "crates/aidaemon-eval" }
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
 aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
+aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"

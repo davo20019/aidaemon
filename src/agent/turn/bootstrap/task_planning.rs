@@ -260,6 +260,175 @@ pub(crate) async fn generate_task_relationship(
     })
 }
 
+/// The turn digest's request: one decision call per user message. The
+/// relationship question is asked only when there is a conversation to
+/// relate to; its options carry the antecedent, one `continuation_<n>`
+/// option per earlier user message the conversation context names, so the
+/// class and the antecedent come back as one answer.
+pub(crate) struct TurnDigestRequest {
+    pub request: aidaemon_decisions::DecisionRequest,
+    /// `continuation_<n>` option -> user message id.
+    pub antecedents: std::collections::BTreeMap<String, String>,
+}
+
+const RELATIONSHIP_CLASSES: [(&str, &str); 3] = [
+    (
+        "new_request",
+        "The message starts a new, separate request, even if it is on a similar topic as earlier ones.",
+    ),
+    (
+        "clarification_answer",
+        "The message answers a question the assistant just asked.",
+    ),
+    (
+        "courtesy",
+        "Thanks, greetings or acknowledgements with no request.",
+    ),
+];
+
+const TIERS: [(&str, &str); 3] = [
+    (
+        "fast",
+        "Answerable right away from general knowledge or the conversation: no tools, no live or personal data, low stakes.",
+    ),
+    (
+        "primary",
+        "Needs tools, live or personal data, or a few steps of moderate work.",
+    ),
+    (
+        "smart",
+        "Needs deep reasoning, long multi-step work, code changes, or carries high stakes.",
+    ),
+];
+
+/// Earlier user message ids named in the relationship context, in order,
+/// without repeats. Reads the context's own row formats (`[message_id=X] U:`
+/// and owed `USER message_id="X"` rows); it never reads message wording.
+pub(crate) fn relationship_candidate_ids(conversation_context: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for line in conversation_context.lines() {
+        let line = line.trim_start();
+        let id = if let Some(rest) = line.strip_prefix("- [message_id=") {
+            rest.split_once("] U:").map(|(id, _)| id)
+        } else if let Some(rest) = line.strip_prefix("USER message_id=\"") {
+            rest.split_once('"').map(|(id, _)| id)
+        } else {
+            None
+        };
+        if let Some(id) = id
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != "unknown")
+        {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// Builds the turn digest. `conversation_context` is the router's context
+/// when the relationship should be asked, `None` otherwise.
+pub(crate) fn turn_digest_request(
+    user_text: &str,
+    conversation_context: Option<&str>,
+) -> TurnDigestRequest {
+    use crate::llm_runtime::decisions::digest_keys;
+    use aidaemon_decisions::{DecisionRequest, Question};
+
+    let mut antecedents = std::collections::BTreeMap::new();
+    let input = match conversation_context.filter(|context| !context.trim().is_empty()) {
+        Some(context) => format!(
+            "Recent conversation with stable message IDs:\n{}\n\nCurrent user message:\n{}",
+            truncate_str(context, 6000),
+            truncate_str(user_text, 4000)
+        ),
+        None => format!("Current user message:\n{}", truncate_str(user_text, 4000)),
+    };
+    let mut request = DecisionRequest::new(input);
+    if let Some(context) = conversation_context.filter(|context| !context.trim().is_empty()) {
+        let mut options: Vec<(String, String)> = RELATIONSHIP_CLASSES
+            .iter()
+            .map(|(key, description)| (key.to_string(), description.to_string()))
+            .collect();
+        // The newest candidates matter most; the choice holds at most 255.
+        let ids = relationship_candidate_ids(context);
+        let skip = ids.len().saturating_sub(64);
+        for (n, id) in ids.into_iter().skip(skip).enumerate() {
+            let key = format!("continuation_{n}");
+            options.push((
+                key.clone(),
+                format!(
+                    "The message advances, retries, corrects or asks about the earlier user message with message_id={id}."
+                ),
+            ));
+            antecedents.insert(key, id);
+        }
+        request.insert(
+            digest_keys::RELATIONSHIP,
+            Question::choice(
+                "How does the current user message relate to the conversation? Judge the whole meaning, not isolated words.",
+                options,
+            ),
+        );
+    }
+    request.insert(
+        digest_keys::IDENTITY,
+        Question::yes_no_described(
+            "Does the current user message state, correct or ask about who the user, the assistant, or the user's family members are (names, relationships)?",
+            "Yes: it states or asks about such an identity, in any language.",
+            "No: it does not, even if it mentions names or family in passing, or quotes text for another purpose.",
+        ),
+    );
+    request.insert(
+        digest_keys::TIER,
+        Question::choice(
+            "Which model tier should handle the current user message?",
+            TIERS,
+        ),
+    );
+    TurnDigestRequest {
+        request,
+        antecedents,
+    }
+}
+
+/// The relationship edge the digest decided, when its answer may be acted
+/// on. Shaped like the router's answer, so the rest of the turn is the same.
+pub(crate) fn digest_relationship(
+    outcome: &crate::llm_runtime::decisions::DecisionOutcome,
+    antecedents: &std::collections::BTreeMap<String, String>,
+) -> Option<PlannedTaskShape> {
+    let answer = outcome.acted(crate::llm_runtime::decisions::digest_keys::RELATIONSHIP)?;
+    let chosen = answer.chosen()?;
+    let (relationship, antecedent) = match antecedents.get(chosen) {
+        Some(id) => ("continuation", Some(id.clone())),
+        None if RELATIONSHIP_CLASSES.iter().any(|(key, _)| *key == chosen) => (chosen, None),
+        None => return None,
+    };
+    let shape = PlannedTaskShape {
+        confidence: Some(
+            if answer.confidence >= 0.8 {
+                "high"
+            } else {
+                "medium"
+            }
+            .to_string(),
+        ),
+        request_relationship: Some(relationship.to_string()),
+        antecedent_user_message_id: antecedent,
+    };
+    planned_task_relationship_is_complete(&shape).then_some(shape)
+}
+
+/// Whether the digest flags the message as identity-critical.
+pub(crate) fn digest_identity(outcome: &crate::llm_runtime::decisions::DecisionOutcome) -> bool {
+    outcome
+        .acted(crate::llm_runtime::decisions::digest_keys::IDENTITY)
+        .and_then(aidaemon_decisions::Answer::p_yes)
+        .is_some_and(|p| p >= 0.5)
+}
+
 /// Determine whether a turn bypasses the relationship router. Semantic
 /// interpretation belongs to the model. Only protocol-level acknowledgments
 /// and exact emergency control commands bypass it.
@@ -556,5 +725,144 @@ mod tests {
             assert_eq!(denied, MemoryPipelinePolicy::SuppressedByCurrentContract);
             assert!(!denied.allows_recall() && !denied.allows_memory());
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use std::collections::BTreeMap;
+
+    use aidaemon_decisions::{Answer, ConfidenceSource, DecisionResponse, QuestionKind};
+
+    use super::*;
+    use crate::llm_runtime::decide::gated_for_tests;
+    use crate::llm_runtime::decisions::{digest_keys, Decision};
+
+    const CONTEXT: &str = "[Session Summary] synthetic summary\n\
+        - [message_id=msg-1] U: book a table for Alice Rivera\n\
+        - [message_id=msg-2] A: Which day?\n\
+        - [message_id=msg-3] U: check the build\n\n\
+        Unfinished owner requests that a continuation may advance (copy the exact message_id):\n\
+        USER message_id=\"msg-0\" (unfinished request): \"deploy the docs\"\n\
+        USER message_id=\"msg-1\" (unfinished request): \"book a table\"";
+
+    fn outcome(
+        key: &str,
+        answer: Answer,
+        acting: bool,
+    ) -> crate::llm_runtime::decisions::DecisionOutcome {
+        let mut answers = BTreeMap::new();
+        answers.insert(key.to_string(), answer);
+        gated_for_tests(
+            Decision::TurnDigest,
+            DecisionResponse::new("test", answers, Default::default()),
+            acting,
+        )
+    }
+
+    #[test]
+    fn candidates_are_user_rows_and_owed_requests_once_each() {
+        assert_eq!(
+            relationship_candidate_ids(CONTEXT),
+            vec!["msg-1", "msg-3", "msg-0"]
+        );
+    }
+
+    #[test]
+    fn the_relationship_carries_one_option_per_candidate() {
+        let digest = turn_digest_request("yes, Friday", Some(CONTEXT));
+        let Some(question) = digest.request.questions.get(digest_keys::RELATIONSHIP) else {
+            panic!("relationship asked");
+        };
+        let QuestionKind::Choice { options } = &question.kind else {
+            panic!("a choice");
+        };
+        assert_eq!(options.len(), 3 + 3);
+        assert_eq!(digest.antecedents.get("continuation_0").unwrap(), "msg-1");
+        assert!(digest.request.validate().is_ok());
+    }
+
+    #[test]
+    fn without_a_conversation_only_identity_and_tier_are_asked() {
+        let digest = turn_digest_request("what is my daughter's name?", None);
+        assert!(!digest
+            .request
+            .questions
+            .contains_key(digest_keys::RELATIONSHIP));
+        assert!(digest.request.questions.contains_key(digest_keys::IDENTITY));
+        assert!(digest.request.questions.contains_key(digest_keys::TIER));
+        assert!(digest.request.validate().is_ok());
+    }
+
+    #[test]
+    fn a_continuation_option_becomes_the_routers_edge() {
+        let digest = turn_digest_request("yes, Friday", Some(CONTEXT));
+        let decided = outcome(
+            digest_keys::RELATIONSHIP,
+            Answer::choice("continuation_0", 0.85, ConfidenceSource::Calibrated),
+            true,
+        );
+        let shape = digest_relationship(&decided, &digest.antecedents).unwrap();
+        assert_eq!(shape.request_relationship.as_deref(), Some("continuation"));
+        assert_eq!(shape.antecedent_user_message_id.as_deref(), Some("msg-1"));
+        assert_eq!(shape.confidence.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_class_answer_has_no_antecedent() {
+        let digest = turn_digest_request("thanks!", Some(CONTEXT));
+        let decided = outcome(
+            digest_keys::RELATIONSHIP,
+            Answer::choice("courtesy", 0.7, ConfidenceSource::Calibrated),
+            true,
+        );
+        let shape = digest_relationship(&decided, &digest.antecedents).unwrap();
+        assert_eq!(shape.request_relationship.as_deref(), Some("courtesy"));
+        assert!(shape.antecedent_user_message_id.is_none());
+        assert_eq!(shape.confidence.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn unsure_shadow_or_self_reported_answers_fall_back_to_the_router() {
+        let digest = turn_digest_request("yes", Some(CONTEXT));
+        for (answer, acting) in [
+            (
+                Answer::choice("new_request", 0.55, ConfidenceSource::Calibrated),
+                true,
+            ),
+            (
+                Answer::choice("new_request", 0.95, ConfidenceSource::Calibrated),
+                false,
+            ),
+            (
+                Answer::choice("new_request", 0.99, ConfidenceSource::SelfReported),
+                true,
+            ),
+        ] {
+            let decided = outcome(digest_keys::RELATIONSHIP, answer, acting);
+            assert!(digest_relationship(&decided, &digest.antecedents).is_none());
+        }
+    }
+
+    #[test]
+    fn identity_is_flagged_only_on_yes() {
+        let yes = outcome(
+            digest_keys::IDENTITY,
+            Answer::yes_no(0.7, ConfidenceSource::SelfReported),
+            true,
+        );
+        assert!(digest_identity(&yes));
+        let no = outcome(
+            digest_keys::IDENTITY,
+            Answer::yes_no(0.2, ConfidenceSource::Calibrated),
+            true,
+        );
+        assert!(!digest_identity(&no));
+        let shadow = outcome(
+            digest_keys::IDENTITY,
+            Answer::yes_no(0.9, ConfidenceSource::Calibrated),
+            false,
+        );
+        assert!(!digest_identity(&shadow));
     }
 }

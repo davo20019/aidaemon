@@ -25,6 +25,8 @@ pub struct SideCallGateway {
     runtime: SharedLlmRuntime,
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
+    /// The optional decision backend (`decide`); empty when none is set.
+    pub(super) decisions: Arc<std::sync::RwLock<Option<super::decide::DecisionLayer>>>,
 }
 
 /// A side call's answer.
@@ -167,7 +169,20 @@ impl SideCallGateway {
             runtime,
             state,
             event_store,
+            decisions: Default::default(),
         }
+    }
+
+    pub(super) fn runtime_handle(&self) -> &SharedLlmRuntime {
+        &self.runtime
+    }
+
+    pub(super) fn event_store_handle(&self) -> Arc<EventStore> {
+        self.event_store.clone()
+    }
+
+    pub(super) fn state_handle(&self) -> Arc<dyn StateStore> {
+        self.state.clone()
     }
 
     /// One request, no tools. `model` is required when the spec says

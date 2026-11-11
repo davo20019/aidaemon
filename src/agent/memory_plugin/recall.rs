@@ -50,6 +50,69 @@ impl DaemonRecall {
         Self { memory, turn }
     }
 
+    /// Starts the recall filter over `facts`, when the decision layer runs
+    /// it. Resolves to the ids of facts to drop: only a calibrated answer
+    /// with P(relevant) below 0.15 drops one, and facts in identity
+    /// categories are never asked about, so they are always kept. In shadow
+    /// mode, or on any failure, nothing is dropped.
+    fn spawn_fact_filter(
+        &self,
+        facts: &[aidaemon_memory::records::Fact],
+    ) -> Option<tokio::task::JoinHandle<Option<std::collections::HashSet<i64>>>> {
+        use crate::llm_runtime::decisions::Decision;
+        let side_calls = self.memory.side_calls.clone();
+        if side_calls.decision_mode(Decision::RecallFilter) == crate::config::DecisionMode::Off {
+            return None;
+        }
+        let mut request = aidaemon_decisions::DecisionRequest::new(format!(
+            "User message:\n{}",
+            crate::utils::truncate_str(&self.turn.user_text, 3000)
+        ));
+        let mut asked = std::collections::BTreeMap::new();
+        for fact in facts
+            .iter()
+            .filter(|fact| !IDENTITY_CATEGORIES.contains(&fact.category.as_str()))
+        {
+            let key = format!("f{}", asked.len());
+            request.insert(
+                key.clone(),
+                aidaemon_decisions::Question::yes_no(format!(
+                    "Would this remembered fact help answer or carry out the user's message? Fact: [{}] {}: {}",
+                    fact.category,
+                    fact.key,
+                    crate::utils::truncate_str(&fact.value, 300)
+                )),
+            );
+            asked.insert(key, fact.id);
+        }
+        if asked.is_empty() {
+            return None;
+        }
+        let session = self.turn.session_id.clone();
+        let task = self.turn.task_id.clone();
+        Some(tokio::spawn(async move {
+            let outcome = side_calls
+                .decide(
+                    Decision::RecallFilter,
+                    request,
+                    crate::llm_runtime::decide::DecisionContext::turn(&session, &task),
+                )
+                .await;
+            Some(
+                asked
+                    .iter()
+                    .filter(|(key, _)| {
+                        outcome
+                            .acted(key)
+                            .and_then(aidaemon_decisions::Answer::p_yes)
+                            .is_some_and(|p| p < 0.5)
+                    })
+                    .map(|(_, id)| *id)
+                    .collect(),
+            )
+        }))
+    }
+
     /// The daemon memory block: critical facts, core profile, then the
     /// query-ranked memory sections. Channel, role and policy scoping are
     /// applied here.
@@ -84,6 +147,11 @@ impl DaemonRecall {
                 "facts",
             )
         };
+
+        // The optional recall filter (decision layer) asks which of these
+        // facts matter to the message. It runs beside the lookups below and
+        // is awaited where the facts are rendered.
+        let fact_filter = self.spawn_fact_filter(&facts);
 
         // Critical facts (identity/profile): bounded identity categories only,
         // owner DMs (delegated agents included).
@@ -244,6 +312,26 @@ impl DaemonRecall {
             profile_str
         } else {
             String::new()
+        };
+
+        let facts = match fact_filter {
+            Some(filter) => match filter.await {
+                Ok(Some(drop)) if !drop.is_empty() => {
+                    let before = facts.len();
+                    let kept: Vec<_> = facts
+                        .into_iter()
+                        .filter(|fact| !drop.contains(&fact.id))
+                        .collect();
+                    info!(
+                        dropped = before - kept.len(),
+                        kept = kept.len(),
+                        "Recall filter dropped facts irrelevant to the message"
+                    );
+                    kept
+                }
+                _ => facts,
+            },
+            None => facts,
         };
 
         let memory_context = MemoryContext {
