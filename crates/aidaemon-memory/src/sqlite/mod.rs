@@ -88,6 +88,15 @@ pub trait Reranker: Send + Sync {
         query: String,
         documents: Vec<String>,
     ) -> anyhow::Result<Vec<(usize, f32)>>;
+
+    /// The score below which a reranked search candidate is not relevant
+    /// and is dropped (exact-key matches are kept regardless). The scale is
+    /// specific to the model: cross-encoders emit logits or probabilities
+    /// with different ranges, so only the implementation can say. `None`
+    /// disables the floor, and the search pool caps are the only gate.
+    fn relevance_floor(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// The store's embedding and reranking models.
