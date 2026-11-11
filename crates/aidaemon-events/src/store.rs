@@ -1738,11 +1738,121 @@ impl EventStore {
             .await?;
         self.adopt_continuation_evidence(session_id, task_id, &mut events)
             .await?;
+        self.adopt_delegated_evidence(session_id, task_id, &mut events)
+            .await?;
         Ok(RunAggregate::replay_on_paths(
             task_id,
             &events,
             self.paths.clone(),
         ))
+    }
+
+    /// Work a run delegated is work the run did: the successful receipts of
+    /// the sub-agent runs it spawned (and theirs, through the typed
+    /// `spawned_by` link, bounded) are adopted into its history as durable
+    /// replays, so its own expectations are credited by what its sub-agents
+    /// observed or changed, matched by exact target like any receipt.
+    ///
+    /// Only typed, succeeded receipts are adopted; never a failed, refused or
+    /// in-flight one, and never a child's `spawn_agent` receipt (its own
+    /// children are read directly). A child's obligation ids are dropped: an
+    /// adopted receipt can satisfy the parent's expectations only by what it
+    /// touched, never bind to the child's own checklist. Each keeps its own
+    /// event id, so the replay orders it where it happened.
+    async fn adopt_delegated_evidence(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        events: &mut Vec<Event>,
+    ) -> anyhow::Result<()> {
+        const MAX_DELEGATED_RUNS: usize = 24;
+        const MAX_DELEGATION_DEPTH: usize = 3;
+        let mut pending = self
+            .spawned_children(task_id)
+            .await?
+            .into_iter()
+            .map(|child| (child, 1usize))
+            .collect::<Vec<_>>();
+        let mut visited = 0usize;
+        let mut adopted = Vec::new();
+        while let Some((child, depth)) = pending.pop() {
+            visited += 1;
+            if visited > MAX_DELEGATED_RUNS {
+                break;
+            }
+            if depth < MAX_DELEGATION_DEPTH {
+                for grandchild in self.spawned_children(&child.task_id).await? {
+                    pending.push((grandchild, depth + 1));
+                }
+            }
+            let child_events = self
+                .query_task_events_for_session(&child.session_id, &child.task_id)
+                .await?;
+            let mut calls = std::collections::HashMap::new();
+            for event in &child_events {
+                if event.event_type == EventType::ToolCall {
+                    if let Ok(call) =
+                        serde_json::from_value::<super::ToolCallData>(event.data.clone())
+                    {
+                        calls.insert(call.tool_call_id.clone(), call);
+                    }
+                }
+            }
+            for event in &child_events {
+                if event.event_type != EventType::ToolResult {
+                    continue;
+                }
+                let Ok(mut result) =
+                    serde_json::from_value::<super::ToolResultData>(event.data.clone())
+                else {
+                    continue;
+                };
+                let Some(result_id) = result
+                    .receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.result_provenance.result_id.clone())
+                else {
+                    continue;
+                };
+                if !result.succeeded() {
+                    continue;
+                }
+                let Some(mut call) = calls.remove(&result.tool_call_id) else {
+                    continue;
+                };
+                if call.name == "spawn_agent" {
+                    continue;
+                }
+                call.task_id = Some(task_id.to_string());
+                call.obligation_ids.clear();
+                call.operation_lineage = Some(super::ToolOperationLineage::DurableReplay {
+                    source_operation_id: call.tool_call_id.clone(),
+                    source_result_id: result_id,
+                });
+                result.task_id = Some(task_id.to_string());
+                if let Some(receipt) = result.receipt.as_mut() {
+                    receipt.completion_obligation_ids.clear();
+                }
+                let mut call_event = Event::new(
+                    session_id,
+                    EventType::ToolCall,
+                    serde_json::to_value(&call)?,
+                );
+                call_event.id = event.id;
+                call_event.task_id = Some(task_id.to_string());
+                let mut result_event = Event::new(
+                    session_id,
+                    EventType::ToolResult,
+                    serde_json::to_value(&result)?,
+                );
+                result_event.id = event.id;
+                result_event.task_id = Some(task_id.to_string());
+                adopted.push(call_event);
+                adopted.push(result_event);
+            }
+        }
+        events.extend(adopted);
+        Ok(())
     }
 
     /// A background continuation child inherits the parent's observation
@@ -4874,6 +4984,175 @@ mod tests {
             proof[0].obligation_ids,
             ["task:synthetic-task/obligation:evidence:0"]
         );
+    }
+
+    async fn append_child_receipt(
+        store: &EventStore,
+        session: &str,
+        task: &str,
+        call_id: &str,
+        path: &str,
+        outcome: crate::traits::ToolOutcomeStatus,
+    ) {
+        let call = ToolCallData {
+            tool_call_id: call_id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": path}),
+            summary: None,
+            task_id: Some(task.to_string()),
+            idempotency_key: None,
+            policy_rev: None,
+            risk_score: None,
+            stable_operation_key: None,
+            obligation_ids: vec![format!("task:{task}/obligation:checklist:0")],
+            max_operation_attempts: None,
+            max_operation_invocations: None,
+            operation_lineage: None,
+            turn_id: None,
+        };
+        store
+            .append(Event::new(
+                session,
+                EventType::ToolCall,
+                serde_json::to_value(&call).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let mut semantics = crate::traits::ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+        semantics.target_hints.push(
+            crate::traits::ToolTargetHint::new(crate::traits::ToolTargetHintKind::Path, path)
+                .unwrap(),
+        );
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(outcome),
+            semantics,
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let mut receipt = crate::ToolReceiptV1::from_metadata(
+            &metadata,
+            outcome,
+            crate::ToolOutcomeEvidenceSource::ToolReported,
+            None,
+        );
+        receipt.result_provenance.result_id = Some(format!("result:{call_id}"));
+        receipt.invocation_stage = crate::traits::ToolInvocationStage::Dispatched;
+        receipt.completion_obligation_ids = vec![format!("task:{task}/obligation:checklist:0")];
+        let result = ToolResultData {
+            message_id: None,
+            tool_call_id: call_id.to_string(),
+            name: "read_file".to_string(),
+            result: "synthetic".to_string(),
+            success: outcome == crate::traits::ToolOutcomeStatus::Succeeded,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(task.to_string()),
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(receipt),
+        };
+        store
+            .append(Event::new(
+                session,
+                EventType::ToolResult,
+                serde_json::to_value(&result).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// A run's record includes what its sub-agents (and theirs) did
+    /// successfully, by exact target and without the children's own
+    /// obligations; failed calls and unrelated runs never enter it.
+    #[tokio::test]
+    async fn delegated_evidence_folds_sub_agent_receipts_into_the_parent() {
+        use crate::traits::ToolOutcomeStatus::{FailedPermanent, Succeeded};
+        let (store, _database) = setup_store().await;
+        let parent = crate::TaskRef {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            task_id: "task-parent".to_string(),
+        };
+        let child = crate::TaskRef {
+            session_id: "specialist:child".to_string(),
+            task_id: "task-child".to_string(),
+        };
+        append_spawn_task_start(&store, &parent.session_id, "task-parent", "turn-1", None).await;
+        append_spawn_task_start(
+            &store,
+            "specialist:child",
+            "task-child",
+            "turn-c",
+            Some(parent.clone()),
+        )
+        .await;
+        append_spawn_task_start(
+            &store,
+            "specialist:grandchild",
+            "task-grandchild",
+            "turn-g",
+            Some(child.clone()),
+        )
+        .await;
+        append_spawn_task_start(&store, "specialist:other", "task-other", "turn-o", None).await;
+        append_child_receipt(
+            &store,
+            "specialist:child",
+            "task-child",
+            "call-routes",
+            "/srv/app/routes.yml",
+            Succeeded,
+        )
+        .await;
+        append_child_receipt(
+            &store,
+            "specialist:child",
+            "task-child",
+            "call-guess",
+            "/home/guessed/app",
+            FailedPermanent,
+        )
+        .await;
+        append_child_receipt(
+            &store,
+            "specialist:grandchild",
+            "task-grandchild",
+            "call-tests",
+            "/srv/app/tests",
+            Succeeded,
+        )
+        .await;
+        append_child_receipt(
+            &store,
+            "specialist:other",
+            "task-other",
+            "call-other",
+            "/srv/app/other",
+            Succeeded,
+        )
+        .await;
+
+        let run = store
+            .task_run_aggregate(&parent.session_id, "task-parent")
+            .await
+            .unwrap();
+        let mut adopted = run.operations.keys().cloned().collect::<Vec<_>>();
+        adopted.sort();
+        assert_eq!(
+            adopted,
+            vec!["call-routes".to_string(), "call-tests".to_string()]
+        );
+        for operation in run.operations.values() {
+            assert!(
+                operation.obligation_ids.is_empty(),
+                "a child's obligations never bind"
+            );
+            assert!(operation.dispatched);
+        }
+        assert!(run.operations["call-tests"]
+            .targets
+            .iter()
+            .any(|hint| hint.value == "/srv/app/tests"));
     }
 
     #[tokio::test]
