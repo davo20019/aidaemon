@@ -41,6 +41,11 @@ pub(super) struct MessageBuildCtx<'a> {
     /// receive hidden tool calls/results or local attachment metadata from an
     /// owner's earlier turn in the same session.
     pub redact_archived_shared_context: bool,
+    /// Whether the exact resources earlier work reached (projected turns'
+    /// successful receipts, and what a child inherited) are named in the
+    /// task context. Off where host paths must not reach the model's
+    /// audience (public channels, shared-channel guests, mandate workers).
+    pub share_known_resources: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
 }
 
@@ -51,6 +56,24 @@ pub(super) struct MessageBuildData {
     /// rendering, compaction, and eviction into the provider-visible payload.
     pub projected_source_message_ids: Vec<String>,
     pub projected_source_turn_ids: Vec<String>,
+}
+
+/// The persisted turns projected into `messages`, without removing their
+/// markers (see [`take_projected_source_ids`]).
+fn peek_projected_turn_ids(messages: &[Value]) -> Vec<String> {
+    let mut turn_ids = Vec::new();
+    for ids in messages
+        .iter()
+        .filter_map(|message| message.get(super::turn_render::SOURCE_TURN_IDS_KEY))
+        .filter_map(Value::as_array)
+    {
+        for id in ids.iter().filter_map(Value::as_str) {
+            if !turn_ids.iter().any(|known: &String| known == id) {
+                turn_ids.push(id.to_string());
+            }
+        }
+    }
+    turn_ids
 }
 
 fn take_projected_source_ids(messages: &mut [Value]) -> (Vec<String>, Vec<String>) {
@@ -1411,6 +1434,24 @@ pub(super) async fn build_turn_messages(
     // the position is fixed and tool calls append after it. Before the user
     // message it would split the prior exchange from the reply to it, and in
     // the leading system block it would invalidate the core prompt.
+    // The exact resources this turn's projected transcript (and a child's
+    // parent) already reached, appended to the tail: drawn only from turns
+    // the transcript holds, so they carry no taint the turn lacks.
+    let known_resources = if ctx.share_known_resources {
+        agent
+            .known_resources(session_id, None, &peek_projected_turn_ids(&messages))
+            .await
+            .render()
+    } else {
+        None
+    };
+    let task_context_tail = match known_resources {
+        Some(section) if !task_context_tail.is_empty() => {
+            std::borrow::Cow::Owned(format!("{task_context_tail}\n\n{section}"))
+        }
+        _ => std::borrow::Cow::Borrowed(task_context_tail),
+    };
+    let task_context_tail = task_context_tail.as_ref();
     if !task_context_tail.is_empty() {
         let tail_insert_pos = find_current_user_position(&messages, user_text)
             .map_or(messages.len(), |position| position + 1);
@@ -2120,6 +2161,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2191,6 +2233,7 @@ mod tests {
             pending_system_messages: &mut first_pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         let first = build_turn_messages(
@@ -2218,6 +2261,7 @@ mod tests {
             pending_system_messages: &mut second_pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         let second = build_turn_messages(
@@ -2318,6 +2362,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2397,6 +2442,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2568,6 +2614,7 @@ mod tests {
             pending_system_messages: &mut pending,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2692,6 +2739,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2823,6 +2871,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -2903,6 +2952,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
 
@@ -3078,6 +3128,7 @@ mod tests {
             pending_system_messages: &mut p1,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         let built1 = build_turn_messages(
@@ -3105,6 +3156,7 @@ mod tests {
             pending_system_messages: &mut p2,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         let built2 = build_turn_messages(
@@ -3175,6 +3227,7 @@ mod tests {
             pending_system_messages: &mut pending,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         let built = build_turn_messages(
@@ -3242,6 +3295,7 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             redact_archived_shared_context: false,
+            share_known_resources: false,
             status_tx: &status_tx,
         };
         build_turn_messages(
@@ -4197,6 +4251,7 @@ mod tests {
                 pending_system_messages: _,
                 empty_response_retry_pending: _,
                 redact_archived_shared_context: _,
+                share_known_resources: _,
                 status_tx: _,
             } = c;
         };

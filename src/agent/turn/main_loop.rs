@@ -1115,6 +1115,9 @@ impl Agent {
                                 | ChannelVisibility::Public
                                 | ChannelVisibility::PublicExternal
                         ),
+                    share_known_resources: user_role == UserRole::Owner
+                        && channel_ctx.visibility != ChannelVisibility::PublicExternal
+                        && self.mandate_execution.is_none(),
                     status_tx: &status_tx,
                 },
             )

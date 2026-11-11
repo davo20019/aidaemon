@@ -142,6 +142,8 @@ mod followup;
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+#[path = "runtime/known_resources.rs"]
+pub(crate) mod known_resources;
 pub(crate) mod memory_plugin;
 #[path = "runtime/notes.rs"]
 mod notes;

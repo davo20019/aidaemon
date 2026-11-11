@@ -1448,6 +1448,7 @@ mod tests {
             spawn_family: None,
             child_declaration: None,
             parent_run: None,
+            known_resources: Default::default(),
         };
         let mut facts = ToolCallContext::default();
         assert!(crate::agent::authority::parent_authority(&facts).is_none());
@@ -2035,6 +2036,7 @@ mod child_runtime_tests {
                 spawn_family: Some(family.clone()),
                 child_declaration: None,
                 parent_run: None,
+                known_resources: Default::default(),
             });
         call_facts
     }
@@ -2145,6 +2147,7 @@ mod child_runtime_tests {
                 spawn_family: Some(family),
                 child_declaration: None,
                 parent_run: None,
+                known_resources: Default::default(),
             });
         let args = json!({"mission": "m", "task": "t"}).to_string();
 
@@ -2182,6 +2185,7 @@ mod child_runtime_tests {
                 spawn_family: Some(family),
                 child_declaration: None,
                 parent_run: None,
+                known_resources: Default::default(),
             });
         call_facts
     }

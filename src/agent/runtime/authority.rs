@@ -388,6 +388,12 @@ pub(crate) struct InheritedAuthority {
     /// The kernel run that started this child, for tracing the family.
     #[serde(default)]
     pub parent_run: Option<aidaemon_core::RunId>,
+    /// The exact resources the parent's work already reached (paths and
+    /// URLs of its successful calls, and what it inherited), so the child
+    /// starts from them instead of rebuilding them from the task's wording.
+    /// A planning fact, never a grant.
+    #[serde(default)]
+    pub known_resources: super::known_resources::KnownResources,
 }
 
 /// The parent turn's authority the dispatcher handed `spawn_agent`: an
@@ -914,6 +920,7 @@ mod tests {
             spawn_family: None,
             child_declaration: None,
             parent_run: None,
+            known_resources: Default::default(),
         }
     }
 
@@ -1025,6 +1032,7 @@ mod tests {
             spawn_family: None,
             child_declaration: None,
             parent_run: None,
+            known_resources: Default::default(),
         };
         let own = resolve_authority(&AuthorityFacts {
             session_mode: mode,

@@ -146,6 +146,7 @@ fn real_authority() -> crate::agent::authority::InheritedAuthority {
         spawn_family: None,
         child_declaration: None,
         parent_run: None,
+        known_resources: Default::default(),
     }
 }
 

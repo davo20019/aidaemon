@@ -2405,6 +2405,11 @@ impl Agent {
             spawn_family: inherited.and_then(|inherited| inherited.spawn_family.clone()),
             child_declaration: None,
             parent_run: inherited.and_then(|inherited| inherited.parent_run),
+            // Inside a chain what the chain reached carries on; a root
+            // dispatch starts from its goal's own context.
+            known_resources: inherited
+                .map(|inherited| inherited.known_resources.clone())
+                .unwrap_or_default(),
         }
     }
 

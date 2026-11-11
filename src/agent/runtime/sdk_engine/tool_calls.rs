@@ -841,10 +841,19 @@ impl Agent {
     /// authority, owner level and workspace, the chat whose `/readonly`
     /// narrows it, whether the turn has seen untrusted content so far, and
     /// the root request with its trust.
-    fn turn_authority_for_children(
+    async fn turn_authority_for_children(
         &self,
         scope: &TurnScope<'_>,
     ) -> crate::agent::authority::InheritedAuthority {
+        // What this run has reached so far, with what its transcript and its
+        // own parent already held: the child starts from these identities.
+        let known_resources = self
+            .known_resources(
+                scope.session_id,
+                Some(scope.task_id),
+                &scope.projected_source_turn_ids,
+            )
+            .await;
         crate::agent::authority::InheritedAuthority {
             authority: scope.authority.authority.clone(),
             owner_level: scope.authority.owner_level,
@@ -878,6 +887,7 @@ impl Agent {
             spawn_family: Some(scope.spawn_family.clone()),
             child_declaration: None,
             parent_run: Some(scope.run_id),
+            known_resources,
         }
     }
 
@@ -914,9 +924,11 @@ impl Agent {
         // How the dispatcher treats this tool (typed, never by name).
         let facts = self.turn_tool_facts(scope, &request.name);
         // A child spawned by this call inherits what this turn has now.
-        let turn_authority = facts
-            .spawns_child_agents
-            .then(|| self.turn_authority_for_children(scope));
+        let turn_authority = if facts.spawns_child_agents {
+            Some(self.turn_authority_for_children(scope).await)
+        } else {
+            None
+        };
         // The session's mode as of now (`/readonly` can arrive mid-turn).
         let ceiling = sdk::AuthorityCeiling::ceiling(scope.ceiling.as_ref()).await;
         let mut ctx = self.sdk_exec_ctx(
@@ -1675,9 +1687,11 @@ impl Agent {
             ))
         } else {
             let facts = self.turn_tool_facts(scope, &request.name);
-            let turn_authority = facts
-                .spawns_child_agents
-                .then(|| self.turn_authority_for_children(scope));
+            let turn_authority = if facts.spawns_child_agents {
+                Some(self.turn_authority_for_children(scope).await)
+            } else {
+                None
+            };
             let ctx = self.sdk_exec_ctx(
                 scope,
                 request,

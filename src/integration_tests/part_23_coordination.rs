@@ -24,6 +24,7 @@ mod coordination_tests {
             spawn_family: Some(family.clone()),
             child_declaration: None,
             parent_run: None,
+            known_resources: Default::default(),
         }
     }
 

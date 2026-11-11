@@ -1670,6 +1670,35 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
+    /// The tasks started by the given turns of a session, latest first.
+    pub async fn task_ids_for_turns(
+        &self,
+        session_id: &str,
+        turn_ids: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        if turn_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; turn_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT task_id FROM events \
+             WHERE session_id = ? AND event_type = 'task_start' AND task_id IS NOT NULL \
+               AND turn_id IN ({placeholders}) \
+             ORDER BY id DESC"
+        );
+        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(session_id);
+        for turn_id in turn_ids {
+            query = query.bind(turn_id);
+        }
+        let mut ids = Vec::new();
+        for id in query.fetch_all(&self.pool).await? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// The aggregate of a run with no readable history.
     pub fn empty_run_aggregate(&self, task_id: &str) -> RunAggregate {
         RunAggregate::on_paths(task_id, self.paths.clone())
