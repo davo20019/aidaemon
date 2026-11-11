@@ -50,6 +50,10 @@ pub struct ApprovalState {
     /// consequential action.
     answers: Arc<OwnerAnsweredCalls>,
     mutating_actions: Arc<Mutex<HashMap<String, u32>>>,
+    /// The chat whose grants a session's app approvals are (a sub-agent's
+    /// session maps to its parent chat), from the dispatcher's typed
+    /// `grant_session`.
+    grant_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl ApprovalState {
@@ -122,15 +126,37 @@ impl ApprovalState {
             .app_approved
             .lock()
             .await
-            .contains(&(session_id.to_string(), bundle_id.to_string()))
+            .contains(&(self.grant_key(session_id), bundle_id.to_string()))
     }
 
-    /// The owner allowed operating `bundle_id` for the session.
+    /// Record that `session_id`'s app approvals are those of `grant_session`.
+    pub fn bind_grant_session(&self, session_id: &str, grant_session: &str) {
+        if session_id.is_empty() || grant_session.is_empty() || session_id == grant_session {
+            return;
+        }
+        self.grant_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), grant_session.to_string());
+    }
+
+    fn grant_key(&self, session_id: &str) -> String {
+        self.grant_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
+    /// The owner allowed operating `bundle_id` for the session (for a
+    /// sub-agent, its parent chat, whose other agents share it).
     pub async fn approve_app_for_session(&self, session_id: &str, bundle_id: &str) {
+        let key = self.grant_key(session_id);
         self.app_approved
             .lock()
             .await
-            .insert((session_id.to_string(), bundle_id.to_string()));
+            .insert((key, bundle_id.to_string()));
     }
 
     /// The owner approved `subject` for one call in the session.
@@ -191,6 +217,28 @@ impl ApprovalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sub-agent's computer_use session shares its parent chat's app
+    /// approvals; an unrelated session does not.
+    #[tokio::test]
+    async fn a_sub_agent_inherits_its_chats_app_approvals() {
+        let state = ApprovalState::new();
+        let config = ComputerUseConfig::default();
+        state
+            .approve_app_for_session("telegram:synthetic-user-1", "com.example.App")
+            .await;
+        state.bind_grant_session("specialist:child", "telegram:synthetic-user-1");
+        assert!(
+            !state
+                .app_needs_approval(&config, "specialist:child", Some("com.example.App"))
+                .await
+        );
+        assert!(
+            state
+                .app_needs_approval(&config, "specialist:other", Some("com.example.App"))
+                .await
+        );
+    }
 
     #[tokio::test]
     async fn app_allow_once_does_not_become_session_approval() {

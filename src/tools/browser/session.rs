@@ -90,6 +90,10 @@ pub struct BrowserSessionRegistry {
     /// Sites on this computer the owner let each session open, by
     /// `policy::local_site_key`; `None` lasts until the session is evicted.
     local_sites: Mutex<HashMap<String, HashMap<String, Option<Instant>>>>,
+    /// The chat whose grants a session's approvals are (a sub-agent's
+    /// session maps to its parent chat), set on every call from the
+    /// dispatcher's typed `grant_session`.
+    grant_sessions: std::sync::Mutex<HashMap<String, String>>,
 }
 
 /// A tab as surfaced to the tool/LLM: opaque id, title, raw URL (the tool
@@ -128,19 +132,37 @@ impl BrowserSessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             local_sites: Mutex::new(HashMap::new()),
+            grant_sessions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Whether this session has been granted session-level approval for ordinary
     /// navigation/mutation. Point-of-action actions ignore this and always
     /// prompt.
-    pub async fn is_session_approved(&self, session_id: &str) -> bool {
-        *self
-            .approvals
+    /// Record that `session_id`'s approvals are those of `grant_session`.
+    pub fn bind_grant_session(&self, session_id: &str, grant_session: &str) {
+        if session_id.is_empty() || grant_session.is_empty() || session_id == grant_session {
+            return;
+        }
+        self.grant_sessions
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), grant_session.to_string());
+    }
+
+    /// The key approvals for `session_id` are kept under.
+    fn grant_key(&self, session_id: &str) -> String {
+        self.grant_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session_id)
-            .unwrap_or(&false)
+            .cloned()
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
+    pub async fn is_session_approved(&self, session_id: &str) -> bool {
+        let key = self.grant_key(session_id);
+        *self.approvals.lock().await.get(&key).unwrap_or(&false)
     }
 
     /// Mark this session approved for ordinary navigation/mutation, so later
@@ -149,15 +171,16 @@ impl BrowserSessionRegistry {
         self.approvals
             .lock()
             .await
-            .insert(session_id.to_string(), true);
+            .insert(self.grant_key(session_id), true);
     }
 
     /// Whether the owner has let this session open the local site `key`.
     pub async fn is_local_site_approved(&self, session_id: &str, key: &str) -> bool {
+        let grant = self.grant_key(session_id);
         self.local_sites
             .lock()
             .await
-            .get(session_id)
+            .get(&grant)
             .and_then(|sites| sites.get(key))
             .is_some_and(|expires| expires.is_none_or(|at| Instant::now() < at))
     }
@@ -169,10 +192,11 @@ impl BrowserSessionRegistry {
         key: String,
         expires_at: Option<Instant>,
     ) {
+        let grant = self.grant_key(session_id);
         self.local_sites
             .lock()
             .await
-            .entry(session_id.to_string())
+            .entry(grant)
             .or_default()
             .insert(key, expires_at);
     }
@@ -602,5 +626,37 @@ impl BrowserSessionRegistry {
                 active: t.target_id == state.active_target_id,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod grant_session_tests {
+    use super::*;
+
+    /// A sub-agent's browser session shares its parent chat's session and
+    /// local-site approvals, both ways; an unrelated session does not.
+    #[tokio::test]
+    async fn a_sub_agent_inherits_its_chats_browser_approvals() {
+        let registry = BrowserSessionRegistry::new();
+        registry
+            .mark_session_approved("telegram:synthetic-user-1")
+            .await;
+        registry.bind_grant_session("specialist:child", "telegram:synthetic-user-1");
+        assert!(registry.is_session_approved("specialist:child").await);
+        assert!(!registry.is_session_approved("specialist:other").await);
+
+        registry
+            .approve_local_site("specialist:child", "https://app.test".to_string(), None)
+            .await;
+        assert!(
+            registry
+                .is_local_site_approved("telegram:synthetic-user-1", "https://app.test")
+                .await
+        );
+        assert!(
+            !registry
+                .is_local_site_approved("specialist:other", "https://app.test")
+                .await
+        );
     }
 }

@@ -555,6 +555,8 @@ impl ComputerUseTool {
         }
 
         let ctx = Self::parse_context(facts)?;
+        self.approval_state
+            .bind_grant_session(&ctx.session_id, facts.grants_session());
         self.ensure_session_ready(&ctx, facts, action).await?;
 
         match action {
@@ -1123,6 +1125,8 @@ impl ComputerUseTool {
             return None;
         }
         let ctx = Self::parse_context(facts).ok()?;
+        self.approval_state
+            .bind_grant_session(&ctx.session_id, facts.grants_session());
         if !self.vision.enabled || self.harness.check_permissions().is_err() {
             return None;
         }
@@ -1428,6 +1432,8 @@ impl Tool for ComputerUseTool {
             return;
         };
         let session_id = facts.session_id.as_str();
+        self.approval_state
+            .bind_grant_session(session_id, facts.grants_session());
         if let Some(subject) = &need.consequential {
             self.approval_state.approve_once(session_id, subject);
             if let Some((app_subject, _)) = &need.app {

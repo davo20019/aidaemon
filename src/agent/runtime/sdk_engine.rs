@@ -1200,6 +1200,7 @@ impl Agent {
             },
             known_project_dir: Some(known_project_dir.clone()),
             session_id: session_id.to_string(),
+            grant_session: grant_session.clone(),
             user_role: Some(user_role),
             channel_visibility: Some(channel_ctx.visibility),
             untrusted_trigger_session: super::is_trigger_session(session_id),

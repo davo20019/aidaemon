@@ -732,6 +732,11 @@ impl Agent {
             untrusted_source: is_trigger_session(ctx.session_id),
             scope_escalation: ctx.scope_escalation.filter(|e| !e.is_empty()).cloned(),
             session_id: ctx.session_id.to_string(),
+            // A sub-agent's own grants are its parent chat's.
+            grant_session: crate::agent::approvals::grant_session(
+                self.approval_session_id.as_deref(),
+                ctx.session_id,
+            ),
             channel_visibility: Some(ctx.channel_visibility),
             channel_id: ctx.channel_id.map(str::to_string),
             task_id: ctx.task_id.map(str::to_string),

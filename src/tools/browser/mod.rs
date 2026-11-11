@@ -856,6 +856,8 @@ impl BrowserTool {
         if session_id.is_empty() {
             return None;
         }
+        self.sessions
+            .bind_grant_session(session_id, facts.grants_session());
         let args = Self::action_args(arguments, session_id, facts.trusted_session)?;
         if args.action == "execute_js"
             && validate_script_constraints(args.script.unwrap_or("")).is_err()
@@ -2154,6 +2156,8 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
 
         let session_id = facts.session_id.as_str();
+        self.sessions
+            .bind_grant_session(session_id, facts.grants_session());
 
         let needs_session = !matches!(action, "close" | "set_mode");
         if needs_session && session_id.is_empty() {

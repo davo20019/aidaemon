@@ -67,6 +67,8 @@ pub(crate) struct AppApprovalRules {
     pub mandate_preapproved: bool,
     /// The turn's session.
     pub session_id: String,
+    /// The chat whose approvals cover the turn (a sub-agent's parent chat).
+    pub grant_session: String,
     /// The role of the turn's user (`None` when unknown).
     pub user_role: Option<crate::types::UserRole>,
     /// Visibility of the channel the turn came from (`None` when unknown),
@@ -368,6 +370,7 @@ impl AppApprovalRules {
     ) -> crate::traits::ToolCallContext {
         crate::traits::ToolCallContext {
             session_id: self.session_id.clone(),
+            grant_session: self.grant_session.clone(),
             user_role: self.user_role,
             channel_visibility: self.channel_visibility,
             trusted_session: self.trusted_session,
@@ -756,6 +759,41 @@ pub(crate) fn grant_session(approval_session_id: Option<&str>, session_id: &str)
     approval_session_id.unwrap_or(session_id).to_string()
 }
 
+/// The request as its card shows it: a sub-agent's card names the mission
+/// it was delegated (the last step of its inherited lineage), so the owner
+/// can tell concurrent sub-agents' cards apart. The request itself (subject,
+/// effects, grants) is unchanged.
+fn asked_by<'r>(
+    agent: &Agent,
+    request: &'r sdk::OwnerApprovalRequest,
+) -> std::borrow::Cow<'r, sdk::OwnerApprovalRequest> {
+    let mission = agent
+        .inherited_authority
+        .as_ref()
+        .and_then(|inherited| inherited.lineage.last())
+        .map(|mission| mission.trim())
+        .filter(|mission| !mission.is_empty());
+    match mission {
+        Some(mission) => {
+            let mut card = request.clone();
+            card.summary = sub_agent_card_summary(mission, &request.summary);
+            std::borrow::Cow::Owned(card)
+        }
+        None => std::borrow::Cow::Borrowed(request),
+    }
+}
+
+/// How many characters of a mission a card shows.
+const CARD_MISSION_CHARS: usize = 120;
+
+fn sub_agent_card_summary(mission: &str, summary: &str) -> String {
+    let mut shown: String = mission.chars().take(CARD_MISSION_CHARS).collect();
+    if mission.chars().count() > CARD_MISSION_CHARS {
+        shown.push('…');
+    }
+    format!("Sub-agent \"{shown}\" asks:\n{summary}")
+}
+
 /// The card's risk level for a kernel request.
 pub(crate) fn card_risk(risk: sdk::ApprovalRisk) -> RiskLevel {
     match risk {
@@ -943,11 +981,13 @@ impl OwnerApprovalResolver<'_> {
         let tool = interruption.call.name.as_str();
         self.record("owner_approval_requested", tool, request, None)
             .await;
+        // Several sub-agents can ask at once: the card says which one asks.
+        let card = asked_by(self.agent, request);
         match self
             .approvals
             .ask(
                 self.card_session,
-                request,
+                card.as_ref(),
                 self.rules.card_permission_mode(tool),
                 kind,
                 &self.cancel,
@@ -1647,6 +1687,17 @@ mod tests {
         let call = sdk::ToolCall::new("c1", "write_file", json!({"path": "/tmp/aidaemon-test/x"}));
         let decision = rules().judge(&hook_ctx(), &call, &tool_info()).await;
         assert_eq!(decision, RuleDecision::Defer);
+    }
+
+    #[test]
+    fn a_sub_agent_card_names_its_mission() {
+        assert_eq!(
+            super::sub_agent_card_summary("Write its tests", "terminal: ls"),
+            "Sub-agent \"Write its tests\" asks:\nterminal: ls"
+        );
+        let long = "x".repeat(200);
+        let card = super::sub_agent_card_summary(&long, "s");
+        assert!(card.contains(&format!("{}…", "x".repeat(120))));
     }
 
     #[tokio::test]

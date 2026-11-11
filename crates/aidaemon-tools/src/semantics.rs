@@ -1928,6 +1928,11 @@ pub struct ToolCallContext {
     pub scope_escalation: Option<ScopeEscalation>,
     /// The session the call belongs to (empty outside the dispatcher).
     pub session_id: String,
+    /// The session whose owner approvals cover this call: the chat that
+    /// started the work. A sub-agent runs in a session of its own but works
+    /// for that chat, so a tool's own session-scoped grants ("allow for
+    /// session") key on this, never on `session_id`. Empty: `session_id`.
+    pub grant_session: String,
     /// Visibility of the channel the turn came from (`None` outside the
     /// dispatcher; each tool keeps its own fallback).
     pub channel_visibility: Option<ChannelVisibility>,
@@ -2020,6 +2025,16 @@ impl ToolCallContext {
     /// The session id, or `None` when the call carries none.
     pub fn session(&self) -> Option<&str> {
         Some(self.session_id.as_str()).filter(|id| !id.trim().is_empty())
+    }
+
+    /// The session a tool's own session-scoped grants key on
+    /// ([`Self::grant_session`], else the call's session).
+    pub fn grants_session(&self) -> &str {
+        if self.grant_session.trim().is_empty() {
+            &self.session_id
+        } else {
+            &self.grant_session
+        }
     }
 }
 
