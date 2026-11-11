@@ -29,7 +29,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use aidaemon_core::{Event, RunId, RunState, RunStore, StoreError};
+use aidaemon_core::{Event, RunId, RunState, RunStatus, RunStore, StoreError};
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::sqlite::{
@@ -167,15 +167,33 @@ impl SqliteStore {
     }
 
     /// Whether the last thing the run journaled was its end. A run that was
-    /// resumed and then cut short journals something after its pause.
+    /// resumed and then cut short journals something after its pause. A run
+    /// paused for an answer journals `finished` with an `Interrupted` status:
+    /// that is a pause, not an end, so it is still waiting.
     pub async fn run_ended(&self, run_id: RunId) -> Result<bool, Error> {
-        let last: Option<String> = sqlx::query_scalar(
-            "SELECT event_type FROM run_events WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+        let last: Option<(String, String)> = sqlx::query_as(
+            "SELECT event_type, payload FROM run_events WHERE run_id = ? \
+             ORDER BY seq DESC LIMIT 1",
         )
         .bind(run_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(last.as_deref() == Some("finished"))
+        let Some((event_type, payload)) = last else {
+            return Ok(false);
+        };
+        if event_type != "finished" {
+            return Ok(false);
+        }
+        let paused = serde_json::from_str::<Event>(&payload).is_ok_and(|event| {
+            matches!(
+                event,
+                Event::Finished {
+                    status: RunStatus::Interrupted { .. },
+                    ..
+                }
+            )
+        });
+        Ok(!paused)
     }
 
     /// The run's journal in order, decoded.

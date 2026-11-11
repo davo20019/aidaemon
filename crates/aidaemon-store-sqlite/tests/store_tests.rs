@@ -484,3 +484,26 @@ async fn a_run_is_ended_only_while_its_last_event_is_the_end() {
     store.append(run, &Event::RunResumed).await.unwrap();
     assert!(!store.run_ended(run).await.unwrap());
 }
+
+#[tokio::test]
+async fn a_run_paused_for_an_answer_has_not_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(db_path(&dir)).await.unwrap();
+    let run = RunId::new();
+    let paused = Event::Finished {
+        status: RunStatus::Interrupted {
+            interruption: Interruption {
+                call: ToolCall::new("c1", "terminal", serde_json::json!({})),
+                reason: "needs the owner".to_string(),
+                kind: InterruptKind::Untrusted,
+            },
+        },
+        usage: Default::default(),
+        turns: 1,
+    };
+    store.append(run, &paused).await.unwrap();
+    assert!(
+        !store.run_ended(run).await.unwrap(),
+        "a pause is not an end: a restart must still find the run"
+    );
+}
