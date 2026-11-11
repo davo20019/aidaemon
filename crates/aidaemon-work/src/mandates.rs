@@ -2317,6 +2317,10 @@ pub enum MandateFinalizationRejectReason {
     DecisionMissing,
     InvalidDecisionState,
     DeliberatorFailed,
+    /// An ACT review whose action ledger proves nothing reached the outside
+    /// world: no mutation succeeded, none has an unknown outcome. Retried
+    /// with backoff; the owner has nothing to reconcile.
+    ActChangedNothing,
 }
 
 impl MandateFinalizationRejectReason {
@@ -2326,6 +2330,7 @@ impl MandateFinalizationRejectReason {
             Self::DecisionMissing => "decision_missing",
             Self::InvalidDecisionState => "invalid_decision_state",
             Self::DeliberatorFailed => "deliberator_failed",
+            Self::ActChangedNothing => "act_changed_nothing",
         }
     }
 }
@@ -2593,6 +2598,11 @@ impl MandateRunNotification {
             } => format!(
                 "{label}: a review failed before it finished ({}). Ask me what it got to if you want the details. It's still active and will retry automatically. {reference}",
                 humanize_reason(MandateFinalizationRejectReason::DeliberatorFailed.as_str()),
+            ),
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::ActChangedNothing,
+            } => format!(
+                "{label}: a review decided to act, but the action did not go through, so nothing changed. It's still active and will retry automatically. {reference}",
             ),
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
                 "{label}: a review could not be verified ({}), so nothing was done. {reference}",

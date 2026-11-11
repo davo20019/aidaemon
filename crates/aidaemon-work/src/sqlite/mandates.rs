@@ -4351,6 +4351,20 @@ impl<S: WorkDatabase> MandateStore for S {
         macro_rules! close_review_failed_retry {
             ($reason:expr) => {{
                 let reason = $reason;
+                let (intention_from, intention_to) =
+                    intention_transition(IntentionStatus::Committed, IntentionStatus::Failed)?;
+                sqlx::query(
+                    "UPDATE intentions
+                     SET status = ?, updated_at = ?, completed_at = ?
+                     WHERE goal_run_id = ? AND status = ?",
+                )
+                .bind(intention_to)
+                .bind(&request.finalized_at)
+                .bind(&request.finalized_at)
+                .bind(&request.goal_run_id)
+                .bind(intention_from)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query(
                     "UPDATE task_attempts
                      SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
@@ -4822,6 +4836,18 @@ impl<S: WorkDatabase> MandateStore for S {
         }
         if let Some(gate) = refused_by {
             reconcile_fail_closed!(MandateReconciliationReason::ActBlockedBeforeDispatch { gate });
+        }
+        // Every external effect of an ACT goes through a mutation
+        // reservation. When none succeeded, none has an unknown outcome and
+        // none belongs to another decision, the ledger proves the review
+        // changed nothing: retry it rather than ask the owner to confirm
+        // what is already known.
+        if decision_outcome == MandateDecisionOutcome::Act
+            && mutation_succeeded == 0
+            && mutation_ambiguous == 0
+            && mutation_mismatched == 0
+        {
+            close_review_failed_retry!(MandateFinalizationRejectReason::ActChangedNothing);
         }
         if !root_success {
             reconcile_fail_closed!(MandateReconciliationReason::RootTaskNotSuccessful);
@@ -7189,22 +7215,32 @@ mod tests {
         );
     }
 
-    /// Without a refused mutation on a receipt the reason stays generic: a
-    /// refused read, or no receipt at all, says nothing about the mutation.
+    /// Without a refused mutation on a receipt there is no gate to name: a
+    /// refused read, or no receipt at all, leaves an ACT whose ledger proves
+    /// it changed nothing, which is retried without asking the owner.
     #[tokio::test]
     async fn only_a_refused_mutation_counts_as_blocked_before_dispatch() {
         for receipt in [None, Some(("untrusted_egress_denied", "ReadOnly"))] {
-            let (store, _database, worker, _run, result) = finalize_refused_act(receipt).await;
-            assert!(
-                matches!(
-                    result,
-                    MandateRunFinalizationResult::ReconciliationRequired {
-                        reason: MandateReconciliationReason::ActMissingVerifiedMutation,
-                        ..
-                    }
-                ),
-                "{receipt:?}: {result:?}"
+            let (store, _database, worker, run, result) = finalize_refused_act(receipt).await;
+            assert_eq!(
+                result,
+                MandateRunFinalizationResult::Rejected {
+                    reason: MandateFinalizationRejectReason::ActChangedNothing,
+                },
+                "{receipt:?}"
             );
+            let (mandate_status, intention_status): (String, String) = sqlx::query_as(
+                "SELECT m.status, i.status FROM goal_runs r
+                 JOIN mandates m ON m.goal_id = r.goal_id
+                 JOIN intentions i ON i.goal_run_id = r.id
+                 WHERE r.id = ?",
+            )
+            .bind(&run.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(mandate_status, "active", "no owner reconciliation");
+            assert_eq!(intention_status, "failed");
             let status: String = sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
                 .bind(&worker.id)
                 .fetch_one(&store.pool)
@@ -7292,11 +7328,12 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let MandateRunFinalizationResult::ReconciliationRequired { reason, counts } = result
-            else {
-                panic!("unresolved reservation must fail closed")
-            };
             if claim_before_finalization {
+                let MandateRunFinalizationResult::ReconciliationRequired { reason, counts } =
+                    result
+                else {
+                    panic!("a claimed dispatch with no outcome must fail closed: {result:?}")
+                };
                 assert_eq!(
                     reason,
                     MandateReconciliationReason::MutationOutcomeAmbiguous
@@ -7304,9 +7341,13 @@ mod tests {
                 assert_eq!(counts.ambiguous_or_reserved_mutations, 1);
                 assert_eq!(counts.never_dispatched_mutations, 0);
             } else {
-                assert_eq!(reason, MandateReconciliationReason::MutationOutcomeFailed);
-                assert_eq!(counts.ambiguous_or_reserved_mutations, 0);
-                assert_eq!(counts.never_dispatched_mutations, 1);
+                // Reserved but never dispatched: provably no effect.
+                assert_eq!(
+                    result,
+                    MandateRunFinalizationResult::Rejected {
+                        reason: MandateFinalizationRejectReason::ActChangedNothing,
+                    }
+                );
             }
             let attempts = store
                 .list_mandate_mutation_attempts_for_run(&run.id)

@@ -1059,7 +1059,8 @@ async fn finalize_mandate_review(
             }
             MandateFinalizationRejectReason::DecisionMissing
             | MandateFinalizationRejectReason::InvalidDecisionState
-            | MandateFinalizationRejectReason::DeliberatorFailed => Some(notice(
+            | MandateFinalizationRejectReason::DeliberatorFailed
+            | MandateFinalizationRejectReason::ActChangedNothing => Some(notice(
                 MandateRunNotificationKind::ReviewFailed { reason },
                 Default::default(),
             )),
