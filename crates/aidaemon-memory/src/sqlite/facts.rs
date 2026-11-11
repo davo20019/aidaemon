@@ -465,6 +465,46 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
     (matched as f32 / tokens.len() as f32) * FACT_LEXICAL_MAX_SCORE
 }
 
+impl SqliteMemory {
+    /// Cosine scores for the facts in `ids` that `indexed` has no score for,
+    /// from each fact's own stored vector. Usually none: every fact with a
+    /// claim is in the embedding index. Read in chunks, so a recall never
+    /// loads every fact's blob.
+    async fn unindexed_fact_scores(
+        &self,
+        query_vec: &[f32],
+        ids: impl Iterator<Item = i64>,
+        indexed: &std::collections::HashMap<i64, f32>,
+    ) -> std::collections::HashMap<i64, f32> {
+        let missing: Vec<i64> = ids.filter(|id| !indexed.contains_key(id)).collect();
+        let mut scores = std::collections::HashMap::new();
+        for chunk in missing.chunks(500) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT id, embedding FROM facts WHERE embedding IS NOT NULL AND id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+            let rows = match builder.build().fetch_all(&self.pool).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read fact vectors for recall");
+                    return scores;
+                }
+            };
+            for row in rows {
+                let blob: Vec<u8> = row.get("embedding");
+                if let Ok(vector) = decode_embedding(&blob) {
+                    scores.insert(row.get("id"), cosine_similarity(query_vec, &vector));
+                }
+            }
+        }
+        scores
+    }
+}
+
 #[async_trait]
 impl FactStore for SqliteMemory {
     async fn stamp_fact_provenance(
@@ -1271,9 +1311,10 @@ impl FactStore for SqliteMemory {
     }
 
     async fn get_relevant_facts(&self, query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
-        // Load facts with stored embeddings
+        // Load facts; vectors come from the embedding index, and only facts
+        // it has none for read their own blob (`unindexed_fact_scores`).
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -1343,16 +1384,17 @@ impl FactStore for SqliteMemory {
 
         // Score facts using stored embeddings, with a small recency boost for sorting.
         // IMPORTANT: the recency boost must not change which facts pass the semantic threshold.
+        let fallback_scores = self
+            .unindexed_fact_scores(&query_vec, all_facts.iter().map(|f| f.id), &indexed_scores)
+            .await;
         let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            let fact = &all_facts[i];
+        for (i, fact) in all_facts.iter().enumerate() {
             let freshness = fact_freshness_boost(now, fact.updated_at);
 
-            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
-                row.get::<Option<Vec<u8>>, _>("embedding")
-                    .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| cosine_similarity(&query_vec, &vec))
-            });
+            let semantic = indexed_scores
+                .get(&fact.id)
+                .or_else(|| fallback_scores.get(&fact.id))
+                .copied();
             let lexical = if fts_fact_ids.contains(&fact.id) {
                 FACT_LEXICAL_MAX_SCORE
             } else {
@@ -1452,7 +1494,7 @@ impl FactStore for SqliteMemory {
         };
 
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL",
         )
         .fetch_all(&self.pool)
@@ -1467,14 +1509,16 @@ impl FactStore for SqliteMemory {
             .fact_embedding_scores(&query_vec, rows.len())
             .await
             .unwrap_or_default();
+        let facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+        let fallback_scores = self
+            .unindexed_fact_scores(&query_vec, facts.iter().map(|f| f.id), &indexed_scores)
+            .await;
         let mut scored: Vec<(Fact, f32)> = Vec::new();
-        for row in &rows {
-            let fact = Self::row_to_fact(row);
-            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
-                row.get::<Option<Vec<u8>>, _>("embedding")
-                    .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| cosine_similarity(&query_vec, &vec))
-            });
+        for fact in facts {
+            let semantic = indexed_scores
+                .get(&fact.id)
+                .or_else(|| fallback_scores.get(&fact.id))
+                .copied();
             if let Some(semantic) = semantic {
                 if semantic > EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE {
                     scored.push((fact, semantic));
@@ -1581,7 +1625,7 @@ impl FactStore for SqliteMemory {
 
         // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -1652,17 +1696,17 @@ impl FactStore for SqliteMemory {
             .await
             .unwrap_or_default();
 
+        let fallback_scores = self
+            .unindexed_fact_scores(&query_vec, filtered.iter().map(|f| f.id), &indexed_scores)
+            .await;
         let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(filtered.len());
-        for (fi, &ri) in filtered_indices.iter().enumerate() {
-            let fact = &filtered[fi];
+        for (fi, fact) in filtered.iter().enumerate() {
             let freshness = fact_freshness_boost(now, fact.updated_at);
 
-            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
-                rows[ri]
-                    .get::<Option<Vec<u8>>, _>("embedding")
-                    .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| cosine_similarity(&query_vec, &vec))
-            });
+            let semantic = indexed_scores
+                .get(&fact.id)
+                .or_else(|| fallback_scores.get(&fact.id))
+                .copied();
             let lexical = if fts_fact_ids.contains(&fact.id) {
                 FACT_LEXICAL_MAX_SCORE
             } else {

@@ -5,11 +5,27 @@ use sqlx::Row;
 use super::*;
 use crate::embedding_index::{
     content_hash, EmbeddingHit, EmbeddingIndex, EmbeddingItem, EmbeddingSearchFilter, MemoryOwner,
-    SqliteEmbeddingIndex,
 };
 use crate::stores::{
     GraphEdgeUpsert, GraphEntityUpsert, GraphNeighbor, GraphSearchScope, MemoryGraphStore,
 };
+
+/// Ids per lookup query, well under SQLite's bound-parameter limit.
+const LOOKUP_CHUNK: usize = 500;
+
+/// Hit scores by numeric owner id; ids that are not numbers are skipped.
+fn owner_scores(hits: &[EmbeddingHit]) -> std::collections::HashMap<i64, f32> {
+    let mut scores = std::collections::HashMap::new();
+    for hit in hits {
+        if let Ok(id) = hit.owner.owner_id.parse::<i64>() {
+            scores
+                .entry(id)
+                .and_modify(|existing: &mut f32| *existing = existing.max(hit.score))
+                .or_insert(hit.score);
+        }
+    }
+    scores
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -130,7 +146,7 @@ impl SqliteMemory {
         purpose: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<EmbeddingHit>> {
-        SqliteEmbeddingIndex::new(self.pool.clone())
+        self.embedding_index
             .search(
                 query,
                 &EmbeddingSearchFilter {
@@ -151,34 +167,46 @@ impl SqliteMemory {
         let hits = self
             .search_embedding_owners(query, "claim", "recall", limit)
             .await?;
+        let claim_scores = owner_scores(&hits);
         let mut scores = std::collections::HashMap::new();
-        for hit in hits {
-            let Ok(claim_id) = hit.owner.owner_id.parse::<i64>() else {
-                continue;
-            };
-            let fact_id: Option<i64> = sqlx::query_scalar(
-                "SELECT c.source_fact_id
+        // One query per chunk of hits, not one per hit: recall asks for as
+        // many hits as there are facts.
+        let ids: Vec<i64> = claim_scores.keys().copied().collect();
+        for chunk in ids.chunks(LOOKUP_CHUNK) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT c.id AS claim_id, c.source_fact_id AS fact_id
                  FROM memory_claims c
                  JOIN facts f ON f.id = c.source_fact_id
                  JOIN memory_embeddings me
                    ON me.owner_type = 'claim' AND me.owner_id = CAST(c.id AS TEXT)
-                  AND me.embedding_purpose = 'recall' AND me.embedding_model = ?
-                 AND me.stale_at IS NULL
-                 WHERE c.id = ? AND c.deleted_at IS NULL AND c.valid_to IS NULL
+                  AND me.embedding_purpose = 'recall' AND me.embedding_model = ",
+            );
+            builder.push_bind(self.embedding_service.model_id());
+            builder.push(
+                " AND me.stale_at IS NULL
+                 WHERE c.deleted_at IS NULL AND c.valid_to IS NULL
                    AND ((f.embedding IS NOT NULL AND me.embedding = f.embedding)
                      OR (f.embedding IS NULL
-                         AND julianday(me.updated_at) >= julianday(f.updated_at)))",
-            )
-            .bind(self.embedding_service.model_id())
-            .bind(claim_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .flatten();
-            if let Some(fact_id) = fact_id {
+                         AND julianday(me.updated_at) >= julianday(f.updated_at)))
+                   AND c.id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+            for row in builder.build().fetch_all(&self.pool).await? {
+                let claim_id: i64 = row.get("claim_id");
+                let Some(fact_id) = row.get::<Option<i64>, _>("fact_id") else {
+                    continue;
+                };
+                let Some(score) = claim_scores.get(&claim_id).copied() else {
+                    continue;
+                };
                 scores
                     .entry(fact_id)
-                    .and_modify(|score: &mut f32| *score = score.max(hit.score))
-                    .or_insert(hit.score);
+                    .and_modify(|existing: &mut f32| *existing = existing.max(score))
+                    .or_insert(score);
             }
         }
         Ok(scores)
@@ -192,21 +220,32 @@ impl SqliteMemory {
         let hits = self
             .search_embedding_owners(query, "span", "recall", limit)
             .await?;
+        let span_scores = owner_scores(&hits);
         let mut scores = std::collections::HashMap::new();
-        for hit in hits {
-            let Ok(span_id) = hit.owner.owner_id.parse::<i64>() else {
-                continue;
-            };
-            let episode_id: Option<i64> = sqlx::query_scalar(
-                "SELECT source_episode_id FROM memory_spans
-                 WHERE id = ? AND deleted_at IS NULL AND valid_to IS NULL",
-            )
-            .bind(span_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .flatten();
-            if let Some(episode_id) = episode_id {
-                scores.insert(episode_id, hit.score);
+        let ids: Vec<i64> = span_scores.keys().copied().collect();
+        for chunk in ids.chunks(LOOKUP_CHUNK) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT id, source_episode_id FROM memory_spans
+                 WHERE deleted_at IS NULL AND valid_to IS NULL AND id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+            for row in builder.build().fetch_all(&self.pool).await? {
+                let span_id: i64 = row.get("id");
+                let Some(episode_id) = row.get::<Option<i64>, _>("source_episode_id") else {
+                    continue;
+                };
+                let Some(score) = span_scores.get(&span_id).copied() else {
+                    continue;
+                };
+                // Several spans can come from one episode: keep the best.
+                scores
+                    .entry(episode_id)
+                    .and_modify(|existing: &mut f32| *existing = existing.max(score))
+                    .or_insert(score);
             }
         }
         Ok(scores)
@@ -220,7 +259,7 @@ impl SqliteMemory {
         content: &str,
         embedding: Vec<f32>,
     ) -> anyhow::Result<()> {
-        SqliteEmbeddingIndex::new(self.pool.clone())
+        self.embedding_index
             .upsert(EmbeddingItem {
                 owner: MemoryOwner::new(owner_type, owner_id),
                 purpose: purpose.to_string(),
@@ -261,7 +300,7 @@ impl SqliteMemory {
             .fetch_optional(&self.pool)
             .await?
             {
-                SqliteEmbeddingIndex::new(self.pool.clone())
+                self.embedding_index
                     .mark_stale(&MemoryOwner::new("claim", claim_id))
                     .await?;
                 MemoryGraphStore::invalidate_claim(self, claim_id, &valid_to).await?;
@@ -329,7 +368,7 @@ impl SqliteMemory {
 
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding") {
             if let Ok(embedding) = decode_embedding(&blob) {
-                SqliteEmbeddingIndex::new(self.pool.clone())
+                self.embedding_index
                     .upsert(EmbeddingItem {
                         owner: MemoryOwner::new("claim", claim_id),
                         purpose: "recall".to_string(),
@@ -395,7 +434,7 @@ impl SqliteMemory {
                 .await?;
         if let Some(blob) = row.get::<Option<Vec<u8>>, _>("embedding") {
             if let Ok(embedding) = decode_embedding(&blob) {
-                SqliteEmbeddingIndex::new(self.pool.clone())
+                self.embedding_index
                     .upsert(EmbeddingItem {
                         owner: MemoryOwner::new("span", span_id),
                         purpose: "recall".to_string(),

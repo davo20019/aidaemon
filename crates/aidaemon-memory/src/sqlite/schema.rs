@@ -578,6 +578,31 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // A change counter for `memory_embeddings`, so the in-memory vector
+    // cache in `SqliteEmbeddingIndex` knows when to reload. Triggers keep it
+    // exact whichever code (or process) writes the table.
+    for statement in [
+        "CREATE TABLE IF NOT EXISTS memory_embedding_generation (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            generation INTEGER NOT NULL
+        )",
+        "INSERT OR IGNORE INTO memory_embedding_generation (id, generation) VALUES (1, 0)",
+        "CREATE TRIGGER IF NOT EXISTS memory_embeddings_generation_insert
+         AFTER INSERT ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END",
+        "CREATE TRIGGER IF NOT EXISTS memory_embeddings_generation_update
+         AFTER UPDATE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END",
+        "CREATE TRIGGER IF NOT EXISTS memory_embeddings_generation_delete
+         AFTER DELETE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+
     for statement in [
         "CREATE INDEX IF NOT EXISTS idx_memory_claims_active ON memory_claims(privacy, channel_id, valid_to, deleted_at)",
         "CREATE INDEX IF NOT EXISTS idx_memory_spans_active ON memory_spans(privacy, channel_id, valid_to, deleted_at)",
@@ -638,7 +663,7 @@ async fn migrate_facts_history_schema(pool: &SqlitePool) -> anyhow::Result<()> {
         || create_l.contains("unique (category,key)");
 
     if has_legacy_unique {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Defensive: clean up a prior failed attempt.
         let _ = sqlx::query("DROP TABLE IF EXISTS facts_new")

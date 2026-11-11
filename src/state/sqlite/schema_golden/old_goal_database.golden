@@ -498,6 +498,30 @@ CREATE TABLE memory_embeddings (
             UNIQUE(owner_type, owner_id, embedding_purpose, embedding_model, content_hash)
         )
 
+table memory_embedding_generation on memory_embedding_generation
+CREATE TABLE memory_embedding_generation (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            generation INTEGER NOT NULL
+        )
+
+trigger memory_embeddings_generation_insert on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_insert
+         AFTER INSERT ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
+trigger memory_embeddings_generation_update on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_update
+         AFTER UPDATE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
+trigger memory_embeddings_generation_delete on memory_embeddings
+CREATE TRIGGER memory_embeddings_generation_delete
+         AFTER DELETE ON memory_embeddings BEGIN
+            UPDATE memory_embedding_generation SET generation = generation + 1 WHERE id = 1;
+         END
+
 index idx_memory_claims_active on memory_claims
 CREATE INDEX idx_memory_claims_active ON memory_claims(privacy, channel_id, valid_to, deleted_at)
 
@@ -1521,6 +1545,7 @@ rows memory_resolution_reviews = 0
 rows memory_write_audit = 0
 rows memory_edges = 0
 rows memory_embeddings = 0
+rows memory_embedding_generation = 1
 rows terminal_allowed_prefixes = 0
 rows terminal_backend_allowed_prefixes = 0
 rows command_patterns = 0

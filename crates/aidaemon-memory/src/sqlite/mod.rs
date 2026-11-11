@@ -127,6 +127,9 @@ impl StoreModels {
 #[derive(Clone)]
 pub struct SqliteMemory {
     pool: SqlitePool,
+    /// One index for this database, so its vector cache is shared by every
+    /// search and clone.
+    embedding_index: crate::embedding_index::SqliteEmbeddingIndex,
     embedding_service: StoreModels,
     fact_upsert_lock: Arc<Mutex<()>>,
     channels: Arc<dyn ChannelIds>,
@@ -137,6 +140,7 @@ impl SqliteMemory {
     /// Memory over `pool`, whose tables [`migrate`] has created.
     pub fn new(pool: SqlitePool, embedder: Arc<dyn Embedder>) -> Self {
         Self {
+            embedding_index: crate::embedding_index::SqliteEmbeddingIndex::new(pool.clone()),
             pool,
             embedding_service: StoreModels {
                 embedder,
