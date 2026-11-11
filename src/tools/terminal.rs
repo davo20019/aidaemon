@@ -7388,6 +7388,24 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
                         })
                 })
             });
+            let command = args.as_ref().and_then(|value| {
+                value
+                    .get("command")
+                    .or_else(|| value.get("script"))
+                    .and_then(Value::as_str)
+            });
+            // A command that asks a remote service to change something is a
+            // remote mutation, however it reaches the service.
+            if command.is_some_and(crate::tools::command_effects::sends_remote_write) {
+                let effects = if has_write_targets {
+                    ToolMutationEffects::REMOTE_MUTATION
+                        .union(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+                } else {
+                    ToolMutationEffects::REMOTE_MUTATION
+                };
+                return ToolCallSemantics::observation_and_mutation_with(effects)
+                    .with_verification_mode(ToolVerificationMode::ResultContent);
+            }
             // Every process call observes its own typed receipt, and every run
             // crosses the native sandbox even when its task-data manifest is
             // empty. An empty manifest means no task-data authority; it never
@@ -9379,6 +9397,25 @@ mod tests {
             r#"{"action":"run","command":"opaque 'unterminated","working_dir":"/tmp","read_paths":[],"write_paths":["/tmp/synthetic-output"]}"#,
         );
         assert!(writable.mutates_state());
+    }
+
+    #[test]
+    fn a_command_that_writes_remotely_is_a_remote_mutation() {
+        let post = terminal_call_semantics(
+            r#"{"action":"run","command":"curl --request POST --data '{}' http://localhost:1/ping"}"#,
+        );
+        assert!(post.mutates_state());
+        assert!(post.observes_state());
+        assert!(post
+            .mutation_effects
+            .contains(ToolMutationEffects::REMOTE_MUTATION));
+
+        let fetch = terminal_call_semantics(
+            r#"{"action":"run","command":"curl -sSL https://example.invalid"}"#,
+        );
+        assert!(!fetch
+            .mutation_effects
+            .contains(ToolMutationEffects::REMOTE_MUTATION));
     }
 
     /// Trust markers in the arguments stand in for nothing: a command the

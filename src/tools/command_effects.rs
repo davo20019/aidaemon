@@ -200,6 +200,110 @@ const NETWORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
 ];
 
 /// Whether any command (behind wrappers, groupings, substitutions and
+/// `sh -c`) asks a remote service to change something: curl with a method
+/// other than GET/HEAD, a body, a form or an upload; wget with a body or
+/// such a method; `git push`. Read from option structure, so a plain fetch
+/// is not a write. Other network programs are not judged here.
+pub(crate) fn sends_remote_write(command: &str) -> bool {
+    expanded_commands(command).iter().any(|tokens| {
+        let args = &tokens[1..];
+        match basename(&tokens[0]) {
+            "curl" => curl_sends_write(args),
+            "wget" => wget_sends_write(args),
+            "git" => git_subcommand(args) == Some("push"),
+            _ => false,
+        }
+    })
+}
+
+fn writes_with_method(method: &str) -> bool {
+    !matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+}
+
+fn curl_sends_write(args: &[String]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if name == "request" {
+                let method = inline.map(str::to_string).or_else(|| iter.next().cloned());
+                if method.is_none_or(|method| writes_with_method(&method)) {
+                    return true;
+                }
+            } else if name.starts_with("data")
+                || name == "json"
+                || name.starts_with("form")
+                || name == "upload-file"
+            {
+                return true;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+            // A valued short option ends its cluster; the rest is its value.
+            for (at, c) in cluster.char_indices() {
+                match c {
+                    'd' | 'F' | 'T' => return true,
+                    'X' => {
+                        let rest = &cluster[at + 1..];
+                        let method = if rest.is_empty() {
+                            iter.next().cloned()
+                        } else {
+                            Some(rest.to_string())
+                        };
+                        if method.is_none_or(|method| writes_with_method(&method)) {
+                            return true;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+fn wget_sends_write(args: &[String]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(long) = arg.strip_prefix("--") else {
+            continue;
+        };
+        let (name, inline) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        match name {
+            "post-data" | "post-file" | "body-data" | "body-file" => return true,
+            "method" => {
+                let method = inline.map(str::to_string).or_else(|| iter.next().cloned());
+                if method.is_none_or(|method| writes_with_method(&method)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// git's subcommand: the first positional after its global options (`-C`
+/// and `-c` take a value).
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-C" || arg == "-c" {
+            iter.next();
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// Whether any command (behind wrappers, groupings, substitutions and
 /// `sh -c`) is a known network-reaching executable or subcommand.
 pub(crate) fn fetches_network(command: &str) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
@@ -3162,6 +3266,38 @@ mod tests {
                 !command_effects(mutating).observation_only,
                 "{mutating} should not be observation-only"
             );
+        }
+    }
+
+    #[test]
+    fn remote_writes_are_read_from_option_structure() {
+        for writing in [
+            "curl --noproxy '*' --silent --request POST -H 'Content-Type: application/json' --data '{}' http://localhost:1/ping",
+            "curl -X POST http://localhost:1/x",
+            "curl -XDELETE http://localhost:1/x",
+            "curl -sd a=1 https://example.invalid",
+            "curl --json '{}' https://example.invalid",
+            "curl -F f=@a https://example.invalid",
+            "curl --upload-file a https://example.invalid",
+            "wget --post-data=a=1 https://example.invalid",
+            "wget --method PUT https://example.invalid",
+            "git push origin main",
+            "git -C repo push",
+            "cd x && curl -X PATCH https://example.invalid",
+        ] {
+            assert!(sends_remote_write(writing), "{writing} sends a write");
+        }
+        for reading in [
+            "curl https://example.invalid",
+            "curl -sSL -o out https://example.invalid",
+            "curl -X GET https://example.invalid",
+            "curl --request=HEAD https://example.invalid",
+            "wget https://example.invalid",
+            "git pull",
+            "git log --grep push",
+            "ls",
+        ] {
+            assert!(!sends_remote_write(reading), "{reading} only reads");
         }
     }
 
