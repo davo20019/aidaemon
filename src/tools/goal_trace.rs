@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Goal, GoalTraceStore, StateStore, TaskActivity, Tool, ToolCapabilities};
+use crate::traits::{GoalTraceStore, StateStore, TaskActivity, Tool, ToolCapabilities};
 
 pub struct GoalTraceTool {
     state: Arc<dyn GoalTraceStore>,
@@ -62,42 +62,11 @@ impl GoalTraceTool {
                 candidates.push(g);
             }
         }
-
-        let mut matches: Vec<&Goal> = candidates
-            .iter()
-            .filter(|g| g.id.starts_with(trimmed))
-            .collect();
-        if matches.is_empty() {
-            anyhow::bail!("Goal not found: {}", trimmed);
-        }
-        if matches.len() == 1 {
-            return Ok(matches.remove(0).id.clone());
-        }
-        matches.sort_by_key(|g| match g.status.as_str() {
-            "active" => 0usize,
-            "failed" => 1,
-            "paused" => 2,
-            "pending_confirmation" => 3,
-            "cancelled" => 4,
-            "completed" => 5,
-            _ => 6,
-        });
-        let preview = matches
-            .iter()
-            .take(5)
-            .map(|g| format!("{} ({})", Self::short_id(&g.id), g.status))
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
-            trimmed,
-            matches.len(),
-            preview
-        );
+        super::goal_ids::pick_goal(trimmed, &candidates, "Goal")
     }
 
     fn short_id(id: &str) -> String {
-        id.chars().take(8).collect()
+        super::goal_ids::short_goal_id(id)
     }
 
     fn truncate(s: &str, max: usize) -> String {

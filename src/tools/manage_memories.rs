@@ -415,46 +415,9 @@ impl ManageMemoriesTool {
             return Ok(trimmed.to_string());
         }
 
-        // Prefix fallback: match against scheduled goals because this tool's
-        // schedule operations operate on scheduled goals.
+        // Schedule operations act on scheduled goals.
         let goals = self.state.get_scheduled_goals().await?;
-        let mut matches: Vec<&crate::traits::Goal> =
-            goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
-
-        if matches.is_empty() {
-            anyhow::bail!("Scheduled goal not found: {}", trimmed);
-        }
-
-        if matches.len() == 1 {
-            return Ok(matches.remove(0).id.clone());
-        }
-
-        // Deterministic ambiguity handling: prefer non-terminal states first.
-        matches.sort_by_key(|g| match g.status.as_str() {
-            "active" => 0usize,
-            "paused" => 1,
-            "pending_confirmation" => 2,
-            "failed" => 3,
-            "cancelled" => 4,
-            "completed" => 5,
-            _ => 6,
-        });
-
-        let preview = matches
-            .iter()
-            .take(5)
-            .map(|g| {
-                let short: String = g.id.chars().take(8).collect();
-                format!("{} ({}, {})", short, g.status, g.description)
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
-            trimmed,
-            matches.len(),
-            preview
-        );
+        super::goal_ids::pick_goal(trimmed, &goals, "Scheduled goal")
     }
 
     /// Resolve a personal goal identifier (domain = "personal") by exact ID or unique prefix.

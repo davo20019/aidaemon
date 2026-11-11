@@ -5,8 +5,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::traits::{
-    semantics_for_exact_read_actions, Goal, ScheduledGoalRunsStore, StateStore, Task, TaskActivity,
-    Tool, ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    semantics_for_exact_read_actions, ScheduledGoalRunsStore, StateStore, Task, TaskActivity, Tool,
+    ToolArgumentContractViolation, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolResultPresentation,
 };
 
@@ -290,62 +290,11 @@ impl ScheduledGoalRunsTool {
         }
 
         let goals = self.state.get_scheduled_goals().await?;
-        let mut matches: Vec<&Goal> = goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
-
-        if matches.is_empty() {
-            // The overview shows objectives, not ids. Accept a distinctive
-            // phrase from the objective text as an explicit handle so the
-            // model can address the goal it just listed. This is handle
-            // syntax for one argument, not request classification.
-            let needle = trimmed.to_lowercase();
-            if needle.chars().count() >= 8 {
-                matches = goals
-                    .iter()
-                    .filter(|g| g.description.to_lowercase().contains(&needle))
-                    .collect();
-            }
-        }
-        if matches.is_empty() {
-            anyhow::bail!("Scheduled goal not found: {}", trimmed);
-        }
-        if matches.len() == 1 {
-            return Ok(matches.remove(0).id.clone());
-        }
-
-        matches.sort_by_key(|g| match g.status.as_str() {
-            "active" => 0usize,
-            "failed" => 1,
-            "paused" => 2,
-            "pending_confirmation" => 3,
-            "cancelled" => 4,
-            "completed" => 5,
-            _ => 6,
-        });
-
-        let preview = matches
-            .iter()
-            .take(5)
-            .map(|g| {
-                let short = Self::short_id(&g.id);
-                format!(
-                    "{} ({}, {})",
-                    short,
-                    g.status,
-                    Self::truncate(&g.description, 40)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
-            trimmed,
-            matches.len(),
-            preview
-        );
+        super::goal_ids::pick_goal(trimmed, &goals, "Scheduled goal")
     }
 
     fn short_id(id: &str) -> String {
-        id.chars().take(8).collect()
+        super::goal_ids::short_goal_id(id)
     }
 
     fn truncate(s: &str, max: usize) -> String {
