@@ -355,7 +355,7 @@ impl TaskPlan {
             ),
             PlanStatus::PartiallyCompleted => (
                 "⚠️ Plan ended with unresolved steps",
-                "The final response must explain each deferred item and its blocker.",
+                "The reply below says what was left undone and why.",
             ),
             PlanStatus::Failed => ("❌ Task stopped", "The plan could not be completed."),
             PlanStatus::Abandoned => ("⏹️ Task cancelled", "No more work is in progress."),
@@ -828,7 +828,9 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::PartiallyCompleted);
         let checklist = plan.render_compact_checklist();
         assert!(checklist.starts_with("⚠️ Plan ended with unresolved steps"));
-        assert!(checklist.contains("explain each deferred item and its blocker"));
+        assert!(checklist.contains("what was left undone and why"));
+        // The footer speaks to the user; it is not an instruction to the model.
+        assert!(!checklist.contains("must"));
         assert!(!checklist.contains("Planned steps complete"));
     }
 
