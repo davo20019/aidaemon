@@ -9,6 +9,7 @@ pub(crate) mod cli_agent;
 #[allow(dead_code)]
 pub mod computer_use;
 pub(crate) mod config_manager;
+pub(crate) mod consequential;
 mod diagnose;
 pub mod file_delivery;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).

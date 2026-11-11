@@ -39,7 +39,6 @@
 // Clippy warning until Task 7 wires approval enforcement.
 #![allow(dead_code)]
 
-use crate::agent::keyword_match;
 pub use crate::tools::web_fetch::local_site_key;
 use crate::tools::web_fetch::{classify_blocked_host, BlockedHostClass};
 
@@ -125,41 +124,10 @@ pub struct BrowserActionRisk {
 
 // ─── Keyword list ─────────────────────────────────────────────────────────────
 
-/// Keywords whose standalone presence in script text or a selector signals a
-/// potentially high-impact operation.
-///
-/// Sourced from the task spec: submit, purchase, delete, send, publish,
-/// permission, authentication, account-management.  Extended with close
-/// financial/session synonyms judged in-scope: buy, checkout, pay, transfer,
-/// "sign out", "log out".
-///
-/// Word-boundary matching (via [`keyword_match`]) means derived forms like
-/// "submitted", "purchasing", "deleted", "sender" do NOT match — which is the
-/// desired low-false-positive behaviour.
-const CONSEQUENTIAL_KEYWORDS: &[&str] = &[
-    "submit",
-    "purchase",
-    "delete",
-    "send",
-    "publish",
-    "permission",
-    "authentication",
-    "account",
-    // Extended synonyms
-    "buy",
-    "checkout",
-    "pay",
-    "transfer",
-    "sign out",
-    "log out",
-];
-
-/// Return `true` if `text` contains any [`CONSEQUENTIAL_KEYWORDS`] as a
-/// complete word (or phrase).
+/// Whether a selector or script names a consequential action: the one list
+/// every UI tool shares ([`crate::tools::consequential`]).
 fn is_consequential(text: &str) -> bool {
-    CONSEQUENTIAL_KEYWORDS
-        .iter()
-        .any(|kw| keyword_match(text, kw))
+    crate::tools::consequential::names_consequential_action(text)
 }
 
 // ─── Classifier ───────────────────────────────────────────────────────────────

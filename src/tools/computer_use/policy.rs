@@ -131,21 +131,6 @@ pub fn is_secure_element(element: &IndexedElement) -> bool {
     role.contains("securetextfield") || subrole.contains("secure") || subrole.contains("password")
 }
 
-const CONSEQUENTIAL_KEYWORDS: &[&str] = &[
-    "send",
-    "submit",
-    "delete",
-    "remove",
-    "buy",
-    "purchase",
-    "publish",
-    "post",
-    "pay",
-    "confirm",
-    "authorize",
-    "permission",
-];
-
 pub fn classify_target(
     action: ComputerActionKind,
     element: Option<&IndexedElement>,
@@ -162,34 +147,16 @@ pub fn classify_target(
             el.subrole.as_deref().unwrap_or("")
         )
         .to_ascii_lowercase();
-        if CONSEQUENTIAL_KEYWORDS
-            .iter()
-            .any(|kw| contains_keyword_as_words(&label, kw))
-        {
+        if crate::tools::consequential::names_consequential_action(&label) {
             return ActionClass::Consequential;
         }
     }
     if let Some(text) = typed_text {
-        let lower = text.to_ascii_lowercase();
-        if CONSEQUENTIAL_KEYWORDS
-            .iter()
-            .any(|kw| contains_keyword_as_words(&lower, kw))
-        {
+        if crate::tools::consequential::names_consequential_action(text) {
             return ActionClass::Consequential;
         }
     }
     action.base_class()
-}
-
-fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
-    let text_words: Vec<&str> = text.split_whitespace().collect();
-    let kw_words: Vec<&str> = keyword.split_whitespace().collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window.iter().zip(kw_words.iter()).all(|(a, b)| a == b))
 }
 
 #[cfg(test)]
