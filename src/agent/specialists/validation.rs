@@ -4,10 +4,17 @@
 //! ranges enforced by the spawn flow in `agent/runtime/spawn.rs`.
 
 use crate::traits::SpecialistKind;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Intersect a specialist's tool allowlist with the set of tools its role is
-/// permitted to use. Unknown or out-of-scope tools are dropped with a warn.
+/// permitted to use. Tools missing from this run are dropped; out-of-scope
+/// tools are dropped with a warn.
+///
+/// A declared tool can be missing for ordinary reasons: config disables it
+/// (`git_info` and `project_inspect` are off by default), or the surface does
+/// not offer it. That is logged at debug, not warn, so it does not repeat on
+/// every spawn. Misspelled names in the bundled specialists are caught by
+/// `bundled_specialists_name_only_real_tools` instead.
 pub fn intersect_tools(
     kind: SpecialistKind,
     declared: &[String],
@@ -17,10 +24,10 @@ pub fn intersect_tools(
     let mut out = Vec::new();
     for name in declared {
         if !known_tools.contains(&name.as_str()) {
-            warn!(
+            debug!(
                 kind = %kind.as_str(),
                 tool = %name,
-                "specialist references unknown tool — dropped"
+                "specialist tool not available in this run — dropped"
             );
             continue;
         }
@@ -69,6 +76,57 @@ pub fn clamp_timeout(kind: SpecialistKind, declared: u64, cap: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tool a bundled specialist names is a tool some source defines, so
+    /// a dropped tool at spawn means "not available here", never a typo.
+    #[test]
+    fn bundled_specialists_name_only_real_tools() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sources = String::new();
+        let mut stack = vec![root.join("src"), root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                }
+            }
+        }
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join("specialists"))
+            .unwrap()
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let frontmatter = text.split("---").nth(1).unwrap_or_default();
+            let mut in_tools = false;
+            for line in frontmatter.lines() {
+                if line.starts_with("tools:") {
+                    in_tools = true;
+                    continue;
+                }
+                if !line.starts_with("  ") {
+                    in_tools = false;
+                }
+                let Some(tool) = line.trim().strip_prefix("- ").filter(|_| in_tools) else {
+                    continue;
+                };
+                assert!(
+                    sources.contains(&format!("\"name\": \"{tool}\"")),
+                    "{} names tool `{tool}`, which no tool schema defines",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no specialist tools were checked");
+    }
 
     #[test]
     fn intersect_drops_unknown_tools() {

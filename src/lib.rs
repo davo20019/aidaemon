@@ -166,10 +166,12 @@ pub fn run() -> anyhow::Result<()> {
     // Interactive runs log to stderr. Background service logs are written to
     // an owner-only, size-rotated file so a long-lived daemon cannot consume
     // the host disk through launch-service output redirection.
+    // html5ever warns about markup it cannot place ("foster parenting not
+    // implemented") on ordinary fetched pages; nothing here can act on it.
     logging::init(if cfg!(feature = "browser") {
-        "info,chromiumoxide=off"
+        "info,html5ever=error,chromiumoxide=off"
     } else {
-        "info"
+        "info,html5ever=error"
     })?;
 
     // Handle CLI arguments
