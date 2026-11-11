@@ -411,6 +411,131 @@ impl BackgroundDelivery<'_> {
     }
 }
 
+/// The most sub-agents one `spawn_agent` call may start; at most
+/// [`MAX_CONCURRENT_CHILDREN`] of them run at once.
+const MAX_BATCH_TASKS: usize = 6;
+use aidaemon_tools::outcome::MAX_CONCURRENT_CHILDREN;
+
+/// The children a batch call (`tasks`) asks for, each as a full single-spawn
+/// argument object: the call's other fields are defaults every task may
+/// override. `None` for a single spawn.
+fn batch_tasks(arguments: &str) -> anyhow::Result<Option<Vec<Value>>> {
+    let Ok(Value::Object(mut call)) = serde_json::from_str::<Value>(arguments) else {
+        return Ok(None);
+    };
+    let Some(tasks) = call.remove("tasks") else {
+        return Ok(None);
+    };
+    let Value::Array(tasks) = tasks else {
+        anyhow::bail!("`tasks` must be a list of sub-agent tasks");
+    };
+    anyhow::ensure!(
+        !tasks.is_empty() && tasks.len() <= MAX_BATCH_TASKS,
+        "`tasks` must list 1 to {MAX_BATCH_TASKS} sub-agents"
+    );
+    anyhow::ensure!(
+        !call.contains_key("mission") && !call.contains_key("task"),
+        "With `tasks`, give each sub-agent its own mission and task inside `tasks`"
+    );
+    let merged = tasks
+        .into_iter()
+        .map(|task| {
+            let Value::Object(task) = task else {
+                anyhow::bail!("each entry of `tasks` must be an object with mission and task");
+            };
+            anyhow::ensure!(
+                !task.contains_key("tasks"),
+                "an entry of `tasks` cannot hold its own `tasks`"
+            );
+            let mut item = call.clone();
+            item.extend(task);
+            Ok(Value::Object(item))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let background = |item: &Value| item.get("background").and_then(Value::as_bool) == Some(true);
+    anyhow::ensure!(
+        merged.iter().all(background) || !merged.iter().any(background),
+        "Every sub-agent in one `tasks` call must share `background`"
+    );
+    Ok(Some(merged))
+}
+
+/// When a child ran, in UTC, so a parent can see which of its children
+/// overlapped.
+fn run_window(
+    started: chrono::DateTime<chrono::Utc>,
+    finished: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let secs = (finished - started).num_seconds().max(0);
+    format!(
+        "Sub-agent ran {}\u{2013}{} UTC ({secs}s).",
+        started.format("%H:%M:%S"),
+        finished.format("%H:%M:%S")
+    )
+}
+
+/// One result for a batch call: each child's result under its mission, in
+/// the order given. It succeeded only if every child did, and it fails only
+/// if every child failed.
+fn combine_batch(
+    runs: Vec<(String, anyhow::Result<ToolCallOutcome>)>,
+    background: bool,
+) -> anyhow::Result<ToolCallOutcome> {
+    let count = runs.len();
+    let mut sections = Vec::with_capacity(count);
+    let mut failures = 0;
+    let mut all_succeeded = true;
+    let mut trust = SourceTrust::Trusted;
+    let mut truncation: Option<crate::traits::TruncationInfo> = None;
+    for (index, (mission, run)) in runs.into_iter().enumerate() {
+        let heading = format!("### Sub-agent {} of {count}: {mission}", index + 1);
+        match run {
+            Ok(outcome) => {
+                if outcome.metadata.output_trust != Some(SourceTrust::Trusted) {
+                    trust = SourceTrust::Untrusted;
+                }
+                if outcome.metadata.outcome_status
+                    != Some(crate::traits::ToolOutcomeStatus::Succeeded)
+                {
+                    all_succeeded = false;
+                }
+                if let Some(cut) = outcome.metadata.truncation {
+                    let sum = truncation.get_or_insert(crate::traits::TruncationInfo {
+                        shown_chars: 0,
+                        total_chars: 0,
+                        remediation_hint: cut.remediation_hint.clone(),
+                    });
+                    sum.shown_chars += cut.shown_chars;
+                    sum.total_chars += cut.total_chars;
+                }
+                sections.push(format!("{heading}\n{}", outcome.output));
+            }
+            Err(error) => {
+                failures += 1;
+                all_succeeded = false;
+                // An error may quote what the child wrote.
+                trust = SourceTrust::Untrusted;
+                sections.push(format!("{heading}\nFailed: {error}"));
+            }
+        }
+    }
+    let output = sections.join("\n\n");
+    if failures == count {
+        anyhow::bail!("{output}");
+    }
+    let mut outcome = reported(output, trust);
+    outcome.metadata.truncation = truncation;
+    if background {
+        return Ok(outcome.handed_to_background());
+    }
+    outcome.metadata.outcome_status = Some(if all_succeeded {
+        crate::traits::ToolOutcomeStatus::Succeeded
+    } else {
+        crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+    });
+    Ok(outcome)
+}
+
 #[derive(Deserialize)]
 struct SpawnArgs {
     /// High-level mission / role description for the sub-agent.
@@ -564,7 +689,7 @@ impl Tool for SpawnAgentTool {
         "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step \
          (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the \
          `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
-         benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). Several spawn_agent calls in one response run in parallel (up to 3) and you receive every result. Do NOT delegate \
+         benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). To run several sub-agents at the same time, give them all in one call as `tasks` (up to 6, 3 running at once); you receive every result, each with when it ran. Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
          The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and \
          do not paste prior tool output."
@@ -639,9 +764,15 @@ impl Tool for SpawnAgentTool {
                         "type": "string",
                         "enum": ["this_child", "running_siblings", "shared"],
                         "description": "Give this whenever scope overlaps a running child's: whose change stands if both change the same lines there. this_child: this child's. running_siblings: the children already running. shared: neither, and each such change is put to you to decide. Omitted, it is shared. No child ever overwrites another's lines without one of these deciding it."
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_BATCH_TASKS,
+                        "items": { "type": "object" },
+                        "description": "Several independent sub-agents to run in parallel, instead of mission and task. Each entry is an object with its own mission and task and any of the other fields above; fields given beside tasks apply to every entry unless it sets its own. All entries share background."
                     }
                 },
-                "required": ["mission", "task"],
                 "additionalProperties": false
             }
         })
@@ -652,10 +783,15 @@ impl Tool for SpawnAgentTool {
         arguments: &str,
         facts: &crate::traits::ToolCallContext,
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        if let Some(tasks) = batch_tasks(arguments)? {
+            return self.execute_batch(tasks, facts).await;
+        }
         let status_tx = crate::traits::status_sender(facts);
         let facts = facts.clone();
 
-        let args: SpawnArgs = serde_json::from_str(arguments)?;
+        let args: SpawnArgs = serde_json::from_str(arguments).map_err(|error| {
+            anyhow::anyhow!("{error}. Give mission and task, or several sub-agents as `tasks`.")
+        })?;
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         // A child can be made narrower than its parent and never wider.
@@ -1179,8 +1315,15 @@ impl crate::traits::ToolSemantics for SpawnAgentTool {
         arguments: &str,
         _roots: &crate::traits::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
-        let read_only_child = serde_json::from_str::<SpawnArgs>(arguments)
-            .is_ok_and(|args| matches!(args.access, Some(ChildAccess::ReadOnly)));
+        let read_only = |arguments: &str| {
+            serde_json::from_str::<SpawnArgs>(arguments)
+                .is_ok_and(|args| matches!(args.access, Some(ChildAccess::ReadOnly)))
+        };
+        let read_only_child = match batch_tasks(arguments) {
+            Ok(Some(tasks)) => tasks.iter().all(|task| read_only(&task.to_string())),
+            Ok(None) => read_only(arguments),
+            Err(_) => false,
+        };
         if read_only_child {
             return aidaemon_core::ToolAnnotations::READ_ONLY;
         }
@@ -1209,6 +1352,33 @@ fn reported(output: String, trust: SourceTrust) -> ToolCallOutcome {
 }
 
 impl SpawnAgentTool {
+    /// Start every child of a batch call, at most [`MAX_CONCURRENT_CHILDREN`]
+    /// at a time, each exactly as its own single spawn would run.
+    async fn execute_batch(
+        &self,
+        tasks: Vec<Value>,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        use futures::StreamExt as _;
+        let background = tasks
+            .first()
+            .and_then(|task| task.get("background"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let runs = futures::stream::iter(tasks.into_iter().map(|task| async move {
+            let mission = task
+                .get("mission")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (mission, self.execute(&task.to_string(), facts).await)
+        }))
+        .buffered(MAX_CONCURRENT_CHILDREN)
+        .collect::<Vec<_>>()
+        .await;
+        combine_batch(runs, background)
+    }
+
     /// Run the sub-agent synchronously (blocking until completion or timeout).
     #[allow(clippy::too_many_arguments)]
     async fn run_sync(
@@ -1230,6 +1400,7 @@ impl SpawnAgentTool {
         model_tier: Option<crate::router::Tier>,
         tree: Option<&crate::agent::authority::SpawnFamily>,
     ) -> anyhow::Result<ToolCallOutcome> {
+        let started = chrono::Utc::now();
         let result = agent
             .run_child(ChildAgentRequest {
                 mission: mission.to_string(),
@@ -1248,6 +1419,7 @@ impl SpawnAgentTool {
                 model_tier,
             })
             .await;
+        let window = run_window(started, chrono::Utc::now());
 
         match result {
             Ok(run) => {
@@ -1257,13 +1429,19 @@ impl SpawnAgentTool {
                         format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
                     }
                     TaskOutcome::Failed => {
-                        return Err(anyhow::anyhow!("Sub-agent failed: {}", run.response));
+                        return Err(anyhow::anyhow!(
+                            "Sub-agent failed: {}\n{window}",
+                            run.response
+                        ));
                     }
                 };
                 let (shown, truncation) =
                     bounded_child_response(&response, self.max_response_chars);
                 let mut outcome = reported(
-                    format!("{shown}{}", coordination_trailer(tree, &run.session)),
+                    format!(
+                        "{shown}\n\n{window}{}",
+                        coordination_trailer(tree, &run.session)
+                    ),
                     run.trust,
                 );
                 outcome.metadata.truncation = truncation;
@@ -1277,7 +1455,7 @@ impl SpawnAgentTool {
                 Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
-                None => Err(anyhow::anyhow!("Specialist failed: {}", error)),
+                None => Err(anyhow::anyhow!("Specialist failed: {error}\n{window}")),
                 Some(timed_out) => {
                     if let Some(task_id) = durable_task_id {
                         // The child may have persisted a terminal outcome (e.g.
@@ -1311,13 +1489,13 @@ impl SpawnAgentTool {
                         // action details come from the child's run.
                         return Ok(reported(
                             format!(
-                                "\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}",
+                                "\u{26a0}\u{fe0f} Sub-agent incomplete\n{window}\n\n{}",
                                 timed_out.render()
                             ),
                             SourceTrust::Untrusted,
                         ));
                     }
-                    Err(anyhow::anyhow!("{timed_out}"))
+                    Err(anyhow::anyhow!("{timed_out}\n{window}"))
                 }
             },
         }
@@ -2052,6 +2230,129 @@ mod child_runtime_tests {
             outcome.metadata.outcome_status,
             Some(crate::traits::ToolOutcomeStatus::Succeeded)
         );
+    }
+
+    /// One call with `tasks` starts its children together: they overlap,
+    /// every result comes back under its mission with when it ran, and the
+    /// call succeeds only because each child did.
+    #[tokio::test]
+    async fn a_batch_call_runs_its_children_together() {
+        use crate::traits::ToolSemantics;
+        let child = ScriptedChild::new("done", Duration::from_millis(300));
+        let tool = tool_for(&child);
+        let args = json!({
+            "tasks": [
+                {"mission": "Count routes", "task": "a"},
+                {"mission": "Count tests", "task": "b"},
+                {"mission": "Count files", "task": "c"}
+            ]
+        })
+        .to_string();
+        let begun = std::time::Instant::now();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_millis(800),
+            "three 300ms children took {:?}",
+            begun.elapsed()
+        );
+        assert_eq!(child.tasks.lock().unwrap().len(), 3);
+        for mission in ["Count routes", "Count tests", "Count files"] {
+            assert!(outcome.output.contains(mission), "{}", outcome.output);
+        }
+        assert_eq!(outcome.output.matches("Sub-agent ran ").count(), 3);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded)
+        );
+        let read_only = json!({
+            "access": "read_only",
+            "tasks": [{"mission": "a", "task": "b"}, {"mission": "c", "task": "d"}]
+        })
+        .to_string();
+        assert!(
+            tool.call_annotations_in(&read_only, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
+    }
+
+    #[test]
+    fn batch_entries_take_the_calls_defaults_and_override_them() {
+        use crate::traits::ToolSemantics;
+        let tasks = batch_tasks(
+            &json!({
+                "access": "read_only",
+                "tasks": [
+                    {"mission": "m1", "task": "t1"},
+                    {"mission": "m2", "task": "t2", "access": "write"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tasks[0]["access"], "read_only");
+        assert_eq!(tasks[1]["access"], "write");
+        assert!(
+            batch_tasks(&json!({"mission": "m", "task": "t"}).to_string())
+                .unwrap()
+                .is_none()
+        );
+        for bad in [
+            json!({"tasks": []}),
+            json!({"mission": "m", "tasks": [{"mission": "a", "task": "b"}]}),
+            json!({"tasks": [{"mission": "a", "task": "b", "tasks": []}]}),
+            json!({"tasks": [
+                {"mission": "a", "task": "b", "background": true},
+                {"mission": "c", "task": "d"}
+            ]}),
+        ] {
+            assert!(batch_tasks(&bad.to_string()).is_err(), "{bad}");
+        }
+        // A write in any entry keeps the call's worst case.
+        let tool = SpawnAgentTool::new_deferred(100, 30);
+        let mixed = json!({"tasks": [
+            {"mission": "a", "task": "b", "access": "read_only"},
+            {"mission": "c", "task": "d"}
+        ]})
+        .to_string();
+        assert!(
+            !tool
+                .call_annotations_in(&mixed, &crate::traits::TrustRoots::new(&[]))
+                .read_only
+        );
+    }
+
+    #[test]
+    fn a_batch_with_a_failed_child_is_not_a_success_and_names_it() {
+        let ok = || {
+            let mut outcome = reported("fine".to_string(), SourceTrust::Trusted);
+            outcome.metadata.outcome_status = Some(crate::traits::ToolOutcomeStatus::Succeeded);
+            outcome
+        };
+        let combined = combine_batch(
+            vec![
+                ("first".to_string(), Ok(ok())),
+                ("second".to_string(), Err(anyhow::anyhow!("boom"))),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            combined.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert_eq!(combined.metadata.output_trust, Some(SourceTrust::Untrusted));
+        assert!(combined
+            .output
+            .contains("Sub-agent 2 of 2: second\nFailed: boom"));
+        assert!(combine_batch(
+            vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
+            false
+        )
+        .is_err());
     }
 
     /// A background child that panics still clears its record, frees its
