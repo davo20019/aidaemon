@@ -773,7 +773,9 @@ impl Agent {
              If you did not execute a tool and receive a success result, do NOT tell the user you performed an action. \
              Do not fabricate completed actions, settings changes, or operations that never happened. \
              Only report actions that you actually executed and whose results you can see. \
-             When describing any tool-derived result or error, only cite filenames, paths, status codes, error messages, field names, parameter names, IDs, test names, values, counts, or other specifics that actually appear in the tool output; if a detail is missing or ambiguous, say that plainly instead of inferring it.\n",
+             When describing any tool-derived result or error, only cite filenames, paths, status codes, error messages, field names, parameter names, IDs, test names, values, counts, or other specifics that actually appear in the tool output; if a detail is missing or ambiguous, say that plainly instead of inferring it. \
+             Quotation marks mean verbatim: quote someone's words only when you copy them character for character from a message or tool result you can see; \
+             otherwise report them without quotation marks as a paraphrase (Alice said she would be late, not Alice said \"I'll be late\").\n",
         );
 
         // Rule 2: capability-honesty kernel (new)
@@ -1889,6 +1891,7 @@ mod tests {
         let core = Agent::core_behavioral_rules();
         for needle in [
             "Never claim actions were performed unless confirmed by a tool result",
+            "Quotation marks mean verbatim",
             "you have a tool for", // capability-honesty kernel
             "Never claim tests pass or builds succeed without running them",
             "Use write_file/edit_file for file creation",

@@ -37,7 +37,7 @@ const OBSERVATION_PROGRAMS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "stat", "file",
     "pwd", "echo", "printf", "which", "whoami", "id", "uname", "date", "du", "df", "tree", "sort",
     "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "jq", "ps",
-    "hostname", "sw_vers", "true", "git", "test", "[",
+    "hostname", "sw_vers", "true", "git", "test", "[", "sleep",
 ];
 
 const SYSTEM_BIN_DIRS: &[&str] = &[
@@ -1070,6 +1070,14 @@ fn date_args_observe(args: &[String]) -> bool {
         })
 }
 
+/// A `sleep` operand: a non-negative number with an optional s/m/h/d unit.
+fn is_sleep_duration(arg: &str) -> bool {
+    let number = arg.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(arg);
+    !number.is_empty()
+        && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        && number.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
 fn observation_args_ok(program: &str, args: &[String]) -> bool {
     let any = |pred: &dyn Fn(&str) -> bool| args.iter().any(|arg| pred(arg));
     match program {
@@ -1097,6 +1105,9 @@ fn observation_args_ok(program: &str, args: &[String]) -> bool {
         "tree" => tree_args_ok(args),
         "date" => date_args_observe(args),
         "hostname" => args.is_empty(),
+        // Waiting does nothing else; a bounded duration (`18`, `0.5`, `2m`).
+        // `infinity` never returns and is left to the owner.
+        "sleep" => !args.is_empty() && args.iter().all(|arg| is_sleep_duration(arg)),
         "file" => !any(&|a| {
             a == "--compile" || a.starts_with("--magic-file") || short_cluster_has(a, &['C', 'm'])
         }),
@@ -3175,6 +3186,10 @@ mod tests {
             "test ! -e restart-check.txt",
             "[ -f Cargo.toml ]",
             "test -d src && ls src",
+            "sleep 18",
+            "sleep 0.5",
+            "sleep 2m",
+            "sleep 5 && cat out.log",
         ] {
             assert!(
                 command_effects(observing).observation_only,
@@ -3182,6 +3197,9 @@ mod tests {
             );
         }
         for mutating in [
+            "sleep infinity",
+            "sleep 5; curl example.invalid",
+            "sleep $(curl example.invalid)",
             "rm -rf /tmp/aidaemon-test/x",
             "ls /tmp; rm -rf /tmp/aidaemon-test/x",
             "ls && rm x",
