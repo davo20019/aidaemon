@@ -1429,6 +1429,7 @@ impl Agent {
             .and_then(|parent| parent.parent_run);
         let prefix_len = state.messages.len();
         let run_id = state.run_id;
+        run_declines.bind(run_id);
 
         // Drive the run and the tool dispatcher together on this task.
         let budget_goal = match self.budget_goal_id(session_id).await {

@@ -16,19 +16,49 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use aidaemon_core as sdk;
+use aidaemon_core::InterruptResolver as _;
 use aidaemon_store_sqlite::SqliteStore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-/// What the owner is told about requests a cut-off run did not carry out.
+/// What the owner is told about requests a cut-off run did not carry out:
+/// each card's question (its first sentence), and that the owner declined
+/// nothing.
 pub(super) fn not_done_note(not_done: &[String]) -> Option<String> {
-    const MAX_CHARS: usize = 300;
+    const MAX_ITEM_CHARS: usize = 120;
+    const MAX_ITEMS: usize = 3;
     if not_done.is_empty() {
         return None;
     }
-    let listed: String = not_done.join("; ").chars().take(MAX_CHARS).collect();
+    let question = |summary: &String| {
+        let summary = summary.trim();
+        // A sentence ends at `?`, a line break, or a `.` before a space (not
+        // the dots of a host name).
+        let mut chars = summary.char_indices().peekable();
+        let mut end = summary.len();
+        while let Some((at, c)) = chars.next() {
+            let next_is_space = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+            if c == '?' || c == '\n' || (c == '.' && next_is_space) {
+                end = at + c.len_utf8();
+                break;
+            }
+        }
+        let first = summary[..end].trim();
+        if first.chars().count() > MAX_ITEM_CHARS {
+            let cut: String = first.chars().take(MAX_ITEM_CHARS).collect();
+            format!("{}\u{2026}", cut.trim_end())
+        } else {
+            first.to_string()
+        }
+    };
+    let mut listed: Vec<String> = not_done.iter().take(MAX_ITEMS).map(question).collect();
+    if not_done.len() > MAX_ITEMS {
+        listed.push(format!("and {} more", not_done.len() - MAX_ITEMS));
+    }
     Some(format!(
-        "⚠️ An earlier request was cut off before you answered, so it was not done: {listed}. Ask again if you still want it."
+        "\u{26a0}\u{fe0f} The daemon restarted while an approval was waiting for you, so it was \
+         not done (you declined nothing): {}. Ask again if you still want it.",
+        listed.join("; ")
     ))
 }
 
@@ -135,38 +165,52 @@ pub(super) async fn settle(
     cancel: CancellationToken,
     resolver: &dyn sdk::InterruptResolver,
 ) -> Result<Option<sdk::RunOutcome>, sdk::CoreError> {
-    let mut outcome = match state.pending.clone() {
+    // A declined owner decision ends the old run: going on would spend model
+    // calls on a request the owner has moved past, and decline, with nobody
+    // asked, every later card it reached. The first one cancels the run, so
+    // it settles only what it had started.
+    let run_cancel = cancel.child_token();
+    let resolver = EndsAtOwnerQuestion {
+        inner: resolver,
+        run: run_cancel.clone(),
+    };
+    let outcome = match state.pending.clone() {
         Some(pending) => {
             let Some(resolution) = resolver.resolve(&state, &pending.interruption).await else {
                 return Ok(None);
             };
-            // A declined owner decision ends the old run here; going on would
-            // spend model calls on a request the owner has moved past.
-            let resume_cancel = if matches!(
-                pending.interruption.kind,
-                sdk::InterruptKind::OwnerApproval(_)
-            ) {
-                let ended = CancellationToken::new();
-                ended.cancel();
-                ended
-            } else {
-                cancel.clone()
-            };
             agent
-                .resume_with_cancel(state, resolution, resume_cancel)
+                .resume_resolving(state, resolution, run_cancel, &resolver)
                 .await?
         }
-        None => agent.run_resolving(state, cancel.clone(), resolver).await?,
+        None => agent.run_resolving(state, run_cancel, &resolver).await?,
     };
-    while let sdk::RunStatus::Interrupted { interruption } = &outcome.status {
-        let Some(resolution) = resolver.resolve(&outcome.state, interruption).await else {
-            return Ok(None);
-        };
-        outcome = agent
-            .resume_with_cancel(outcome.state, resolution, cancel.clone())
-            .await?;
+    if matches!(outcome.status, sdk::RunStatus::Interrupted { .. }) {
+        return Ok(None);
     }
     Ok(Some(outcome))
+}
+
+/// Settles a recovered run's interruptions with `inner`, and ends the run at
+/// the first owner question: nobody is there to answer it.
+struct EndsAtOwnerQuestion<'a> {
+    inner: &'a dyn sdk::InterruptResolver,
+    run: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl sdk::InterruptResolver for EndsAtOwnerQuestion<'_> {
+    async fn resolve(
+        &self,
+        state: &sdk::RunState,
+        interruption: &sdk::Interruption,
+    ) -> Option<sdk::Resolution> {
+        let resolution = self.inner.resolve(state, interruption).await;
+        if matches!(interruption.kind, sdk::InterruptKind::OwnerApproval(_)) {
+            self.run.cancel();
+        }
+        resolution
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +237,71 @@ mod tests {
         }
         assert!(store.run_ended(state.run_id).await.unwrap());
         assert!(stranded_run(Some(&store), session).await.is_none());
+    }
+
+    #[test]
+    fn the_not_done_note_names_each_question_briefly() {
+        let note = not_done_note(&[
+            "Let the browser open demo.example.test, a site on this computer? Approve only if you asked for it.".to_string(),
+            format!("Run terminal {}", "x".repeat(400)),
+        ])
+        .unwrap();
+        assert!(note.contains("Let the browser open demo.example.test, a site on this computer?"));
+        assert!(!note.contains("Approve only"), "{note}");
+        assert!(note.contains("you declined nothing"), "{note}");
+        assert!(note.chars().count() < 400, "{note}");
+        assert!(not_done_note(&[]).is_none());
+    }
+
+    struct Declines;
+
+    #[async_trait::async_trait]
+    impl sdk::InterruptResolver for Declines {
+        async fn resolve(
+            &self,
+            _state: &sdk::RunState,
+            _interruption: &sdk::Interruption,
+        ) -> Option<sdk::Resolution> {
+            Some(sdk::Resolution::Deny {
+                reason: "cut off".to_string(),
+            })
+        }
+    }
+
+    fn interruption(kind: sdk::InterruptKind) -> sdk::Interruption {
+        sdk::Interruption {
+            call: sdk::ToolCall::new("c1", "browser", serde_json::json!({})),
+            reason: "r".to_string(),
+            kind,
+        }
+    }
+
+    /// A recovered run ends at the first owner question it reaches: nobody
+    /// is there to answer, so it must not go on declining later cards.
+    #[tokio::test]
+    async fn a_recovered_run_ends_at_its_first_owner_question() {
+        let state = sdk::RunState::new("aidaemon", "s", "Earlier request.");
+        let resolver = EndsAtOwnerQuestion {
+            inner: &Declines,
+            run: CancellationToken::new(),
+        };
+        resolver
+            .resolve(&state, &interruption(sdk::InterruptKind::Untrusted))
+            .await;
+        assert!(
+            !resolver.run.is_cancelled(),
+            "a verifier check is not the owner's"
+        );
+        let owner = sdk::InterruptKind::OwnerApproval(sdk::OwnerApprovalRequest {
+            effects: Vec::new(),
+            summary: "Open a site".to_string(),
+            subject: "browser".to_string(),
+            risk: sdk::ApprovalRisk::High,
+            warnings: Vec::new(),
+        });
+        let answer = resolver.resolve(&state, &interruption(owner)).await;
+        assert!(matches!(answer, Some(sdk::Resolution::Deny { .. })));
+        assert!(resolver.run.is_cancelled());
     }
 
     #[tokio::test]

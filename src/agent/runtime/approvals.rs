@@ -121,13 +121,27 @@ impl std::fmt::Debug for ApprovalTools {
 /// The effects the owner declined in a run, as the kernel's hook context
 /// reports them (`RunState::declined`). Declines only grow within a
 /// daemon run, so the latest view holds every earlier one.
+///
+/// Once bound to its turn's run, it takes in that run's declines only: the
+/// same hooks also judge a run a restart left unfinished, settled before
+/// the turn, and what that run declined (with nobody asked) is not the
+/// owner's answer in this one.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RunDeclines(Arc<Mutex<Vec<sdk::EffectKey>>>);
+pub(crate) struct RunDeclines(Arc<Mutex<(Option<sdk::RunId>, Vec<sdk::EffectKey>)>>);
 
 impl RunDeclines {
-    /// Take in the run's declines as a hook context shows them.
-    pub(crate) fn observe(&self, declined: &[sdk::EffectKey]) {
-        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    /// Take in only `run`'s declines from now on.
+    pub(crate) fn bind(&self, run: sdk::RunId) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(run);
+    }
+
+    /// Take in `run`'s declines as a hook context shows them.
+    pub(crate) fn observe(&self, run: sdk::RunId, declined: &[sdk::EffectKey]) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (bound, seen) = &mut *guard;
+        if bound.is_some_and(|bound| bound != run) {
+            return;
+        }
         for key in declined {
             if !seen.contains(key) {
                 seen.push(key.clone());
@@ -137,7 +151,7 @@ impl RunDeclines {
 
     /// Every decline seen so far.
     pub(crate) fn snapshot(&self) -> Vec<sdk::EffectKey> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
     }
 }
 
@@ -565,7 +579,7 @@ impl ApprovalRules for AppApprovalRules {
         call: &sdk::ToolCall,
         _info: &sdk::ToolInfo,
     ) -> RuleDecision {
-        self.run_declines.observe(ctx.declined);
+        self.run_declines.observe(ctx.run_id, ctx.declined);
         if let Some(approvals) = self.judged_tool(&call.name) {
             return self.judge_canonical(approvals, ctx.run_id, call).await;
         }
@@ -2611,8 +2625,14 @@ mod tests {
         );
         assert_eq!(rules.run_declines.snapshot(), declined.to_vec());
         // A later view keeps every earlier decline.
-        rules.run_declines.observe(&[]);
+        rules.run_declines.observe(ctx.run_id, &[]);
         assert_eq!(rules.run_declines.snapshot(), declined.to_vec());
+        // Bound to its turn's run, it ignores another run's declines (a
+        // run settled after a restart, with nobody asked).
+        let turn = RunDeclines::default();
+        turn.bind(sdk::RunId::new());
+        turn.observe(ctx.run_id, &declined);
+        assert!(turn.snapshot().is_empty());
     }
 
     /// A temp SQLite store for the tools whose judgment reads state.
