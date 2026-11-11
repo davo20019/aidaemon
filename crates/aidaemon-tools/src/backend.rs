@@ -40,6 +40,13 @@ impl BackendPath {
         Self(path.into())
     }
 
+    /// Whether `path` names its location on its own: absolute, `~` or
+    /// `~/…` (the backend's home). Anything else, `~user` included, is
+    /// relative to a working directory, as [`normalize_lexically`] reads it.
+    pub fn is_anchored(path: &str) -> bool {
+        path == "~" || path.starts_with("~/") || Path::new(path).is_absolute()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -629,4 +636,19 @@ pub fn normalize_local_lexically(path: &Path) -> anyhow::Result<PathBuf> {
         }
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod anchored_path_tests {
+    use super::*;
+
+    #[test]
+    fn only_absolute_and_home_paths_are_anchored() {
+        for anchored in ["/srv/app", "~", "~/notes"] {
+            assert!(BackendPath::is_anchored(anchored), "{anchored}");
+        }
+        for relative in ["notes", "./notes", "~someone/notes", ""] {
+            assert!(!BackendPath::is_anchored(relative), "{relative}");
+        }
+    }
 }

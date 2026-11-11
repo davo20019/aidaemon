@@ -248,7 +248,7 @@ async fn scoped_workspace_arguments(
     // usable without exposing the host's absolute path in conversation.
     let requested = if raw_path == "." {
         root_path.clone()
-    } else if std::path::Path::new(raw_path).is_absolute() || raw_path.starts_with('~') {
+    } else if crate::execution::BackendPath::is_anchored(raw_path) {
         std::path::PathBuf::from(raw_path)
     } else {
         root_path.join(raw_path)

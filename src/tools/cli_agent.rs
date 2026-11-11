@@ -1310,7 +1310,7 @@ impl CliAgentTool {
     ) -> anyhow::Result<String> {
         let path = path.trim();
         anyhow::ensure!(!path.is_empty(), "CLI access path cannot be empty");
-        let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
+        let prepared = if BackendPath::is_anchored(path) {
             path.to_string()
         } else if let Some(working_dir) = working_dir {
             BackendPath::new(working_dir).join(path).to_string()
@@ -4642,7 +4642,7 @@ impl crate::traits::ToolSemantics for CliAgentTool {
         {
             let path = execution_cwd
                 .as_deref()
-                .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+                .filter(|_| !crate::execution::BackendPath::is_anchored(path))
                 .map(|cwd| {
                     crate::execution::BackendPath::new(cwd)
                         .join(path)
@@ -4665,7 +4665,7 @@ impl crate::traits::ToolSemantics for CliAgentTool {
             .map(|path| {
                 execution_cwd
                     .as_deref()
-                    .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+                    .filter(|_| !crate::execution::BackendPath::is_anchored(path))
                     .map(|cwd| {
                         crate::execution::BackendPath::new(cwd)
                             .join(path)

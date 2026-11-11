@@ -1291,17 +1291,15 @@ pub(crate) fn url_host_effect(url: &reqwest::Url) -> Option<EffectKey> {
     egress_effect(scheme, url.host_str()?, Some(port))
 }
 
-/// A path effect on `raw`, absolute and normalized: `~/` expands to the home
-/// directory and a relative path resolves against `cwd` (an absolute
-/// directory). On disk the nearest existing ancestor is canonicalized, so an
-/// existing path is declared by its canonical form (symlinks resolved, and on
-/// macOS case and `/tmp` as `/private/tmp`) and a new one below it agrees with
-/// it. A `Delete` keeps its last component: removing a symlink removes the
-/// link. `None` when the path cannot be read structurally (shell expansion)
-/// or is relative with no known working directory.
-pub(crate) fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> Option<EffectKey> {
+/// A path argument as an absolute path, when it can be read structurally:
+/// `~` and `~/…` expand to the home directory, a relative path resolves
+/// against `cwd` (an absolute directory). `None` for shell expansion or
+/// globbing, `~user`, or a relative path with no known working directory.
+/// Every effect a path declares is read this way, so a delete and a write
+/// of the same argument name the same path.
+fn structural_absolute_path(raw: &str, cwd: Option<&str>) -> Option<String> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.contains(['$', '`', '*', '?', '[', '{', '}', '\\', '\0']) {
+    if raw.is_empty() || raw.contains(['$', '`', '*', '?', '[', ']', '{', '}', '\\', '\0']) {
         return None;
     }
     let expanded = if raw == "~" || raw.starts_with("~/") {
@@ -1311,12 +1309,23 @@ pub(crate) fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> O
     } else {
         raw.to_string()
     };
-    let absolute = if expanded.starts_with('/') {
-        expanded
-    } else {
-        let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
-        format!("{}/{expanded}", cwd.trim_end_matches('/'))
-    };
+    if expanded.starts_with('/') {
+        return Some(expanded);
+    }
+    let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
+    Some(format!("{}/{expanded}", cwd.trim_end_matches('/')))
+}
+
+/// A path effect on `raw`, absolute and normalized: `~/` expands to the home
+/// directory and a relative path resolves against `cwd` (an absolute
+/// directory). On disk the nearest existing ancestor is canonicalized, so an
+/// existing path is declared by its canonical form (symlinks resolved, and on
+/// macOS case and `/tmp` as `/private/tmp`) and a new one below it agrees with
+/// it. A `Delete` keeps its last component: removing a symlink removes the
+/// link. `None` when the path cannot be read structurally (shell expansion)
+/// or is relative with no known working directory.
+pub(crate) fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> Option<EffectKey> {
+    let absolute = structural_absolute_path(raw, cwd)?;
     let lexical = EffectKey::path(class, &absolute)?;
     Some(resolved_on_disk(class, lexical))
 }
@@ -1361,23 +1370,7 @@ pub(crate) fn shell_path_effects(
     raw: &str,
     cwd: Option<&str>,
 ) -> Option<Vec<EffectKey>> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.contains(['$', '`', '*', '?', '[', ']', '{', '}', '\\', '\0']) {
-        return None;
-    }
-    let expanded = if raw == "~" || raw.starts_with("~/") {
-        format!("{}{}", dirs::home_dir()?.to_str()?, &raw[1..])
-    } else if raw.starts_with('~') {
-        return None;
-    } else {
-        raw.to_string()
-    };
-    let absolute = if expanded.starts_with('/') {
-        expanded
-    } else {
-        let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
-        format!("{}/{expanded}", cwd.trim_end_matches('/'))
-    };
+    let absolute = structural_absolute_path(raw, cwd)?;
     let components: Vec<&str> = absolute
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
@@ -2952,6 +2945,26 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path effect reads its argument the same way: a bracket in
+    /// either form, `~user` and an unanchored relative path are unreadable.
+    #[test]
+    fn path_effects_read_one_argument_one_way() {
+        for raw in ["/tmp/a]b", "/tmp/a[b", "~someone/x", "rel/x"] {
+            assert!(
+                path_effect(EffectClass::Write, raw, None).is_none(),
+                "{raw}"
+            );
+            assert!(
+                shell_path_effects(EffectClass::Write, raw, None).is_none(),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            structural_absolute_path("notes.txt", Some("/srv/app/")),
+            Some("/srv/app/notes.txt".to_string())
+        );
+    }
 
     /// `xargs` takes its operands from stdin, which no argument names: the
     /// paths it reads cannot be determined, even with a readable redirect.
