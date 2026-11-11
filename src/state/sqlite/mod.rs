@@ -295,6 +295,8 @@ mod token_usage;
 mod memory_store_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_transaction_tests;
 
 #[cfg(test)]
 mod turn_id_hydration_tests {

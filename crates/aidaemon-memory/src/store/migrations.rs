@@ -133,7 +133,7 @@ pub(crate) async fn run(pool: &SqlitePool) -> Result<()> {
     }
 
     for migration in MIGRATIONS.iter().filter(|m| m.version > found) {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let claimed = sqlx::query(
             "INSERT OR IGNORE INTO memory_schema_migrations (version, applied_at)
              VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",

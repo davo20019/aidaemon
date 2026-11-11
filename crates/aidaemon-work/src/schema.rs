@@ -176,7 +176,7 @@ pub async fn migrate_work_tables(
                 })
         }
 
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Helper: column existence check (works even if the table doesn't exist).
         async fn column_exists(
@@ -1465,7 +1465,7 @@ pub async fn migrate_work_tables(
     .and_then(|row| row.try_get::<Option<String>, _>("sql").ok().flatten())
     .unwrap_or_default();
     if !mutation_attempts_schema.contains("never_dispatched") {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DROP TABLE IF EXISTS mandate_mutation_attempts_v2")
             .execute(&mut *tx)
             .await?;

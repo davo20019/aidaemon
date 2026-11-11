@@ -47,7 +47,7 @@ async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<
         })
         .collect();
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let mut scanned: u64 = 0;
     let mut migrated: u64 = 0;
 

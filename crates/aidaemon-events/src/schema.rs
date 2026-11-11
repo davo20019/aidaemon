@@ -95,7 +95,7 @@ pub async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     .fetch_one(pool)
     .await?
         > 0;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS task_lifecycle (

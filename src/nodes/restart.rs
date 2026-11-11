@@ -161,7 +161,7 @@ impl NodeStore {
         let now = Utc::now();
         let created_at = now.to_rfc3339();
         let command_id = format!("restart_{}", uuid::Uuid::new_v4().simple());
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         // The unique index on active commands settles a concurrent request.
         sqlx::query(
             "INSERT INTO node_restart_commands
@@ -289,7 +289,7 @@ impl NodeStore {
         let Some((next, event)) = outcome else {
             return Ok(());
         };
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE node_restart_commands SET state = ?, finished_at = ?
              WHERE command_id = ? AND state = ?",
@@ -317,7 +317,7 @@ impl NodeStore {
         boot_id: &str,
         uptime_ms: u64,
     ) -> anyhow::Result<Option<DeviceRestartCommand>> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let claimed = sqlx::query(
             "UPDATE node_restart_commands
              SET state = 'delivered', delivered_at = ?, delivered_boot_id = ?,

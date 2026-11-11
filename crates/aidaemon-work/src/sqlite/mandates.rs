@@ -1545,7 +1545,7 @@ async fn quarantine_uncontrolled_autopilot_mandates(
 /// restart, even though no safe controller run can execute it.
 pub async fn enforce_mandate_invariants_on_startup(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     quarantine_uncontrolled_autopilot_mandates(&mut transaction, &now).await?;
     transaction.commit().await?;
     Ok(())

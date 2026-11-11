@@ -100,7 +100,7 @@ impl SqliteMemoryStore {
         now: DateTime<Utc>,
     ) -> std::result::Result<UpsertOutcome, sqlx::Error> {
         let now_s = ts(now);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
             "SELECT id, value, source_excerpt, privacy, channel_id FROM memory_facts
              WHERE scope = ? AND category = ? AND key = ? AND superseded_at IS NULL",
@@ -396,7 +396,7 @@ impl MemoryStore for SqliteMemoryStore {
         key: &str,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM memory_facts
              WHERE scope = ? AND category = ? AND key = ? AND superseded_at IS NULL",
@@ -464,7 +464,7 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     async fn record_fact_recalls(&self, ids: &[String], now: DateTime<Utc>) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         bump_recalls(&mut tx, "memory_facts", ids, &ts(now)).await?;
         tx.commit().await?;
         Ok(())
@@ -501,7 +501,7 @@ impl MemoryStore for SqliteMemoryStore {
         let topics = serde_json::to_string(&episode.topics)
             .map_err(|e| MemoryError::Store(e.to_string()))?;
         let (blob, model) = embedding_columns(&embedding);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO memory_episodes (id, scope, session_id, summary, topics, importance,
                 created_at, embedding, embedding_model, privacy, channel_id)
@@ -558,7 +558,7 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     async fn record_episode_recalls(&self, ids: &[String], now: DateTime<Utc>) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         bump_recalls(&mut tx, "memory_episodes", ids, &ts(now)).await?;
         tx.commit().await?;
         Ok(())
@@ -566,7 +566,7 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn decay(&self, now: DateTime<Utc>, config: &RetentionConfig) -> Result<DecayReport> {
         let mut report = DecayReport::default();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(window) = config.superseded_retention {
             report.superseded_deleted = sqlx::query(
                 "DELETE FROM memory_facts WHERE superseded_at IS NOT NULL AND superseded_at < ?",

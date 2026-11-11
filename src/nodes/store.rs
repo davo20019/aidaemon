@@ -549,7 +549,7 @@ impl NodeStore {
         firmware_version: &str,
         capabilities: &[super::domain::CapabilityObservation],
     ) -> anyhow::Result<EnrollmentResult> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT secret_digest, owner_id, expected_kind, display_name, policy_profile,
                     conversation_session_id, expires_at, consumed_at, attempts
@@ -783,7 +783,7 @@ impl NodeStore {
         boot_id: &str,
         session_ttl_seconds: u64,
     ) -> anyhow::Result<CreatedSession> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now();
         let updated = sqlx::query(
             "UPDATE node_auth_challenges SET used_at = ?
@@ -979,7 +979,7 @@ impl NodeStore {
         new_public_key_sec1: &[u8],
     ) -> anyhow::Result<EnrollmentResult> {
         let now = Utc::now();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let consumed = sqlx::query(
             "UPDATE node_credential_rotation_challenges SET used_at = ?
              WHERE rotation_id = ? AND used_at IS NULL AND expires_at > ?",
@@ -1074,7 +1074,7 @@ impl NodeStore {
         constraints: serde_json::Value,
     ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let next_revision: i64 = sqlx::query_scalar(
             "UPDATE nodes SET authorization_revision = authorization_revision + 1
              WHERE node_id = ? AND revoked_at IS NULL RETURNING authorization_revision",
@@ -1139,7 +1139,7 @@ impl NodeStore {
             "psram_free": heartbeat.psram_free,
             "recovery": heartbeat.recovery.as_ref(),
         });
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "UPDATE nodes SET last_seen_at = ?, last_runtime_version = ?,
                     last_firmware_version = ?, last_health_json = ?
@@ -1185,7 +1185,7 @@ impl NodeStore {
     ) -> anyhow::Result<DateTime<Utc>> {
         let received_at = Utc::now();
         let received_at_text = received_at.to_rfc3339();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for reading in &request.readings {
             if monitoring.is_some_and(|config| config.enabled) {
                 let duplicate: Option<i64> = sqlx::query_scalar(
@@ -1289,7 +1289,7 @@ impl NodeStore {
             "turn-request",
             format!("text\0{request_id}\0{text}").as_bytes(),
         );
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) = sqlx::query(
             "SELECT request_digest, result_id FROM node_request_dedup
              WHERE node_id = ? AND operation = 'create_turn' AND idempotency_key = ?",
@@ -1399,7 +1399,7 @@ impl NodeStore {
             )
             .as_bytes(),
         );
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) = sqlx::query(
             "SELECT request_digest, result_id FROM node_request_dedup
              WHERE node_id = ? AND operation = 'create_turn' AND idempotency_key = ?",
@@ -1571,7 +1571,7 @@ impl NodeStore {
         state: NodeTurnState,
         payload: serde_json::Value,
     ) -> anyhow::Result<u64> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now().to_rfc3339();
         let result_text = payload.get("text").and_then(|value| value.as_str());
         let error_code = payload.get("code").and_then(|value| value.as_str());
@@ -1605,7 +1605,7 @@ impl NodeStore {
     }
 
     pub async fn begin_turn_processing(&self, node_id: &str, turn_id: &str) -> anyhow::Result<u64> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE node_turns SET state = 'thinking', updated_at = ?
              WHERE turn_id = ? AND node_id = ? AND state = 'accepted'",
@@ -1632,7 +1632,7 @@ impl NodeStore {
     }
 
     pub async fn cancel_turn(&self, node_id: &str, turn_id: &str) -> anyhow::Result<NodeTurnState> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current: String =
             sqlx::query_scalar("SELECT state FROM node_turns WHERE turn_id = ? AND node_id = ?")
                 .bind(turn_id)
@@ -1723,7 +1723,7 @@ impl NodeStore {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Node Channel is unavailable"))?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let cursor = append_event_tx(
             &mut transaction,
             row.get::<String, _>("node_id").as_str(),
@@ -1812,7 +1812,7 @@ impl NodeStore {
     ) -> anyhow::Result<QueuedAudioAnnouncement> {
         let now = Utc::now();
         let expires_at = now + Duration::seconds(ttl_seconds as i64);
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let eligible: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM nodes n
@@ -1951,7 +1951,7 @@ impl NodeStore {
         detail_code: Option<&str>,
     ) -> anyhow::Result<Option<OutboundMediaCleanup>> {
         let now = Utc::now();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let event_exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM node_outbox
              WHERE cursor = ? AND node_id = ? AND turn_id IS NULL AND event_type = 'channel.audio'",
@@ -2136,7 +2136,7 @@ impl NodeStore {
 
     pub async fn revoke_node(&self, node_id: &str) -> anyhow::Result<bool> {
         let now = Utc::now().to_rfc3339();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE nodes SET revoked_at = COALESCE(revoked_at, ?),
                     policy_revision = policy_revision + 1,

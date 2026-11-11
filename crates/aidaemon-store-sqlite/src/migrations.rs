@@ -86,7 +86,7 @@ pub(crate) async fn run(pool: &SqlitePool) -> Result<(), Error> {
     }
 
     for migration in MIGRATIONS.iter().filter(|m| m.version > found) {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         // Claim the version first: this takes the write lock, and if another
         // process applied it meanwhile the insert is ignored and we skip.
         let claimed = sqlx::query(

@@ -738,7 +738,7 @@ impl NodeMonitoringService {
         let recovered = monitor
             .comparison
             .recovery_matches(value, monitor.clear_threshold);
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         if monitor.threshold_triggered_at.is_some() {
             if recovered {
@@ -1009,7 +1009,7 @@ impl NodeMonitoringService {
             .await?;
         for row in &expired {
             let monitor = monitor_from_row(row)?;
-            let mut transaction = self.pool.begin().await?;
+            let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let changed = sqlx::query(
                 "UPDATE node_monitors SET status = 'expired', condition_since = NULL, updated_at = ?
                  WHERE monitor_id = ? AND status IN ('active','paused','suspended')",
@@ -1143,7 +1143,7 @@ impl NodeMonitoringService {
         reason: &str,
         evidence: Value,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE node_monitors SET status = 'suspended', condition_since = NULL, updated_at = ?
              WHERE monitor_id = ? AND status = 'active'",
@@ -1180,7 +1180,7 @@ impl NodeMonitoringService {
         state: &str,
         notify: bool,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "UPDATE node_monitors SET availability_state = ?, last_availability_alert_at = ?, updated_at = ?
              WHERE monitor_id = ? AND status = 'active'",
@@ -1204,7 +1204,7 @@ impl NodeMonitoringService {
         state: &str,
         repeated: bool,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "UPDATE node_monitors SET last_availability_alert_at = ?, updated_at = ?
              WHERE monitor_id = ? AND status = 'active'",
