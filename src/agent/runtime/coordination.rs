@@ -1150,7 +1150,24 @@ impl Coordination {
             if let Some(bytes) = bytes.as_deref() {
                 ledger.retain(state, bytes);
             }
-            let overwritten = ledger.held_by_others(&path, state, owner);
+            let mut overwritten = ledger.held_by_others(&path, state, owner);
+            // The top-level agent settles the tree: its own command changing
+            // lines that finished children wrote is its decision about their
+            // settled work, not an overwrite nobody decided. A child still
+            // running, or an overlapping shell window, keeps the notice.
+            let by_root = ledger
+                .root
+                .as_ref()
+                .is_some_and(|root| root.session == member);
+            if by_root && !overlapped {
+                overwritten.retain(|writer| match writer {
+                    Writer::Member(session) => ledger
+                        .roster
+                        .iter()
+                        .any(|held| &held.session == session && held.running),
+                    Writer::OverlappingShells => true,
+                });
+            }
             if !ledger.absorb(&path, state, Claim::by(owner)) {
                 continue;
             }
@@ -2550,6 +2567,40 @@ mod tests {
                 holders: vec![Writer::Member("b".to_string())],
             }]
         );
+    }
+
+    /// The top-level agent's own command changing lines its finished child
+    /// wrote is its decision (no notice); while that child is still running,
+    /// the notice stands.
+    #[test]
+    fn the_root_settling_a_finished_childs_lines_is_not_an_overwrite() {
+        for child_running in [false, true] {
+            let c = after_a_siblings_change(b"one\ntwo\n", b"ONE\ntwo\n");
+            c.bind_root("a", "synthetic request", "turn-1");
+            c.add_member(Member {
+                session: "b".to_string(),
+                parent: "a".to_string(),
+                mission: "write notes".to_string(),
+                specialist: None,
+                scope: vec![F.to_string()],
+                running: true,
+            });
+            if !child_running {
+                c.finish_member("b");
+            }
+            c.shell_began("a", "1");
+            c.shell_finished("a", "1", vec![(F.to_string(), None)]);
+            let expected = if child_running {
+                vec![LogEntry::ShellOverwrote {
+                    member: "a".to_string(),
+                    path: F.to_string(),
+                    holders: vec![Writer::Member("b".to_string())],
+                }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(c.log_entries(), expected, "child running: {child_running}");
+        }
     }
 
     /// A file a reader sees changed while one member's shell runs is put
