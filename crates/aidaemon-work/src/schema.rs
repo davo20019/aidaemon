@@ -1136,6 +1136,8 @@ pub async fn migrate_work_tables(
             goal_run_id TEXT NOT NULL UNIQUE REFERENCES goal_runs(id) ON DELETE CASCADE,
             mandate_version INTEGER NOT NULL,
             outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
+            origin TEXT NOT NULL DEFAULT 'deliberator'
+                CHECK (origin IN ('deliberator', 'runtime_fallback')),
             activity_level TEXT NOT NULL DEFAULT 'quiet'
                 CHECK (activity_level IN ('quiet', 'active', 'urgent')),
             rationale TEXT NOT NULL,
@@ -1191,6 +1193,30 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await;
+    // Who wrote a decision was once read from its rationale text; existing
+    // runtime-written rows are recognised by the two texts the runtime used.
+    let origin_added = sqlx::query(
+        "ALTER TABLE mandate_decision_cycles
+         ADD COLUMN origin TEXT NOT NULL DEFAULT 'deliberator'
+         CHECK (origin IN ('deliberator', 'runtime_fallback'))",
+    )
+    .execute(pool)
+    .await
+    .is_ok();
+    if origin_added {
+        sqlx::query(
+            "UPDATE mandate_decision_cycles SET origin = 'runtime_fallback'
+             WHERE rationale IN (?, ?)",
+        )
+        .bind(crate::mandates::SAFE_FALLBACK_WAIT_RATIONALE)
+        .bind(
+            "This review reached its internal runaway-protection ceiling before another model \
+             turn could be admitted. No new action was authorized; the controller will retry \
+             automatically at the earliest bounded review time.",
+        )
+        .execute(pool)
+        .await?;
+    }
     let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN termination_kind TEXT")
         .execute(pool)
         .await;

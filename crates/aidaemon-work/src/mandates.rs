@@ -1358,19 +1358,41 @@ impl MandateActivityLevel {
     }
 }
 
-/// Runtime-authored rationale used when a mandate deliberator exits without
-/// committing a typed decision. This marker is deliberately exact and stable:
-/// finalization treats it as a failed review that must be surfaced and retried,
-/// never as a successful model-authored WAIT.
+/// Who wrote a decision. Only the deliberator's own `record_decision` writes
+/// `Deliberator`; every decision the runtime records on its behalf (it
+/// exited, failed or ran out of budget without one) is `RuntimeFallback`,
+/// which finalization closes as a failed review that is retried with
+/// backoff and surfaced to the owner.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateDecisionOrigin {
+    #[default]
+    Deliberator,
+    RuntimeFallback,
+}
+
+impl MandateDecisionOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deliberator => "deliberator",
+            Self::RuntimeFallback => "runtime_fallback",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deliberator" => Some(Self::Deliberator),
+            "runtime_fallback" => Some(Self::RuntimeFallback),
+            _ => None,
+        }
+    }
+}
+
+/// Rationale of the WAIT the runtime records when a mandate deliberator exits
+/// without committing a decision. Display text only: what makes it a
+/// fallback is its [`MandateDecisionOrigin::RuntimeFallback`].
 pub const SAFE_FALLBACK_WAIT_RATIONALE: &str =
     "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.";
-
-/// Whether a persisted decision rationale is the exact runtime fallback marker.
-/// Centralizes the comparison so persistence, finalization, and the tool
-/// boundary agree on what a runtime-authored decision is.
-pub fn is_runtime_fallback_rationale(rationale: &str) -> bool {
-    rationale == SAFE_FALLBACK_WAIT_RATIONALE
-}
 
 /// Why a STOP decision may close a mandate. Evidence-dependent reasons must
 /// cite one or more current-run structured tool receipts.
@@ -1439,6 +1461,8 @@ pub struct MandateDecisionCycle {
     pub mandate_version: i64,
     pub outcome: MandateDecisionOutcome,
     #[serde(default)]
+    pub origin: MandateDecisionOrigin,
+    #[serde(default)]
     pub activity_level: MandateActivityLevel,
     pub rationale: String,
     /// Sourced observations used by the deliberator, serialized as JSON.
@@ -1496,6 +1520,7 @@ impl MandateDecisionCycle {
             goal_run_id: goal_run_id.to_string(),
             mandate_version,
             outcome,
+            origin: MandateDecisionOrigin::Deliberator,
             activity_level: MandateActivityLevel::Quiet,
             rationale: rationale.trim().to_string(),
             belief_snapshot: None,
@@ -1526,14 +1551,15 @@ impl MandateDecisionCycle {
             SAFE_FALLBACK_WAIT_RATIONALE,
             mandate.version,
         );
+        decision.origin = MandateDecisionOrigin::RuntimeFallback;
         decision.reconsider_at = Some(mandate.bounded_next_review_at(None, now));
         decision
     }
 
-    /// True when this decision is the runtime fallback marker rather than a
-    /// model-authored deliberation.
+    /// True when the runtime recorded this decision on the deliberator's
+    /// behalf rather than the deliberator committing it.
     pub fn is_runtime_fallback(&self) -> bool {
-        is_runtime_fallback_rationale(&self.rationale)
+        self.origin == MandateDecisionOrigin::RuntimeFallback
     }
 
     pub fn validate_content_bounds(&self) -> Result<(), String> {

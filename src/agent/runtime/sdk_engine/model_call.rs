@@ -290,19 +290,17 @@ impl Agent {
         {
             Ok(lease) => lease,
             Err(error) => {
-                // The balance is used up. A committed WAIT/ASK/STOP already
-                // completed the review; otherwise a bounded WAIT is recorded
-                // so the controller retries. The
-                // review closes from that durable decision, not as a
-                // provider failure.
+                // The balance is used up. A WAIT/ASK/STOP the deliberator
+                // already committed completed the review, which closes from
+                // that decision. Without one the call fails, and the review
+                // closes as failed: retried with backoff, owner told.
                 if error.to_string().contains(MANDATE_BUDGET_EXHAUSTED) {
                     if let Some(summary) =
-                        crate::agent::mandate_run::recover_mandate_capacity_as_wait(self).await
+                        crate::agent::mandate_run::committed_non_action_mandate_summary(self).await
                     {
                         info!(
                             task_id = scope.task_id,
-                            "SDK engine: mandate review closed from a committed or recovered \
-                             non-action decision"
+                            "SDK engine: mandate review closed from a committed non-action decision"
                         );
                         scope
                             .verdict

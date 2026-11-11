@@ -179,67 +179,13 @@ pub(in crate::agent) async fn committed_non_action_mandate_summary(
         .await
         .ok()
         .flatten()?;
-    if decision.mandate_id != fence.mandate_id || decision.mandate_version != fence.mandate_version
+    if decision.mandate_id != fence.mandate_id
+        || decision.mandate_version != fence.mandate_version
+        || decision.is_runtime_fallback()
     {
         return None;
     }
     decision.non_action_summary()
-}
-
-const CAPACITY_RECOVERY_WAIT_RATIONALE: &str = "This review reached its internal runaway-protection ceiling before another model turn could be admitted. No new action was authorized; the controller will retry automatically at the earliest bounded review time.";
-
-pub(in crate::agent) async fn recover_mandate_capacity_as_wait(agent: &Agent) -> Option<String> {
-    if let Some(summary) = committed_non_action_mandate_summary(agent).await {
-        return Some(summary);
-    }
-    let fence = agent.mandate_execution.as_ref()?;
-    if fence.worker_task_id != fence.root_task_id {
-        return None;
-    }
-    if agent
-        .state
-        .get_mandate_decision_for_run(&fence.goal_run_id)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return None;
-    }
-    let mandate = agent
-        .state
-        .get_mandate_for_goal(&fence.goal_id)
-        .await
-        .ok()
-        .flatten()?;
-    if !mandate.is_active()
-        || mandate.id != fence.mandate_id
-        || mandate.version != fence.mandate_version
-    {
-        return None;
-    }
-    let mut decision = crate::traits::MandateDecisionCycle::new(
-        &mandate.id,
-        &fence.goal_run_id,
-        crate::traits::MandateDecisionOutcome::Wait,
-        CAPACITY_RECOVERY_WAIT_RATIONALE,
-        mandate.version,
-    );
-    decision.reconsider_at =
-        Some(mandate.bounded_next_review_at(Some(mandate.min_review_secs), chrono::Utc::now()));
-    if let Err(error) = agent
-        .state
-        .record_mandate_decision(&decision, None, Some(fence.root_task_attempt_id.as_str()))
-        .await
-    {
-        warn!(
-            mandate_id = %fence.mandate_id,
-            goal_run_id = %fence.goal_run_id,
-            %error,
-            "Could not persist capacity-recovery WAIT"
-        );
-    }
-    committed_non_action_mandate_summary(agent).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,52 +317,50 @@ mod tests {
         (mandate, run)
     }
 
+    /// A review that runs out of budget before deciding has no committed
+    /// decision to close from; a runtime fallback WAIT never counts as one,
+    /// so finalization closes the review as failed (retried with backoff).
     #[tokio::test]
-    async fn exhausted_mandate_review_recovers_with_one_typed_wait_and_bounded_retry() {
+    async fn only_a_deliberator_decision_closes_an_exhausted_review() {
         let mut harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
             .await
             .expect("setup test agent");
         let (mandate, run) = install_due_mandate_root(&mut harness).await;
-        let before = chrono::Utc::now();
-
-        let summary = recover_mandate_capacity_as_wait(&harness.agent)
+        assert!(committed_non_action_mandate_summary(&harness.agent)
             .await
-            .expect("capacity exhaustion should recover as WAIT");
-        assert!(summary.contains("WAIT recorded"));
-        assert!(summary.contains("retry automatically"));
+            .is_none());
 
-        let decision = harness
+        let fallback = crate::traits::MandateDecisionCycle::runtime_fallback_wait(
+            &mandate,
+            &run.id,
+            chrono::Utc::now(),
+        );
+        assert!(fallback.is_runtime_fallback());
+        let attempt = harness
+            .agent
+            .mandate_execution
+            .as_ref()
+            .expect("mandate fence")
+            .root_task_attempt_id
+            .clone();
+        harness
+            .state
+            .record_mandate_decision(&fallback, None, Some(attempt.as_str()))
+            .await
+            .expect("record runtime fallback");
+        let stored = harness
             .state
             .get_mandate_decision_for_run(&run.id)
             .await
-            .expect("read recovered decision")
-            .expect("recovered decision");
+            .expect("read decision")
+            .expect("stored decision");
         assert_eq!(
-            decision.outcome,
-            crate::traits::MandateDecisionOutcome::Wait
+            stored.origin,
+            crate::traits::MandateDecisionOrigin::RuntimeFallback
         );
-        assert_eq!(decision.rationale, CAPACITY_RECOVERY_WAIT_RATIONALE);
-        let retry_at = chrono::DateTime::parse_from_rfc3339(
-            decision
-                .reconsider_at
-                .as_deref()
-                .expect("bounded retry time"),
-        )
-        .expect("valid retry timestamp")
-        .with_timezone(&chrono::Utc);
-        assert!(retry_at >= before + chrono::Duration::seconds(mandate.min_review_secs - 1));
-        assert!(retry_at <= before + chrono::Duration::seconds(mandate.min_review_secs + 2));
-
-        let second_summary = recover_mandate_capacity_as_wait(&harness.agent)
+        assert!(committed_non_action_mandate_summary(&harness.agent)
             .await
-            .expect("recovery is idempotent");
-        assert_eq!(second_summary, summary);
-        let decisions = harness
-            .state
-            .list_mandate_decisions(&mandate.id, 10)
-            .await
-            .expect("list decisions");
-        assert_eq!(decisions.len(), 1);
+            .is_none());
     }
 
     #[test]

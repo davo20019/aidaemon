@@ -1,15 +1,15 @@
 use super::*;
 use crate::traits::{
     GoalRun, Intention, IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority,
-    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOutcome, MandateDispatchGate,
-    MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
-    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
-    MandateMutationReservation, MandateObjectiveMeasurement, MandateOperatingUpdates,
-    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
-    MandateRunFinalizationResult, MandateRunProofCounts, MandateStatus, MandateStore,
-    MandateStrategyRevision, MandateStrategyRevisionKind, MandateSuspension, MandateSuspensionKind,
-    MandateTerminationKind, MandateWakeSignal, Task,
+    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin, MandateDecisionOutcome,
+    MandateDispatchGate, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
+    MandateLearningNote, MandateMutationAttempt, MandateMutationAttemptStatus,
+    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationQuotaBlockReason,
+    MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
+    MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
+    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
+    MandateStatus, MandateStore, MandateStrategyRevision, MandateStrategyRevisionKind,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
 };
 use sha2::{Digest, Sha256};
 
@@ -21,7 +21,7 @@ const MANDATE_COLUMNS: &str =
      expires_at, confirmed_at, version, owner_principal_id, created_by_session, created_at, updated_at";
 
 const DECISION_COLUMNS: &str =
-    "id, mandate_id, goal_run_id, mandate_version, outcome, activity_level, rationale, belief_snapshot, \
+    "id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level, rationale, belief_snapshot, \
      evidence_receipt_ids_json, question, termination_kind, termination_match, reconsider_at, \
      action_attempts, created_at, updated_at";
 
@@ -109,6 +109,8 @@ fn decision_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateDec
         goal_run_id: row.get("goal_run_id"),
         mandate_version: row.get("mandate_version"),
         outcome,
+        origin: MandateDecisionOrigin::parse(&row.get::<String, _>("origin"))
+            .ok_or_else(|| anyhow::anyhow!("invalid mandate decision origin"))?,
         activity_level: MandateActivityLevel::parse(&row.get::<String, _>("activity_level"))
             .ok_or_else(|| anyhow::anyhow!("invalid mandate activity level"))?,
         rationale: row.get("rationale"),
@@ -3366,16 +3368,17 @@ impl<S: WorkDatabase> MandateStore for S {
         };
         sqlx::query(
             "INSERT INTO mandate_decision_cycles (
-                id, mandate_id, goal_run_id, mandate_version, outcome, activity_level, rationale,
-                belief_snapshot, evidence_receipt_ids_json, question, termination_kind,
+                id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level,
+                rationale, belief_snapshot, evidence_receipt_ids_json, question, termination_kind,
                 termination_match, reconsider_at, action_attempts, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&decision.id)
         .bind(&decision.mandate_id)
         .bind(&decision.goal_run_id)
         .bind(decision.mandate_version)
         .bind(decision.outcome.as_str())
+        .bind(decision.origin.as_str())
         .bind(decision.activity_level.as_str())
         .bind(&decision.rationale)
         .bind(&decision.belief_snapshot)
@@ -4301,7 +4304,7 @@ impl<S: WorkDatabase> MandateStore for S {
                     g.dispatch_failures AS review_failures,
                     gr.goal_id AS goal_id, gr.root_task_id AS root_task_id,
                     dc.id AS decision_cycle_id, dc.mandate_version AS decision_version,
-                    dc.outcome AS decision_outcome, dc.rationale AS decision_rationale,
+                    dc.outcome AS decision_outcome, dc.origin AS decision_origin,
                     dc.action_attempts AS decision_action_attempts
              FROM goal_runs gr
              JOIN mandates m ON m.goal_id = gr.goal_id
@@ -4560,7 +4563,10 @@ impl<S: WorkDatabase> MandateStore for S {
         let decision_cycle_id: Option<String> = row.get("decision_cycle_id");
         let decision_version: Option<i64> = row.get("decision_version");
         let decision_outcome_raw: Option<String> = row.get("decision_outcome");
-        let decision_rationale: Option<String> = row.get("decision_rationale");
+        let decision_origin = row
+            .get::<Option<String>, _>("decision_origin")
+            .as_deref()
+            .and_then(MandateDecisionOrigin::parse);
         let decision_action_attempts: Option<i64> = row.get("decision_action_attempts");
         let (Some(decision_cycle_id), Some(decision_version), Some(decision_outcome_raw)) =
             (decision_cycle_id, decision_version, decision_outcome_raw)
@@ -4576,11 +4582,7 @@ impl<S: WorkDatabase> MandateStore for S {
         let Some(decision_outcome) = MandateDecisionOutcome::parse(&decision_outcome_raw) else {
             close_invalid_decision_state!();
         };
-        if decision_outcome == MandateDecisionOutcome::Wait
-            && decision_rationale
-                .as_deref()
-                .is_some_and(crate::traits::is_runtime_fallback_rationale)
-        {
+        if decision_origin == Some(MandateDecisionOrigin::RuntimeFallback) {
             close_review_failed_retry!(MandateFinalizationRejectReason::DeliberatorFailed);
         }
         let Some(decision_action_attempts) = decision_action_attempts else {

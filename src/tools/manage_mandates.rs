@@ -2098,10 +2098,6 @@ impl ManageMandatesTool {
         }
         let rationale =
             required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
-        anyhow::ensure!(
-            !crate::traits::is_runtime_fallback_rationale(rationale),
-            "rationale is reserved for the runtime fallback marker"
-        );
         let mut decision =
             MandateDecisionCycle::new(&mandate.id, &run.id, outcome, rationale, mandate.version);
         decision.activity_level =
