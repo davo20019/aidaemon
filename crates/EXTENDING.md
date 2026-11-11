@@ -21,6 +21,7 @@ store, ...) use exactly the same traits, so they double as templates.
 | A sandbox | `Sandbox` | `aidaemon-tools` | `BubblewrapSandbox` |
 | Run storage | `RunStore` | `aidaemon-core` | `aidaemon-store-sqlite` |
 | Telemetry | `EventSink` | `aidaemon-core` | `aidaemon_policies::TracingSink` |
+| A decision backend | `Decider` | `aidaemon-decisions` | `ProviderDecider` |
 
 ## A channel in ~50 lines of structure
 
