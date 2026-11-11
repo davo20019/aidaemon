@@ -1201,6 +1201,13 @@ impl SpawnAgentTool {
                     run.trust,
                 );
                 outcome.metadata.truncation = truncation;
+                // The child's run already closed with a typed outcome: that,
+                // not a scan of its reply's wording (a review listing "Bugs"
+                // read as a failure), is the receipt's outcome.
+                outcome.metadata.outcome_status = Some(match run.outcome {
+                    TaskOutcome::Succeeded => crate::traits::ToolOutcomeStatus::Succeeded,
+                    _ => crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+                });
                 Ok(outcome)
             }
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
@@ -1907,6 +1914,27 @@ mod child_runtime_tests {
         assert_eq!(
             *child.timed_out_tasks.lock().unwrap(),
             vec!["task-synthetic-1".to_string()]
+        );
+    }
+
+    /// A child whose run succeeded is a succeeded receipt even when its
+    /// report is full of failure vocabulary: the typed outcome crosses back
+    /// to the parent, not a scan of the wording.
+    #[tokio::test]
+    async fn a_succeeded_child_reports_its_typed_outcome_not_its_wording() {
+        let child = ScriptedChild::new(
+            "## Findings\n### Bugs\n- Error: the handler fails on empty input.\nFAILED checks: 2",
+            Duration::ZERO,
+        );
+        let tool = tool_for(&child);
+        let args = json!({"mission": "Review", "task": "t"}).to_string();
+        let outcome = tool
+            .call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded)
         );
     }
 
