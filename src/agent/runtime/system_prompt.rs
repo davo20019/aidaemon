@@ -424,6 +424,20 @@ impl Agent {
             &date_time_str,
             resume_section.as_deref(),
         );
+        // Where commands and file tools run. A model that is never told the
+        // home directory guesses one (a sub-agent handed `~/projects/x`
+        // expanded `~` to `/home/<owner's first name>`). Public channels
+        // never learn host paths; a mandate worker builds its own tail.
+        let (mut fresh_tail, mut continuation_tail) = (fresh_tail, continuation_tail);
+        if channel_ctx.visibility != ChannelVisibility::PublicExternal && !mandate_context {
+            let backend = &self.execution_backend;
+            let environment =
+                render_environment_section(backend.kind(), backend.home_hint().as_str());
+            for tail in [&mut fresh_tail, &mut continuation_tail] {
+                tail.push_str("\n\n");
+                tail.push_str(&environment);
+            }
+        }
         let tail = if preserve_conversation_context {
             &continuation_tail
         } else {
@@ -1218,6 +1232,21 @@ impl Agent {
     }
 }
 
+/// The task-context section naming where commands and file tools run: the
+/// execution backend, the host OS for a local one, and its home directory.
+fn render_environment_section(kind: crate::execution::BackendKind, home: &str) -> String {
+    let os = match kind {
+        crate::execution::BackendKind::Local => format!(", {}", std::env::consts::OS),
+        _ => String::new(),
+    };
+    format!(
+        "[Environment]\nCommands and file tools run on the {}{os} backend. Home directory: {home}. \
+         `~` means this directory and the tools expand it themselves; never guess a home \
+         directory or a user name in a path.",
+        kind.as_str()
+    )
+}
+
 /// The mandate task lead's protocol rules. The measured control loop
 /// (record_measurement, stagnation, STOP on target) is included only for an
 /// autopilot mandate with an objective control; elsewhere it is advisory and
@@ -1801,6 +1830,23 @@ mod tests {
 
     /// The tail starts with the marker and carries the volatile sections —
     /// here we assert the date/time block and the marker.
+    #[test]
+    fn environment_section_names_backend_os_and_home() {
+        let section = super::render_environment_section(
+            crate::execution::BackendKind::Local,
+            "/Users/synthetic-user",
+        );
+        assert!(section.starts_with("[Environment]"));
+        assert!(section.contains("Home directory: /Users/synthetic-user."));
+        assert!(section.contains(std::env::consts::OS));
+        let remote = super::render_environment_section(
+            crate::execution::BackendKind::Ssh,
+            "/home/synthetic-user",
+        );
+        assert!(!remote.contains(std::env::consts::OS));
+        assert!(remote.contains("/home/synthetic-user"));
+    }
+
     #[test]
     fn context_tail_carries_all_volatile_sections_and_marker() {
         let tail =
