@@ -720,7 +720,7 @@ async fn test_null_channel_legacy_facts() {
 /// Regression: explicit semantic search must surface a near-synonym match that
 /// falls just under the passive-injection threshold. "spouse" embeds at ~0.28
 /// against a stored `partner_name` fact — below the 0.30 passive cutoff but above
-/// the 0.22 explicit-search cutoff — so `search_facts_semantic` (the user-initiated
+/// the 0.22 explicit-search cutoff — so `search_facts` (the user-initiated
 /// tool path) must return it, even though passive injection might not.
 #[tokio::test]
 async fn test_explicit_search_catches_near_threshold_synonym() {
@@ -737,11 +737,22 @@ async fn test_explicit_search_catches_near_threshold_synonym() {
         .await
         .unwrap();
 
-    let hits = store.search_facts_semantic("spouse", 10).await.unwrap();
+    let report = store
+        .search_facts(
+            "spouse",
+            10,
+            &aidaemon_memory::search::FactSearchConfig::default(),
+        )
+        .await
+        .unwrap();
     assert!(
-        hits.iter().any(|(f, _)| f.key == "partner_name"),
-        "explicit semantic search should surface the partner fact for the synonym 'spouse'; got {:?}",
-        hits.iter().map(|(f, _)| f.key.as_str()).collect::<Vec<_>>()
+        report.hits.iter().any(|h| h.fact.key == "partner_name"),
+        "explicit search should surface the partner fact for the synonym 'spouse'; got {:?}",
+        report
+            .hits
+            .iter()
+            .map(|h| h.fact.key.as_str())
+            .collect::<Vec<_>>()
     );
 }
 

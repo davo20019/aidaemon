@@ -204,21 +204,6 @@ pub trait FactStore: Send + Sync {
         self.get_facts(None).await
     }
 
-    /// Pure semantic (vector) search over active facts: returns `(fact, score)`
-    /// pairs whose embedding similarity clears the relevance threshold, ranked by
-    /// score, with NO recency padding. Unlike [`get_relevant_facts`] (which is
-    /// tuned for context injection and pads sparse results with recent facts),
-    /// this returns only genuine matches — suitable for supplementing the
-    /// keyword-based memory search tool. Default returns empty (stores without an
-    /// embedding index simply contribute nothing).
-    async fn search_facts_semantic(
-        &self,
-        _query: &str,
-        _max: usize,
-    ) -> anyhow::Result<Vec<(Fact, f32)>> {
-        Ok(vec![])
-    }
-
     /// Explicit fact search: one ranked list plus query-relevant related
     /// facts. Ranking lives in [`crate::search`]; a store only gathers facts
     /// and scores. The default returns an empty report so stores without
@@ -255,21 +240,6 @@ pub trait FactStore: Send + Sync {
 
     async fn repair_memory_projections(&self) -> anyhow::Result<MemoryHealthReport> {
         self.memory_health_report().await
-    }
-
-    /// Assemble the neighborhood of facts for the given resolved entity names and
-    /// initial seed fact IDs (e.g. from an embedding search hit). Expands the set
-    /// via namespace, co-mention, and owner-relationship cluster rules.
-    ///
-    /// The default no-op keeps non-SQLite stores compiling without change.
-    /// Wired into production in Task 6 (`get_relevant_facts`).
-    #[allow(dead_code)]
-    async fn assemble_neighborhood(
-        &self,
-        _entities: &[String],
-        _initial_ids: &HashSet<i64>,
-    ) -> anyhow::Result<Vec<Fact>> {
-        Ok(vec![])
     }
 }
 

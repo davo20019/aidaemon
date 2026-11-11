@@ -12,114 +12,9 @@ use crate::traits::{
 };
 use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 
-/// Split text into lowercased word tokens, breaking on every non-alphanumeric
-/// boundary. Structured fact keys carry their words behind `_`, `-`, `:` and
-/// `.` separators (e.g. `local_dev_db_port`, `bug_fix:constraints`,
-/// `fastapi:database`), so a plain whitespace split would leave them as one
-/// opaque token. Splitting here turns `local_dev_db_port` into
-/// `["local", "dev", "db", "port"]` so individual query words can match.
-fn lexical_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 2)
-        .map(|t| t.to_ascii_lowercase())
-        .collect()
-}
-
 fn compact_provenance_excerpt(text: &str) -> String {
     let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     crate::utils::truncate_str(&single_line, 180)
-}
-
-/// Score one fact against a search query, or `None` if it doesn't clear the
-/// relevance bar.
-///
-/// Matching is **word-boundary**, not substring: the query word `port` matches
-/// the `port` token inside `local_dev_db_port` but NOT incidental substrings
-/// like `report`, `portfolio`, `important` or `support`. Naive `.contains()`
-/// matching (the previous behavior) let that noise outrank — and truncate away —
-/// the canonical fact, so a query like "database port" could bury
-/// `local_dev_db_port` past the result limit. Key-field matches are weighted
-/// above value/category matches so the canonical fact sorts first.
-///
-/// A full-phrase substring match still wins outright (highest score), which
-/// preserves exact-key / exact-value lookups.
-fn score_fact_for_query(
-    key: &str,
-    value: &str,
-    category: &str,
-    query_lower: &str,
-    query_words: &[&str],
-) -> Option<usize> {
-    let key_lower = key.to_lowercase();
-    let val_lower = value.to_lowercase();
-    let cat_lower = category.to_lowercase();
-
-    // A contiguous multi-word phrase match gets the max score. We only take this
-    // shortcut for genuine phrases (2+ words): for a single word, `.contains()`
-    // is exactly the substring matching we want to avoid (e.g. "port" is a
-    // substring of "reports"), so single words fall through to token matching.
-    if query_words.len() >= 2
-        && (key_lower.contains(query_lower)
-            || val_lower.contains(query_lower)
-            || cat_lower.contains(query_lower))
-    {
-        return Some(query_words.len() * 4 + 4);
-    }
-
-    if query_words.is_empty() {
-        return None;
-    }
-
-    let key_tokens = lexical_tokens(key);
-    let val_tokens = lexical_tokens(value);
-    let cat_tokens = lexical_tokens(category);
-
-    let mut key_hits = 0usize;
-    let mut other_hits = 0usize;
-    for w in query_words {
-        let w = *w;
-        if key_tokens.iter().any(|t| t == w) {
-            key_hits += 1;
-        } else if val_tokens.iter().any(|t| t == w) || cat_tokens.iter().any(|t| t == w) {
-            other_hits += 1;
-        }
-    }
-
-    let total_hits = key_hits + other_hits;
-    // Require at least half the query words to match (capped at 2) so a single
-    // incidental overlap doesn't flood results on multi-word queries.
-    let min_hits = if query_words.len() >= 3 { 2 } else { 1 };
-    if total_hits < min_hits {
-        return None;
-    }
-
-    // Weight key matches more heavily so the canonical fact ranks first.
-    Some(key_hits * 3 + other_hits)
-}
-
-/// Merge keyword (lexical) and semantic (vector) search results into one ranked
-/// list, deduped by fact id. Lexical matches come first in their existing order
-/// (highest precision for exact keys/values), followed by semantic-only facts
-/// the keyword pass missed, in semantic-rank order. The returned bool flags
-/// semantic-only entries so the caller can mark them in the output. Both inputs
-/// are assumed pre-ranked.
-fn merge_search_results(
-    lexical: Vec<crate::traits::Fact>,
-    semantic: Vec<crate::traits::Fact>,
-) -> Vec<(crate::traits::Fact, bool)> {
-    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut merged: Vec<(crate::traits::Fact, bool)> = Vec::new();
-    for f in lexical {
-        if seen.insert(f.id) {
-            merged.push((f, false));
-        }
-    }
-    for f in semantic {
-        if seen.insert(f.id) {
-            merged.push((f, true));
-        }
-    }
-    merged
 }
 
 pub struct ManageMemoriesTool {
@@ -1026,81 +921,35 @@ impl ManageMemoriesTool {
                 }
 
                 let limit = args.limit.unwrap_or(10).clamp(1, 200);
-
-                // Pass 1 — keyword (lexical) search. High precision for exact
-                // keys/values (port numbers, names, structured keys). Uses
-                // word-boundary token matching so "port" doesn't match "report".
-                let mut facts = self.store.get_canonical_memory_facts().await?;
-                let canonical_owner_keys: std::collections::HashSet<String> = facts
-                    .iter()
-                    .filter(|fact| fact.category == "user")
-                    .map(|fact| canonical_personal_display_key(&fact.key))
-                    .collect();
-                facts.extend(
-                    self.store
-                        .get_all_facts_with_provenance()
-                        .await?
-                        .into_iter()
-                        .filter(|fact| {
-                            fact.category != "user"
-                                || !canonical_owner_keys
-                                    .contains(&canonical_personal_display_key(&fact.key))
-                        }),
-                );
-                let query_lower = query.to_lowercase();
-                let query_words: Vec<&str> = query_lower
-                    .split_whitespace()
-                    .filter(|w| w.len() >= 2) // skip single-char noise
-                    .collect();
-                let mut scored: Vec<(crate::traits::Fact, usize)> = facts
-                    .into_iter()
-                    .filter_map(|f| {
-                        score_fact_for_query(
-                            &f.key,
-                            &f.value,
-                            &f.category,
-                            &query_lower,
-                            &query_words,
-                        )
-                        .map(|score| (f, score))
-                    })
-                    .collect();
-                scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-                let lexical: Vec<crate::traits::Fact> =
-                    scored.into_iter().map(|(f, _)| f).collect();
-
-                // Pass 2 — semantic (vector) search. Finds conceptually related
-                // facts the keyword pass misses (e.g. "DB setup" → the port). The
-                // dedicated method returns thresholded matches only — no padding.
-                let semantic: Vec<crate::traits::Fact> = self
+                let report = self
                     .store
-                    .search_facts_semantic(query, limit)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(f, _)| f)
-                    .collect();
-
-                let merged = merge_search_results(lexical, semantic);
-                if merged.is_empty() {
+                    .search_facts(
+                        query,
+                        limit,
+                        &aidaemon_memory::search::FactSearchConfig::default(),
+                    )
+                    .await?;
+                if report.hits.is_empty() {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
-                // Collect initial fact IDs (lexical + semantic) for neighborhood dedup.
-                let initial_ids: std::collections::HashSet<i64> =
-                    merged.iter().map(|(f, _)| f.id).collect();
-
                 let mut output = format!(
-                    "══ Stored facts matching '{}' ({} of {} matches) ══\n\
+                    "══ Stored facts matching '{}' ({} shown, {} relevant of {} considered) ══\n\
                      IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
                     query,
-                    merged.len().min(limit),
-                    merged.len()
+                    report.hits.len(),
+                    report.passed_floor,
+                    report.considered
                 );
-                for (f, semantic_only) in merged.iter().take(limit) {
+                for hit in &report.hits {
+                    let f = &hit.fact;
                     let privacy_label = f.privacy.to_string();
                     let channel_label = f.channel_id.as_deref().unwrap_or("global");
-                    let marker = if *semantic_only { " (semantic match)" } else { "" };
+                    let marker = if hit.kind == aidaemon_memory::search::MatchKind::Semantic {
+                        " (semantic match)"
+                    } else {
+                        ""
+                    };
                     // Surface WHEN the fact was learned so the model can answer
                     // temporal questions ("when did I tell you X?") directly from
                     // search results instead of reaching for the wrong tool.
@@ -1133,76 +982,19 @@ impl ManageMemoriesTool {
                         marker
                     ));
                 }
-
-                // Relational neighborhood expansion — fail-open on any error.
-                //
-                // Trigger condition: any matched fact has a relationship-typed key
-                // (mother_name, father, spouse, …) or a namespaced key (X:attr) —
-                // these are cheap key checks over already-fetched results with zero
-                // LLM cost on unrelated searches.
-                //
-                // Entity candidates are derived SOLELY from the matched results:
-                //   1. Relationship key → fact.value is a person name
-                //      (e.g. mother_name="Carol Mendez" → "Carol Mendez")
-                //   2. Namespaced key   → namespace prefix is the concept/subject
-                //      (e.g. "LearnEnglishSounds:path" → "LearnEnglishSounds")
-                //
-                // Deduped by lowercased value, capped at 6.
-                let results_signal_relational = merged.iter().any(|(f, _)| {
-                    aidaemon_memory::neighborhood::is_relationship_key(&f.key)
-                        || aidaemon_memory::neighborhood::fact_namespace(&f.key).is_some()
-                });
-                if results_signal_relational {
-                    let mut seen_lower: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    let mut candidates: Vec<String> = Vec::new();
-                    for (f, _) in &merged {
-                        if aidaemon_memory::neighborhood::is_relationship_key(&f.key) {
-                            let v = f.value.trim();
-                            if !v.is_empty() {
-                                let lower = v.to_ascii_lowercase();
-                                if seen_lower.insert(lower) {
-                                    candidates.push(v.to_string());
-                                }
-                            }
-                        }
-                        if let Some(ns) = aidaemon_memory::neighborhood::fact_namespace(&f.key) {
-                            let lower = ns.to_ascii_lowercase();
-                            if seen_lower.insert(lower) {
-                                candidates.push(ns.to_string());
-                            }
-                        }
-                    }
-                    candidates.truncate(6);
-
-                    if !candidates.is_empty() {
-                        let t0 = std::time::Instant::now();
-                        if let Ok(neighborhood) = self
-                            .store
-                            .assemble_neighborhood(&candidates, &initial_ids)
-                            .await
-                        {
-                            let assembly_ms = t0.elapsed().as_millis() as u64;
-                            let added = neighborhood.len();
-                            tracing::info!(
-                                target: "memory_recall",
-                                assembly_ms,
-                                entities = candidates.len(),
-                                added,
-                                "neighborhood expansion"
-                            );
-                            if added > 0 {
-                                output.push_str(
-                                    "\n── Related context (connected facts) ──\n",
-                                );
-                                for f in neighborhood.iter().take(16) {
-                                    output.push_str(&format!(
-                                        "• [{}] {} → \"{}\"\n",
-                                        f.category, f.key, f.value
-                                    ));
-                                }
-                            }
-                        }
+                if report.passed_floor > report.hits.len() {
+                    output.push_str(&format!(
+                        "({} more relevant; raise limit to see them.)\n",
+                        report.passed_floor - report.hits.len()
+                    ));
+                }
+                if !report.related.is_empty() {
+                    output.push_str("\n── Related context (connected facts) ──\n");
+                    for hit in &report.related {
+                        output.push_str(&format!(
+                            "• [{}] {} → \"{}\"\n",
+                            hit.fact.category, hit.fact.key, hit.fact.value
+                        ));
                     }
                 }
 
@@ -2713,116 +2505,6 @@ mod tests {
         );
     }
 
-    /// Helper mirroring the search branch: score every fact, keep matches,
-    /// sort by score desc (stable), return keys in ranked order.
-    fn ranked_keys<'a>(facts: &'a [(&'a str, &'a str, &'a str)], query: &str) -> Vec<&'a str> {
-        let query_lower = query.to_lowercase();
-        let query_words: Vec<&str> = query_lower
-            .split_whitespace()
-            .filter(|w| w.len() >= 2)
-            .collect();
-        let mut scored: Vec<(&str, usize)> = facts
-            .iter()
-            .filter_map(|(cat, key, val)| {
-                score_fact_for_query(key, val, cat, &query_lower, &query_words).map(|s| (*key, s))
-            })
-            .collect();
-        scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
-        scored.into_iter().map(|(k, _)| k).collect()
-    }
-
-    #[test]
-    fn test_lexical_tokens_splits_structured_keys() {
-        assert_eq!(
-            lexical_tokens("local_dev_db_port"),
-            vec!["local", "dev", "db", "port"]
-        );
-        assert_eq!(
-            lexical_tokens("bug_fix:constraints"),
-            vec!["bug", "fix", "constraints"]
-        );
-        // Single-char fragments are dropped as noise.
-        assert_eq!(lexical_tokens("a_b_cd"), vec!["cd"]);
-    }
-
-    #[test]
-    fn test_search_word_boundary_not_substring() {
-        // "port" must NOT match the substring inside "report"/"portfolio".
-        let report = score_fact_for_query(
-            "report_output_location",
-            "~/reports",
-            "project",
-            "port",
-            &["port"],
-        );
-        assert!(
-            report.is_none(),
-            "query 'port' should not match key 'report_output_location'"
-        );
-
-        // ...but it MUST match the real `port` token in `local_dev_db_port`.
-        let real = score_fact_for_query(
-            "local_dev_db_port",
-            "54329",
-            "preference",
-            "port",
-            &["port"],
-        );
-        assert!(
-            real.is_some(),
-            "query 'port' should match key 'local_dev_db_port'"
-        );
-    }
-
-    #[test]
-    fn test_search_canonical_fact_outranks_substring_noise() {
-        // Regression for the live recall bug: asking for the dev DB port
-        // returned "not found" because substring matches on "port" (report,
-        // portfolio, important, ...) outranked and truncated away the real fact.
-        let facts: Vec<(&str, &str, &str)> = vec![
-            ("project", "report_output_location", "~/reports"),
-            ("project", "portfolio_site", "example.com"),
-            ("technical", "important_note", "ship it"),
-            ("project", "support_email", "help@example.com"),
-            ("preference", "local_dev_db_port", "54329"),
-            ("technical", "data_export_format", "html"),
-        ];
-
-        let ranked = ranked_keys(&facts, "database port");
-        assert_eq!(
-            ranked.first().copied(),
-            Some("local_dev_db_port"),
-            "canonical port fact should rank first, got order: {ranked:?}"
-        );
-
-        // The pure-substring noise must be gone entirely.
-        assert!(
-            !ranked.contains(&"report_output_location"),
-            "substring noise should not appear: {ranked:?}"
-        );
-        assert!(!ranked.contains(&"portfolio_site"), "{ranked:?}");
-    }
-
-    #[test]
-    fn test_search_key_match_weighted_above_value_match() {
-        // A key-token match should outrank a fact that only matches in its value.
-        let key_match = score_fact_for_query(
-            "local_dev_db_port",
-            "54329",
-            "preference",
-            "port",
-            &["port"],
-        )
-        .unwrap();
-        let value_match =
-            score_fact_for_query("misc_note", "open the port", "general", "port", &["port"])
-                .unwrap();
-        assert!(
-            key_match > value_match,
-            "key match ({key_match}) should outrank value-only match ({value_match})"
-        );
-    }
-
     #[test]
     fn provenance_excerpt_is_single_line_utf8_safe_and_bounded() {
         let input = format!("User said:\n\t{}", "🦀".repeat(250));
@@ -2833,55 +2515,55 @@ mod tests {
         assert!(compact.ends_with("..."));
     }
 
-    fn mk_fact(id: i64, category: &str, key: &str, value: &str) -> crate::traits::Fact {
-        let now = chrono::Utc::now();
-        crate::traits::Fact {
-            id,
-            category: category.to_string(),
-            key: key.to_string(),
-            value: value.to_string(),
-            source: "test".to_string(),
-            created_at: now,
-            updated_at: now,
-            superseded_at: None,
-            recall_count: 0,
-            last_recalled_at: None,
-            channel_id: None,
-            privacy: FactPrivacy::Global,
-            first_seen_at: None,
-            source_excerpt: None,
+    #[tokio::test]
+    async fn search_header_reports_honest_counts() {
+        let state = setup_state().await;
+        let tool = test_tool(state.clone());
+        let topics = [
+            "gardening",
+            "bicycle",
+            "jazz",
+            "sourdough",
+            "chess",
+            "hiking",
+            "kettle",
+            "piano",
+            "camera",
+            "pottery",
+        ];
+        for i in 0..27 {
+            state
+                .upsert_fact(
+                    "general",
+                    &format!("hobby_{i}"),
+                    &format!("{} session {i}", topics[i % topics.len()]),
+                    "test",
+                    None,
+                    FactPrivacy::Global,
+                )
+                .await
+                .unwrap();
         }
-    }
-
-    #[test]
-    fn test_merge_search_results_lexical_first_then_semantic() {
-        let lexical = vec![
-            mk_fact(1, "preference", "local_dev_db_port", "54329"),
-            mk_fact(2, "project", "ci_pipeline_name", "thunderbird-ci"),
-        ];
-        let semantic = vec![mk_fact(9, "technical", "database_engine", "postgres")];
-
-        let merged = merge_search_results(lexical, semantic);
-        let order: Vec<(i64, bool)> = merged.iter().map(|(f, s)| (f.id, *s)).collect();
-        assert_eq!(order, vec![(1, false), (2, false), (9, true)]);
-    }
-
-    #[test]
-    fn test_merge_search_results_dedupes_by_id_keeping_lexical() {
-        // A fact found by BOTH passes appears once, flagged as lexical (false).
-        let lexical = vec![mk_fact(1, "preference", "local_dev_db_port", "54329")];
-        let semantic = vec![
-            mk_fact(1, "preference", "local_dev_db_port", "54329"),
-            mk_fact(7, "technical", "db_host", "localhost"),
-        ];
-
-        let merged = merge_search_results(lexical, semantic);
-        let order: Vec<(i64, bool)> = merged.iter().map(|(f, s)| (f.id, *s)).collect();
-        assert_eq!(
-            order,
-            vec![(1, false), (7, true)],
-            "id 1 must appear once as lexical, not duplicated by semantic"
-        );
+        for i in 0..3 {
+            state
+                .upsert_fact(
+                    "project",
+                    &format!("zephyr_item_{i}"),
+                    &format!("zephyr build {i}"),
+                    "test",
+                    None,
+                    FactPrivacy::Global,
+                )
+                .await
+                .unwrap();
+        }
+        let out = tool
+            .call(&json!({"action": "search", "query": "zephyr"}).to_string())
+            .await
+            .unwrap();
+        assert!(out.contains("(3 shown, 3 relevant of"), "{out}");
+        assert!(!out.contains("of 30 matches"), "{out}");
+        assert!(!out.contains("more relevant"), "{out}");
     }
 
     #[tokio::test]
