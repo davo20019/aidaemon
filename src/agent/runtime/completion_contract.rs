@@ -3049,6 +3049,34 @@ mod tests {
             );
         }
     }
+    /// An absolute path-shaped token names the filesystem only when it reaches
+    /// it: a route such as `/api/items` (no `/api` directory) is no target,
+    /// while a file still to be created under a real directory is.
+    #[test]
+    fn verification_targets_require_absolute_paths_to_reach_the_filesystem() {
+        let route = format!("/synthetic-route-{}/items", uuid::Uuid::new_v4().simple());
+        let targets = extract_verification_targets(
+            &format!("Add a functional test for POST {route} and its 403 case."),
+            &[],
+        );
+        assert!(
+            targets.is_empty(),
+            "a route became a path target: {targets:?}"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let planned = root.path().join("tests").join("ItemsTest.php");
+        let planned = planned.to_string_lossy().to_string();
+        let targets = extract_verification_targets(&format!("Create {planned} now."), &[]);
+        assert_eq!(
+            targets,
+            vec![VerificationTarget {
+                kind: VerificationTargetKind::Path,
+                value: planned,
+            }]
+        );
+    }
+
     #[test]
     fn verification_targets_preserve_exact_structurally_anchored_paths() {
         let root = tempfile::tempdir().expect("tempdir");

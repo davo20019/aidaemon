@@ -300,6 +300,15 @@ pub fn resolve_structural_filesystem_reference_from(
 
     let base = relative_reference_base(workspace_anchor)?;
     let direct = join_normalized(&base, token)?;
+    // A path-shaped token in prose names this machine's filesystem only when
+    // it reaches it: the path exists, or some directory above it other than
+    // the filesystem root does (a file about to be created). `/api/items`
+    // with no `/api` directory is a URL route or similar notation; making it
+    // a filesystem target sends the agent searching a path that cannot exist
+    // and lets a failed listing of it count as the observation.
+    if explicit && !direct.exists() && !reaches_existing_directory(&direct) {
+        return None;
+    }
     // A bare existing directory name is still ordinary language ("tests",
     // "docs", "memory") often enough that it cannot establish a hard path
     // obligation. Exact bare files remain structural; directories require an
@@ -342,6 +351,14 @@ pub fn resolve_structural_filesystem_reference_from(
     }
 
     None
+}
+
+/// Some ancestor of `path` below the filesystem root exists as a directory.
+fn reaches_existing_directory(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .filter(|ancestor| ancestor.parent().is_some())
+        .any(Path::is_dir)
 }
 
 fn push_unique_search_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
