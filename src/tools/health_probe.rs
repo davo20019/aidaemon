@@ -59,13 +59,13 @@ impl Tool for HealthProbeTool {
     }
 
     fn description(&self) -> &str {
-        "Create, manage, and monitor health probes for services, endpoints, and infrastructure"
+        "Create and monitor scheduled health probes."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "health_probe",
-            "description": "Create and monitor scheduled health probes.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

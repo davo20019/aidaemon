@@ -361,13 +361,13 @@ impl Tool for ReadChannelHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read recent messages from a Slack channel's conversation history. Use this when the user asks about what was discussed, what needs attention, key topics, or any question about actual channel conversations. Returns messages with metadata (reactions, threads, mentions) for analysis."
+        "Read recent messages from a Slack channel's conversation history. ALWAYS use this tool when the user asks about what was discussed, takeaways, what happened, key topics, or any question about channel conversations. This reads ALL messages in the channel, not just messages sent to you. The channel_id is auto-detected — you can call this with no arguments."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "read_channel_history",
-            "description": "Read recent messages from a Slack channel's conversation history. ALWAYS use this tool when the user asks about what was discussed, takeaways, what happened, key topics, or any question about channel conversations. This reads ALL messages in the channel, not just messages sent to you. The channel_id is auto-detected — you can call this with no arguments.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -537,13 +537,13 @@ impl Tool for SearchHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Search and page exact canonical user/assistant messages across authorized sessions; use manage_memories search_episodes for coarse semantic recall"
+        "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors. Opening a turn_id also returns the tool calls that turn ran and their output, which search does not cover."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "search_history",
-            "description": "Search exact retained conversation messages. Search returns anchored context and task objective/resolution bookends. Open an event or page older/newer exact messages with signed cursors. Opening a turn_id also returns the tool calls that turn ran and their output, which search does not cover.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -27,16 +27,16 @@ impl Tool for EscalateToParentTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the agent coordinating this request to decide something you should not decide alone"
+        "Ask the agent coordinating this request to decide something you should \
+                not decide alone: work another sub-agent may already be doing, or a conflict with \
+                its changes. Use it sparingly; the answer is one of proceed, stop or instead \
+                (do what the note says), with a note."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "escalate_to_parent",
-            "description": "Ask the agent coordinating this request to decide something you should \
-                not decide alone: work another sub-agent may already be doing, or a conflict with \
-                its changes. Use it sparingly; the answer is one of proceed, stop or instead \
-                (do what the note says), with a note.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -28,13 +28,13 @@ impl Tool for SkillResourcesTool {
     }
 
     fn description(&self) -> &str {
-        "Load resources (scripts, references, assets) from a skill on demand"
+        "Access resources bundled with a skill. Use 'list' to see available resources, 'read' to load a specific file."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "skill_resources",
-            "description": "Access resources bundled with a skill. Use 'list' to see available resources, 'read' to load a specific file.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

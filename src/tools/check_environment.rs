@@ -69,13 +69,13 @@ impl Tool for CheckEnvironmentTool {
     }
 
     fn description(&self) -> &str {
-        "Check available development tools, runtimes, and config files"
+        "Check which development tools and runtimes are available, their versions, and what config files exist. Use this instead of running multiple 'which' and '--version' commands."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "check_environment",
-            "description": "Check which development tools and runtimes are available, their versions, and what config files exist. Use this instead of running multiple 'which' and '--version' commands.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

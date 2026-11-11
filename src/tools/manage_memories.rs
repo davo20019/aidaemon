@@ -609,10 +609,15 @@ struct ManageArgs {
     is_paused: Option<bool>,
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str =
+    "Memories/goals. search=facts; search_episodes=past chats. Store via remember_fact.";
+
 fn manage_memories_schema() -> Value {
     json!({
         "name": "manage_memories",
-        "description": "Memories/goals. search=facts; search_episodes=past chats. Store via remember_fact.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -697,7 +702,7 @@ impl Tool for ManageMemoriesTool {
     }
 
     fn description(&self) -> &str {
-        "List/search/forget memories, and create/list/configure scheduled goals. Use scheduled_goal_runs to update, trigger, or inspect executions."
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

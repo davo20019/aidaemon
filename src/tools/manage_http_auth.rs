@@ -1134,10 +1134,14 @@ impl ManageHttpAuthTool {
     }
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "HTTP auth CRUD; keychain secrets; verify refreshes.";
+
 fn manage_http_auth_schema() -> Value {
     json!({
         "name": "manage_http_auth",
-        "description": "HTTP auth CRUD; keychain secrets; verify refreshes.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -1178,7 +1182,7 @@ impl Tool for ManageHttpAuthTool {
     }
 
     fn description(&self) -> &str {
-        "Create, inspect, verify, and remove generic API auth profiles for HTTP APIs"
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

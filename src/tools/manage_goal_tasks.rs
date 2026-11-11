@@ -323,7 +323,7 @@ impl Tool for ManageGoalTasksTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_goal_tasks",
-            "description": "Manage tasks inside the current goal.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

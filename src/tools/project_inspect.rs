@@ -28,13 +28,13 @@ impl Tool for ProjectInspectTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect a project directory to understand its type, structure, and metadata"
+        "Inspect one or more project directories to understand type, structure, dependencies, and git status. Prefer one batched call (`paths`) instead of many single calls when comparing multiple folders."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "project_inspect",
-            "description": "Inspect one or more project directories to understand type, structure, dependencies, and git status. Prefer one batched call (`paths`) instead of many single calls when comparing multiple folders.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

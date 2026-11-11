@@ -177,6 +177,35 @@ fn all_tool_schemas_disable_additional_properties() {
     }
 }
 
+/// A tool has one description. The model reads the schema's, so a second
+/// literal in `description()` drifts unseen (a spawn_agent fix once landed
+/// in the copy the model never reads); the schema must reference it.
+#[test]
+fn tool_schemas_use_the_single_tool_description() {
+    let mut duplicated = Vec::new();
+    for file in tool_source_files() {
+        let source = fs::read_to_string(&file).expect("read tool source");
+        let Some(segment) = schema_source_region(&source) else {
+            continue;
+        };
+        let Some(name_at) = segment.find("\"name\":") else {
+            continue;
+        };
+        let after_name = &segment[name_at..];
+        let Some(description_at) = after_name.find("\"description\":") else {
+            continue;
+        };
+        let value = after_name[description_at + "\"description\":".len()..].trim_start();
+        if value.starts_with('"') {
+            duplicated.push(file.display().to_string());
+        }
+    }
+    assert!(
+        duplicated.is_empty(),
+        "schema() must use \"description\": self.description(), not a second copy: {duplicated:?}"
+    );
+}
+
 #[test]
 fn all_tools_define_explicit_capabilities() {
     for file in tool_source_files() {

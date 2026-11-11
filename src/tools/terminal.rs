@@ -7677,13 +7677,13 @@ impl Tool for TerminalTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the configured execution workspace. Novel commands are semantically assessed; only dangerous or uncertain effects require owner approval."
+        "Run shell commands in local, Docker, or SSH workspaces. Dangerous or uncertain commands require owner approval. Check or kill long-running commands later; use write_file instead of shell redirection. If a chain (&&, ||, ;, |) has a dangerous segment, refuse the whole chain and ask which operation the user wants."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Run shell commands in local, Docker, or SSH workspaces. Dangerous or uncertain commands require owner approval. Check or kill long-running commands later; use write_file instead of shell redirection. If a chain (&&, ||, ;, |) has a dangerous segment, refuse the whole chain and ask which operation the user wants.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

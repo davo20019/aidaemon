@@ -2048,13 +2048,13 @@ impl Tool for HttpRequestTool {
     }
 
     fn description(&self) -> &str {
-        "Make authenticated HTTP requests to external APIs"
+        "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost or a local dev site (a site on this computer by another name asks the owner first); each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only, except plain http to localhost or a local dev site (a site on this computer by another name asks the owner first); each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

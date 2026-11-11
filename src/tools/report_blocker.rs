@@ -363,7 +363,7 @@ impl Tool for ReportBlockerTool {
     fn schema(&self) -> Value {
         json!({
             "name": "report_blocker",
-            "description": "Report an unresolved external boundary or exhausted recovery.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

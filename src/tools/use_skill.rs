@@ -24,13 +24,13 @@ impl Tool for UseSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Activate a skill by name to get its instructions"
+        "Load a skill's full instructions by name. Use it when a skill in the Available Skills list clearly fits the task and you need its specifics. Do NOT guess skill names — only use skills that are listed or that the user asked for by name."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "use_skill",
-            "description": "Load a skill's full instructions by name. Use it when a skill in the Available Skills list clearly fits the task and you need its specifics. Do NOT guess skill names — only use skills that are listed or that the user asked for by name.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

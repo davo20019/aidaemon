@@ -23,13 +23,13 @@ impl Tool for SystemInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get system information for the configured execution environment"
+        "Get system information for the configured execution environment, including hostname, OS, uptime, and memory"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "system_info",
-            "description": "Get system information for the configured execution environment, including hostname, OS, uptime, and memory",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {},

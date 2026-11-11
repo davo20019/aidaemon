@@ -25,13 +25,13 @@ impl Tool for GitInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get comprehensive git repository information in one call"
+        "Get comprehensive git repository information: status, log, branches, remotes, diff, and stash — all in one call instead of multiple terminal commands."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "git_info",
-            "description": "Get comprehensive git repository information: status, log, branches, remotes, diff, and stash — all in one call instead of multiple terminal commands.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

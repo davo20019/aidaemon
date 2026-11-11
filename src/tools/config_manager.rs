@@ -1587,10 +1587,14 @@ fn apply_instruction_for_key(key: &str) -> &'static str {
     }
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "Read/update config.toml (backup+validate).";
+
 fn manage_config_schema() -> Value {
     json!({
         "name": "manage_config",
-        "description": "Read/update config.toml (backup+validate).",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -1626,7 +1630,7 @@ impl Tool for ConfigManagerTool {
     }
 
     fn description(&self) -> &str {
-        "Read or update aidaemon's own config.toml, including guided primary-provider and failover-provider changes. Automatically backs up before changes and validates before saving."
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

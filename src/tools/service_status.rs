@@ -24,13 +24,13 @@ impl Tool for ServiceStatusTool {
     }
 
     fn description(&self) -> &str {
-        "Check running services, listening ports, and Docker containers"
+        "Check running services: listening ports, Docker containers, and relevant processes. Use this instead of terminal lsof/ss/docker ps commands."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "service_status",
-            "description": "Check running services: listening ports, Docker containers, and relevant processes. Use this instead of terminal lsof/ss/docker ps commands.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

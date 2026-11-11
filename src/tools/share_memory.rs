@@ -65,13 +65,13 @@ impl Tool for ShareMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Make a memory permanently shareable in the current channel"
+        "Make a memory permanently shareable in the current channel. Use when the owner approves sharing cross-channel information."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "share_memory",
-            "description": "Make a memory permanently shareable in the current channel. Use when the owner approves sharing cross-channel information.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

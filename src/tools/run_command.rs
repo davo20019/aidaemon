@@ -175,13 +175,13 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run safe build, test, lint, and inspection commands"
+        "Run allowlisted build, test, lint, and read-only inspection commands. Repository-defined scripts, installs, and arbitrary commands require terminal."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "run_command",
-            "description": "Run allowlisted build, test, lint, and read-only inspection commands. Repository-defined scripts, installs, and arbitrary commands require terminal.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -24,13 +24,13 @@ impl Tool for GitCommitTool {
     }
 
     fn description(&self) -> &str {
-        "Stage and commit changes to git"
+        "Stage files and create a git commit. Use this instead of running separate git add + git commit terminal commands. Validates changes exist before committing."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "git_commit",
-            "description": "Stage files and create a git commit. Use this instead of running separate git add + git commit terminal commands. Validates changes exist before committing.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -1149,10 +1149,14 @@ fn string_enum(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "Manage runs.";
+
 fn scheduled_goal_runs_schema() -> Value {
     json!({
         "name": "scheduled_goal_runs",
-        "description": "Manage runs.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -1201,7 +1205,7 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect all scheduled autonomous objectives and their latest durable runs, or manage one scheduled goal, without memory, terminal, or sqlite access. Use action=overview for discovery and state audits; it does not require goal_id."
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

@@ -20,13 +20,13 @@ impl Tool for PolicyMetricsTool {
     }
 
     fn description(&self) -> &str {
-        "Read runtime policy metrics (response routing outcomes, no-progress iterations, and failed-task token burn)"
+        "Read runtime policy/agent-loop metrics. Use this when the user asks about routing behavior, no-progress loops, or token cost of failed tasks."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "policy_metrics",
-            "description": "Read runtime policy/agent-loop metrics. Use this when the user asks about routing behavior, no-progress loops, or token cost of failed tasks.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

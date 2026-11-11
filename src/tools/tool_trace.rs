@@ -39,13 +39,13 @@ impl Tool for ToolTraceTool {
     }
 
     fn description(&self) -> &str {
-        "Quick alias for tool-level execution traces (same backend as goal_trace action=tool_trace)"
+        "Quick alias for tool-level execution traces. Equivalent to goal_trace(action='tool_trace')."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "tool_trace",
-            "description": "Quick alias for tool-level execution traces. Equivalent to goal_trace(action='tool_trace').",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

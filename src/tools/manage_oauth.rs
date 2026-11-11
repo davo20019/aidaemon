@@ -1294,10 +1294,14 @@ impl ManageOAuthTool {
     }
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "OAuth. Never paste secrets; inspect first; connect reauthorizes; bind_account proves identity. Manual auth → manage_http_auth.";
+
 fn manage_oauth_schema() -> Value {
     json!({
         "name": "manage_oauth",
-        "description": "OAuth. Never paste secrets; inspect first; connect reauthorizes; bind_account proves identity. Manual auth → manage_http_auth.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -1338,7 +1342,7 @@ impl Tool for ManageOAuthTool {
     }
 
     fn description(&self) -> &str {
-        "Connect and manage OAuth services, including custom providers"
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

@@ -487,10 +487,15 @@ struct GoalTraceArgs {
     max_activities_per_task: Option<usize>,
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str =
+    "Goal/task traces and tool-call timelines. Omit goal_id for recent-goal list.";
+
 fn goal_trace_schema() -> Value {
     json!({
         "name": "goal_trace",
-        "description": "Goal/task traces and tool-call timelines. Omit goal_id for recent-goal list.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -536,7 +541,7 @@ impl Tool for GoalTraceTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect goal/task execution traces and tool-call timelines without terminal/sqlite forensics"
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

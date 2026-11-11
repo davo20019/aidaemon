@@ -63,10 +63,15 @@ struct ManagePeopleArgs {
     inactive_days: Option<u32>,
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str =
+    "Owner's contacts: people, relationships, facts. Use add_fact to store new info.";
+
 fn manage_people_schema() -> Value {
     json!({
         "name": "manage_people",
-        "description": "Owner's contacts: people, relationships, facts. Use add_fact to store new info.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -103,7 +108,7 @@ impl Tool for ManagePeopleTool {
     }
 
     fn description(&self) -> &str {
-        "Manage the owner's contacts and social circle. Track people, their preferences, relationships, and important dates."
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

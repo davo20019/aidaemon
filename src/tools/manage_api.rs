@@ -953,10 +953,14 @@ impl ManageApiTool {
     }
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.";
+
 fn manage_api_schema() -> Value {
     json!({
         "name": "manage_api",
-        "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -995,7 +999,7 @@ impl Tool for ManageApiTool {
     }
 
     fn description(&self) -> &str {
-        "Deterministically connect, learn, and verify external APIs by orchestrating auth, docs/spec ingestion, and a safe live probe"
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

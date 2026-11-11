@@ -121,13 +121,13 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store one or more long-lived facts (not goals or schedules) for long-term memory; use when user says learn/remember/save this"
+        "Store stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

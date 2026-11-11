@@ -13,13 +13,13 @@ impl Tool for ListCheckpointsTool {
     }
 
     fn description(&self) -> &str {
-        "List local filesystem checkpoints and their rollback readiness"
+        "List recent local workspace checkpoints. This is read-only. Checkpoint content is held in an external shadow-Git store, not in the user's repository."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "list_checkpoints",
-            "description": "List recent local workspace checkpoints. This is read-only. Checkpoint content is held in an external shadow-Git store, not in the user's repository.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

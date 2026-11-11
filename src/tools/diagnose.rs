@@ -1671,13 +1671,13 @@ impl Tool for DiagnoseTool {
     }
 
     fn description(&self) -> &str {
-        "Diagnose why an agent task failed using event timelines, decision points, evidence-linked root-cause ranking, and per-task LLM telemetry (latency, fallbacks, token-estimate drift)."
+        "Diagnose why a PREVIOUS agent task failed or behaved inefficiently. The diagnose action also reports per-task LLM telemetry (latency p50/p95/max, model fallbacks/retries, and est-vs-actual input-token drift) so you can tell whether slowness came from the model/provider vs the harness. ONLY use when the user explicitly asks why something failed/was slow or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.)."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "self_diagnose",
-            "description": "Diagnose why a PREVIOUS agent task failed or behaved inefficiently. The diagnose action also reports per-task LLM telemetry (latency p50/p95/max, model fallbacks/retries, and est-vs-actual input-token drift) so you can tell whether slowness came from the model/provider vs the harness. ONLY use when the user explicitly asks why something failed/was slow or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

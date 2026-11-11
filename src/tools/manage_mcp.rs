@@ -251,10 +251,15 @@ struct ManageMcpArgs {
     value: Option<String>,
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str =
+    "Manage MCP servers at runtime. set_env stores env vars in OS keychain, never in chat.";
+
 fn manage_mcp_schema() -> Value {
     json!({
         "name": "manage_mcp",
-        "description": "Manage MCP servers at runtime. set_env stores env vars in OS keychain, never in chat.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -284,7 +289,7 @@ impl Tool for ManageMcpTool {
     }
 
     fn description(&self) -> &str {
-        "Add, remove, list, configure, and enable/disable MCP (Model Context Protocol) servers at runtime"
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {

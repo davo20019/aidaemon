@@ -59,13 +59,13 @@ impl Tool for SetReminderTool {
     }
 
     fn description(&self) -> &str {
-        "Remind the user later"
+        "Send the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "set_reminder",
-            "description": "Send the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {

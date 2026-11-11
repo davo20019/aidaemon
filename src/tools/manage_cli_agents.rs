@@ -182,10 +182,14 @@ struct ManageCliAgentsArgs {
     limit: Option<usize>,
 }
 
+/// The tool's one description: the schema the model reads and
+/// `description()` both use it.
+const TOOL_DESCRIPTION: &str = "Manage CLI AI agents (claude/gemini/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Discovery is automatic — use only to add custom agents or inspect invocation history.";
+
 fn manage_cli_agents_schema() -> Value {
     json!({
         "name": "manage_cli_agents",
-        "description": "Manage CLI AI agents (claude/gemini/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Discovery is automatic — use only to add custom agents or inspect invocation history.",
+        "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
@@ -237,7 +241,7 @@ impl Tool for ManageCliAgentsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage CLI AI agents (claude/gemini/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Discovery is automatic — use only to add custom agents or inspect invocation history."
+        TOOL_DESCRIPTION
     }
 
     fn schema(&self) -> Value {
