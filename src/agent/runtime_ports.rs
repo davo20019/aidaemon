@@ -31,6 +31,15 @@ impl ChildAgentRuntime for Agent {
         self.role()
     }
 
+    fn tool_names(&self) -> Option<Vec<String>> {
+        Some(
+            self.tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect(),
+        )
+    }
+
     fn specialist_descriptions(&self) -> Vec<(String, String)> {
         self.specialists
             .llm_visible_kinds()

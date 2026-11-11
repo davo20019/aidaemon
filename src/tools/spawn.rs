@@ -471,6 +471,43 @@ impl From<ChildModelTier> for crate::router::Tier {
     }
 }
 
+/// A tool name as a caller wrote it in a grant. Models sometimes copy the
+/// provider's function-call namespace (`functions.read_file`) into the
+/// argument; the tool is `read_file`.
+fn tool_name_from_grant(raw: &str) -> String {
+    let name = raw.trim();
+    name.strip_prefix("functions.")
+        .unwrap_or(name)
+        .trim()
+        .to_string()
+}
+
+/// The granted tool names the caller cannot hand on: not among its own
+/// tools, or outside its own authority. A grant naming none of the caller's
+/// tools would start a child that can do nothing, so any unknown name is an
+/// error the caller can correct.
+fn ungrantable_tools(
+    requested: &aidaemon_core::Authority,
+    own_authority: &aidaemon_core::Authority,
+    own_tools: Option<&[String]>,
+) -> Vec<String> {
+    let Some(names) = requested.tools.as_ref() else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter(|name| {
+            let outside_authority = own_authority
+                .tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(*name));
+            let not_owned = own_tools.is_some_and(|tools| !tools.iter().any(|tool| tool == *name));
+            outside_authority || not_owned
+        })
+        .cloned()
+        .collect()
+}
+
 /// The authority the caller asked for its child, if it asked for one.
 fn requested_child_authority(args: &SpawnArgs) -> anyhow::Result<Option<aidaemon_core::Authority>> {
     if args.tools.is_none() && args.access.is_none() {
@@ -479,7 +516,7 @@ fn requested_child_authority(args: &SpawnArgs) -> anyhow::Result<Option<aidaemon
     let tools = args.tools.as_ref().map(|names| {
         names
             .iter()
-            .map(|name| name.trim().to_string())
+            .map(|name| tool_name_from_grant(name))
             .filter(|name| !name.is_empty())
             .collect::<std::collections::BTreeSet<_>>()
     });
@@ -527,9 +564,9 @@ impl Tool for SpawnAgentTool {
         "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step \
          (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the \
          `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
-         benefits from a fresh context window, or should keep running while other work continues (background=true; foreground sub-agents run one at a time). Do NOT delegate \
+         benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). Several spawn_agent calls in one response run in parallel (up to 3) and you receive every result. Do NOT delegate \
          trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
-         The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist cannot delegate further), so reference files by path and \
+         The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and \
          do not paste prior tool output."
     }
 
@@ -539,7 +576,7 @@ impl Tool for SpawnAgentTool {
             "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work \
                 is multi-step (research → synthesize, code → test, fetch → analyze), matches a named \
                 specialist (see the `specialist` enum: code, browser_verifier, research, review, \
-                artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while other work continues (background=true; foreground sub-agents run one at a time). Do NOT delegate trivial one-shot reads (a single read_file, a \
+                artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). Several spawn_agent calls in one response run in parallel (up to 3) and you receive every result. Do NOT delegate trivial one-shot reads (a single read_file, a \
                 single web_search) — handle those directly. The sub-agent starts with a fresh context and \
                 the same tools unless its specialist narrows them (a named specialist cannot delegate \
                 further), so reference files by path and do not paste prior tool output.",
@@ -628,13 +665,28 @@ impl Tool for SpawnAgentTool {
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::agent::authority::parent_authority(&facts).cloned();
         // A child can be made narrower than its parent and never wider.
+        let agent = self.get_agent()?;
         if let Some(requested) = requested_child_authority(&args)? {
             let parent = parent_authority.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("A child's tools and access can only be set inside a turn")
             })?;
+            let own_tools = agent.tool_names();
+            let unknown = ungrantable_tools(&requested, &parent.authority, own_tools.as_deref());
+            if !unknown.is_empty() {
+                let mut grantable = own_tools.unwrap_or_default();
+                if let Some(allowed) = parent.authority.tools.as_ref() {
+                    grantable.retain(|tool| allowed.contains(tool));
+                }
+                grantable.sort();
+                anyhow::bail!(
+                    "`tools` names tools you cannot give this child: {}. Use exact tool names \
+                     from: {}.",
+                    unknown.join(", "),
+                    grantable.join(", ")
+                );
+            }
             parent.authority = parent.authority.narrow(&requested);
         }
-        let agent = self.get_agent()?;
 
         info!(
             depth = agent.depth(),
@@ -1934,6 +1986,40 @@ mod child_runtime_tests {
         assert_eq!(
             *child.timed_out_tasks.lock().unwrap(),
             vec!["task-synthetic-1".to_string()]
+        );
+    }
+
+    /// A grant written with the provider's function namespace names the
+    /// tool; a name the caller does not have is refused, not silently
+    /// turned into a child with no tools.
+    #[test]
+    fn granted_tool_names_are_exact_or_refused() {
+        assert_eq!(tool_name_from_grant(" functions.read_file "), "read_file");
+        assert_eq!(tool_name_from_grant("search_files"), "search_files");
+        let requested = requested_child_authority(
+            &serde_json::from_value::<SpawnArgs>(serde_json::json!({
+                "mission": "m",
+                "task": "t",
+                "tools": ["functions.read_file", "made_up"]
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let own = vec!["read_file".to_string(), "search_files".to_string()];
+        assert_eq!(
+            ungrantable_tools(&requested, &aidaemon_core::Authority::full(), Some(&own)),
+            vec!["made_up".to_string()]
+        );
+        let narrow = aidaemon_core::Authority {
+            level: aidaemon_core::AccessLevel::Write,
+            tools: Some(["search_files".to_string()].into_iter().collect()),
+        };
+        let mut outside = ungrantable_tools(&requested, &narrow, Some(&own));
+        outside.sort();
+        assert_eq!(
+            outside,
+            vec!["made_up".to_string(), "read_file".to_string()]
         );
     }
 

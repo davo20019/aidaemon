@@ -146,6 +146,13 @@ pub(crate) trait ChildAgentRuntime: Send + Sync {
     fn role(&self) -> AgentRole;
     fn specialist_descriptions(&self) -> Vec<(String, String)>;
 
+    /// The names of the tools this agent has, which bound what it can grant
+    /// a child. `None`: not known (the grant is then checked only against
+    /// the agent's own authority).
+    fn tool_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
     async fn validate_executor_task_for_spawn(
         &self,
         task_id: &str,
