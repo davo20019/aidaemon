@@ -178,6 +178,15 @@ impl Agent {
             *override_guard = false;
         }
 
+        // The decision layer follows the reloaded config, so a Gemini key
+        // set from chat (`/setkey`) takes effect without a restart.
+        self.side_calls.set_decisions(
+            crate::llm_runtime::decide::DecisionLayer::from_config_with_key(
+                &config.decisions,
+                config.gemini_provider_api_key().as_deref(),
+            ),
+        );
+
         info!(
             old_provider = ?old_runtime.provider_kind(),
             new_provider = ?config.provider.kind,

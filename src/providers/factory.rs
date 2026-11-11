@@ -233,11 +233,33 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
 
 pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
     let primary_target = build_provider_target(&config.provider)?;
+    // A hosted fallback that needs an API key and has none yet (added to the
+    // config, key to come from `/setkey`) is left out of the chain instead
+    // of stopping the daemon; the primary still must build.
     let failover_targets = config
         .provider
         .fallbacks
         .iter()
-        .map(build_provider_target)
+        .enumerate()
+        .filter(|(index, fallback)| {
+            // Local OpenAI-compatible servers need no key; ChatGPT uses OAuth.
+            let keyless = fallback.api_key.trim().is_empty()
+                && matches!(
+                    fallback.kind,
+                    crate::config::ProviderKind::GoogleGenai
+                        | crate::config::ProviderKind::Anthropic
+                        | crate::config::ProviderKind::XaiNative
+                );
+            if keyless {
+                tracing::warn!(
+                    fallback = index,
+                    kind = ?fallback.kind,
+                    "fallback provider has no API key yet; left out of the failover chain"
+                );
+            }
+            !keyless
+        })
+        .map(|(_, fallback)| build_provider_target(fallback))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let primary_router = primary_target.router();
@@ -260,4 +282,54 @@ pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<Provid
         provider_kind: primary_target.provider_kind(),
         failover_targets,
     })
+}
+
+#[cfg(test)]
+mod keyless_fallback_tests {
+    use super::*;
+
+    fn config(text: &str) -> AppConfig {
+        let mut config: AppConfig = toml::from_str(text).unwrap();
+        config.provider.apply_model_defaults_recursive();
+        config
+    }
+
+    #[test]
+    fn a_gemini_fallback_without_a_key_is_skipped_not_fatal() {
+        let config = config(
+            r#"
+            [provider]
+            api_key = "synthetic-primary-key"
+            [[provider.fallbacks]]
+            kind = "google_genai"
+            api_key = ""
+            [[provider.fallbacks]]
+            kind = "openai_compatible"
+            base_url = "http://localhost:11434/v1"
+            api_key = ""
+            [provider.fallbacks.models]
+            default = "local-model"
+            "#,
+        );
+        let bundle = build_provider_router(&config).expect("the daemon still starts");
+        // The keyless Gemini entry is left out; the keyless local server stays.
+        assert_eq!(bundle.failover_targets.len(), 1);
+    }
+
+    #[test]
+    fn decisions_reuse_the_gemini_fallback_key() {
+        let config = config(
+            r#"
+            [provider]
+            api_key = "synthetic-primary-key"
+            [[provider.fallbacks]]
+            kind = "google_genai"
+            api_key = "synthetic-gemini-key"
+            "#,
+        );
+        assert_eq!(
+            config.gemini_provider_api_key().as_deref(),
+            Some("synthetic-gemini-key")
+        );
+    }
 }
