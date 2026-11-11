@@ -555,8 +555,207 @@ impl SqliteMemory {
     }
 }
 
+impl SqliteMemory {
+    /// Every fact an explicit search ranks, loaded once: canonical
+    /// projections, then active rows, minus owner rows a projection already
+    /// covers.
+    async fn explicit_search_facts(&self) -> anyhow::Result<Vec<Fact>> {
+        let mut facts = self.canonical_personal_facts().await.unwrap_or_default();
+        let canonical_owner_keys: std::collections::HashSet<String> = facts
+            .iter()
+            .filter(|fact| fact.category == "user")
+            .map(|fact| canonical_personal_key(&fact.key))
+            .collect();
+        facts.extend(
+            self.get_all_facts_with_provenance()
+                .await?
+                .into_iter()
+                .filter(|fact| {
+                    fact.category != "user"
+                        || !canonical_owner_keys.contains(&canonical_personal_key(&fact.key))
+                }),
+        );
+        Ok(facts)
+    }
+
+    /// Cosine of the query against every fact with a current vector, by
+    /// position in `facts`. Empty when the query cannot be embedded.
+    async fn explicit_search_cosine(&self, query: &str, facts: &[Fact]) -> Vec<(usize, f32)> {
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(vector) => vector,
+            Err(error) => {
+                tracing::warn!(target: "memory_recall", %error, "explicit fact search: query embedding failed; lexical only");
+                return Vec::new();
+            }
+        };
+        let indexed = self
+            .fact_embedding_scores(&query_vec, facts.len())
+            .await
+            .unwrap_or_default();
+        let fallback = self
+            .unindexed_fact_scores(
+                &query_vec,
+                facts.iter().map(|f| f.id).filter(|id| *id > 0),
+                &indexed,
+            )
+            .await;
+        facts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fact)| {
+                indexed
+                    .get(&fact.id)
+                    .or_else(|| fallback.get(&fact.id))
+                    .map(|score| (i, *score))
+            })
+            .collect()
+    }
+
+    /// Rerank `docs` against the query, or `None` when there is no reranker
+    /// or it fails (the caller then falls back to its unreranked order).
+    async fn explicit_search_rerank(
+        &self,
+        query: &str,
+        docs: Vec<String>,
+    ) -> Option<Vec<(usize, f32)>> {
+        self.embedding_service.reranker.as_ref()?;
+        if docs.is_empty() {
+            return Some(Vec::new());
+        }
+        match self.embedding_service.rerank(query.to_string(), docs).await {
+            Ok(scores) => Some(scores),
+            Err(error) => {
+                tracing::warn!(target: "memory_recall", %error, "explicit fact search: rerank unavailable; using fusion order");
+                None
+            }
+        }
+    }
+
+    fn rerank_floor(&self) -> Option<f32> {
+        self.embedding_service
+            .reranker
+            .as_ref()
+            .and_then(|reranker| reranker.relevance_floor())
+    }
+}
+
 #[async_trait]
 impl FactStore for SqliteMemory {
+    async fn search_facts(
+        &self,
+        query: &str,
+        limit: usize,
+        config: &crate::search::FactSearchConfig,
+    ) -> anyhow::Result<crate::search::FactSearchReport> {
+        use crate::neighborhood::{eligible_neighbors, is_relationship_key, seeds_from_hits};
+        use crate::search::{self, LexicalIndex};
+
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(search::FactSearchReport::default());
+        }
+        let started = std::time::Instant::now();
+        let facts = self.explicit_search_facts().await?;
+        let load_ms = started.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let lexical = LexicalIndex::build(&facts).score(query);
+        let lexical_ms = stage.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let cosine = self.explicit_search_cosine(query, &facts).await;
+        let embed_ms = stage.elapsed().as_millis() as u64;
+
+        let stage = std::time::Instant::now();
+        let pool = search::candidates(&facts, &lexical, &cosine, config);
+        let docs: Vec<String> = pool
+            .iter()
+            .map(|c| {
+                let f = &facts[c.index];
+                build_fact_embedding_text(&f.category, &f.key, &f.value)
+            })
+            .collect();
+        let reranked = self.explicit_search_rerank(query, docs).await;
+        let floor = self.rerank_floor();
+        let mut report = search::rank(&facts, &pool, reranked.as_deref(), floor, limit, config);
+        let rerank_ms = stage.elapsed().as_millis() as u64;
+
+        // Expansion seeds come only from the hits actually returned.
+        let stage = std::time::Instant::now();
+        let hit_facts: Vec<Fact> = report.hits.iter().map(|h| h.fact.clone()).collect();
+        let known_people: Vec<String> = PeopleStore::get_all_people(self)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|p| std::iter::once(p.name).chain(p.aliases))
+            .collect();
+        let seeds = seeds_from_hits(&hit_facts, &known_people);
+        let relationship_cluster = hit_facts.iter().any(|f| is_relationship_key(&f.key));
+        if !seeds.is_empty() || relationship_cluster {
+            let exclude: std::collections::HashSet<i64> = hit_facts.iter().map(|f| f.id).collect();
+            let mut neighbors = eligible_neighbors(&facts, &seeds, relationship_cluster, &exclude);
+            // A neighbor duplicating a hit's content is not new context.
+            let shown: std::collections::HashSet<(&str, &str, &str)> = hit_facts
+                .iter()
+                .map(|f| (f.category.as_str(), f.key.as_str(), f.value.as_str()))
+                .collect();
+            neighbors.retain(|f| {
+                !shown.contains(&(f.category.as_str(), f.key.as_str(), f.value.as_str()))
+            });
+
+            let position: std::collections::HashMap<i64, usize> =
+                facts.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+            let cosine_by_index: std::collections::HashMap<usize, f32> =
+                cosine.iter().copied().collect();
+            let lexical_by_index: std::collections::HashMap<usize, f32> =
+                lexical.iter().map(|h| (h.index, h.score)).collect();
+            let prior = |f: &Fact| -> f32 {
+                let index = position[&f.id];
+                if cosine.is_empty() {
+                    lexical_by_index.get(&index).copied().unwrap_or(0.0)
+                } else {
+                    cosine_by_index.get(&index).copied().unwrap_or(0.0)
+                }
+            };
+            if neighbors.len() > config.related_pool {
+                neighbors.sort_by(|a, b| prior(b).total_cmp(&prior(a)).then(a.id.cmp(&b.id)));
+                neighbors.truncate(config.related_pool);
+            }
+            let docs: Vec<String> = neighbors
+                .iter()
+                .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
+                .collect();
+            let related = match self.explicit_search_rerank(query, docs).await {
+                Some(scores) => search::rank_related(&neighbors, &scores, floor, config),
+                None => {
+                    let scores: Vec<(usize, f32)> = neighbors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| (i, prior(f)))
+                        .collect();
+                    search::rank_related(&neighbors, &scores, None, config)
+                }
+            };
+            report.related = related;
+        }
+        let expand_ms = stage.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            target: "memory_recall",
+            load_ms,
+            lexical_ms,
+            embed_ms,
+            rerank_ms,
+            expand_ms,
+            considered = report.considered,
+            passed_floor = report.passed_floor,
+            returned = report.hits.len(),
+            related = report.related.len(),
+            reranked = report.reranked,
+            "explicit fact search"
+        );
+        Ok(report)
+    }
+
     async fn stamp_fact_provenance(
         &self,
         category: &str,

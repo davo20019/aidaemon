@@ -219,6 +219,19 @@ pub trait FactStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Explicit fact search: one ranked list plus query-relevant related
+    /// facts. Ranking lives in [`crate::search`]; a store only gathers facts
+    /// and scores. The default returns an empty report so stores without
+    /// search keep compiling.
+    async fn search_facts(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _config: &crate::search::FactSearchConfig,
+    ) -> anyhow::Result<crate::search::FactSearchReport> {
+        Ok(crate::search::FactSearchReport::default())
+    }
+
     /// Persist a model-extracted semantic graph for an already-written fact.
     /// Implementations must validate the graph and retain claim provenance.
     async fn project_extracted_fact_graph(

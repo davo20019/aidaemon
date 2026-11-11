@@ -30,6 +30,8 @@ mod people;
 mod retention;
 mod rows;
 mod schema;
+#[cfg(test)]
+mod search_tests;
 mod structured;
 
 pub(crate) use claims::memory_visible;
