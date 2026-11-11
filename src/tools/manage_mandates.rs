@@ -2075,27 +2075,8 @@ impl ManageMandatesTool {
             required_trimmed(args.outcome.as_deref(), "outcome")?.to_ascii_lowercase();
         let outcome = MandateDecisionOutcome::parse(&outcome_raw)
             .ok_or_else(|| anyhow::anyhow!("outcome must be act, wait, ask, or stop"))?;
-        anyhow::ensure!(
-            outcome != MandateDecisionOutcome::Act
-                || mandate.authority.max_mutating_actions_per_cycle > 0,
-            "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle (if the objective is stagnant, a WAIT must carry a strategy revision that explores, avoids, or retires a tactic)"
-        );
-        if outcome == MandateDecisionOutcome::Act {
-            let quota = self
-                .state
-                .get_mandate_mutation_quota_state(&mandate.id, &chrono::Utc::now().to_rfc3339())
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("mandate mutation quota state is missing"))?;
-            if !quota.available_now {
-                let earliest = quota
-                    .earliest_next_slot_at
-                    .as_deref()
-                    .unwrap_or("unavailable");
-                anyhow::bail!(
-                    "mandate_mutation_quota_unavailable: choose WAIT; earliest_next_slot_at={earliest}"
-                );
-            }
-        }
+        // Whether ACT is admissible now (mutation budget, quota, cooldown)
+        // is decided by the store when it commits the decision.
         let rationale =
             required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
         let mut decision =

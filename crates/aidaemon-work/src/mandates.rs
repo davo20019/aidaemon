@@ -2031,6 +2031,26 @@ impl Intention {
     /// persisted for a value-contract mandate. The criterion is matched by the
     /// state store against immutable owner policy; this method owns the
     /// content-presence half of that contract.
+    /// The whole value contract against the owner's policy: when the
+    /// mandate names success criteria, the intention carries a complete
+    /// value contract whose criterion is one of them, word for word.
+    pub fn validate_value_against(&self, mandate: &Mandate) -> Result<(), String> {
+        if mandate.success_criteria.is_empty() {
+            return Ok(());
+        }
+        self.validate_value_contract()?;
+        let value_criterion = self.value_criterion.as_deref().unwrap_or_default();
+        if mandate
+            .success_criteria
+            .iter()
+            .any(|criterion| criterion == value_criterion)
+        {
+            Ok(())
+        } else {
+            Err("ACT value_criterion is not an exact owner-authored success criterion".to_string())
+        }
+    }
+
     pub fn validate_value_contract(&self) -> Result<(), String> {
         if !self
             .value_criterion

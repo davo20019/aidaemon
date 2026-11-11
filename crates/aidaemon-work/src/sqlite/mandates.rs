@@ -3096,22 +3096,9 @@ impl<S: WorkDatabase> MandateStore for S {
         // still fails closed.
         if let Some(intention) = intention {
             if let Some(mandate) = self.get_mandate(&decision.mandate_id).await? {
-                if !mandate.success_criteria.is_empty() {
-                    intention
-                        .validate_value_contract()
-                        .map_err(anyhow::Error::msg)?;
-                    let value_criterion = intention
-                        .value_criterion
-                        .as_deref()
-                        .expect("validated value contract has a criterion");
-                    anyhow::ensure!(
-                        mandate
-                            .success_criteria
-                            .iter()
-                            .any(|criterion| criterion == value_criterion),
-                        "ACT value_criterion is not an exact owner-authored success criterion"
-                    );
-                }
+                intention
+                    .validate_value_against(&mandate)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
         if decision.outcome == MandateDecisionOutcome::Ask {
@@ -3219,6 +3206,37 @@ impl<S: WorkDatabase> MandateStore for S {
                     && operating_updates.is_none(),
                 "runtime fallback decisions must be bare WAIT markers"
             );
+        }
+        // Whether ACT is admissible now is decided here, in the transaction
+        // that commits the decision, by the same rules as every other
+        // outcome (`admissibility`), so no caller keeps its own copy.
+        if decision.outcome == MandateDecisionOutcome::Act {
+            let quota =
+                mutation_quota_state_on_connection(&mut tx, &mandate.id, &now_string).await?;
+            let block = match &quota {
+                Some(quota) => quota.block_reason,
+                None => Some(MandateMutationQuotaBlockReason::MutationDisabled),
+            };
+            let admissible =
+                crate::admissibility::admissible_outcomes(&crate::admissibility::OutcomeState {
+                    stagnant: false,
+                    quota_block: block,
+                    adapts_strategy: false,
+                });
+            if !admissible.act {
+                if block == Some(MandateMutationQuotaBlockReason::MutationDisabled) {
+                    anyhow::bail!(
+                        "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle (if the objective is stagnant, a WAIT must carry a strategy revision that explores, avoids, or retires a tactic)"
+                    );
+                }
+                let earliest = quota
+                    .as_ref()
+                    .and_then(|quota| quota.earliest_next_slot_at.as_deref())
+                    .unwrap_or("unavailable");
+                anyhow::bail!(
+                    "mandate_mutation_quota_unavailable: choose WAIT; earliest_next_slot_at={earliest}"
+                );
+            }
         }
         let current_measurement = if mandate.objective_control.is_some()
             && !runtime_fallback
@@ -3412,22 +3430,9 @@ impl<S: WorkDatabase> MandateStore for S {
             intention
                 .validate_content_bounds()
                 .map_err(anyhow::Error::msg)?;
-            if !mandate.success_criteria.is_empty() {
-                intention
-                    .validate_value_contract()
-                    .map_err(anyhow::Error::msg)?;
-                let value_criterion = intention
-                    .value_criterion
-                    .as_deref()
-                    .expect("validated value contract has a criterion");
-                anyhow::ensure!(
-                    mandate
-                        .success_criteria
-                        .iter()
-                        .any(|criterion| criterion == value_criterion),
-                    "ACT value_criterion is not an exact owner-authored success criterion"
-                );
-            }
+            intention
+                .validate_value_against(&mandate)
+                .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
                 intention.status == IntentionStatus::Committed && intention.completed_at.is_none(),
                 "a new intention must be committed and incomplete"
@@ -8785,25 +8790,18 @@ mod tests {
             "Try another action",
             "The daily ledger must reject it",
         );
-        store
+        // The new cycle's ACT is refused when it is committed: the store
+        // reads the same rolling ledger across policy versions.
+        let refused = store
             .record_mandate_decision(&second_act, Some(&second_intention), None)
             .await
-            .unwrap();
-        let second_fence = claim_mutation_fence(&store, &goal, &current, &second_run).await;
-        let second = reservation(
-            &current,
-            &second_act,
-            &second_run,
-            &second_fence,
-            1,
-            302,
-            base + chrono::Duration::seconds(901),
+            .expect_err("ACT must be refused while the rolling quota is used up");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("mandate_mutation_quota_unavailable: choose WAIT"),
+            "{refused}"
         );
-        assert!(store
-            .reserve_mandate_action_attempt(&second)
-            .await
-            .unwrap()
-            .is_none());
         let quota = store
             .get_mandate_mutation_quota_state(
                 &current.id,
