@@ -36,6 +36,15 @@ impl FilePolicy for DaemonFilePolicy {
         true
     }
 
+    fn refusal_hint(&self, path: &Path) -> Option<String> {
+        self.paths.is_own_file(path).then(|| {
+            "This is one of aidaemon's own files, which change only through manage_config: \
+             read the config with manage_config action 'read' (secrets hidden), and change one \
+             setting with 'set' or 'unset'."
+                .to_string()
+        })
+    }
+
     fn shell_tool_name(&self) -> &str {
         "terminal"
     }

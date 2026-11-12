@@ -116,6 +116,11 @@ pub trait FilePolicy: Send + Sync {
     fn plants_configuration(&self, _path: &str) -> bool {
         false
     }
+    /// Where to go instead when the file tools refuse `path`: an app's own
+    /// files can have a tool of their own (its config tool, for example).
+    fn refusal_hint(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// The policy for tools confined to a [`Workspace`].

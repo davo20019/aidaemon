@@ -1675,6 +1675,69 @@ fn signal_remedy_hint(signal: i32) -> &'static str {
     }
 }
 
+/// A note for a failed command when the disk is nearly full. A full disk
+/// makes programs fail with errors that do not mention space (a VM or
+/// container engine that never comes up, a socket that never appears, an
+/// install that stops part way), so the measured free space goes with the
+/// failure instead of a guess.
+fn low_disk_note() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let (free, total) = disk_space(&home)?;
+    low_disk_message(&home, free, total)
+}
+
+const LOW_DISK_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+fn low_disk_message(path: &std::path::Path, free: u64, total: u64) -> Option<String> {
+    if total == 0 || free >= LOW_DISK_FREE_BYTES {
+        return None;
+    }
+    let gb = |bytes: u64| bytes as f64 / 1_000_000_000.0;
+    Some(format!(
+        "\n[SYSTEM diagnostic] The disk holding {} has only {:.1} GB free of {:.0} GB. \
+         Programs that need disk space (VMs, container engines, installs, builds) fail or hang \
+         when it runs out, often with errors that never mention space; report the free space \
+         as the likely cause.",
+        path.display(),
+        gb(free),
+        gb(total)
+    ))
+}
+
+#[cfg(unix)]
+fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+    // writable statvfs the call fills.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let block = stat.f_frsize as u64;
+    Some((
+        (stat.f_bavail as u64).saturating_mul(block),
+        (stat.f_blocks as u64).saturating_mul(block),
+    ))
+}
+
+#[cfg(not(unix))]
+fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// The exit code line and, for a failure, the low-disk note.
+fn push_exit_status(output: &mut String, exit_code: Option<i32>) {
+    if let Some(code) = exit_code {
+        if code != 0 {
+            output.push_str(&format!("\n[exit code: {}]", code));
+            if let Some(note) = low_disk_note() {
+                output.push_str(&note);
+            }
+        }
+    }
+}
+
 fn confined_opaque_failure_hint(
     exit_code: Option<i32>,
     _stdout: &str,
@@ -4647,11 +4710,7 @@ impl TerminalTool {
             );
             let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
             output.push_str(&formatted);
-            if let Some(code) = exit_code {
-                if code != 0 {
-                    output.push_str(&format!("\n[exit code: {}]", code));
-                }
-            }
+            push_exit_status(&mut output, exit_code);
 
             let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
@@ -5404,11 +5463,7 @@ impl TerminalTool {
                 }
                 let (mut output, truncation) =
                     format_output(&stdout, &stderr, self.max_output_chars);
-                if let Some(code) = exit_code {
-                    if code != 0 {
-                        output.push_str(&format!("\n[exit code: {}]", code));
-                    }
-                }
+                push_exit_status(&mut output, exit_code);
                 if !self_heal_note.is_empty() {
                     output.push_str(&self_heal_note);
                 }
@@ -6715,11 +6770,7 @@ impl TerminalTool {
             );
             let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
             output.push_str(&formatted);
-            if let Some(code) = exit_code {
-                if code != 0 {
-                    output.push_str(&format!("\n[exit code: {}]", code));
-                }
-            }
+            push_exit_status(&mut output, exit_code);
             let mut metadata = background_completion_metadata(exit_code);
             metadata.truncation = truncation;
             metadata.semantics = semantics;
@@ -14186,5 +14237,21 @@ mod call_effects_tests {
                 "{other}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod low_disk_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_on_a_nearly_full_disk_names_the_free_space() {
+        let gib = 1024 * 1024 * 1024;
+        let path = std::path::Path::new("/Users/synthetic-user");
+        let note = low_disk_message(path, 2 * gib, 460 * gib).expect("low disk is reported");
+        assert!(note.contains("only 2.1 GB free of 494 GB"), "{note}");
+        assert!(low_disk_message(path, 50 * gib, 460 * gib).is_none());
+        assert!(low_disk_message(path, 0, 0).is_none());
+        assert!(disk_space(std::path::Path::new("/")).is_some_and(|(_, total)| total > 0));
     }
 }

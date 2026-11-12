@@ -469,9 +469,21 @@ fn render_archived(
 
     // Position of the turn's last assistant/tool record — where the synthetic
     // placeholder is emitted (end of turn) so order stays chronological.
+    // A turn that ended (cancelled or failed) with nothing of the assistant's
+    // left (the shared-history view drops tool-only records) still says how
+    // it ended, right after the request: otherwise the request reads as
+    // still waiting, and the next turn takes it up again.
     let last_assistant_or_tool = turn_messages
         .iter()
-        .rposition(|m| m.role == "assistant" || m.role == "tool");
+        .rposition(|m| m.role == "assistant" || m.role == "tool")
+        .or_else(|| {
+            matches!(
+                terminal_state,
+                TerminalState::Cancelled | TerminalState::Failed
+            )
+            .then(|| turn_messages.len().checked_sub(1))
+            .flatten()
+        });
 
     let need_placeholder = last_substantive_assistant.is_none();
     let mut vision_skipped = false;
@@ -725,6 +737,36 @@ mod tests {
             tool_name: Some(name.to_string()),
             ..Message::runtime_defaults()
         }
+    }
+
+    #[test]
+    fn a_cancelled_request_with_nothing_left_of_the_reply_says_it_was_cancelled() {
+        // The shared-history view drops tool-only records: a turn cancelled
+        // while its sub-agents ran keeps only the owner's request, which
+        // read as still waiting, and the next turn redid it.
+        let turn = vec![user("In parallel, run two synthetic sleep commands")];
+        let render = |terminal_state| {
+            render_turn(
+                &turn,
+                RenderMode::Archived { terminal_state },
+                RENDERER_VERSION,
+                &RenderOptions::default(),
+            )
+        };
+        let cancelled = render(TerminalState::Cancelled);
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(cancelled[1]["role"], "assistant");
+        assert_eq!(
+            cancelled[1]["content"],
+            TerminalState::Cancelled.placeholder(0)
+        );
+        assert_eq!(
+            render(TerminalState::Failed)[1]["content"],
+            TerminalState::Failed.placeholder(0)
+        );
+        // A turn with no recorded end (still running or queued) is left as
+        // it is.
+        assert_eq!(render(TerminalState::Interrupted).len(), 1);
     }
 
     #[test]

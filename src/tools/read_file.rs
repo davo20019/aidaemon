@@ -140,6 +140,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(text.contains("does not open credential or secret files"));
+        assert!(text.contains("manage_config action 'read'"), "{text}");
         assert!(!text.contains("synthetic-secret"));
         let other = dir.path().join("config.toml");
         std::fs::write(&other, "title = \"ok\"\n").unwrap();

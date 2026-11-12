@@ -193,6 +193,11 @@ impl DaemonPaths {
     pub fn is_sensitive(&self, path: &Path) -> bool {
         self.classifier.is_sensitive(path) || is_configured_env_file(path)
     }
+
+    /// True for the daemon's own config and env files given at startup.
+    pub fn is_own_file(&self, path: &Path) -> bool {
+        self.classifier.is_protected(path)
+    }
 }
 
 /// Env files named by the daemon's own environment variables

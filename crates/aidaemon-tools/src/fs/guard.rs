@@ -56,10 +56,15 @@ impl ProtectedPathGuard {
             FileGuard::Reads => {
                 for raw in reads {
                     if self.resolved_any(raw, |path| self.holds_secret(path)).await {
-                        return Some(format!(
-                            "{tool} does not open credential or secret files ({raw}). Ask the \
-                             owner to share what is needed."
-                        ));
+                        return Some(match self.hint(raw).await {
+                            Some(hint) => format!(
+                                "{tool} does not open credential or secret files ({raw}). {hint}"
+                            ),
+                            None => format!(
+                                "{tool} does not open credential or secret files ({raw}). Ask \
+                                 the owner to share what is needed."
+                            ),
+                        });
                     }
                 }
                 None
@@ -81,12 +86,27 @@ impl ProtectedPathGuard {
                         .resolved_any(raw, |path| self.policy.is_sensitive(path))
                         .await
                     {
-                        return Some(format!("{tool} cannot change sensitive path: {raw}"));
+                        return Some(match self.hint(raw).await {
+                            Some(hint) => {
+                                format!("{tool} cannot change sensitive path: {raw}. {hint}")
+                            }
+                            None => format!("{tool} cannot change sensitive path: {raw}"),
+                        });
                     }
                 }
                 None
             }
         }
+    }
+
+    /// The policy's pointer for a refused path, as named or as it really is.
+    async fn hint(&self, raw: &str) -> Option<String> {
+        let path = self.backend.resolve_path(raw).await.ok()?;
+        if let Some(hint) = self.policy.refusal_hint(Path::new(path.as_str())) {
+            return Some(hint);
+        }
+        let real = self.real_path(&path).await?;
+        self.policy.refusal_hint(&real)
     }
 
     /// `.env.example` style templates hold placeholders: they are judged by

@@ -6,10 +6,13 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
+
+mod config_path;
 use crate::traits::{
     semantics_for_exact_read_actions, OwnerApprovalNeed, Tool, ToolCallContext, ToolCallSemantics,
     ToolCapabilities, ToolMutationEffects,
 };
+use config_path::ConfigPath;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
 const SENSITIVE_KEYS: &[&str] = &[
@@ -339,6 +342,9 @@ impl ConfigManagerTool {
         } else {
             args.value.clone()
         };
+        if args.action == "unset" {
+            return format!("Config change: remove {}", args.key);
+        }
         format!("Config change: {} = {}", args.key, display_value)
     }
 
@@ -389,10 +395,10 @@ impl ConfigManagerTool {
     /// refuses before changing anything).
     async fn approval_summary(&self, args: &ConfigArgs) -> anyhow::Result<Option<String>> {
         match args.action.as_str() {
-            "set" => {
+            "set" | "unset" => {
                 if args.key.is_empty()
-                    || args.value.is_empty()
-                    || !Self::requires_approval(&args.key)
+                    || (args.action == "set" && args.value.is_empty())
+                    || !Self::change_needs_approval(args)
                 {
                     return Ok(None);
                 }
@@ -459,13 +465,13 @@ impl ConfigManagerTool {
             }
         };
         let subject = match args.action.as_str() {
-            "set" => {
+            "set" | "unset" => {
                 let value = if is_sensitive_key(&args.key) {
                     secret(&args.value)
                 } else {
                     args.value.clone()
                 };
-                json!({"action": "set", "key": args.key, "value": value})
+                json!({"action": args.action, "key": args.key, "value": value})
             }
             "remove_failover_provider" => json!({
                 "action": args.action,
@@ -1578,7 +1584,8 @@ fn apply_instruction_for_key(key: &str) -> &'static str {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str = "Read/update config.toml (backup+validate).";
+const TOOL_DESCRIPTION: &str =
+    "Read (secrets hidden)/update config.toml (backup+validate). key: dotted path, list entry as a[2].";
 
 fn manage_config_schema() -> Value {
     json!({
@@ -1589,7 +1596,7 @@ fn manage_config_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt"]
+                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt"]
                 },
                 "key": { "type": "string" },
                 "value": { "type": "string" },
@@ -1633,117 +1640,266 @@ impl Tool for ConfigManagerTool {
     ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let facts = facts.clone();
 
-        self.run(arguments, &facts)
-            .await
-            .map(crate::traits::ToolCallOutcome::from_output)
+        let reply = self.run_reply(arguments, &facts).await?;
+        let mut outcome = crate::traits::ToolCallOutcome::from_output(reply.text);
+        outcome.metadata.outcome_status = reply.status;
+        Ok(outcome)
+    }
+}
+
+/// One call's reply. `status` is the tool's own verdict when it knows it
+/// (reads, `get`, `set`, `unset`), so a config dump that happens to mention
+/// timeouts is never read back as a failure.
+struct ConfigReply {
+    text: String,
+    status: Option<crate::traits::ToolOutcomeStatus>,
+}
+
+impl ConfigReply {
+    fn done(text: String) -> Self {
+        Self {
+            text,
+            status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+        }
+    }
+
+    fn refused(text: String) -> Self {
+        Self {
+            text,
+            status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
+        }
+    }
+}
+
+impl From<String> for ConfigReply {
+    fn from(text: String) -> Self {
+        Self { text, status: None }
     }
 }
 
 impl ConfigManagerTool {
-    /// Run one call with the dispatcher's `facts`.
-    pub(crate) async fn run(
+    async fn run_reply(
         &self,
         arguments: &str,
         facts: &ToolCallContext,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ConfigReply> {
         let mut args: ConfigArgs = serde_json::from_str(arguments)?;
         args.kernel_approved = facts.kernel_approved.is_some();
 
         match args.action.as_str() {
-            "list_provider_presets" => Ok(Self::list_provider_presets_message()),
-            "switch_provider" => self.switch_provider(&args).await,
-            "list_failover_providers" => self.list_failover_providers().await,
-            "add_failover_provider" => self.add_failover_provider(&args).await,
-            "remove_failover_provider" => self.remove_failover_provider(&args).await,
-            "enable_stt" => self.enable_stt(&args).await,
+            "list_provider_presets" => Ok(ConfigReply::done(Self::list_provider_presets_message())),
+            "switch_provider" => self.switch_provider(&args).await.map(Into::into),
+            "list_failover_providers" => self.list_failover_providers().await.map(ConfigReply::done),
+            "add_failover_provider" => self.add_failover_provider(&args).await.map(Into::into),
+            "remove_failover_provider" => self.remove_failover_provider(&args).await.map(Into::into),
+            "enable_stt" => self.enable_stt(&args).await.map(Into::into),
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let mut doc: toml::Value = content.parse()?;
                 redact_secrets(&mut doc);
                 let redacted = toml::to_string_pretty(&doc)?;
-                Ok(format!(
-                    "Current config.toml (secrets redacted):\n\n{}",
+                Ok(ConfigReply::done(format!(
+                    "Current config.toml at {} (secrets redacted):\n\n{}",
+                    self.config_path.display(),
                     redacted
-                ))
+                )))
             }
-            "get" => {
-                if args.key.is_empty() {
-                    return Ok("Error: 'key' is required for 'get' action.".to_string());
-                }
-                // Block direct reads of sensitive keys
-                if is_sensitive_key(&args.key) {
-                    return Ok(format!(
-                        "{} = \"{}\" (redacted for security)",
-                        args.key, REDACTED
-                    ));
-                }
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
-                let doc: toml::Value = content.parse()?;
-                let value = navigate_toml(&doc, &args.key);
-                match value {
-                    Some(v) => Ok(format!("{} = {}", args.key, v)),
-                    None => Ok(format!("Key '{}' not found in config.", args.key)),
-                }
-            }
-            "set" => {
-                if args.key.is_empty() || args.value.is_empty() {
-                    return Ok(
-                        "Error: 'key' and 'value' are required for 'set' action.".to_string()
-                    );
-                }
-
-                // Security-sensitive keys need the owner's approval, which
-                // the kernel asked for before this runs.
-                if Self::requires_approval(&args.key) {
-                    Self::require_kernel_approval(&args)?;
-                }
-
-                let content = tokio::fs::read_to_string(&self.config_path).await?;
-                let mut doc: toml::Table = content.parse()?;
-
-                // Parse the new value as TOML
-                let new_value: toml::Value = args.value.parse().or_else(|_| {
-                    let wrapped = format!("v = {}", args.value);
-                    let table: toml::Table = wrapped.parse()?;
-                    Ok::<toml::Value, toml::de::Error>(table["v"].clone())
-                })?;
-
-                set_toml_value(&mut doc, &args.key, new_value)?;
-
-                let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-
-                // Validate before writing
-                if let Err(e) = Self::validate_config(&new_content) {
-                    return Ok(format!(
-                        "Refused to save: {}.\n\nThe config was NOT modified. Fix the value and try again.",
-                        e
-                    ));
-                }
-
-                // Backup current config before writing
-                if let Err(e) = self.create_backup().await {
-                    warn!("Failed to create backup: {}", e);
-                    // Continue anyway — better to fix config than refuse
-                }
-
-                tokio::fs::write(&self.config_path, &new_content).await?;
-                set_owner_only_permissions(&self.config_path);
-
-                let apply_instruction = apply_instruction_for_key(&args.key);
-                Ok(format!(
-                    "Updated {} = {}\n\nBackup saved to config.toml.bak. Config validated and saved. {}",
-                    args.key, args.value, apply_instruction
-                ))
-            }
+            "get" => self.get_value(&args).await,
+            "set" | "unset" => self.change_value(&args).await,
             "restore" => match self.restore_backup().await {
-                Ok(msg) => Ok(msg),
-                Err(e) => Ok(format!("Restore failed: {}", e)),
+                Ok(msg) => Ok(ConfigReply::done(msg)),
+                Err(e) => Ok(ConfigReply::refused(format!("Restore failed: {}", e))),
             },
-            _ => Ok(format!(
-                "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', or 'enable_stt'.",
+            _ => Ok(ConfigReply::refused(format!(
+                "Unknown action: {}. Use 'read', 'get', 'set', 'unset', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', or 'enable_stt'.",
                 args.action
-            )),
+            ))),
         }
+    }
+
+    async fn get_value(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
+        if args.key.is_empty() {
+            return Ok(ConfigReply::refused(
+                "Error: 'key' is required for 'get' action.".to_string(),
+            ));
+        }
+        let path = match ConfigPath::parse(&args.key) {
+            Ok(path) => path,
+            Err(e) => return Ok(ConfigReply::refused(format!("Error: {e}."))),
+        };
+        if is_sensitive_key(&args.key) {
+            return Ok(ConfigReply::done(format!(
+                "{path} = \"{REDACTED}\" (redacted for security)"
+            )));
+        }
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let doc: toml::Value = content.parse()?;
+        match path.lookup(&doc) {
+            Some(value) => {
+                let mut value = value.clone();
+                redact_secrets(&mut value);
+                Ok(ConfigReply::done(format!("{path} = {value}")))
+            }
+            None => Ok(ConfigReply::refused(format!(
+                "config.toml has no setting `{path}`."
+            ))),
+        }
+    }
+
+    /// `set` or `unset` one setting. The change is written only when the
+    /// daemon's config would read it (a key it ignores is refused), and it is
+    /// reported saved only after the file read back from disk holds it.
+    async fn change_value(&self, args: &ConfigArgs) -> anyhow::Result<ConfigReply> {
+        let unset = args.action == "unset";
+        if args.key.is_empty() || (!unset && args.value.is_empty()) {
+            return Ok(ConfigReply::refused(if unset {
+                "Error: 'key' is required for 'unset' action.".to_string()
+            } else {
+                "Error: 'key' and 'value' are required for 'set' action.".to_string()
+            }));
+        }
+        let path = match ConfigPath::parse(&args.key) {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(ConfigReply::refused(format!(
+                    "Error: {e}. The config was NOT modified."
+                )))
+            }
+        };
+
+        // Security-sensitive keys need the owner's approval, which the
+        // kernel asked for before this runs.
+        if Self::change_needs_approval(args) {
+            Self::require_kernel_approval(args)?;
+        }
+
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml_edit::DocumentMut = content.parse()?;
+        let new_value = (!unset).then(|| config_path::parse_value(&args.value));
+        let edited = match &new_value {
+            Some(value) => path.set(&mut doc, value.clone()),
+            None => path.unset(&mut doc),
+        };
+        if let Err(e) = edited {
+            return Ok(ConfigReply::refused(format!(
+                "Refused: {e}. The config was NOT modified."
+            )));
+        }
+        let new_content = doc.to_string();
+
+        if let Err(e) = Self::validate_config(&new_content) {
+            return Ok(ConfigReply::refused(format!(
+                "Refused to save: {}.\n\nThe config was NOT modified. Fix the value and try again.",
+                e
+            )));
+        }
+        if let Some(value) = &new_value {
+            if !path.ends_in_index() && !Self::config_reads(&doc, &path, value) {
+                return Ok(ConfigReply::refused(format!(
+                    "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
+                     The config was NOT modified. Check the key name with action 'read'."
+                )));
+            }
+        }
+
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+            // Continue anyway — better to fix config than refuse
+        }
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        set_owner_only_permissions(&self.config_path);
+
+        // What a reload will load: the file as it is on disk now.
+        let written = tokio::fs::read_to_string(&self.config_path).await?;
+        if let Err(e) = Self::validate_config(&written) {
+            return Ok(ConfigReply::refused(format!(
+                "config.toml was written but no longer loads ({e}). The change is not in effect; \
+                 use action 'restore' to bring back the backup."
+            )));
+        }
+        let on_disk: toml::Value = written.parse()?;
+        let found = path.lookup(&on_disk);
+        let apply_instruction = apply_instruction_for_key(&args.key);
+        match &new_value {
+            Some(value) => {
+                let expected = config_path::plain_value(value);
+                if found.is_none() || found != expected.as_ref() {
+                    return Ok(ConfigReply::refused(format!(
+                        "config.toml was written, but reading it back does not show `{path}` = {value}. \
+                         The change is not in effect."
+                    )));
+                }
+                let shown = if is_sensitive_key(&args.key) {
+                    format!("\"{REDACTED}\"")
+                } else {
+                    value.to_string()
+                };
+                Ok(ConfigReply::done(format!(
+                    "Updated {path} = {shown}\n\nBackup saved to config.toml.bak. Checked: the saved \
+                     config loads and holds the new value. {apply_instruction}"
+                )))
+            }
+            None => {
+                if found.is_some() {
+                    return Ok(ConfigReply::refused(format!(
+                        "config.toml was written, but `{path}` is still there. The change is not in effect."
+                    )));
+                }
+                Ok(ConfigReply::done(format!(
+                    "Removed {path}.\n\nBackup saved to config.toml.bak. Checked: the saved config \
+                     loads without it. {apply_instruction}"
+                )))
+            }
+        }
+    }
+
+    /// Whether the daemon's config reads the setting at `path`: the same
+    /// document with a value of the wrong shape there must fail to load. A
+    /// key the config ignores loads either way.
+    fn config_reads(
+        doc: &toml_edit::DocumentMut,
+        path: &ConfigPath,
+        value: &toml_edit::Value,
+    ) -> bool {
+        let mut probe = doc.clone();
+        if path
+            .set(&mut probe, config_path::probe_value(value))
+            .is_err()
+        {
+            return true;
+        }
+        Self::validate_config(&probe.to_string()).is_err()
+    }
+
+    /// A change needs the owner when it names a security-sensitive key, or
+    /// replaces a table or list entry that holds one.
+    fn change_needs_approval(args: &ConfigArgs) -> bool {
+        let Ok(path) = ConfigPath::parse(&args.key) else {
+            return Self::requires_approval(&args.key);
+        };
+        if let Some(key) = path.last_key() {
+            if APPROVAL_REQUIRED_KEYS.contains(&key) {
+                return true;
+            }
+        }
+        if args.action == "unset" {
+            return path.last_key().is_none();
+        }
+        plain_holds_approval_key(
+            config_path::plain_value(&config_path::parse_value(&args.value)).as_ref(),
+        )
+    }
+}
+
+fn plain_holds_approval_key(value: Option<&toml::Value>) -> bool {
+    match value {
+        Some(toml::Value::Table(table)) => table.iter().any(|(key, value)| {
+            APPROVAL_REQUIRED_KEYS.contains(&key.as_str()) || plain_holds_approval_key(Some(value))
+        }),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .any(|item| plain_holds_approval_key(Some(item))),
+        _ => false,
     }
 }
 
@@ -1791,36 +1947,6 @@ impl crate::traits::ToolSemantics for ConfigManagerTool {
     }
 }
 
-/// Navigate a TOML value by a dotted key path like "provider.models.primary".
-fn navigate_toml<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
-    let mut current = value;
-    for key in path.split('.') {
-        current = current.get(key)?;
-    }
-    Some(current)
-}
-
-/// Set a value in a TOML table at a dotted key path.
-fn set_toml_value(table: &mut toml::Table, path: &str, value: toml::Value) -> anyhow::Result<()> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
-        anyhow::bail!("Empty key path");
-    }
-
-    let mut current = table;
-    for &key in &parts[..parts.len() - 1] {
-        current = current
-            .entry(key)
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("'{}' is not a table", key))?;
-    }
-
-    let last_key = parts.last().unwrap();
-    current.insert(last_key.to_string(), value);
-    Ok(())
-}
-
 /// Remove a value from a TOML table at a dotted key path. Missing paths are ignored.
 #[cfg(test)]
 fn remove_toml_value(table: &mut toml::Table, path: &str) -> anyhow::Result<()> {
@@ -1845,17 +1971,51 @@ fn remove_toml_value(table: &mut toml::Table, path: &str) -> anyhow::Result<()> 
 
 /// Check if the last segment of a dotted key path is a sensitive key name.
 fn is_sensitive_key(path: &str) -> bool {
-    let last = path.rsplit('.').next().unwrap_or(path);
-    SENSITIVE_KEYS.contains(&last)
+    match ConfigPath::parse(path) {
+        Ok(path) => {
+            let keys: Vec<&str> = path
+                .segments()
+                .iter()
+                .filter_map(|segment| match segment {
+                    config_path::PathSegment::Key(key) => Some(key.as_str()),
+                    config_path::PathSegment::Index(_) => None,
+                })
+                .collect();
+            path.last_key().is_some_and(is_sensitive_name)
+                || (keys.len() >= 2
+                    && path.last_key().is_some()
+                    && SECRET_VALUE_MAPS.contains(&keys[keys.len() - 2]))
+        }
+        Err(_) => {
+            let last = path.rsplit('.').next().unwrap_or(path);
+            is_sensitive_name(last)
+        }
+    }
 }
+
+fn is_sensitive_name(key: &str) -> bool {
+    SENSITIVE_KEYS.contains(&key)
+}
+
+/// Tables whose every value can be a credential (request headers, a
+/// server's environment).
+const SECRET_VALUE_MAPS: &[&str] = &["extra_headers", "otlp_headers", "env"];
 
 /// Recursively walk a TOML value and replace sensitive keys with a redacted placeholder.
 fn redact_secrets(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
             for (key, val) in table.iter_mut() {
-                if SENSITIVE_KEYS.contains(&key.as_str()) {
+                if is_sensitive_name(key) {
                     *val = toml::Value::String(REDACTED.to_string());
+                } else if SECRET_VALUE_MAPS.contains(&key.as_str()) {
+                    if let toml::Value::Table(entries) = val {
+                        for (_, entry) in entries.iter_mut() {
+                            if entry.as_str() != Some("keychain") {
+                                *entry = toml::Value::String(REDACTED.to_string());
+                            }
+                        }
+                    }
                 } else {
                     redact_secrets(val);
                 }
@@ -1999,6 +2159,129 @@ default = "claude-sonnet-4-20250514"
                 "{no_card}"
             );
         }
+    }
+
+    const TWO_FALLBACKS: &str = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "first-key"
+
+[provider.fallbacks.models]
+default = "first-model"
+
+[[provider.fallbacks]]
+kind = "google_genai"
+api_key = "second-key"
+
+[provider.fallbacks.models]
+default = "old-model"
+fallback = ["old-a", "old-b"]
+"#;
+
+    #[tokio::test]
+    async fn a_list_position_edits_that_fallback_entry_and_is_checked_on_disk() {
+        let (_dir, path) = write_temp_config(TWO_FALLBACKS);
+        let tool = ConfigManagerTool::new(path.clone());
+        for (key, value) in [
+            ("provider.fallbacks[1].models.default", "new-model"),
+            ("provider.fallbacks.1.models.smart", "\"new-smart\""),
+            ("provider.fallbacks[1].models.fallback", "[\"new-a\"]"),
+        ] {
+            let args = json!({"action": "set", "key": key, "value": value}).to_string();
+            let outcome = tool
+                .execute(&args, &ToolCallContext::default())
+                .await
+                .unwrap();
+            assert!(outcome.output.contains("Checked"), "{}", outcome.output);
+            assert_eq!(
+                outcome.metadata.outcome_status,
+                Some(crate::traits::ToolOutcomeStatus::Succeeded)
+            );
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("fallbacks["), "{text}");
+        let config: AppConfig = toml::from_str(&text).unwrap();
+        let google = &config.provider.fallbacks[1].models;
+        assert_eq!(google.default_model, "new-model");
+        assert_eq!(google.smart, "new-smart");
+        assert_eq!(google.fallback_models, vec!["new-a".to_string()]);
+        assert_eq!(
+            config.provider.fallbacks[0].models.default_model,
+            "first-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn paths_the_config_does_not_have_or_read_are_refused_unchanged() {
+        let (_dir, path) = write_temp_config(TWO_FALLBACKS);
+        let tool = ConfigManagerTool::new(path.clone());
+        for (key, expect) in [
+            ("provider.fallbacks[2].models.default", "has 2 entries"),
+            (
+                "provider.fallbacks.models.default",
+                "is a list of 2 entries",
+            ),
+            ("provider.\"fallbacks[2]\".models", "is not a config key"),
+            ("provider.models.no_such_setting", "does not read a setting"),
+            ("no_such_section.value", "does not read a setting"),
+        ] {
+            let args = json!({"action": "set", "key": key, "value": "x"}).to_string();
+            let outcome = tool
+                .execute(&args, &ToolCallContext::default())
+                .await
+                .unwrap();
+            assert!(outcome.output.contains(expect), "{key}: {}", outcome.output);
+            assert!(
+                outcome.output.contains("NOT modified"),
+                "{}",
+                outcome.output
+            );
+            assert_eq!(
+                outcome.metadata.outcome_status,
+                Some(crate::traits::ToolOutcomeStatus::FailedPermanent)
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), TWO_FALLBACKS);
+        }
+    }
+
+    #[tokio::test]
+    async fn unset_removes_a_setting_and_read_is_a_typed_success() {
+        let (_dir, path) = write_temp_config(TWO_FALLBACKS);
+        let tool = ConfigManagerTool::new(path.clone());
+        let args =
+            json!({"action": "unset", "key": "provider.fallbacks[1].models.fallback"}).to_string();
+        let output = tool.call(&args).await.unwrap();
+        assert!(
+            output.starts_with("Removed provider.fallbacks[1].models.fallback"),
+            "{output}"
+        );
+        assert!(!fs::read_to_string(&path).unwrap().contains("old-a"));
+
+        let read = tool
+            .execute(r#"{"action":"read"}"#, &ToolCallContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            read.metadata.outcome_status,
+            Some(crate::traits::ToolOutcomeStatus::Succeeded)
+        );
+        assert!(read.output.contains("old-model"));
+        assert!(!read.output.contains("second-key"), "{}", read.output);
+        let get = tool
+            .call(r#"{"action":"get","key":"provider.fallbacks[1]"}"#)
+            .await
+            .unwrap();
+        assert!(
+            get.contains("old-model") && !get.contains("second-key"),
+            "{get}"
+        );
     }
 
     #[tokio::test]

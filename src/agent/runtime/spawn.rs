@@ -114,7 +114,17 @@ fn resolve_child_outcome(
 #[derive(Default)]
 pub(crate) struct RunningChildren {
     next: std::sync::atomic::AtomicU64,
-    entries: std::sync::Mutex<Vec<(u64, String, aidaemon_channels::ports::RunningChild)>>,
+    entries: std::sync::Mutex<Vec<ListedChild>>,
+}
+
+/// One running child as listed: its chat, its title and the task it was
+/// given (which tells siblings with the same title apart).
+struct ListedChild {
+    id: u64,
+    session_id: String,
+    title: String,
+    task: String,
+    started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// One running child's place in [`RunningChildren`], removed when dropped
@@ -125,37 +135,102 @@ pub(crate) struct RunningChildEntry {
 }
 
 impl RunningChildren {
-    pub(crate) fn enter(self: &Arc<Self>, session_id: &str, mission: &str) -> RunningChildEntry {
+    pub(crate) fn enter(
+        self: &Arc<Self>,
+        session_id: &str,
+        mission: &str,
+        task: &str,
+    ) -> RunningChildEntry {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((
+            .push(ListedChild {
                 id,
-                session_id.to_string(),
-                aidaemon_channels::ports::RunningChild {
-                    label: child_status_label(mission),
-                    started_at: chrono::Utc::now(),
-                },
-            ));
+                session_id: session_id.to_string(),
+                title: child_status_label(mission),
+                task: task.to_string(),
+                started_at: chrono::Utc::now(),
+            });
         RunningChildEntry {
             registry: self.clone(),
             id,
         }
     }
 
+    /// The chat's running children. Children sharing a title (two parallel
+    /// helpers given the same mission line) are told apart by the part of
+    /// their task that differs.
     pub(crate) fn for_session(
         &self,
         session_id: &str,
     ) -> Vec<aidaemon_channels::ports::RunningChild> {
-        self.entries
+        let entries = self
+            .entries
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let listed: Vec<&ListedChild> = entries
             .iter()
-            .filter(|(_, session, _)| session == session_id)
-            .map(|(_, _, child)| child.clone())
+            .filter(|child| child.session_id == session_id)
+            .collect();
+        listed
+            .iter()
+            .map(|child| {
+                let siblings: Vec<&str> = listed
+                    .iter()
+                    .filter(|other| other.id != child.id && other.title == child.title)
+                    .map(|other| other.task.as_str())
+                    .collect();
+                let label = match distinguishing_detail(&child.task, &siblings) {
+                    Some(detail) => format!("{} ({detail})", child.title),
+                    None => child.title.clone(),
+                };
+                aidaemon_channels::ports::RunningChild {
+                    label,
+                    started_at: child.started_at,
+                }
+            })
             .collect()
     }
+}
+
+/// The words of `task` that tell it apart from `siblings`, starting one
+/// word before the first difference; `None` with no siblings or no
+/// difference.
+fn distinguishing_detail(task: &str, siblings: &[&str]) -> Option<String> {
+    const WORDS: usize = 5;
+    const MAX_CHARS: usize = 50;
+    if siblings.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = task.split_whitespace().collect();
+    let shared = siblings
+        .iter()
+        .map(|other| {
+            words
+                .iter()
+                .zip(other.split_whitespace())
+                .take_while(|(a, b)| **a == *b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    if shared >= words.len() {
+        return None;
+    }
+    let start = shared.saturating_sub(1);
+    let end = (start + WORDS).min(words.len());
+    let mut detail = words[start..end].join(" ");
+    if detail.chars().count() > MAX_CHARS {
+        detail = detail.chars().take(MAX_CHARS - 1).collect::<String>();
+        detail = format!("{}…", detail.trim_end());
+    } else if end < words.len() {
+        detail.push('…');
+    }
+    if start > 0 {
+        detail.insert(0, '…');
+    }
+    Some(detail)
 }
 
 impl Drop for RunningChildEntry {
@@ -164,7 +239,7 @@ impl Drop for RunningChildEntry {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|(id, _, _)| *id != self.id);
+            .retain(|child| child.id != self.id);
     }
 }
 
@@ -2941,7 +3016,7 @@ impl Agent {
         // runs, waited on or in the background.
         let _listed = effective_approval_session_id
             .as_deref()
-            .map(|chat| self.running_children.enter(chat, mission));
+            .map(|chat| self.running_children.enter(chat, mission, task));
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
@@ -3550,6 +3625,39 @@ mod tests {
             ]
         );
         assert_eq!(passed_through, 1);
+    }
+
+    #[test]
+    fn running_siblings_with_one_title_are_told_apart_by_their_task() {
+        let registry = Arc::new(RunningChildren::default());
+        let mission = "Run one shell command and report its exact output.";
+        let _alpha = registry.enter(
+            "chat-1",
+            mission,
+            "Run this exact shell command: sleep 120 && echo alpha-test . Report the output.",
+        );
+        let _beta = registry.enter(
+            "chat-1",
+            mission,
+            "Run this exact shell command: sleep 120 && echo beta-test . Report the output.",
+        );
+        let _other_chat = registry.enter("chat-2", mission, "Run: date");
+        let labels: Vec<String> = registry
+            .for_session("chat-1")
+            .into_iter()
+            .map(|child| child.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                format!("{mission} (…echo alpha-test . Report the…)"),
+                format!("{mission} (…echo beta-test . Report the…)"),
+            ]
+        );
+        let alone = registry.for_session("chat-2");
+        assert_eq!(alone[0].label, mission);
+        drop(_beta);
+        assert_eq!(registry.for_session("chat-1")[0].label, mission);
     }
 
     #[test]
