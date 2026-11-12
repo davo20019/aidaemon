@@ -160,7 +160,7 @@ impl DiscordChannel {
             bot_token: bot_token.to_string(),
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids,
-            runner: TurnRunner::new(runtime.clone()),
+            runner: TurnRunner::new(runtime.turn_deps()),
             deps: runtime,
             prompts: Prompts::default(),
             transport: std::sync::RwLock::new(Arc::new(transport)),

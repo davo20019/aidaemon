@@ -654,7 +654,7 @@ pub(crate) async fn init_health_probe_manager(
 
     let health_manager = Arc::new(HealthProbeManager::new(
         store.clone(),
-        hub,
+        Arc::new(crate::health::HubAlerts(hub)),
         config.health.tick_interval_secs,
     ));
     health_manager

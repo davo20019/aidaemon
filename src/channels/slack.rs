@@ -16,7 +16,7 @@ use super::formatting::{
 use super::prompts::Prompts;
 use super::turns::{Turn, TurnRunner, TurnSurface};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
-use crate::runtime_ports::ChannelAgentRuntime;
+use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::{QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{ChannelCapabilities, HubChannel, StateStore};
@@ -317,7 +317,7 @@ pub struct SlackChannel {
     owner_user_ids: std::sync::RwLock<Vec<String>>,
     workspace_grants: std::sync::RwLock<Vec<WorkspaceGrant>>,
     use_threads: bool,
-    agent: Arc<dyn ChannelAgentRuntime>,
+    agent: Arc<dyn DaemonAgentRuntime>,
     config_path: PathBuf,
     task_registry: Arc<TaskRegistry>,
     files_enabled: bool,
@@ -386,7 +386,7 @@ impl SlackChannel {
     ) -> Self {
         let deps = runtime.clone();
         Self {
-            runner: TurnRunner::new(runtime.clone()),
+            runner: TurnRunner::new(runtime.turn_deps()),
             deps,
             api_base: SLACK_API.to_string(),
             transport: Arc::new(aidaemon_channel_slack::SlackChannel::new(

@@ -5,14 +5,11 @@ use tracing::warn;
 
 const DEFAULT_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-pub(crate) fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
+pub fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
     delay.max(Duration::from_secs(1)).min(max_delay)
 }
 
-pub(crate) fn retry_after_from_headers(
-    headers: &HeaderMap,
-    max_delay: Duration,
-) -> Option<Duration> {
+pub fn retry_after_from_headers(headers: &HeaderMap, max_delay: Duration) -> Option<Duration> {
     headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
@@ -20,7 +17,7 @@ pub(crate) fn retry_after_from_headers(
         .map(|secs| bounded_retry_after(Duration::from_secs(secs), max_delay))
 }
 
-pub(crate) async fn sleep_after_rate_limit(surface: &str, delay: Duration) {
+pub async fn sleep_after_rate_limit(surface: &str, delay: Duration) {
     warn!(
         surface,
         retry_after_secs = delay.as_secs(),
@@ -29,7 +26,7 @@ pub(crate) async fn sleep_after_rate_limit(surface: &str, delay: Duration) {
     tokio::time::sleep(delay).await;
 }
 
-pub(crate) fn default_retry_after_cap() -> Duration {
+pub fn default_retry_after_cap() -> Duration {
     DEFAULT_MAX_RETRY_AFTER
 }
 

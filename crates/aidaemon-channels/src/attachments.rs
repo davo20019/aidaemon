@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::traits::{AttachmentProvenance, MessageAttachment};
+use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
 
 pub use aidaemon_events::attachments::{
     new_resource_id, save_tool_observation_image, sha256_file, RESOURCE_ID_PREFIX,

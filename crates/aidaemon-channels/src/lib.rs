@@ -15,7 +15,9 @@
 
 #[cfg(feature = "conformance")]
 pub mod approval_conformance;
+pub mod approval_render;
 mod approvals;
+pub mod attachments;
 pub mod channel;
 pub mod commands;
 #[cfg(feature = "conformance")]
@@ -26,13 +28,24 @@ pub mod download;
 pub mod hub;
 mod inbound_files;
 pub mod latex;
+pub mod live_status;
 pub mod names;
+pub mod owner_wait;
 pub mod policy;
+pub mod ports;
+pub mod presentation;
+pub mod prompts;
+pub mod queue;
+#[cfg(feature = "http")]
+pub mod rate_limit;
 mod render;
 pub mod router;
 pub mod runner;
 pub mod session;
+pub mod slash;
 pub mod split;
+pub mod tasks;
+pub mod turns;
 
 #[cfg(feature = "testing")]
 pub mod testing;

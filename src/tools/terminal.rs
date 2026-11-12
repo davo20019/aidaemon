@@ -313,17 +313,7 @@ fn sum_subtree_resources(
     out
 }
 
-/// A request sent to the ChannelHub for command approval.
-pub struct ApprovalRequest {
-    pub command: String,
-    pub session_id: String,
-    pub risk_level: RiskLevel,
-    pub warnings: Vec<String>,
-    pub permission_mode: PermissionMode,
-    pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
-    /// What kind of approval this is (command vs goal confirmation).
-    pub kind: crate::types::ApprovalKind,
-}
+pub use aidaemon_channels::hub::ApprovalRequest;
 
 /// A background process being tracked after it exceeded the initial timeout.
 ///

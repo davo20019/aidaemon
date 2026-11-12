@@ -1044,3 +1044,34 @@ impl Channel for SlackChannel {
         }
     }
 }
+
+/// Check a bot token with `auth.test`; returns `(bot_name, team_name)`.
+pub async fn validate_tokens(
+    bot_token: &str,
+    _app_token: &str,
+) -> Result<(String, String), String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://slack.com/api/auth.test")
+        .header("Authorization", format!("Bearer {}", bot_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to validate Slack token: {}", e))?;
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Slack response: {}", e))?;
+
+    if json["ok"].as_bool() != Some(true) {
+        return Err(format!(
+            "Invalid Slack token: {}\n\nMake sure you have the correct bot token.",
+            json["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+
+    Ok((
+        json["user"].as_str().unwrap_or("unknown").to_string(),
+        json["team"].as_str().unwrap_or("unknown").to_string(),
+    ))
+}

@@ -8,15 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_channels::{
-    ApprovalChoice, ApprovalPrompt, Channel, Conversation, MessageRef, OutboundMessage,
-};
+use crate::{ApprovalChoice, ApprovalPrompt, Channel, Conversation, MessageRef, OutboundMessage};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{info, warn};
 
-use super::approval_render;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::types::{ApprovalResponse, GoalConfirmationStyle};
+use crate::approval_render;
+use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
+use aidaemon_tools::semantics::{ApprovalResponse, GoalConfirmationStyle};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const GOAL_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -36,7 +34,7 @@ struct Open {
 
 /// The prompts a channel has open, by id.
 #[derive(Default)]
-pub(crate) struct Prompts {
+pub struct Prompts {
     open: Arc<Mutex<HashMap<String, Open>>>,
 }
 
@@ -91,7 +89,7 @@ fn expired_text(kind: Kind, text: &str) -> String {
 }
 
 /// What answering a prompt changed.
-pub(crate) struct Answered {
+pub struct Answered {
     /// The message to replace, and its new text (without buttons).
     pub update: Option<(MessageRef, String)>,
     /// A short confirmation of the answer ("✅ Allowed this once").
@@ -104,7 +102,7 @@ impl Prompts {
     /// Ask to approve `command`; waits up to five minutes. A timeout, a
     /// failed send or a closed prompt is an error (and declines).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn approval(
+    pub async fn approval(
         &self,
         channel: Arc<dyn Channel>,
         conversation: &Conversation,
@@ -137,7 +135,7 @@ impl Prompts {
     }
 
     /// Ask to confirm a goal; waits up to thirty minutes. True to confirm.
-    pub(crate) async fn goal(
+    pub async fn goal(
         &self,
         channel: Arc<dyn Channel>,
         conversation: &Conversation,
@@ -233,13 +231,13 @@ impl Prompts {
     }
 
     /// Whether `prompt_id` is open (an answer to anything else is stale).
-    pub(crate) async fn is_open(&self, prompt_id: &str) -> bool {
+    pub async fn is_open(&self, prompt_id: &str) -> bool {
         self.open.lock().await.contains_key(prompt_id)
     }
 
     /// Answer prompt `prompt_id` with `choice_id`. `None` if the prompt is
     /// not open or the choice is not one of its own.
-    pub(crate) async fn answer(&self, prompt_id: &str, choice_id: &str) -> Option<Answered> {
+    pub async fn answer(&self, prompt_id: &str, choice_id: &str) -> Option<Answered> {
         let mut open = self.open.lock().await;
         let kind = open.get(prompt_id)?.kind;
         let response = response_for(kind, choice_id)?;
@@ -359,7 +357,7 @@ mod tests {
     /// whoever asked stops waiting and drops the request.
     #[tokio::test]
     async fn an_unanswered_card_expires() {
-        use aidaemon_channels::testing::{direct, TestChannel};
+        use crate::testing::{direct, TestChannel};
         for dropped in [false, true] {
             let channel = Arc::new(
                 TestChannel::new("synthetic")

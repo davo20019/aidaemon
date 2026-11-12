@@ -3,11 +3,16 @@
 
 pub use aidaemon_work::health::*;
 
+use std::sync::Arc;
+
 use crate::channels::ChannelHub;
 
+/// Delivers health alerts through the daemon's channel hub.
+pub struct HubAlerts(pub Arc<ChannelHub>);
+
 #[async_trait::async_trait]
-impl AlertDelivery for ChannelHub {
+impl AlertDelivery for HubAlerts {
     async fn broadcast_text(&self, session_ids: &[String], text: &str) {
-        ChannelHub::broadcast_text(self, session_ids, text).await;
+        self.0.broadcast_text(session_ids, text).await;
     }
 }

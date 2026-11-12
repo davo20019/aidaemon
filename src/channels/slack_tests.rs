@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::channels::mock_api::{MockApi, Recorded};
-use crate::runtime_ports::ChannelAgentRuntime;
+use crate::runtime_ports::DaemonAgentRuntime;
 use crate::testing::{setup_test_agent, MockProvider};
 
 const BOT: &str = "U0SYNTHBOT";
@@ -27,7 +27,7 @@ async fn channel(
     provider: MockProvider,
 ) -> (Arc<SlackChannel>, crate::testing::TestHarness) {
     let mut harness = setup_test_agent(provider).await.unwrap();
-    let agent: Arc<dyn ChannelAgentRuntime> = Arc::new(std::mem::replace(
+    let agent: Arc<dyn DaemonAgentRuntime> = Arc::new(std::mem::replace(
         &mut harness.agent,
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));

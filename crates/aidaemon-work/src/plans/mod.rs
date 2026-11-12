@@ -714,10 +714,8 @@ impl StepStatus {
 }
 
 /// Whether a card from [`TaskPlan::render_compact_checklist`] shows every
-/// step finished. Such a card is only progress: the reply covers the result.
-pub fn is_completed_checklist(rendered: &str) -> bool {
-    rendered.trim_start().starts_with('✅')
-}
+/// step finished (the channel's live status reads cards the same way).
+pub use aidaemon_channels::live_status::is_completed_checklist;
 
 /// The progress part of a rendered checklist's header (`step 2 of 5`,
 /// `5 of 5 steps`), for showing a sub-agent's plan as one line. `None` for a

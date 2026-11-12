@@ -14,10 +14,12 @@
 //! ```
 
 mod api;
+pub mod bot_api;
 mod callback;
 mod channel;
 pub mod format;
 mod mapping;
+mod plain;
 #[cfg(feature = "webhook")]
 mod webhook;
 

@@ -76,7 +76,7 @@ async fn channel(
     provider: MockProvider,
 ) -> (Arc<TelegramChannel>, crate::testing::TestHarness) {
     let mut harness = setup_test_agent(provider).await.unwrap();
-    let agent: Arc<dyn ChannelAgentRuntime> = Arc::new(std::mem::replace(
+    let agent: Arc<dyn DaemonAgentRuntime> = Arc::new(std::mem::replace(
         &mut harness.agent,
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));

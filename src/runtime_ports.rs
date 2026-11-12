@@ -12,11 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::events::TaskOutcome;
 use crate::traits::AgentRole;
-use crate::traits::MessageAttachment;
-use crate::types::{
-    ApprovalResponse, ChannelContext, MediaMessage, PermissionMode, RiskLevel, StatusUpdate,
-    UserRole,
-};
+use crate::types::{ChannelContext, StatusUpdate, UserRole};
 
 /// Result returned by a delegated child-agent run.
 #[derive(Debug)]
@@ -231,222 +227,18 @@ pub(crate) trait ConversationRuntime: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// Owned inbound turn delivered by a chat transport.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct InboundMessageTiming {
-    /// Timestamp assigned by the source platform, when available.
-    pub platform_message_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// First instant the daemon transport handler observed the message.
-    pub transport_received_at: chrono::DateTime<chrono::Utc>,
-    /// Instant the message entered a per-session queue, if it waited.
-    pub queue_entered_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Instant the transport handed the turn to the agent runtime.
-    pub agent_dispatched_at: chrono::DateTime<chrono::Utc>,
-}
+pub(crate) use aidaemon_channels::ports::{
+    AgentIngress, AgentResponseEnvelope, AssistantNoteSink, ChannelAgentRuntime,
+    InboundMessageRequest, InboundMessageTiming, OutboundRouter, SessionRouteLease,
+};
 
-impl InboundMessageTiming {
-    pub(crate) fn new(
-        platform_message_at: Option<chrono::DateTime<chrono::Utc>>,
-        transport_received_at: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
-        Self {
-            platform_message_at,
-            transport_received_at,
-            queue_entered_at: None,
-            agent_dispatched_at: transport_received_at,
-        }
-    }
-
-    pub(crate) fn mark_queued(&mut self, at: chrono::DateTime<chrono::Utc>) {
-        self.queue_entered_at = Some(at);
-    }
-
-    pub(crate) fn mark_dispatched_now(&mut self) {
-        self.agent_dispatched_at = chrono::Utc::now();
-    }
-}
-
-pub(crate) struct InboundMessageRequest {
-    pub session_id: String,
-    pub user_text: String,
-    pub attachments: Vec<MessageAttachment>,
-    pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    pub user_role: UserRole,
-    pub channel_ctx: ChannelContext,
-    pub heartbeat: Option<Arc<AtomicU64>>,
-    pub ingress_timing: Option<InboundMessageTiming>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AgentResponseEnvelope {
-    pub response_id: String,
-    pub task_id: String,
-    pub turn_id: Option<String>,
-    pub text: String,
-    pub referenced_receipts: Vec<crate::events::CompletionProofReference>,
-    pub disposition: crate::events::AssistantResponseDisposition,
-}
-
-impl AgentResponseEnvelope {
-    pub(crate) fn delivery(
-        &self,
-        platform: &str,
-        state: crate::events::ResponseDeliveryState,
-        platform_message_ids: Vec<String>,
-        error_code: Option<String>,
-    ) -> crate::events::ResponseDeliveryData {
-        debug_assert!(self
-            .referenced_receipts
-            .iter()
-            .all(|reference| !reference.receipt_id.trim().is_empty()));
-        crate::events::ResponseDeliveryData {
-            response_id: self.response_id.clone(),
-            task_id: self.task_id.clone(),
-            turn_id: self.turn_id.clone(),
-            platform: platform.to_string(),
-            state,
-            platform_message_ids,
-            error_code,
-            occurred_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
-}
-
-/// The only agent capability chat transports need.
+/// The daemon's additions to [`ChannelAgentRuntime`]: what its own chat
+/// glue (Slack project grants, `/reload`) needs from the agent.
 #[async_trait]
-pub(crate) trait AgentIngress: Send + Sync {
-    async fn handle_inbound_message(
-        &self,
-        request: InboundMessageRequest,
-    ) -> anyhow::Result<AgentResponseEnvelope>;
-
-    async fn record_response_delivery(
-        &self,
-        _session_id: &str,
-        _delivery: crate::events::ResponseDeliveryData,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// Agent administration surface used by shared channel commands.
-#[async_trait]
-pub(crate) trait ChannelAgentRuntime: AgentIngress {
+pub(crate) trait DaemonAgentRuntime: ChannelAgentRuntime {
     /// Whether the file tools must not write `path` on this daemon.
     fn is_sensitive_path(&self, path: &std::path::Path) -> bool;
     /// The daemon's execution environment.
     fn execution_backend(&self) -> crate::execution::SharedExecutionBackend;
-    async fn terminalize_supervised_task(
-        &self,
-        session_id: &str,
-        status: crate::events::TaskStatus,
-        error: String,
-    ) -> anyhow::Result<Option<String>>;
-    async fn cancel_active_finite_work_for_session(&self, session_id: &str) -> Vec<String>;
-    async fn current_model(&self) -> String;
-    async fn context_debug_settings(
-        &self,
-        session_id: &str,
-        model: &str,
-    ) -> (bool, usize, usize, usize, Option<i64>);
-    async fn set_model(&self, model: String);
-    async fn list_models(&self) -> anyhow::Result<Vec<String>>;
-    async fn clear_model_override(&self);
     async fn reload_provider(&self, config: &crate::config::AppConfig) -> anyhow::Result<String>;
-    async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()>;
-    async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
-}
-
-/// Persistence hook used by outbound delivery without depending on `Agent`.
-#[async_trait]
-pub(crate) trait AssistantNoteSink: Send + Sync {
-    async fn record_assistant_note(&self, session_id: &str, note: &str) -> anyhow::Result<()>;
-}
-
-/// Outbound operations shared by the agent runtime, tools, and heartbeat.
-#[async_trait]
-pub(crate) trait OutboundRouter: Send + Sync {
-    async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
-    async fn send_text_tracked(
-        &self,
-        session_id: &str,
-        text: &str,
-    ) -> anyhow::Result<Option<String>>;
-    async fn edit_text(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<bool>;
-    async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
-    async fn send_media_strict(&self, session_id: &str, media: &MediaMessage)
-        -> anyhow::Result<()>;
-    async fn background_status_surface(&self, session_id: &str) -> Option<String>;
-    async fn take_background_status_surface(&self, session_id: &str) -> Option<String>;
-    /// Delete a message this daemon sent. `Ok(false)` when the channel
-    /// cannot delete it; the default suits routers that never can.
-    async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-    /// The plan card a turn left in the session's chat, if the channel keeps
-    /// one; the default suits routers without plan cards.
-    async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
-        None
-    }
-    /// Record a plan card sent outside a turn (see [`Self::checklist_surface`]).
-    async fn register_checklist_surface(&self, _session_id: &str, _message_id: &str) {}
-    async fn request_inline_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-        risk_level: RiskLevel,
-        warnings: &[String],
-        permission_mode: PermissionMode,
-    ) -> anyhow::Result<ApprovalResponse>;
-    async fn register_session_route(&self, child_session: &str, parent_session: &str) -> bool;
-    async fn unregister_session_route(&self, child_session: &str, parent_session: &str);
-}
-
-/// Cancellation-safe route lifetime that is independent of the concrete hub.
-pub(crate) struct SessionRouteLease {
-    router: Weak<dyn OutboundRouter>,
-    child_session: String,
-    parent_session: String,
-}
-
-impl SessionRouteLease {
-    pub async fn register(
-        router: &Arc<dyn OutboundRouter>,
-        child_session: &str,
-        parent_session: &str,
-    ) -> Option<Self> {
-        if !router
-            .register_session_route(child_session, parent_session)
-            .await
-        {
-            return None;
-        }
-        Some(Self {
-            router: Arc::downgrade(router),
-            child_session: child_session.to_string(),
-            parent_session: parent_session.to_string(),
-        })
-    }
-}
-
-impl Drop for SessionRouteLease {
-    fn drop(&mut self) {
-        let Some(router) = self.router.upgrade() else {
-            return;
-        };
-        let child_session = self.child_session.clone();
-        let parent_session = self.parent_session.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                router
-                    .unregister_session_route(&child_session, &parent_session)
-                    .await;
-            });
-        }
-    }
 }

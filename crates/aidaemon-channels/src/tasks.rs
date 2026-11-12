@@ -1,3 +1,7 @@
+//! Each session's chat operations: the running turn (cancel token,
+//! heartbeat), messages queued behind it, steering messages taken mid-turn
+//! and duplicate suppression. Internal to aidaemon, no stability promise.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,8 +10,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::MessageAttachment;
-use crate::types::{ChannelContext, UserRole};
+use aidaemon_events::conversation::MessageAttachment;
+use aidaemon_tools::semantics::UserRole;
+
+use crate::context::ChannelContext;
 
 /// Window in seconds during which identical messages to the same session
 /// are treated as duplicates, even after the original was popped from the queue.
@@ -38,7 +44,7 @@ pub struct QueuedMessage {
     pub queued_at: DateTime<Utc>,
     /// Optional transport timing follows the exact message through queue
     /// coalescing and later agent dispatch.
-    pub ingress_timing: Option<crate::runtime_ports::InboundMessageTiming>,
+    pub ingress_timing: Option<crate::ports::InboundMessageTiming>,
 }
 
 impl QueuedMessage {
@@ -58,10 +64,7 @@ impl QueuedMessage {
         }
     }
 
-    pub fn with_ingress_timing(
-        mut self,
-        mut timing: crate::runtime_ports::InboundMessageTiming,
-    ) -> Self {
+    pub fn with_ingress_timing(mut self, mut timing: crate::ports::InboundMessageTiming) -> Self {
         timing.mark_queued(self.queued_at);
         self.ingress_timing = Some(timing);
         self

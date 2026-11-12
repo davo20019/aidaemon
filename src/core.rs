@@ -367,7 +367,7 @@ pub async fn run(
     agent.set_task_registry(task_registry.clone());
 
     // 11. Channels
-    let channel_agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime> = agent.clone();
+    let channel_agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime> = agent.clone();
     let channel_bundle = startup_channels::build_channels(
         &config,
         crate::channels::ChannelRuntimeDeps {
