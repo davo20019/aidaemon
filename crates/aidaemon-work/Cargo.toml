@@ -30,8 +30,8 @@ aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
 anyhow = "1"
-async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"], optional = true }
-async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"], optional = true }
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"], optional = true }
+async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"], optional = true }
 async-trait = "0.1"
 croner = "4"
 futures = { version = "0.3", optional = true }

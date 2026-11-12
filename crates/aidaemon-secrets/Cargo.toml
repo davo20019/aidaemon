@@ -26,16 +26,10 @@ keychain = ["dep:keyring"]
 anyhow = "1"
 dotenvy = "0.15"
 
-# keyring v4 dropped feature flags and moved `Entry` to `keyring-core`; staying
-# on v3 until that migration is scoped separately.
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"], optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"], optional = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", features = ["windows-native"], optional = true }
+# keyring 4 (`v1` feature, the default): Keychain on macOS, Credential
+# Manager on Windows, the Secret Service on other unix. It finds entries
+# saved by keyring 3 (same service and account).
+keyring = { version = "4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

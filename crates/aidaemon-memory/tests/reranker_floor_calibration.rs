@@ -150,9 +150,9 @@ fn model_cache() -> PathBuf {
 #[ignore = "loads the local reranker model"]
 fn reranker_floor_calibration() {
     let options =
-        fastembed::RerankInitOptions::new(fastembed::RerankerModel::JINARerankerV2BaseMultiligual)
+        fastembed::RerankInitOptions::new(fastembed::RerankerModel::JINARerankerV2BaseMultilingual)
             .with_cache_dir(model_cache());
-    let model = fastembed::TextRerank::try_new(options).unwrap();
+    let mut model = fastembed::TextRerank::try_new(options).unwrap();
     let docs: Vec<String> = CORPUS
         .iter()
         .map(|(c, k, v)| build_fact_embedding_text(c, k, v))

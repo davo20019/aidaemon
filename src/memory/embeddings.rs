@@ -1,5 +1,5 @@
 #[cfg(not(test))]
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
@@ -21,7 +21,7 @@ type SharedReranker = Arc<Mutex<TextRerank>>;
 /// Cross-encoder reranker for the explicit memory-search path. A multilingual
 /// model so it handles the user's mixed EN/ES facts. Loaded lazily (and only if
 /// reranking is actually used) since it is a sizeable extra download.
-const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV2BaseMultiligual;
+const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV2BaseMultilingual;
 
 #[derive(Clone)]
 pub struct EmbeddingService {
@@ -48,7 +48,7 @@ impl EmbeddingService {
             .model
             .get_or_try_init(|| async {
                 task::spawn_blocking(|| {
-                    let mut options = InitOptions::default();
+                    let mut options = TextInitOptions::default();
                     options.model_name = EmbeddingModel::AllMiniLML6V2;
                     options.show_download_progress = true;
                     let model = TextEmbedding::try_new(options)?;
@@ -72,7 +72,7 @@ impl EmbeddingService {
         {
             let model = self.get_model().await?;
             task::spawn_blocking(move || {
-                let guard = model
+                let mut guard = model
                     .lock()
                     .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
                 let embeddings = guard.embed(vec![text], None)?;
@@ -95,10 +95,10 @@ impl EmbeddingService {
         {
             let model = self.get_model().await?;
             task::spawn_blocking(move || {
-                let guard = model
+                let mut guard = model
                     .lock()
                     .map_err(|e| anyhow::anyhow!("embedding model mutex poisoned: {e}"))?;
-                guard.embed(texts, None)
+                Ok(guard.embed(texts, None)?)
             })
             .await?
         }
@@ -143,7 +143,7 @@ impl EmbeddingService {
         }
         let reranker = self.get_reranker().await?;
         task::spawn_blocking(move || {
-            let guard = reranker
+            let mut guard = reranker
                 .lock()
                 .map_err(|e| anyhow::anyhow!("reranker model mutex poisoned: {e}"))?;
             let results = guard.rerank(query, documents, false, None)?;

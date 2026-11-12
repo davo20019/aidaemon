@@ -255,7 +255,7 @@ async fn memory() -> (tempfile::TempDir, SqliteMemory) {
     let mut memory = SqliteMemory::new(pool, Arc::new(embedder));
     if std::env::var("AIDAEMON_EVAL_RERANK").is_ok_and(|v| v == "1") {
         let options = fastembed::RerankInitOptions::new(
-            fastembed::RerankerModel::JINARerankerV2BaseMultiligual,
+            fastembed::RerankerModel::JINARerankerV2BaseMultilingual,
         )
         .with_cache_dir(model_cache());
         let model = fastembed::TextRerank::try_new(options).unwrap();

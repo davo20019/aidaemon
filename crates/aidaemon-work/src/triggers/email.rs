@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::imap_proto::types::Envelope;
+use async_imap::imap_proto::Envelope;
 use async_native_tls::TlsConnector;
 use futures::TryStreamExt;
 use tokio::net::TcpStream;
