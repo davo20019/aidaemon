@@ -1,3 +1,6 @@
+//! After a run: what it teaches memory, whether it stalled and why, and the
+//! user-facing words for a run that ran out of budget.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -5,36 +8,36 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::events::TaskOutcome;
+use aidaemon_events::TaskOutcome;
 
-use super::{semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
+use crate::turn::loop_utils::{semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
 
 #[derive(Clone)]
-pub(crate) struct LearningContext {
-    pub(super) user_text: String,
+pub struct LearningContext {
+    pub user_text: String,
     /// False when the task's compiled capability policy suppresses all
     /// automatic memory persistence. Canonical task/event telemetry is still
     /// recorded; only learned procedures, expertise, and failure patterns are
     /// skipped.
-    pub(super) memory_persistence_allowed: bool,
-    pub(super) intent_domains: Vec<String>,
-    pub(super) tool_calls: Vec<String>,     // "tool_name(summary)"
-    pub(super) errors: Vec<(String, bool)>, // (error_text, was_recovered)
-    pub(super) first_error: Option<String>,
-    pub(super) recovery_actions: Vec<String>,
+    pub memory_persistence_allowed: bool,
+    pub intent_domains: Vec<String>,
+    pub tool_calls: Vec<String>,     // "tool_name(summary)"
+    pub errors: Vec<(String, bool)>, // (error_text, was_recovered)
+    pub first_error: Option<String>,
+    pub recovery_actions: Vec<String>,
     #[allow(dead_code)] // Reserved for duration-based learning
-    pub(super) start_time: chrono::DateTime<Utc>,
-    pub(super) completed_naturally: bool,
-    pub(super) explicit_positive_signals: u32,
-    pub(super) explicit_negative_signals: u32,
+    pub start_time: chrono::DateTime<Utc>,
+    pub completed_naturally: bool,
+    pub explicit_positive_signals: u32,
+    pub explicit_negative_signals: u32,
     /// Semantic outcome emitted at task end; authoritative for learning when set.
-    pub(super) task_outcome: Option<TaskOutcome>,
+    pub task_outcome: Option<TaskOutcome>,
 }
 
 impl LearningContext {
     /// What the full memory system learns from: this run, with the first
     /// error stripped of the daemon's scaffolding lines.
-    pub(crate) fn into_run_learning(self) -> aidaemon_memory::full::writer::RunLearning {
+    pub fn into_run_learning(self) -> aidaemon_memory::full::writer::RunLearning {
         aidaemon_memory::full::writer::RunLearning {
             user_text: self.user_text,
             persistence_allowed: self.memory_persistence_allowed,
@@ -44,7 +47,7 @@ impl LearningContext {
             first_error: self.first_error.map(|error| {
                 error
                     .lines()
-                    .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
+                    .filter(|line| !crate::message_content::is_internal_scaffolding_line(line))
                     .collect::<Vec<_>>()
                     .join("\n")
             }),
@@ -58,7 +61,7 @@ impl LearningContext {
 }
 
 /// Process learning from a completed task - runs in background.
-pub(super) async fn process_learning(
+pub async fn process_learning(
     state: &Arc<dyn aidaemon_memory::stores::MemoryStores>,
     ctx: LearningContext,
 ) -> anyhow::Result<()> {
@@ -66,7 +69,7 @@ pub(super) async fn process_learning(
 }
 
 /// Classify the stall cause from recent errors for actionable guidance.
-pub(super) fn classify_stall(
+pub fn classify_stall(
     learning_ctx: &LearningContext,
     deferred_no_tool_error_marker: &str,
     tool_failure_count: &HashMap<String, usize>,
@@ -195,10 +198,7 @@ fn looks_like_provider_server_error(recent_errors: &str) -> bool {
 }
 
 /// Graceful response when task token budget is exhausted.
-pub(super) fn graceful_budget_response(
-    learning_ctx: &LearningContext,
-    _tokens_used: u64,
-) -> String {
+pub fn graceful_budget_response(learning_ctx: &LearningContext, _tokens_used: u64) -> String {
     let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let mut summary = format!(
         "I've reached my processing limit for this task. \
@@ -219,7 +219,7 @@ pub(super) fn graceful_budget_response(
 }
 
 /// Graceful response when a scheduled run hits its per-run budget.
-pub(super) fn graceful_scheduled_run_budget_response(
+pub fn graceful_scheduled_run_budget_response(
     learning_ctx: &LearningContext,
     tokens_used: i64,
     budget_per_check: i64,
@@ -245,7 +245,7 @@ pub(super) fn graceful_scheduled_run_budget_response(
 }
 
 /// Graceful response when a goal hits its daily token budget.
-pub(super) fn graceful_goal_daily_budget_response(
+pub fn graceful_goal_daily_budget_response(
     learning_ctx: &LearningContext,
     tokens_used_today: i64,
     budget_daily: i64,
@@ -298,7 +298,7 @@ pub(super) fn graceful_goal_daily_budget_response(
 ///    → not productive
 /// 3. Error rate: unrecovered errors * 2 < max(1, total_successful)
 /// 4. Minimum 3 successful tool calls
-pub(super) fn is_productive(
+pub fn is_productive(
     learning_ctx: &LearningContext,
     stall_count: usize,
     consecutive_same_tool_count: usize,
@@ -376,7 +376,7 @@ fn abbreviate_absolute_path(path: &str) -> String {
     format!("[path:.../{}]{}", tail, suffix)
 }
 
-pub(in crate::agent) fn redact_error_line_for_summary(key_line: &str) -> String {
+pub fn redact_error_line_for_summary(key_line: &str) -> String {
     let unix_summarized = ABS_UNIX_PATH_RE
         .replace_all(key_line, |caps: &regex::Captures<'_>| {
             abbreviate_absolute_path(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
@@ -387,7 +387,7 @@ pub(in crate::agent) fn redact_error_line_for_summary(key_line: &str) -> String 
             abbreviate_absolute_path(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
         })
         .to_string();
-    crate::tools::sanitize::redact_secrets(&windows_summarized)
+    aidaemon_tools::sanitize::redact_secrets(&windows_summarized)
 }
 
 /// User-facing message shown when a tool's work is moved to the background
@@ -400,7 +400,7 @@ pub(in crate::agent) fn redact_error_line_for_summary(key_line: &str) -> String 
 /// `user_request` is the user's original message. The gist line is omitted
 /// when it is empty or itself an internal/synthetic re-engagement prompt
 /// (so we never echo `[Background command …]` machinery back to the user).
-pub(in crate::agent) fn build_friendly_background_handoff(user_request: &str) -> String {
+pub fn build_friendly_background_handoff(user_request: &str) -> String {
     let mut msg = String::from(
         "⏳ **Still on it**\n\nThis is taking a little longer, so it's running in the \
          background now. I'll send the result as soon as it's ready.",
@@ -425,7 +425,7 @@ fn friendly_request_gist(user_request: &str) -> Option<String> {
     if first_line.is_empty() {
         return None;
     }
-    Some(crate::utils::truncate_str(first_line, 140))
+    Some(aidaemon_events::text::truncate_str(first_line, 140))
 }
 
 ///
@@ -434,13 +434,13 @@ fn friendly_request_gist(user_request: &str) -> Option<String> {
 ///
 /// Recap for internal/LLM context — keeps raw command text so the model can see
 /// exactly what already ran (helps avoid re-running the same command).
-pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
+pub fn categorize_tool_calls(tool_calls: &[String]) -> String {
     categorize_tool_calls_inner(tool_calls, false)
 }
 
 /// Recap for user-facing replies — redacts raw shell commands to a count so they
 /// never reach chat, while keeping file / search / source detail.
-pub(in crate::agent) fn categorize_tool_calls_user_facing(tool_calls: &[String]) -> String {
+pub fn categorize_tool_calls_user_facing(tool_calls: &[String]) -> String {
     categorize_tool_calls_inner(tool_calls, true)
 }
 
@@ -952,22 +952,22 @@ mod tests {
             completed_naturally: true,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
-            task_outcome: Some(crate::events::TaskOutcome::Partial),
+            task_outcome: Some(aidaemon_events::TaskOutcome::Partial),
         };
-        assert!(!crate::events::TaskOutcome::Partial.task_success());
+        assert!(!aidaemon_events::TaskOutcome::Partial.task_success());
 
         let failed_ctx = LearningContext {
-            task_outcome: Some(crate::events::TaskOutcome::Failed),
+            task_outcome: Some(aidaemon_events::TaskOutcome::Failed),
             ..partial_ctx.clone()
         };
-        assert!(!crate::events::TaskOutcome::Failed.task_success());
+        assert!(!aidaemon_events::TaskOutcome::Failed.task_success());
         assert!(!failed_ctx.task_outcome.unwrap().task_success());
 
         let succeeded_ctx = LearningContext {
-            task_outcome: Some(crate::events::TaskOutcome::Succeeded),
+            task_outcome: Some(aidaemon_events::TaskOutcome::Succeeded),
             ..partial_ctx
         };
-        assert!(crate::events::TaskOutcome::Succeeded.task_success());
+        assert!(aidaemon_events::TaskOutcome::Succeeded.task_success());
         assert!(succeeded_ctx.task_outcome.unwrap().task_success());
     }
 }

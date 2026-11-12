@@ -1,4 +1,7 @@
-use super::*;
+//! Replies built from tool output when the model has nothing better: what a
+//! tool output may stand in for, and what must be synthesized first.
+
+use crate::turn::post_task;
 
 fn tool_output_completion_prefix(tool_name: &str, artifact_delivered: bool) -> &'static str {
     if artifact_delivered {
@@ -15,7 +18,7 @@ fn tool_output_completion_prefix(tool_name: &str, artifact_delivered: bool) -> &
     }
 }
 
-pub(super) fn build_tool_output_completion_reply(
+pub fn build_tool_output_completion_reply(
     tool_name: &str,
     tool_output: &str,
     artifact_delivered: bool,
@@ -30,7 +33,7 @@ pub(super) fn build_tool_output_completion_reply(
     // Strip the untrusted-data wrapper tags before embedding: a reply that
     // carries the raw markers gets its whole block gutted by the user-facing
     // sanitizer downstream, shipping a dangling "Here's the result:" stub.
-    let stripped = crate::tools::sanitize::strip_internal_control_markers(tool_output);
+    let stripped = aidaemon_tools::sanitize::strip_internal_control_markers(tool_output);
     let trimmed = stripped.trim();
     // Don't use trivially uninformative tool outputs as completion replies.
     // These produce confusing messages like "Here is the latest tool output: (no output)".
@@ -45,8 +48,8 @@ pub(super) fn build_tool_output_completion_reply(
 /// when the response provider is unavailable or finalization exhausts its
 /// bounded pass: persisted receipt truth must be visible, and a present but
 /// unsatisfied receipt must never be described as missing.
-pub(super) fn build_receipt_closeout_reply(
-    result: &crate::events::ToolResultData,
+pub fn build_receipt_closeout_reply(
+    result: &aidaemon_events::ToolResultData,
     contract_fulfilled: bool,
 ) -> String {
     let status = result.outcome_status().as_str();
@@ -104,7 +107,7 @@ pub(super) fn build_receipt_closeout_reply(
             let output = result.result.trim();
             (!output.is_empty()).then_some(output)
         })
-        .map(|detail| crate::utils::truncate_str(detail.trim(), 240).to_string())
+        .map(|detail| aidaemon_events::text::truncate_str(detail.trim(), 240).to_string())
         .filter(|detail| !detail.is_empty())
         .map(|detail| format!(" Detail: {detail}."))
         .unwrap_or_default();
@@ -115,7 +118,7 @@ pub(super) fn build_receipt_closeout_reply(
 }
 
 fn cleaned_structured_tool_output(tool_output: &str) -> String {
-    crate::tools::sanitize::strip_internal_control_markers(tool_output)
+    aidaemon_tools::sanitize::strip_internal_control_markers(tool_output)
 }
 
 /// Extract a complete JSON value from a mixed tool result such as:
@@ -164,7 +167,7 @@ fn send_file_completion_reply() -> &'static str {
 /// Strip the `[UNTRUSTED EXTERNAL DATA ...]...[END UNTRUSTED EXTERNAL DATA]`
 /// wrapper that the tool execution framework adds to tool results. The raw content
 /// is needed for trivial-output detection, since the wrapper obscures the actual output.
-pub(in crate::agent) fn strip_untrusted_wrapper(s: &str) -> &str {
+pub fn strip_untrusted_wrapper(s: &str) -> &str {
     let trimmed = s.trim();
     if !trimmed.starts_with("[UNTRUSTED EXTERNAL DATA") {
         return trimmed;
@@ -184,7 +187,7 @@ pub(in crate::agent) fn strip_untrusted_wrapper(s: &str) -> &str {
     content.trim()
 }
 
-pub(super) fn is_trivial_tool_output(s: &str) -> bool {
+pub fn is_trivial_tool_output(s: &str) -> bool {
     let unwrapped = strip_untrusted_wrapper(s);
     let lower = unwrapped.to_ascii_lowercase();
     lower.is_empty()
@@ -231,7 +234,7 @@ fn looks_like_directory_listing(lower: &str) -> bool {
     perm_lines >= 2
 }
 
-pub(super) fn tool_output_requires_final_synthesis(tool_name: &str, tool_output: &str) -> bool {
+pub fn tool_output_requires_final_synthesis(tool_name: &str, tool_output: &str) -> bool {
     if tool_output.trim().is_empty() {
         return false;
     }
@@ -243,7 +246,7 @@ pub(super) fn tool_output_requires_final_synthesis(tool_name: &str, tool_output:
     // Sniff the CONTENT, not the transport: the untrusted-data wrapper starts
     // with '[', which the bracket check mistook for JSON — routing every
     // wrapped tool output into the structured-synthesis path.
-    let body = crate::tools::sanitize::strip_internal_control_markers(tool_output);
+    let body = aidaemon_tools::sanitize::strip_internal_control_markers(tool_output);
     let trimmed = body.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return true;
@@ -256,7 +259,7 @@ pub(super) fn tool_output_requires_final_synthesis(tool_name: &str, tool_output:
             || structured_json_value(trimmed).is_some())
 }
 
-pub(super) fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
+pub fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
     let calls: Vec<String> = tool_calls.iter().map(|call| (*call).to_string()).collect();
     let summary = post_task::categorize_tool_calls_user_facing(&calls);
     if !summary.trim().is_empty() {

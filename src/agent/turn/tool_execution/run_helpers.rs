@@ -6,35 +6,13 @@
 
 use crate::agent::*;
 use crate::traits::{
-    RequestEvidenceRequirement, RequestVerificationTargetKind, ToolCallSemantics,
-    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
+    RequestEvidenceRequirement, RequestVerificationTargetKind, ToolCallSemantics, ToolTargetHint,
+    ToolTargetHintKind,
 };
 use crate::utils::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
 const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
-
-pub(in crate::agent) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
-    if let Some(facts) = crate::agent::memory_plugin::memory_tool_facts(tool_name) {
-        return facts.scope;
-    }
-    match tool_name {
-        "web_search" | "web_fetch" | "http_request" | "browser" => {
-            Some(ToolSemanticScope::ExternalRemote)
-        }
-        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
-        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
-        "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
-        "scheduled_goals"
-        | "scheduled_goal_runs"
-        | "manage_goal_tasks"
-        | "goal_trace"
-        | "tool_trace"
-        | "manage_mandates" => Some(ToolSemanticScope::GoalState),
-        "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
-        _ => None,
-    }
-}
 
 /// Return the typed write capabilities available for a mutation call when
 /// the semantic manifest did not include a separate write target list.

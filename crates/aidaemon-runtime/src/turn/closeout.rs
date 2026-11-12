@@ -9,11 +9,11 @@
 //! loop for more work only when a tool admissible under Authority could
 //! satisfy them. Nothing here reads request wording.
 
-use crate::events::RunObligation;
-use crate::traits::ToolSemanticScope;
+use aidaemon_events::traits::ToolSemanticScope;
+use aidaemon_events::RunObligation;
 
 /// Static authority view used to test whether a tool may still be invoked.
-pub(in crate::agent) struct ClosingAuthority<'a> {
+pub struct ClosingAuthority<'a> {
     pub forbids_tool_use: bool,
     pub forbids_mutation: bool,
     pub allowed_tool_names: &'a [String],
@@ -25,7 +25,7 @@ impl ClosingAuthority<'static> {
     /// The turn's resolved authority: read-only forbids mutation, an empty
     /// tool set forbids tool use. Offered tools were already filtered to the
     /// authority's tool set, so no allowlist or scope applies here.
-    pub(in crate::agent) fn from_resolved(authority: &aidaemon_core::Authority) -> Self {
+    pub fn from_resolved(authority: &aidaemon_core::Authority) -> Self {
         Self {
             forbids_tool_use: authority
                 .tools
@@ -43,7 +43,7 @@ impl ClosingAuthority<'static> {
     /// reachable). Demand-only, never a refusal: this view decides what the
     /// loop may ask for, and the tools stay callable; the kernel's
     /// `AuthorityHook` is the only thing that refuses a call.
-    pub(in crate::agent) fn without_tool_demands(mut self, request_forbids_tools: bool) -> Self {
+    pub fn without_tool_demands(mut self, request_forbids_tools: bool) -> Self {
         self.forbids_tool_use |= request_forbids_tools;
         self
     }
@@ -53,7 +53,7 @@ impl<'a> ClosingAuthority<'a> {
     /// The tool is admitted only because the runtime kept it as an owner
     /// control-plane tool; the caller must also check the exact call
     /// (`ToolSemantics::owner_control_plane_call`).
-    pub(in crate::agent) fn admits_only_as_control_plane(&self, tool: &str) -> bool {
+    pub fn admits_only_as_control_plane(&self, tool: &str) -> bool {
         !self.allowed_tool_names.is_empty()
             && !self.allowed_tool_names.iter().any(|name| name == tool)
             && self
@@ -66,17 +66,13 @@ impl<'a> ClosingAuthority<'a> {
     /// registered tool's declared capability (None for unknown tools, which
     /// stay admissible so a custom tool is never declared unavailable
     /// prematurely).
-    pub(in crate::agent) fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
+    pub fn admits_tool(&self, tool: &str, read_only: Option<bool>) -> bool {
         self.refusal_reason(tool, read_only).is_none()
     }
 
     /// The first check that refuses `tool`, in evaluation order, or `None`
     /// when Authority admits it.
-    pub(in crate::agent) fn refusal_reason(
-        &self,
-        tool: &str,
-        read_only: Option<bool>,
-    ) -> Option<&'static str> {
+    pub fn refusal_reason(&self, tool: &str, read_only: Option<bool>) -> Option<&'static str> {
         if self.forbids_tool_use {
             return Some("forbids_tool_use");
         }
@@ -92,7 +88,7 @@ impl<'a> ClosingAuthority<'a> {
         // even when a scope-level prohibition would otherwise cover it (the
         // same rule as an exact write path beating a directory root).
         if !explicitly_allowed {
-            if let Some(scope) = crate::agent::tool_execution::fallback_tool_semantic_scope(tool) {
+            if let Some(scope) = crate::turn::tool_facts::fallback_tool_semantic_scope(tool) {
                 if self.forbidden_tool_scopes.contains(&scope) {
                     return Some("forbidden_scope");
                 }
@@ -107,7 +103,7 @@ impl<'a> ClosingAuthority<'a> {
 
 /// Whether some visible tool admissible under `authority` could still
 /// satisfy `obligation`.
-pub(in crate::agent) fn obligation_admissible(
+pub fn obligation_admissible(
     obligation: &RunObligation,
     authority: &ClosingAuthority<'_>,
     visible_tools: &[&str],
@@ -126,7 +122,7 @@ pub(in crate::agent) fn obligation_admissible(
         // Candidate routing is ranked and capped for model guidance. Apply
         // authority first so unavailable candidates cannot crowd out an
         // admissible route or suppress the custom-tool fallback below.
-        let candidates = crate::agent::inquiry::candidate_tools_for_requirements(
+        let candidates = crate::turn::inquiry::candidate_tools_for_requirements(
             std::slice::from_ref(requirement),
             visible_tools.iter().copied().filter(|tool| admits(tool)),
         );
@@ -137,7 +133,7 @@ pub(in crate::agent) fn obligation_admissible(
         // possible candidates rather than being declared unavailable.
         return visible_tools
             .iter()
-            .any(|tool| !crate::agent::inquiry::has_static_evidence_model(tool) && admits(tool));
+            .any(|tool| !crate::turn::inquiry::has_static_evidence_model(tool) && admits(tool));
     }
     // A mutation obligation with no exact predicate: any admissible mutating
     // tool could still perform it unless Authority forbids mutation outright.
@@ -155,13 +151,12 @@ pub(in crate::agent) fn obligation_admissible(
 /// more only when something admissible could satisfy the request, and only
 /// within the demand's budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::agent) enum StopDemand {
+pub enum StopDemand {
     /// A mandate task lead must commit its decision with `manage_mandates
     /// record_decision`; its prose is never the decision.
     MandateDecisionCommit,
     /// The run's last GUI coordinate click is unverified; an observation by
     /// the GUI tool that made the click confirms it.
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
     GuiClickVerification,
     /// The final reply cannot ship (empty, internal markers, pasted tool
     /// output, or written to a ledger demand that ended unmet); a rewrite
@@ -173,12 +168,12 @@ pub(in crate::agent) enum StopDemand {
 }
 
 /// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
-pub(in crate::agent) const MANDATE_DECISION_TOOL: &str = "manage_mandates";
-pub(in crate::agent) const MANDATE_DECISION_CALL: &str = r#"{"action":"record_decision"}"#;
+pub const MANDATE_DECISION_TOOL: &str = "manage_mandates";
+pub const MANDATE_DECISION_CALL: &str = r#"{"action":"record_decision"}"#;
 
 impl StopDemand {
     /// The decision-point condition each verdict is recorded under.
-    pub(in crate::agent) fn condition(self) -> &'static str {
+    pub fn condition(self) -> &'static str {
         match self {
             Self::MandateDecisionCommit => "mandate_decision_commit_missing",
             Self::GuiClickVerification => "gui_coordinate_click_unverified",
@@ -188,7 +183,7 @@ impl StopDemand {
     }
 
     /// How many times one run may ask for this demand.
-    pub(in crate::agent) fn budget(self) -> u32 {
+    pub fn budget(self) -> u32 {
         match self {
             Self::MandateDecisionCommit | Self::ReplyRepair | Self::CombinedVerification => 1,
             Self::GuiClickVerification => 3,
@@ -198,7 +193,7 @@ impl StopDemand {
 
 /// The arbiter's answer for one stop demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::agent) enum StopDemandVerdict {
+pub enum StopDemandVerdict {
     /// Ask the model for one more pass.
     Demand,
     /// This run already used the demand's budget.
@@ -209,7 +204,7 @@ pub(in crate::agent) enum StopDemandVerdict {
 }
 
 impl StopDemandVerdict {
-    pub(in crate::agent) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Demand => "demand",
             Self::Exhausted => "exhausted",
@@ -221,7 +216,7 @@ impl StopDemandVerdict {
 /// Whether the loop may ask for `demand`, after `used` earlier asks this run.
 /// `control_plane_call(tool, arguments)` answers whether a tool kept only as
 /// an owner control-plane tool admits that exact call, as the call gate asks.
-pub(in crate::agent) fn stop_demand_verdict(
+pub fn stop_demand_verdict(
     demand: StopDemand,
     used: u32,
     authority: &ClosingAuthority<'_>,
@@ -405,11 +400,11 @@ mod stop_demand_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{RunObligationClass, RunObligationState};
-    use crate::traits::{
+    use aidaemon_events::traits::{
         EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
         RequestReceiptPredicate, ToolMutationEffects,
     };
+    use aidaemon_events::{RunObligationClass, RunObligationState};
 
     fn obligation(
         receipt: Option<RequestReceiptPredicate>,
@@ -620,7 +615,7 @@ mod tests {
             "read_node_sensors",
             "web_search",
         ];
-        let candidates = crate::agent::inquiry::candidate_tools_for_requirements(
+        let candidates = crate::turn::inquiry::candidate_tools_for_requirements(
             std::slice::from_ref(&requirement),
             visible,
         );

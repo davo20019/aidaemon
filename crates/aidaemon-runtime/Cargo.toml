@@ -27,6 +27,7 @@ aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels" }
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }
 aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
+aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
@@ -34,10 +35,13 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
+once_cell = "1"
+regex = "1"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+shellexpand = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
@@ -47,6 +51,5 @@ tracing = "0.1"
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
-aidaemon-memory = { path = "../aidaemon-memory" }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

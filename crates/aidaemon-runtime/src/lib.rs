@@ -14,6 +14,7 @@
 //!   and the prefix fingerprints.
 //! - [`policy`]: execution policies, turn signals, recall guardrails and
 //!   model trust tiers.
+//! - [`markers`]: marker constants shared by prompts and sanitizers.
 //! - [`message_content`]: chat content helpers.
 //! - [`context_budget`]: token estimates and context-window budgets.
 //! - [`turn`]: system directives, tool-result notices and task outcomes.
@@ -22,6 +23,7 @@
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod llm;
+pub mod markers;
 pub mod message_content;
 pub mod policy;
 pub mod prompt;

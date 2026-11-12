@@ -23,8 +23,8 @@ pub use aidaemon_events::model_call_telemetry::{
 };
 pub use aidaemon_events::payloads::*;
 pub(crate) use aidaemon_events::run_aggregate::{
-    CloseoutDecision, RunAggregate, RunObligation, RunObligationClass, RunObligationState,
-    RunTerminalDecision, OWNER_APPROVAL_DECLINED,
+    CloseoutDecision, RunAggregate, RunObligationClass, RunObligationState, RunTerminalDecision,
+    OWNER_APPROVAL_DECLINED,
 };
 #[cfg(test)]
 pub(crate) use aidaemon_events::store::GeneratedResponseRef;

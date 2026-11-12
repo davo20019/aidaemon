@@ -7,12 +7,12 @@
 
 use std::collections::HashSet;
 
-use crate::traits::{
+use aidaemon_events::traits::{
     EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
     ToolEvidenceCapability, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
 };
 
-pub(in crate::agent) fn capability(
+pub fn capability(
     scope: ToolSemanticScope,
     purposes: &[EvidencePurpose],
     authority: EvidenceAuthority,
@@ -21,7 +21,7 @@ pub(in crate::agent) fn capability(
     ToolEvidenceCapability::new(scope, purposes, authority, temporal_scope)
 }
 
-pub(in crate::agent) fn action_from_arguments(arguments: &str) -> Option<String> {
+pub fn action_from_arguments(arguments: &str) -> Option<String> {
     string_argument(arguments, "action")
 }
 
@@ -38,7 +38,7 @@ fn string_argument(arguments: &str, key: &str) -> Option<String> {
 /// Evidence affordances for a successful result from one exact tool call.
 /// Dispatch still decides whether the call was an observation; this metadata
 /// only states what a substantive result from that observation can support.
-pub(in crate::agent) fn evidence_capabilities_for_tool_call(
+pub fn evidence_capabilities_for_tool_call(
     tool_name: &str,
     arguments: &str,
 ) -> Vec<ToolEvidenceCapability> {
@@ -51,7 +51,7 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
         ConversationHistory, ExternalRemote, GoalState, HostLocal, LocalWorkspace,
     };
 
-    if let Some(facts) = crate::agent::memory_plugin::memory_tool_facts(tool_name) {
+    if let Some(facts) = crate::turn::tool_facts::memory_tool_facts(tool_name) {
         return (facts.evidence)(arguments);
     }
 
@@ -233,7 +233,7 @@ pub(in crate::agent) fn evidence_capabilities_for_tool_call(
 /// This lets dynamic/custom tools participate without teaching the controller
 /// their names. Resource IDs remain unclassified because their domain is
 /// intentionally opaque outside the session registry.
-pub(in crate::agent) fn evidence_capabilities_from_target_hints(
+pub fn evidence_capabilities_from_target_hints(
     target_hints: &[ToolTargetHint],
 ) -> Vec<ToolEvidenceCapability> {
     let mut capabilities = Vec::new();
@@ -280,7 +280,7 @@ fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> 
         ],
         _ => &["{}"],
     };
-    let facts = crate::agent::memory_plugin::memory_tool_facts(tool_name);
+    let facts = crate::turn::tool_facts::memory_tool_facts(tool_name);
     let representative_calls = facts
         .as_ref()
         .map_or(representative_calls, |facts| facts.representative_calls);
@@ -300,20 +300,18 @@ fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> 
 /// advertise argument-dependent semantics only when they execute, so an
 /// unknown name must remain a possible candidate rather than being declared
 /// unavailable prematurely.
-pub(in crate::agent) fn has_static_evidence_model(tool_name: &str) -> bool {
+pub fn has_static_evidence_model(tool_name: &str) -> bool {
     !static_evidence_capabilities(tool_name).is_empty()
 }
 
-pub(in crate::agent) fn capability_supports_requirement(
+pub fn capability_supports_requirement(
     capability: &ToolEvidenceCapability,
     requirement: &RequestEvidenceRequirement,
 ) -> bool {
     requirement.supports_capability(capability)
 }
 
-pub(in crate::agent) fn requirement_is_exact_invocation(
-    requirement: &RequestEvidenceRequirement,
-) -> bool {
+pub fn requirement_is_exact_invocation(requirement: &RequestEvidenceRequirement) -> bool {
     // A receipt predicate identifies a performed operation by its typed
     // adapter outcome. Scope remains useful for candidate routing and target
     // constraints are checked separately, but neither can turn an immutable
@@ -334,9 +332,7 @@ pub(in crate::agent) fn requirement_is_exact_invocation(
 /// satisfying a proposed requirement. This validates contract coherence, not
 /// current tool availability: an impossible authority/scope/time tuple must
 /// never enter the proof graph and consume retries forever.
-pub(in crate::agent) fn requirement_has_builtin_evidence_route(
-    requirement: &RequestEvidenceRequirement,
-) -> bool {
+pub fn requirement_has_builtin_evidence_route(requirement: &RequestEvidenceRequirement) -> bool {
     if requirement_is_exact_invocation(requirement) {
         return true;
     }
@@ -357,7 +353,7 @@ pub(in crate::agent) fn requirement_has_builtin_evidence_route(
         "system_info",
         "self_diagnose",
     ];
-    let memory_tools = crate::agent::memory_plugin::modeled_memory_tools();
+    let memory_tools = crate::turn::tool_facts::modeled_memory_tools();
     EVIDENCE_MODELED_TOOLS
         .iter()
         .copied()
@@ -369,7 +365,7 @@ pub(in crate::agent) fn requirement_has_builtin_evidence_route(
         })
 }
 
-pub(in crate::agent) fn candidate_tools_for_requirements<'a>(
+pub fn candidate_tools_for_requirements<'a>(
     requirements: &[RequestEvidenceRequirement],
     visible_tool_names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
@@ -404,7 +400,7 @@ pub(in crate::agent) fn candidate_tools_for_requirements<'a>(
 /// Typed epistemic uncertainty derived after semantic assessment. Operational
 /// risk remains separate; this score reflects how many independent evidence
 /// obligations and source classes must be reconciled.
-pub(in crate::agent) fn epistemic_uncertainty(requirements: &[RequestEvidenceRequirement]) -> f32 {
+pub fn epistemic_uncertainty(requirements: &[RequestEvidenceRequirement]) -> f32 {
     if requirements.is_empty() {
         return 0.0;
     }
@@ -434,7 +430,7 @@ pub(in crate::agent) fn epistemic_uncertainty(requirements: &[RequestEvidenceReq
     score.clamp(0.0, 0.9)
 }
 
-pub(in crate::agent) fn describe_requirement(requirement: &RequestEvidenceRequirement) -> String {
+pub fn describe_requirement(requirement: &RequestEvidenceRequirement) -> String {
     let scopes = requirement
         .acceptable_scopes
         .iter()
