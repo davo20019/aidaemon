@@ -50,7 +50,8 @@ pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope
         | "manage_goal_tasks"
         | "goal_trace"
         | "tool_trace"
-        | "manage_mandates" => Some(ToolSemanticScope::GoalState),
+        | "manage_mandates"
+        | "manage_automations" => Some(ToolSemanticScope::GoalState),
         "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
         _ => None,
     }

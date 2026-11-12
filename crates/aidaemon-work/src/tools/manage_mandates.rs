@@ -9,12 +9,11 @@ use sha2::{Digest, Sha256};
 use crate::traits::UserRole;
 use crate::traits::{
     Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote,
-    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationScope,
-    MandateReconciliationResolution, MandateStatus, MandateStrategySnapshot, MandateSuspensionKind,
-    MandateTerminationKind, MandateToolStore, ToolCallContext, ToolCallMetadata, ToolCallOperation,
-    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
-    ToolRole,
+    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveMeasurement,
+    MandateOperatingUpdates, MandateOperationScope, MandateReconciliationResolution, MandateStatus,
+    MandateStrategySnapshot, MandateSuspensionKind, MandateTerminationKind, MandateToolStore,
+    ToolCallContext, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
 };
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::OutcomeTool as Tool;
@@ -550,39 +549,8 @@ impl ManageMandatesTool {
         activation_duration_secs: Option<i64>,
         proposed_policy_version: i64,
     ) -> MandateConfirmationCard {
+        let mut card = Self::owner_card(mandate, activation_duration_secs);
         let authority = &mandate.authority;
-        let labels = access_labels(authority);
-        let changes = can_change(authority, &labels);
-        let can_do = if changes {
-            CanDo::Changes {
-                what: labels.changes.iter().cloned().collect(),
-                per_review: authority.max_mutating_actions_per_cycle,
-                per_day: authority.max_mutating_actions_per_rolling_24h,
-                min_gap_secs: authority.min_seconds_between_mutations,
-            }
-        } else {
-            CanDo::ReadOnly
-        };
-        let mut triggers = Vec::new();
-        if authority.owner_alerts {
-            triggers.push(NoticeTrigger::Finding);
-        }
-        if changes {
-            triggers.push(NoticeTrigger::Change);
-        }
-        triggers.extend([NoticeTrigger::NeedsInput, NoticeTrigger::Problem]);
-        let ends = Ends {
-            limit: match (activation_duration_secs, mandate.expires_at.as_deref()) {
-                (Some(secs), _) => EndLimit::AfterApproval { secs },
-                (None, Some(at)) => EndLimit::At(
-                    crate::schedule::owner_time_rfc3339(at)
-                        .unwrap_or_else(|| "at the end date you set".to_string()),
-                ),
-                (None, None) => EndLimit::None,
-            },
-            has_stop_conditions: !mandate.stop_conditions.is_empty(),
-        };
-
         let mut details = Vec::new();
         if !mandate.constraints.is_empty() {
             details.push(format!(
@@ -636,6 +604,51 @@ impl ManageMandatesTool {
             "Policy reference: Your approval covers only the rules and limits shown here (policy version {proposed_policy_version})."
         ));
 
+        card.details = details;
+        card
+    }
+
+    /// A mandate's five essentials (what, how often, what it can do, when
+    /// it tells you, when it ends) with no details: the confirmation card's
+    /// head, and the card the owner's automation list shows.
+    /// `activation_duration_secs` is a duration still to start on approval.
+    pub fn owner_card(
+        mandate: &Mandate,
+        activation_duration_secs: Option<i64>,
+    ) -> MandateConfirmationCard {
+        let authority = &mandate.authority;
+        let labels = access_labels(authority);
+        let changes = can_change(authority, &labels);
+        let can_do = if changes {
+            CanDo::Changes {
+                what: labels.changes.iter().cloned().collect(),
+                per_review: authority.max_mutating_actions_per_cycle,
+                per_day: authority.max_mutating_actions_per_rolling_24h,
+                min_gap_secs: authority.min_seconds_between_mutations,
+            }
+        } else {
+            CanDo::ReadOnly
+        };
+        let mut triggers = Vec::new();
+        if authority.owner_alerts {
+            triggers.push(NoticeTrigger::Finding);
+        }
+        if changes {
+            triggers.push(NoticeTrigger::Change);
+        }
+        triggers.extend([NoticeTrigger::NeedsInput, NoticeTrigger::Problem]);
+        let ends = Ends {
+            limit: match (activation_duration_secs, mandate.expires_at.as_deref()) {
+                (Some(secs), _) => EndLimit::AfterApproval { secs },
+                (None, Some(at)) => EndLimit::At(
+                    crate::schedule::owner_time_rfc3339(at)
+                        .unwrap_or_else(|| "at the end date you set".to_string()),
+                ),
+                (None, None) => EndLimit::None,
+            },
+            has_stop_conditions: !mandate.stop_conditions.is_empty(),
+        };
+
         MandateConfirmationCard {
             what: mandate
                 .objective
@@ -651,7 +664,7 @@ impl ManageMandatesTool {
             can_do: can_do.render(),
             tells_you_when: NoticeTrigger::render(&triggers),
             ends: ends.render(),
-            details,
+            details: Vec::new(),
         }
     }
 
@@ -1678,16 +1691,14 @@ impl ManageMandatesTool {
                     .await?,
                 "mandate suspension changed before it could be resolved"
             );
-            return Ok(
-                if action == "answer_question" {
-                    format!(
+            return Ok(if action == "answer_question" {
+                format!(
                     "Mandate {} is active after recording bounded owner guidance. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change, and do not claim this answer authorized one.",
                     mandate.id
                 )
-                } else {
-                    format!("Mandate {} is active after typed {}.", mandate.id, action)
-                },
-            );
+            } else {
+                format!("Mandate {} is active after typed {}.", mandate.id, action)
+            });
         }
 
         let (from, to) = match action {

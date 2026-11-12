@@ -1172,7 +1172,10 @@ primary = "gpt-4o"
             "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
         ));
         assert!(prompt.contains(
-            "| Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
+            "| Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
+        ));
+        assert!(prompt.contains(
+            "| List the user's automations (both kinds), show one, pause/resume/cancel one by name | manage_automations"
         ));
         assert!(prompt.contains("Do not use keyword filters"));
         assert!(prompt.contains("manage_mandates(action=\"draft\")"));

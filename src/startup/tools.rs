@@ -233,6 +233,7 @@ enum BaseToolId {
     ManageMemories,
     SetReminder,
     ManageMandates,
+    ManageAutomations,
     SearchHistory,
     ScheduledGoalRuns,
     GoalTrace,
@@ -286,6 +287,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::ManageMandates,
         name: "manage_mandates",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ManageAutomations,
+        name: "manage_automations",
     },
     BaseToolSpec {
         id: BaseToolId::SearchHistory,
@@ -1218,6 +1223,13 @@ async fn build_base_tool(
                             .join(&config.skills.dir),
                     )
                 }),
+            )),
+            terminal_tool: None,
+        },
+        BaseToolId::ManageAutomations => BuiltBaseTool {
+            tool: Arc::new(crate::tools::ManageAutomationsTool::new(
+                state,
+                memory.store.clone(),
             )),
             terminal_tool: None,
         },

@@ -41,3 +41,15 @@ async fn work_schema_golden_manage_mandates() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
     check_golden(&crate::tools::ManageMandatesTool::new(harness.state));
 }
+
+/// New with the one automation list (2026-11-12): the owner's automations of
+/// both kinds, and pause/resume/cancel by name.
+#[tokio::test]
+async fn work_schema_golden_manage_automations() {
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let memory = harness.state.memory_stores();
+    check_golden(&crate::tools::ManageAutomationsTool::new(
+        harness.state,
+        memory,
+    ));
+}

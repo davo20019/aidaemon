@@ -160,7 +160,11 @@ impl CommandHost for DaemonCommandHost {
                 };
                 let at = at.with_timezone(&Utc);
                 if next.as_ref().is_none_or(|(earliest, _)| at < *earliest) {
-                    next = Some((at, goal.description.clone()));
+                    // The owner's name for it reads better than the instruction.
+                    let what =
+                        aidaemon_work::automations::name_from_context(goal.context.as_deref())
+                            .unwrap_or_else(|| goal.description.clone());
+                    next = Some((at, what));
                 }
             }
         }

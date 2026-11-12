@@ -2407,7 +2407,18 @@ pub fn spawn_background_task_lead(
                         "blocked": blocked_count,
                         "total": tasks.len(),
                     });
-                    updated_goal.context = Some(summary.to_string());
+                    // Kept beside the goal's own context keys (a reminder's
+                    // message, the owner's name for it), not in their place.
+                    let mut context = updated_goal
+                        .context
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    if let Some(summary) = summary.as_object() {
+                        context.extend(summary.clone());
+                    }
+                    updated_goal.context = Some(serde_json::Value::Object(context).to_string());
                     info!(
                         goal_id = %goal_id,
                         completed_count,
