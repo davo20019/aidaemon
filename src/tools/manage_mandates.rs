@@ -554,12 +554,19 @@ impl ManageMandatesTool {
                 mandate.authority.max_mutating_actions_per_rolling_24h,
                 display_duration(mandate.authority.min_seconds_between_mutations.into())
             ),
-            format!(
-                "Review interval: Usually every {}; may vary from {} to {}.",
-                display_duration(mandate.default_review_secs),
-                display_duration(mandate.min_review_secs),
-                display_duration(mandate.max_review_secs)
-            ),
+            if mandate.min_review_secs == mandate.max_review_secs {
+                format!(
+                    "Review interval: Every {}.",
+                    display_duration(mandate.default_review_secs)
+                )
+            } else {
+                format!(
+                    "Review interval: Usually every {}; may vary from {} to {}.",
+                    display_duration(mandate.default_review_secs),
+                    display_duration(mandate.min_review_secs),
+                    display_duration(mandate.max_review_secs)
+                )
+            },
             format!(
                 "Expiration: {}",
                 activation_duration_secs.map_or_else(
@@ -5055,6 +5062,42 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fixed_review_interval_is_shown_as_one_value() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let tool = ManageMandatesTool::new(harness.state.clone());
+        let expires_at = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let args = format!(
+            r#"{{
+                    "action":"create",
+                    "objective":"Watch a synthetic endpoint",
+                    "allow_observations":false,
+                    "constraints":["No fabrication"],
+                    "success_criteria":["Owner ends it"],
+                    "stop_conditions":["Endpoint retired"],
+                    "min_review_minutes":60,
+                    "max_review_minutes":60,
+                    "default_review_minutes":60,
+                    "expires_at":"{expires_at}"
+                }}"#,
+        );
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&args).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        let rendered = request.warnings.join("\n");
+        assert!(
+            rendered.contains("Review interval: Every 1 hour."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("may vary from"), "{rendered}");
     }
 
     #[tokio::test]
