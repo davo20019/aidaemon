@@ -25,6 +25,30 @@ pub fn step_ended_line(step: &str) -> String {
     format!("finished {step}")
 }
 
+/// The line for a step that handed its work on: the work goes on, so it
+/// never reads as finished ("Finished delegating to a specialist" while the
+/// helper still ran, live 2026-11-12).
+pub fn step_handed_off_line(step: &str, to_helper: bool) -> String {
+    if to_helper {
+        return "Handed off to a helper; it's working in the background".to_string();
+    }
+    let step = step.trim().trim_end_matches(['…', '.']);
+    let mut chars = step.chars();
+    match chars.next() {
+        Some(first) => format!(
+            "{}{} goes on in the background",
+            first.to_uppercase(),
+            chars.as_str()
+        ),
+        None => "A step goes on in the background".to_string(),
+    }
+}
+
+/// A helper's start line, one per helper.
+pub fn helper_started_line(label: &str) -> String {
+    format!("Started in the background: {}", label.trim())
+}
+
 /// Abstraction over the chat surface so `LiveStatus` is testable without a bot.
 #[async_trait::async_trait]
 pub trait SurfaceSink: Send + Sync {
@@ -41,8 +65,41 @@ pub trait SurfaceSink: Send + Sync {
 pub struct LiveStatus {
     message_id: Option<String>,
     checklist: Option<String>,
-    current_line: Option<String>,
+    /// The turn's own current step and when it began.
+    current_line: Option<(String, std::time::Instant)>,
+    /// Each helper's line, in the order they started: its label, what it
+    /// is doing and since when.
+    helpers: Vec<(String, HelperLine, std::time::Instant)>,
+    /// What the surface shows now, so an unchanged card is never re-sent.
+    shown: Option<String>,
+    /// The surface was edited into the turn's reply.
+    finalized: bool,
     edit_supported: bool,
+}
+
+/// What one helper's line on the card says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperLine {
+    Started,
+    Progress(String),
+}
+
+/// How long a step must have run before its line says for how long.
+const ELAPSED_SHOWN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `line` with how long its step has run, in whole minutes once it passes
+/// [`ELAPSED_SHOWN_AFTER`] ("Running a command · 3 min so far"), so a long
+/// step reads as alive and the card changes at most once a minute.
+pub fn line_with_elapsed(line: &str, elapsed: std::time::Duration) -> String {
+    if elapsed < ELAPSED_SHOWN_AFTER {
+        return line.to_string();
+    }
+    let minutes = elapsed.as_secs() / 60;
+    if minutes == 0 {
+        format!("{line} · under a minute so far")
+    } else {
+        format!("{line} · {minutes} min so far")
+    }
 }
 
 impl LiveStatus {
@@ -51,21 +108,103 @@ impl LiveStatus {
             message_id: None,
             checklist: None,
             current_line: None,
+            helpers: Vec::new(),
+            shown: None,
+            finalized: false,
             edit_supported: true,
         }
     }
 
+    /// The card: the plan (when there is one), each helper's line and the
+    /// turn's own current step, each long step with how long it has run. A
+    /// plan never hides the helpers or the step running now (live
+    /// 2026-11-12: six minutes of a plan card and "typing" while two
+    /// helpers worked).
     fn render(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
         if let Some(c) = &self.checklist {
-            return Some(c.clone());
+            parts.push(c.clone());
         }
-        self.current_line
-            .as_ref()
-            .map(|l| format!("⏳ {}", capitalize_first(l)))
+        let done = self
+            .checklist
+            .as_deref()
+            .is_some_and(crate::live_status::is_completed_checklist);
+        for (label, line, since) in &self.helpers {
+            parts.push(match line {
+                HelperLine::Started => helper_started_line(label),
+                HelperLine::Progress(progress) => {
+                    line_with_elapsed(&format!("🤖 {label}: {progress}"), since.elapsed())
+                }
+            });
+        }
+        if !done {
+            if let Some((line, since)) = &self.current_line {
+                parts.push(format!(
+                    "⏳ {}",
+                    line_with_elapsed(&capitalize_first(line), since.elapsed())
+                ));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// What the card would show now.
+    pub fn preview(&self) -> Option<String> {
+        self.render()
+    }
+
+    /// Note the plan card without sending it.
+    pub fn note_checklist(&mut self, text: String) {
+        self.checklist = Some(text);
+    }
+
+    /// Note the turn's current step without sending it; the same step
+    /// keeps its start time.
+    pub fn note_activity(&mut self, line: String) {
+        if self.current_line.as_ref().map(|(shown, _)| shown) != Some(&line) {
+            self.current_line = Some((line, std::time::Instant::now()));
+        }
+    }
+
+    /// Note that a helper started: its own line, one per helper.
+    pub fn note_helper_started(&mut self, label: &str) {
+        if !self.helpers.iter().any(|(known, ..)| known == label) {
+            self.helpers.push((
+                label.to_string(),
+                HelperLine::Started,
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// Note a helper's latest step on its own line.
+    pub fn note_helper_progress(&mut self, label: &str, progress: &str) {
+        let line = HelperLine::Progress(progress.to_string());
+        match self.helpers.iter_mut().find(|(known, ..)| known == label) {
+            Some(entry) if entry.1 == line => {}
+            Some(entry) => {
+                entry.1 = line;
+                entry.2 = std::time::Instant::now();
+            }
+            None => self
+                .helpers
+                .push((label.to_string(), line, std::time::Instant::now())),
+        }
+    }
+
+    /// Send the card when what it would show changed since it was last
+    /// sent (a step's elapsed time included); `true` when it was sent.
+    pub async fn flush_if_changed(&mut self, sink: &dyn SurfaceSink) -> bool {
+        if self.finalized || self.render().is_none() || self.render() == self.shown {
+            return false;
+        }
+        self.flush(sink).await;
+        true
     }
 
     async fn flush(&mut self, sink: &dyn SurfaceSink) {
         let Some(body) = self.render() else { return };
+        self.shown = Some(body.clone());
         let body = crate::presentation::render_internal_markers(&body);
         match (&self.message_id, self.edit_supported) {
             (Some(id), true) => match sink.edit(id, &body).await {
@@ -96,16 +235,12 @@ impl LiveStatus {
     }
 
     pub async fn set_checklist(&mut self, sink: &dyn SurfaceSink, text: String) {
-        self.checklist = Some(text);
+        self.note_checklist(text);
         self.flush(sink).await;
     }
 
     pub async fn set_activity(&mut self, sink: &dyn SurfaceSink, line: String) {
-        // A checklist, once present, owns the surface; ignore single-line activity.
-        if self.checklist.is_some() {
-            return;
-        }
-        self.current_line = Some(line);
+        self.note_activity(line);
         self.flush(sink).await;
     }
 
@@ -117,6 +252,9 @@ impl LiveStatus {
         }
         if let (Some(id), true) = (&self.message_id, self.edit_supported) {
             if matches!(sink.edit(id, reply).await, Ok(true)) {
+                // The surface is the reply now: no later refresh may turn
+                // it back into the card.
+                self.finalized = true;
                 return true;
             }
         }
@@ -130,8 +268,20 @@ impl LiveStatus {
     /// A checklist with unfinished, failed or deferred steps always stays as
     /// the record of what was left.
     pub async fn clear(&mut self, sink: &dyn SurfaceSink, reply_delivered: bool) {
-        if let Some(checklist) = self.checklist.as_deref() {
-            if !reply_delivered || !crate::live_status::is_completed_checklist(checklist) {
+        if let Some(checklist) = self.checklist.clone() {
+            if !reply_delivered || !crate::live_status::is_completed_checklist(&checklist) {
+                // The card stays as the record of the plan: the step and
+                // helper lines were only live progress, so they go.
+                self.current_line = None;
+                self.helpers.clear();
+                if self.shown.as_deref() != Some(checklist.as_str()) {
+                    if let (Some(id), true) = (&self.message_id, self.edit_supported) {
+                        let body = crate::presentation::render_internal_markers(&checklist);
+                        if matches!(sink.edit(id, &body).await, Ok(true)) {
+                            self.shown = Some(checklist);
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -139,6 +289,8 @@ impl LiveStatus {
             let _ = sink.delete(&id).await;
         }
         self.current_line = None;
+        self.helpers.clear();
+        self.shown = None;
         self.edit_supported = true;
     }
 
@@ -165,6 +317,9 @@ impl LiveStatus {
         self.message_id = None;
         self.checklist = None;
         self.current_line = None;
+        self.helpers.clear();
+        self.shown = None;
+        self.finalized = false;
         self.edit_supported = true;
     }
 }
@@ -289,14 +444,68 @@ mod tests {
             .contains("⏳ Running the script"));
     }
 
+    /// A plan card never hides the step running now or the helpers: each
+    /// helper has its own line, under the plan (live 2026-11-12: six
+    /// minutes of a plan card and "typing" while two helpers worked).
     #[tokio::test]
-    async fn checklist_owns_the_surface() {
+    async fn the_plan_card_shows_each_helper_and_the_step_running_now() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
         s.set_checklist(&sink, "📋 Plan\n☐ a".into()).await;
-        s.set_activity(&sink, "Running".into()).await; // ignored
+        s.note_helper_started("Counter A");
+        s.note_helper_started("Counter B");
+        s.note_helper_progress("Counter B", "running a command");
+        s.set_activity(&sink, "waiting for the helpers".into())
+            .await;
         assert_eq!(sink.creates.lock().unwrap().len(), 1);
-        assert_eq!(sink.edits.lock().unwrap().len(), 0);
+        let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(
+            card,
+            "📋 Plan\n☐ a\n\nStarted in the background: Counter A\n\n🤖 Counter B: running a \
+             command\n\n⏳ Waiting for the helpers"
+        );
+        // Nothing changed: nothing is re-sent.
+        assert!(!s.flush_if_changed(&sink).await);
+        assert_eq!(sink.edits.lock().unwrap().len(), 1);
+        // The kept plan card loses the live lines when the turn ends.
+        s.clear(&sink, false).await;
+        assert_eq!(sink.edits.lock().unwrap().last().unwrap().1, "📋 Plan\n☐ a");
+    }
+
+    /// A long step says for how long it has run, in whole minutes, so the
+    /// card changes at most once a minute.
+    #[test]
+    fn a_long_step_says_how_long_it_has_run() {
+        use std::time::Duration;
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(10)),
+            "Running a command"
+        );
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(45)),
+            "Running a command · under a minute so far"
+        );
+        assert_eq!(
+            line_with_elapsed("Running a command", Duration::from_secs(6 * 60 + 5)),
+            "Running a command · 6 min so far"
+        );
+    }
+
+    /// A step that handed its work on never reads as finished.
+    #[test]
+    fn a_handed_off_step_never_reads_as_finished() {
+        assert_eq!(
+            step_handed_off_line("delegating to a specialist", true),
+            "Handed off to a helper; it's working in the background"
+        );
+        assert_eq!(
+            step_handed_off_line("running a command", false),
+            "Running a command goes on in the background"
+        );
+        assert_eq!(
+            helper_started_line("Counter A"),
+            "Started in the background: Counter A"
+        );
     }
 
     #[tokio::test]

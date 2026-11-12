@@ -83,8 +83,12 @@ pub fn same_tool_loop(
 }
 
 /// Whether a same-tool streak past its limit is still long work rather than
-/// a loop: its calls vary and at least three in four succeeded. The stepwise
-/// limit stays a hard ceiling, and a `Stepwise` tool has no other limit.
+/// a loop, from the run's typed receipts: its calls vary and at least three
+/// in four succeeded. A streak in which every call differs from every other
+/// and every one succeeded repeats nothing, so it is progress at any length
+/// (live 2026-11-12: a count, one `sleep 2 && echo N` call per number, was
+/// refused at its 40th distinct, successful call); one that repeats or fails
+/// stops at the stepwise limit. A `Stepwise` tool has no other limit.
 fn streak_is_progress(
     receipts: &[&Receipt],
     tool: &str,
@@ -99,7 +103,7 @@ fn streak_is_progress(
         .copied()
         .collect();
     let total = streak.len() + 1;
-    if allowance == SameToolStreak::Stepwise || total >= limits.stepwise {
+    if allowance == SameToolStreak::Stepwise {
         return false;
     }
     let mut unique: Vec<&Value> = vec![arguments];
@@ -109,7 +113,10 @@ fn streak_is_progress(
         }
     }
     let succeeded = streak.iter().filter(|receipt| receipt.succeeded()).count();
-    unique.len() * 2 > total && succeeded * 4 >= streak.len() * 3
+    if unique.len() == total && succeeded == streak.len() {
+        return true;
+    }
+    total < limits.stepwise && unique.len() * 2 > total && succeeded * 4 >= streak.len() * 3
 }
 
 /// The loop guard as a kernel hook. It refuses the looping call with a
@@ -336,11 +343,39 @@ mod tests {
         );
     }
 
+    /// Forty distinct calls that all succeeded repeat nothing: a long
+    /// stepwise job (one number per call) is never a loop.
     #[tokio::test]
-    async fn progress_stops_at_the_hard_ceiling() {
+    async fn distinct_successful_calls_pass_the_hard_ceiling() {
         let run = RunId::new();
         let decision = judged(
-            receipts(varied(39, 0), run),
+            receipts(varied(60, 0), run),
+            run,
+            json!({"command": "next"}),
+        )
+        .await;
+        assert_eq!(decision, ToolDecision::Allow);
+    }
+
+    /// A streak with any repeated or failed call still stops at the hard
+    /// ceiling.
+    #[tokio::test]
+    async fn progress_with_repeats_or_failures_stops_at_the_hard_ceiling() {
+        let run = RunId::new();
+        let decision = judged(
+            receipts(varied(39, 2), run),
+            run,
+            json!({"command": "next"}),
+        )
+        .await;
+        assert!(
+            matches!(decision, ToolDecision::Deny { .. }),
+            "{decision:?}"
+        );
+        let mut repeated: Vec<(Value, ReceiptStatus)> = varied(38, 0).collect();
+        repeated.push((json!({"command": "step 0"}), ReceiptStatus::Succeeded));
+        let decision = judged(
+            receipts(repeated.into_iter(), run),
             run,
             json!({"command": "next"}),
         )

@@ -1060,6 +1060,61 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
     );
 }
 
+/// A child is listed for the chat from the moment it is created, before its
+/// setup and first model call, and its start reaches the chat's card as its
+/// own line (live 2026-11-12: a status read while two helpers were starting
+/// said none ran).
+#[tokio::test]
+async fn test_a_child_is_listed_from_the_moment_it_is_created() {
+    let provider = MockProvider::with_delayed_responses(
+        vec![MockProvider::text_response("synthetic count done")],
+        vec![std::time::Duration::from_millis(300)],
+    );
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let agent = Arc::new(harness.agent);
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
+    let running = agent.clone();
+    let run = tokio::spawn(async move {
+        running
+            .spawn_child_with_outcome(
+                "Counter A",
+                "synthetic count",
+                Some(status_tx),
+                ChannelContext::private("test"),
+                UserRole::Owner,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("telegram:synthetic-chat"),
+                None,
+                None,
+                None,
+            )
+            .await
+    });
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), status_rx.recv())
+        .await
+        .expect("a status update arrives")
+        .expect("the channel is open");
+    assert!(
+        matches!(&first, crate::types::StatusUpdate::HelperStarted { label } if label == "Counter A"),
+        "{first:?}"
+    );
+    // The start line is sent once the child is listed, so it is listed now.
+    let listed = aidaemon_channels::ports::ChannelAgentRuntime::running_children(
+        agent.as_ref(),
+        "telegram:synthetic-chat",
+    )
+    .await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].label, "Counter A");
+    run.await.unwrap().expect("the child runs to its end");
+}
+
 /// A child charges the tree it belongs to, so a request's budget covers all
 /// of its sub-agents.
 #[tokio::test]

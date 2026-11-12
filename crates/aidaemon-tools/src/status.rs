@@ -89,6 +89,14 @@ pub enum StatusUpdate {
     /// The parent's card keeps the parent's checklist and shows this as its
     /// activity line, so a child's plan never stands in for the whole task.
     SubAgentProgress { label: String, progress: String },
+    /// A helper (sub-agent) was created, named as the owner reads it. Each
+    /// helper gets its own start line, so parallel helpers never hide each
+    /// other behind one shared activity line.
+    HelperStarted { label: String },
+    /// A step ended by handing its work to something that keeps running: a
+    /// helper (`to_helper`) or a background job. The work has not finished,
+    /// so the step must never read as finished.
+    StepHandedOff { name: String, to_helper: bool },
 }
 
 impl StatusUpdate {

@@ -2106,11 +2106,15 @@ fn is_indicator_only_status(update: &StatusUpdate) -> bool {
 
 /// Single status consumer used at both the primary and queue-drain sites.
 ///
-/// Ordinary progress events are folded into the `LiveStatus` single-surface owner
-/// (one message created lazily and edited in place). BudgetExtended and explicitly
-/// typed user actions are must-deliver and sent as their own messages. Merely
-/// containing a URL does not make internal progress user-facing: task descriptions
-/// often contain URLs too.
+/// Every progress event updates the `LiveStatus` card's state (one message
+/// created lazily and edited in place); the card is sent at most once per
+/// `min_interval`, and an update that arrives inside the interval is shown
+/// when it ends instead of being dropped (live 2026-11-12: a throttled
+/// step left the card stale through six minutes of helpers working). A
+/// long step's line says how long it has run, refreshed on a tick.
+/// BudgetExtended and explicitly typed user actions are must-deliver and
+/// sent as their own messages. Merely containing a URL does not make
+/// internal progress user-facing: task descriptions often contain URLs too.
 async fn run_status_consumer(
     mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
     owner: std::sync::Arc<tokio::sync::Mutex<LiveStatus>>,
@@ -2122,21 +2126,31 @@ async fn run_status_consumer(
     use SurfaceSink;
     let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
     let min_interval = Duration::from_secs(3);
-    while let Some(first) = rx.recv().await {
-        // Whatever piled up while the last edit was on its way: only the
-        // newest card state matters, so a slow surface catches up in one
-        // edit instead of replaying (and the sender, which never waits,
-        // finds room for the closing checklist).
-        let mut backlog = vec![first];
-        while let Ok(next) = rx.try_recv() {
-            backlog.push(next);
-        }
-        for update in coalesce_status_backlog(backlog) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let backlog = tokio::select! {
+            first = rx.recv() => {
+                let Some(first) = first else { break };
+                // Whatever piled up while the last edit was on its way is
+                // applied in order and shown in one edit.
+                let mut backlog = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    backlog.push(next);
+                }
+                backlog
+            }
+            // Nothing new: show what an interval held back, or a long step's
+            // new elapsed time.
+            _ = tick.tick() => Vec::new(),
+        };
+        let mut show_now = false;
+        let mut typing = false;
+        for update in backlog {
             if is_indicator_only_status(&update) {
-                let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                typing = true;
                 continue;
             }
-            let is_immediate = update.requires_immediate_delivery();
             let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
             // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
             if !is_dm && !is_budget_ext {
@@ -2144,7 +2158,7 @@ async fn run_status_consumer(
             }
             // BudgetExtended and explicit user actions are must-deliver: send as
             // their own message (never folded into the live surface).
-            if is_immediate {
+            if update.requires_immediate_delivery() {
                 let text = match &update {
                     StatusUpdate::BudgetExtended {
                         old_budget,
@@ -2163,105 +2177,71 @@ async fn run_status_consumer(
                 }
                 continue;
             }
-            // Ordinary progress → single live surface, gated by min_interval.
-            // Exception: the plan checklist is the highest-value content and edits in
-            // place, so it must never be dropped by the throttle. It typically arrives
-            // within a second of the track_requirements ToolStart (well inside
-            // min_interval), which previously discarded it and the plan never showed.
-            let now = tokio::time::Instant::now();
-            let is_checklist = matches!(
-                &update,
-                StatusUpdate::Checklist { .. } | StatusUpdate::ToolComplete { .. }
-            );
-            if !is_checklist && now.duration_since(last_sent) < min_interval {
-                continue;
-            }
-            let sink_ref: &dyn SurfaceSink = sink.as_ref();
             // Single-writer invariant: exactly one consumer task touches `owner` per
             // turn and turns are sequential (the previous task is aborted before the
-            // next is spawned), so holding the lock across the network send below is
-            // safe — there is never a second writer to contend with.
-            match &update {
-                StatusUpdate::Checklist { text } => {
-                    owner
-                        .lock()
-                        .await
-                        .set_checklist(sink_ref, text.clone())
-                        .await;
-                }
-                StatusUpdate::ToolStart { name, summary } => {
-                    let line = if summary.is_empty() {
-                        format!("{name}…")
-                    } else {
-                        format!("{name}: {summary}…")
-                    };
-                    owner.lock().await.set_activity(sink_ref, line).await;
-                }
-                StatusUpdate::ToolComplete { name, .. } => {
-                    owner
-                        .lock()
-                        .await
-                        .set_activity(
-                            sink_ref,
-                            aidaemon_channels::live_status::step_ended_line(name),
-                        )
-                        .await;
-                }
-                StatusUpdate::PlanStepStart { description, .. }
-                | StatusUpdate::PlanStepComplete { description, .. } => {
-                    owner
-                        .lock()
-                        .await
-                        .set_activity(sink_ref, description.clone())
-                        .await;
-                }
-                StatusUpdate::SubAgentProgress { label, progress } => {
-                    owner
-                        .lock()
-                        .await
-                        .set_activity(sink_ref, format!("🤖 {label}: {progress}"))
-                        .await;
-                }
-                _ => {
-                    continue; // other Plan*/Thinking variants: no separate message
-                }
+            // next is spawned), so holding the lock is safe.
+            show_now |= note_status(&mut *owner.lock().await, &update);
+        }
+        if !is_dm {
+            continue;
+        }
+        let now = tokio::time::Instant::now();
+        if show_now || now.duration_since(last_sent) >= min_interval {
+            let sink_ref: &dyn SurfaceSink = sink.as_ref();
+            if owner.lock().await.flush_if_changed(sink_ref).await {
+                last_sent = tokio::time::Instant::now();
+                typing = true;
             }
-            last_sent = tokio::time::Instant::now();
+        }
+        if typing {
             let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
         }
     }
 }
 
-/// Keep what a backlog of status updates still needs shown: every
-/// must-deliver message in order, the newest checklist and the newest
-/// progress line. Older card states would only be overwritten, and one
-/// typing indicator covers any number of `Thinking` beats.
-fn coalesce_status_backlog(backlog: Vec<StatusUpdate>) -> Vec<StatusUpdate> {
-    let is_checklist = |update: &StatusUpdate| matches!(update, StatusUpdate::Checklist { .. });
-    let is_progress = |update: &StatusUpdate| {
-        !update.requires_immediate_delivery()
-            && !is_indicator_only_status(update)
-            && !is_checklist(update)
-    };
-    let last_checklist = backlog.iter().rposition(is_checklist);
-    let last_progress = backlog.iter().rposition(is_progress);
-    let last_thinking = backlog.iter().rposition(is_indicator_only_status);
-    backlog
-        .into_iter()
-        .enumerate()
-        .filter(|(index, update)| {
-            if is_checklist(update) {
-                Some(*index) == last_checklist
-            } else if is_progress(update) {
-                Some(*index) == last_progress
-            } else if is_indicator_only_status(update) {
-                Some(*index) == last_thinking
+/// Apply one progress update to the card's state; `true` when the card
+/// should show it at once, past the interval: the plan, a step's end, a
+/// handoff and a helper's start are never held back.
+fn note_status(live: &mut LiveStatus, update: &StatusUpdate) -> bool {
+    match update {
+        StatusUpdate::Checklist { text } => {
+            live.note_checklist(text.clone());
+            true
+        }
+        StatusUpdate::ToolStart { name, summary } => {
+            live.note_activity(if summary.is_empty() {
+                format!("{name}…")
             } else {
-                true
-            }
-        })
-        .map(|(_, update)| update)
-        .collect()
+                format!("{name}: {summary}…")
+            });
+            false
+        }
+        StatusUpdate::ToolComplete { name, .. } => {
+            live.note_activity(aidaemon_channels::live_status::step_ended_line(name));
+            true
+        }
+        StatusUpdate::StepHandedOff { name, to_helper } => {
+            live.note_activity(aidaemon_channels::live_status::step_handed_off_line(
+                name, *to_helper,
+            ));
+            true
+        }
+        StatusUpdate::PlanStepStart { description, .. }
+        | StatusUpdate::PlanStepComplete { description, .. } => {
+            live.note_activity(description.clone());
+            false
+        }
+        StatusUpdate::HelperStarted { label } => {
+            live.note_helper_started(label);
+            true
+        }
+        StatusUpdate::SubAgentProgress { label, progress } => {
+            live.note_helper_progress(label, progress);
+            false
+        }
+        // Other Plan*/Thinking variants: no line of their own.
+        _ => false,
+    }
 }
 
 /// Legacy (pre-LiveStatus) status consumer used only when the `ChannelHub` is
@@ -2442,6 +2422,12 @@ async fn run_legacy_status_consumer(
             StatusUpdate::SubAgentProgress { label, progress } => {
                 format!("🤖 {label}: {progress}")
             }
+            StatusUpdate::HelperStarted { label } => {
+                aidaemon_channels::live_status::helper_started_line(label)
+            }
+            StatusUpdate::StepHandedOff { name, to_helper } => {
+                aidaemon_channels::live_status::step_handed_off_line(name, *to_helper)
+            }
         };
         let _ = bot.send_message(chat_id, text).await;
         dm_status_count += 1;
@@ -2480,47 +2466,49 @@ mod tests {
         assert_eq!(outbound_content_type(b"homepage.png but text"), None);
     }
 
+    /// Two helpers started together each get their own start line on the
+    /// card, whatever order or batch their updates arrive in (live
+    /// 2026-11-12: only "Counter B" showed).
     #[test]
-    fn a_status_backlog_keeps_the_newest_card_and_every_must_deliver() {
-        let checklist = |text: &str| StatusUpdate::Checklist {
-            text: text.to_string(),
-        };
-        let tool = |name: &str| StatusUpdate::ToolStart {
-            name: name.to_string(),
-            summary: String::new(),
-        };
-        let action = StatusUpdate::UserActionRequired {
-            message: "Open the synthetic link".to_string(),
-        };
-        let kept = coalesce_status_backlog(vec![
-            StatusUpdate::Thinking(1),
-            checklist("step 1"),
-            tool("reading"),
-            action.clone(),
-            StatusUpdate::Thinking(2),
-            checklist("done"),
-            tool("writing"),
-        ]);
-        let shown: Vec<String> = kept
-            .iter()
-            .map(|update| match update {
-                StatusUpdate::Checklist { text } => format!("checklist:{text}"),
-                StatusUpdate::ToolStart { name, .. } => format!("tool:{name}"),
-                StatusUpdate::UserActionRequired { message } => format!("action:{message}"),
-                StatusUpdate::Thinking(n) => format!("thinking:{n}"),
-                _ => "other".to_string(),
-            })
-            .collect();
-        assert_eq!(
-            shown,
-            vec![
-                "action:Open the synthetic link",
-                "thinking:2",
-                "checklist:done",
-                "tool:writing"
-            ]
+    fn parallel_helpers_each_get_their_own_line() {
+        let mut live = LiveStatus::new();
+        assert!(note_status(
+            &mut live,
+            &StatusUpdate::HelperStarted {
+                label: "Counter A".into()
+            }
+        ));
+        assert!(note_status(
+            &mut live,
+            &StatusUpdate::HelperStarted {
+                label: "Counter B".into()
+            }
+        ));
+        assert!(!note_status(
+            &mut live,
+            &StatusUpdate::SubAgentProgress {
+                label: "Counter B".into(),
+                progress: "running a command".into(),
+            }
+        ));
+        assert!(note_status(
+            &mut live,
+            &StatusUpdate::StepHandedOff {
+                name: "delegating to a specialist".into(),
+                to_helper: true,
+            }
+        ));
+        let card = live.preview().unwrap();
+        assert!(
+            card.contains("Started in the background: Counter A"),
+            "{card}"
         );
-        assert_eq!(coalesce_status_backlog(vec![checklist("only")]).len(), 1);
+        assert!(card.contains("🤖 Counter B: running a command"), "{card}");
+        assert!(
+            card.contains("Handed off to a helper; it's working in the background"),
+            "{card}"
+        );
+        assert!(!card.contains("Finished"), "{card}");
     }
 
     #[test]
