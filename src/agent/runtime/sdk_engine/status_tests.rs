@@ -183,3 +183,104 @@ async fn run_closed_by_policy_denial_is_not_a_success() {
     assert_ne!(aggregate.lifecycle_phase(), TaskKernelPhase::WorkSucceeded);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The agent's own `blocked` ends the run there: no more work is demanded,
+/// its reply ships, and the task is partial everywhere it is recorded.
+#[tokio::test]
+async fn claimed_blocked_ends_the_run_partial() {
+    let checklist = r#"{"items":[
+        {"text":"Probe the service","status":"completed","requires_observation":true},
+        {"text":"Write the report","status":"pending","mutation_effects":["local_workspace_write"]}
+    ],"outcome":"blocked"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_probe", "{}"),
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::text_response("I can't write the report: the folder is not shared with me."),
+        MockProvider::text_response("UNREACHED second answer"),
+    ]);
+    let harness = root(provider, vec![probe()]).await;
+    let session = "status-claimed-blocked";
+    let reply = ask(&harness, session, "Probe the service and write the report").await;
+
+    assert_eq!(
+        reply,
+        "I can't write the report: the folder is not shared with me."
+    );
+    assert_eq!(harness.provider.call_count().await, 3);
+    let end = task_end(&harness, session).await;
+    assert_eq!(end.status, TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+    assert_eq!(
+        phase(&harness, session, &end.task_id).await,
+        TaskKernelPhase::Partial
+    );
+}
+
+/// Receipts never upgrade the agent's own `partial`: a run that would be a
+/// plain success stays partial when the agent says it is.
+#[tokio::test]
+async fn claimed_partial_is_not_upgraded_by_receipts() {
+    let checklist = r#"{"items":[
+        {"text":"Probe the service","status":"completed"},
+        {"text":"Probe the backup too","status":"deferred"}
+    ],"outcome":"partial"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_probe", "{}"),
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::text_response("The main probe is ok; I did not get to the backup."),
+    ]);
+    let harness = root(provider, vec![probe()]).await;
+    let session = "status-claimed-partial";
+    ask(&harness, session, "Probe the service").await;
+
+    let end = task_end(&harness, session).await;
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+    assert_eq!(
+        phase(&harness, session, &end.task_id).await,
+        TaskKernelPhase::Partial
+    );
+}
+
+/// A claimed `done` with the work done is a success.
+#[tokio::test]
+async fn claimed_done_with_the_work_done_is_a_success() {
+    let checklist = r#"{"items":[
+        {"text":"Probe the service","status":"completed"}
+    ],"outcome":"done"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_probe", "{}"),
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::text_response("The probe says ok."),
+    ]);
+    let harness = root(provider, vec![probe()]).await;
+    let session = "status-claimed-done";
+    let reply = ask(&harness, session, "Probe the service").await;
+
+    assert_eq!(reply, "The probe says ok.");
+    let end = task_end(&harness, session).await;
+    assert_eq!(end.effective_outcome(), TaskOutcome::Succeeded);
+}
+
+/// Evidence downgrades a claimed `done`: a declared change no receipt shows
+/// keeps the run below success.
+#[tokio::test]
+async fn claimed_done_with_work_open_is_not_a_success() {
+    let checklist = r#"{"items":[
+        {"text":"Write the report","status":"completed","mutation_effects":["local_workspace_write"]}
+    ],"outcome":"done"}"#;
+    let mut responses = vec![
+        MockProvider::tool_call_response("synthetic_probe", "{}"),
+        MockProvider::tool_call_response("track_requirements", checklist),
+    ];
+    responses.extend((0..6).map(|_| MockProvider::text_response("All done.")));
+    let harness = root(MockProvider::with_responses(responses), vec![probe()]).await;
+    let session = "status-claimed-done-open";
+    ask(&harness, session, "Write the report").await;
+
+    let end = task_end(&harness, session).await;
+    assert_ne!(end.effective_outcome(), TaskOutcome::Succeeded);
+    assert_ne!(
+        phase(&harness, session, &end.task_id).await,
+        TaskKernelPhase::WorkSucceeded
+    );
+}

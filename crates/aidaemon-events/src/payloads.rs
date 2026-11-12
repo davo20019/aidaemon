@@ -983,6 +983,48 @@ pub struct ExecutorExpectationsDeclaredData {
     pub schema_version: u16,
     pub task_id: String,
     pub items: Vec<ExecutorExpectationItem>,
+    /// The model's own verdict on the whole request, when it gave one
+    /// (`track_requirements`' `outcome`). A claimed `done` is still judged
+    /// by receipts and can be downgraded; `partial` and `blocked` end the
+    /// run unmet and nothing upgrades them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ExecutorClaimedOutcome>,
+}
+
+/// How the working agent says the request ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorClaimedOutcome {
+    /// Everything asked for is done (receipts still judge it).
+    Done,
+    /// Some of it is done; the rest is not.
+    Partial,
+    /// It could not be done; something outside the run stands in the way.
+    Blocked,
+}
+
+impl ExecutorClaimedOutcome {
+    pub fn from_protocol_name(name: &str) -> Option<Self> {
+        match name {
+            "done" => Some(Self::Done),
+            "partial" => Some(Self::Partial),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Partial => "partial",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// Whether the agent says the request is not fully done.
+    pub const fn unfinished(self) -> bool {
+        !matches!(self, Self::Done)
+    }
 }
 
 impl ExecutorExpectationsDeclaredData {

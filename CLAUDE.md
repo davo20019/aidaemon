@@ -246,6 +246,12 @@ permitted, `UnreachableReason::ExecutorDeferred`), but it never counts toward
 accomplished work. In the SDK kernel the same split is
 `StopDecision::AcceptUnmet` and `RunOutcome::is_succeeded()`: `Completed`
 means the run stopped, not that its objective was met.
+The model's own verdict is `track_requirements`' `outcome`
+(`done | partial | blocked`, `RunAggregate::executor_claimed_outcome`):
+`partial`/`blocked` stop the run with `AcceptUnmet` and cap the task at
+`partial`; receipts can downgrade a claimed `done`, nothing upgrades the
+other two. A run closed by a policy denial is `partial` too: the work did
+not happen, and a denial is final, never retried as a failure.
 
 ## Untrusted Content Rule
 
