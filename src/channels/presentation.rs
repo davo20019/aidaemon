@@ -404,6 +404,29 @@ mod tests {
     }
 }
 
+/// `text` cut to at most `max_chars` characters (the ellipsis included) at
+/// the last whole word, so a preview never ends mid-word. A single word
+/// longer than the limit is cut where it must be.
+pub(crate) fn word_preview(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let budget = max_chars.saturating_sub(1);
+    let head: String = text.chars().take(budget).collect();
+    // Cut at a space only when the word after it was split.
+    let next_is_break = text.chars().nth(budget).is_some_and(char::is_whitespace);
+    let kept = if next_is_break {
+        head.as_str()
+    } else {
+        head.rfind(char::is_whitespace)
+            .map(|at| &head[..at])
+            .filter(|kept| !kept.trim().is_empty())
+            .unwrap_or(head.as_str())
+    };
+    format!("{}…", kept.trim_end())
+}
+
 /// The reply to a message that arrives while a task runs in its session.
 /// Without attachments the running task takes it in at its next step when
 /// it is from the same sender (`TaskRegistry::take_steering_messages`);
@@ -413,15 +436,12 @@ pub(crate) fn queued_message_notice(
     current_task: &str,
     has_attachments: bool,
 ) -> String {
-    let preview: String = text.chars().take(50).collect();
-    let suffix = if text.chars().count() > 50 { "..." } else { "" };
+    let preview = word_preview(text, 50);
     if has_attachments {
-        format!(
-            "📥 Got \"{preview}{suffix}\". I'll handle it right after the current task: {current_task}"
-        )
+        format!("📥 Got \"{preview}\". I'll handle it right after the current task: {current_task}")
     } else {
         format!(
-            "📥 Got \"{preview}{suffix}\". I'll take it into account in the current task \
+            "📥 Got \"{preview}\". I'll take it into account in the current task \
              ({current_task}), or handle it right after if it can't join."
         )
     }
@@ -438,6 +458,38 @@ mod queued_notice_tests {
         let waiting = queued_message_notice("see the attached log", "Read four files", true);
         assert!(waiting.contains("right after the current task: Read four files"));
         let long = queued_message_notice(&"x".repeat(80), "t", false);
-        assert!(long.contains(&format!("{}...", "x".repeat(50))));
+        assert!(long.contains(&format!("{}…", "x".repeat(49))));
+    }
+
+    #[test]
+    fn a_preview_ends_on_a_whole_word() {
+        use super::word_preview;
+        let request = "Every day at 7:13 am, send me a one-line synthetic test reminder \
+                       that says: daily-check beta.";
+        assert_eq!(
+            word_preview(request, 80),
+            "Every day at 7:13 am, send me a one-line synthetic test reminder that says:…"
+        );
+        assert_eq!(word_preview("short request", 80), "short request");
+        assert_eq!(
+            word_preview(&"y".repeat(90), 10),
+            format!("{}…", "y".repeat(9))
+        );
+        let notice = queued_message_notice(
+            "What scheduled goals do I have?",
+            &word_preview(request, 80),
+            false,
+        );
+        assert!(
+            notice.contains(
+                "(Every day at 7:13 am, send me a one-line synthetic test reminder that says:…)"
+            ),
+            "{notice}"
+        );
+        let queued = queued_message_notice(request, "t", false);
+        assert!(
+            queued.contains("\"Every day at 7:13 am, send me a one-line…\""),
+            "{queued}"
+        );
     }
 }

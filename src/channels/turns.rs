@@ -252,7 +252,8 @@ impl TurnRunner {
             // Each turn gets the whole limit; a message queued behind a long
             // turn does not inherit what that turn used.
             let owner_wait = crate::tools::OwnerWaitClock::default();
-            let description: String = text.chars().take(80).collect();
+            // Shown in "current task (…)" notices and cancel replies.
+            let description = super::presentation::word_preview(&text, 80);
             let (task_id, cancel) = registry.register(&session_id, &description).await;
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
             registry.set_heartbeat(task_id, heartbeat.clone()).await;
@@ -389,15 +390,10 @@ impl TurnRunner {
             // Let the finished turn's messages commit first.
             tokio::time::sleep(Duration::from_millis(100)).await;
             let queued = surface.before_queued(queued).await;
-            let preview: String = queued.text.chars().take(50).collect();
+            let preview = super::presentation::word_preview(&queued.text, 50);
             info!(session_id, "Processing queued message: {}", preview);
-            let ellipsis = if queued.text.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
             let _ = surface
-                .say(&format!("▶️ Processing queued: \"{preview}{ellipsis}\""))
+                .say(&format!("▶️ Processing queued: \"{preview}\""))
                 .await;
             text = queued.text;
             role = queued.user_role;
