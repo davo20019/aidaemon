@@ -8,6 +8,8 @@
 //!   model calls made outside the agent loop ([`llm::side_calls`],
 //!   [`llm::gateway`]), with the optional decision backend
 //!   ([`llm::decide`]).
+//! - [`engine`]: the boundary between a turn's kernel run and its host:
+//!   the host calls, the forwarding hooks and the host provider.
 //! - [`chat_bridge`]: calling an SDK provider with chat-completions JSON,
 //!   and the classified provider errors recovery decisions read.
 //! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
@@ -22,6 +24,7 @@
 
 pub mod chat_bridge;
 pub mod context_budget;
+pub mod engine;
 pub mod llm;
 pub mod markers;
 pub mod message_content;

@@ -43,7 +43,7 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -61,6 +61,10 @@ use crate::config::{AppConfig, ProviderKind, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
+use aidaemon_runtime::engine::calls::{
+    AfterCallCheck, BudgetCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice,
+    ModelErrorCheck, StopCheck, ToolRequest,
+};
 
 #[path = "sdk_engine/budgets.rs"]
 mod budgets;
@@ -88,9 +92,7 @@ use stop::*;
 /// detector bound runaway work; this only stops a run that defeats all three.
 /// Long coding tasks routinely need well over a hundred tool rounds.
 const DEFAULT_MAX_TURNS: u32 = 150;
-/// Daemon tools enforce their own timeouts (terminal backgrounding, CLI
-/// agents); this only stops a wedged call from holding the turn forever.
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+use aidaemon_runtime::engine::TOOL_TIMEOUT;
 const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
 /// How turns run on the SDK kernel. Held by the root agent and inherited by
 /// every child it spawns.
@@ -310,25 +312,6 @@ pub(in crate::agent) fn turn_cwd(backend: &dyn crate::execution::ExecutionBacken
     backend.workspace_root().as_str().to_string()
 }
 
-/// Everything the SDK run asks of the daemon, served on the turn's own task.
-/// What the kernel's event sink hands to the turn's dispatcher.
-enum KernelNotice {
-    /// A call the kernel refused before dispatch.
-    Refusal(sdk::Receipt),
-    /// The stuck detector fired.
-    Stuck,
-}
-
-pub(super) enum DaemonCall {
-    Tool(ToolRequest),
-    AfterCall(AfterCallCheck),
-    Gate(GateRequest),
-    Model(ModelCall),
-    Stop(StopCheck),
-    Budget(BudgetCheck),
-    ModelError(ModelErrorCheck),
-}
-
 /// What turn setup (`main_loop.rs`) settled before the SDK run starts:
 /// the recorded task, the structural contract, the offered tools, the selected
 /// model and the system prompt.
@@ -388,29 +371,6 @@ pub(in crate::agent) struct SdkTurnSetup {
     /// an automatic re-run (`deferred_retry`). False for a continuation of
     /// another task, which that task's own recovery owns.
     pub(in crate::agent) defer_on_provider_failure: bool,
-}
-
-/// The model wants to stop; the dispatcher asks the run ledger.
-/// A model response to charge against the budgets before it is acted on.
-pub(super) struct BudgetCheck {
-    response: sdk::ModelResponse,
-    reply: oneshot::Sender<sdk::ModelDecision>,
-}
-
-/// A failed model call, for the daemon to say whether to try again.
-pub(super) struct ModelErrorCheck {
-    /// The provider stack gave up on a timeout; it retried the rest itself.
-    timed_out: bool,
-    reply: oneshot::Sender<sdk::ModelErrorDecision>,
-}
-
-pub(super) struct StopCheck {
-    /// Operations of this run that completed.
-    completed_results: usize,
-    /// The run's latest tool call failed and none succeeded.
-    failed_without_success: bool,
-    final_text: String,
-    reply: oneshot::Sender<sdk::StopDecision>,
 }
 
 /// What a turn's terminal canonicalizer reads (see [`terminal_canonicalizer`]).
@@ -500,52 +460,6 @@ pub(super) fn terminal_canonicalizer(
         };
         super::approvals::JudgedTerminal { call, scope }
     }
-}
-
-/// One kernel tool call as the daemon dispatcher sees it.
-pub(super) struct KernelCall {
-    /// The kernel run the call belongs to (call ids are unique per run).
-    run_id: sdk::RunId,
-    name: String,
-    arguments: Value,
-    call_id: String,
-}
-
-/// A dispatched call came back to the kernel; record it.
-pub(super) struct AfterCallCheck {
-    run_id: sdk::RunId,
-    call_id: String,
-    /// What the model reads; `None` when the dispatcher ran no such call.
-    reply: oneshot::Sender<Option<sdk::ToolOutput>>,
-}
-
-/// One tool call handed from the SDK run to the daemon dispatcher.
-pub(super) struct ToolRequest {
-    call: KernelCall,
-    reply: oneshot::Sender<sdk::ToolResult>,
-    /// Cancelled when the kernel stops waiting for this call (its timeout, or
-    /// the run ending), so the tool stops too instead of running on unseen.
-    abandoned: tokio_util::sync::CancellationToken,
-}
-
-impl std::ops::Deref for ToolRequest {
-    type Target = KernelCall;
-    fn deref(&self) -> &KernelCall {
-        &self.call
-    }
-}
-
-impl std::ops::DerefMut for ToolRequest {
-    fn deref_mut(&mut self) -> &mut KernelCall {
-        &mut self.call
-    }
-}
-
-/// A call the kernel's hooks allowed so far, put to the dispatcher's gates
-/// ([`hooks::DispatchGate`]) before it runs.
-pub(super) struct GateRequest {
-    call: KernelCall,
-    reply: oneshot::Sender<sdk::ToolDecision>,
 }
 
 /// Encode the image attachments `model` may see. Returns the images and
