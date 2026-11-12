@@ -10,15 +10,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::oauth::SharedHttpProfiles;
-use crate::skills::{self, Skill};
-use crate::tools::http_request::HttpRequestTool;
-use crate::tools::skill_registry::{self, RegistryEntry};
-use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
-use crate::traits::{
-    semantics_for_exact_read_actions, SkillsStore, Tool, ToolCallContext, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects,
+use super::skill_registry::{self, RegistryEntry};
+use crate::SkillsStore;
+use crate::{self as skills, Skill};
+use aidaemon_tools::http_request::HttpRequestTool;
+use aidaemon_tools::http_request::SharedHttpProfiles;
+use aidaemon_tools::semantics::{
+    semantics_for_exact_read_actions, ToolCallContext, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects,
 };
+use aidaemon_tools::web::{build_browser_client, validate_url_for_ssrf};
+use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
@@ -144,7 +146,7 @@ struct GraphQlIntrospectionSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ApiSafeProbe {
+pub struct ApiSafeProbe {
     pub method: String,
     pub url: String,
     pub body: Option<String>,
@@ -153,7 +155,7 @@ pub(crate) struct ApiSafeProbe {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LearnedApiArtifact {
+pub struct LearnedApiArtifact {
     pub output: String,
     pub safe_probe: Option<ApiSafeProbe>,
 }
@@ -2101,7 +2103,7 @@ impl ManageSkillsTool {
         Ok((written.display().to_string(), existed))
     }
 
-    pub(crate) async fn learn_api_and_persist(
+    pub async fn learn_api_and_persist(
         &self,
         name: Option<&str>,
         profile: Option<&str>,
@@ -3023,8 +3025,8 @@ impl Tool for ManageSkillsTool {
     fn approval_card_kind(
         &self,
         _request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> crate::types::ApprovalKind {
-        crate::types::ApprovalKind::CommandOnce
+    ) -> aidaemon_tools::semantics::ApprovalKind {
+        aidaemon_tools::semantics::ApprovalKind::CommandOnce
     }
 
     fn description(&self) -> &str {
@@ -3088,13 +3090,13 @@ impl Tool for ManageSkillsTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         self.run(arguments, &facts)
             .await
-            .map(crate::traits::ToolCallOutcome::from_output)
+            .map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
@@ -3102,15 +3104,11 @@ impl ManageSkillsTool {
     /// Run one call with the dispatcher's `facts`. The owner's approval
     /// for the actions that fetch external skill content comes from the
     /// agent kernel (`owner_approval_request`); outside it they are refused.
-    pub(crate) async fn run(
-        &self,
-        arguments: &str,
-        facts: &ToolCallContext,
-    ) -> anyhow::Result<String> {
+    pub async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ManageSkillsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
         if Self::approval_for(&args, !self.registry_urls.is_empty()).is_some()
-            && facts.kernel_approved != Some(crate::traits::ApprovalScope::Call)
+            && facts.kernel_approved != Some(aidaemon_tools::semantics::ApprovalScope::Call)
         {
             anyhow::bail!(
                 "manage_skills {} requires approval through the agent kernel; it was called \
@@ -3251,16 +3249,16 @@ impl ManageSkillsTool {
 
     /// The owner approval for one call, judged from its arguments alone
     /// (`_` keys are not arguments). A call that cannot be read never runs.
-    pub(crate) fn owner_approval(
+    pub fn owner_approval(
         arguments: &Value,
         has_registries: bool,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
         let Ok(args) = serde_json::from_value::<ManageSkillsArgs>(arguments.clone()) else {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
         };
         match Self::approval_for(&args, has_registries) {
-            Some(request) => crate::traits::OwnerApprovalNeed::Ask(request),
-            None => crate::traits::OwnerApprovalNeed::NotNeeded,
+            Some(request) => aidaemon_tools::semantics::OwnerApprovalNeed::Ask(request),
+            None => aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded,
         }
     }
 
@@ -3270,12 +3268,9 @@ impl ManageSkillsTool {
     /// a declined fetch binds that host; the fetched content then becomes a
     /// skill, so no fetching call claims its effects are exhaustive. Every
     /// other change stays undeclared (`unknown`).
-    pub(crate) fn effects_for(
-        arguments: &str,
-        registries: &[String],
-    ) -> aidaemon_core::CallEffects {
-        use crate::tools::command_effects::url_effect;
+    pub fn effects_for(arguments: &str, registries: &[String]) -> aidaemon_core::CallEffects {
         use aidaemon_core::CallEffects;
+        use aidaemon_tools::command_effects::url_effect;
         let Ok(args) = serde_json::from_str::<ManageSkillsArgs>(arguments) else {
             return CallEffects::unknown();
         };
@@ -3304,17 +3299,17 @@ impl ManageSkillsTool {
 }
 
 #[async_trait]
-impl crate::traits::ToolSemantics for ManageSkillsTool {
+impl aidaemon_tools::semantics::ToolSemantics for ManageSkillsTool {
     /// Fetching external skill content asks the owner, whatever the
     /// session. The dispatcher runs the call only with that answer; a
     /// decline is recorded by the kernel.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &aidaemon_tools::semantics::ApprovalCall<'_>,
         _facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
         if call.refused {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
         }
         Self::owner_approval(call.arguments, !self.registry_urls.is_empty())
     }
@@ -3357,34 +3352,22 @@ impl crate::traits::ToolSemantics for ManageSkillsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::CallWithFacts;
-    use crate::traits::ToolCalls as _;
+    use aidaemon_tools::testing::CallWithFacts;
+    use aidaemon_tools::testing::ToolCalls as _;
     use std::sync::Arc;
 
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::traits::store_prelude::*;
-    use crate::traits::SkillDraft;
+    use crate::InMemorySkillStore;
+    use aidaemon_memory::skills::{SkillDraft, SkillStore};
     use serde_json::json;
 
-    async fn setup_tool() -> (ManageSkillsTool, Arc<dyn StateStore>, tempfile::TempDir) {
+    async fn setup_tool() -> (ManageSkillsTool, Arc<dyn SkillStore>, tempfile::TempDir) {
         let skills_dir = tempfile::TempDir::new().unwrap();
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let sqlite_state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(db_file);
-
+        let store = Arc::new(InMemorySkillStore::new());
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
-            sqlite_state.clone() as Arc<dyn crate::traits::SkillsStore>,
+            store.clone() as Arc<dyn crate::SkillsStore>,
         );
-
-        (tool, sqlite_state as Arc<dyn StateStore>, skills_dir)
+        (tool, store as Arc<dyn SkillStore>, skills_dir)
     }
 
     #[test]
@@ -3737,7 +3720,7 @@ mutation CreateWidget {
     /// injected `_` keys.
     #[test]
     fn fetching_actions_ask_the_owner_and_others_do_not() {
-        use crate::traits::OwnerApprovalNeed;
+        use aidaemon_tools::semantics::OwnerApprovalNeed;
         let ask = |args: Value, registries: bool| match ManageSkillsTool::owner_approval(
             &args, registries,
         ) {
@@ -3807,7 +3790,7 @@ mutation CreateWidget {
             r#"{"action":"update","name":"updatable"}"#,
         ] {
             let error = tool
-                .call_with(args, crate::testing::call_facts("test:owner"))
+                .call_with(args, aidaemon_tools::testing::call_facts("test:owner"))
                 .await
                 .expect_err(args);
             assert!(
@@ -3820,7 +3803,7 @@ mutation CreateWidget {
         let listed = tool
             .call_with(
                 r#"{"action":"list"}"#,
-                crate::testing::call_facts("test:owner"),
+                aidaemon_tools::testing::call_facts("test:owner"),
             )
             .await
             .unwrap();

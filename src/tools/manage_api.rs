@@ -16,7 +16,7 @@ use crate::traits::{
 };
 use crate::types::StatusUpdate;
 
-use super::manage_skills::{ApiSafeProbe, LearnedApiArtifact};
+use aidaemon_skills::tools::{ApiSafeProbe, LearnedApiArtifact};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApiAuthMode {

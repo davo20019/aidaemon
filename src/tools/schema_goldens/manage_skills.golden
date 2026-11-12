@@ -1,0 +1,76 @@
+{
+  "description": "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources.",
+  "name": "manage_skills",
+  "schema": {
+    "description": "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources.",
+    "name": "manage_skills",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Action",
+          "enum": [
+            "add",
+            "add_inline",
+            "learn_api",
+            "list",
+            "remove",
+            "remove_all",
+            "enable",
+            "disable",
+            "browse",
+            "install",
+            "update",
+            "review"
+          ],
+          "type": "string"
+        },
+        "approve": {
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Inline markdown (add_inline)",
+          "type": "string"
+        },
+        "draft_id": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "auto",
+            "openapi",
+            "docs"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "names": {
+          "description": "Names (remove_all)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "profile": {
+          "description": "Auth profile for learn_api",
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

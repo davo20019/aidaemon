@@ -89,3 +89,17 @@ fn dev_tool_schema_goldens() {
 fn list_checkpoints_schema_golden() {
     check_golden(&crate::tools::ListCheckpointsTool);
 }
+
+#[test]
+fn skills_tools_schema_goldens() {
+    let dir = std::env::temp_dir().join("aidaemon-golden-skills");
+    check_golden(&crate::tools::UseSkillTool::new(dir.clone()));
+    check_golden(&crate::tools::SkillResourcesTool::new(
+        dir.clone(),
+        std::sync::Arc::new(crate::skills::FileSystemResolver::new()),
+    ));
+    check_golden(&crate::tools::ManageSkillsTool::new(
+        dir,
+        std::sync::Arc::new(aidaemon_skills::InMemorySkillStore::new()),
+    ));
+}

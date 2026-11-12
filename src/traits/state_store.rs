@@ -33,9 +33,7 @@ pub trait HealthCheckStore: Send + Sync {
 }
 
 /// Focused persistence contract used by skill startup and management.
-pub trait SkillsStore: SkillStore + SettingsStore {}
-
-impl<T> SkillsStore for T where T: SkillStore + SettingsStore {}
+pub use aidaemon_skills::SkillsStore;
 
 /// Facade trait kept for backwards compatibility.
 ///

@@ -14,7 +14,7 @@
 //! ]
 //! ```
 
-use crate::tools::web_fetch::validate_url_for_ssrf;
+use aidaemon_tools::web::validate_url_for_ssrf;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 

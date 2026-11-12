@@ -1,0 +1,21 @@
+{
+  "description": "Load a skill's full instructions by name. Use it when a skill in the Available Skills list clearly fits the task and you need its specifics. Do NOT guess skill names — only use skills that are listed or that the user asked for by name.",
+  "name": "use_skill",
+  "schema": {
+    "description": "Load a skill's full instructions by name. Use it when a skill in the Available Skills list clearly fits the task and you need its specifics. Do NOT guess skill names — only use skills that are listed or that the user asked for by name.",
+    "name": "use_skill",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "skill_name": {
+          "description": "Name of the skill to activate",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_name"
+      ],
+      "type": "object"
+    }
+  }
+}

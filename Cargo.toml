@@ -44,6 +44,7 @@ members = [
     "crates/aidaemon-events",
     "crates/aidaemon-work",
     "crates/aidaemon-runtime",
+    "crates/aidaemon-skills",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
     "crates/aidaemon-channel-slack",
@@ -129,6 +130,7 @@ aidaemon-decisions = { version = "=0.2.0", path = "crates/aidaemon-decisions", f
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { version = "=0.2.0", path = "crates/aidaemon-tools", features = ["checkpoints"] }
+aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 aidaemon-tool-browser = { version = "=0.2.0", path = "crates/aidaemon-tool-browser" }
 aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers" }
 # The MCP transport; the daemon keeps its registry and result rendering.

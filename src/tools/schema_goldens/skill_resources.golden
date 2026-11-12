@@ -1,0 +1,34 @@
+{
+  "description": "Access resources bundled with a skill. Use 'list' to see available resources, 'read' to load a specific file.",
+  "name": "skill_resources",
+  "schema": {
+    "description": "Access resources bundled with a skill. Use 'list' to see available resources, 'read' to load a specific file.",
+    "name": "skill_resources",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Action: 'list' available resources or 'read' a specific resource",
+          "enum": [
+            "list",
+            "read"
+          ],
+          "type": "string"
+        },
+        "resource_path": {
+          "description": "Relative path of resource to read (e.g. 'references/guide.md'). Required for 'read' action.",
+          "type": "string"
+        },
+        "skill_name": {
+          "description": "Name of the skill",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_name",
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

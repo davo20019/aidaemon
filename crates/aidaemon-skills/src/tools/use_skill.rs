@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::skills;
-use crate::tools::sanitize::sanitize_external_content;
-use crate::traits::{Tool, ToolCapabilities};
+use crate as skills;
+use aidaemon_tools::sanitize::sanitize_external_content;
+use aidaemon_tools::semantics::ToolCapabilities;
+use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct UseSkillTool {
     skills_dir: PathBuf,
@@ -48,8 +49,8 @@ impl Tool for UseSkillTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
         let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
@@ -78,11 +79,11 @@ impl Tool for UseSkillTool {
             ))
         }
     }.await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for UseSkillTool {
+impl aidaemon_tools::semantics::ToolSemantics for UseSkillTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -97,8 +98,8 @@ impl crate::traits::ToolSemantics for UseSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::Skill;
-    use crate::traits::ToolCalls as _;
+    use crate::Skill;
+    use aidaemon_tools::testing::ToolCalls as _;
 
     fn make_skill(name: &str, body: &str) -> Skill {
         Skill {

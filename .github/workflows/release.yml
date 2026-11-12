@@ -342,6 +342,7 @@ jobs:
             aidaemon-events
             aidaemon-tool-browser
             aidaemon-memory
+            aidaemon-skills
             aidaemon-work
             aidaemon-runtime
             aidaemon-sdk
