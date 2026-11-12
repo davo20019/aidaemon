@@ -313,20 +313,29 @@ fn denial_reason(tool: &str, verdict: &VerifierVerdict) -> String {
     }
 }
 
-/// The verdict in the verifier's reply; anything else fails closed.
+/// The verdict in the verifier's reply; anything else fails closed. A
+/// failover model that does not honour the schema may wrap the one object in
+/// a code fence or a sentence: the object is still read, but only when the
+/// reply holds exactly one object of the verdict's shape.
 fn parse_verdict(raw: &str) -> VerifierVerdict {
     #[derive(serde::Deserialize)]
     struct Wire {
         consistent: bool,
         reason: String,
     }
-    match serde_json::from_str::<Wire>(raw.trim()) {
-        Ok(wire) => VerifierVerdict {
+    let raw = raw.trim();
+    let wire = serde_json::from_str::<Wire>(raw).ok().or_else(|| {
+        let start = raw.find('{')?;
+        let end = raw.rfind('}')?;
+        serde_json::from_str::<Wire>(raw.get(start..=end)?).ok()
+    });
+    match wire {
+        Some(wire) => VerifierVerdict {
             consistent: wire.consistent,
             reason: wire.reason.trim().to_string(),
             decided: true,
         },
-        Err(_) => could_not_verify(),
+        None => could_not_verify(),
     }
 }
 
@@ -431,6 +440,16 @@ impl UntrustedVerifier<'_> {
             &self.cancel,
         )
         .await;
+        if !verdict.consistent {
+            // Why a step was held: the card shows it, and the log keeps it
+            // for a live test that only has the log.
+            tracing::info!(
+                tool,
+                decided = verdict.decided,
+                reason = %verdict.reason,
+                "Untrusted call verifier did not pass the call"
+            );
+        }
         self.decisions
             .record_decision_point(
                 self.emitter,
@@ -973,5 +992,23 @@ mod tests {
         for bad in ["not json", "", r#"{"consistent":"yes","reason":"x"}"#, "{}"] {
             assert_eq!(parse_verdict(bad), could_not_verify(), "{bad}");
         }
+    }
+
+    /// A failover model without schema support may fence its one verdict
+    /// object: it still reads. Two objects, or none, fail closed.
+    #[test]
+    fn a_fenced_verdict_from_a_failover_model_still_reads() {
+        let fenced = "```json\n{\"consistent\": true, \"reason\": \"asked for\"}\n```";
+        assert_eq!(
+            parse_verdict(fenced),
+            VerifierVerdict {
+                consistent: true,
+                reason: "asked for".to_string(),
+                decided: true,
+            }
+        );
+        let two = r#"{"consistent":false,"reason":"a"} {"consistent":true,"reason":"b"}"#;
+        assert_eq!(parse_verdict(two), could_not_verify());
+        assert_eq!(parse_verdict("Sure! consistent"), could_not_verify());
     }
 }

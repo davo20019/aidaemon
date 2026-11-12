@@ -235,8 +235,12 @@ impl LlmRuntimeSnapshot {
         wrap: impl FnOnce(ModelBackend) -> ModelBackend,
     ) -> Result<aidaemon_events::provider::ProviderResponse, String> {
         use crate::chat_bridge::ChatJson;
-        let backend = wrap(self.model_routed_backend());
-        let models = self.with_failover_models(vec![self.primary_model()]);
+        let routed = self.model_routed_backend();
+        let models = available_first(
+            &routed,
+            self.with_failover_models(vec![self.primary_model()]),
+        );
+        let backend = wrap(routed);
         let deadline = std::time::Instant::now() + budget;
         let mut last_error = "no model available".to_string();
         for model in models {
@@ -291,6 +295,30 @@ impl LlmRuntimeSnapshot {
             routes,
         })
     }
+}
+
+/// `models` without those their provider already knows cannot answer now
+/// (a used-up quota, a rejected key: [`aidaemon_core::QuotaGuard`]), so a
+/// judgment does not pay for a known refusal on every call. When every model
+/// is known to be out, all are kept: the attempts then fail at once and the
+/// last error says why.
+fn available_first(
+    backend: &ModelBackend,
+    models: Vec<String>,
+) -> Vec<String> {
+    let now = std::time::SystemTime::now();
+    let (out, available): (Vec<String>, Vec<String>) = models.into_iter().partition(|model| {
+        backend
+            .unavailable_until(model)
+            .is_some_and(|until| until > now)
+    });
+    if available.is_empty() {
+        return out;
+    }
+    if !out.is_empty() {
+        tracing::debug!(skipped = ?out, "Safety judgment skips models known to be out");
+    }
+    available
 }
 
 #[derive(Clone)]
@@ -426,6 +454,10 @@ impl aidaemon_core::Provider for ModelRoutedBackend {
         self.backend_for(&request.model).complete(request).await
     }
 
+    fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
+        self.backend_for(model).unavailable_until(model)
+    }
+
     fn stream<'a>(
         &'a self,
         request: &'a aidaemon_core::ModelRequest,
@@ -494,6 +526,83 @@ mod tests {
         let served = failover.requests();
         assert_eq!(served.len(), 1);
         assert_eq!(served[0].model, "failover-model");
+    }
+
+    /// A used-up quota on the judge's primary model is an infrastructure
+    /// failure: the judgment moves on to the failover provider and is
+    /// answered there. Once the primary is known to be out, later
+    /// judgments skip it instead of paying for its refusal each time; a
+    /// failure tied to the request still stops at the first model.
+    #[tokio::test]
+    async fn a_judgment_fails_over_past_a_used_up_quota_and_then_skips_it() {
+        let primary = Arc::new(ScriptedProvider::with_results([Err(
+            aidaemon_core::ProviderError::QuotaExhausted {
+                message: "usage limit reached".into(),
+                resets_at: None,
+                per_model: false,
+                in_stream: false,
+            },
+        )]));
+        let guarded: ModelBackend = Arc::new(aidaemon_core::QuotaGuard::from_arc(primary.clone()));
+        let verdict = r#"{"consistent":true,"reason":"asked for"}"#;
+        let failover = Arc::new(ScriptedProvider::new([text(verdict), text(verdict)]));
+        let runtime = SharedLlmRuntime::new_with_failovers(
+            guarded,
+            None,
+            ProviderKind::OpenaiChatgpt,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                failover.clone(),
+                None,
+                ProviderKind::Anthropic,
+                "failover-model".to_string(),
+            )],
+        );
+        let messages = [serde_json::json!({"role": "user", "content": "judge this"})];
+        for _ in 0..2 {
+            let answer = runtime
+                .snapshot()
+                .ask_for_judgment_through(
+                    &messages,
+                    &Default::default(),
+                    std::time::Duration::from_secs(5),
+                    |backend| backend,
+                )
+                .await
+                .expect("the failover provider judges");
+            assert_eq!(answer.content.as_deref(), Some(verdict));
+        }
+        assert_eq!(primary.requests().len(), 1, "the out-of-quota model is asked once");
+        assert_eq!(failover.requests().len(), 2);
+
+        // A request the provider rejected as malformed stops at once.
+        let rejecting = Arc::new(ScriptedProvider::with_results([Err(
+            aidaemon_core::ProviderError::InvalidRequest("schema rejected".into()),
+        )]));
+        let unused = Arc::new(ScriptedProvider::new([text(verdict)]));
+        let runtime = SharedLlmRuntime::new_with_failovers(
+            rejecting,
+            None,
+            ProviderKind::OpenaiChatgpt,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                unused.clone(),
+                None,
+                ProviderKind::Anthropic,
+                "failover-model".to_string(),
+            )],
+        );
+        let refused = runtime
+            .snapshot()
+            .ask_for_judgment_through(
+                &messages,
+                &Default::default(),
+                std::time::Duration::from_secs(5),
+                |backend| backend,
+            )
+            .await;
+        assert!(refused.is_err());
+        assert!(unused.requests().is_empty());
     }
 
     fn router(default: &str, fallback: &[&str], fast: &str) -> Router {
