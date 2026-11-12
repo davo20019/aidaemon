@@ -552,8 +552,10 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-policies",
+ "aidaemon-secrets",
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "dirs",

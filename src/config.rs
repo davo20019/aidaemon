@@ -70,6 +70,11 @@ pub fn secret_store() -> &'static std::sync::Arc<aidaemon_secrets::KeychainSecre
     })
 }
 
+/// The daemon's secret store as a shared trait object, for the crates.
+pub fn shared_secret_store() -> std::sync::Arc<dyn aidaemon_secrets::SecretStore> {
+    secret_store().clone()
+}
+
 /// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
 pub(crate) fn keychain_disabled() -> bool {
     secret_store().keychain_disabled()
@@ -2666,18 +2671,7 @@ pub struct OAuthConfig {
     pub providers: HashMap<String, OAuthProviderConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct OAuthProviderConfig {
-    #[serde(default)]
-    pub display_name: Option<String>,
-    pub auth_type: String,
-    pub authorize_url: String,
-    pub token_url: String,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    #[serde(default)]
-    pub allowed_domains: Vec<String>,
-}
+pub use aidaemon_tools::services::oauth::OAuthProviderConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PeopleConfig {

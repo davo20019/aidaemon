@@ -8,6 +8,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "oauth")]
+pub mod oauth;
+
 /// The conversation's audience, shared across the SDK.
 pub use aidaemon_core::ChannelVisibility;
 
@@ -222,3 +225,116 @@ pub trait DynamicCliAgentStore: Send + Sync {
 pub trait OAuthGatewayStore: OAuthStore {}
 
 impl<T> OAuthGatewayStore for T where T: OAuthStore {}
+
+/// OAuth connections and pending flows kept in memory, for tests and hosts
+/// without a database. Same upsert rules as the daemon's SQLite store.
+#[derive(Default)]
+pub struct InMemoryOAuthStore {
+    inner: std::sync::Mutex<InMemoryOAuth>,
+}
+
+#[derive(Default)]
+struct InMemoryOAuth {
+    next_id: i64,
+    connections: std::collections::BTreeMap<String, OAuthConnection>,
+    flows: std::collections::HashMap<String, PendingOAuthFlow>,
+}
+
+impl InMemoryOAuthStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InMemoryOAuth> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl OAuthStore for InMemoryOAuthStore {
+    async fn save_oauth_connection(&self, conn: &OAuthConnection) -> anyhow::Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut inner = self.lock();
+        let (id, created_at) = match inner.connections.get(&conn.service) {
+            Some(existing) => (existing.id, existing.created_at.clone()),
+            None => {
+                inner.next_id += 1;
+                (inner.next_id, now.clone())
+            }
+        };
+        inner.connections.insert(
+            conn.service.clone(),
+            OAuthConnection {
+                id,
+                created_at,
+                updated_at: now,
+                ..conn.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn save_pending_oauth_flow(&self, flow: &PendingOAuthFlow) -> anyhow::Result<()> {
+        self.lock().flows.insert(flow.state.clone(), flow.clone());
+        Ok(())
+    }
+
+    async fn get_oauth_connection(&self, service: &str) -> anyhow::Result<Option<OAuthConnection>> {
+        Ok(self.lock().connections.get(service).cloned())
+    }
+
+    async fn list_oauth_connections(&self) -> anyhow::Result<Vec<OAuthConnection>> {
+        Ok(self.lock().connections.values().cloned().collect())
+    }
+
+    async fn update_oauth_account_id(
+        &self,
+        service: &str,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.lock();
+        let Some(conn) = inner.connections.get_mut(service) else {
+            return Ok(false);
+        };
+        conn.account_id = account_id.map(str::to_string);
+        conn.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(true)
+    }
+
+    async fn get_pending_oauth_flow(
+        &self,
+        state: &str,
+    ) -> anyhow::Result<Option<PendingOAuthFlow>> {
+        Ok(self.lock().flows.get(state).cloned())
+    }
+
+    async fn list_pending_oauth_flows(&self) -> anyhow::Result<Vec<PendingOAuthFlow>> {
+        let mut flows: Vec<PendingOAuthFlow> = self.lock().flows.values().cloned().collect();
+        flows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(flows)
+    }
+
+    async fn delete_oauth_connection(&self, service: &str) -> anyhow::Result<()> {
+        self.lock().connections.remove(service);
+        Ok(())
+    }
+
+    async fn delete_pending_oauth_flow(&self, state: &str) -> anyhow::Result<()> {
+        self.lock().flows.remove(state);
+        Ok(())
+    }
+
+    async fn update_oauth_token_expiry(
+        &self,
+        service: &str,
+        expires_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(conn) = self.lock().connections.get_mut(service) {
+            conn.token_expires_at = expires_at.map(str::to_string);
+            conn.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        Ok(())
+    }
+}

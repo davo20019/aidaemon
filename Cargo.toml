@@ -130,7 +130,7 @@ aidaemon-policies = { version = "=0.2.0", path = "crates/aidaemon-policies" }
 aidaemon-decisions = { version = "=0.2.0", path = "crates/aidaemon-decisions", features = ["gemini"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
-aidaemon-tools = { version = "=0.2.0", path = "crates/aidaemon-tools", features = ["checkpoints"] }
+aidaemon-tools = { version = "=0.2.0", path = "crates/aidaemon-tools", features = ["checkpoints", "oauth"] }
 aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 # Secrets: the keychain, its env-file mode and the account names.
 aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
