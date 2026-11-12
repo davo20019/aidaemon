@@ -241,6 +241,7 @@ impl Agent {
                 extra.push(note);
             }
         }
+        self.sdk_note_delivered_notices(scope).await;
         let run = {
             let raised: Vec<String> = scope
                 .extra_system
@@ -558,6 +559,43 @@ impl Agent {
             .last_batch_size
             .store(response.tool_calls.len(), Ordering::Relaxed);
         Ok(from_provider_response(response))
+    }
+
+    /// Notices delivered to this chat since the last model call of the turn
+    /// (`notices_turn_context`), raised as context so the reply never
+    /// contradicts what the owner was just told. Only the turn serving the
+    /// chat reads them: children and mandate runs have sessions of their own.
+    async fn sdk_note_delivered_notices(&self, scope: &TurnScope<'_>) {
+        if self.depth > 0 || self.mandate_execution.is_some() {
+            return;
+        }
+        let Ok(since) = scope.notices_seen.lock().map(|seen| seen.0) else {
+            return;
+        };
+        let notices = match self
+            .state
+            .notices_delivered_since(scope.session_id, since)
+            .await
+        {
+            Ok(notices) => notices,
+            Err(error) => {
+                warn!(task_id = scope.task_id, %error, "SDK engine: could not read notices sent during the turn");
+                return;
+            }
+        };
+        let fresh: Vec<_> = match scope.notices_seen.lock() {
+            Ok(mut seen) => notices
+                .into_iter()
+                .filter(|notice| seen.1.insert(notice.id.clone()))
+                .collect(),
+            Err(_) => return,
+        };
+        let Some(context) = aidaemon_work::goals::notices_turn_context(&fresh) else {
+            return;
+        };
+        if let Ok(mut extra) = scope.extra_system.lock() {
+            extra.push(context);
+        }
     }
 
     /// Messages the same sender sent while this root turn runs, taken from
