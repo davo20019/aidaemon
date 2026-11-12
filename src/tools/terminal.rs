@@ -5088,8 +5088,15 @@ impl TerminalTool {
             Self::dedupe_key_for_run(&dedupe_identity, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
             // The work is already running in the background: the run hands
-            // off to it.
-            return Ok(ToolCallOutcome {
+            // off to it only when its notifier will report the result (a
+            // task-owned job without one dies at task end).
+            let reports_back = self
+                .running
+                .lock()
+                .await
+                .get(&existing_pid)
+                .is_some_and(|proc| proc.notifier_active);
+            let outcome = ToolCallOutcome {
                 output: format!(
                     "Equivalent command is already running in this scope (pid={}). \
                      Use action=\"check\" pid={} to inspect progress or action=\"kill\" pid={} to stop it.",
@@ -5102,8 +5109,12 @@ impl TerminalTool {
                     ..ToolCallMetadata::default()
                 },
                 finish: None,
-            }
-            .handed_to_background());
+            };
+            return Ok(if reports_back {
+                outcome.handed_to_background()
+            } else {
+                outcome
+            });
         }
 
         let capabilities = ConfinedCapabilities { network };
@@ -6462,12 +6473,22 @@ impl TerminalTool {
                         pid,
                         pid
                     )
-                } else {
+                } else if notifier_started {
                     format!(
                         "Command still running after {}s. Moved to background (pid={}).\n\
                          IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
                          You can run other commands (like curl) while this runs in the background.\n\
                          Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
+                        elapsed, pid, pid, pid
+                    )
+                } else {
+                    // Nothing will report this job's result: the run keeps
+                    // going and reads it itself before the task ends.
+                    format!(
+                        "Command still running after {}s. Moved to background (pid={}).\n\
+                         You can run other commands (like curl) while this runs in the background.\n\
+                         No completion notification is available here, so nothing will report its result: \
+                         use action=\"check\" with pid={} to read its output and result before you finish, or action=\"kill\" with pid={} to stop it.",
                         elapsed, pid, pid, pid
                     )
                 };
@@ -6510,12 +6531,15 @@ impl TerminalTool {
                     finish: None,
                 };
                 // Work the daemon moved to background tracking hands the run
-                // off; a launch the model detached on purpose is a running
-                // service whose startup output the model reports.
-                Ok(if detach {
-                    outcome
-                } else {
+                // off only when the notifier will report its result: a
+                // task-owned job without one dies at task end, so the run
+                // keeps going and reads the result itself. A launch the model
+                // detached on purpose is a running service whose startup
+                // output the model reports.
+                Ok(if notifier_started && !detach {
                     outcome.handed_to_background()
+                } else {
+                    outcome
                 })
             }
         }
@@ -10980,6 +11004,64 @@ mod tests {
                 ),
                 None,
                 crate::testing::call_facts("sess_background_job"),
+            )
+            .await;
+    }
+
+    /// A background job hands the run off only when something will report
+    /// back: without a notifier the task end would kill the job and lose its
+    /// output, so the run keeps going and the output says how to read the
+    /// result instead of promising a notification.
+    #[tokio::test]
+    async fn background_run_without_notifier_keeps_the_run() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        // No state queue and no hub: no completion notifier can start.
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            state.pool(),
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 20; echo counted","background":true}"#,
+                None,
+                crate::testing::call_facts("sess_background_no_notifier"),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.background_started);
+        assert!(!outcome.metadata.completion_notifications_enabled);
+        assert!(!outcome.metadata.background_handoff);
+        assert!(outcome.finish.is_none());
+        assert!(!outcome.output.contains("do NOT wait or repeatedly check"));
+        assert!(outcome.output.contains("action=\"check\""));
+        let pid = outcome
+            .output
+            .split("pid=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .unwrap()
+            .to_string();
+        let _ = tool
+            .call_with_execution_context(
+                &format!(r#"{{"action":"kill","pid":{pid}}}"#),
+                None,
+                crate::testing::call_facts("sess_background_no_notifier"),
             )
             .await;
     }
