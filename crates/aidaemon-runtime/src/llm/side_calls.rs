@@ -38,6 +38,10 @@ pub enum SideCall {
     /// Answers a decision's closed questions on a chat model, when the
     /// decision backend is `provider` (see `llm_runtime::decisions`).
     DecisionAsk,
+    /// Reads a message the owner sent while a run is going: a question
+    /// about that work (answered from its live state), a change to it, or
+    /// something else.
+    MidRunMessage,
 }
 
 /// What a side call's answer is used for; this sets how it may fail.
@@ -102,7 +106,7 @@ pub struct SideCallSpec {
 impl SideCall {
     /// Every side call, in registry order.
     #[cfg(test)]
-    pub const ALL: [SideCall; 14] = [
+    pub const ALL: [SideCall; 15] = [
         SideCall::UntrustedVerifier,
         SideCall::CommandRisk,
         SideCall::RelationshipRouter,
@@ -117,6 +121,7 @@ impl SideCall {
         SideCall::SkillPromotion,
         SideCall::ParentCoordination,
         SideCall::DecisionAsk,
+        SideCall::MidRunMessage,
     ];
 
     /// This call's spec.
@@ -157,6 +162,9 @@ impl SideCall {
             // The decision's own deadline bounds it too; whoever asked
             // falls back to its default on failure.
             SideCall::DecisionAsk => ("decision_ask", InputShaper, CallerSupplied, 10, SafeDefault),
+            // The owner is waiting on a chat reply; on failure the message
+            // joins the running work, as before.
+            SideCall::MidRunMessage => ("mid_run_message", InputShaper, Cheap, 15, SafeDefault),
         };
         SideCallSpec {
             purpose,

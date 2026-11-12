@@ -45,6 +45,9 @@ pub struct QueuedMessage {
     /// Optional transport timing follows the exact message through queue
     /// coalescing and later agent dispatch.
     pub ingress_timing: Option<crate::ports::InboundMessageTiming>,
+    /// Whether the running turn may take it in mid-run. A message read as
+    /// unrelated to the running work waits for its own turn.
+    pub steerable: bool,
 }
 
 impl QueuedMessage {
@@ -61,7 +64,14 @@ impl QueuedMessage {
             attachments,
             queued_at: Utc::now(),
             ingress_timing: None,
+            steerable: true,
         }
+    }
+
+    /// Keep it out of the running turn: it runs as its own turn.
+    pub fn not_steerable(mut self) -> Self {
+        self.steerable = false;
+        self
     }
 
     pub fn with_ingress_timing(mut self, mut timing: crate::ports::InboundMessageTiming) -> Self {
@@ -463,9 +473,10 @@ impl TaskRegistry {
 
     /// Take the queued messages a running turn can absorb mid-run: from the
     /// front of the queue, while each comes from the same principal and
-    /// channel context as the turn (`user_role`, `channel_ctx`) and carries
-    /// no attachments. The first message that differs, and everything after
-    /// it, stays queued for its own turn, so order and authorization hold.
+    /// channel context as the turn (`user_role`, `channel_ctx`), carries
+    /// no attachments and was not kept for its own turn (`steerable`). The
+    /// first message that differs, and everything after it, stays queued for
+    /// its own turn, so order and authorization hold.
     pub async fn take_steering_messages(
         &self,
         session_id: &str,
@@ -478,7 +489,8 @@ impl TaskRegistry {
         };
         let mut taken = Vec::new();
         while queue.front().is_some_and(|next| {
-            next.user_role == user_role
+            next.steerable
+                && next.user_role == user_role
                 && &next.channel_ctx == channel_ctx
                 && next.attachments.is_empty()
         }) {
@@ -691,6 +703,23 @@ mod tests {
             .take_steering_messages(session, UserRole::Owner, &ctx)
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_leaves_a_message_kept_for_its_own_turn_queued() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-separate";
+        let separate = queued("what is the capital of Peru?").not_steerable();
+        let ctx = separate.channel_ctx.clone();
+        registry.queue_message(session, separate, None).await;
+        registry
+            .queue_message(session, queued("and the docs"), None)
+            .await;
+        assert!(registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await
+            .is_empty());
+        assert_eq!(registry.queue_len(session).await, 2);
     }
 
     #[tokio::test]

@@ -115,9 +115,70 @@ pub trait AgentIngress: Send + Sync {
     }
 }
 
+/// What a message sent while a run is going is about, as the model read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidRunIntent {
+    /// A question about the running work: how it is going, what it found,
+    /// whether a result is ready. Answered now from the work's live state;
+    /// the run goes on undisturbed.
+    AboutRunningWork,
+    /// It changes or adds to the running work: the run takes it in.
+    ChangesWork,
+    /// Something else: it runs as its own turn once the current one ends.
+    Unrelated,
+}
+
+/// One helper (sub-agent) of the running work, as its progress last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperProgress {
+    /// The helper's job, in the words it was given.
+    pub label: String,
+    /// Its own progress line ("step 2 of 4: ...").
+    pub progress: String,
+    /// How long ago that progress came.
+    pub since: std::time::Duration,
+}
+
+/// The running work as its typed live state shows it, for answering a
+/// question about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunningWork {
+    /// The request the run is working on.
+    pub request: String,
+    /// How long it has been running.
+    pub elapsed: std::time::Duration,
+    /// Its latest step and how long ago it started.
+    pub last_step: Option<(String, std::time::Duration)>,
+    /// Its plan card (checklist), as shown in chat.
+    pub plan: Option<String>,
+    /// Its helpers still reporting progress.
+    pub helpers: Vec<HelperProgress>,
+}
+
+/// How a message sent mid-run is handled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidRunReading {
+    pub intent: MidRunIntent,
+    /// For [`MidRunIntent::AboutRunningWork`]: a short reply drawn from the
+    /// [`RunningWork`]; without one the channel says the state itself.
+    pub answer: Option<String>,
+}
+
 /// Agent administration surface used by shared channel commands.
 #[async_trait]
 pub trait ChannelAgentRuntime: AgentIngress {
+    /// Read a message the owner sent while `work` runs in `session_id`.
+    /// `None` (the default, or when the reading failed) hands it to the
+    /// running work, as a steering message.
+    async fn read_mid_run_message(
+        &self,
+        _session_id: &str,
+        _text: &str,
+        _work: &RunningWork,
+    ) -> Option<MidRunReading> {
+        None
+    }
+
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

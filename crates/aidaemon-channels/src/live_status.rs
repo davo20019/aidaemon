@@ -53,6 +53,7 @@ impl LiveStatus {
 
     async fn flush(&mut self, sink: &dyn SurfaceSink) {
         let Some(body) = self.render() else { return };
+        let body = crate::presentation::render_internal_markers(&body);
         match (&self.message_id, self.edit_supported) {
             (Some(id), true) => match sink.edit(id, &body).await {
                 Ok(true) => {}
