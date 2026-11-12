@@ -7,15 +7,15 @@ description: >
 tags: ["kit:web"]
 input: What's the workaround for the PDF export crash discussed at https://forum.example.test/t/4410?
 script:
-  - tool_calls: [{ name: web_fetch, arguments: { url: "https://forum.example.test/t/4410" } }]
+  - tool_calls: [{ name: web_get_page, arguments: { url: "https://forum.example.test/t/4410" } }]
   - text: Turn off "Embed fonts" under Settings > Export; a proper fix ships in 2.4.1.
 expect:
   status: completed
   final_text_contains: [embed fonts]
-  tools_used: [web_fetch]
+  tools_used: [web_get_page]
   proposed: { tools_not_used: [share_note] }
 live_expect:
   status: completed
   final_text_contains: [embed fonts]
-  tools_used: [web_fetch]
+  tools_used: [web_get_page]
   proposed: { tools_not_used: [share_note] }

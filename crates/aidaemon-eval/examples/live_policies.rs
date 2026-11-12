@@ -9,7 +9,7 @@
 //! ```
 //! Configs: `baseline` (default), `completion_check`, `streak_guard`,
 //! `untrusted_output`, `redactor`, `context_window`, `context_window_8k`,
-//! `egress_guard`, `scope_guard`, `approval`, `all`. Each writes
+//! `context_window_8k_recent2`, `egress_guard`, `scope_guard`, `approval`, `all`. Each writes
 //! `<out_dir>/<config>.json` and prints its report, plus a comparison against
 //! `<out_dir>/baseline.json` when present. Every agent also has the
 //! scenarios' own `DenyDestructive` fixture hook (unless a scenario is
@@ -37,6 +37,7 @@ const CONFIGS: &[&str] = &[
     "redactor",
     "context_window",
     "context_window_8k",
+    "context_window_8k_recent2",
     "egress_guard",
     "scope_guard",
     "approval",
@@ -59,6 +60,10 @@ fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
         "context_window" => vec![Arc::new(ContextWindow::new(120_000))],
         // Below the 10k window `context_trail` gives the model.
         "context_window_8k" => vec![Arc::new(ContextWindow::new(8_000))],
+        // The same with two protected turns, so the protected tail fits.
+        "context_window_8k_recent2" => {
+            vec![Arc::new(ContextWindow::new(8_000).keep_recent_turns(2))]
+        }
         "egress_guard" => vec![Arc::new(EgressGuard::new())],
         // `scope_outside` declares /workspace/app as its workspace.
         "scope_guard" => vec![Arc::new(ScopeGuard::new([
