@@ -10,7 +10,6 @@
 //! and the system decides how to remember. `aidaemon-memory` is the
 //! built-in system; [`DaemonMemory`] is the daemon's own store.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aidaemon_core as sdk;
@@ -331,13 +330,12 @@ pub(crate) struct DaemonMemoryInner {
     /// Runs the conversation summarizer's model calls.
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     context_window_config: crate::config::ContextWindowConfig,
-    max_facts: usize,
     record_decision_points: bool,
-    /// The configured assistant name (pinned among the critical facts).
-    assistant_name: Option<String>,
-    /// Per session, the entities the core profile selected last, so the
-    /// selection stays stable across turns.
-    core_profile_ids: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// The full memory system's recall over `store`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    recall: Arc<aidaemon_memory::full::RecallSource>,
+    /// The full memory system that serves the daemon's turns.
+    system: aidaemon_memory::full::FullMemory,
 }
 
 impl DaemonMemory {
@@ -353,20 +351,26 @@ impl DaemonMemory {
         record_decision_points: bool,
         system_prompt: &str,
     ) -> Self {
+        let recall = Arc::new(aidaemon_memory::full::RecallSource::new(
+            store.clone(),
+            aidaemon_memory::full::RecallSettings {
+                max_facts,
+                assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
+                    system_prompt,
+                ),
+            },
+        ));
         Self {
             inner: Arc::new(DaemonMemoryInner {
+                system: aidaemon_memory::full::FullMemory::new(recall.clone()),
+                recall,
                 state,
                 store,
                 event_store,
                 llm_runtime,
                 side_calls,
                 context_window_config,
-                max_facts,
                 record_decision_points,
-                assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
-                    system_prompt,
-                ),
-                core_profile_ids: tokio::sync::RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -441,10 +445,13 @@ impl DaemonMemory {
     }
 }
 
+/// The daemon's memory is the full memory system (`aidaemon_memory::full`)
+/// served like any other `MemorySystem`: the daemon gives it the turn's
+/// audience, its recall host and its run-end writer.
 #[async_trait]
 impl MemoryPlugin for DaemonMemory {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts {
-        let recall = DaemonRecall::new(self.inner.clone(), turn.clone());
+        use aidaemon_policies::MemorySystem as _;
         let config = &self.inner.context_window_config;
         let writer = DaemonMemoryWriter::new(
             turn.clone(),
@@ -455,11 +462,17 @@ impl MemoryPlugin for DaemonMemory {
             },
             self.inner.clone(),
         );
+        let full = aidaemon_memory::full::FullTurn {
+            recall: recall::recall_turn(turn),
+            host: DaemonRecall::host(&self.inner, turn.clone()),
+            hooks: vec![Arc::new(writer)],
+        };
+        let system_turn =
+            system_memory::host_system_turn(turn, aidaemon_policies::HostTurn::new(full));
+        let parts = self.inner.system.turn(&system_turn).await;
         MemoryParts {
-            hooks: vec![
-                Arc::new(aidaemon_policies::MemoryInjection::new(recall)),
-                Arc::new(writer),
-            ],
+            hooks: parts.hooks,
+            tools: parts.tools,
             ..MemoryParts::default()
         }
     }

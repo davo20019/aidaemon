@@ -2,54 +2,15 @@
 use serde_json::Value;
 
 use super::intent_routing::contains_keyword_as_words;
-use crate::traits::Fact;
+#[cfg(test)]
+use aidaemon_memory::render::{
+    build_critical_facts_prompt_block, extract_critical_fact_summary, CriticalFactSummary,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CriticalFactQuery {
     OwnerName,
     AssistantName,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct CriticalFactSummary {
-    pub owner_name: Option<String>,
-    pub assistant_name: Option<String>,
-}
-
-fn normalize_name_candidate(raw: &str) -> Option<String> {
-    let trimmed = raw
-        .trim()
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
-    if trimmed.is_empty() || trimmed.len() > 80 {
-        return None;
-    }
-    if trimmed
-        .chars()
-        .any(|c| matches!(c, '\n' | '\r' | '[' | ']' | '{' | '}'))
-    {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-fn extract_name_from_phrase(value: &str) -> Option<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-
-    for prefix in ["my name is ", "i am ", "i'm ", "call me "] {
-        if lower.starts_with(prefix) {
-            let name = value.trim()[prefix.len()..].trim();
-            return normalize_name_candidate(name);
-        }
-    }
-
-    if let Some(idx) = lower.find(" is myself") {
-        return normalize_name_candidate(value[..idx].trim());
-    }
-
-    None
 }
 
 pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
@@ -99,51 +60,6 @@ pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFact
     None
 }
 
-pub(super) fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
-    let mut summary = CriticalFactSummary::default();
-
-    for fact in facts {
-        let key = fact.key.trim();
-        let value = fact.value.trim();
-        if key.is_empty() || value.is_empty() {
-            continue;
-        }
-        let lower_key = key.to_ascii_lowercase();
-        let lower_cat = fact.category.trim().to_ascii_lowercase();
-
-        if summary.owner_name.is_none() {
-            let owner_name_key = matches!(
-                lower_key.as_str(),
-                "name" | "owner_name" | "user_name" | "full_name" | "my_name" | "owner"
-            );
-            let owner_name_category = matches!(
-                lower_cat.as_str(),
-                "user" | "personal" | "profile" | "identity"
-            );
-            if (owner_name_key && owner_name_category) || lower_key == "owner_name" {
-                summary.owner_name = normalize_name_candidate(value);
-            } else if let Some(name) = extract_name_from_phrase(value) {
-                if lower_key.contains("name") || lower_key.contains("owner") {
-                    summary.owner_name = Some(name);
-                }
-            }
-        }
-
-        if summary.assistant_name.is_none() {
-            let assistant_key = matches!(
-                lower_key.as_str(),
-                "assistant_name" | "bot_name" | "ai_name" | "daemon_name"
-            ) || (lower_key == "name"
-                && matches!(lower_cat.as_str(), "assistant" | "bot"));
-            if assistant_key {
-                summary.assistant_name = normalize_name_candidate(value);
-            }
-        }
-    }
-
-    summary
-}
-
 #[cfg(test)]
 pub(super) fn deterministic_reply_for_critical_query(
     query: CriticalFactQuery,
@@ -160,37 +76,6 @@ pub(super) fn deterministic_reply_for_critical_query(
             || "I don't have a pinned assistant name in critical memory right now.".to_string(),
             |name| format!("My name is {}.", name),
         ),
-    }
-}
-
-pub(super) fn build_critical_facts_prompt_block(summary: &CriticalFactSummary) -> Option<String> {
-    let mut lines = vec![
-        "═══ CRITICAL FACTS — USE THESE EXACT VALUES ═══".to_string(),
-        "These pinned values cover ONLY your user's identity and your own — no other entity."
-            .to_string(),
-        "When asked about a fact below, reply with the EXACT value shown here.".to_string(),
-        "Do NOT substitute, paraphrase, or infer different values from training data.".to_string(),
-        "They do NOT apply to subjects from the current conversation: if the question refers to \
-         an entity just discussed (e.g. \"the owner\"/\"the founder\" of a company), answer from \
-         that conversation context, not from this block."
-            .to_string(),
-    ];
-
-    let mut fact_count = 0;
-    if let Some(owner_name) = summary.owner_name.as_ref() {
-        lines.push(format!("• Owner name → {}", owner_name));
-        fact_count += 1;
-    }
-    if let Some(assistant_name) = summary.assistant_name.as_ref() {
-        lines.push(format!("• Assistant name → {}", assistant_name));
-        fact_count += 1;
-    }
-    lines.push("═══════════════════════════════════════════════".to_string());
-
-    if fact_count == 0 {
-        None
-    } else {
-        Some(lines.join("\n"))
     }
 }
 
@@ -249,6 +134,7 @@ pub(super) fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::Fact;
     use crate::types::FactPrivacy;
     use chrono::Utc;
     use serde_json::json;

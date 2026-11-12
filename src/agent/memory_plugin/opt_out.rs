@@ -16,15 +16,17 @@
 //! (`/clear`, a new session) nothing brings the turn back. Recall still
 //! works on the turn: opting out is about learning, not reading.
 
+use std::sync::Arc;
+
 use aidaemon_core as sdk;
 use aidaemon_policies::TurnLearning;
 use async_trait::async_trait;
-use serde_json::{json, Value};
 
 use crate::events::{EventEmitter, EventType, MemoryPipelineAccess, MemoryPolicyCompiledData};
 
 /// The host's opt-out tool, offered under any memory system.
-pub(crate) const SKIP_LEARNING_TOOL: &str = "skip_learning";
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use aidaemon_policies::SKIP_LEARNING_TOOL;
 
 /// The policy event's reason for an opted-out turn.
 pub(crate) const OPTED_OUT_REASON: &str = "learning_opted_out";
@@ -52,110 +54,64 @@ pub(crate) async fn mark_turn_opted_out(
 }
 
 /// What the model is told when an opted-out turn tries to store something.
-pub(crate) const PRIVATE_TURN_STORE_REFUSAL: &str = "[PRIVATE] This message is private, so \
-nothing from it is stored in memory. Do not try another way to store it; tell the user plainly \
-that you won't remember it.";
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use aidaemon_policies::PRIVATE_TURN_STORE_REFUSAL;
 
 /// Refuses memory stores on a turn opted out of learning, for the daemon's
 /// memory tools and a replacing memory system's alike: a call is judged by
 /// its tool's [`MemoryToolFacts`](super::tool_facts::MemoryToolFacts)
-/// (`stores`), never by its name. Reads still run. The opt-out is read at
-/// call time, so a `skip_learning` earlier in the turn covers later calls.
-pub(crate) struct PrivateTurnGuard {
-    learning: TurnLearning,
-}
+/// (`stores`), never by its name. Reads still run.
+pub(crate) struct PrivateTurnGuard;
 
 impl PrivateTurnGuard {
-    pub(crate) fn new(learning: TurnLearning) -> Self {
-        Self { learning }
+    #[allow(clippy::new_ret_no_self)]
+    pub(crate) fn new(learning: TurnLearning) -> aidaemon_policies::PrivateTurnGuard {
+        aidaemon_policies::PrivateTurnGuard::new(
+            learning,
+            Arc::new(|call: &sdk::ToolCall| {
+                super::tool_facts::memory_tool_facts(&call.name)
+                    .is_some_and(|facts| (facts.stores)(&call.arguments.to_string()))
+            }),
+        )
     }
 }
 
-#[async_trait]
-impl sdk::Hook for PrivateTurnGuard {
-    async fn before_tool(
-        &self,
-        _ctx: &sdk::HookContext<'_>,
-        call: &sdk::ToolCall,
-        _tool: &sdk::ToolInfo,
-    ) -> sdk::ToolDecision {
-        if self.learning.allowed() {
-            return sdk::ToolDecision::Allow;
-        }
-        let stores = super::tool_facts::memory_tool_facts(&call.name)
-            .is_some_and(|facts| (facts.stores)(&call.arguments.to_string()));
-        if stores {
-            sdk::ToolDecision::Deny {
-                reason: PRIVATE_TURN_STORE_REFUSAL.to_string(),
-            }
-        } else {
-            sdk::ToolDecision::Allow
-        }
-    }
-}
-
-/// The model's way to opt the current turn out of learning.
-pub(crate) struct SkipLearningTool {
-    learning: TurnLearning,
-    emitter: EventEmitter,
-    task_id: String,
-    turn_id: String,
-}
+/// The model's way to opt the current turn out of learning: it marks the
+/// turn's events like a turn the memory policy suppressed.
+pub(crate) struct SkipLearningTool;
 
 impl SkipLearningTool {
+    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new(
         learning: TurnLearning,
         emitter: EventEmitter,
         task_id: String,
         turn_id: String,
-    ) -> Self {
-        Self {
+    ) -> aidaemon_policies::SkipLearningTool {
+        aidaemon_policies::SkipLearningTool::new(
             learning,
-            emitter,
-            task_id,
-            turn_id,
-        }
+            Arc::new(TurnOptOut {
+                emitter,
+                task_id,
+                turn_id,
+            }),
+        )
     }
 }
 
+/// Records a turn's opt-out in its events.
+struct TurnOptOut {
+    emitter: EventEmitter,
+    task_id: String,
+    turn_id: String,
+}
+
 #[async_trait]
-impl sdk::Tool for SkipLearningTool {
-    fn spec(&self) -> sdk::ToolSpec {
-        sdk::ToolSpec {
-            name: SKIP_LEARNING_TOOL.into(),
-            description: "Keep the current message out of long-term memory. Call it when the \
-                          user does not want what they say now remembered or learned from. \
-                          Nothing from this turn is then learned, now or later; memory can \
-                          still be used to answer. It applies to this turn only and cannot be \
-                          undone."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn annotations(&self) -> sdk::ToolAnnotations {
-        sdk::ToolAnnotations::READ_ONLY
-    }
-
-    fn source_trust(&self, _arguments: &Value) -> sdk::SourceTrust {
-        sdk::SourceTrust::Trusted
-    }
-
-    async fn call(&self, _arguments: Value, _ctx: &sdk::ToolContext) -> sdk::ToolResult {
-        if self.learning.opt_out() {
-            mark_turn_opted_out(&self.emitter, &self.task_id, &self.turn_id)
-                .await
-                .map_err(|error| {
-                    sdk::ToolError(format!("Could not record the opt-out: {error}"))
-                })?;
-        }
-        Ok(sdk::ToolOutput::text(
-            "This turn will not be remembered or learned from.",
-        ))
+impl aidaemon_policies::OptOutRecorder for TurnOptOut {
+    async fn record_opt_out(&self) -> Result<(), String> {
+        mark_turn_opted_out(&self.emitter, &self.task_id, &self.turn_id)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

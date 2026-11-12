@@ -453,3 +453,95 @@ impl aidaemon_memory::history::ConsolidationCursors for EventHistory {
             .await
     }
 }
+
+impl EventHistory {
+    /// The user message event `event_id`, if memory may learn from it: its
+    /// task's memory policy allowed access and never suppressed it (a message
+    /// outside any task is always learnable).
+    pub(crate) async fn learnable_user_message(
+        &self,
+        event_id: i64,
+    ) -> anyhow::Result<Option<aidaemon_memory::history::LoggedMessage>> {
+        let Some(row) = sqlx::query(
+            "SELECT e.id, e.session_id, e.data, e.created_at FROM events e
+             WHERE e.id = ? AND e.event_type = 'user_message'
+               AND (e.task_id IS NULL OR EXISTS (
+                   SELECT 1 FROM events policy
+                   WHERE policy.task_id = e.task_id
+                     AND policy.event_type = 'memory_policy_compiled'
+                     AND json_extract(policy.data, '$.access') = 'allowed'
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM events policy
+                   WHERE policy.task_id = e.task_id
+                     AND policy.event_type = 'memory_policy_compiled'
+                     AND json_extract(policy.data, '$.access') = 'suppressed'
+               ))",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let data: String = row.get("data");
+        let content = serde_json::from_str::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        Ok(Some(aidaemon_memory::history::LoggedMessage {
+            id: event_id,
+            session_id: row.get("session_id"),
+            content,
+            created_at: row.get("created_at"),
+        }))
+    }
+}
+
+/// The event log as the memory store links into it.
+#[async_trait::async_trait]
+impl aidaemon_memory::history::MessageLog for EventHistory {
+    async fn message_bounds(
+        &self,
+        session_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+        let row = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events WHERE session_id = ?
+               AND event_type IN ('user_message', 'assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(session_id)
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await;
+        match row {
+            Ok(row) => Ok((
+                row.try_get("start_event_id").unwrap_or(None),
+                row.try_get("end_event_id").unwrap_or(None),
+            )),
+            Err(error) if error.to_string().contains("no such table") => Ok((None, None)),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn retained(&self, ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!("SELECT id FROM events WHERE id IN ({placeholders})");
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        Ok(query.fetch_all(&self.pool).await?.into_iter().collect())
+    }
+}

@@ -120,6 +120,9 @@ impl RetentionManager {
                 error_solutions_days: self.config.error_solutions_days,
             },
         )
+        .with_message_log(std::sync::Arc::new(
+            super::history_source::EventHistory::new(self.pool.clone(), None),
+        ))
     }
 
     /// Delete the canonical history-bearing task envelope and exact messages.

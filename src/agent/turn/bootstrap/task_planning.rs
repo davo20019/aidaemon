@@ -97,59 +97,26 @@ pub(crate) fn planned_task_relationship_is_complete(shape: &PlannedTaskShape) ->
         }
 }
 
-/// Automatic-memory policy for one task, compiled once from typed lifecycle
-/// state. Prompt retrieval, message-span projection, and post-task learning
-/// must all consume this one value; none of those stages is allowed to
-/// independently reinterpret the user's wording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemoryPipelinePolicy {
-    Allowed,
-    SuppressedByCurrentContract,
-    /// No person wrote this turn's text (background continuation, runtime
-    /// resume, mandate cycle, control command). Recall stays on so the agent
-    /// still knows who it works for; persistence stays off so it cannot learn
-    /// from its own synthetic text.
-    RecallOnlyNonUserTurn,
-}
-
-impl MemoryPipelinePolicy {
-    /// Whether automatic memory may be written or learned from this task.
-    pub(crate) const fn allows_memory(self) -> bool {
-        matches!(self, Self::Allowed)
-    }
-
-    /// Whether stored memory may be recalled into this task's prompt.
-    pub(crate) const fn allows_recall(self) -> bool {
-        matches!(self, Self::Allowed | Self::RecallOnlyNonUserTurn)
-    }
-
-    pub(crate) const fn reason_code(self) -> &'static str {
-        match self {
-            Self::Allowed => "allowed_by_compiled_contract",
-            Self::SuppressedByCurrentContract => "inherited_contract_denies_user_memory",
-            Self::RecallOnlyNonUserTurn => "non_user_turn_recall_only",
-        }
-    }
-}
+/// Automatic-memory policy for one task (`aidaemon_memory::policy`).
+pub(crate) use aidaemon_memory::policy::MemoryPipelinePolicy;
 
 /// Compile the task-local automatic-memory policy from typed lifecycle state:
-/// a contract that forbids user memory (inherited from a request that said so)
-/// suppresses it; otherwise a person's turn keeps full memory and a turn no
-/// person wrote may only recall.
+/// whether the contract forbids user memory (inherited from a request that
+/// said so) and whether a person wrote the turn.
 pub(crate) fn compile_memory_pipeline_policy(
     current_contract: &crate::agent::CompletionContract,
     user_authored_turn: bool,
 ) -> MemoryPipelinePolicy {
-    if current_contract
-        .forbidden_tool_scopes
-        .contains(&crate::traits::ToolSemanticScope::UserMemory)
-    {
-        MemoryPipelinePolicy::SuppressedByCurrentContract
-    } else if user_authored_turn {
-        MemoryPipelinePolicy::Allowed
-    } else {
-        MemoryPipelinePolicy::RecallOnlyNonUserTurn
-    }
+    MemoryPipelinePolicy::compile(
+        if user_authored_turn {
+            aidaemon_memory::policy::TurnAuthor::Person
+        } else {
+            aidaemon_memory::policy::TurnAuthor::Synthetic
+        },
+        current_contract
+            .forbidden_tool_scopes
+            .contains(&crate::traits::ToolSemanticScope::UserMemory),
+    )
 }
 
 /// JSON-object mode is rejected by a number of OpenAI-compatible gateways

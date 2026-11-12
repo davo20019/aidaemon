@@ -5,7 +5,6 @@ use super::*;
 use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_memory::records::*;
-use aidaemon_memory::sqlite::project_event_span;
 use aidaemon_memory::stores::GraphSearchScope;
 
 mod claims;
