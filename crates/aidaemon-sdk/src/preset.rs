@@ -21,7 +21,7 @@
 //! |---|---|---|
 //! | Provider | none: name one | [`Preset::provider`], [`Preset::provider_from_env`], [`Preset::provider_from_env_or`] |
 //! | Model | `AIDAEMON_MODEL`, else the provider's default | [`Preset::model`] |
-//! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`](crate::policies::ScopeGuard) over the workspace, [`EgressGuard`](crate::policies::EgressGuard), [`ApprovalPolicy`](crate::policies::ApprovalPolicy) (`DestructiveOnly`), [`Redactor`](crate::policies::Redactor), [`UntrustedOutput`](crate::policies::UntrustedOutput) | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::without_default_hooks`] |
+//! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`](crate::policies::ScopeGuard) over the workspace, [`EgressGuard`](crate::policies::EgressGuard), [`ApprovalPolicy`](crate::policies::ApprovalPolicy) (`DestructiveOnly`), [`Redactor`](crate::policies::Redactor), [`UntrustedOutput`](crate::policies::UntrustedOutput) | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
 //! | Memory | none | [`Preset::memory`]: any [`MemorySystem`] |
@@ -29,7 +29,10 @@
 //!
 //! A destructive call pauses the run for the owner
 //! ([`RunStatus::Interrupted`](crate::RunStatus)): answer it with
-//! [`Agent::resume`].
+//! [`Agent::resume`]. So does, without a workspace, any call that may
+//! change things and declares no paths, since no scope check covers it;
+//! with a workspace, a call that declares no paths is refused. Mark tools
+//! that touch no files with [`Preset::path_free_tool`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,6 +130,8 @@ pub struct Preset {
     approvals: ApprovalMode,
     default_hooks: bool,
     undeclared_writes: Option<UndeclaredAccess>,
+    undeclared_reads: Option<UndeclaredAccess>,
+    path_free: Vec<String>,
     memory: Option<(Arc<dyn MemorySystem>, MemoryTurn)>,
     configure: Vec<Box<dyn FnOnce(AgentBuilder) -> AgentBuilder + Send>>,
 }
@@ -146,6 +151,8 @@ impl Preset {
             approvals: ApprovalMode::DestructiveOnly,
             default_hooks: true,
             undeclared_writes: None,
+            undeclared_reads: None,
+            path_free: Vec::new(),
             memory: None,
             configure: Vec::new(),
         }
@@ -253,13 +260,37 @@ impl Preset {
     }
 
     /// What the scope guard does with a call that may change things but
-    /// declares no paths ([`Tool::access`]). The default is `Deny` with a
-    /// [`Preset::workspace`] (every file tool there declares its paths) and
-    /// `Allow` without one, where no directory is in scope to check
-    /// against, so tools of your own that do not touch files (a refund, a
-    /// ticket) run; the approval policy still asks before destructive ones.
+    /// declares no access ([`Tool::access`]). Unset, it is `Deny` with a
+    /// [`Preset::workspace`] (every file tool there declares its paths).
+    /// Without one, no directory is in scope to check against, so the
+    /// scope guard lets such a call through and the approval policy asks
+    /// the owner before it runs, whatever [`Preset::approvals`] says short
+    /// of [`ApprovalMode::Never`]: a refund tool reaches the owner instead
+    /// of being refused, and a tool that writes files without declaring
+    /// them never runs unseen. Setting `Allow` here runs such calls without
+    /// that extra ask; mark tools that touch no files with
+    /// [`Preset::path_free_tool`] instead.
     pub fn undeclared_writes(mut self, policy: UndeclaredAccess) -> Self {
         self.undeclared_writes = Some(policy);
+        self
+    }
+
+    /// What the scope guard does with a read-only call that declares no
+    /// access. Unset, it is `Deny` with a [`Preset::workspace`] (a read
+    /// outside it cannot be ruled out) and `Allow` without one.
+    pub fn undeclared_reads(mut self, policy: UndeclaredAccess) -> Self {
+        self.undeclared_reads = Some(policy);
+        self
+    }
+
+    /// A tool of yours that touches no files (a ticket, a refund, an order
+    /// lookup): its empty access manifest means "nothing" to the scope
+    /// guard and the approval policy, so it is neither refused for not
+    /// declaring paths nor asked about for that reason. The approval mode
+    /// still applies. The tools a [`Preset::memory`] system gives are
+    /// marked this way.
+    pub fn path_free_tool(mut self, name: impl Into<String>) -> Self {
+        self.path_free.push(name.into());
         self
     }
 
@@ -315,9 +346,12 @@ impl Preset {
         let mut instructions = self.instructions;
         let mut tools = self.tools;
         let mut extra_hooks = Vec::new();
+        let mut path_free = self.path_free;
         if let Some((system, turn)) = &self.memory {
             let parts = system.turn(turn).await;
             extra_hooks.extend(parts.hooks);
+            // Memory tools keep the memory store, not workspace files.
+            path_free.extend(parts.tools.iter().map(|tool| tool.spec().name));
             tools.extend(parts.tools);
             if let Some(guidance) = system.guidance() {
                 if !instructions.is_empty() {
@@ -337,11 +371,30 @@ impl Preset {
             tools.extend(crate::tools::default_tools(workspace));
         }
 
-        let undeclared = self.undeclared_writes.unwrap_or(if roots.is_empty() {
-            UndeclaredAccess::Allow
-        } else {
+        // With a workspace, a call that declares no access cannot be checked
+        // against it, so it is refused. Without one, nothing is in scope:
+        // reads run, and a call that may change things asks the owner.
+        let confined = !roots.is_empty();
+        let ask_undeclared = !confined && self.undeclared_writes.is_none();
+        let undeclared_writes = self.undeclared_writes.unwrap_or(if confined {
             UndeclaredAccess::Deny
+        } else {
+            UndeclaredAccess::Allow
         });
+        let undeclared_reads = self.undeclared_reads.unwrap_or(if confined {
+            UndeclaredAccess::Deny
+        } else {
+            UndeclaredAccess::Allow
+        });
+        let mut scope = ScopeGuard::new(&roots)
+            .undeclared_writer(undeclared_writes)
+            .undeclared_read_only(undeclared_reads);
+        let mut approval =
+            ApprovalPolicy::new(self.approvals).ask_undeclared_writes(ask_undeclared);
+        for name in &path_free {
+            scope = scope.path_free_tool(name.clone());
+            approval = approval.path_free_tool(name.clone());
+        }
         builder = builder.instructions(instructions);
         for tool in tools {
             builder = builder.tool_arc(tool);
@@ -349,7 +402,7 @@ impl Preset {
         if self.default_hooks {
             builder = builder
                 .hook(AuthorityHook::new(self.authority))
-                .hook(ScopeGuard::new(&roots).undeclared_writer(undeclared))
+                .hook(scope)
                 .hook(EgressGuard::new());
         }
         for hook in self.hooks.into_iter().chain(extra_hooks) {
@@ -357,7 +410,7 @@ impl Preset {
         }
         if self.default_hooks {
             builder = builder
-                .hook(ApprovalPolicy::new(self.approvals))
+                .hook(approval)
                 .hook(Redactor::default())
                 .hook(UntrustedOutput::default());
         }

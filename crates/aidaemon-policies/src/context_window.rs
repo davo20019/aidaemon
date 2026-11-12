@@ -63,7 +63,7 @@ const STUB_LINE_CHARS: usize = 120;
 /// if it needs the exact content.
 ///
 /// **Never over budget.** System messages, injected harness messages and
-/// the user's first message are never elided or dropped, and the most
+/// the user's first and latest messages are never elided or dropped, and the most
 /// recent `keep_recent_turns` turns (default 1: the results the model has
 /// not seen yet) are kept whole by the
 /// stable steps. If the request still passes the budget (the recent turns
@@ -273,11 +273,15 @@ fn units(messages: &[Message]) -> Vec<Range<usize>> {
 }
 
 /// Units never elided or dropped: system messages, messages the harness or
-/// a hook injected, and the user's first message.
+/// a hook injected, the user's first message (the task) and the user's
+/// latest message (the question being answered now). The latest message
+/// stays the same through a run's tool rounds, so pinning it keeps the
+/// prefix stable; when the user speaks again, the one before it becomes
+/// droppable like any older message.
 fn fixed_units(messages: &[Message], units: &[Range<usize>]) -> Vec<bool> {
-    let first_user = messages
-        .iter()
-        .position(|m| m.role == Role::User && !m.is_injected());
+    let is_user = |m: &Message| m.role == Role::User && !m.is_injected();
+    let first_user = messages.iter().position(is_user);
+    let latest_user = messages.iter().rposition(is_user);
     units
         .iter()
         .map(|r| {
@@ -285,6 +289,7 @@ fn fixed_units(messages: &[Message], units: &[Range<usize>]) -> Vec<bool> {
             m.role == Role::System
                 || (m.role == Role::User && m.is_injected())
                 || first_user.is_some_and(|f| r.contains(&f))
+                || latest_user.is_some_and(|l| r.contains(&l))
         })
         .collect()
 }
@@ -533,6 +538,33 @@ mod tests {
         assert!(estimate_tokens(&request.messages) < 6_000);
         assert!(ContextWindow::new(6_000).compact_request(&mut request));
         assert!(estimate_tokens(&request.messages) + 2_000 <= 6_000);
+    }
+
+    #[test]
+    fn the_latest_user_message_is_never_dropped() {
+        // A second question, then big tool rounds: the question the model
+        // is answering must survive both the stable steps and the
+        // emergency drop.
+        let mut m = vec![
+            Message::system("sys"),
+            Message::user("Summarize the files for Alice Rivera"),
+            Message::assistant("Done: three files summarized.", Vec::new()),
+            Message::user("Now which one mentions the refund?"),
+        ];
+        for r in 0..6 {
+            m.extend(round(&format!("c{r}"), &body(8_000, "z")));
+        }
+        for budget in [3_000, 6_000, 12_000] {
+            let v = view(&ContextWindow::new(budget), &m);
+            assert!(well_formed(&v));
+            assert!(estimate_tokens(&v) <= budget, "{}", estimate_tokens(&v));
+            assert!(
+                v.iter()
+                    .any(|x| x.content == "Now which one mentions the refund?"),
+                "budget {budget}: the current question was dropped"
+            );
+            assert_eq!(v[0].content, "sys");
+        }
     }
 
     #[test]

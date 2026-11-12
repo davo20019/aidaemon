@@ -32,6 +32,8 @@ async fn agent(
         .provider_from_env_or(script)
         .instructions("Build the report you are asked for, then summarize it in one sentence.")
         .tool(BuildReport)
+        // The report touches no files: run it without asking the owner.
+        .path_free_tool("build_report")
         .sqlite(db)
         .build()
         .await
