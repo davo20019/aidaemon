@@ -72,7 +72,7 @@ pub use config::ComputerUseConfig;
 #[cfg(feature = "computer_use")]
 pub use tools::computer_use;
 mod traits;
-mod triggers;
+use aidaemon_work::triggers;
 mod types;
 mod updater;
 pub mod utils;

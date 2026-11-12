@@ -34,6 +34,7 @@ stability promise.
 - Phase 9.3: `aidaemon-work` holds the work domain's logic: `plans` (task plans, their store and the `task_plans` migration), `mandates::policy` and `mandates::history`, `reminders`, `schedule` (cron parsing and next-run times) and `goal_tokens` (goal cancellation and daily budget overrides). Tables unchanged.
 - Phase 9.3: `aidaemon-work::tools::manage_mandates` (the `manage_mandates` tool, unchanged name, schema and confirmation cards) and `tools::objective_status`; `stores::MandateToolStore`. A host gives strategy skills through `StrategySkills`.
 - Phase 9.3: `aidaemon-work::scheduler`, the goal cycle (due mandate reviews, scheduled goals and reminders, stuck and orphaned tasks, escalated recoveries, goal notifications) as `GoalCycle` and `GoalCycleService`, over `SchedulerStore`. The host gives its agent runtime (`TaskLeadHost`), channels (`NoticeDelivery`) and presentation (`WorkPresenter`). `goals::{tasks_satisfy_goal_completion, goal_completion_summary_indicates_not_finished, is_terminal_task_status}`; `goal_tokens::SCHEDULED_AUTONOMOUS_*`.
+- Phase 9.3: `aidaemon-work::triggers` holds the trigger event bus (`event_bus`, `EventSender`, `EventReceiver`), `TriggerSettings` and, behind the new `email-trigger` feature, the IMAP `TriggerManager`.
 
 ## [0.1.0]: first release (not yet published)
 

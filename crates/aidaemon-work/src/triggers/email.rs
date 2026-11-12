@@ -1,3 +1,5 @@
+//! The email trigger: an IMAP IDLE watch that wakes work on new mail.
+
 use std::sync::Arc;
 
 use async_imap::extensions::idle::IdleResponse;
@@ -5,27 +7,18 @@ use async_imap::imap_proto::types::Envelope;
 use async_native_tls::TlsConnector;
 use async_std::net::TcpStream;
 use futures::TryStreamExt;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::config::TriggersConfig;
-use crate::traits::TriggerEvent;
+use super::{EventSender, TriggerEvent, TriggerSettings};
 
-pub type EventSender = broadcast::Sender<TriggerEvent>;
-pub type EventReceiver = broadcast::Receiver<TriggerEvent>;
-
-/// Create a new event bus (broadcast channel).
-pub fn event_bus(capacity: usize) -> (EventSender, EventReceiver) {
-    broadcast::channel(capacity)
-}
-
+/// Starts the configured trigger sources; each sends its events on the bus.
 pub struct TriggerManager {
-    config: TriggersConfig,
+    config: TriggerSettings,
     sender: EventSender,
 }
 
 impl TriggerManager {
-    pub fn new(config: TriggersConfig, sender: EventSender) -> Self {
+    pub fn new(config: TriggerSettings, sender: EventSender) -> Self {
         Self { config, sender }
     }
 

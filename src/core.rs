@@ -305,7 +305,7 @@ pub async fn run(
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers
-    let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
+    let trigger_manager = Arc::new(TriggerManager::new(config.triggers.settings(), event_tx));
     trigger_manager.spawn();
 
     // 9b. Scheduler deprecated — evergreen goals replace it.
