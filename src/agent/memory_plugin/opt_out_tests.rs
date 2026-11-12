@@ -438,3 +438,47 @@ async fn after_clear_a_private_turn_reaches_no_prompt_or_history_search() {
         "a normal turn stays searchable: {found}"
     );
 }
+
+/// Fails its first mark, then succeeds; counts each attempt.
+#[derive(Default)]
+struct FlakyRecorder(Mutex<u32>);
+
+#[async_trait]
+impl aidaemon_policies::OptOutRecorder for FlakyRecorder {
+    async fn record_opt_out(&self) -> Result<(), String> {
+        let mut attempts = self.0.lock().unwrap();
+        *attempts += 1;
+        if *attempts == 1 {
+            Err("synthetic storage fault".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The turn's opt-out flag flips once, but its mark is retried until it is
+/// recorded: a mark that failed once must not leave the events unmarked.
+#[tokio::test]
+async fn a_failed_opt_out_mark_is_retried_until_recorded() {
+    use aidaemon_core::Tool;
+
+    let recorder = Arc::new(FlakyRecorder::default());
+    let learning = TurnLearning::default();
+    let tool = super::opt_out::SkipLearningTool::with_recorder(learning.clone(), recorder.clone());
+    let ctx = aidaemon_core::ToolContext::new(SESSION, "call-1");
+
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_err());
+    assert!(!learning.allowed(), "the turn is opted out even so");
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_ok());
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        2,
+        "the failed mark was retried"
+    );
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_ok());
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        2,
+        "a recorded mark is not repeated"
+    );
+}
