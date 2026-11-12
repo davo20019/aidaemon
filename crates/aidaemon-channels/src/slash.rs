@@ -303,6 +303,38 @@ fn mode_line(mode: Option<(ChatMode, Option<DateTime<Utc>>)>, now: DateTime<Utc>
 /// How `/status` and `/tasks` name a chat turn.
 const TURN_LABEL: &str = "Working on your message";
 
+/// `/tasks`: the chat's unfinished turns and the sub-agents running for it.
+pub fn render_tasks(
+    entries: &[crate::tasks::TaskEntry],
+    children: &[crate::ports::RunningChild],
+    now: DateTime<Utc>,
+) -> String {
+    if entries.is_empty() && children.is_empty() {
+        return "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string();
+    }
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let elapsed = match e.finished_at {
+                Some(fin) => format!("{}s", (fin - e.started_at).num_seconds()),
+                None => format!("{}s elapsed", (now - e.started_at).num_seconds()),
+            };
+            format!("#{} [{}] {TURN_LABEL} ({})", e.id, e.status, elapsed)
+        })
+        .collect();
+    lines.extend(children.iter().map(|child| {
+        format!(
+            "Sub-agent [running] {} ({}s elapsed)",
+            crate::presentation::word_preview(&child.label, 120),
+            (now - child.started_at).num_seconds()
+        )
+    }));
+    format!(
+        "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
+        lines.join("\n")
+    )
+}
+
 /// `/status`: the chat's mode, what is running and what is scheduled next.
 pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
     let mode = mode_line(view.mode, now);
@@ -323,7 +355,7 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         for child in &view.children {
             lines.push(format!(
                 "• Sub-agent: {} ({} so far)",
-                crate::presentation::word_preview(&child.label, 80),
+                crate::presentation::word_preview(&child.label, 120),
                 compact_chrono_duration(now - child.started_at, ZeroUnitStyle::Trim)
             ));
         }
@@ -708,39 +740,8 @@ impl SharedCommands {
             .into_iter()
             .filter(|entry| !matches!(entry.status, TaskStatus::Completed))
             .collect::<Vec<_>>();
-        let now = Utc::now();
         let children = self.agent.running_children(session_id).await;
-        if entries.is_empty() && children.is_empty() {
-            "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string()
-        } else {
-            let mut lines: Vec<String> = entries
-                .iter()
-                .map(|e| {
-                    let elapsed = match e.finished_at {
-                        Some(fin) => {
-                            let d = fin - e.started_at;
-                            format!("{}s", d.num_seconds())
-                        }
-                        None => {
-                            let d = Utc::now() - e.started_at;
-                            format!("{}s elapsed", d.num_seconds())
-                        }
-                    };
-                    format!("#{} [{}] {TURN_LABEL} ({})", e.id, e.status, elapsed)
-                })
-                .collect();
-            lines.extend(children.iter().map(|child| {
-                format!(
-                    "Sub-agent [running] {} ({}s elapsed)",
-                    crate::presentation::word_preview(&child.label, 80),
-                    (now - child.started_at).num_seconds()
-                )
-            }));
-            format!(
-                "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
-                lines.join("\n")
-            )
-        }
+        render_tasks(&entries, &children, Utc::now())
     }
 
     async fn handle_cancel(&self, arg: &str) -> String {
@@ -1010,6 +1011,28 @@ mod help_and_status_tests {
             private_request("/private /private hi"),
             Some(PrivateRequest::With("hi"))
         );
+    }
+
+    #[test]
+    fn tasks_lists_running_sub_agents_by_their_title() {
+        let now = Utc::now();
+        let children = vec![
+            crate::ports::RunningChild {
+                label: "Run one shell command (…echo alpha-test . Report…)".to_string(),
+                started_at: now - chrono::Duration::seconds(30),
+            },
+            crate::ports::RunningChild {
+                label: "Run one shell command (…echo beta-test . Report…)".to_string(),
+                started_at: now - chrono::Duration::seconds(30),
+            },
+        ];
+        let tasks = render_tasks(&[], &children, now);
+        assert!(
+            tasks.contains("Sub-agent [running] Run one shell command (…echo alpha-test . Report…) (30s elapsed)"),
+            "{tasks}"
+        );
+        assert!(tasks.contains("echo beta-test"), "{tasks}");
+        assert!(render_tasks(&[], &[], now).starts_with("No active"));
     }
 
     #[test]
