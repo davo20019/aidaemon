@@ -544,7 +544,6 @@ mod tests {
     use super::*;
     use crate::testing::CallWithFacts;
     use crate::testing::{setup_test_agent, MockProvider};
-    use crate::traits::store_prelude::*;
 
     fn owner() -> ToolCallContext {
         ToolCallContext {
