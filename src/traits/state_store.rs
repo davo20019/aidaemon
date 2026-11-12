@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 pub use aidaemon_events::provider::TokenUsageStore;
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
-pub use aidaemon_tools::services::{OAuthGatewayStore, OAuthStore, SettingsStore};
+pub use aidaemon_tools::services::{
+    DynamicCliAgentStore, OAuthGatewayStore, OAuthStore, SettingsStore,
+};
 #[allow(unused_imports)]
 pub use aidaemon_work::stores::*;
 
@@ -244,76 +246,6 @@ pub trait DynamicMcpServerStore: Send + Sync {
         _server: &super::DynamicMcpServer,
     ) -> anyhow::Result<()> {
         Ok(())
-    }
-}
-
-/// Runtime-managed CLI agents persistence + invocation logs.
-#[async_trait]
-pub trait DynamicCliAgentStore: Send + Sync {
-    /// Store a dynamically added CLI agent.
-    async fn save_dynamic_cli_agent(&self, _agent: &super::DynamicCliAgent) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Get all dynamic CLI agents.
-    async fn list_dynamic_cli_agents(&self) -> anyhow::Result<Vec<super::DynamicCliAgent>> {
-        Ok(vec![])
-    }
-
-    /// Delete a dynamic CLI agent by ID.
-    async fn delete_dynamic_cli_agent(&self, _id: i64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Update a dynamic CLI agent.
-    async fn update_dynamic_cli_agent(
-        &self,
-        _agent: &super::DynamicCliAgent,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Log the start of a CLI agent invocation. Returns the invocation ID.
-    async fn log_cli_agent_start(
-        &self,
-        _task_id: Option<&str>,
-        _session_id: &str,
-        _agent_name: &str,
-        _prompt_summary: &str,
-        _working_dir: Option<&str>,
-    ) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Log the completion of a CLI agent invocation.
-    async fn log_cli_agent_complete(
-        &self,
-        _id: i64,
-        _exit_code: Option<i32>,
-        _output_summary: &str,
-        _success: bool,
-        _duration_secs: f64,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Get recent CLI agent invocations (most recent first).
-    async fn get_cli_agent_invocations(
-        &self,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<super::CliAgentInvocation>> {
-        Ok(vec![])
-    }
-
-    /// Auto-close stale CLI agent invocations that never completed (e.g. crashed worker).
-    ///
-    /// Implementations should mark rows with `completed_at IS NULL` and older than
-    /// `max_age_hours` as completed with `success=false`.
-    async fn cleanup_stale_cli_agent_invocations(
-        &self,
-        _max_age_hours: i64,
-    ) -> anyhow::Result<u64> {
-        Ok(0)
     }
 }
 

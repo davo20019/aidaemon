@@ -2153,6 +2153,55 @@ pub enum ApprovalResponse {
     Deny,
 }
 
+/// Relative impact of an operation requiring approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RiskLevel {
+    Safe,
+    Medium,
+    High,
+    Critical,
+}
+
+impl std::fmt::Display for RiskLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RiskLevel::Safe => write!(f, "Safe"),
+            RiskLevel::Medium => write!(f, "Medium"),
+            RiskLevel::High => write!(f, "High"),
+            RiskLevel::Critical => write!(f, "Critical"),
+        }
+    }
+}
+
+impl RiskLevel {
+    /// Whether this risk level represents an action that should interrupt the
+    /// owner for approval. Safe and medium operations may still be observable
+    /// or locally mutating, but they are not dangerous enough to justify
+    /// blocking an otherwise authorized task.
+    pub const fn requires_owner_approval(self) -> bool {
+        matches!(self, Self::High | Self::Critical)
+    }
+}
+
+/// Typed presentation requested for an exact goal/mandate confirmation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoalConfirmationStyle {
+    #[default]
+    Standard,
+    Autopilot,
+}
+
+/// Role assigned to an agent for role-based tool scoping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// Root agent — routes, classifies, full tool access (legacy behavior).
+    Orchestrator,
+    /// Plans & delegates — management tools only.
+    TaskLead,
+    /// Executes a single task — action tools + report_blocker.
+    Executor,
+}
+
 /// How one call changes a file (see [`ToolSemantics::call_file_write`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileWriteKind {

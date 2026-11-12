@@ -3,22 +3,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
+#[cfg(test)]
 use crate::types::StatusUpdate;
 
 pub use aidaemon_tools::semantics::*;
-
-/// Role assigned to an agent for role-based tool scoping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentRole {
-    /// Root agent — routes, classifies, full tool access (legacy behavior).
-    Orchestrator,
-    /// Plans & delegates — management tools only.
-    TaskLead,
-    /// Executes a single task — action tools + report_blocker.
-    Executor,
-}
 
 /// Stable specialist profile used to label child-agent sessions and events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,29 +78,8 @@ impl SpecialistKind {
 /// call without running it lives on the [`ToolSemantics`] supertrait.
 pub use aidaemon_tools::OutcomeTool as Tool;
 
-/// The channel a call's live progress goes to, carried in
-/// [`ToolCallContext::extensions`].
-#[derive(Clone)]
-pub struct ToolStatus(pub mpsc::Sender<StatusUpdate>);
-
-/// Where this call's live progress goes, if anywhere.
-pub fn status_sender(facts: &ToolCallContext) -> Option<mpsc::Sender<StatusUpdate>> {
-    facts
-        .extensions
-        .get::<ToolStatus>()
-        .map(|status| status.0.clone())
-}
-
-/// `facts` with this call's progress channel added.
-pub fn with_status(
-    mut facts: ToolCallContext,
-    status_tx: Option<mpsc::Sender<StatusUpdate>>,
-) -> ToolCallContext {
-    if let Some(status_tx) = status_tx {
-        facts.extensions.insert(ToolStatus(status_tx));
-    }
-    facts
-}
+pub use aidaemon_tools::status::{status_sender, with_status, ToolStatus};
+pub use aidaemon_tools::NothingSentError;
 
 /// Calling a tool directly from a test.
 #[cfg(test)]
@@ -150,19 +120,6 @@ pub trait ToolCalls: Tool {
 
 #[cfg(test)]
 impl<T: Tool + ?Sized> ToolCalls for T {}
-
-/// A tool could not reach its target at all, so nothing took effect and the
-/// call may run again.
-#[derive(Debug)]
-pub(crate) struct NothingSentError(pub(crate) String);
-
-impl std::fmt::Display for NothingSentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for NothingSentError {}
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,146 @@
+//! Live progress of a turn: what tools and the agent loop report while they
+//! work, and the channel a tool call's progress goes to.
+
+use tokio::sync::mpsc;
+
+use crate::semantics::ToolCallContext;
+
+/// Status updates emitted by tools and the agent loop for live feedback to the user.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum StatusUpdate {
+    /// Sent before each LLM call (skipped on iteration 0).
+    Thinking(usize),
+    /// Sent before each tool execution.
+    ToolStart { name: String, summary: String },
+    /// Streaming output chunk from a tool (e.g., CLI agent progress).
+    ToolProgress { name: String, chunk: String },
+    /// A tool is paused until the user completes an explicit action, such as
+    /// authorizing an OAuth connection in their browser. Unlike ordinary tool
+    /// progress, channels must deliver this immediately and without truncation.
+    UserActionRequired { message: String },
+    /// Tool execution completed with a brief summary.
+    ToolComplete { name: String, summary: String },
+    /// Tool can be cancelled with the given task_id.
+    ToolCancellable { name: String, task_id: String },
+    /// Periodic summary for long-running tasks (emitted every 5 minutes).
+    ProgressSummary { elapsed_mins: u64, summary: String },
+    /// Warning that soft iteration limit is approaching.
+    IterationWarning { current: usize, threshold: usize },
+    /// A new task plan was created.
+    PlanCreated {
+        plan_id: String,
+        description: String,
+        total_steps: usize,
+    },
+    /// A plan step has started executing.
+    PlanStepStart {
+        plan_id: String,
+        step_index: usize,
+        total_steps: usize,
+        description: String,
+    },
+    /// A plan step completed successfully.
+    PlanStepComplete {
+        plan_id: String,
+        step_index: usize,
+        total_steps: usize,
+        description: String,
+        summary: Option<String>,
+    },
+    /// A plan step failed.
+    PlanStepFailed {
+        plan_id: String,
+        step_index: usize,
+        description: String,
+        error: String,
+    },
+    /// The entire plan completed successfully.
+    PlanComplete {
+        plan_id: String,
+        description: String,
+        total_steps: usize,
+        duration_secs: u64,
+    },
+    /// The plan was abandoned by user request.
+    PlanAbandoned {
+        plan_id: String,
+        description: String,
+    },
+    /// The plan was revised with new/updated steps.
+    PlanRevised {
+        plan_id: String,
+        description: String,
+        reason: String,
+        new_total_steps: usize,
+    },
+    /// Token budget was auto-extended due to productive progress.
+    BudgetExtended {
+        old_budget: i64,
+        new_budget: i64,
+        extension: usize,
+        max_extensions: usize,
+    },
+    /// A rendered task-plan checklist to display on the single live surface.
+    /// Replaces the separate checklist message previously posted by
+    /// `track_requirements` directly through the hub.
+    Checklist { text: String },
+    /// A sub-agent's own plan progress (`step 2 of 4`), named by its mission.
+    /// The parent's card keeps the parent's checklist and shows this as its
+    /// activity line, so a child's plan never stands in for the whole task.
+    SubAgentProgress { label: String, progress: String },
+}
+
+impl StatusUpdate {
+    /// Whether a channel must deliver this update immediately instead of
+    /// treating it as optional, rate-limited progress.
+    pub fn requires_immediate_delivery(&self) -> bool {
+        matches!(
+            self,
+            Self::UserActionRequired { .. } | Self::BudgetExtended { .. }
+        )
+    }
+}
+
+/// The channel a call's live progress goes to, carried in
+/// [`ToolCallContext::extensions`].
+#[derive(Clone)]
+pub struct ToolStatus(pub mpsc::Sender<StatusUpdate>);
+
+/// Where this call's live progress goes, if anywhere.
+pub fn status_sender(facts: &ToolCallContext) -> Option<mpsc::Sender<StatusUpdate>> {
+    facts
+        .extensions
+        .get::<ToolStatus>()
+        .map(|status| status.0.clone())
+}
+
+/// `facts` with this call's progress channel added.
+pub fn with_status(
+    mut facts: ToolCallContext,
+    status_tx: Option<mpsc::Sender<StatusUpdate>>,
+) -> ToolCallContext {
+    if let Some(status_tx) = status_tx {
+        facts.extensions.insert(ToolStatus(status_tx));
+    }
+    facts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusUpdate;
+
+    #[test]
+    fn url_in_ordinary_progress_does_not_force_chat_delivery() {
+        let progress = StatusUpdate::ToolProgress {
+            name: "agent delegation".to_string(),
+            chunk: "Checking https://blog.example.test/posts/example/".to_string(),
+        };
+        assert!(!progress.requires_immediate_delivery());
+
+        let action = StatusUpdate::UserActionRequired {
+            message: "[Authorize](https://auth.example.test/)".to_string(),
+        };
+        assert!(action.requires_immediate_delivery());
+    }
+}

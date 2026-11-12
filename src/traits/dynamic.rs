@@ -63,33 +63,4 @@ pub struct DynamicMcpServer {
     pub created_at: String,
 }
 
-/// A dynamically added CLI agent configuration (stored in database).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicCliAgent {
-    pub id: i64,
-    pub name: String,
-    pub command: String,
-    pub args_json: String, // JSON array of argument strings
-    pub description: String,
-    pub timeout_secs: Option<u64>,
-    pub max_output_chars: Option<usize>,
-    pub enabled: bool,
-    pub created_at: String,
-}
-
-/// A record of a CLI agent invocation for logging/auditing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CliAgentInvocation {
-    pub id: i64,
-    pub task_id: Option<String>,
-    pub session_id: String,
-    pub agent_name: String,
-    pub prompt_summary: String,
-    pub working_dir: Option<String>,
-    pub started_at: String,
-    pub completed_at: Option<String>,
-    pub exit_code: Option<i32>,
-    pub output_summary: Option<String>,
-    pub success: Option<bool>,
-    pub duration_secs: Option<f64>,
-}
+pub use aidaemon_tools::services::{CliAgentInvocation, DynamicCliAgent};
