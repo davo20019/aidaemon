@@ -2,6 +2,8 @@ use super::*;
 use crate::memory::embeddings::EmbeddingService;
 use crate::state::SqliteStateStore;
 use crate::traits::{Goal, GoalSchedule, Mandate, MandateAuthority, Task, TaskActivity};
+use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn synthetic_task(desc: &str, status: &str) -> Task {

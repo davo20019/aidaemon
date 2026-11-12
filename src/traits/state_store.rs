@@ -2,10 +2,7 @@
 //! the app assembles for itself: the `StateStore` facade over every slice,
 //! and the composite that spans crates for a tool still in `src/`
 //! (`SkillsStore`: memory + settings, moves with skills in 9.6). The
-//! database liveness probe (`HealthCheckStore`) serves the daemon's own
-//! heartbeat.
-
-use async_trait::async_trait;
+//! database liveness probe (`HealthCheckStore`) is `aidaemon-work`'s.
 
 pub use aidaemon_channels::hub::{DynamicBotStore, SessionChannelStore};
 pub use aidaemon_events::provider::TokenUsageStore;
@@ -23,14 +20,6 @@ pub use aidaemon_work::stores::*;
 
 /// Learning storage lives in the SDK memory crate.
 pub use aidaemon_memory::LearningStore;
-
-/// Database health check — verifies the connection is alive.
-#[async_trait]
-pub trait HealthCheckStore: Send + Sync {
-    async fn health_check(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
 
 /// Focused persistence contract used by skill startup and management.
 pub use aidaemon_skills::SkillsStore;
