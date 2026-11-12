@@ -1,4 +1,5 @@
 pub(crate) mod activity_log;
+mod background_model;
 pub mod embeddings;
 pub(crate) mod history_intake;
 pub mod history_source;
