@@ -18,9 +18,9 @@ exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "
 # aidaemon-node-protocol and aidaemon-node-sdk keep their own versions.
 version = "0.2.0"
 edition = "2021"
-# Floor set by the SDK crates' dependency tree with all features (image,
-# ignore: 1.88); verified in CI by the MSRV job.
-rust-version = "1.88"
+# Floor set by the SDK crates' dependency tree with all features
+# (uuid: 1.89); verified in CI by the MSRV job.
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
