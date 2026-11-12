@@ -71,6 +71,7 @@ name = "aidaemon"
 version = "0.12.9"
 dependencies = [
  "aes-gcm",
+ "aidaemon-agents",
  "aidaemon-channel-discord",
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
@@ -157,6 +158,7 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-core",
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
 ]

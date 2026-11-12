@@ -1,6 +1,5 @@
 #[cfg(test)]
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Value;
 #[cfg(test)]
@@ -11,68 +10,7 @@ use crate::types::StatusUpdate;
 
 pub use aidaemon_tools::semantics::*;
 
-/// Stable specialist profile used to label child-agent sessions and events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SpecialistKind {
-    TaskLead,
-    Executor,
-    Research,
-    ArtifactWriter,
-    Code,
-    BrowserVerifier,
-    Review,
-    CommsDraft,
-    Generic,
-}
-
-impl SpecialistKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SpecialistKind::TaskLead => "task_lead",
-            SpecialistKind::Executor => "executor",
-            SpecialistKind::Research => "research",
-            SpecialistKind::ArtifactWriter => "artifact_writer",
-            SpecialistKind::Code => "code",
-            SpecialistKind::BrowserVerifier => "browser_verifier",
-            SpecialistKind::Review => "review",
-            SpecialistKind::CommsDraft => "comms_draft",
-            SpecialistKind::Generic => "generic",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "task_lead" => Some(SpecialistKind::TaskLead),
-            "executor" => Some(SpecialistKind::Executor),
-            "research" => Some(SpecialistKind::Research),
-            "artifact_writer" => Some(SpecialistKind::ArtifactWriter),
-            "code" => Some(SpecialistKind::Code),
-            "browser_verifier" => Some(SpecialistKind::BrowserVerifier),
-            "review" => Some(SpecialistKind::Review),
-            "comms_draft" => Some(SpecialistKind::CommsDraft),
-            "generic" => Some(SpecialistKind::Generic),
-            _ => None,
-        }
-    }
-
-    // Test-only oracle: iterates every variant for exhaustiveness checks in
-    // `SpecialistRegistry` unit tests. Production code dispatches on
-    // `SpecialistKind` values directly, so this helper is unused there.
-    #[allow(dead_code)]
-    pub fn all() -> &'static [SpecialistKind] {
-        &[
-            SpecialistKind::TaskLead,
-            SpecialistKind::Executor,
-            SpecialistKind::Research,
-            SpecialistKind::ArtifactWriter,
-            SpecialistKind::Code,
-            SpecialistKind::BrowserVerifier,
-            SpecialistKind::Review,
-            SpecialistKind::CommsDraft,
-            SpecialistKind::Generic,
-        ]
-    }
-}
+pub use aidaemon_agents::specialist::SpecialistKind;
 
 /// A tool: the SDK's [`aidaemon_tools::OutcomeTool`]. What it says about a
 /// call without running it lives on the [`ToolSemantics`] supertrait.
