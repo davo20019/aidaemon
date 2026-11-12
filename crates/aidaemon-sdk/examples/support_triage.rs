@@ -9,7 +9,10 @@
 //! ```text
 //! ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example support_triage
 //! OPENAI_API_KEY=...    cargo run -p aidaemon-sdk --example support_triage
+//! cargo run -p aidaemon-sdk --example support_triage --features testing   # scripted
 //! ```
+//! Without an API key it runs against a scripted model, approves on its own,
+//! and exits non-zero unless the refund went through.
 //! Optional: AIDAEMON_MODEL (model id), OPENAI_BASE_URL (any OpenAI-compatible
 //! server), and a ticket as the first argument.
 
@@ -17,11 +20,13 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use aidaemon_sdk::policies::{
-    ApprovalMode, ApprovalPolicy, EgressGuard, Redactor, ScopeGuard, UntrustedOutput,
+    ApprovalMode, ApprovalPolicy, EgressGuard, Redactor, ScopeGuard, UndeclaredAccess,
+    UntrustedOutput,
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
-use aidaemon_sdk::{Authority, AuthorityHook, FnTool, MemoryStore};
+use aidaemon_sdk::testing::{call, text, tool_calls, ScriptedProvider};
+use aidaemon_sdk::{Authority, AuthorityHook, FnTool, MemoryStore, ReceiptStatus};
 use serde_json::{json, Value};
 
 const DEFAULT_TICKET: &str = "Hi, this is Alice Rivera (order ORD-1001). The Acme Blender \
@@ -151,9 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let p = builder.build()?;
             (Box::new(move |b| b.provider(p)), "gpt-5")
         } else {
-            eprintln!("set ANTHROPIC_API_KEY or OPENAI_API_KEY");
-            std::process::exit(2);
+            let p = scripted();
+            (Box::new(move |b| b.provider(p)), "scripted")
         };
+    let scripted_run = default_model == "scripted";
     let model = std::env::var("AIDAEMON_MODEL").unwrap_or_else(|_| default_model.to_string());
 
     let store = Arc::new(MemoryStore::new());
@@ -168,7 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // Every write (refund or escalation) asks the owner first.
         .hook(AuthorityHook::new(Authority::full()))
-        .hook(ScopeGuard::new(Vec::<std::path::PathBuf>::new()))
+        // No directory is in scope, and these tools touch no files: a tool
+        // without an access manifest may run (the default `Deny` would refuse
+        // every refund and escalation before the owner is asked).
+        .hook(
+            ScopeGuard::new(Vec::<std::path::PathBuf>::new())
+                .undeclared_writer(UndeclaredAccess::Allow),
+        )
         .hook(EgressGuard::new())
         .hook(ApprovalPolicy::new(ApprovalMode::AllWrites))
         .hook(Redactor::default())
@@ -197,7 +209,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::io::stdout().flush()?;
         let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
+        if scripted_run {
+            answer.push('y');
+            println!("y (scripted)");
+        } else {
+            std::io::stdin().lock().read_line(&mut answer)?;
+        }
         let resolution = if answer.trim().eq_ignore_ascii_case("y") {
             Resolution::Approve
         } else {
@@ -216,5 +233,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         usage.billable_tokens(),
         outcome.receipts().len()
     );
+    if scripted_run {
+        let refunded = outcome
+            .receipts()
+            .iter()
+            .any(|r| r.tool == "issue_refund" && r.status == ReceiptStatus::Succeeded);
+        if !refunded {
+            eprintln!("scripted run: the approved refund did not go through");
+            std::process::exit(1);
+        }
+    }
     Ok(())
+}
+
+/// What the model says when no API key is set.
+fn scripted() -> ScriptedProvider {
+    ScriptedProvider::new([
+        tool_calls([call("c1", "lookup_order", json!({"order_id": "ORD-1001"}))]),
+        tool_calls([call(
+            "c2",
+            "issue_refund",
+            json!({"order_id": "ORD-1001", "amount_cents": 8900}),
+        )]),
+        text("I refunded the full $89.00 for your Acme Blender. Sorry about the cracked jar."),
+    ])
 }
