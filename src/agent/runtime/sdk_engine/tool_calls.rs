@@ -319,6 +319,7 @@ impl Agent {
             parent_run: Some(scope.run_id),
             known_resources,
             // The spawn tool appends the child's own mission.
+            card_title: None,
             lineage: self
                 .inherited_authority
                 .as_ref()
@@ -485,6 +486,18 @@ impl Agent {
         let failed = executed.failed();
         let trust =
             self.call_output_trust(scope, &request.name, arguments, Some(executed.metadata()));
+        // A site on this computer named in a trusted result (a dev server
+        // or `ddev` project this work started) is one the work set up: the
+        // browser opens it without a card. Never from outside content.
+        if trust == sdk::SourceTrust::Trusted {
+            if let ExecutedOutcome::Returned { outcome, .. } = &executed {
+                let grant = crate::agent::approvals::grant_session(
+                    self.approval_session_id.as_deref(),
+                    scope.session_id,
+                );
+                aidaemon_tools::local_sites::note_sites_in(&grant, &outcome.output).await;
+            }
+        }
         // The first untrusted read records the turn as tainted at once, so a
         // run that never finishes still taints later turns that see it.
         if trust == sdk::SourceTrust::Untrusted {

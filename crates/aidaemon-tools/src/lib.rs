@@ -63,6 +63,7 @@ pub mod git_info;
 pub mod http_request;
 pub mod internal_markers;
 pub mod local_backend;
+pub mod local_sites;
 pub mod outcome;
 pub mod owner_answers;
 pub mod path_class;

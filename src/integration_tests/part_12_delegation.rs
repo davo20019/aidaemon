@@ -1087,6 +1087,7 @@ async fn test_child_tokens_count_against_the_requests_tree() {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            card_title: None,
             lineage: Vec::new(),
             parent_task: None,
         });

@@ -1279,6 +1279,15 @@ impl Agent {
             crate::agent::untrusted::origin_is_owner_authored(user_role, session_id)
                 && inherited.is_none_or(|parent| parent.origin_trusted)
                 && mandate_origin.as_ref().is_none_or(|origin| origin.trusted);
+        // A site on this computer the owner's own request names is one the
+        // browser may open for this work without a card.
+        if origin_trusted {
+            aidaemon_tools::local_sites::note_sites_in(
+                &super::approvals::grant_session(self.approval_session_id.as_deref(), session_id),
+                origin_request,
+            )
+            .await;
+        }
         let scope = TurnScope {
             daemon_paths: &self.daemon_paths,
             execution_backend: &*self.execution_backend,
@@ -1399,11 +1408,12 @@ impl Agent {
             },
             owner: super::approvals::OwnerApprovalResolver {
                 decisions: self,
-                mission: self
-                    .inherited_authority
-                    .as_ref()
-                    .and_then(|inherited| inherited.lineage.last())
-                    .map(String::as_str),
+                mission: self.inherited_authority.as_ref().and_then(|inherited| {
+                    inherited
+                        .card_title
+                        .as_deref()
+                        .or(inherited.lineage.last().map(String::as_str))
+                }),
                 approvals,
                 rules,
                 card_session: session_id,
