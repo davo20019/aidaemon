@@ -83,6 +83,7 @@ dependencies = [
  "aidaemon-mcp",
  "aidaemon-memory",
  "aidaemon-node-protocol",
+ "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-runtime",
@@ -367,6 +368,38 @@ dependencies = [
  "p256",
  "rand 0.10.3",
  "reqwest 0.13.5",
+ "uuid",
+]
+
+[[package]]
+name = "aidaemon-nodes"
+version = "0.2.0"
+dependencies = [
+ "aidaemon-channels",
+ "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-node-protocol",
+ "aidaemon-secrets",
+ "aidaemon-tools",
+ "aidaemon-work",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "hmac",
+ "p256",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "shellexpand",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

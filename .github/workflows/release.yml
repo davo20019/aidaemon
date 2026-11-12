@@ -345,6 +345,7 @@ jobs:
             aidaemon-memory
             aidaemon-skills
             aidaemon-work
+            aidaemon-nodes
             aidaemon-runtime
             aidaemon-sdk
           )

@@ -1,4 +1,4 @@
-use crate::traits::ToolSemantics;
+use aidaemon_tools::semantics::ToolSemantics;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -6,13 +6,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
-use crate::types::{ChannelVisibility, UserRole};
+use aidaemon_core::ChannelVisibility;
+use aidaemon_tools::semantics::UserRole;
 
-use crate::traits::{
-    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, Tool, ToolCallContext,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
+use aidaemon_tools::semantics::{
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
     ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolVerificationMode,
 };
+use aidaemon_tools::OutcomeTool as Tool;
 
 const FRESH_READING_SECONDS: i64 = 90;
 /// A Node seen within this many seconds counts as recently connected (a
@@ -253,8 +255,8 @@ impl Tool for ReadNodeSensorsTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         Ok(ToolCallOutcome {
@@ -324,7 +326,7 @@ impl ReadNodeSensorsTool {
     }
 }
 
-impl crate::traits::ToolSemantics for ReadNodeSensorsTool {
+impl aidaemon_tools::semantics::ToolSemantics for ReadNodeSensorsTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -376,8 +378,8 @@ impl Tool for ReadNodeHealthTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         Ok(ToolCallOutcome {
@@ -435,7 +437,7 @@ impl ReadNodeHealthTool {
     }
 }
 
-impl crate::traits::ToolSemantics for ReadNodeHealthTool {
+impl aidaemon_tools::semantics::ToolSemantics for ReadNodeHealthTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: true,
@@ -492,8 +494,8 @@ impl Tool for SendNodeAudioTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         let (output, status) = self.execute_delivery(arguments, &facts).await?;
@@ -509,7 +511,7 @@ impl Tool for SendNodeAudioTool {
     }
 }
 
-impl crate::traits::ToolSemantics for SendNodeAudioTool {
+impl aidaemon_tools::semantics::ToolSemantics for SendNodeAudioTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -577,8 +579,8 @@ impl Tool for ManageNodeMonitorsTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         self.run(arguments, &facts)
@@ -665,7 +667,7 @@ impl ManageNodeMonitorsTool {
     }
 }
 
-impl crate::traits::ToolSemantics for ManageNodeMonitorsTool {
+impl aidaemon_tools::semantics::ToolSemantics for ManageNodeMonitorsTool {
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -699,7 +701,7 @@ impl crate::traits::ToolSemantics for ManageNodeMonitorsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::CallWithFacts;
+    use aidaemon_tools::testing::CallWithFacts;
 
     #[test]
     fn played_audio_receipt_is_authoritative_delivery_and_outcome_evidence() {
@@ -742,8 +744,8 @@ mod tests {
         let error = tool
             .call_with(
                 r#"{}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Public),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Public),
                     ..Default::default()
                 },
             )
@@ -754,8 +756,8 @@ mod tests {
         let error = health_tool
             .call_with(
                 r#"{}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Public),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Public),
                     ..Default::default()
                 },
             )
@@ -778,8 +780,8 @@ mod tests {
         let non_owner = tool
             .call_with(
                 r#"{"text":"hello"}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Public),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Public),
                     ..Default::default()
                 },
             )
@@ -790,8 +792,8 @@ mod tests {
         let disabled = tool
             .call_with(
                 r#"{"text":"hello"}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Owner),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
                     ..Default::default()
                 },
             )
@@ -814,9 +816,9 @@ mod tests {
         let non_owner = tool
             .call_with(
                 r#"{"action":"list"}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Public),
-                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Public),
+                    channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
                     session_id: "public-session".into(),
                     ..Default::default()
                 },
@@ -828,9 +830,9 @@ mod tests {
         let public_channel = tool
             .call_with(
                 r#"{"action":"list"}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Owner),
-                    channel_visibility: Some(crate::types::ChannelVisibility::PublicExternal),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
+                    channel_visibility: Some(aidaemon_core::ChannelVisibility::PublicExternal),
                     session_id: "owner-session".into(),
                     ..Default::default()
                 },
@@ -842,9 +844,9 @@ mod tests {
         let disabled = tool
             .call_with(
                 r#"{"action":"list"}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Owner),
-                    channel_visibility: Some(crate::types::ChannelVisibility::Private),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
+                    channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
                     session_id: "owner-session".into(),
                     ..Default::default()
                 },

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::traits::{ChannelCapabilities, HubChannel};
-use crate::types::{ApprovalResponse, MediaMessage};
+use aidaemon_channels::hub::{ChannelCapabilities, HubChannel, MediaMessage};
+use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
+use aidaemon_tools::semantics::ApprovalResponse;
 
 use super::domain::NODE_CHANNEL_NAME;
 use super::store::NodeStore;
@@ -57,7 +57,7 @@ impl HubChannel for NodeChannel {
         _session_id: &str,
         _goal_description: &str,
         _details: &[String],
-        _style: crate::types::GoalConfirmationStyle,
+        _style: aidaemon_tools::semantics::GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
         Ok(false)
     }

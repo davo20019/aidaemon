@@ -1,26 +1,25 @@
-//! First-class AIdaemon Node domain and protocol.
-//!
-//! A Node is a persistent participant with server-issued identity, observed
-//! hardware capabilities, explicit authorization, policy, and one or more
-//! conversational Channels. Transport adapters only expose the narrow Node
-//! Gateway; they never establish domain authority.
+//! Nodes: the domain, Gateway, store and tools live in `aidaemon-nodes`.
+//! The daemon keeps its adapters: the agent behind Node turns
+//! (`service::AgentNodeConversationIngress`), the instance key in the
+//! daemon's secret store (`auth`) and the `aidaemon node` CLI.
 
-pub mod announcement;
-pub mod auth;
-pub mod channel;
+pub use aidaemon_nodes::{
+    announcement, channel, domain, gateway, monitoring, ota, protocol, restart, simulator, speech,
+    store, tool,
+};
+
 pub mod cli;
-pub mod domain;
-pub mod gateway;
-pub mod monitoring;
-pub mod ota;
-pub mod protocol;
-pub mod restart;
 pub mod service;
-pub mod simulator;
-pub mod speech;
-pub mod store;
-pub mod tool;
 
-pub use domain::{AuthenticatedNodeContext, NodeAction, NodeRecord};
-pub use service::{NodeConversationIngress, NodeService};
-pub use store::NodeStore;
+/// Node authentication, with the instance key kept in the daemon's secret store.
+pub mod auth {
+    pub use aidaemon_nodes::auth::*;
+
+    /// The Gateway instance key from the daemon's secret store.
+    pub fn load_or_create_instance_key() -> anyhow::Result<[u8; 32]> {
+        aidaemon_nodes::auth::load_or_create_instance_key(crate::config::secret_store().as_ref())
+    }
+}
+
+pub use aidaemon_nodes::{AuthenticatedNodeContext, NodeAction, NodeRecord};
+pub use aidaemon_nodes::{NodeConversationIngress, NodeService, NodeStore};

@@ -46,6 +46,7 @@ members = [
     "crates/aidaemon-runtime",
     "crates/aidaemon-skills",
     "crates/aidaemon-secrets",
+    "crates/aidaemon-nodes",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
     "crates/aidaemon-channel-slack",
@@ -127,6 +128,8 @@ aidaemon-tools = { version = "=0.2.0", path = "crates/aidaemon-tools", features 
 aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 # Secrets: the keychain, its env-file mode and the account names.
 aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
+# Nodes: hardware companions, their Gateway, store and tools.
+aidaemon-nodes = { version = "=0.2.0", path = "crates/aidaemon-nodes" }
 aidaemon-tool-browser = { version = "=0.2.0", path = "crates/aidaemon-tool-browser" }
 aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
 # The MCP transport; the daemon keeps its registry and result rendering.
