@@ -213,45 +213,52 @@ impl Subject for AgentSubject<'_> {
     type Observed = ();
 
     async fn run(&self, scenario: &Scenario, run: usize) -> Result<Trajectory, FactoryError> {
-        let script = scenario.script.as_ref().map(|_| {
-            let responses = scenario.scripted_responses();
-            (responses.len(), Arc::new(ScriptedProvider::new(responses)))
-        });
-        let provider: Arc<dyn Provider> = match (&script, self.factory.live_provider(scenario)) {
-            (Some((_, scripted)), _) => scripted.clone(),
-            (None, Some(live)) => live,
-            (None, None) => {
-                return Err(
-                    "scenario has no `script` and the factory supplied no live provider".into(),
-                )
-            }
-        };
-        let agent = self
-            .factory
-            .build(scenario, provider)
-            .map_err(|err| format!("agent factory failed: {err}"))?;
-        let session = format!("eval-{}-{run}", scenario.name);
-        let outcome = agent
-            .run(&session, &scenario.input)
-            .await
-            .map_err(|err| format!("run failed: {err}"))?;
-
-        let mut trajectory = Trajectory::from_outcome(&outcome);
-        if let Some((len, scripted)) = &script {
-            let calls = scripted.requests().len();
-            if calls > *len {
-                trajectory.run_failures.push(format!(
-                    "script ran out: the model was called {calls} times but the script has {len} replies"
-                ));
-            } else if scripted.remaining() > 0 {
-                trajectory.run_failures.push(format!(
-                    "script not fully consumed: {} of {len} replies unused",
-                    scripted.remaining()
-                ));
-            }
-        }
-        Ok(trajectory)
+        Ok(run_agent(self.factory, scenario, run).await?.1)
     }
+}
+
+/// Run `scenario` once on an agent from `factory`: the kernel outcome and
+/// its trajectory (with any script problems in `run_failures`).
+pub(crate) async fn run_agent(
+    factory: &dyn AgentFactory,
+    scenario: &Scenario,
+    run: usize,
+) -> Result<(RunOutcome, Trajectory), FactoryError> {
+    let script = scenario.script.as_ref().map(|_| {
+        let responses = scenario.scripted_responses();
+        (responses.len(), Arc::new(ScriptedProvider::new(responses)))
+    });
+    let provider: Arc<dyn Provider> = match (&script, factory.live_provider(scenario)) {
+        (Some((_, scripted)), _) => scripted.clone(),
+        (None, Some(live)) => live,
+        (None, None) => {
+            return Err("scenario has no `script` and the factory supplied no live provider".into())
+        }
+    };
+    let agent = factory
+        .build(scenario, provider)
+        .map_err(|err| format!("agent factory failed: {err}"))?;
+    let session = format!("eval-{}-{run}", scenario.name);
+    let outcome = agent
+        .run(&session, &scenario.input)
+        .await
+        .map_err(|err| format!("run failed: {err}"))?;
+
+    let mut trajectory = Trajectory::from_outcome(&outcome);
+    if let Some((len, scripted)) = &script {
+        let calls = scripted.requests().len();
+        if calls > *len {
+            trajectory.run_failures.push(format!(
+                "script ran out: the model was called {calls} times but the script has {len} replies"
+            ));
+        } else if scripted.remaining() > 0 {
+            trajectory.run_failures.push(format!(
+                "script not fully consumed: {} of {len} replies unused",
+                scripted.remaining()
+            ));
+        }
+    }
+    Ok((outcome, trajectory))
 }
 
 impl CaseResult {
