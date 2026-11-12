@@ -89,6 +89,7 @@ pub mod profile;
 pub mod progressive;
 mod recall;
 pub mod records;
+pub mod render;
 pub mod retrieval_eval;
 mod scoring;
 pub mod search;

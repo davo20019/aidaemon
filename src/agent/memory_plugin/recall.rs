@@ -197,6 +197,13 @@ impl DaemonRecall {
         // user-private preferences.
         let goals = if allowed && inject_personal {
             or_logged(state.get_active_personal_goals(20).await, "goals")
+                .into_iter()
+                .map(|goal| skills::RecallGoal {
+                    id: goal.id,
+                    description: goal.description,
+                    status: goal.status,
+                })
+                .collect()
         } else {
             vec![]
         };
