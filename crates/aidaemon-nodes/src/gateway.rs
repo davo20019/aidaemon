@@ -13,8 +13,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::channels::ChannelHub;
 use crate::config::NodesConfig;
+use aidaemon_channels::hub::ChannelHub;
 
 use super::domain::NODE_CHANNEL_NAME;
 use super::protocol::*;
@@ -765,17 +765,17 @@ async fn cancel_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::CallWithFacts;
+    use aidaemon_tools::testing::CallWithFacts;
     use async_trait::async_trait;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashMap;
 
-    use crate::channels::SessionMap;
-    use crate::nodes::domain::{AuthenticatedNodeContext, CHILD_COMPANION_POLICY};
-    use crate::nodes::service::NodeConversationIngress;
-    use crate::nodes::simulator::NodeSimulator;
-    use crate::nodes::store::NodeStore;
-    use crate::nodes::tool::{ReadNodeHealthTool, ReadNodeSensorsTool};
+    use crate::domain::{AuthenticatedNodeContext, CHILD_COMPANION_POLICY};
+    use crate::service::NodeConversationIngress;
+    use crate::simulator::NodeSimulator;
+    use crate::store::NodeStore;
+    use crate::tool::{ReadNodeHealthTool, ReadNodeSensorsTool};
+    use aidaemon_channels::hub::SessionMap;
 
     struct EchoIngress;
     #[async_trait]
@@ -811,7 +811,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        crate::nodes::store::migrate(&pool).await.unwrap();
+        crate::store::migrate(&pool).await.unwrap();
         let store = Arc::new(NodeStore::new(pool, [7_u8; 32]));
         let media_dir = tempfile::tempdir().unwrap();
         let mut config = NodesConfig::default();
@@ -825,7 +825,7 @@ mod tests {
         ];
         let firmware_image = b"synthetic signed K10 application image";
         let firmware_release =
-            crate::nodes::ota::FirmwareRelease::signed_for_test(firmware_image, "0.4.0", 1);
+            crate::ota::FirmwareRelease::signed_for_test(firmware_image, "0.4.0", 1);
         let service = Arc::new(
             NodeService::new(store.clone(), config.clone()).with_firmware_release(firmware_release),
         );
@@ -861,7 +861,7 @@ mod tests {
         store
             .set_authorization(
                 &enrollment.node_id,
-                crate::nodes::domain::NodeAction::SubmitAudioTurn,
+                crate::domain::NodeAction::SubmitAudioTurn,
                 true,
                 serde_json::json!({"max_duration_ms":10000}),
             )
@@ -870,7 +870,7 @@ mod tests {
         store
             .set_authorization(
                 &enrollment.node_id,
-                crate::nodes::domain::NodeAction::ReportSensor,
+                crate::domain::NodeAction::ReportSensor,
                 true,
                 serde_json::json!({"capabilities":[
                     "sensor.environment.temperature",
@@ -919,7 +919,7 @@ mod tests {
         store
             .set_authorization(
                 &enrollment.node_id,
-                crate::nodes::domain::NodeAction::ReceiveAudio,
+                crate::domain::NodeAction::ReceiveAudio,
                 true,
                 serde_json::json!({"content_types":["audio/wav"]}),
             )
@@ -928,7 +928,7 @@ mod tests {
         store
             .set_authorization(
                 &enrollment.node_id,
-                crate::nodes::domain::NodeAction::ReceiveOta,
+                crate::domain::NodeAction::ReceiveOta,
                 true,
                 serde_json::json!({"board":"unihiker_k10","channel":"stable"}),
             )
@@ -1040,8 +1040,8 @@ mod tests {
         let tool_output = tool
             .call_with(
                 r#"{}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Owner),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
                     ..Default::default()
                 },
             )
@@ -1053,8 +1053,8 @@ mod tests {
         let health_output = health_tool
             .call_with(
                 r#"{}"#,
-                crate::traits::ToolCallContext {
-                    user_role: Some(crate::types::UserRole::Owner),
+                aidaemon_tools::semantics::ToolCallContext {
+                    user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
                     ..Default::default()
                 },
             )
@@ -1149,10 +1149,7 @@ mod tests {
             .await
             .unwrap();
         assert!(service
-            .authorize(
-                &context,
-                crate::nodes::domain::NodeAction::ReceiveActuatorCommand
-            )
+            .authorize(&context, crate::domain::NodeAction::ReceiveActuatorCommand)
             .await
             .is_err());
         let old_token = simulator.identity.access_token.clone().unwrap();

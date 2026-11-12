@@ -66,6 +66,7 @@ pub mod local_backend;
 pub mod outcome;
 pub mod owner_answers;
 pub mod path_class;
+pub mod permission_bypass;
 pub mod process_control;
 pub mod project_inspect;
 pub mod result_spill;

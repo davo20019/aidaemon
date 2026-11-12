@@ -16,14 +16,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::tools::owner_answers::OwnerAnsweredCalls;
-use crate::traits::{
+use aidaemon_tools::owner_answers::OwnerAnsweredCalls;
+use aidaemon_tools::semantics::{
     ApprovalCall, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, OwnerApprovalNeed,
-    Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolDispatchFacts, ToolEvidenceCapability, ToolMutationEffects, ToolOutcomeStatus,
     ToolSemanticScope, ToolSemantics, ToolVerificationMode,
 };
-use crate::types::{ApprovalKind, ApprovalResponse, UserRole};
+use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, UserRole};
+use aidaemon_tools::OutcomeTool as Tool;
 
 use super::domain::NodeAction;
 use super::store::NodeStore;
@@ -646,13 +647,14 @@ impl ToolSemantics for NodeRestartTool {
 mod tests {
     use super::*;
     use crate::config::NodesConfig;
-    use crate::nodes::domain::{AuthenticatedNodeContext, NodeAction, CHILD_COMPANION_POLICY};
-    use crate::nodes::ota::FirmwareRelease;
-    use crate::nodes::protocol::{CapabilityObservation, HeartbeatRequest, HeartbeatResponse};
-    use crate::nodes::service::NodeService;
-    use crate::testing::{call_through_kernel, CallWithFacts};
-    use crate::traits::{OwnerApprovalNeed, Tool, ToolCallContext, ToolSemantics};
-    use crate::types::{ApprovalKind, ApprovalResponse, UserRole};
+    use crate::domain::{AuthenticatedNodeContext, NodeAction, CHILD_COMPANION_POLICY};
+    use crate::ota::FirmwareRelease;
+    use crate::protocol::{CapabilityObservation, HeartbeatRequest, HeartbeatResponse};
+    use crate::service::NodeService;
+    use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse, UserRole};
+    use aidaemon_tools::semantics::{OwnerApprovalNeed, ToolCallContext, ToolSemantics};
+    use aidaemon_tools::testing::{call_through_kernel, CallWithFacts};
+    use aidaemon_tools::OutcomeTool as Tool;
     use chrono::{Duration, Utc};
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::Row;
@@ -678,7 +680,7 @@ mod tests {
         CapabilityObservation {
             capability_id: "firmware.ota".to_string(),
             version: 1,
-            limits: serde_json::json!({"board": crate::nodes::ota::K10_BOARD_ID}),
+            limits: serde_json::json!({"board": crate::ota::K10_BOARD_ID}),
         }
     }
 
@@ -688,7 +690,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        crate::nodes::store::migrate(&pool).await.unwrap();
+        crate::store::migrate(&pool).await.unwrap();
         let now = (Utc::now() - Duration::seconds(2)).to_rfc3339();
         sqlx::query(
             "INSERT INTO nodes
@@ -1109,7 +1111,10 @@ mod tests {
         let tool = NodeRestartTool::new(fixture.store.clone());
         let arguments = serde_json::json!({"action": "status"});
         let need = tool
-            .owner_approval_request(&crate::traits::ApprovalCall::as_sent(&arguments), &owner())
+            .owner_approval_request(
+                &aidaemon_tools::semantics::ApprovalCall::as_sent(&arguments),
+                &owner(),
+            )
             .await;
         assert!(matches!(need, OwnerApprovalNeed::NotNeeded));
         let output = tool
@@ -1126,7 +1131,10 @@ mod tests {
         let tool = NodeRestartTool::new(fixture.store.clone());
         let arguments = serde_json::json!({"action": "request"});
         let need = tool
-            .owner_approval_request(&crate::traits::ApprovalCall::as_sent(&arguments), &owner())
+            .owner_approval_request(
+                &aidaemon_tools::semantics::ApprovalCall::as_sent(&arguments),
+                &owner(),
+            )
             .await;
         assert!(matches!(need, OwnerApprovalNeed::NotNeeded));
         let error = tool

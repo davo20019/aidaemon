@@ -1,3 +1,4 @@
+use aidaemon_secrets::SecretStore;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
@@ -10,8 +11,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 const INSTANCE_KEYCHAIN_FIELD: &str = "node_gateway_instance_key_v1";
 
-pub fn load_or_create_instance_key() -> anyhow::Result<[u8; 32]> {
-    if let Ok(encoded) = crate::config::resolve_from_keychain(INSTANCE_KEYCHAIN_FIELD) {
+/// The Gateway instance key, kept in `secrets` under
+/// `node_gateway_instance_key_v1`; created on first use.
+pub fn load_or_create_instance_key(secrets: &dyn SecretStore) -> anyhow::Result<[u8; 32]> {
+    if let Ok(encoded) = secrets.get(INSTANCE_KEYCHAIN_FIELD) {
         let decoded = URL_SAFE_NO_PAD
             .decode(encoded.trim())
             .map_err(|_| anyhow::anyhow!("Stored Node Gateway instance key is malformed"))?;
@@ -26,7 +29,7 @@ pub fn load_or_create_instance_key() -> anyhow::Result<[u8; 32]> {
 
     let mut key = [0_u8; 32];
     rand::rng().fill_bytes(&mut key);
-    crate::config::store_in_keychain(INSTANCE_KEYCHAIN_FIELD, &URL_SAFE_NO_PAD.encode(key))?;
+    secrets.set(INSTANCE_KEYCHAIN_FIELD, &URL_SAFE_NO_PAD.encode(key))?;
     Ok(key)
 }
 
