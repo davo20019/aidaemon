@@ -321,7 +321,6 @@ impl EventType {
 
     /// Parse from string (database storage)
     #[allow(clippy::should_implement_trait)]
-    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }

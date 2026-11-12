@@ -122,16 +122,10 @@ fn skill_is_valuable(skill: &Skill) -> bool {
         return false;
     }
 
-    let non_generic_trigger_count = skill
+    skill
         .triggers
         .iter()
-        .filter(|trigger| !is_generic_low_value_trigger(trigger))
-        .count();
-    if non_generic_trigger_count == 0 {
-        return false;
-    }
-
-    true
+        .any(|trigger| !is_generic_low_value_trigger(trigger))
 }
 
 pub struct SkillPromoter {
