@@ -630,7 +630,6 @@ mod summary_tests {
 mod provenance_tests {
     use super::*;
     use crate::testing::{setup_test_agent, MockProvider};
-    use crate::traits::store_prelude::*;
 
     fn root_task(goal_id: &str) -> Task {
         Task {

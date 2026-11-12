@@ -717,7 +717,7 @@ impl Agent {
                     scope.open_background_jobs.fetch_add(1, Ordering::Relaxed);
                 }
                 if outcome.metadata.background_settled {
-                    let _ = scope.open_background_jobs.fetch_update(
+                    let _ = scope.open_background_jobs.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |open| open.checked_sub(1),
