@@ -824,7 +824,7 @@ pub(crate) async fn deliver_background_completion_ping(
 /// Resolve an edited background status surface after the promised result has
 /// actually been delivered. The completion ping is deliberately nonterminal;
 /// only this post-delivery transition gets a checkmark.
-async fn finalize_background_completion_surface(
+pub(crate) async fn finalize_background_completion_surface(
     hub: Option<&Arc<dyn OutboundRouter>>,
     session_id: &str,
     surface_id: Option<&str>,
@@ -847,7 +847,7 @@ async fn finalize_background_completion_surface(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundSurfaceOutcome {
+pub(crate) enum BackgroundSurfaceOutcome {
     Delivered,
     StillWorking,
     Queued,

@@ -145,15 +145,19 @@ fn format_background_progress(
     elapsed_secs: u64,
     latest_activity: Option<&str>,
 ) -> String {
+    let elapsed = if elapsed_secs < 90 {
+        format!("{elapsed_secs}s")
+    } else {
+        format!("{} min", (elapsed_secs + 30) / 60)
+    };
     let mut message = format!(
-        "Background task is still running ({}s).\nWorker: {}\nTask: {}",
-        elapsed_secs,
+        "\u{23f3} Still working on it in the background ({elapsed}).\n{}: {}",
         tool_name,
-        truncate_with_note(task_context, 240),
+        truncate_with_note(task_context, 200),
     );
     if let Some(activity) = latest_activity.filter(|activity| !activity.trim().is_empty()) {
-        message.push_str("\nLatest activity: ");
-        message.push_str(&truncate_with_note(activity.trim(), 240));
+        message.push_str("\nLast step: ");
+        message.push_str(&truncate_with_note(activity.trim(), 160));
     }
     message
 }
@@ -170,6 +174,23 @@ async fn deliver_cli_agent_notification(
     if session_id.trim().is_empty() {
         warn!("{context}: no session available; update dropped");
         return false;
+    }
+
+    // Progress belongs in the session's one background status message (the
+    // handoff reply, registered when it was delivered): edit it in place
+    // rather than stacking a new message per update. Without one, or when the
+    // channel cannot edit, fall through to a fresh message.
+    if notification_type == "progress" {
+        if let Some(hub) = hub {
+            if let Some(surface_id) = hub.background_status_surface(session_id).await {
+                if matches!(
+                    hub.edit_text(session_id, &surface_id, message).await,
+                    Ok(true)
+                ) {
+                    return true;
+                }
+            }
+        }
     }
 
     let message = crate::channels::present_notification(notification_type, message);
@@ -3306,6 +3327,24 @@ impl CliAgentTool {
                         }
                     }
 
+                    // The session's background status message ("still working
+                    // on it…") is resolved now the result went out as its own
+                    // message, so it never stays on "working" after the job.
+                    if let Some(ref hub) = hub_for_completion {
+                        let surface = hub.take_background_status_surface(&notify_session_id).await;
+                        crate::tools::terminal::finalize_background_completion_surface(
+                            Some(hub),
+                            &notify_session_id,
+                            surface.as_deref(),
+                            if delivered {
+                                crate::tools::terminal::BackgroundSurfaceOutcome::Delivered
+                            } else {
+                                crate::tools::terminal::BackgroundSurfaceOutcome::Queued
+                            },
+                        )
+                        .await;
+                    }
+
                     if !delivered {
                         let queue_goal_id = if notify_goal_id.trim().is_empty() {
                             "global"
@@ -5329,9 +5368,9 @@ mod tests {
             Some("Running focused validation"),
         );
 
-        assert!(message.contains("still running (240s)"));
-        assert!(message.contains("Worker: codex"));
-        assert!(message.contains("Latest activity: Running focused validation"));
+        assert!(message.contains("Still working on it in the background (4 min)"));
+        assert!(message.contains("codex: Investigate"));
+        assert!(message.contains("Last step: Running focused validation"));
     }
 
     /// Create a CliAgentTool with `echo` registered as a test tool.
@@ -7704,7 +7743,7 @@ mod tests {
             notifications.iter().any(|entry| {
                 entry.session_id == "session-progress"
                     && entry.notification_type == "progress"
-                    && entry.message.contains("still running")
+                    && entry.message.contains("Still working")
             }),
             "pending notifications: {notifications:?}"
         );

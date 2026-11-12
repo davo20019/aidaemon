@@ -77,6 +77,22 @@ fn launcher(notifications: bool) -> MockTool {
     .with_finish(handoff())
 }
 
+/// A notifying launch whose tool left the run going (no finish of its own):
+/// only the stop-time handoff can resolve it.
+fn launcher_without_finish() -> MockTool {
+    MockTool::new(
+        "synthetic_launcher",
+        "Starts a synthetic long job",
+        "Started synthetic job 7; it keeps running.",
+    )
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::Backgrounded),
+        background_started: true,
+        completion_notifications_enabled: true,
+        ..ToolCallMetadata::default()
+    })
+}
+
 /// The finish a tool hands the turn to the background with
 /// (`ToolCallOutcome::handed_to_background`).
 fn handoff() -> aidaemon_core::Finish {
@@ -389,6 +405,34 @@ async fn background_handoff_with_more_declared_work_lets_the_model_continue() {
     assert_eq!(harness.provider.call_count().await, 3);
 }
 
+/// A job that reports back hands the run off at launch even with declared
+/// work beyond it: the continuation its completion starts finishes that work
+/// from the job's result (live 2026-11-11: left running, the run polled the
+/// job and started a sub-agent to watch it).
+#[tokio::test]
+async fn notifying_launch_with_more_declared_work_hands_off() {
+    let checklist = r#"{"items":[
+        {"text":"Start the job","status":"in_progress"},
+        {"text":"Send the screenshot","status":"pending"}
+    ]}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::tool_call_response("synthetic_launcher", "{}"),
+        MockProvider::text_response("UNREACHED model narration"),
+    ]);
+    let harness = root(provider, vec![Arc::new(launcher(true))]).await;
+    let text = "Build the site, then send a screenshot";
+    let reply = ask(&harness, "finish-launch-more-work", text).await;
+
+    assert_eq!(
+        reply,
+        crate::agent::post_task::build_friendly_background_handoff(text)
+    );
+    assert_eq!(harness.provider.call_count().await, 2);
+    let end = task_end(&harness, "finish-launch-more-work").await;
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+}
+
 /// A notifying job still running when the model stops makes the stop a
 /// handoff: its notifier owns the result, so the model's own verdict on the
 /// unfinished work does not ship, whatever it says (live 2026-11-11: "I
@@ -405,7 +449,7 @@ async fn stop_with_a_notifying_job_still_running_ships_the_handoff() {
         MockProvider::text_response("I couldn't do it: the job failed."),
         MockProvider::text_response("UNREACHED second answer"),
     ]);
-    let harness = root(provider, vec![Arc::new(launcher(true))]).await;
+    let harness = root(provider, vec![Arc::new(launcher_without_finish())]).await;
     let text = "Build the site, then send a screenshot";
     let reply = ask(&harness, "finish-stop-running", text).await;
 
@@ -443,7 +487,11 @@ async fn stop_after_the_job_settled_ships_the_models_answer() {
         MockProvider::tool_call_response("synthetic_check", "{}"),
         MockProvider::text_response("Job 7 finished and the site is built."),
     ]);
-    let harness = root(provider, vec![Arc::new(launcher(true)), Arc::new(settle)]).await;
+    let harness = root(
+        provider,
+        vec![Arc::new(launcher_without_finish()), Arc::new(settle)],
+    )
+    .await;
     let reply = ask(&harness, "finish-stop-settled", "Build the site and report").await;
 
     assert_eq!(reply, "Job 7 finished and the site is built.");

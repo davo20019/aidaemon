@@ -1318,9 +1318,18 @@ impl Agent {
                     // The call that started the job is one open item at most;
                     // a second means the model declared work beyond it.
                     let work_remains = scope.open_checklist_items.load(Ordering::Relaxed) > 1;
+                    // A job that reports back re-engages the session when it
+                    // ends, and that continuation finishes the request's
+                    // remaining steps from the job's result. So declared work
+                    // beyond it does not keep this run going: left running, the
+                    // run polled the job, started a sub-agent to watch it, and
+                    // posted half-results while the job worked (live
+                    // 2026-11-11). Only a job without notifications keeps the
+                    // run going for the remaining work.
+                    let reports_back = outcome.metadata.completion_notifications_enabled;
                     let hands_off = finish.is_some()
                         && !typed_failure
-                        && !work_remains
+                        && (!work_remains || reports_back)
                         && !outcome.metadata.detached;
                     handed_off = hands_off;
                     let directive = if hands_off {
