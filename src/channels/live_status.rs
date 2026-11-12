@@ -40,7 +40,9 @@ impl LiveStatus {
         if let Some(c) = &self.checklist {
             return Some(c.clone());
         }
-        self.current_line.as_ref().map(|l| format!("⏳ {l}"))
+        self.current_line
+            .as_ref()
+            .map(|l| format!("⏳ {}", capitalize_first(l)))
     }
 
     async fn flush(&mut self, sink: &dyn SurfaceSink) {
@@ -101,12 +103,17 @@ impl LiveStatus {
         false
     }
 
-    /// Remove the temporary activity surface once the final response has been
-    /// delivered. A checklist is retained as the completed plan summary, but
-    /// an activity-only surface should not become a separate "Done" bubble.
-    pub async fn clear(&mut self, sink: &dyn SurfaceSink) {
-        if self.checklist.is_some() {
-            return;
+    /// Remove the temporary surface when the turn is over. An activity line
+    /// is always removed. A checklist with every step done is removed only
+    /// when `reply_delivered`: the reply says what was done, so the card would
+    /// repeat it; without a reply the card is the only sign the work happened.
+    /// A checklist with unfinished, failed or deferred steps always stays as
+    /// the record of what was left.
+    pub async fn clear(&mut self, sink: &dyn SurfaceSink, reply_delivered: bool) {
+        if let Some(checklist) = self.checklist.as_deref() {
+            if !reply_delivered || !crate::plans::is_completed_checklist(checklist) {
+                return;
+            }
         }
         if let Some(id) = self.message_id.take() {
             let _ = sink.delete(&id).await;
@@ -131,6 +138,16 @@ impl LiveStatus {
         self.checklist = None;
         self.current_line = None;
         self.edit_supported = true;
+    }
+}
+
+/// "checking memory" -> "Checking memory": tool labels are lowercase so they
+/// read inside a sentence; a status line starts one.
+fn capitalize_first(line: &str) -> String {
+    let mut chars = line.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -296,7 +313,7 @@ mod tests {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
         s.set_activity(&sink, "Working…".into()).await;
-        s.clear(&sink).await;
+        s.clear(&sink, false).await;
         assert_eq!(
             *sink.deletes.lock().unwrap(),
             vec!["m1".to_string()],
@@ -305,16 +322,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_keeps_checklist_without_done_marker() {
+    async fn clear_keeps_unfinished_checklist() {
         let sink = FakeSink::new(true);
         let mut s = LiveStatus::new();
-        s.set_checklist(&sink, "📋 Plan\n✅ Step 1\n☐ Step 2".into())
-            .await;
-        s.clear(&sink).await;
+        s.set_checklist(
+            &sink,
+            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (deferred)".into(),
+        )
+        .await;
+        s.clear(&sink, true).await;
         assert_eq!(
             sink.deletes.lock().unwrap().len(),
             0,
-            "clear keeps the completed checklist instead of adding a done marker"
+            "a card with unfinished steps stays as the record of what was left"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_drops_fully_done_checklist() {
+        // Live 2026-11-11: "Remember X" left a "✅ Planned steps complete /
+        // 1 of 1 steps complete / ✅ Remember X / Finalizing…" card above a
+        // reply saying the same thing.
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_checklist(&sink, "⏳ Remember X".into()).await;
+        s.set_checklist(&sink, "✅ Remember X".into()).await;
+        s.clear(&sink, true).await;
+        assert_eq!(*sink.deletes.lock().unwrap(), vec!["m1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clear_keeps_fully_done_checklist_when_no_reply_went_out() {
+        // Cancelled, errored or failed send: the card is the only sign the
+        // work happened, so it stays.
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_checklist(&sink, "✅ Done · 2 of 2 steps\n\n✅ a\n✅ b".into())
+            .await;
+        s.clear(&sink, false).await;
+        assert_eq!(sink.deletes.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn activity_line_starts_with_a_capital() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, "checking memory…".into()).await;
+        assert_eq!(sink.creates.lock().unwrap()[0], "⏳ Checking memory…");
     }
 }

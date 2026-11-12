@@ -338,7 +338,7 @@ pub enum StatusUpdate {
     /// Replaces the separate checklist message previously posted by
     /// `track_requirements` directly through the hub.
     Checklist { text: String },
-    /// A sub-agent's own plan progress (`Step 2 of 4`), named by its mission.
+    /// A sub-agent's own plan progress (`step 2 of 4`), named by its mission.
     /// The parent's card keeps the parent's checklist and shows this as its
     /// activity line, so a child's plan never stands in for the whole task.
     SubAgentProgress { label: String, progress: String },

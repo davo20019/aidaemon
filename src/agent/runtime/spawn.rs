@@ -160,7 +160,7 @@ fn child_status_sender(
         while let Some(update) = rx.recv().await {
             let update = match update {
                 StatusUpdate::Checklist { text } => {
-                    let Some(progress) = checklist_progress_line(&text) else {
+                    let Some(progress) = crate::plans::checklist_progress(&text) else {
                         continue;
                     };
                     StatusUpdate::SubAgentProgress {
@@ -189,20 +189,6 @@ fn child_status_label(mission: &str) -> String {
     }
     let cut: String = line.chars().take(MAX_CHARS - 1).collect();
     format!("{}…", cut.trim_end())
-}
-
-/// The step count of a rendered checklist (`Step 2 of 5` while working,
-/// `5 of 5 steps complete` once done), as the child's progress.
-fn checklist_progress_line(rendered: &str) -> Option<String> {
-    rendered
-        .lines()
-        .map(str::trim)
-        .find(|line| {
-            (line.starts_with("Step ") && line.contains(" of "))
-                || (line.starts_with(|c: char| c.is_ascii_digit())
-                    && line.ends_with(" steps complete"))
-        })
-        .map(str::to_string)
 }
 
 /// What a stopped child had done, from its typed tool records: every call to
@@ -3498,8 +3484,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "Build the Drupal demo site for Acme Corp: Step 2 of 4".to_string(),
-                "Build the WordPress demo site for Acme Corp: 5 of 5 steps complete".to_string(),
+                "Build the Drupal demo site for Acme Corp: step 2 of 4".to_string(),
+                "Build the WordPress demo site for Acme Corp: 5 of 5 steps".to_string(),
             ]
         );
         assert_eq!(passed_through, 1);

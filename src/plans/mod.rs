@@ -331,66 +331,60 @@ impl TaskPlan {
             .collect()
     }
 
-    /// Compact, channel-friendly checklist for posting to the user at start.
+    /// Compact, channel-friendly checklist for the live status card.
+    ///
+    /// One header line carries the state and the count; one line per step
+    /// follows, so the card stays short on a phone. A one-step plan is just
+    /// that step (a header and a "1 of 1" would only repeat it). A fully
+    /// completed card starts with ✅ ([`is_completed_checklist`]) so the
+    /// channel can drop it once the reply, which says what was done, lands.
     pub fn render_compact_checklist(&self) -> String {
-        let (heading, footer) = match self.status {
-            PlanStatus::Planning => (
-                "🧭 Planning your task",
-                "I’ll update this message as I work.",
-            ),
-            PlanStatus::InProgress => (
-                "⚙️ Working on your task",
-                "I’ll update this message as I work.",
-            ),
-            PlanStatus::Paused => (
-                "⏸️ Task paused",
-                "Work will continue when the task resumes.",
-            ),
-            // A completed checklist means the execution plan is resolved. It
-            // is not the durable task terminal: the final assistant response
-            // and TaskEnd event are still outstanding at this point.
-            PlanStatus::Completed => (
-                "✅ Planned steps complete",
-                "Finalizing the response and task outcome…",
-            ),
-            PlanStatus::PartiallyCompleted => (
-                "⚠️ Plan ended with unresolved steps",
-                "The reply below says what was left undone and why.",
-            ),
-            PlanStatus::Failed => ("❌ Task stopped", "The plan could not be completed."),
-            PlanStatus::Abandoned => ("⏹️ Task cancelled", "No more work is in progress."),
-        };
         let total = self.steps.len();
-        let position = self.current_step.saturating_add(1).min(total);
-        let mut out = format!("{heading}\n\n");
-        if self.status == PlanStatus::InProgress && total > 0 {
-            out.push_str(&format!("Step {position} of {total}\n"));
-        } else {
-            out.push_str(&format!(
-                "{} of {total} steps complete\n",
-                self.completed_steps()
-            ));
+        let done = self.completed_steps();
+        if total == 1 && !matches!(self.status, PlanStatus::PartiallyCompleted) {
+            let step = &self.steps[0];
+            let mark = match (self.status, step.status) {
+                (_, StepStatus::Completed) => "✅",
+                (PlanStatus::Failed, _) | (_, StepStatus::Failed) => "❌",
+                (PlanStatus::Abandoned, _) => "⏹️",
+                (PlanStatus::Paused, _) => "⏸️",
+                _ => "⏳",
+            };
+            return format!("{mark} {}", step.description);
         }
-
-        let first_pending = self
-            .steps
-            .iter()
-            .position(|step| step.status == StepStatus::Pending);
-        for (index, step) in self.steps.iter().enumerate() {
-            let block = match step.status {
+        let header = match self.status {
+            PlanStatus::Planning => "🧭 Planning…".to_string(),
+            PlanStatus::InProgress => {
+                let position = self.current_step.saturating_add(1).min(total);
+                format!("⚙️ Working · step {position} of {total}")
+            }
+            PlanStatus::Paused => format!("⏸️ Paused · {done} of {total} done"),
+            // The execution plan is resolved; the reply is still on its way,
+            // which the typing indicator shows. Never claim the task is over.
+            PlanStatus::Completed => format!("✅ Done · {done} of {total} steps"),
+            PlanStatus::PartiallyCompleted => {
+                format!("⚠️ Stopped short · {done} of {total} done")
+            }
+            PlanStatus::Failed => format!("❌ Stopped · {done} of {total} done"),
+            PlanStatus::Abandoned => format!("⏹️ Cancelled · {done} of {total} done"),
+        };
+        let mut out = header;
+        out.push('\n');
+        for step in &self.steps {
+            let line = match step.status {
                 StepStatus::Completed => format!("✅ {}", step.description),
-                StepStatus::InProgress => format!("▶️ Working now\n{}", step.description),
-                StepStatus::Deferred => format!("⏭️ Deferred\n{}", step.description),
-                StepStatus::Failed => format!("⚠️ Needs attention\n{}", step.description),
-                StepStatus::Skipped => format!("➖ Skipped\n{}", step.description),
-                StepStatus::Pending if Some(index) == first_pending => {
-                    format!("○ Up next\n{}", step.description)
-                }
+                StepStatus::InProgress => format!("▶️ {}", step.description),
+                StepStatus::Deferred => format!("⏭️ {} (deferred)", step.description),
+                StepStatus::Failed => format!("⚠️ {} (needs attention)", step.description),
+                StepStatus::Skipped => format!("➖ {} (skipped)", step.description),
                 StepStatus::Pending => format!("○ {}", step.description),
             };
-            out.push_str(&format!("\n{block}\n"));
+            out.push('\n');
+            out.push_str(&line);
         }
-        out.push_str(&format!("\n{footer}"));
+        if self.status == PlanStatus::PartiallyCompleted {
+            out.push_str("\n\nThe reply below says what was left undone and why.");
+        }
         out
     }
 
@@ -615,6 +609,21 @@ impl StepStatus {
     }
 }
 
+/// Whether a card from [`TaskPlan::render_compact_checklist`] shows every
+/// step finished. Such a card is only progress: the reply covers the result.
+pub fn is_completed_checklist(rendered: &str) -> bool {
+    rendered.trim_start().starts_with('✅')
+}
+
+/// The progress part of a rendered checklist's header (`step 2 of 5`,
+/// `5 of 5 steps`), for showing a sub-agent's plan as one line. `None` for a
+/// one-step card, which has no count.
+pub fn checklist_progress(rendered: &str) -> Option<String> {
+    let header = rendered.lines().next()?;
+    let (_, progress) = header.split_once(" · ")?;
+    Some(progress.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,11 +789,15 @@ mod tests {
         plan.steps[1].status = StepStatus::InProgress;
         plan.current_step = 1;
         let checklist = plan.render_compact_checklist();
-        assert!(checklist.starts_with("⚙️ Working on your task"));
-        assert!(checklist.contains("Step 2 of 2\n\n"));
-        assert!(checklist.contains("✅ create script"));
-        assert!(checklist.contains("▶️ Working now\nsend the file"));
-        assert!(checklist.contains("I’ll update this message as I work."));
+        assert_eq!(
+            checklist,
+            "⚙️ Working · step 2 of 2\n\n✅ create script\n▶️ send the file"
+        );
+        assert_eq!(
+            checklist_progress(&checklist).as_deref(),
+            Some("step 2 of 2")
+        );
+        assert!(!is_completed_checklist(&checklist));
         assert!(checklist.contains("create script"));
         assert!(checklist.contains("send the file"));
         let recap = plan.render_recap();
@@ -806,9 +819,27 @@ mod tests {
         plan.status = PlanStatus::Completed;
 
         let checklist = plan.render_compact_checklist();
-        assert!(checklist.starts_with("✅ Planned steps complete"));
-        assert!(checklist.contains("Finalizing the response and task outcome"));
+        // One step: the step itself, no header or "1 of 1".
+        assert_eq!(checklist, "✅ observe result");
+        assert!(is_completed_checklist(&checklist));
+        assert_eq!(checklist_progress(&checklist), None);
         assert!(!checklist.contains("Task complete"));
+
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["first".into(), "second".into()],
+            "track_requirements",
+        );
+        for step in &mut plan.steps {
+            step.status = StepStatus::Completed;
+        }
+        plan.status = PlanStatus::Completed;
+        let checklist = plan.render_compact_checklist();
+        assert_eq!(checklist, "✅ Done · 2 of 2 steps\n\n✅ first\n✅ second");
+        assert!(is_completed_checklist(&checklist));
+        assert!(!checklist.contains("Finalizing"));
     }
 
     #[test]
@@ -827,11 +858,12 @@ mod tests {
 
         assert_eq!(plan.status, PlanStatus::PartiallyCompleted);
         let checklist = plan.render_compact_checklist();
-        assert!(checklist.starts_with("⚠️ Plan ended with unresolved steps"));
+        assert!(checklist.starts_with("⚠️ Stopped short · 0 of 2 done"));
+        assert!(checklist.contains("⏭️ first action (deferred)"));
+        assert!(!is_completed_checklist(&checklist));
         assert!(checklist.contains("what was left undone and why"));
         // The footer speaks to the user; it is not an instruction to the model.
         assert!(!checklist.contains("must"));
-        assert!(!checklist.contains("Planned steps complete"));
     }
 
     #[test]

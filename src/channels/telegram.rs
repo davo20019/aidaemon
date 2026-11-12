@@ -4643,10 +4643,12 @@ struct LiveSurface {
 
 impl LiveSurface {
     /// Resolve the status message so it doesn't stay on "⏳ Running…".
-    async fn clear(&self) {
+    /// `reply_delivered`: a finished plan card is dropped only once a reply
+    /// says what was done.
+    async fn clear(&self, reply_delivered: bool) {
         use crate::channels::live_status::SurfaceSink;
         let sink: &dyn SurfaceSink = self.sink.as_ref();
-        self.owner.lock().await.clear(sink).await;
+        self.owner.lock().await.clear(sink, reply_delivered).await;
     }
 }
 
@@ -4750,7 +4752,7 @@ impl TurnSurface for TelegramSurface {
             Ok(ids) => {
                 message_ids.extend(ids);
                 if let Some(live) = &self.live {
-                    live.clear().await;
+                    live.clear(true).await;
                 }
                 if background_handoff {
                     if let (Some(hub), Some(id)) = (&self.hub, message_ids.last()) {
@@ -4780,7 +4782,7 @@ impl TurnSurface for TelegramSurface {
             return;
         };
         if ended != TurnEnd::Delivered {
-            live.clear().await;
+            live.clear(false).await;
         }
         live.owner.lock().await.reset();
     }
