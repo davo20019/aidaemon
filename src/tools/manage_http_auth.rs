@@ -157,7 +157,7 @@ impl ManageHttpAuthTool {
     }
 
     fn keychain_field_name(profile: &str, field: &str) -> String {
-        format!("http_auth_{}_{}", profile, field)
+        aidaemon_secrets::names::http_auth(profile, field)
     }
 
     fn normalize_domains(domains: &[String]) -> anyhow::Result<Vec<String>> {

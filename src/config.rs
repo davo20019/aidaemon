@@ -50,287 +50,49 @@ pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
     Ok(result.into_owned())
 }
 
+/// The daemon's secret store: the OS keychain under the `aidaemon` service,
+/// or the runtime env file while `AIDAEMON_NO_KEYCHAIN` is `1` or `true`.
+pub fn secret_store() -> &'static std::sync::Arc<aidaemon_secrets::KeychainSecretStore> {
+    static STORE: std::sync::OnceLock<std::sync::Arc<aidaemon_secrets::KeychainSecretStore>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        std::sync::Arc::new(aidaemon_secrets::KeychainSecretStore::new(
+            aidaemon_secrets::KeychainSettings {
+                service: KEYCHAIN_SERVICE.to_string(),
+                disable_var: Some("AIDAEMON_NO_KEYCHAIN".to_string()),
+                env_file_vars: vec![
+                    crate::RUNTIME_ENV_FILE_ENV_KEY.to_string(),
+                    "AIDAEMON_ENV_FILE".to_string(),
+                ],
+                default_env_file: PathBuf::from(".env"),
+            },
+        ))
+    })
+}
+
 /// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
 pub(crate) fn keychain_disabled() -> bool {
-    std::env::var("AIDAEMON_NO_KEYCHAIN").is_ok_and(|v| v == "1" || v == "true")
+    secret_store().keychain_disabled()
 }
 
+#[cfg(test)]
 fn resolve_env_file_path() -> PathBuf {
-    if let Ok(path) = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY) {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    PathBuf::from(".env")
+    secret_store().env_store().env_file_path()
 }
 
-fn env_file_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-fn is_env_key_assignment(line: &str, env_key: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    let Some((k, _)) = trimmed.split_once('=') else {
-        return false;
-    };
-    k.trim() == env_key
-}
-
-fn encode_env_value(value: &str) -> String {
-    let is_simple = value.bytes().all(|b| {
-        matches!(
-            b,
-            b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b'_'
-                | b'-'
-                | b'.'
-                | b'/'
-                | b':'
-                | b'@'
-                | b'+'
-                | b'='
-        )
-    });
-    if is_simple {
-        return value.to_string();
-    }
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '$' => escaped.push_str("\\$"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            _ => escaped.push(ch),
-        }
-    }
-    format!("\"{}\"", escaped)
-}
-
-#[cfg(unix)]
-fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-fn upsert_env_secret(field_name: &str, value: &str) -> anyhow::Result<()> {
-    let _guard = env_file_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
-    let env_path = resolve_env_file_path();
-    let env_key = field_name.to_uppercase();
-    let assignment = format!("{}={}", env_key, encode_env_value(value));
-
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(&env_path)?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut replaced = false;
-    for line in &mut lines {
-        if is_env_key_assignment(line, &env_key) {
-            *line = assignment.clone();
-            replaced = true;
-        }
-    }
-    if !replaced {
-        lines.push(assignment);
-    }
-
-    if let Some(parent) = env_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    std::fs::write(&env_path, body)?;
-    set_file_mode_0600(&env_path)?;
-    Ok(())
-}
-
-fn remove_env_secret(field_name: &str) -> anyhow::Result<()> {
-    let _guard = env_file_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
-    let env_path = resolve_env_file_path();
-    if !env_path.exists() {
-        return Ok(());
-    }
-
-    let env_key = field_name.to_uppercase();
-    let mut lines: Vec<String> = std::fs::read_to_string(&env_path)?
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
-    let original_len = lines.len();
-    lines.retain(|line| !is_env_key_assignment(line, &env_key));
-
-    if lines.len() == original_len {
-        return Ok(());
-    }
-
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    std::fs::write(&env_path, body)?;
-    set_file_mode_0600(&env_path)?;
-    Ok(())
-}
-
-fn decode_env_value_loose(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-    {
-        &trimmed[1..trimmed.len().saturating_sub(1)]
-    } else {
-        trimmed
-    };
-
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('$') => out.push('$'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<Option<String>> {
-    if !env_path.exists() {
-        return Ok(None);
-    }
-
-    let mut found_via_dotenv: Option<String> = None;
-    if let Ok(iter) = dotenvy::from_path_iter(env_path) {
-        for entry in iter {
-            match entry {
-                Ok((key, value)) => {
-                    if key == env_key {
-                        found_via_dotenv = Some(value);
-                    }
-                }
-                Err(_) => {
-                    // Ignore malformed lines and continue parsing other entries.
-                    continue;
-                }
-            }
-        }
-    }
-    if found_via_dotenv.is_some() {
-        return Ok(found_via_dotenv);
-    }
-
-    let content = std::fs::read_to_string(env_path)?;
-    let mut found_via_loose_scan: Option<String> = None;
-    for line in content.lines() {
-        if is_env_key_assignment(line, env_key) {
-            if let Some((_, raw_value)) = line.split_once('=') {
-                found_via_loose_scan = Some(decode_env_value_loose(raw_value));
-            }
-        }
-    }
-    Ok(found_via_loose_scan)
-}
-
+/// Read a secret from the daemon's secret store.
 pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
-    let env_key = field_name.to_uppercase();
-
-    if keychain_disabled() {
-        let env_path = resolve_env_file_path();
-        if env_path.exists() {
-            if let Some(val) = read_env_secret_from_file(&env_path, &env_key)? {
-                if !val.is_empty() {
-                    return Ok(val);
-                }
-            }
-            anyhow::bail!(
-                "Keychain disabled and env var '{}' not found in '{}'",
-                env_key,
-                env_path.display()
-            );
-        }
-
-        if let Ok(val) = std::env::var(&env_key) {
-            if !val.is_empty() {
-                return Ok(val);
-            }
-        }
-
-        anyhow::bail!(
-            "Keychain disabled and env var '{}' not set for '{}'",
-            env_key,
-            field_name
-        );
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry
-        .get_password()
-        .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", field_name, e))
+    aidaemon_secrets::SecretStore::get(secret_store().as_ref(), field_name)
 }
 
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
-    if keychain_disabled() {
-        return upsert_env_secret(field_name, value);
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry.set_password(value)?;
-    Ok(())
+    aidaemon_secrets::SecretStore::set(secret_store().as_ref(), field_name, value)
 }
 
 /// Delete a secret from the OS keychain.
 pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
-    if keychain_disabled() {
-        return remove_env_secret(field_name);
-    }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
-    entry
-        .delete_credential()
-        .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
+    aidaemon_secrets::SecretStore::delete(secret_store().as_ref(), field_name)
 }
 
 /// Where to export run traces. Nothing is exported unless an endpoint is
@@ -1024,40 +786,28 @@ impl ProviderConfig {
     }
 
     fn resolve_secrets_recursive(&mut self, key_prefix: Option<&str>) -> anyhow::Result<()> {
-        let api_key_key = key_prefix
-            .map(|prefix| format!("{}_api_key", prefix))
-            .unwrap_or_else(|| "api_key".to_string());
+        use aidaemon_secrets::names;
         if self.api_key == "keychain" {
-            self.api_key = resolve_from_keychain(&api_key_key)?;
+            self.api_key = resolve_from_keychain(&names::provider_field(key_prefix, "api_key"))?;
         }
 
-        let gateway_token_key = key_prefix
-            .map(|prefix| format!("{}_gateway_token", prefix))
-            .unwrap_or_else(|| "gateway_token".to_string());
         if self.gateway_token.as_deref() == Some("keychain") {
-            self.gateway_token = Some(resolve_from_keychain(&gateway_token_key)?);
+            self.gateway_token = Some(resolve_from_keychain(&names::provider_field(
+                key_prefix,
+                "gateway_token",
+            ))?);
         }
 
         if let Some(headers) = self.extra_headers.as_mut() {
             for (name, value) in headers.iter_mut() {
                 if value == "keychain" {
-                    let normalized_name = name
-                        .to_ascii_lowercase()
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                        .collect::<String>();
-                    let key = key_prefix
-                        .map(|prefix| format!("{}_header_{}", prefix, normalized_name))
-                        .unwrap_or_else(|| format!("provider_header_{}", normalized_name));
-                    *value = resolve_from_keychain(&key)?;
+                    *value = resolve_from_keychain(&names::provider_header(key_prefix, name))?;
                 }
             }
         }
 
         for (idx, fallback) in self.fallbacks.iter_mut().enumerate() {
-            let nested_prefix = key_prefix
-                .map(|prefix| format!("{}_fallback_{}", prefix, idx))
-                .unwrap_or_else(|| format!("provider_fallback_{}", idx));
+            let nested_prefix = names::provider_fallback_prefix(key_prefix, idx);
             fallback.resolve_secrets_recursive(Some(&nested_prefix))?;
         }
 
@@ -3589,11 +3339,7 @@ impl AppConfig {
         // Telegram bots array
         for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
             if bot.bot_token == "keychain" {
-                let key = if i == 0 {
-                    "bot_token".to_string()
-                } else {
-                    format!("telegram_bot_token_{}", i)
-                };
+                let key = aidaemon_secrets::names::bot_token("bot_token", "telegram_bot_token", i);
                 bot.bot_token = resolve_from_keychain(&key)?;
             }
         }
@@ -3637,11 +3383,11 @@ impl AppConfig {
             }
             for (i, bot) in self.discord_bots.iter_mut().enumerate() {
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 {
-                        "discord_bot_token".to_string()
-                    } else {
-                        format!("discord_bot_token_{}", i)
-                    };
+                    let key = aidaemon_secrets::names::bot_token(
+                        "discord_bot_token",
+                        "discord_bot_token",
+                        i,
+                    );
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
             }
@@ -3659,19 +3405,13 @@ impl AppConfig {
             }
             for (i, bot) in self.slack_bots.iter_mut().enumerate() {
                 if bot.app_token == "keychain" {
-                    let key = if i == 0 {
-                        "slack_app_token".to_string()
-                    } else {
-                        format!("slack_app_token_{}", i)
-                    };
+                    let key =
+                        aidaemon_secrets::names::bot_token("slack_app_token", "slack_app_token", i);
                     bot.app_token = resolve_from_keychain(&key)?;
                 }
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 {
-                        "slack_bot_token".to_string()
-                    } else {
-                        format!("slack_bot_token_{}", i)
-                    };
+                    let key =
+                        aidaemon_secrets::names::bot_token("slack_bot_token", "slack_bot_token", i);
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
             }
@@ -3691,7 +3431,7 @@ impl AppConfig {
             for (field, value) in fields.iter_mut() {
                 if let Some(ref v) = value {
                     if v == "keychain" {
-                        let keychain_key = format!("http_auth_{}_{}", name, field);
+                        let keychain_key = aidaemon_secrets::names::http_auth(name, field);
                         **value = Some(resolve_from_keychain(&keychain_key)?);
                     }
                 }

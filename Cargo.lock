@@ -86,6 +86,7 @@ dependencies = [
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-runtime",
+ "aidaemon-secrets",
  "aidaemon-skills",
  "aidaemon-store-sqlite",
  "aidaemon-tool-browser",
@@ -111,7 +112,6 @@ dependencies = [
  "hmac",
  "htmd",
  "ignore",
- "keyring",
  "libc",
  "libsqlite3-sys",
  "llm_readability",
@@ -474,6 +474,16 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "aidaemon-secrets"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "keyring",
+ "tempfile",
 ]
 
 [[package]]
