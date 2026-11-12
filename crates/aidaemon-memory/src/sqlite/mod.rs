@@ -100,8 +100,8 @@ pub trait Reranker: Send + Sync {
         None
     }
 
-    /// How long a search waits for one rerank before it keeps the
-    /// unreranked order. Reranking only refines an answer the search already
+    /// How long a search waits for its reranks (all of them together)
+    /// before it keeps the unreranked order. Reranking only refines an answer the search already
     /// has, so a model starved of CPU (or queued behind another rerank) must
     /// cost the search a bounded wait, never minutes.
     fn deadline(&self) -> std::time::Duration {
@@ -150,17 +150,35 @@ impl StoreModels {
         Ok(vectors)
     }
 
+    /// When a search that starts reranking now must be done with it: one
+    /// [`Reranker::deadline`] covers every rerank the search makes (its hits
+    /// and then its related facts), so a slow model costs a search one
+    /// bounded wait, not one per step. `None` without a reranker.
+    fn rerank_deadline(&self) -> Option<tokio::time::Instant> {
+        self.reranker
+            .as_ref()
+            .map(|reranker| tokio::time::Instant::now() + reranker.deadline())
+    }
+
     async fn rerank(
         &self,
         query: String,
         documents: Vec<String>,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         match &self.reranker {
             Some(reranker) => {
-                let deadline = reranker.deadline();
-                tokio::time::timeout(deadline, reranker.rerank(query, documents))
+                if deadline <= tokio::time::Instant::now() {
+                    anyhow::bail!("the search's rerank budget is spent");
+                }
+                tokio::time::timeout_at(deadline, reranker.rerank(query, documents))
                     .await
-                    .map_err(|_| anyhow::anyhow!("rerank missed its {deadline:?} deadline"))?
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "rerank missed the search's {:?} deadline",
+                            reranker.deadline()
+                        )
+                    })?
             }
             None => anyhow::bail!("no reranker configured"),
         }

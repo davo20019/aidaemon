@@ -1,10 +1,15 @@
 #[cfg(not(test))]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+#[cfg(not(test))]
 use std::sync::{Arc, Mutex};
+#[cfg(not(test))]
 use tokio::sync::OnceCell;
+#[cfg(not(test))]
 use tokio::task;
 use tracing::info;
+
+use super::background_model::BackgroundModel;
 
 /// Stable identifier persisted beside every derived embedding. Changing the
 /// model creates a new index generation instead of silently mixing vectors.
@@ -16,7 +21,6 @@ pub const EMBEDDING_MODEL_ID: &str = "fastembed/all-MiniLM-L6-v2";
 /// and short, so this is acceptable for our usage pattern.
 #[cfg(not(test))]
 type SharedModel = Arc<Mutex<TextEmbedding>>;
-type SharedReranker = Arc<Mutex<TextRerank>>;
 
 /// Cross-encoder reranker for the explicit memory-search path. A multilingual
 /// model so it handles the user's mixed EN/ES facts. Loaded lazily (and only if
@@ -27,7 +31,10 @@ const RERANKER_MODEL: RerankerModel = RerankerModel::JINARerankerV2BaseMultiling
 pub struct EmbeddingService {
     #[cfg(not(test))]
     model: Arc<OnceCell<SharedModel>>,
-    reranker: Arc<OnceCell<SharedReranker>>,
+    /// Loaded in the background on first use and kept even when the search
+    /// that started the load stops waiting; one rerank runs at a time, and a
+    /// rerank whose search gave up never holds later searches in a queue.
+    reranker: BackgroundModel<TextRerank>,
 }
 
 impl EmbeddingService {
@@ -37,7 +44,13 @@ impl EmbeddingService {
         Ok(Self {
             #[cfg(not(test))]
             model: Arc::new(OnceCell::new()),
-            reranker: Arc::new(OnceCell::new()),
+            reranker: BackgroundModel::new("reranker", || {
+                let options =
+                    RerankInitOptions::new(RERANKER_MODEL).with_show_download_progress(true);
+                let model = TextRerank::try_new(options)?;
+                info!("Reranker model loaded ({:?})", RERANKER_MODEL);
+                Ok(model)
+            }),
         })
     }
 
@@ -104,28 +117,11 @@ impl EmbeddingService {
         }
     }
 
-    /// Returns the cross-encoder reranker, initializing it on first call.
-    async fn get_reranker(&self) -> anyhow::Result<SharedReranker> {
-        let reranker = self
-            .reranker
-            .get_or_try_init(|| async {
-                task::spawn_blocking(|| {
-                    let options =
-                        RerankInitOptions::new(RERANKER_MODEL).with_show_download_progress(true);
-                    let model = TextRerank::try_new(options)?;
-                    info!("Reranker model loaded ({:?})", RERANKER_MODEL);
-                    Ok::<_, anyhow::Error>(Arc::new(Mutex::new(model)))
-                })
-                .await?
-            })
-            .await?;
-        Ok(reranker.clone())
-    }
-
     /// Cross-encoder rerank: score each document against the query and return
     /// `(original_index, score)` pairs sorted by descending relevance. The
     /// indices map back into the input `documents` vec. Runs on a blocking
-    /// thread. Errors propagate so callers can fall back to bi-encoder order.
+    /// thread. Errors (including "busy with a rerank whose search gave up")
+    /// propagate so callers can fall back to bi-encoder order.
     pub async fn rerank(
         &self,
         query: String,
@@ -141,18 +137,15 @@ impl EmbeddingService {
         if cfg!(test) {
             anyhow::bail!("reranker disabled in test builds");
         }
-        let reranker = self.get_reranker().await?;
-        task::spawn_blocking(move || {
-            let mut guard = reranker
-                .lock()
-                .map_err(|e| anyhow::anyhow!("reranker model mutex poisoned: {e}"))?;
-            let results = guard.rerank(query, documents, false, None)?;
-            let mut ranked: Vec<(usize, f32)> =
-                results.into_iter().map(|r| (r.index, r.score)).collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            Ok(ranked)
-        })
-        .await?
+        self.reranker
+            .run(move |model| {
+                let results = model.rerank(query, documents, false, None)?;
+                let mut ranked: Vec<(usize, f32)> =
+                    results.into_iter().map(|r| (r.index, r.score)).collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(ranked)
+            })
+            .await
     }
 }
 

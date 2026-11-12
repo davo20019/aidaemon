@@ -218,6 +218,69 @@ async fn search_facts_falls_back_when_the_reranker_misses_its_deadline() {
     assert!(!report.hits.is_empty());
 }
 
+/// Answers every rerank after `delay`, counting the calls that started and
+/// the ones that finished.
+struct SlowReranker {
+    delay: std::time::Duration,
+    deadline: std::time::Duration,
+    started: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Reranker for SlowReranker {
+    async fn rerank(
+        &self,
+        _query: String,
+        documents: Vec<String>,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        use std::sync::atomic::Ordering;
+        self.started.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        Ok((0..documents.len()).map(|i| (i, -(i as f32))).collect())
+    }
+
+    fn deadline(&self) -> std::time::Duration {
+        self.deadline
+    }
+}
+
+/// The hits' rerank and the related facts' rerank share one deadline: a
+/// model that takes most of it for the hits leaves the related step only
+/// the rest, so a search never waits two deadlines.
+#[tokio::test]
+async fn search_facts_related_rerank_shares_the_search_deadline() {
+    use std::sync::atomic::Ordering;
+    let (memory, _file, _) = seeded().await;
+    let reranker = Arc::new(SlowReranker {
+        delay: std::time::Duration::from_millis(600),
+        deadline: std::time::Duration::from_millis(1000),
+        started: Default::default(),
+        finished: Default::default(),
+    });
+    let memory = memory.with_reranker(reranker.clone());
+    let report = memory
+        .search_facts("mother", 1, &FactSearchConfig::default())
+        .await
+        .unwrap();
+    assert!(report.reranked, "the hits' rerank fit in the deadline");
+    assert_eq!(
+        reranker.started.load(Ordering::SeqCst),
+        2,
+        "the related step reranks too"
+    );
+    assert_eq!(
+        reranker.finished.load(Ordering::SeqCst),
+        1,
+        "the related rerank got only what was left of the deadline"
+    );
+    assert!(
+        !report.related.is_empty(),
+        "related facts fall back to their unreranked order"
+    );
+}
+
 /// Scores documents by how many query words they contain, with a floor of 1.
 struct OverlapReranker;
 

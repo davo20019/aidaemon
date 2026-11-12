@@ -723,19 +723,26 @@ impl SqliteMemory {
 
     /// Rerank `docs` against the query, or `None` when there is no reranker
     /// or it fails (the caller then falls back to its unreranked order).
+    /// `deadline` is the whole search's (`StoreModels::rerank_deadline`).
     async fn explicit_search_rerank(
         &self,
         query: &str,
         docs: Vec<String>,
+        deadline: Option<tokio::time::Instant>,
+        step: &'static str,
     ) -> Option<Vec<(usize, f32)>> {
-        self.embedding_service.reranker.as_ref()?;
+        let deadline = deadline?;
         if docs.is_empty() {
             return Some(Vec::new());
         }
-        match self.embedding_service.rerank(query.to_string(), docs).await {
+        match self
+            .embedding_service
+            .rerank(query.to_string(), docs, deadline)
+            .await
+        {
             Ok(scores) => Some(scores),
             Err(error) => {
-                tracing::warn!(target: "memory_recall", %error, "explicit fact search: rerank unavailable; using fusion order");
+                tracing::warn!(target: "memory_recall", %error, step, "explicit fact search: rerank unavailable; using unreranked order");
                 None
             }
         }
@@ -784,7 +791,10 @@ impl FactStore for SqliteMemory {
                 build_fact_embedding_text(&f.category, &f.key, &f.value)
             })
             .collect();
-        let reranked = self.explicit_search_rerank(query, docs).await;
+        let rerank_deadline = self.embedding_service.rerank_deadline();
+        let reranked = self
+            .explicit_search_rerank(query, docs, rerank_deadline, "hits")
+            .await;
         let floor = self.rerank_floor();
         let mut report = search::rank(&facts, &pool, reranked.as_deref(), floor, limit, config);
         let rerank_ms = stage.elapsed().as_millis() as u64;
@@ -834,7 +844,10 @@ impl FactStore for SqliteMemory {
                 .iter()
                 .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
                 .collect();
-            let related = match self.explicit_search_rerank(query, docs).await {
+            let related = match self
+                .explicit_search_rerank(query, docs, rerank_deadline, "related")
+                .await
+            {
                 Some(scores) => {
                     search::rank_related(&neighbors, &scores, floor, report.best_score(), config)
                 }
