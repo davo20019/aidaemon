@@ -80,6 +80,12 @@ pub struct Scenario<S = NoExtension, X = NoExtension> {
     pub setup: Option<S>,
     #[serde(default)]
     pub expect: Expect<X>,
+    /// Assertions used instead of `expect` when a scripted scenario runs
+    /// live ([`Scenario::into_live`], [`crate::Suite::live`]). A script pins
+    /// exact counts, wording and token use that a real model need not
+    /// repeat; this block says what a live run must still show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_expect: Option<Expect<X>>,
     /// Where the scenario was loaded from, for error messages.
     #[serde(skip)]
     pub source: Option<PathBuf>,
@@ -395,6 +401,18 @@ impl<S, X> Scenario<S, X> {
 
     pub fn is_scripted(&self) -> bool {
         self.script.is_some()
+    }
+
+    /// The same scenario for a live model: the script is dropped (so the
+    /// factory's live provider runs it) and `live_expect`, when present,
+    /// replaces `expect`. Without `live_expect` the scripted assertions are
+    /// kept as they are.
+    pub fn into_live(mut self) -> Self {
+        self.script = None;
+        if let Some(live) = self.live_expect.take() {
+            self.expect = live;
+        }
+        self
     }
 
     /// The script as core model responses.

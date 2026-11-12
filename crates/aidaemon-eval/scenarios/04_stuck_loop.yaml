@@ -20,3 +20,8 @@ expect:
   status: stuck
   tool_call_counts: { check_status: 9 }
   max_turns: 3
+# Live: the job never finishes, so a good run stops polling on its own (or
+# is stopped) within a few turns instead of spending its whole turn budget.
+live_expect:
+  max_turns: 6
+  final_text_not_contains: [job 42 has finished, job 42 is complete, job 42 finished]

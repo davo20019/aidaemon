@@ -15,3 +15,12 @@ expect:
   receipt_statuses: { get_weather: [succeeded] }
   no_failed_receipts: true
   max_turns: 2
+live_expect:
+  status: completed
+  final_text_contains: [sunny]
+  tools_used: [get_weather]
+  tools_not_used: [delete_file]
+  tool_call_counts: { get_weather: 1 }
+  receipt_statuses: { get_weather: [succeeded] }
+  no_failed_receipts: true
+  max_turns: 2
