@@ -1,0 +1,33 @@
+{
+  "description": "Get comprehensive git repository information: status, log, branches, remotes, diff, and stash — all in one call instead of multiple terminal commands.",
+  "name": "git_info",
+  "schema": {
+    "description": "Get comprehensive git repository information: status, log, branches, remotes, diff, and stash — all in one call instead of multiple terminal commands.",
+    "name": "git_info",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "description": "Sections to include (default: all). Options: status, log, branches, remotes, diff, stash",
+          "items": {
+            "enum": [
+              "status",
+              "log",
+              "branches",
+              "remotes",
+              "diff",
+              "stash"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "Path to the git repository (default: current directory)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

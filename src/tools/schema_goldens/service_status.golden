@@ -1,0 +1,33 @@
+{
+  "description": "Check running services: listening ports, Docker containers, and relevant processes. Use this instead of terminal lsof/ss/docker ps commands.",
+  "name": "service_status",
+  "schema": {
+    "description": "Check running services: listening ports, Docker containers, and relevant processes. Use this instead of terminal lsof/ss/docker ps commands.",
+    "name": "service_status",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "description": "Sections to include (default: all). Options: ports, docker, processes",
+          "items": {
+            "enum": [
+              "ports",
+              "docker",
+              "processes"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "services": {
+          "description": "Filter by service names or port numbers (optional)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

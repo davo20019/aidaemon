@@ -205,7 +205,11 @@ mod tests {
         assert_eq!(content, "new content");
 
         // The backup lives under the daemon's data dir, not beside the file.
-        let backup = crate::tools::fs_utils::local_backup_path(&file_path).unwrap();
+        let backup = crate::tools::fs_utils::local_backup_path(
+            &crate::tools::file_policy::file_backup_root().unwrap(),
+            &file_path,
+        )
+        .unwrap();
         let backup_content = tokio::fs::read_to_string(&backup).await.unwrap();
         assert_eq!(backup_content, "old content");
         assert!(!file_path.with_extension("txt.bak").exists());

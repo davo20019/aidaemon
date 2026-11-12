@@ -794,7 +794,7 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 let browser_tool = BrowserTool::new(
-                    config.browser.clone(),
+                    config.browser.settings(),
                     media_tx.clone(),
                     inbox_dir.clone(),
                     execution_backend.clone(),

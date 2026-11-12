@@ -95,7 +95,7 @@ jobs:
 
       - name: Clippy (SDK crates)
         run: >-
-          cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
@@ -151,7 +151,7 @@ jobs:
       - name: cargo doc per crate
         run: |
           set -euo pipefail
-          for crate in aidaemon-core aidaemon-providers aidaemon-tools \
+          for crate in aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browser \
             aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies \
             aidaemon-eval aidaemon-memory aidaemon-decisions aidaemon-events \
             aidaemon-work aidaemon-channels aidaemon-channel-telegram \
@@ -198,7 +198,7 @@ jobs:
       - name: cargo check on the MSRV
         run: >-
           cargo check --locked --all-features
-          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-memory
           -p aidaemon-decisions -p aidaemon-events -p aidaemon-work
@@ -338,7 +338,7 @@ jobs:
 
       - name: SDK crate tests
         run: >-
-          cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions

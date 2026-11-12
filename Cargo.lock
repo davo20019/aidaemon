@@ -86,6 +86,7 @@ dependencies = [
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-store-sqlite",
+ "aidaemon-tool-browser",
  "aidaemon-tools",
  "aidaemon-work",
  "anyhow",
@@ -97,7 +98,6 @@ dependencies = [
  "axuielement",
  "axum",
  "base64 0.22.1",
- "chromiumoxide",
  "chrono",
  "croner",
  "dialoguer",
@@ -465,24 +465,56 @@ dependencies = [
 ]
 
 [[package]]
-name = "aidaemon-tools"
+name = "aidaemon-tool-browser"
 version = "0.1.0"
 dependencies = [
+ "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-tools",
  "anyhow",
  "async-trait",
- "chrono",
- "dirs",
- "globset",
- "htmd",
- "ignore",
- "libc",
- "llm_readability",
- "regex",
+ "chromiumoxide",
+ "futures",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "shellexpand",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aidaemon-tools"
+version = "0.1.0"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-policies",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "dirs",
+ "futures",
+ "globset",
+ "hmac",
+ "htmd",
+ "ignore",
+ "libc",
+ "llm_readability",
+ "once_cell",
+ "proptest",
+ "rand 0.8.6",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "shell-words",
  "shellexpand",
  "tempfile",
  "thiserror 1.0.69",

@@ -1,0 +1,339 @@
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+use crate::backend::{BackendPath, ExecutionBackend};
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
+
+use super::fs_utils;
+
+pub struct GitInfoTool {
+    backend: crate::backend::SharedExecutionBackend,
+}
+
+impl GitInfoTool {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
+
+const VALID_SECTIONS: &[&str] = &["status", "log", "branches", "remotes", "diff", "stash"];
+
+#[async_trait]
+impl Tool for GitInfoTool {
+    fn name(&self) -> &str {
+        "git_info"
+    }
+
+    fn description(&self) -> &str {
+        "Get comprehensive git repository information: status, log, branches, remotes, diff, and stash — all in one call instead of multiple terminal commands."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "git_info",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the git repository (default: current directory)"
+                    },
+                    "include": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["status", "log", "branches", "remotes", "diff", "stash"]
+                        },
+                        "description": "Sections to include (default: all). Options: status, log, branches, remotes, diff, stash"
+                    }
+                },
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let path_str = args["path"].as_str().unwrap_or(".");
+            let backend = self.backend.clone();
+            let repo_dir = backend.resolve_path(path_str).await?;
+
+            let check =
+                fs_utils::run_cmd_backend(&*backend, "git rev-parse --git-dir", Some(&repo_dir), 5)
+                    .await?;
+            if check.exit_code != 0 {
+                anyhow::bail!("Not a git repository: {}", path_str);
+            }
+
+            let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            } else {
+                VALID_SECTIONS.iter().map(|s| s.to_string()).collect()
+            };
+
+            let mut output = String::new();
+
+            for section in &sections {
+                let section_output = match section.as_str() {
+                    "status" => get_status(&*backend, &repo_dir).await,
+                    "log" => get_log(&*backend, &repo_dir).await,
+                    "branches" => get_branches(&*backend, &repo_dir).await,
+                    "remotes" => get_remotes(&*backend, &repo_dir).await,
+                    "diff" => get_diff(&*backend, &repo_dir).await,
+                    "stash" => get_stash(&*backend, &repo_dir).await,
+                    _ => continue,
+                };
+
+                if !section_output.is_empty() {
+                    output.push_str(&format!("## {}\n{}\n", capitalize(section), section_output));
+                }
+            }
+
+            if output.is_empty() {
+                output.push_str("No git information available.");
+            }
+
+            Ok(output)
+        }
+        .await;
+        output.map(crate::semantics::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::semantics::ToolSemantics for GitInfoTool {
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    /// Commit messages and diffs are written by whoever wrote the repository.
+    /// With no `path` the call reads the working directory.
+    fn output_trust(
+        &self,
+        arguments: &str,
+        roots: &crate::semantics::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let path = match args.as_ref().map(|args| args.get("path")) {
+            Some(None) | Some(Some(Value::Null)) => Some("."),
+            Some(Some(value)) => value.as_str(),
+            None => None,
+        };
+        match path {
+            Some(path) if roots.contains(path) => aidaemon_core::SourceTrust::Trusted,
+            _ => aidaemon_core::SourceTrust::Untrusted,
+        }
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+async fn get_status(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    let mut result = String::new();
+
+    // Branch
+    if let Ok(out) =
+        fs_utils::run_cmd_backend(backend, "git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
+    {
+        if out.exit_code == 0 {
+            result.push_str(&format!("Branch: {}\n", out.stdout.trim()));
+        }
+    }
+
+    // Status
+    if let Ok(out) =
+        fs_utils::run_cmd_backend(backend, "git status --porcelain", Some(dir), 5).await
+    {
+        if out.exit_code == 0 {
+            let lines: Vec<&str> = out.stdout.lines().collect();
+            if lines.is_empty() {
+                result.push_str("Working tree: clean\n");
+            } else {
+                result.push_str(&format!("Changed files ({}):\n", lines.len()));
+                for line in lines.iter().take(30) {
+                    result.push_str(&format!("  {}\n", line));
+                }
+                if lines.len() > 30 {
+                    result.push_str(&format!("  ... and {} more\n", lines.len() - 30));
+                }
+            }
+        }
+    }
+
+    // Ahead/behind
+    if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
+        "git rev-list --left-right --count HEAD...@{upstream}",
+        Some(dir),
+        5,
+    )
+    .await
+    {
+        if out.exit_code == 0 {
+            let parts: Vec<&str> = out.stdout.trim().split('\t').collect();
+            if parts.len() == 2 {
+                let ahead = parts[0].trim();
+                let behind = parts[1].trim();
+                if ahead != "0" || behind != "0" {
+                    result.push_str(&format!("Ahead: {}, Behind: {}\n", ahead, behind));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+async fn get_log(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
+        "git log --oneline -10 --format='%h %s (%cr, %an)'",
+        Some(dir),
+        5,
+    )
+    .await
+    {
+        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+            return out.stdout.clone();
+        }
+    }
+    String::new()
+}
+
+async fn get_branches(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(
+        backend,
+        "git branch -a --format='%(refname:short) %(upstream:short) %(upstream:track)'",
+        Some(dir),
+        5,
+    )
+    .await
+    {
+        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+            return out.stdout.clone();
+        }
+    }
+    String::new()
+}
+
+async fn get_remotes(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git remote -v", Some(dir), 5).await {
+        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+            return out.stdout.clone();
+        }
+    }
+    String::new()
+}
+
+async fn get_diff(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git diff --stat", Some(dir), 10).await {
+        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+            return out.stdout.clone();
+        }
+    }
+    String::new()
+}
+
+async fn get_stash(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(backend, "git stash list", Some(dir), 5).await {
+        if out.exit_code == 0 && !out.stdout.trim().is_empty() {
+            return out.stdout.clone();
+        }
+    }
+    String::from("No stashes\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ToolCalls as _;
+
+    #[test]
+    fn test_schema_has_required_fields() {
+        let tool = GitInfoTool::new(crate::testing::active_execution_backend());
+        let schema = tool.schema();
+        assert_eq!(schema["name"], "git_info");
+        assert!(!schema["description"].as_str().unwrap().is_empty());
+        assert!(schema["parameters"]["properties"]["include"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_git_info_on_current_repo() {
+        // This test assumes we're running from within a git repo
+        let args = json!({"include": ["status"]}).to_string();
+        let result = GitInfoTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await;
+        // Should succeed if running from aidaemon project
+        if let Ok(output) = result {
+            assert!(output.contains("Status") || output.contains("Branch"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_info_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
+        let result = GitInfoTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a git"));
+    }
+
+    #[test]
+    fn test_capitalize() {
+        assert_eq!(capitalize("status"), "Status");
+        assert_eq!(capitalize("log"), "Log");
+        assert_eq!(capitalize(""), "");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use crate::semantics::ToolSemantics;
+
+    #[test]
+    fn a_repository_outside_the_trusted_roots_is_untrusted() {
+        let tool = GitInfoTool::new(crate::testing::active_execution_backend());
+        let root = std::env::temp_dir().join("aidaemon-synthetic-root");
+        let root = root.to_string_lossy().into_owned();
+        let grants = [root.clone()];
+        let roots = crate::semantics::TrustRoots::new(&grants);
+        let inside = serde_json::json!({"path": format!("{root}/repo")}).to_string();
+        assert_eq!(
+            tool.output_trust(&inside, &roots),
+            aidaemon_core::SourceTrust::Trusted
+        );
+        let outside = serde_json::json!({"path": "/synthetic/other/repo"}).to_string();
+        assert_eq!(
+            tool.output_trust(&outside, &roots),
+            aidaemon_core::SourceTrust::Untrusted
+        );
+    }
+}

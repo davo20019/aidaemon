@@ -340,6 +340,7 @@ jobs:
             aidaemon-channel-slack
             aidaemon-channel-telegram
             aidaemon-events
+            aidaemon-tool-browser
             aidaemon-memory
             aidaemon-work
             aidaemon-sdk

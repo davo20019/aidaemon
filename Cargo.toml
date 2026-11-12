@@ -33,6 +33,7 @@ members = [
     "crates/aidaemon-core",
     "crates/aidaemon-providers",
     "crates/aidaemon-tools",
+    "crates/aidaemon-tool-browser",
     "crates/aidaemon-store-sqlite",
     "crates/aidaemon-mcp",
     "crates/aidaemon-agents",
@@ -87,7 +88,6 @@ async-std = { version = "1", features = ["attributes"] }
 futures = "0.3"
 axum = "0.8"
 dialoguer = "0.11"
-chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-features = false, optional = true }
 shellexpand = "3"
 dirs = "6"
 fastembed = "4"
@@ -131,6 +131,7 @@ aidaemon-decisions = { version = "=0.1.0", path = "crates/aidaemon-decisions", f
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { version = "=0.1.0", path = "crates/aidaemon-tools" }
+aidaemon-tool-browser = { version = "=0.1.0", path = "crates/aidaemon-tool-browser" }
 aidaemon-providers = { version = "=0.1.0", path = "crates/aidaemon-providers" }
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { version = "=0.1.0", path = "crates/aidaemon-mcp" }
@@ -166,7 +167,7 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [features]
 default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel"]
-browser = ["dep:chromiumoxide"]
+browser = ["aidaemon-tool-browser/chromium"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
 execution-docker = []
@@ -195,6 +196,7 @@ aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] 
 aidaemon-eval = { path = "crates/aidaemon-eval" }
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
 aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
+aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
 aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
 tempfile = "3"
 proptest = "1"

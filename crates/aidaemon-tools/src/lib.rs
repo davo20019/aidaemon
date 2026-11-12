@@ -43,19 +43,42 @@ use std::sync::Arc;
 use aidaemon_core::Tool;
 
 pub mod backend;
+pub mod background_deliverable;
+pub mod backoff;
 mod checklist;
+pub mod command_effects;
+pub mod command_risk;
+pub mod consequential;
+pub mod daemon_guard;
 mod exec;
+pub mod file_delivery;
 mod fs;
+pub mod fs_utils;
+pub mod git_commit;
+pub mod git_info;
+pub mod http_request;
+pub mod local_backend;
 pub mod outcome;
+pub mod owner_answers;
 pub mod path_class;
+pub mod process_control;
+pub mod project_inspect;
+pub mod result_spill;
+pub mod sanitize;
 mod search;
 mod search_files;
 pub mod semantics;
+pub mod service_status;
 pub mod services;
 mod shell;
 pub mod status;
+pub mod system;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod text;
 mod util;
 pub mod web;
+pub mod web_search;
 mod workspace;
 
 #[cfg(test)]

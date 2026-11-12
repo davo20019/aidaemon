@@ -17,21 +17,33 @@ categories = ["development-tools", "asynchronous"]
 exclude = ["tests/", "benches/"]
 publish = false
 
+[features]
+# Helpers for calling tools directly from tests.
+testing = []
+
 [dependencies]
 aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
+aidaemon-policies = { version = "0.1.0", path = "../aidaemon-policies" }
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
 globset = "0.4"
+hmac = "0.12"
 htmd = "0.1"
 ignore = "0.4"
 llm_readability = "0.0"
+once_cell = "1"
+rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
+shell-words = "1.1"
 shellexpand = "3"
 thiserror = "1"
 tracing = "0.1"
@@ -43,5 +55,6 @@ libc = "0.2"
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "rt-multi-thread", "net", "test-util"] }

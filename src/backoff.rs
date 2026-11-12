@@ -2,10 +2,7 @@ use std::time::Duration;
 
 use rand::Rng;
 
-pub(crate) fn exponential_backoff(base: Duration, attempt: u32, max: Duration) -> Duration {
-    let multiplier = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
-    base.saturating_mul(multiplier).min(max)
-}
+pub(crate) use aidaemon_tools::backoff::exponential_backoff;
 
 pub(crate) fn jittered_delay(base: Duration, jitter_fraction: f64) -> Duration {
     if base.is_zero() || jitter_fraction <= 0.0 {

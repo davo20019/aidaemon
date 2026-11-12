@@ -2500,28 +2500,7 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
-/// How browser sessions are isolated from one another with respect to cookies,
-/// cache, and other browsing state.
-///
-/// HONESTY CONTRACT: this enum must never claim isolation that isn't actually
-/// delivered. `Page` mode explicitly SHARES cookies across sessions;
-/// `BrowserContext` mode creates a real, per-session incognito browser context
-/// (no shared cookies/cache). The two modes are mutually exclusive with a
-/// shared persistent profile or an attached remote-debugging Chrome — see
-/// [`BrowserConfig::resolve_session_isolation`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
-pub enum SessionIsolation {
-    /// All sessions share one default browser context: cookies/cache are SHARED.
-    /// This is the only honest option when attached to a persistent profile or a
-    /// remote-debugging Chrome instance.
-    Page,
-    /// Each session gets its own incognito browser context: cookies/cache are
-    /// ISOLATED per session. Requires dedicated ephemeral browsing (no
-    /// `user_data_dir`, no `remote_debugging_port`).
-    BrowserContext,
-}
+pub use aidaemon_tool_browser::SessionIsolation;
 
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
@@ -2674,59 +2653,45 @@ impl ComputerUseConfig {
 }
 
 impl BrowserConfig {
-    /// Resolved navigation/DOM-ready timeout, clamped to a sane bounded range
-    /// (1..=120s) so a typo'd or absurd config value can neither hang the tool
-    /// (huge value) nor make navigation give up before any page can load
-    /// (zero/tiny value).
+    /// What the browser tool takes from `[browser]`.
+    pub fn settings(&self) -> aidaemon_tool_browser::BrowserSettings {
+        aidaemon_tool_browser::BrowserSettings {
+            headless: self.headless,
+            screenshot_width: self.screenshot_width,
+            screenshot_height: self.screenshot_height,
+            remote_debugging_port: self.remote_debugging_port,
+            user_data_dir: self.user_data_dir.clone(),
+            profile: self.profile.clone(),
+            session_isolation: self.session_isolation,
+            nav_timeout_secs: self.nav_timeout_secs,
+            element_timeout_secs: self.element_timeout_secs,
+            action_timeout_secs: self.action_timeout_secs,
+        }
+    }
+
+    /// Resolved navigation/DOM-ready timeout (see [`aidaemon_tool_browser::BrowserSettings::nav_timeout`]).
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     pub fn nav_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.nav_timeout_secs.clamp(1, 120))
+        self.settings().nav_timeout()
     }
 
-    /// Resolved default `wait`-action element-poll timeout, clamped to 1..=120s.
+    /// Resolved default `wait`-action element-poll timeout.
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     pub fn element_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.element_timeout_secs.clamp(1, 120))
+        self.settings().element_timeout()
     }
 
-    /// Resolved overall per-action ceiling (used by the click nav-race),
-    /// clamped to 1..=300s.
+    /// Resolved overall per-action ceiling.
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     pub fn action_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 300))
+        self.settings().action_timeout()
     }
 
-    /// Resolve the effective session-isolation mode, rejecting configurations
-    /// that would falsely claim per-session cookie isolation.
-    ///
-    /// HONESTY CONTRACT: a shared persistent profile (`user_data_dir`) or an
-    /// attached remote-debugging Chrome (`remote_debugging_port`) cannot give
-    /// per-session isolated cookies — they always share one cookie jar. So:
-    ///
-    /// - `Some(BrowserContext)` + shared/attached → **Err** (don't lie).
-    /// - `Some(Page)` → always `Ok(Page)` (honest: shared cookies).
-    /// - `Some(BrowserContext)` + ephemeral → `Ok(BrowserContext)`.
-    /// - `None` (auto): shared/attached → `Ok(Page)`; ephemeral →
-    ///   `Ok(BrowserContext)`.
+    /// The effective session-isolation mode, refusing configurations that
+    /// would falsely claim per-session cookie isolation.
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
-        let shared_or_attached =
-            self.user_data_dir.is_some() || self.remote_debugging_port.is_some();
-
-        match self.session_isolation {
-            Some(SessionIsolation::BrowserContext) if shared_or_attached => Err(
-                "browser.session_isolation = \"browser_context\" requires dedicated ephemeral \
-                 browsing, but a shared persistent profile (user_data_dir) or an attached \
-                 remote-debugging Chrome (remote_debugging_port) is configured. These share a \
-                 single cookie jar and CANNOT provide per-session isolated cookies. Either use \
-                 session_isolation = \"page\" (sessions share cookies), or remove user_data_dir \
-                 and remote_debugging_port to enable real per-session isolation."
-                    .to_string(),
-            ),
-            Some(mode) => Ok(mode),
-            None if shared_or_attached => Ok(SessionIsolation::Page),
-            None => Ok(SessionIsolation::BrowserContext),
-        }
+        self.settings().resolve_session_isolation()
     }
 }
 
@@ -2990,54 +2955,8 @@ pub struct CliToolConfig {
     pub max_output_chars: Option<usize>,
 }
 
-#[derive(Deserialize, Clone)]
-pub struct SearchConfig {
-    #[serde(default)]
-    pub backend: SearchBackendKind,
-    #[serde(default)]
-    pub api_key: String,
-    /// Base URL of a self-hosted SearxNG instance, wherever the user hosts it
-    /// (e.g. "http://localhost:8080" for the default Docker setup).
-    /// When set, SearxNG becomes available as a search backend.
-    #[serde(default)]
-    pub searxng_url: String,
-    /// When true (default), web_search queries every configured backend in
-    /// parallel and merges the results. When false, only `backend` is used.
-    #[serde(default = "default_true")]
-    pub parallel: bool,
-}
-
-impl Default for SearchConfig {
-    fn default() -> Self {
-        Self {
-            backend: SearchBackendKind::default(),
-            api_key: String::new(),
-            searxng_url: String::new(),
-            parallel: true,
-        }
-    }
-}
-
-impl fmt::Debug for SearchConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SearchConfig")
-            .field("backend", &self.backend)
-            .field("api_key", &redact(&self.api_key))
-            .field("searxng_url", &self.searxng_url)
-            .field("parallel", &self.parallel)
-            .finish()
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchBackendKind {
-    #[default]
-    #[serde(alias = "duckduckgo")]
-    DuckDuckGo,
-    Brave,
-    Searxng,
-}
+#[allow(unused_imports)]
+pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HealthConfig {
@@ -3544,101 +3463,7 @@ fn default_people_reconnect_reminder_days() -> u32 {
     30
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum HttpAuthType {
-    Oauth1a,
-    Bearer,
-    Header,
-    Basic,
-}
-
-impl fmt::Debug for HttpAuthType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpAuthType::Oauth1a => write!(f, "oauth1a"),
-            HttpAuthType::Bearer => write!(f, "bearer"),
-            HttpAuthType::Header => write!(f, "header"),
-            HttpAuthType::Basic => write!(f, "basic"),
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
-pub struct HttpAuthProfile {
-    pub auth_type: HttpAuthType,
-    pub allowed_domains: Vec<String>,
-    // OAuth 1.0a fields
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_secret: Option<String>,
-    #[serde(default)]
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub access_token_secret: Option<String>,
-    #[serde(default)]
-    pub user_id: Option<String>,
-    // Bearer token
-    #[serde(default)]
-    pub token: Option<String>,
-    // Header auth
-    #[serde(default)]
-    pub header_name: Option<String>,
-    #[serde(default)]
-    pub header_value: Option<String>,
-    // Basic auth
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-}
-
-impl fmt::Debug for HttpAuthProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpAuthProfile")
-            .field("auth_type", &self.auth_type)
-            .field("allowed_domains", &self.allowed_domains)
-            .field("api_key", &redact_option(&self.api_key))
-            .field("api_secret", &redact_option(&self.api_secret))
-            .field("access_token", &redact_option(&self.access_token))
-            .field(
-                "access_token_secret",
-                &redact_option(&self.access_token_secret),
-            )
-            .field("user_id", &self.user_id)
-            .field("token", &redact_option(&self.token))
-            .field("header_name", &self.header_name)
-            .field("header_value", &redact_option(&self.header_value))
-            .field("username", &self.username)
-            .field("password", &redact_option(&self.password))
-            .finish()
-    }
-}
-
-impl HttpAuthProfile {
-    /// Collect all credential values for this profile (for stripping from error messages).
-    pub fn credential_values(&self) -> Vec<&str> {
-        let mut vals = Vec::new();
-        for v in [
-            &self.api_key,
-            &self.api_secret,
-            &self.access_token,
-            &self.access_token_secret,
-            &self.token,
-            &self.header_value,
-            &self.password,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !v.is_empty() {
-                vals.push(v.as_str());
-            }
-        }
-        vals
-    }
-}
+pub use aidaemon_tools::http_request::{HttpAuthProfile, HttpAuthType};
 
 /// Context window management configuration.
 /// Controls conversation history trimming, summarization, and progressive fact extraction.

@@ -1,0 +1,65 @@
+[package]
+name = "aidaemon-tool-browser"
+description = "A Chrome browser tool for aidaemon agents (navigate, read, click, fill, screenshot, with owner approval for consequential actions); implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-tool-browser"
+readme = "README.md"
+keywords = ["agent", "browser", "chrome", "llm", "tools"]
+categories = ["development-tools", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# The tool itself (Chrome over the DevTools protocol). Without it the crate
+# has only the settings types.
+chromium = [
+    "dep:aidaemon-channels",
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:async-trait",
+    "dep:chromiumoxide",
+    "dep:futures",
+    "dep:reqwest",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:shellexpand",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:uuid",
+]
+
+[dependencies]
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core", optional = true }
+aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels", optional = true }
+aidaemon-events = { version = "0.1.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
+chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-features = false, optional = true }
+futures = { version = "0.3", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+shellexpand = { version = "3", optional = true }
+tokio = { version = "1", features = ["sync", "macros", "rt", "time", "fs"], optional = true }
+tracing = { version = "0.1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[dev-dependencies]
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true

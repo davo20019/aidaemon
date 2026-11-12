@@ -11,7 +11,21 @@ fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")
 }
 
+/// Daemon tools that moved into crates (Phase 9 step 4) and are still
+/// held to the same schema rules.
+const MOVED_TOOL_SOURCES: &[&str] = &[
+    "crates/aidaemon-tools/src/web_search.rs",
+    "crates/aidaemon-tools/src/http_request.rs",
+    "crates/aidaemon-tools/src/system.rs",
+    "crates/aidaemon-tools/src/git_info.rs",
+    "crates/aidaemon-tools/src/git_commit.rs",
+    "crates/aidaemon-tools/src/project_inspect.rs",
+    "crates/aidaemon-tools/src/service_status.rs",
+];
+
 fn tool_source_files() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let moved = MOVED_TOOL_SOURCES.iter().map(|path| root.join(path));
     let mut files = fs::read_dir(tools_dir())
         .expect("read src/tools")
         .filter_map(|entry| entry.ok())
@@ -24,6 +38,7 @@ fn tool_source_files() -> Vec<PathBuf> {
                 .ok()
                 .is_some_and(|src| src.contains("impl Tool for"))
         })
+        .chain(moved)
         .collect::<Vec<_>>();
     files.sort();
     files

@@ -684,7 +684,7 @@ mod tests {
             ..crate::config::ExecutionConfig::default()
         };
         let backend: SharedExecutionBackend =
-            Arc::new(crate::execution::LocalBackend::new(&config).await.unwrap());
+            Arc::new(crate::execution::local_backend(&config).await.unwrap());
 
         let files = referenced_file_context(&backend, "python3 check.py").await;
         assert_eq!(files.len(), 1);
