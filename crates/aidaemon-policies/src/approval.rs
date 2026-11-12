@@ -98,6 +98,8 @@ pub struct ApprovalPolicy {
     rules: Option<Arc<dyn ApprovalRules>>,
     grants: Option<Arc<dyn ApprovalGrants>>,
     workspace_root: Option<String>,
+    ask_undeclared_writes: bool,
+    path_free: HashSet<String>,
 }
 
 impl std::fmt::Debug for ApprovalPolicy {
@@ -111,6 +113,8 @@ impl std::fmt::Debug for ApprovalPolicy {
             .field("rules", &self.rules.is_some())
             .field("grants", &self.grants.is_some())
             .field("workspace_root", &self.workspace_root)
+            .field("ask_undeclared_writes", &self.ask_undeclared_writes)
+            .field("path_free", &self.path_free)
             .finish()
     }
 }
@@ -172,6 +176,24 @@ impl ApprovalPolicy {
     /// no rule or grant can allow one.
     pub fn workspace_root(mut self, root: impl Into<String>) -> Self {
         self.workspace_root = Some(root.into());
+        self
+    }
+
+    /// Also ask before a call that is not read-only and declares no access
+    /// at all (no paths, hosts or commands), unless the mode is
+    /// [`ApprovalMode::Never`] or the tool is
+    /// [`path_free`](Self::path_free_tool). Such a call cannot be checked
+    /// by the scope guard, so with no directory in scope it is not run
+    /// silently. Allow rules and application rules still decide first.
+    pub fn ask_undeclared_writes(mut self, on: bool) -> Self {
+        self.ask_undeclared_writes = on;
+        self
+    }
+
+    /// A tool known to touch no files: [`Self::ask_undeclared_writes`]
+    /// does not ask about it (the mode still does).
+    pub fn path_free_tool(mut self, name: impl Into<String>) -> Self {
+        self.path_free.insert(name.into());
         self
     }
 
@@ -263,6 +285,19 @@ impl ApprovalPolicy {
             }
             ApprovalMode::Always => Some(format!("every call needs approval (`{tool_name}`)")),
         };
+        let why = why.or_else(|| {
+            (self.ask_undeclared_writes
+                && self.mode != ApprovalMode::Never
+                && !ann.read_only
+                && info.access.is_empty()
+                && !self.path_free.contains(tool_name))
+            .then(|| {
+                format!(
+                    "`{tool_name}` may change things and did not declare which paths it \
+                     touches, so no scope check covers it"
+                )
+            })
+        });
         match why {
             Some(why) => Step::Ask(call_request(tool_name, arguments, info, why)),
             None => Step::Decided(ToolDecision::Allow),
@@ -442,6 +477,34 @@ mod tests {
 
     fn interrupts(d: &ToolDecision) -> bool {
         matches!(d, ToolDecision::Interrupt { .. })
+    }
+
+    #[test]
+    fn undeclared_writers_are_asked_about_when_enabled() {
+        let w = info(ToolAnnotations::WRITE, &[]);
+        let ro = info(ToolAnnotations::READ_ONLY, &[]);
+        let declared = info(ToolAnnotations::WRITE, &["echo hi"]);
+        let plain = ApprovalPolicy::new(ApprovalMode::DestructiveOnly);
+        assert_eq!(plain.decide("save", &w), ToolDecision::Allow);
+
+        let asking = ApprovalPolicy::new(ApprovalMode::DestructiveOnly)
+            .ask_undeclared_writes(true)
+            .path_free_tool("remember");
+        match asking.decide("save", &w) {
+            ToolDecision::Interrupt { reason, .. } => {
+                assert!(reason.contains("did not declare"), "{reason}")
+            }
+            other => panic!("expected an ask, got {other:?}"),
+        }
+        assert_eq!(asking.decide("save", &ro), ToolDecision::Allow);
+        assert_eq!(asking.decide("save", &declared), ToolDecision::Allow);
+        assert_eq!(asking.decide("remember", &w), ToolDecision::Allow);
+        assert_eq!(
+            asking.clone().allow_tool("save").decide("save", &w),
+            ToolDecision::Allow
+        );
+        let never = ApprovalPolicy::new(ApprovalMode::Never).ask_undeclared_writes(true);
+        assert_eq!(never.decide("save", &w), ToolDecision::Allow);
     }
 
     #[test]

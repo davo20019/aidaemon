@@ -1,5 +1,6 @@
 //! Filesystem scope as a `before_tool` hook, driven by access manifests.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use aidaemon_core::{Hook, HookContext, Safeguard, ToolCall, ToolDecision, ToolInfo};
@@ -31,6 +32,7 @@ pub struct ScopeGuard {
     resolve_symlinks: bool,
     undeclared_read_only: UndeclaredAccess,
     undeclared_writer: UndeclaredAccess,
+    path_free: HashSet<String>,
 }
 
 impl ScopeGuard {
@@ -49,6 +51,7 @@ impl ScopeGuard {
             resolve_symlinks: false,
             undeclared_read_only: UndeclaredAccess::Allow,
             undeclared_writer: UndeclaredAccess::Deny,
+            path_free: HashSet::new(),
         }
     }
 
@@ -82,9 +85,21 @@ impl ScopeGuard {
         self
     }
 
+    /// A tool known to touch no files (a memory or checklist tool, a
+    /// business API): its empty access manifest is taken as "touches
+    /// nothing" rather than "not declared", so neither undeclared policy
+    /// applies. Paths it does declare are still checked.
+    pub fn path_free_tool(mut self, name: impl Into<String>) -> Self {
+        self.path_free.insert(name.into());
+        self
+    }
+
     /// The decision for one call, without a hook context.
     pub fn decide(&self, tool_name: &str, info: &ToolInfo) -> ToolDecision {
         if info.access.is_empty() {
+            if self.path_free.contains(tool_name) {
+                return ToolDecision::Allow;
+            }
             let policy = if info.annotations.read_only {
                 self.undeclared_read_only
             } else {
@@ -94,9 +109,14 @@ impl ScopeGuard {
                 UndeclaredAccess::Allow => ToolDecision::Allow,
                 UndeclaredAccess::Deny => ToolDecision::Deny {
                     reason: format!(
-                        "blocked by scope policy: `{tool_name}` can change things but did not \
-                         declare which paths it touches, so it cannot be checked against the \
-                         allowed directories ({})",
+                        "blocked by scope policy: `{tool_name}` {} but did not declare which \
+                         paths it touches, so it cannot be checked against the allowed \
+                         directories ({})",
+                        if info.annotations.read_only {
+                            "can read files"
+                        } else {
+                            "can change things"
+                        },
                         self.roots_list()
                     ),
                 },
@@ -328,6 +348,36 @@ mod tests {
         assert!(denied(
             &strict.decide("t", &info(ToolAnnotations::READ_ONLY, &[], &[]))
         ));
+    }
+
+    #[test]
+    fn path_free_tools_skip_the_undeclared_policies_but_not_declared_paths() {
+        let guard = ScopeGuard::new(["/work"])
+            .undeclared_read_only(UndeclaredAccess::Deny)
+            .path_free_tool("recall")
+            .path_free_tool("remember");
+        assert_eq!(
+            guard.decide("recall", &info(ToolAnnotations::READ_ONLY, &[], &[])),
+            ToolDecision::Allow
+        );
+        assert_eq!(
+            guard.decide("remember", &info(ToolAnnotations::WRITE, &[], &[])),
+            ToolDecision::Allow
+        );
+        match guard.decide("read", &info(ToolAnnotations::READ_ONLY, &[], &[])) {
+            ToolDecision::Deny { reason } => {
+                assert!(reason.contains("can read files"), "{reason}")
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+        assert!(denied(&guard.decide(
+            "recall",
+            &info(
+                ToolAnnotations::READ_ONLY,
+                &["/home/alice/.ssh/id_ed25519"],
+                &[]
+            )
+        )));
     }
 
     #[test]
