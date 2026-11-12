@@ -2820,15 +2820,24 @@ impl EventStore {
             (
                 _,
                 super::RunTerminalDecision::Succeeded
-                | super::RunTerminalDecision::SucceededByEvidence
-                | super::RunTerminalDecision::ClosedByPolicyDenial,
+                | super::RunTerminalDecision::SucceededByEvidence,
             ) => crate::TaskOutcome::Succeeded,
+            // Refused by policy: the work did not happen; final, not failed.
+            (_, super::RunTerminalDecision::ClosedByPolicyDenial) => crate::TaskOutcome::Partial,
             (_, super::RunTerminalDecision::Failed) => crate::TaskOutcome::Failed,
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
                 crate::TaskOutcome::Succeeded
             }
             (TaskStatus::Completed | TaskStatus::Interrupted, _) => crate::TaskOutcome::Partial,
             (TaskStatus::Failed, _) => crate::TaskOutcome::Failed,
+        };
+        // The working agent's own `partial`/`blocked` is never a success.
+        let outcome = if outcome == crate::TaskOutcome::Succeeded
+            && aggregate.executor_claimed_unfinished()
+        {
+            crate::TaskOutcome::Partial
+        } else {
+            outcome
         };
         let efficiency = Some(
             self.task_efficiency_data(&task_id)

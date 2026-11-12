@@ -997,6 +997,7 @@ impl Agent {
                 "run_terminal_decision": format!("{:?}", terminal_decision).to_lowercase(),
                 "proof_basis": proof_basis,
                 "evidence_closed": run_aggregate.evidence_closed(),
+                "executor_claimed_outcome": run_aggregate.executor_claimed_outcome.map(|claim| claim.as_str()),
                 "task_kernel_phase": format!("{:?}", run_aggregate.lifecycle_phase()).to_lowercase(),
                 "obligations_required": run_aggregate.required_count(),
                 "obligations_satisfied": run_aggregate.satisfied_count(),
@@ -1373,9 +1374,15 @@ fn task_end_decision_and_outcome(
         (
             _,
             crate::events::RunTerminalDecision::Succeeded
-            | crate::events::RunTerminalDecision::SucceededByEvidence
-            | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
+            | crate::events::RunTerminalDecision::SucceededByEvidence,
         ) => crate::events::TaskOutcome::Succeeded,
+        // Policy refused everything the request asked for: the work did not
+        // happen. The run is final at that boundary (partial, never failed,
+        // so nothing retries a denial), and the request stays open for the
+        // owner's follow-up.
+        (_, crate::events::RunTerminalDecision::ClosedByPolicyDenial) => {
+            crate::events::TaskOutcome::Partial
+        }
         (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
         (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
         // The contract's work is still owed and nothing ran at all: there
@@ -1415,10 +1422,11 @@ fn task_end_decision_and_outcome(
         }
         (_, crate::events::RunTerminalDecision::Unspecified) => outcome,
     };
-    // The owner declined part of what the run set out to do: whatever the
-    // closing reply says, that work did not happen.
+    // The owner declined part of what the run set out to do, or the working
+    // agent itself said the request is partial or blocked: whatever the
+    // receipts or the closing reply say, that is not a success.
     let effective_outcome = if effective_outcome == crate::events::TaskOutcome::Succeeded
-        && run_aggregate.owner_declined()
+        && (run_aggregate.owner_declined() || run_aggregate.executor_claimed_unfinished())
     {
         crate::events::TaskOutcome::Partial
     } else {
@@ -1651,7 +1659,7 @@ mod tests {
             decision,
             crate::events::RunTerminalDecision::ClosedByPolicyDenial
         );
-        assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
     }
 
     #[test]

@@ -292,7 +292,9 @@ pub enum RunTerminalDecision {
     SucceededByEvidence,
     /// Every open obligation was refused by a typed authority boundary before
     /// dispatch (nothing dispatched). The request could not be carried out
-    /// and the run is complete at that boundary; the reply narrates it.
+    /// and the run is complete at that boundary; the reply narrates it. The
+    /// work did not happen, so this is final but not a success: the task
+    /// ends `Partial` and the phase is `TaskKernelPhase::Partial`.
     ClosedByPolicyDenial,
     /// At least one exact bounded invocation is exhausted without proof.
     Failed,
@@ -311,6 +313,10 @@ pub struct RunAggregate {
     /// The executing model declared typed expectations of its own.
     #[serde(default)]
     pub executor_expectations_present: bool,
+    /// The executing model's own verdict on the request, from its latest
+    /// checklist declaration. `partial`/`blocked` cap the run below success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_claimed_outcome: Option<super::ExecutorClaimedOutcome>,
     /// Exact resources the request named for verification (from the
     /// compiled contract). A refusal touching one of them binds every
     /// untargeted observation obligation to that boundary.
@@ -379,6 +385,7 @@ impl RunAggregate {
             task_id: task_id.into(),
             contract_present: false,
             executor_expectations_present: false,
+            executor_claimed_outcome: None,
             verification_targets: Vec::new(),
             contract_fingerprint: None,
             effect_revision: 0,
@@ -683,6 +690,7 @@ impl RunAggregate {
     /// accomplished work: only receipts satisfy an obligation.
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
         self.executor_expectations_present = true;
+        self.executor_claimed_outcome = declared.outcome;
         let exact_resource_targets = declared.schema_version >= 2;
         let depended_on: BTreeSet<usize> = declared
             .items
@@ -1116,6 +1124,13 @@ impl RunAggregate {
     /// Executor-declared obligations not yet proven, deferred ones included.
     /// These are the model's own statement of unmet work; a run that ends
     /// with any is incomplete, not "closed by evidence".
+    /// The executing model said the request is not fully done (`partial`
+    /// or `blocked`). Its own verdict: no receipt upgrades it to a success.
+    pub fn executor_claimed_unfinished(&self) -> bool {
+        self.executor_claimed_outcome
+            .is_some_and(super::ExecutorClaimedOutcome::unfinished)
+    }
+
     pub fn open_executor_expectations(&self) -> usize {
         self.obligations
             .iter()
@@ -1980,7 +1995,7 @@ impl RunAggregate {
         // the executor's own declared, still-open work. Those items are the
         // model's typed statement that more is required, so "every receipt
         // succeeded" is incompleteness, not proof.
-        if self.open_executor_expectations() > 0 {
+        if self.open_executor_expectations() > 0 || self.executor_claimed_unfinished() {
             return false;
         }
         if !self.expectations_present()
@@ -2317,9 +2332,18 @@ impl RunAggregate {
             return TaskKernelPhase::ResponsePrepared;
         }
         match self.terminal_decision() {
-            RunTerminalDecision::Succeeded
-            | RunTerminalDecision::SucceededByEvidence
-            | RunTerminalDecision::ClosedByPolicyDenial => TaskKernelPhase::WorkSucceeded,
+            // The agent's own `partial`/`blocked` is never upgraded by
+            // receipts that happen to cover the declared work.
+            RunTerminalDecision::Succeeded | RunTerminalDecision::SucceededByEvidence
+                if self.executor_claimed_unfinished() =>
+            {
+                TaskKernelPhase::Partial
+            }
+            RunTerminalDecision::Succeeded | RunTerminalDecision::SucceededByEvidence => {
+                TaskKernelPhase::WorkSucceeded
+            }
+            // The requested work was refused, so it did not happen.
+            RunTerminalDecision::ClosedByPolicyDenial => TaskKernelPhase::Partial,
             RunTerminalDecision::Failed => TaskKernelPhase::Failed,
             RunTerminalDecision::Pending => TaskKernelPhase::WorkPending,
             RunTerminalDecision::Unspecified if self.started => TaskKernelPhase::Running,
@@ -3897,7 +3921,7 @@ mod tests {
             aggregate.terminal_decision(),
             RunTerminalDecision::ClosedByPolicyDenial
         );
-        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::WorkSucceeded);
+        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::Partial);
 
         // A refusal of an unrelated capability does not bind: the obligation
         // stays reachable and the run stays pending.
@@ -4556,6 +4580,7 @@ mod tests {
                 schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
                 task_id: "task-1".to_string(),
                 items,
+                outcome: None,
             },
         )
     }
@@ -4654,6 +4679,47 @@ mod tests {
     fn renumber(events: &mut [Event]) {
         for (index, event) in events.iter_mut().enumerate() {
             event.id = index as i64 + 1;
+        }
+    }
+
+    /// The agent's own `blocked` caps the run below success: receipts that
+    /// cover every declared item close nothing, and the phase is partial.
+    #[test]
+    fn claimed_blocked_is_never_upgraded_by_covering_receipts() {
+        let declared = |outcome| {
+            let mut event = executor_expectations(vec![checklist_item(
+                0,
+                ToolMutationEffects::NONE,
+                true,
+                &["/tmp/proj/routes.yml"],
+                "completed",
+            )]);
+            event.data["outcome"] = serde_json::json!(outcome);
+            event
+        };
+        let read = [
+            call("routes", "read_file"),
+            result(
+                "routes",
+                "read_file",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                terminal_observation_semantics(Some("/tmp/proj/routes.yml")),
+            ),
+        ];
+        for (outcome, unfinished) in [("done", false), ("blocked", true)] {
+            let mut events = vec![declared(outcome)];
+            events.extend(read.clone());
+            renumber(&mut events);
+            let aggregate = RunAggregate::replay("task-1", &events);
+            assert_eq!(aggregate.executor_claimed_unfinished(), unfinished);
+            assert_eq!(aggregate.evidence_closed(), !unfinished, "{outcome}");
+            assert_eq!(
+                aggregate.lifecycle_phase() == TaskKernelPhase::Partial,
+                unfinished,
+                "{outcome}: {:?}",
+                aggregate.lifecycle_phase()
+            );
         }
     }
 

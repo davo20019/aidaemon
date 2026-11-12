@@ -163,6 +163,17 @@ impl Agent {
             decision = self
                 .sdk_closeout(scope, check.completed_results, check.failed_without_success)
                 .await;
+            // The agent said the request is partial or blocked: the run stops
+            // unmet, and only its reply may still need repair.
+            if let sdk::StopDecision::AcceptUnmet { .. } = decision {
+                let repair = self.sdk_reply_check(scope, &check.final_text).await;
+                let _ = check.reply.send(if repair.permits_stop() {
+                    decision
+                } else {
+                    repair
+                });
+                return;
+            }
             if decision != sdk::StopDecision::Accept
                 && reply_defect(&check.final_text, None).is_none()
             {
@@ -496,6 +507,34 @@ impl Agent {
             return sdk::StopDecision::Accept;
         };
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
+        // The agent's own typed verdict: `partial` or `blocked` ends the run
+        // unmet. No more work is demanded (the agent said it cannot or will
+        // not finish), and nothing later turns it into a success.
+        if let Some(claim) = aggregate
+            .executor_claimed_outcome
+            .filter(|claim| claim.unfinished())
+        {
+            scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+            self.emit_decision_point(
+                scope.emitter,
+                scope.task_id,
+                iteration,
+                crate::events::DecisionType::PostExecutionValidation,
+                format!("Agent reported the request as {}", claim.as_str()),
+                serde_json::json!({
+                    "condition": "executor_claimed_outcome",
+                    "claimed_outcome": claim.as_str(),
+                    "engine": "sdk",
+                }),
+            )
+            .await;
+            return sdk::StopDecision::AcceptUnmet {
+                unmet: vec![format!(
+                    "the agent reported the request as {}",
+                    claim.as_str()
+                )],
+            };
+        }
         let authority =
             crate::agent::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);

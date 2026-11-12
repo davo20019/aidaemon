@@ -345,6 +345,10 @@ pub(crate) fn executor_expectations_from_checklist_arguments(
         schema_version: ExecutorExpectationsDeclaredData::SCHEMA_VERSION,
         task_id: task_id.to_string(),
         items,
+        outcome: value
+            .get("outcome")
+            .and_then(Value::as_str)
+            .and_then(crate::events::ExecutorClaimedOutcome::from_protocol_name),
     })
 }
 
@@ -415,6 +419,8 @@ impl Tool for TrackRequirementsTool {
          may then end, but a deferred or removed item is reported as not done, never as done. \
          If the user adds, changes or cancels work while you are working, pass the revised list \
          before continuing. \
+         Before your final answer, pass the list once more with outcome: done, partial, or blocked; \
+         the request is reported that way, and only receipts can confirm done. \
          Skip this only for a single read-only lookup, a plain answer or conversation, or when \
          the user forbids it."
     }
@@ -517,6 +523,11 @@ impl Tool for TrackRequirementsTool {
                             "required": ["text", "status"],
                             "additionalProperties": false
                         }
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "description": "Your verdict on the whole request, set on your last call before the final answer.",
+                        "enum": ["done", "partial", "blocked"]
                     }
                 },
                 "required": ["items"],
@@ -698,6 +709,17 @@ impl crate::traits::ToolSemantics for TrackRequirementsTool {
         let value: Value = serde_json::from_str(arguments).map_err(|error| {
             ToolArgumentContractViolation::new(format!("invalid JSON arguments: {error}"))
         })?;
+        if let Some(outcome) = value.get("outcome") {
+            if outcome
+                .as_str()
+                .and_then(crate::events::ExecutorClaimedOutcome::from_protocol_name)
+                .is_none()
+            {
+                return Err(ToolArgumentContractViolation::new(
+                    "outcome must be one of done, partial, blocked",
+                ));
+            }
+        }
         if let Some(items) = value.get("items").and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 parse_expectation_targets(item.get("targets")).map_err(|error| {
@@ -744,6 +766,29 @@ mod tests {
         // The tool only persists checklist state; UI delivery is handled by the
         // agent loop via StatusUpdate::Checklist, so there is no hub to wire here.
         (TrackRequirementsTool::new(plan_store.clone()), plan_store)
+    }
+
+    /// The agent's verdict is typed: anything but done, partial or blocked
+    /// is rejected before the call runs, and a valid one reaches the ledger.
+    #[tokio::test]
+    async fn checklist_outcome_is_typed() {
+        let (tool, _plan_store) = test_tool().await;
+        let item = r#"{"text":"Probe","status":"completed"}"#;
+        assert!(tool
+            .validate_arguments(&format!(r#"{{"items":[{item}],"outcome":"finished"}}"#))
+            .is_err());
+        let blocked = format!(r#"{{"items":[{item}],"outcome":"blocked"}}"#);
+        assert!(tool.validate_arguments(&blocked).is_ok());
+        let declared = executor_expectations_from_checklist_arguments("task-synthetic", &blocked)
+            .expect("declared");
+        assert_eq!(
+            declared.outcome,
+            Some(crate::events::ExecutorClaimedOutcome::Blocked)
+        );
+        let none = format!(r#"{{"items":[{item}]}}"#);
+        let declared =
+            executor_expectations_from_checklist_arguments("task-synthetic", &none).unwrap();
+        assert_eq!(declared.outcome, None);
     }
 
     #[tokio::test]
