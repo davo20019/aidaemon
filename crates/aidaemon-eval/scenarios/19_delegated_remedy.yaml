@@ -1,0 +1,28 @@
+name: delegated_remedy
+description: >
+  The live 2026-11-12 shape: the setup is delegated and the sub-agent comes
+  back incomplete with the Docker error of a stopped OrbStack. A good run
+  starts OrbStack itself and finishes (delegating again or not); a bad one
+  passes the blocker on to the owner without trying. claude-haiku-5-5,
+  2026-11-12: 13/15 plain, 15/15 with `OBSTACLE_GUIDANCE` (the misses
+  reported Docker not running and gave no URL).
+tags: ["kit:delegate"]
+instructions: >
+  You are an assistant running on the owner's laptop, with a shell and
+  sub-agents for longer jobs.
+input: >
+  Have a sub-agent set up a local DDEV Drupal site for a high school in
+  ~/projects/school (DDEV project name `school`), then tell me its
+  homepage URL.
+script:
+  - tool_calls: [{ name: spawn_agent, arguments: { mission: "Set up the DDEV Drupal site in ~/projects/school" } }]
+  - tool_calls: [{ name: run_command, arguments: { command: "orb start" } }]
+  - tool_calls: [{ name: spawn_agent, arguments: { mission: "Start the DDEV Drupal site in ~/projects/school" } }]
+  - text: The site is up at https://school.ddev.site (OrbStack was stopped; I started it).
+expect:
+  status: completed
+  tool_call_counts: { spawn_agent: 2, run_command: 1 }
+  final_text_contains: [school.ddev.site]
+live_expect:
+  status: completed
+  final_text_contains: [school.ddev.site]

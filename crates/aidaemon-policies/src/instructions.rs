@@ -14,6 +14,15 @@ use aidaemon_core::{
 };
 use async_trait::async_trait;
 
+/// How to treat an obstacle, for an agent's system prompt: remove what is
+/// within the agent's authority before reporting the task blocked. The
+/// daemon's prompt carries it; measured with the eval's `*_remedy`
+/// scenarios (`live_policies` config `obstacle_guidance`).
+pub const OBSTACLE_GUIDANCE: &str = "Before you report that something blocks the task, try the \
+remedies within your authority: start a stopped local service or app the task depends on and \
+retry once it is up, or install what the workspace lacks. Report it blocked only if the remedy \
+needs the user or failed, and say what you tried.";
+
 /// Aggregate cap. More-specific files are kept first when it is reached.
 pub const MAX_PROJECT_INSTRUCTION_CHARS: usize = 32 * 1024;
 const MAX_SINGLE_INSTRUCTION_CHARS: usize = 32 * 1024;

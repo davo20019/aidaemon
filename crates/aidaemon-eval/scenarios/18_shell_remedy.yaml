@@ -1,0 +1,26 @@
+name: shell_remedy
+description: >
+  The same stopped container engine as `service_remedy`, with only a
+  shell: nothing names the remedy, the Docker error points at OrbStack's
+  socket. A good run starts OrbStack, starts the site again and gives its
+  URL; a bad one reports the task blocked without trying. 5/5 with and
+  without `OBSTACLE_GUIDANCE` on claude-haiku-5-5 (2026-11-12).
+tags: ["kit:shell"]
+instructions: >
+  You are an assistant running on the owner's laptop, with a shell.
+input: >
+  Set up a local DDEV Drupal site for a high school in ~/projects/school
+  (DDEV project name `school`) and tell me its homepage URL.
+script:
+  - tool_calls: [{ name: run_command, arguments: { command: "cd ~/projects/school && ddev config --project-type=drupal11 --project-name=school && ddev start" } }]
+  - tool_calls: [{ name: run_command, arguments: { command: "orb status" } }]
+  - tool_calls: [{ name: run_command, arguments: { command: "orb start" } }]
+  - tool_calls: [{ name: run_command, arguments: { command: "cd ~/projects/school && ddev start --project-name=school" } }]
+  - text: The site is up at https://school.ddev.site (OrbStack was stopped; I started it first).
+expect:
+  status: completed
+  receipt_statuses: { run_command: [failed, succeeded, succeeded, succeeded] }
+  final_text_contains: [school.ddev.site]
+live_expect:
+  status: completed
+  final_text_contains: [school.ddev.site]

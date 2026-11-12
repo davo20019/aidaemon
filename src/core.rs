@@ -1011,6 +1011,21 @@ primary = "gpt-4o"
         }
     }
 
+    /// Live 2026-11-12: a run reported "can't connect to Docker" with
+    /// OrbStack stopped instead of starting it. The prompt says to remove an
+    /// obstacle within the agent's authority before reporting it.
+    #[test]
+    fn the_base_prompt_says_to_remove_obstacles_first() {
+        use crate::startup::prompt::MemoryPrompt;
+        let prompt =
+            build_base_system_prompt(&minimal_config(), &[], None, &MemoryPrompt::DaemonsOwn)
+                .unwrap();
+        assert!(prompt.contains(&format!(
+            "- **Remove obstacles you can.** {}\n",
+            aidaemon_policies::OBSTACLE_GUIDANCE
+        )));
+    }
+
     #[test]
     fn base_prompt_uses_default_agent_identity() {
         let config = minimal_config();

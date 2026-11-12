@@ -58,7 +58,9 @@ pub use conversation::{
 };
 pub use egress::EgressGuard;
 pub use grants::SessionGrants;
-pub use instructions::{InstructionSource, NestedInstructions, ProjectInstructions};
+pub use instructions::{
+    InstructionSource, NestedInstructions, ProjectInstructions, OBSTACLE_GUIDANCE,
+};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
 pub use memory::{
     HistoryIntake, HostTurn, InMemoryRecall, Learning, MemoryInjection, MemoryParts, MemorySystem,

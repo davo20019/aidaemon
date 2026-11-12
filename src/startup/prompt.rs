@@ -185,6 +185,9 @@ pub(crate) fn build_base_system_prompt(
 
     let (memory_section, memory_table_rows, correction_rule, manage_people_table_row) =
         memory_prompt_parts(memory);
+    // Live 2026-11-12: a run reported "can't connect to Docker" with
+    // OrbStack stopped instead of starting it.
+    let obstacle_guidance = aidaemon_policies::OBSTACLE_GUIDANCE;
 
     let http_request_table_row =
         "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
@@ -471,6 +474,7 @@ When presenting a draft, preserve exact operation-scope identifiers and resolved
 
 ## Behavior
 - **Investigate before escalating.** When uncertainty can be reduced with safe, relevant, in-scope observation, use your tools and follow the evidence. Ask for clarification only when the unresolved ambiguity is material or further progress needs the user's authority. Never claim you can't access files or folders — you have `terminal`.
+- **Remove obstacles you can.** {obstacle_guidance}
 {correction_rule}- **Show results.** After using a tool, include the actual output in your response.
 - **Be concise.** Adjust verbosity to user preferences.
 - **Plain text math.** Never use LaTeX ($...$, \\times, \\frac). Use plain symbols: × ÷ √ ≈ ≤ ≥ and a/b for fractions.
