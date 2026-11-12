@@ -38,6 +38,7 @@ pub struct Shell {
     max_timeout: Duration,
     max_output_bytes: usize,
     allow_network: bool,
+    deny_read: Vec<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Shell {
@@ -64,10 +65,14 @@ impl Shell {
             max_timeout: Duration::from_secs(110),
             max_output_bytes: 20_000,
             allow_network: false,
+            deny_read: Vec::new(),
         }
     }
 
-    /// Shell with [`best_available_sandbox`].
+    /// Shell with [`best_available_sandbox`]: bubblewrap on Linux and
+    /// seatbelt on macOS when available, overridable with
+    /// [`crate::SANDBOX_ENV`]; uncontained (with a one-time warning) when no
+    /// OS sandbox is available.
     pub fn sandboxed(workspace: Workspace) -> Self {
         Self::new(workspace, best_available_sandbox())
     }
@@ -99,6 +104,17 @@ impl Shell {
     /// which never restricts it).
     pub fn allow_network(mut self, allow: bool) -> Self {
         self.allow_network = allow;
+        self
+    }
+
+    /// Host paths commands must not read, for example credential
+    /// directories (contained backends only; see
+    /// [`SandboxCommand::deny_read`]).
+    pub fn deny_read(
+        mut self,
+        paths: impl IntoIterator<Item = impl Into<std::path::PathBuf>>,
+    ) -> Self {
+        self.deny_read.extend(paths.into_iter().map(Into::into));
         self
     }
 
@@ -231,6 +247,7 @@ impl Tool for Shell {
             timeout,
             max_output_bytes: self.max_output_bytes,
             allow_network: self.allow_network,
+            deny_read: self.deny_read.clone(),
             cancel: ctx.cancel.clone(),
         };
         let out = match self.backend.run(&spec).await {

@@ -68,8 +68,9 @@ pub use backend::{
 };
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
-    best_available_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError,
-    LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox, TerminalConfinement,
+    best_available_sandbox, sandbox_preference_from_env, select_sandbox, BubblewrapSandbox,
+    CommandOutput, DockerSandbox, ExecError, LocalSandbox, Sandbox, SandboxCommand, SandboxKind,
+    SandboxSelection, SeatbeltSandbox, TerminalConfinement, SANDBOX_ENV,
 };
 pub use fs::{
     format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
@@ -86,18 +87,28 @@ pub use web::{NetworkGuard, WebFetch};
 pub use workspace::{PathError, Workspace};
 
 /// The standard set: `read_file`, `write_file`, `edit_file`, `glob`, `grep`,
-/// `shell` (with [`best_available_sandbox`]) and `web_fetch`.
+/// `shell` (with [`best_available_sandbox`]: bubblewrap on Linux, seatbelt
+/// on macOS) and `web_fetch`.
 ///
 /// `track_requirements` is not included because it is only useful together
 /// with its stop hook; add both with [`Checklist::with_gate`].
 pub fn default_tools(workspace: Workspace) -> Vec<Arc<dyn Tool>> {
+    default_tools_with_sandbox(workspace, best_available_sandbox())
+}
+
+/// [`default_tools`] with the shell on an explicit backend, for example
+/// `SandboxKind::Local.backend()` to run commands on the host on purpose.
+pub fn default_tools_with_sandbox(
+    workspace: Workspace,
+    sandbox: Arc<dyn Sandbox>,
+) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFile::new(workspace.clone())),
         Arc::new(WriteFile::new(workspace.clone())),
         Arc::new(EditFile::new(workspace.clone())),
         Arc::new(Glob::new(workspace.clone())),
         Arc::new(Grep::new(workspace.clone())),
-        Arc::new(Shell::sandboxed(workspace)),
+        Arc::new(Shell::new(workspace, sandbox)),
         Arc::new(WebFetch::new()),
     ]
 }
