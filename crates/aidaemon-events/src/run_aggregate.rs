@@ -684,8 +684,8 @@ impl RunAggregate {
     /// subject/facet receipt). Opaque identifiers are exact resource IDs; they
     /// never fall back to an untargeted observation.
     /// Untyped free-text items are not obligations. A later declaration
-    /// replaces the set: kept indices retain their proof; `deferred`/`skipped`
-    /// items and removed indices that are not already proven become
+    /// replaces the set: kept indices retain their proof; `deferred`/`skipped`/
+    /// `failed` items and removed indices that are not already proven become
     /// `Deferred`. Editing the checklist never turns unperformed work into
     /// accomplished work: only receipts satisfy an obligation.
     fn install_executor_expectations(&mut self, declared: ExecutorExpectationsDeclaredData) {
@@ -700,7 +700,8 @@ impl RunAggregate {
         let mut declared_ids = BTreeSet::new();
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
-            let deferred = matches!(item.status.as_str(), "deferred" | "skipped");
+            // `failed`: tried and not achieved. Not demanded again, never done.
+            let deferred = matches!(item.status.as_str(), "deferred" | "skipped" | "failed");
             let has_effect = !item.mutation_effects.is_empty();
             let declared_observation_targets = if item.observation_targets.is_empty() {
                 item.targets
@@ -5272,6 +5273,26 @@ mod tests {
             RunObligationState::Satisfied
         );
         assert!(aggregate.is_fulfilled());
+    }
+
+    /// An item the executor tried and could not achieve (`failed`) is not
+    /// demanded again and never counts as done, like a deferred one.
+    #[test]
+    fn a_failed_item_is_not_demanded_and_not_done() {
+        let mut events = vec![executor_expectations(vec![checklist_item(
+            0,
+            ToolMutationEffects::LOCAL_WORKSPACE_WRITE,
+            false,
+            &["/tmp/out"],
+            "failed",
+        )])];
+        renumber(&mut events);
+        let aggregate = RunAggregate::replay("task-1", &events);
+        assert_eq!(
+            aggregate.obligations["task:task-1/obligation:checklist:0"].state,
+            RunObligationState::Deferred
+        );
+        assert!(!aggregate.is_fulfilled());
     }
 
     /// Serialized projections from before the rename still load.

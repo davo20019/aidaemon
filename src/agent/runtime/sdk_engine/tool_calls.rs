@@ -1559,7 +1559,10 @@ impl Agent {
                     .items
                     .iter()
                     .filter(|item| {
-                        !matches!(item.status.as_str(), "completed" | "deferred" | "skipped")
+                        !matches!(
+                            item.status.as_str(),
+                            "completed" | "deferred" | "skipped" | "failed"
+                        )
                     })
                     .count();
                 scope
