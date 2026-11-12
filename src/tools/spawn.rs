@@ -467,47 +467,76 @@ fn batch_tasks(arguments: &str) -> anyhow::Result<Option<Vec<Value>>> {
 }
 
 /// When a child ran and how long it took, measured by the daemon: its start
-/// and finish in this machine's local time (the owner's clock, as `date`
-/// shows it) and the elapsed time between them. A parent sees which of its
-/// children overlapped, and a duration it reports is this measurement, not
-/// times the child wrote in its own reply.
+/// and finish in the owner's zone and 12-hour clock ("5:44 PM ET", as every
+/// owner-facing time reads), the elapsed time between them, and how much of
+/// it the child spent waiting for the owner to answer a card. A parent sees
+/// which of its children overlapped, and the times, durations and waits it
+/// reports are these measurements, never arithmetic on times the child
+/// printed (live 2026-11-12: "about 16 minutes (17:44 to 18:00)", and a
+/// "5-minute wait for approval" the model guessed).
 fn run_window(
     started: chrono::DateTime<chrono::Utc>,
     finished: chrono::DateTime<chrono::Utc>,
+    waited: Duration,
 ) -> String {
     let elapsed = (finished - started).max(chrono::Duration::zero());
-    let local = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&chrono::Local);
     format!(
-        "Sub-agent ran {}\u{2013}{} (local time, UTC{}), {} ({}s) measured by the daemon. \
-         Report this when saying how long it took; times in the sub-agent's own reply are \
-         its estimates.",
-        local(started).format("%H:%M:%S"),
-        local(finished).format("%H:%M:%S"),
-        local(started).format("%:z"),
+        "Sub-agent ran {} to {}: {} ({}s), measured by the daemon.{} Report these times, this \
+         duration and this wait as given (the owner's time zone, 12-hour clock); times in the \
+         sub-agent's own reply are its estimates.",
+        crate::cron_utils::owner_time(&started),
+        crate::cron_utils::owner_time(&finished),
         aidaemon_tools::duration_format::compact_chrono_duration(
             elapsed,
             aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
         ),
-        elapsed.num_seconds()
+        elapsed.num_seconds(),
+        owner_wait_note(waited),
+    )
+}
+
+/// How long a child waited for the owner's answer on its cards, from its
+/// own wait clock; empty when it never waited.
+fn owner_wait_note(waited: Duration) -> String {
+    if waited.as_secs() == 0 {
+        return String::new();
+    }
+    format!(
+        " Of that, it waited {} for the owner's answer on an approval card.",
+        aidaemon_tools::duration_format::compact_seconds(
+            i64::try_from(waited.as_secs()).unwrap_or(i64::MAX),
+            aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+        )
     )
 }
 
 /// A background child's measured run for the chat: how long it took and
-/// when, in this machine's local time.
+/// when, in the owner's zone, and how long it waited for the owner.
 fn background_timing(
     started: chrono::DateTime<chrono::Utc>,
     finished: chrono::DateTime<chrono::Utc>,
+    waited: Duration,
 ) -> String {
     let elapsed = (finished - started).max(chrono::Duration::zero());
-    let local = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&chrono::Local);
+    let wait = if waited.as_secs() == 0 {
+        String::new()
+    } else {
+        format!(
+            " It waited {} of that for your answer.",
+            aidaemon_tools::duration_format::compact_seconds(
+                i64::try_from(waited.as_secs()).unwrap_or(i64::MAX),
+                aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+            )
+        )
+    };
     format!(
-        "Took {} ({}\u{2013}{}).",
+        "Took {} ({} to {}).{wait}",
         aidaemon_tools::duration_format::compact_chrono_duration(
             elapsed,
             aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
         ),
-        local(started).format("%-I:%M:%S %p"),
-        local(finished).format("%-I:%M:%S %p")
+        crate::cron_utils::owner_time(&started),
+        crate::cron_utils::owner_time(&finished),
     )
 }
 
@@ -1170,6 +1199,9 @@ impl Tool for SpawnAgentTool {
             let finished = std::panic::AssertUnwindSafe(async {
                 let started_at = std::time::Instant::now();
                 let started_utc = chrono::Utc::now();
+                let waits = crate::tools::OwnerWaitClock::current()
+                    .unwrap_or_default()
+                    .nested();
                 let mut progress_interval =
                     tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
                 progress_interval.tick().await; // consume immediate tick
@@ -1179,22 +1211,25 @@ impl Tool for SpawnAgentTool {
                 let result: anyhow::Result<ChildAgentRun> = {
                     let mut result_fut = std::pin::pin!(crate::agent::authority::within_permit(
                         family_permit.as_ref(),
-                        agent.run_child(ChildAgentRequest {
-                            mission: mission.clone(),
-                            task: task.clone(),
-                            status_tx: status_tx.clone(),
-                            channel_ctx,
-                            user_role,
-                            child_role,
-                            goal_id: goal_id_ref.clone(),
-                            task_id: task_id_ref.clone(),
-                            project_scope: project_scope.clone(),
-                            specialist: args.specialist.clone(),
-                            approval_session_id: Some(session_id.clone()),
-                            parent_authority: parent_authority.clone(),
-                            time_limit,
-                            model_tier: args.model_tier.map(Into::into),
-                        })
+                        crate::tools::OwnerWaitClock::within(
+                            Some(waits.clone()),
+                            agent.run_child(ChildAgentRequest {
+                                mission: mission.clone(),
+                                task: task.clone(),
+                                status_tx: status_tx.clone(),
+                                channel_ctx,
+                                user_role,
+                                child_role,
+                                goal_id: goal_id_ref.clone(),
+                                task_id: task_id_ref.clone(),
+                                project_scope: project_scope.clone(),
+                                specialist: args.specialist.clone(),
+                                approval_session_id: Some(session_id.clone()),
+                                parent_authority: parent_authority.clone(),
+                                time_limit,
+                                model_tier: args.model_tier.map(Into::into),
+                            })
+                        )
                     ),);
                     let owner_cancelled = async {
                         match cancel_token.as_ref() {
@@ -1339,7 +1374,7 @@ impl Tool for SpawnAgentTool {
                 // read this, not times the child wrote.
                 let message = format!(
                     "{message}\n\n{}",
-                    background_timing(started_utc, chrono::Utc::now())
+                    background_timing(started_utc, chrono::Utc::now(), waits.waited())
                 );
                 delivery.deliver(notification_type, &message, trust).await;
                 settle_background_steps(
@@ -1630,8 +1665,14 @@ impl SpawnAgentTool {
         tree: Option<&crate::agent::authority::SpawnFamily>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let started = chrono::Utc::now();
-        let result = agent
-            .run_child(ChildAgentRequest {
+        // The child's own wait clock: its card waits, apart from its
+        // siblings', still counting for the turn.
+        let waits = crate::tools::OwnerWaitClock::current()
+            .unwrap_or_default()
+            .nested();
+        let result = crate::tools::OwnerWaitClock::within(
+            Some(waits.clone()),
+            agent.run_child(ChildAgentRequest {
                 mission: mission.to_string(),
                 task: task.to_string(),
                 status_tx,
@@ -1646,9 +1687,10 @@ impl SpawnAgentTool {
                 parent_authority,
                 time_limit: self.time_limit(),
                 model_tier,
-            })
-            .await;
-        let window = run_window(started, chrono::Utc::now());
+            }),
+        )
+        .await;
+        let window = run_window(started, chrono::Utc::now(), waits.waited());
 
         match result {
             Ok(run) => {
@@ -3149,18 +3191,35 @@ mod child_runtime_tests {
     fn a_childs_result_carries_its_measured_elapsed_time() {
         let started = chrono::Utc::now();
         let finished = started + chrono::Duration::seconds(86);
-        let window = run_window(started, finished);
+        let window = run_window(started, finished, Duration::ZERO);
         assert!(
-            window.contains("1m 26s (86s) measured by the daemon"),
+            window.contains(": 1m 26s (86s), measured by the daemon."),
             "{window}"
         );
-        let local = started.with_timezone(&chrono::Local);
+        // The owner's zone and 12-hour clock, never a 24-hour reading.
+        let owner_start = crate::cron_utils::owner_time(&started);
         assert!(
-            window.contains(&local.format("%H:%M:%S").to_string()),
+            owner_start.contains(" AM ") || owner_start.contains(" PM "),
+            "{owner_start}"
+        );
+        assert!(
+            window.contains(&format!("ran {owner_start} to ")),
             "{window}"
         );
-        let timing = background_timing(started, finished);
+        assert!(!window.contains("waited"), "{window}");
+        let timing = background_timing(started, finished, Duration::ZERO);
         assert!(timing.starts_with("Took 1m 26s ("), "{timing}");
+        // A wait for the owner is the child's measured wait, said as such.
+        let waited = run_window(started, finished, Duration::from_secs(300));
+        assert!(
+            waited.contains("Of that, it waited 5m for the owner's answer on an approval card."),
+            "{waited}"
+        );
+        let timing = background_timing(started, finished, Duration::from_secs(300));
+        assert!(
+            timing.ends_with("It waited 5m of that for your answer."),
+            "{timing}"
+        );
     }
 
     #[tokio::test]

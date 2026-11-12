@@ -14,7 +14,7 @@ tokio::task_local! {
 /// How long a turn has spent waiting for its owner to answer a card. Waiting
 /// on a person is not the turn working, so the turn's hang limit leaves it out.
 #[derive(Clone, Default)]
-pub struct OwnerWaitClock(Arc<Mutex<OwnerWaitState>>);
+pub struct OwnerWaitClock(Arc<Mutex<OwnerWaitState>>, Option<Box<OwnerWaitClock>>);
 
 #[derive(Default)]
 struct OwnerWaitState {
@@ -27,7 +27,11 @@ struct OwnerWaitState {
 }
 
 /// Ends one card's wait when dropped, however the wait ends.
-pub struct OwnerWaiting(OwnerWaitClock);
+pub struct OwnerWaiting {
+    clock: OwnerWaitClock,
+    /// The same wait on the enclosing clock, ended with this one.
+    _parent: Option<Box<OwnerWaiting>>,
+}
 
 impl OwnerWaitClock {
     /// Total time spent waiting so far, including a wait still open.
@@ -51,17 +55,29 @@ impl OwnerWaitClock {
         }
     }
 
+    /// A clock of its own for one part of the turn (a sub-agent): its waits
+    /// are measured apart from its siblings', and count on this clock too.
+    pub fn nested(&self) -> Self {
+        Self(Arc::default(), Some(Box::new(self.clone())))
+    }
+
     /// Mark a card as waiting on the owner in the current turn.
     pub fn begin_waiting() -> Option<OwnerWaiting> {
-        let clock = Self::current()?;
+        Some(Self::current()?.begin())
+    }
+
+    fn begin(&self) -> OwnerWaiting {
         {
-            let mut state = clock.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.open += 1;
             if state.open == 1 {
                 state.since = Some(Instant::now());
             }
         }
-        Some(OwnerWaiting(clock))
+        OwnerWaiting {
+            clock: self.clone(),
+            _parent: self.1.as_ref().map(|parent| Box::new(parent.begin())),
+        }
     }
 }
 
@@ -201,7 +217,7 @@ impl Drop for InFlight {
 
 impl Drop for OwnerWaiting {
     fn drop(&mut self) {
-        let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.clock.0.lock().unwrap_or_else(|e| e.into_inner());
         state.open = state.open.saturating_sub(1);
         if state.open == 0 {
             if let Some(since) = state.since.take() {
@@ -231,6 +247,24 @@ mod progress_tests {
         assert!(clock.idle() >= STEP);
         clock.touch();
         assert!(clock.idle() < STEP);
+    }
+
+    /// A sub-agent's own clock measures only its waits, and they still
+    /// count for the turn it belongs to.
+    #[tokio::test]
+    async fn a_nested_clock_measures_its_own_waits_and_counts_for_the_turn() {
+        let turn = OwnerWaitClock::default();
+        let helper = turn.nested();
+        let sibling = turn.nested();
+        OwnerWaitClock::within(Some(helper.clone()), async {
+            let card = OwnerWaitClock::begin_waiting();
+            tokio::time::sleep(STEP * 2).await;
+            drop(card);
+        })
+        .await;
+        assert!(helper.waited() >= STEP * 2, "{:?}", helper.waited());
+        assert!(turn.waited() >= STEP * 2, "{:?}", turn.waited());
+        assert_eq!(sibling.waited(), Duration::ZERO);
     }
 
     #[tokio::test]
