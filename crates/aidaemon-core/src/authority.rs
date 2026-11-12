@@ -92,6 +92,7 @@ impl Authority {
 pub struct AuthorityHook {
     authority: Authority,
     ceiling: Option<Arc<dyn AuthorityCeiling>>,
+    delegated: bool,
 }
 
 impl AuthorityHook {
@@ -99,7 +100,17 @@ impl AuthorityHook {
         Self {
             authority,
             ceiling: None,
+            delegated: false,
         }
+    }
+
+    /// This run's authority was set by the agent that started it (a
+    /// sub-agent's): a refusal by that authority says so, so the run reports
+    /// the limit to its parent instead of to the session's owner. A refusal
+    /// by the ceiling still names the session.
+    pub fn delegated(mut self) -> Self {
+        self.delegated = true;
+        self
     }
 
     /// Read `ceiling` on every call and judge with the narrower of this
@@ -116,6 +127,7 @@ impl std::fmt::Debug for AuthorityHook {
         f.debug_struct("AuthorityHook")
             .field("authority", &self.authority)
             .field("ceiling", &self.ceiling.is_some())
+            .field("delegated", &self.delegated)
             .finish()
     }
 }
@@ -143,6 +155,19 @@ impl Hook for AuthorityHook {
         call: &ToolCall,
         tool: &ToolInfo,
     ) -> ToolDecision {
+        if self.delegated {
+            if let Err(reason) = self.authority.permits(&call.name, tool.annotations) {
+                return ToolDecision::Deny {
+                    reason: format!(
+                        "[AUTHORITY BLOCKED] `{}` is outside the access this sub-agent was \
+                         given ({reason}). Use a permitted tool or report the limitation: the \
+                         agent that started this one chose that access, and only it can start \
+                         a sub-agent with more (never more than its own).",
+                        call.name
+                    ),
+                };
+            }
+        }
         let narrowed = match &self.ceiling {
             Some(ceiling) => ceiling.ceiling().await.map(|c| self.authority.narrow(&c)),
             None => None,
@@ -361,6 +386,48 @@ mod tests {
         assert!(
             reason.starts_with("[AUTHORITY BLOCKED] `write_file`"),
             "{reason}"
+        );
+    }
+
+    /// A sub-agent refused by the access its parent gave it is told so (the
+    /// parent can start it again with more); a refusal by the session's
+    /// ceiling still names the session.
+    #[tokio::test]
+    async fn a_delegated_refusal_names_the_parent_not_the_session() {
+        let run = |hook: AuthorityHook| async move {
+            let agent = Agent::builder("a")
+                .model("m")
+                .provider(ScriptedProvider::new([
+                    tool_calls([call("c1", "write_file", json!({}))]),
+                    text("done"),
+                ]))
+                .tool(writer_tool())
+                .hook(hook)
+                .attest(Safeguard::Scope)
+                .attest(Safeguard::Approval)
+                .attest(Safeguard::Egress)
+                .attest(Safeguard::UntrustedOutput)
+                .build()
+                .unwrap();
+            let out = agent.run("s", "go").await.unwrap();
+            assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
+            out.receipts()[0].reason.clone().unwrap_or_default()
+        };
+        let given = run(AuthorityHook::new(Authority::read_only()).delegated()).await;
+        assert!(
+            given.contains("this sub-agent was given (read-only)"),
+            "{given}"
+        );
+        assert!(!given.contains("session"), "{given}");
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let session = run(AuthorityHook::new(Authority::full())
+            .with_ceiling(std::sync::Arc::new(FlagCeiling(flag)))
+            .delegated())
+        .await;
+        assert!(
+            session.contains("this session allows (read-only)"),
+            "{session}"
         );
     }
 

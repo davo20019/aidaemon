@@ -942,8 +942,12 @@ impl Agent {
             self.state.clone(),
             self.mode_session_for(session_id),
         ));
-        let authority_hook =
+        let mut authority_hook =
             sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone());
+        // A child's authority is what its parent gave it: a refusal says so.
+        if self.inherited_authority.is_some() {
+            authority_hook = authority_hook.delegated();
+        }
         let mut builder = sdk::Agent::builder("aidaemon")
             .attest(sdk::Safeguard::Scope)
             .model(model.clone())
