@@ -6,7 +6,6 @@ use crate::events::{Consolidator, EventStore, Pruner};
 use crate::llm_runtime::gateway::SideCallGateway;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
-use crate::memory::manager::MemoryManager;
 use crate::plans::PlanStore;
 use crate::traits::StateStore;
 use sqlx::SqlitePool;
@@ -14,7 +13,8 @@ use sqlx::SqlitePool;
 pub struct MemoryPipelineBundle {
     pub consolidator: Arc<Consolidator>,
     pub pruner: Arc<Pruner>,
-    pub memory_manager: Arc<MemoryManager>,
+    /// The full memory system's background jobs.
+    pub memory_jobs: Arc<aidaemon_memory::full::MemoryJobs>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50,22 +50,20 @@ pub fn build_memory_pipeline(
 
     let consolidation_interval =
         Duration::from_secs(config.state.consolidation_interval_hours * 3600);
-    let memory_manager = Arc::new(
-        MemoryManager::new(
-            pool,
-            embedding_service,
-            llm_runtime,
-            side_calls,
-            consolidation_interval,
-            Some(consolidator.clone()),
-        )
-        .with_state(state)
-        .with_memory(memory_store),
+    let memory_jobs = crate::memory::jobs_host::memory_jobs(
+        pool,
+        state,
+        memory_store,
+        embedding_service,
+        llm_runtime,
+        side_calls,
+        consolidation_interval,
+        Some(consolidator.clone()),
     );
 
     MemoryPipelineBundle {
         consolidator,
         pruner,
-        memory_manager,
+        memory_jobs,
     }
 }

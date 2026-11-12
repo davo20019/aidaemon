@@ -50,7 +50,7 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) pool: SqlitePool,
     pub(crate) event_store: Arc<crate::events::EventStore>,
     pub(crate) pruner: Arc<crate::events::Pruner>,
-    pub(crate) memory_manager: Arc<crate::memory::manager::MemoryManager>,
+    pub(crate) memory_jobs: Arc<aidaemon_memory::full::MemoryJobs>,
     pub(crate) own_memory: bool,
     pub(crate) memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pub(crate) memory_services: Vec<Arc<dyn aidaemon_core::Service>>,
@@ -65,6 +65,33 @@ pub(crate) struct HeartbeatDependencies {
     pub(crate) execution_backend: crate::execution::SharedExecutionBackend,
 }
 
+/// Goal review, which is work and always runs, then, when the daemon's own
+/// memory serves, the full memory system's jobs. Another memory system
+/// brings its own.
+pub(crate) fn register_memory_jobs(
+    heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
+    pool: SqlitePool,
+    memory_jobs: &Arc<aidaemon_memory::full::MemoryJobs>,
+    own_memory: bool,
+) {
+    heartbeat.register_job(
+        "goal_review",
+        Duration::from_secs(7 * 24 * 3600),
+        move || {
+            let pool = pool.clone();
+            async move { crate::memory::jobs_host::review_goals(&pool).await }
+        },
+    );
+    if !own_memory {
+        info!("Memory background tasks left to the configured memory system");
+        return;
+    }
+    for service in memory_jobs.services() {
+        heartbeat.add_service(service);
+    }
+    info!("Memory background tasks registered with heartbeat");
+}
+
 pub(crate) async fn init_heartbeat_coordinator(
     config: &AppConfig,
     dependencies: HeartbeatDependencies,
@@ -74,7 +101,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         pool,
         event_store,
         pruner,
-        memory_manager,
+        memory_jobs,
         own_memory,
         memory_store,
         memory_services,
@@ -105,8 +132,7 @@ pub(crate) async fn init_heartbeat_coordinator(
         );
         heartbeat.set_task_inactivity_timeout(config.daemon.watchdog.task_inactivity_timeout_secs);
 
-        // Register memory manager jobs
-        memory_manager.register_heartbeat_jobs(&mut heartbeat, own_memory);
+        register_memory_jobs(&mut heartbeat, pool.clone(), &memory_jobs, own_memory);
         for service in memory_services {
             heartbeat.add_service(service);
         }

@@ -205,7 +205,7 @@ impl Consolidator {
         let plans = self.completed_plans(session_id, &suppressed_task_ids).await;
         let report = self.learner().learn(&trace_events(&events), &plans).await;
 
-        // Note: Episode creation is handled exclusively by MemoryManager (LLM-quality episodes)
+        // Note: Episode creation is handled exclusively by the memory jobs (LLM-quality episodes)
         let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         self.event_store.mark_consolidated(&event_ids).await?;
 

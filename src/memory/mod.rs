@@ -1,7 +1,8 @@
+pub(crate) mod activity_log;
 pub mod embeddings;
 pub(crate) mod history_intake;
 pub mod history_source;
-pub mod manager;
+pub(crate) mod jobs_host;
 pub mod people_intelligence;
 pub mod procedures;
 pub mod progressive;

@@ -24,6 +24,10 @@ impl EventHistory {
         Self { pool, state }
     }
 
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub(crate) async fn session_visibility_from_events(
         &self,
         session_id: &str,
@@ -123,27 +127,18 @@ impl EventHistory {
         Ok(saw_owner_message)
     }
 
+    /// Whether every user message after `last_episode` (the session's
+    /// latest episode; `None`: the whole session) came from the owner, and
+    /// there was at least one.
     pub(crate) async fn session_since_last_episode_is_owner_only(
         &self,
         session_id: &str,
+        last_episode: Option<&aidaemon_memory::records::EpisodeBound>,
     ) -> anyhow::Result<bool> {
         if self.session_is_memory_isolated(session_id).await? {
             return Ok(false);
         }
-        let last_episode = sqlx::query(
-            "SELECT end_event_id, end_time FROM episodes
-             WHERE session_id = ?
-             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let rows = if let Some(end_event_id) = last_episode
-            .as_ref()
-            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
-            .flatten()
-        {
+        let rows = if let Some(end_event_id) = last_episode.and_then(|bound| bound.end_event_id) {
             sqlx::query(
                 "SELECT data FROM events
                  WHERE session_id = ?
@@ -155,10 +150,7 @@ impl EventHistory {
             .bind(end_event_id)
             .fetch_all(&self.pool)
             .await?
-        } else if let Some(since) = last_episode
-            .as_ref()
-            .and_then(|row| row.try_get::<String, _>("end_time").ok())
-        {
+        } else if let Some(since) = last_episode.and_then(|bound| bound.end_time.as_ref()) {
             sqlx::query(
                 "SELECT data FROM events
                  WHERE session_id = ?
@@ -167,7 +159,7 @@ impl EventHistory {
                  ORDER BY created_at ASC",
             )
             .bind(session_id)
-            .bind(&since)
+            .bind(since)
             .fetch_all(&self.pool)
             .await?
         } else {

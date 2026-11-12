@@ -125,3 +125,79 @@ pub trait MessageLog: Send + Sync {
     /// Which of `ids` the host still keeps.
     async fn retained(&self, ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>>;
 }
+
+/// One conversation turn from the host's log, as the background jobs read
+/// it. The host leaves out its own internal turns (a run talking to itself)
+/// and turns of tasks whose memory policy suppressed memory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedTurn {
+    pub role: TurnRole,
+    pub content: Option<String>,
+    /// For an assistant turn: the tools it called, by name, in order.
+    pub tool_calls: Vec<String>,
+    /// For a tool result: the tool's name.
+    pub tool_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Which sessions [`ActivityLog::uncaptured_sessions`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncapturedSessions {
+    /// At least this many conversation turns since the session's latest
+    /// episode ended.
+    pub min_turns: usize,
+    /// Only turns before this count, and the session's last such turn is
+    /// before it too: the session has gone idle. `None`: any turn counts.
+    pub idle_before: Option<DateTime<Utc>>,
+}
+
+/// The host's conversation log as the full memory system's background jobs
+/// read it: which sessions have turns no episode covers, those turns, and
+/// the recent activity patterns are learned from. Memory never reads the
+/// host's tables itself.
+#[async_trait]
+pub trait ActivityLog: ConversationSource + ConsolidationCursors {
+    /// Sessions whose conversation turns since their latest episode end
+    /// pass `which`. `episode_ends` holds each session's latest episode end
+    /// (RFC 3339); a session missing from it has no episode. Memory-isolated
+    /// sessions may be returned: the jobs check.
+    async fn uncaptured_sessions(
+        &self,
+        episode_ends: &[(String, String)],
+        which: UncapturedSessions,
+    ) -> anyhow::Result<Vec<String>>;
+
+    /// Whether every user message after `since` (the session's latest
+    /// episode; `None`: the whole session) came from the owner, and there
+    /// was at least one. A memory-isolated session never is.
+    async fn owner_only_after(
+        &self,
+        session_id: &str,
+        since: Option<&crate::records::EpisodeBound>,
+    ) -> anyhow::Result<bool>;
+
+    /// The session's conversation turns after `since` (the latest episode;
+    /// `None`: from the start), oldest first, at most `limit` read.
+    async fn turns_after(
+        &self,
+        session_id: &str,
+        since: Option<&crate::records::EpisodeBound>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LoggedTurn>>;
+
+    /// Conversation turns of sessions that are not memory-isolated, from
+    /// `since` on, newest first, at most `limit` read.
+    async fn recent_turns(
+        &self,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LoggedTurn>>;
+
+    /// The owner's own messages from `since` on, in sessions that are not
+    /// memory-isolated, newest first, at most `limit` read.
+    async fn recent_owner_messages(
+        &self,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LoggedTurn>>;
+}
