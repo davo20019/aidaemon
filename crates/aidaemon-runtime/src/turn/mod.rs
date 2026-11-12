@@ -2,7 +2,8 @@
 //! the loop injects (their model-facing text), how a task's outcome is read
 //! from its completion evidence, tool-failure classification, the ledger
 //! closeout's admissibility, evidence routing, the replies built from tool
-//! output, structural reply checks and the post-run learning context.
+//! output, structural reply checks, the post-run learning context and the
+//! project instructions found for a turn's scope.
 
 pub mod closeout;
 pub mod completion_checks;
@@ -14,6 +15,7 @@ pub mod inquiry;
 pub mod loop_utils;
 pub mod post_task;
 pub mod project_dir;
+pub mod project_instructions;
 pub mod project_scope;
 pub mod reply_checks;
 pub mod sliding_window;

@@ -158,9 +158,7 @@ impl CompletionContract {
     }
 }
 
-pub fn persistable_completion_contract(
-    contract: &CompletionContract,
-) -> RequestCompletionContract {
+pub fn persistable_completion_contract(contract: &CompletionContract) -> RequestCompletionContract {
     RequestCompletionContract {
         scope_task_id: contract.scope_task_id.clone(),
         adopted_from_task_ids: contract.adopted_from_task_ids.clone(),
@@ -230,9 +228,7 @@ pub fn completion_contract_from_persisted(
     let reachable_evidence_requirements = contract
         .evidence_requirements
         .iter()
-        .filter(|requirement| {
-            super::inquiry::requirement_has_builtin_evidence_route(requirement)
-        })
+        .filter(|requirement| super::inquiry::requirement_has_builtin_evidence_route(requirement))
         .cloned()
         .collect();
     CompletionContract {
@@ -358,12 +354,12 @@ pub fn inherit_unfinished_request_contract(
                 .iter()
                 .any(|binding| binding.source_obligation_id == source_obligation_id)
             {
-                current
-                    .adopted_evidence_bindings
-                    .push(aidaemon_events::traits::AdoptedEvidenceBinding {
+                current.adopted_evidence_bindings.push(
+                    aidaemon_events::traits::AdoptedEvidenceBinding {
                         source_obligation_id,
                         requirement: requirement.clone(),
-                    });
+                    },
+                );
             }
         }
     }
@@ -1054,11 +1050,7 @@ impl CompletionProgress {
     }
 
     #[cfg(test)]
-    pub fn mark_mutation(
-        &mut self,
-        contract: &CompletionContract,
-        semantics: &ToolCallSemantics,
-    ) {
+    pub fn mark_mutation(&mut self, contract: &CompletionContract, semantics: &ToolCallSemantics) {
         let evidence_id = self.next_evidence_id("synthetic-mutation");
         self.mark_mutation_receipt(contract, semantics, &evidence_id);
     }
@@ -1254,10 +1246,7 @@ impl CompletionProgress {
         }
     }
 
-    pub fn completion_obligations_for_receipt(
-        &self,
-        tool_call_id: &str,
-    ) -> Vec<String> {
+    pub fn completion_obligations_for_receipt(&self, tool_call_id: &str) -> Vec<String> {
         self.proof_graph
             .obligations_satisfied_by_receipt(tool_call_id)
     }

@@ -2,8 +2,6 @@
 //! checks, durable replay, project anchoring, dispatch through
 //! `execute_tool_outcome`, receipts and the persisted tool exchange.
 
-use std::collections::HashMap;
-
 use super::*;
 
 pub(in crate::agent) use aidaemon_runtime::engine::tool_calls::*;
@@ -11,74 +9,6 @@ pub(in crate::agent) use aidaemon_runtime::engine::tool_calls::*;
 /// Stands in for a call's result between the tool returning and the
 /// after-tool hook writing what the model reads.
 const RESULT_PENDING: &str = "[tool result pending]";
-
-/// How a call ended, before its result is recorded.
-enum ExecutedOutcome {
-    Returned {
-        outcome: crate::traits::ToolCallOutcome,
-        status: crate::traits::ToolOutcomeStatus,
-    },
-    /// The tool returned `Err`: an explicit typed failure.
-    Raised {
-        metadata: crate::traits::ToolCallMetadata,
-        error_text: String,
-    },
-}
-
-impl ExecutedOutcome {
-    fn metadata(&self) -> &crate::traits::ToolCallMetadata {
-        match self {
-            Self::Returned { outcome, .. } => &outcome.metadata,
-            Self::Raised { metadata, .. } => metadata,
-        }
-    }
-
-    /// The same test the receipt makes.
-    fn failed(&self) -> bool {
-        match self {
-            Self::Returned { outcome, status } => {
-                status.is_failure() || outcome.metadata.contract_rejected
-            }
-            Self::Raised { .. } => true,
-        }
-    }
-}
-
-/// A call that ran, waiting for the after-tool hook to record it.
-pub(in crate::agent) struct ExecutedCall {
-    request: KernelCall,
-    arguments: String,
-    injected_dir: Option<String>,
-    facts: crate::traits::ToolDispatchFacts,
-    grant: Option<crate::traits::MandateAuthorityGrant>,
-    idempotency_key: Option<String>,
-    send_file_key: Option<String>,
-    duration_ms: u64,
-    trust: sdk::SourceTrust,
-    executed: ExecutedOutcome,
-}
-
-/// Calls that ran and are not recorded yet, by run and call id.
-#[derive(Clone, Default)]
-pub(in crate::agent) struct ExecutedCalls(
-    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), ExecutedCall>>>,
-);
-
-impl ExecutedCalls {
-    fn insert(&self, run: sdk::RunId, call_id: &str, call: ExecutedCall) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((run, call_id.to_string()), call);
-    }
-
-    fn take(&self, run: sdk::RunId, call_id: &str) -> Option<ExecutedCall> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(run, call_id.to_string()))
-    }
-}
 
 /// The kernel's judgment of a dispatched call, removed from `judged`:
 /// `None` when the tool's calls are not judged in canonical form
@@ -1101,6 +1031,7 @@ impl Agent {
                         backend: self.execution_backend.clone(),
                         escalator: crate::agent::coordination::Escalator::new(
                             self.side_calls.clone(),
+                            self.state.clone(),
                             self.state.clone(),
                         ),
                         untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),

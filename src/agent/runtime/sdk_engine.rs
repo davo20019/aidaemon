@@ -82,9 +82,13 @@ mod stop;
 #[path = "sdk_engine/tool_calls.rs"]
 mod tool_calls;
 
+pub(crate) use aidaemon_runtime::engine::outcome::TurnVerdict;
+pub(in crate::agent) use aidaemon_runtime::engine::scope::{
+    AbsorbedSteering, BudgetGoal, TurnScope,
+};
 use budgets::*;
 use hooks::*;
-pub(crate) use outcome::TurnVerdict;
+#[cfg(test)]
 use stop::*;
 
 /// Model turns per run. Token budgets, the same-tool guard and the stuck
@@ -502,203 +506,12 @@ fn sdk_images(
     (images, skipped)
 }
 
-/// The goal whose token budget this turn charges.
-struct BudgetGoal {
-    goal_id: String,
-    /// Scheduled runs charge their per-run budget instead of the daily one.
-    scheduled: bool,
-}
-
 /// The kernel's tool-name rule: 1-64 characters from `[a-zA-Z0-9_-]`.
 fn kernel_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// Everything a dispatched call needs from the turn.
-pub(in crate::agent) struct TurnScope<'a> {
-    pub(in crate::agent) session_id: &'a str,
-    daemon_paths: &'a crate::tools::DaemonPaths,
-    execution_backend: &'a dyn crate::execution::ExecutionBackend,
-    /// The MCP-registry tools bridged for this turn (daemon tools are
-    /// `Agent::tools`); see [`Agent::turn_tool`].
-    mcp_tools: Vec<Arc<dyn crate::traits::Tool>>,
-    /// Redacts secrets (the SDK's shapes and the configured literals) from
-    /// the arguments of calls the kernel refused before they are written to
-    /// the ledger.
-    ledger_redactor: aidaemon_policies::Redactor,
-    /// The user's message for this turn.
-    user_text: &'a str,
-    pub(in crate::agent) task_id: &'a str,
-    pub(in crate::agent) emitter: &'a EventEmitter,
-    /// The projected starting transcript, sent byte-for-byte on every call.
-    prefix: Vec<Value>,
-    /// Kernel messages that stand for `prefix`; later ones are this run's.
-    prefix_len: usize,
-    budget_goal: Option<BudgetGoal>,
-    /// Set once the goal budget is used up; later model calls are refused.
-    model_calls: AtomicU64,
-    /// The verify-once and failure-recovery passes have been used.
-    verification_demanded: AtomicBool,
-    recovery_demanded: AtomicBool,
-    /// Extra passes the ledger demanded so far.
-    closeout_demands: std::sync::atomic::AtomicU32,
-    /// The latest closeout let the run stop after a demand while the ledger
-    /// still held reachable expectations: the reply in hand was written to
-    /// the daemon's demand, not to the user.
-    closeout_ended_unmet: AtomicBool,
-    /// `completed_results` at the last checklist demand (`u64::MAX`: none).
-    executor_demanded_at: AtomicU64,
-    /// Checklist items the model has not finished or set aside, as last
-    /// declared through `track_requirements`.
-    open_checklist_items: AtomicU64,
-    /// The model has declared a checklist in this run, finished or not.
-    checklist_declared: AtomicBool,
-    status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    channel_ctx: &'a ChannelContext,
-    user_role: UserRole,
-    /// The engine model, for vision gating of tool-observed images.
-    model: &'a str,
-    turn_id: &'a str,
-    /// The turn's contract: its expectations are credited from receipts.
-    contract: &'a crate::agent::completion_contract::CompletionContract,
-    progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
-    /// Shared with the memory writer, which learns from it at run end.
-    learning: Arc<std::sync::Mutex<crate::agent::post_task::LearningContext>>,
-    /// The turn's learning consent, handed to the sub-agents it spawns.
-    learning_consent: aidaemon_policies::TurnLearning,
-    /// The model-visible output of the latest tool call, for paste checks.
-    latest_tool_output: std::sync::Mutex<Option<String>>,
-    /// The one reply retry has been spent.
-    reply_retry_used: AtomicBool,
-    /// The next model call runs with tools disabled (empty-reply retry).
-    text_only_next_call: Arc<AtomicBool>,
-    /// The usage of the latest model call, until its budget check takes it.
-    pending_charge: std::sync::Mutex<Option<crate::traits::TokenUsage>>,
-    /// Where calls without a directory run; refined by the model's own
-    /// explicit directories (see `SdkTurnSetup::known_project_dir`).
-    known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
-    /// Terminal calls in the canonical form the kernel's approval rules
-    /// judged, by run and call id: the dispatcher executes exactly these,
-    /// with the scope they were judged with.
-    judged_terminal_calls: super::approvals::JudgedCalls,
-    /// How `CanonicalCallHook` canonicalized each call, by run and call id.
-    canonical_calls: tool_calls::CanonicalCalls,
-    /// What the dispatcher's gates decided for each call, by run and call
-    /// id (`DispatchGate`); execution takes a cleared call's grant here.
-    gate_outcomes: tool_calls::GateOutcomes,
-    /// Calls that ran and wait for the after-tool hook to record them.
-    executed_calls: tool_calls::ExecutedCalls,
-    /// The run's declines as the kernel last showed them to the approval
-    /// rules: a child spawned from this turn starts with them.
-    run_declines: super::approvals::RunDeclines,
-    /// The live decline set this turn's run shares with its parent (when it
-    /// is a child) and with the children it spawns: the kernel refuses any
-    /// of them an effect the owner declined in another.
-    shared_declines: sdk::SharedDeclines,
-    /// The request's sub-agent tree (a root turn starts one).
-    spawn_family: crate::agent::authority::SpawnFamily,
-    run_id: sdk::RunId,
-    /// The single-project scope lock passed to tools.
-    project_scope: Option<String>,
-    /// See `SdkTurnSetup::authority`.
-    authority: &'a crate::agent::authority::ResolvedAuthority,
-    /// The chat's live `/readonly` ceiling, read by the hook per call and by
-    /// the dispatcher's `mutation_forbidden`.
-    pub(in crate::agent) ceiling: Arc<crate::agent::authority::SessionModeCeiling>,
-    /// The owner's trusted file roots: configured roots, the working
-    /// directory, the project scope and directory, and the task's write
-    /// grants.
-    trust_roots: Vec<String>,
-    /// Where relative file paths resolve (see `turn_cwd`).
-    cwd: String,
-    /// A dispatched call returned untrusted content this turn.
-    untrusted_seen: AtomicBool,
-    /// The root request egress is judged against (a child's is its root's),
-    /// and whether the owner wrote it.
-    origin_request: &'a str,
-    origin_trusted: bool,
-    authorized_scopes: Vec<String>,
-    scopes_are_guess: bool,
-    /// See `SdkTurnSetup::projected_source_message_ids`.
-    projected_source_message_ids: Vec<String>,
-    projected_source_turn_ids: Vec<String>,
-    /// Terminal replies, external acks and run failures: the turn's verdict.
-    verdict: Arc<TurnVerdict>,
-    /// Daemon memory tools the active memory plugin owns on this turn.
-    owned_memory_tools: &'static [&'static str],
-    /// Tool calls in the latest model response (a direct response needs one).
-    last_batch_size: std::sync::atomic::AtomicUsize,
-    /// Skills referencing untrusted external content are active.
-    restrict_untrusted_reference_tools: bool,
-    untrusted_reference_skills: Vec<String>,
-    /// Billable tokens this run spent, and the task budget (0: none).
-    /// Tokens used by this request's whole tree of plain sub-agents.
-    task_tokens: Arc<AtomicU64>,
-    task_budget: AtomicU64,
-    task_budget_extensions: std::sync::atomic::AtomicUsize,
-    /// Distinct successful operations (tool and canonical arguments).
-    succeeded_operations: std::sync::Mutex<HashSet<String>>,
-    /// The latest successful call repeated an earlier operation.
-    repeating: AtomicBool,
-    /// Distinct successful operations so far, and the count at the last
-    /// extension.
-    succeeded_calls: std::sync::atomic::AtomicUsize,
-    successes_at_task_extension: std::sync::atomic::AtomicUsize,
-    /// The goal's effective daily budget after extensions, and their count.
-    goal_daily_budget: std::sync::Mutex<Option<i64>>,
-    goal_budget_extensions: std::sync::atomic::AtomicU32,
-    /// The one ask to check a file more than one member changed was made.
-    combined_verification_demands: std::sync::atomic::AtomicU32,
-    /// Mandate decision correction turns used.
-    mandate_commit_retries: std::sync::atomic::AtomicU32,
-    /// Verify-before-claim demands for an unverified GUI coordinate click.
-    #[cfg(feature = "computer_use")]
-    gui_verify_demands: std::sync::atomic::AtomicU32,
-    /// The one 80% budget warning (task or scheduled run) was given.
-    budget_warning_sent: AtomicBool,
-    /// Timed-out model calls retried in this run.
-    model_call_timeouts: std::sync::atomic::AtomicU32,
-    /// The latest model call was rejected as too long for the model's
-    /// window (now recorded); the call is retried once compacted.
-    context_overflowed: AtomicBool,
-    context_overflow_retries: std::sync::atomic::AtomicU32,
-    /// The typed error of the latest model call that failed after recovery;
-    /// the kernel keeps only its text.
-    provider_failure: std::sync::Mutex<Option<crate::providers::ProviderError>>,
-    /// `send_file` dedupe keys that already succeeded in this task.
-    sent_files: std::sync::Mutex<HashSet<String>>,
-    /// Nested project instructions discovered just in time.
-    instruction_tracker:
-        Option<tokio::sync::Mutex<crate::project_instructions::ProjectInstructionTracker>>,
-    /// System context raised during the run and not yet sent; the next model
-    /// call pins it at the run's current end (`placed_directives`).
-    extra_system: std::sync::Mutex<Vec<String>>,
-    /// When the turn started, and the notices delivered since then that a
-    /// model call already carried: each model call reads the new ones, so
-    /// the reply agrees with what the owner was told meanwhile.
-    notices_seen: std::sync::Mutex<(chrono::DateTime<chrono::Utc>, HashSet<String>)>,
-    /// Directives and mid-turn user messages, with the run position they
-    /// arrived at.
-    placed_directives: std::sync::Mutex<Vec<(usize, Value)>>,
-    /// Mid-turn messages taken into the run, and whether a model call
-    /// answered each; unanswered ones are re-queued at run end.
-    absorbed_steering: std::sync::Mutex<Vec<model_call::AbsorbedSteering>>,
-    /// The run's summarized older rounds, once it outgrew the context.
-    compaction: std::sync::Mutex<Option<compaction::RunCompaction>>,
-    /// Set when a call moved work to the background with completion
-    /// notifications on: the daemon will deliver its result later, so the
-    /// reply is a background handoff, not the terminal answer.
-    background_handoff: AtomicBool,
-    /// Background jobs this run launched with completion notifications on
-    /// (not detached services) whose end it has not observed: each typed
-    /// launch receipt adds one, each typed settle receipt (the job's result
-    /// read back, or the job cancelled) takes one away. While any is open, a
-    /// stop is a handoff: the job's result reaches the session through its
-    /// notifier, so the run must not close the request on its own.
-    open_background_jobs: AtomicUsize,
 }
 
 impl Agent {
@@ -1234,6 +1047,7 @@ impl Agent {
                 escalator: crate::agent::coordination::Escalator::new(
                     self.side_calls.clone(),
                     self.state.clone(),
+                    self.state.clone(),
                 ),
             },
             canonical: tool_calls::CanonicalCallHook {
@@ -1503,7 +1317,6 @@ impl Agent {
             sent_files: std::sync::Mutex::new(HashSet::new()),
             combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "computer_use")]
             gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
@@ -1564,14 +1377,22 @@ impl Agent {
         // broker.
         let resolver = super::approvals::DaemonInterruptResolver {
             untrusted: crate::agent::untrusted::UntrustedVerifier {
-                agent: self,
-                scope: &scope,
+                tools: &self.tools,
+                gateway: &self.side_calls,
+                decisions: self,
+                emitter: scope.emitter,
+                task_id: scope.task_id,
                 origin_request,
                 origin_trusted,
                 cancel: cancel.clone(),
             },
             owner: super::approvals::OwnerApprovalResolver {
-                agent: self,
+                decisions: self,
+                mission: self
+                    .inherited_authority
+                    .as_ref()
+                    .and_then(|inherited| inherited.lineage.last())
+                    .map(String::as_str),
                 approvals,
                 rules,
                 card_session: session_id,

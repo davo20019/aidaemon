@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -220,18 +220,7 @@ impl AppConfig {
     }
 }
 
-/// How much the owner may do by default. Both levels act the same at the
-/// tool gate; `unrestricted` records, instead of checking, outward actions
-/// taken after the turn read untrusted content.
-/// Ordered `Full < Unrestricted`: a child takes the lower of its parent's
-/// and its own.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum OwnerLevel {
-    #[default]
-    Full,
-    Unrestricted,
-}
+pub use aidaemon_runtime::authority::OwnerLevel;
 
 /// `[authority]`: the explicit facts tool authority is resolved from.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -2023,10 +2012,11 @@ impl Default for SubagentsConfig {
     }
 }
 
-pub(crate) const DEFAULT_SUBAGENTS_MAX_CONCURRENT: usize = 4;
-pub(crate) const DEFAULT_SUBAGENTS_MAX_PER_REQUEST: usize = 12;
-pub(crate) const DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD: usize = 3;
-pub(crate) const DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST: usize = 12;
+use aidaemon_runtime::authority::{
+    DEFAULT_SUBAGENTS_MAX_CONCURRENT, DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_CHILD,
+    DEFAULT_SUBAGENTS_MAX_ESCALATIONS_PER_REQUEST, DEFAULT_SUBAGENTS_MAX_PER_REQUEST,
+};
+
 fn default_subagents_max_concurrent() -> usize {
     DEFAULT_SUBAGENTS_MAX_CONCURRENT
 }

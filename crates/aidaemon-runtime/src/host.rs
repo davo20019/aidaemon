@@ -6,6 +6,7 @@
 //!   event log).
 //! - [`TurnWorkspace`]: where the turn's file work happens (the execution
 //!   backend and the configured project roots).
+//! - [`DecisionRecorder`]: where the turn's decision points go.
 
 use aidaemon_events::stores::DialogueStateStore;
 use aidaemon_events::EventStore;
@@ -26,4 +27,20 @@ pub trait TurnWorkspace: Send + Sync {
     fn execution_backend(&self) -> &dyn ExecutionBackend;
     /// Configured project roots path references resolve against.
     fn project_roots(&self) -> &[String];
+}
+
+/// Where a turn's decision points go: the record of why the runtime chose
+/// what it did, kept with the turn's events when the host records them.
+#[async_trait::async_trait]
+pub trait DecisionRecorder: Send + Sync {
+    /// Record one decision point of `task_id` at loop `iteration`.
+    async fn record_decision_point(
+        &self,
+        emitter: &aidaemon_events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        decision_type: aidaemon_events::DecisionType,
+        summary: String,
+        metadata: serde_json::Value,
+    );
 }

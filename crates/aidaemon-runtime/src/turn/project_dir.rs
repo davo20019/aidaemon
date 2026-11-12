@@ -59,7 +59,9 @@ pub fn extract_project_dir_hint_with_aliases(
             || token.starts_with("../")
             || looks_windows_abs;
         let normalized = looks_path
-            .then(|| normalize_project_dir(&*aidaemon_tools::testing::active_execution_backend(), token))
+            .then(|| {
+                normalize_project_dir(&*aidaemon_tools::testing::active_execution_backend(), token)
+            })
             .flatten();
         let Some(normalized) = normalized else {
             continue;
@@ -399,7 +401,10 @@ mod tests {
     }
 
     fn normalize_project_dir(raw_path: &str) -> Option<String> {
-        super::normalize_project_dir(&*aidaemon_tools::testing::active_execution_backend(), raw_path)
+        super::normalize_project_dir(
+            &*aidaemon_tools::testing::active_execution_backend(),
+            raw_path,
+        )
     }
     use proptest::prelude::*;
 

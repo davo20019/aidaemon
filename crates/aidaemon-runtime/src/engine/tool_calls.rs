@@ -71,7 +71,8 @@ pub fn grant_own_spill_reads(
     manifest: &mut aidaemon_tools::semantics::ToolCallAccessManifest,
     session_id: &str,
 ) {
-    let Some(dir) = aidaemon_tools::result_spill::session_spill_dir_for_backend(backend, session_id)
+    let Some(dir) =
+        aidaemon_tools::result_spill::session_spill_dir_for_backend(backend, session_id)
     else {
         return;
     };
@@ -182,9 +183,7 @@ pub struct CanonRecord {
 /// [`CanonicalCallHook`] before any other hook judges the call, read by the
 /// approval rules and the dispatcher, so nobody canonicalizes again.
 #[derive(Debug, Clone, Default)]
-pub struct CanonicalCalls(
-    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>,
-);
+pub struct CanonicalCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>);
 
 impl CanonicalCalls {
     pub fn get(&self, run: sdk::RunId, call_id: &str) -> Option<CanonRecord> {
@@ -329,9 +328,7 @@ pub struct GateClearance {
 /// Gate outcomes by run and call id. A call is gated once: the kernel may
 /// put a call to its hooks again, and gets the same decision.
 #[derive(Debug, Clone, Default)]
-pub struct GateOutcomes(
-    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), GateOutcome>>>,
-);
+pub struct GateOutcomes(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), GateOutcome>>>);
 
 impl GateOutcomes {
     pub fn get(&self, run: sdk::RunId, call_id: &str) -> Option<GateOutcome> {
@@ -515,12 +512,7 @@ pub fn record_call_for_learning(
 /// One tool call as post-task learning records it (a
 /// `tool_name(summary)` line, marked when it was rejected or failed so
 /// activity summaries never claim work that did not happen).
-pub fn learning_tool_summary(
-    name: &str,
-    arguments: &str,
-    rejected: bool,
-    failed: bool,
-) -> String {
+pub fn learning_tool_summary(name: &str, arguments: &str, rejected: bool, failed: bool) -> String {
     let line = format!(
         "{name}({})",
         crate::turn::tool_summary::summarize_tool_args(name, arguments)
@@ -607,6 +599,72 @@ fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schem
             _ => true,
         }
     });
+}
+
+/// How a call ended, before its result is recorded.
+pub enum ExecutedOutcome {
+    Returned {
+        outcome: aidaemon_tools::semantics::ToolCallOutcome,
+        status: aidaemon_tools::semantics::ToolOutcomeStatus,
+    },
+    /// The tool returned `Err`: an explicit typed failure.
+    Raised {
+        metadata: aidaemon_tools::semantics::ToolCallMetadata,
+        error_text: String,
+    },
+}
+
+impl ExecutedOutcome {
+    pub fn metadata(&self) -> &aidaemon_tools::semantics::ToolCallMetadata {
+        match self {
+            Self::Returned { outcome, .. } => &outcome.metadata,
+            Self::Raised { metadata, .. } => metadata,
+        }
+    }
+
+    /// The same test the receipt makes.
+    pub fn failed(&self) -> bool {
+        match self {
+            Self::Returned { outcome, status } => {
+                status.is_failure() || outcome.metadata.contract_rejected
+            }
+            Self::Raised { .. } => true,
+        }
+    }
+}
+
+/// A call that ran, waiting for the after-tool hook to record it.
+pub struct ExecutedCall {
+    pub request: crate::engine::calls::KernelCall,
+    pub arguments: String,
+    pub injected_dir: Option<String>,
+    pub facts: aidaemon_tools::semantics::ToolDispatchFacts,
+    pub grant: Option<aidaemon_events::mandate_grant::MandateAuthorityGrant>,
+    pub idempotency_key: Option<String>,
+    pub send_file_key: Option<String>,
+    pub duration_ms: u64,
+    pub trust: sdk::SourceTrust,
+    pub executed: ExecutedOutcome,
+}
+
+/// Calls that ran and are not recorded yet, by run and call id.
+#[derive(Clone, Default)]
+pub struct ExecutedCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), ExecutedCall>>>);
+
+impl ExecutedCalls {
+    pub fn insert(&self, run: sdk::RunId, call_id: &str, call: ExecutedCall) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), call);
+    }
+
+    pub fn take(&self, run: sdk::RunId, call_id: &str) -> Option<ExecutedCall> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
 }
 
 #[cfg(test)]

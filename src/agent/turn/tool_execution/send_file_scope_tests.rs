@@ -1,7 +1,7 @@
 //! The send_file adapter against the task scope check.
 
-use aidaemon_runtime::turn::tool_dispatch::access_manifest_scope_violation;
 use crate::traits::{ToolTargetHint, ToolTargetHintKind};
+use aidaemon_runtime::turn::tool_dispatch::access_manifest_scope_violation;
 
 /// Live 2026-11-11: a sub-agent confined to its project took a browser
 /// screenshot (saved in the daemon inbox) and `send_file` was refused as
