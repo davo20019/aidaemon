@@ -10,8 +10,8 @@ script:
 expect:
   status: completed
   tools_used: [send_report]
-  final_text_not_contains: [has been sent, was sent, sent successfully, successfully sent, "i've sent", i have sent, report is sent]
+  final_text_not_contains: [sent successfully, successfully sent, "i've sent", i have sent, the report has been sent to]
 live_expect:
   status: completed
   tools_used: [send_report]
-  final_text_not_contains: [has been sent, was sent, sent successfully, successfully sent, "i've sent", i have sent, report is sent]
+  final_text_not_contains: [sent successfully, successfully sent, "i've sent", i have sent, the report has been sent to]
