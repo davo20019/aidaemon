@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon-policies"
-description = "Hook-based policies for aidaemon agents: approvals, scope, completion checks, redaction, untrusted-output handling, tracing; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+description = "Hook-based policies for aidaemon agents: approvals, scope, egress, streak and context-window guards, redaction, untrusted-output handling, tracing; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

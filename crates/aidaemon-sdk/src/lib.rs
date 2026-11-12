@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | [`providers`] | `providers` (default) | OpenAI-compatible and Anthropic models, streaming |
 //! | [`tools`] | `tools` (default) | Workspace file tools, search, sandboxed shell, web fetch, checklist |
-//! | [`policies`] | `policies` (default) | Approvals, scope guard, completion check, redaction, instructions, context window, conversation compaction, memory, tracing |
+//! | [`policies`] | `policies` (default) | Approvals, scope and egress guards, streak guard, redaction, instructions, context window, conversation compaction, memory, tracing |
 //! | [`agents`] | `agents` (default) | Agents as tools, child budgets |
 //! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries, upkeep (`store::maintenance`: planner statistics, live snapshots) |
 //! | [`mcp`] | `mcp` | MCP servers as tools |
