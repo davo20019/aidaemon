@@ -6,25 +6,25 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use crate::agent::inquiry::{action_from_arguments, capability};
-use crate::traits::{
+use crate::turn::inquiry::{action_from_arguments, capability};
+use aidaemon_events::traits::{
     EvidenceAuthority::Canonical,
     EvidencePurpose::{
         Attribution, CausalExplanation, Content, CurrentState, HistoricalRecord, Outcome,
     },
     EvidenceTemporalScope::{Both, Current},
-    ToolEvidenceCapability,
+    ToolEvidenceCapability, ToolSemanticScope,
     ToolSemanticScope::{GoalState, UserMemory},
 };
 
 /// How the turn treats one memory tool's calls and results.
-pub(in crate::agent) use aidaemon_memory::full::tools::MemoryToolFacts;
+pub use aidaemon_memory::full::tools::MemoryToolFacts;
 
 static FACTS: LazyLock<RwLock<HashMap<String, Arc<MemoryToolFacts>>>> =
     LazyLock::new(|| RwLock::new(daemon_tool_facts()));
 
 /// The facts of tool `name`, if it is a memory tool.
-pub(in crate::agent) fn memory_tool_facts(name: &str) -> Option<Arc<MemoryToolFacts>> {
+pub fn memory_tool_facts(name: &str) -> Option<Arc<MemoryToolFacts>> {
     FACTS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -32,8 +32,32 @@ pub(in crate::agent) fn memory_tool_facts(name: &str) -> Option<Arc<MemoryToolFa
         .cloned()
 }
 
+/// The semantic scope of a tool that states none: a memory tool's from its
+/// facts, the standard tools' by name.
+pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
+    if let Some(facts) = memory_tool_facts(tool_name) {
+        return facts.scope;
+    }
+    match tool_name {
+        "web_search" | "web_fetch" | "http_request" | "browser" => {
+            Some(ToolSemanticScope::ExternalRemote)
+        }
+        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
+        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
+        "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
+        "scheduled_goals"
+        | "scheduled_goal_runs"
+        | "manage_goal_tasks"
+        | "goal_trace"
+        | "tool_trace"
+        | "manage_mandates" => Some(ToolSemanticScope::GoalState),
+        "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
+        _ => None,
+    }
+}
+
 /// The memory tools whose evidence is modeled.
-pub(in crate::agent) fn modeled_memory_tools() -> Vec<String> {
+pub fn modeled_memory_tools() -> Vec<String> {
     FACTS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -46,7 +70,7 @@ pub(in crate::agent) fn modeled_memory_tools() -> Vec<String> {
 /// Facts for a tool a memory system contributed, from what it declares. Only
 /// the read/write distinction is assumed: such a system may share nothing
 /// else with the daemon's memory. The daemon's own tools keep their facts.
-pub(in crate::agent) fn register_memory_system_tool(name: &str, read_only: bool) {
+pub fn register_memory_system_tool(name: &str, read_only: bool) {
     let mut facts = FACTS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -172,7 +196,7 @@ fn manage_memories_output_is_report(result_text: &str, tool_arguments: Option<&s
         return false;
     }
 
-    let cleaned = crate::agent::loop_utils::strip_appended_diagnostics(result_text);
+    let cleaned = crate::turn::loop_utils::strip_appended_diagnostics(result_text);
     let trimmed = cleaned.trim_start();
     !trimmed.starts_with("ERROR:")
         && !trimmed.starts_with("Error:")

@@ -429,24 +429,6 @@ pub(in crate::agent) fn truncate_for_resume(text: &str, max_chars: usize) -> Str
     out
 }
 
-pub(in crate::agent) fn build_empty_response_fallback(response_note: Option<&str>) -> String {
-    let base = "I wasn't able to process that request because automatic model recovery returned no usable output.";
-    let generic = base.to_string();
-    let Some(note) = response_note.map(str::trim).filter(|s| !s.is_empty()) else {
-        return generic;
-    };
-
-    let flattened = note.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = flattened.trim_matches(|c: char| c == '"' || c == '\'');
-    let trimmed = trimmed.trim_end_matches(['.', '!', '?']);
-    if trimmed.is_empty() {
-        return generic;
-    }
-
-    let note_preview = truncate_for_resume(trimmed, 180);
-    format!("{base} Provider detail: {note_preview}.")
-}
-
 fn normalize_for_resume_intent(text: &str) -> String {
     text.split_whitespace()
         .map(|part| part.trim_matches(|c: char| c.is_ascii_punctuation()))

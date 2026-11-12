@@ -25,7 +25,10 @@ mod recall;
 #[cfg(test)]
 mod swap_tests;
 mod system_memory;
-mod tool_facts;
+/// What the turn knows about memory tools lives in `aidaemon-runtime`.
+mod tool_facts {
+    pub(in crate::agent) use aidaemon_runtime::turn::tool_facts::*;
+}
 mod writer;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use opt_out::{
@@ -34,9 +37,7 @@ pub(crate) use opt_out::{
 };
 pub(crate) use recall::DaemonRecall;
 pub(crate) use system_memory::SystemMemory;
-pub(in crate::agent) use tool_facts::{
-    memory_tool_facts, modeled_memory_tools, register_memory_system_tool,
-};
+pub(in crate::agent) use tool_facts::{memory_tool_facts, register_memory_system_tool};
 pub(crate) use writer::{DaemonMemoryWriter, MemoryWrites, WriterSettings};
 
 /// The daemon's built-in memory tools. Offered only while the active plugin

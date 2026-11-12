@@ -2,6 +2,20 @@
 
 use serde_json::Value;
 
+/// Whether a line is harness-injected scaffolding (truncation notices,
+/// \[SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
+/// tool output. Such lines are addressed to the model and must never be
+/// mistaken for error content or shipped to the user.
+pub fn is_internal_scaffolding_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.contains("OUTPUT TRUNCATED")
+        || trimmed.starts_with("[SYSTEM]")
+        || trimmed.starts_with("[DIAGNOSTIC]")
+        || trimmed.starts_with("[TOOL STATS]")
+        || trimmed.starts_with("[UNTRUSTED EXTERNAL DATA")
+        || trimmed.starts_with("[END UNTRUSTED")
+}
+
 /// Extract plain text from OpenAI-style string or multimodal content.
 pub fn content_value_as_text(content: &Value) -> Option<String> {
     match content {

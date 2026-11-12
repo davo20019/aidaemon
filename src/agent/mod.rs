@@ -46,7 +46,7 @@ const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 /// LLM keeps calling e.g. `terminal` with varied commands without progress.
 /// Set high enough to allow complex multi-step investigations from mobile,
 /// and to leave room for follow-up work after cli_agent returns.
-const MAX_CONSECUTIVE_SAME_TOOL: usize = 8;
+use aidaemon_runtime::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 /// The adjacent prior assistant answer is recent transcript, not generic
 /// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
 /// genuinely oversized answers use deterministic head/tail compaction.
@@ -85,8 +85,10 @@ mod policy_signals {
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
 use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
-#[path = "turn/validation_state.rs"]
-mod validation_state;
+/// Validation state lives in `aidaemon-runtime`.
+mod validation_state {
+    pub(crate) use aidaemon_runtime::turn::validation_state::*;
+}
 pub(in crate::agent) use validation_state::ApprovalState;
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, extract_executor_handoff_context,
@@ -101,22 +103,20 @@ pub(crate) use execution_state::TargetScope;
 pub(in crate::agent) use execution_state::{
     select_initial_execution_budget, ExecutionPersistence, ExecutionState, StepExecutionOutcome,
 };
-#[path = "turn/loop_utils.rs"]
-mod loop_utils;
+/// Tool-failure classification lives in `aidaemon-runtime`.
+mod loop_utils {
+    pub(in crate::agent) use aidaemon_runtime::turn::loop_utils::*;
+}
 /// Recall guardrails live in `aidaemon-runtime`.
 mod recall_guardrails {
     pub(super) use aidaemon_runtime::policy::recall_guardrails::*;
 }
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
-use loop_utils::{
-    extract_command_from_args, fixup_message_ordering, is_trigger_session, semantic_failure_limit,
-};
-#[path = "runtime/post_task.rs"]
-mod post_task;
-/// Task outcomes live in `aidaemon-runtime`.
-mod task_outcome {
-    pub use aidaemon_runtime::turn::task_outcome::*;
+use loop_utils::{extract_command_from_args, fixup_message_ordering, is_trigger_session};
+/// The post-run learning context lives in `aidaemon-runtime`.
+mod post_task {
+    pub(crate) use aidaemon_runtime::turn::post_task::*;
 }
 use post_task::LearningContext;
 
@@ -129,10 +129,14 @@ pub(crate) mod approvals;
 pub(crate) mod authority;
 #[path = "turn/bootstrap/mod.rs"]
 mod bootstrap;
-#[path = "turn/closeout.rs"]
-mod closeout;
-#[path = "turn/completion_checks.rs"]
-mod completion_checks;
+/// The ledger closeout's admissibility lives in `aidaemon-runtime`.
+mod closeout {
+    pub(in crate::agent) use aidaemon_runtime::turn::closeout::*;
+}
+/// Replies built from tool output live in `aidaemon-runtime`.
+mod completion_checks {
+    pub(in crate::agent) use aidaemon_runtime::turn::completion_checks::*;
+}
 #[path = "runtime/completion_contract.rs"]
 mod completion_contract;
 pub(crate) mod conversation_compaction;
@@ -188,8 +192,10 @@ pub(in crate::agent) use history::VerificationTargetKind;
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
-#[path = "turn/inquiry.rs"]
-mod inquiry;
+/// Evidence routing lives in `aidaemon-runtime`.
+mod inquiry {
+    pub(in crate::agent) use aidaemon_runtime::turn::inquiry::*;
+}
 #[path = "runtime/llm.rs"]
 mod llm;
 #[path = "turn/main_loop.rs"]
@@ -207,8 +213,10 @@ mod prefix_fingerprint {
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
-#[path = "turn/sliding_window.rs"]
-mod sliding_window;
+/// Tool-result summaries live in `aidaemon-runtime`.
+mod sliding_window {
+    pub(in crate::agent) use aidaemon_runtime::turn::sliding_window::*;
+}
 #[path = "runtime/spawn.rs"]
 mod spawn;
 pub(crate) mod stt;
@@ -228,8 +236,10 @@ mod tool_execution;
 mod tool_result_notices {
     pub(in crate::agent) use aidaemon_runtime::turn::tool_result_notices::*;
 }
-#[path = "turn/turn_eviction.rs"]
-pub(crate) mod turn_eviction;
+/// Whole-turn eviction lives in `aidaemon-runtime`.
+pub(crate) mod turn_eviction {
+    pub(crate) use aidaemon_runtime::turn::turn_eviction::*;
+}
 #[path = "turn/turn_render.rs"]
 pub(crate) mod turn_render;
 #[path = "turn/turn_render_cache.rs"]

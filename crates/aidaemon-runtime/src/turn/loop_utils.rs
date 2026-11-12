@@ -1,23 +1,29 @@
+//! Tool-failure classification and the message-list repairs the loop runs
+//! before each model call.
+
 use std::collections::HashMap;
 
-use crate::traits::ToolOutcomeStatus;
+use aidaemon_events::traits::ToolOutcomeStatus;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use tracing::warn;
 
-pub(in crate::agent) fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
-    crate::traits::extract_primary_message_content(raw, &[])
+pub fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
+    aidaemon_events::traits::extract_primary_message_content(raw, &[])
 }
 
+/// Calls of one tool in a row before the loop asks whether the run is stuck.
+pub const MAX_CONSECUTIVE_SAME_TOOL: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolFailureClass {
+pub enum ToolFailureClass {
     Semantic,
     Transient,
 }
 
-pub(super) fn semantic_failure_limit(tool_name: &str) -> usize {
+pub fn semantic_failure_limit(tool_name: &str) -> usize {
     match tool_name {
         "cli_agent" => 2,
         // API calls often need multiple attempts to discover correct parameter
@@ -114,7 +120,7 @@ fn classify_text_error(lower: &str) -> ToolFailureClass {
     ToolFailureClass::Semantic
 }
 
-pub(super) fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
+pub fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     contains_any(
         &lower,
@@ -146,7 +152,7 @@ fn looks_like_file_lookup_miss(lower: &str) -> bool {
     )
 }
 
-pub(super) fn is_file_lookup_miss_for_tool(tool_name: &str, lower_text: &str) -> bool {
+pub fn is_file_lookup_miss_for_tool(tool_name: &str, lower_text: &str) -> bool {
     is_file_lookup_tool(tool_name) && looks_like_file_lookup_miss(lower_text)
 }
 
@@ -424,7 +430,7 @@ fn successful_management_output_is_structural(
     }
 }
 
-pub(super) fn classify_tool_result_failure(
+pub fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
 ) -> Option<ToolFailureClass> {
@@ -524,7 +530,7 @@ pub(super) fn classify_tool_result_failure(
     None
 }
 
-pub(super) fn classify_tool_result_failure_with_args(
+pub fn classify_tool_result_failure_with_args(
     tool_name: &str,
     result_text: &str,
     tool_arguments: Option<&str>,
@@ -532,7 +538,7 @@ pub(super) fn classify_tool_result_failure_with_args(
     if successful_management_output_is_structural(tool_name, result_text, tool_arguments) {
         return None;
     }
-    if crate::agent::memory_plugin::memory_tool_facts(tool_name)
+    if crate::turn::tool_facts::memory_tool_facts(tool_name)
         .and_then(|facts| facts.output_is_report)
         .is_some_and(|is_report| is_report(result_text, tool_arguments))
     {
@@ -562,7 +568,7 @@ fn invokes_test_runner(args_json: &str) -> bool {
     let Some(command) = extract_command_from_args(args_json) else {
         return false;
     };
-    crate::tools::command_risk::structural_shell_invocations(&command)
+    aidaemon_tools::command_risk::structural_shell_invocations(&command)
         .iter()
         .any(|invocation| {
             let program = std::path::Path::new(&invocation.program)
@@ -595,11 +601,11 @@ fn invokes_test_runner(args_json: &str) -> bool {
         })
 }
 
-pub(super) fn classify_tool_result_failure_with_context(
+pub fn classify_tool_result_failure_with_context(
     tool_name: &str,
     result_text: &str,
     tool_arguments: Option<&str>,
-    metadata: Option<&crate::traits::ToolCallMetadata>,
+    metadata: Option<&aidaemon_events::traits::ToolCallMetadata>,
 ) -> Option<ToolFailureClass> {
     if let Some(meta) = metadata {
         if let Some(status) = meta.outcome_status {
@@ -678,11 +684,11 @@ pub(super) fn classify_tool_result_failure_with_context(
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
 }
 
-pub(in crate::agent) fn classify_tool_outcome_status(
+pub fn classify_tool_outcome_status(
     tool_name: &str,
     result_text: &str,
     tool_arguments: Option<&str>,
-    metadata: Option<&crate::traits::ToolCallMetadata>,
+    metadata: Option<&aidaemon_events::traits::ToolCallMetadata>,
 ) -> ToolOutcomeStatus {
     if let Some(status) = metadata.and_then(|meta| meta.outcome_status) {
         return status;
@@ -713,14 +719,14 @@ pub(in crate::agent) fn classify_tool_outcome_status(
 /// This is persisted with the receipt so recovery and completion logic can
 /// distinguish an authoritative typed outcome from a compatibility parse of
 /// model-visible text.
-pub(in crate::agent) fn tool_outcome_evidence_source(
-    metadata: &crate::traits::ToolCallMetadata,
-) -> crate::events::ToolOutcomeEvidenceSource {
+pub fn tool_outcome_evidence_source(
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
+) -> aidaemon_events::ToolOutcomeEvidenceSource {
     if metadata.receipt_replayed {
-        return crate::events::ToolOutcomeEvidenceSource::DurableReplay;
+        return aidaemon_events::ToolOutcomeEvidenceSource::DurableReplay;
     }
     if metadata.outcome_status.is_some() {
-        return crate::events::ToolOutcomeEvidenceSource::ToolReported;
+        return aidaemon_events::ToolOutcomeEvidenceSource::ToolReported;
     }
     if metadata.exit_code.is_some()
         || metadata.timed_out
@@ -729,12 +735,12 @@ pub(in crate::agent) fn tool_outcome_evidence_source(
         || metadata.transport_error.is_some()
         || metadata.http_status.is_some()
     {
-        return crate::events::ToolOutcomeEvidenceSource::StructuredMetadata;
+        return aidaemon_events::ToolOutcomeEvidenceSource::StructuredMetadata;
     }
-    crate::events::ToolOutcomeEvidenceSource::LegacyText
+    aidaemon_events::ToolOutcomeEvidenceSource::LegacyText
 }
 
-pub(super) fn failure_class_from_outcome_status(
+pub fn failure_class_from_outcome_status(
     outcome_status: ToolOutcomeStatus,
 ) -> Option<ToolFailureClass> {
     match outcome_status {
@@ -750,7 +756,7 @@ pub(super) fn failure_class_from_outcome_status(
 
 /// Merge consecutive messages with the same role (`user` or `assistant`) into
 /// one message, preserving all content and tool calls.
-pub(super) fn merge_consecutive_messages(messages: &mut Vec<Value>) {
+pub fn merge_consecutive_messages(messages: &mut Vec<Value>) {
     if messages.len() <= 1 {
         return;
     }
@@ -1058,7 +1064,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn structured_exit_code_zero_prevents_terminal_text_false_positive() {
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             exit_code: Some(0),
             ..Default::default()
         };
@@ -1073,7 +1079,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn structured_exit_code_nonzero_marks_terminal_failure() {
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             exit_code: Some(2),
             ..Default::default()
         };
@@ -1088,7 +1094,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn test_runner_negative_result_is_not_counted_as_success() {
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             exit_code: Some(1),
             ..Default::default()
         };
@@ -1100,7 +1106,7 @@ mod tool_error_detection_tests {
         );
         assert_eq!(
             status,
-            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+            aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult
         );
         assert!(!status.satisfies_requested_condition());
         assert!(!status.is_failure());
@@ -1137,7 +1143,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn failing_command_mentioning_test_in_an_argument_is_a_failure() {
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             exit_code: Some(22),
             ..Default::default()
         };
@@ -1152,14 +1158,14 @@ mod tool_error_detection_tests {
 
     #[test]
     fn tool_supplied_outcome_status_is_authoritative() {
-        let metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Blocked),
             exit_code: Some(0),
             ..Default::default()
         };
         assert_eq!(
             super::classify_tool_outcome_status("terminal", "success", None, Some(&metadata)),
-            crate::traits::ToolOutcomeStatus::Blocked
+            aidaemon_events::traits::ToolOutcomeStatus::Blocked
         );
     }
 
@@ -1208,7 +1214,7 @@ mod tool_error_detection_tests {
         // When a tool returns Err("Path is a directory"), transport_error is set
         // in metadata. This should NOT be classified as Transient — it's a semantic
         // error, not a network/timeout issue.
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             transport_error: Some("Path is a directory, not a file: /tmp/test86".to_string()),
             ..Default::default()
         };
@@ -1226,7 +1232,7 @@ mod tool_error_detection_tests {
     fn transport_error_actual_timeout_still_transient() {
         // Actual transport errors (timeouts, connection refused) should
         // still be classified as Transient.
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             transport_error: Some("connection refused".to_string()),
             ..Default::default()
         };
@@ -1245,7 +1251,7 @@ mod tool_error_detection_tests {
         // The text-based classification will classify it as Transient for
         // file tools (via is_file_lookup_miss), but the transport_error
         // path should not short-circuit to Transient.
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             transport_error: Some("File not found: /tmp/missing.txt".to_string()),
             ..Default::default()
         };
@@ -1264,7 +1270,7 @@ mod tool_error_detection_tests {
         // A command moved to background sets timed_out=true alongside
         // background_started=true. The handoff is not a failure — the command
         // is still running and may well succeed.
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             background_started: true,
             timed_out: true,
             ..Default::default()
@@ -1281,7 +1287,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn plain_timeout_without_background_is_still_transient() {
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             timed_out: true,
             ..Default::default()
         };
@@ -1296,7 +1302,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn classify_uses_structured_http_status_over_text_scraping() {
-        let meta = crate::traits::ToolCallMetadata {
+        let meta = aidaemon_events::traits::ToolCallMetadata {
             http_status: Some(403),
             ..Default::default()
         };
@@ -1311,7 +1317,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn classify_structured_http_status_transient() {
-        let meta = crate::traits::ToolCallMetadata {
+        let meta = aidaemon_events::traits::ToolCallMetadata {
             http_status: Some(429),
             ..Default::default()
         };
@@ -1326,7 +1332,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn classify_structured_http_200_is_not_error() {
-        let meta = crate::traits::ToolCallMetadata {
+        let meta = aidaemon_events::traits::ToolCallMetadata {
             http_status: Some(200),
             ..Default::default()
         };
@@ -1345,7 +1351,7 @@ mod tool_error_detection_tests {
 /// 2. Drop orphaned assistant tool_calls (without corresponding tool result)
 /// 3. Merge any consecutive same-role user/assistant messages (stability)
 /// 4. Ensure conversation starts with user/system (not tool)
-pub(super) fn fixup_message_ordering(messages: &mut Vec<Value>) {
+pub fn fixup_message_ordering(messages: &mut Vec<Value>) {
     // Pass 0: initial coalescing helps reduce edge cases.
     merge_consecutive_messages(messages);
 
@@ -1575,7 +1581,7 @@ pub(super) fn fixup_message_ordering(messages: &mut Vec<Value>) {
 /// Strategy: for each tool name, keep only the most recent error details and
 /// replace earlier errors with a short note. A successful (non-error) tool
 /// result resets the error streak for that tool.
-pub(super) fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
+pub fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
     let Some(boundary) = messages
         .iter()
         .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
@@ -1626,7 +1632,7 @@ pub(super) fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
 }
 
 /// Extract the "command" field from tool arguments JSON (for terminal tool).
-pub(super) fn extract_command_from_args(args_json: &str) -> Option<String> {
+pub fn extract_command_from_args(args_json: &str) -> Option<String> {
     serde_json::from_str::<Value>(args_json)
         .ok()
         .and_then(|v| v.get("command")?.as_str().map(String::from))
@@ -1634,7 +1640,7 @@ pub(super) fn extract_command_from_args(args_json: &str) -> Option<String> {
 
 /// Build a stable dedupe key for send_file calls within a single task.
 /// Key format: "{expanded_path}|{trimmed_caption}".
-pub(super) fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<String> {
+pub fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(args_json).ok()?;
     let file_path = parsed.get("file_path")?.as_str()?.trim();
     if file_path.is_empty() {
@@ -1651,7 +1657,7 @@ pub(super) fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<
 
 /// Check if a session ID indicates it was triggered by an automated source
 /// (e.g., email trigger) rather than direct user interaction via Telegram.
-pub(super) fn is_trigger_session(session_id: &str) -> bool {
+pub fn is_trigger_session(session_id: &str) -> bool {
     session_id.contains("trigger") || session_id.starts_with("event_")
 }
 

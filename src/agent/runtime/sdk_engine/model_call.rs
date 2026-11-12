@@ -2,6 +2,10 @@
 //! router, fallbacks, telemetry and the mandate token lease.
 
 use super::*;
+#[cfg(test)]
+pub(super) use aidaemon_runtime::engine::hooks::{
+    raised_output_ceiling, thinking_cutoff_effort, MAX_RAISED_OUTPUT_TOKENS,
+};
 
 /// Per-call ceilings: the default, a foreground turn's, a mandate run's.
 pub(super) const DEFAULT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(360);
@@ -32,27 +36,6 @@ pub(super) const STEERING_CHECKLIST_NOTE: &str =
     "[You declared a checklist for this request. If this message adds, changes or cancels \
      work, call track_requirements with the full revised list before continuing. If it only \
      clarifies or grants permission, leave the list as it is.]";
-
-/// The output ceiling a thinking cutoff raises to.
-pub(super) const MAX_RAISED_OUTPUT_TOKENS: u32 = 32_768;
-
-/// The doubled output ceiling after a cutoff that used `used` tokens, or
-/// `None` when it cannot grow (unknown usage, or already at the cap).
-pub(super) fn raised_output_ceiling(used: Option<u32>, current: u32) -> Option<u32> {
-    let base = used.filter(|used| *used > 0)?.max(current);
-    let raised = base.saturating_mul(2).min(MAX_RAISED_OUTPUT_TOKENS);
-    (raised > base).then_some(raised)
-}
-
-/// Reasoning effort after `cutoffs` consecutive thinking cutoffs: unchanged
-/// for the first (the raised output ceiling is the fix), then low, then off.
-pub(super) fn thinking_cutoff_effort(cutoffs: u8) -> Option<String> {
-    match cutoffs {
-        0 | 1 => None,
-        2 => Some("low".to_string()),
-        _ => Some("off".to_string()),
-    }
-}
 
 /// Run `call`, failing once it has been silent for `idle` or has run for
 /// `hard` in all. Silence is measured from the latest streamed chunk, so a

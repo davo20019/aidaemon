@@ -1,7 +1,7 @@
-//! Settling a run the daemon left unfinished (a crash or a restart) before the
+//! Settling a run the host left unfinished (a crash or a restart) before the
 //! next turn of its session starts.
 //!
-//! The kernel checkpoints a run's state into the daemon's store. A run whose
+//! The kernel checkpoints a run's state into the host's store. A run whose
 //! last checkpoint is `in_flight` stopped mid tool batch: the kernel finishes
 //! that batch under its own rules (idempotent calls run again, others are
 //! marked indeterminate rather than repeated). A run that is `pending` was
@@ -9,7 +9,7 @@
 //! declined without a card and ended there, because the owner has moved on
 //! and sent a new message: the turn says what was not done instead. The
 //! recovered transcript is not reused: the next turn is built
-//! from the daemon's own projection, as every turn is, so nothing is
+//! from the host's own projection, as every turn is, so nothing is
 //! duplicated.
 
 use std::collections::HashSet;
@@ -24,7 +24,7 @@ use tracing::warn;
 /// What the owner is told about requests a cut-off run did not carry out:
 /// each card's question (its first sentence), and that the owner declined
 /// nothing.
-pub(super) fn not_done_note(not_done: &[String]) -> Option<String> {
+pub fn not_done_note(not_done: &[String]) -> Option<String> {
     const MAX_ITEM_CHARS: usize = 120;
     const MAX_ITEMS: usize = 3;
     if not_done.is_empty() {
@@ -82,18 +82,18 @@ fn is_ending(run_id: sdk::RunId) -> bool {
 /// Ends the run in the journal if its turn is dropped before the run returns.
 /// A dropped turn was stopped on purpose, so the next message must not resume
 /// it. A process crash runs no destructor and is still recovered.
-pub(super) struct EndIfDropped {
+pub struct EndIfDropped {
     store: Option<Arc<SqliteStore>>,
     run_id: sdk::RunId,
 }
 
 impl EndIfDropped {
-    pub(super) fn new(store: Option<Arc<SqliteStore>>, run_id: sdk::RunId) -> Self {
+    pub fn new(store: Option<Arc<SqliteStore>>, run_id: sdk::RunId) -> Self {
         Self { store, run_id }
     }
 
     /// The run returned on its own.
-    pub(super) fn disarm(mut self) {
+    pub fn disarm(mut self) {
         self.store = None;
     }
 }
@@ -129,10 +129,7 @@ impl Drop for EndIfDropped {
 }
 
 /// The session's most recent run, when it is unfinished.
-pub(super) async fn stranded_run(
-    store: Option<&SqliteStore>,
-    session_id: &str,
-) -> Option<sdk::RunState> {
+pub async fn stranded_run(store: Option<&SqliteStore>, session_id: &str) -> Option<sdk::RunState> {
     let store = store?;
     let state = match store.latest_state_for_session(session_id).await {
         Ok(Some(state)) if state.pending.is_some() || state.in_flight.is_some() => state,
@@ -165,7 +162,7 @@ pub(super) async fn stranded_run(
 /// with ended with the process, and the turn about to start is a new run
 /// whose declines start empty. Its own `declined` record still binds it
 /// while it settles, and still keeps it from ending `Succeeded`.
-pub(super) async fn settle(
+pub async fn settle(
     agent: &sdk::Agent,
     state: sdk::RunState,
     cancel: CancellationToken,
