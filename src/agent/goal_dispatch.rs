@@ -13,12 +13,9 @@ use crate::traits::{Goal, ScheduledRunState, StateStore, Task};
 
 use super::Agent;
 
-/// Recurring runs may spend one additional envelope when their durable health
-/// snapshot shows concrete progress. This is intentionally small: autonomy
-/// means adapting inside a bounded policy, not silently turning a runaway run
-/// into unbounded spend.
-pub(crate) const SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS: usize = 1;
-pub(crate) const SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP: i64 = 2_000_000;
+pub(crate) use aidaemon_work::goal_tokens::{
+    SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+};
 
 /// Blocked path patterns for auto-sent files (mirrors SendFileTool).
 const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[

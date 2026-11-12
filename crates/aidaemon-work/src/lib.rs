@@ -10,6 +10,7 @@ pub mod mandates;
 pub mod plans;
 pub mod reminders;
 pub mod schedule;
+pub mod scheduler;
 pub mod schema;
 pub mod sqlite;
 pub mod stores;

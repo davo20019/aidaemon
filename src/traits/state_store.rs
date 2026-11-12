@@ -49,6 +49,7 @@ pub trait StateStore:
     + super::HistorySearchStore
     + GoalTraceStore
     + MandateToolStore
+    + aidaemon_work::scheduler::SchedulerStore
     + McpRegistryStore
     + SkillsStore
     + ReportBlockerStore

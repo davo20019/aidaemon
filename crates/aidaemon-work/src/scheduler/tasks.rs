@@ -2,9 +2,9 @@
 
 use super::*;
 
-impl HeartbeatCoordinator {
+impl GoalCycle {
     /// Detect tasks that have been running/claimed longer than the timeout and mark them interrupted.
-    pub(super) async fn detect_stuck_tasks(&self) {
+    pub async fn detect_stuck_tasks(&self) {
         match self.state.recover_expired_task_attempts().await {
             Ok(tasks) if !tasks.is_empty() => {
                 warn!(
@@ -53,7 +53,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn block_pending_tasks_with_terminal_failed_dependencies(&self) {
+    pub async fn block_pending_tasks_with_terminal_failed_dependencies(&self) {
         let goals = match self.state.get_active_goals().await {
             Ok(g) => g,
             Err(e) => {
@@ -128,7 +128,7 @@ impl HeartbeatCoordinator {
 
     /// Auto-retry failed idempotent tasks that haven't exceeded their max retries.
     /// Resets them to "pending" so they get picked up by dispatch_pending_tasks.
-    pub(super) async fn auto_retry_failed_tasks(&self) {
+    pub async fn auto_retry_failed_tasks(&self) {
         let goals = match self.state.get_active_goals().await {
             Ok(g) => g,
             Err(e) => {
@@ -250,7 +250,7 @@ impl HeartbeatCoordinator {
     /// 3. The task lead picks up all pending tasks for the goal
     ///
     /// Falls back to notification if no agent reference is available.
-    pub(super) async fn dispatch_pending_tasks(&self) {
+    pub async fn dispatch_pending_tasks(&self) {
         let pending = match self.state.get_pending_tasks_by_priority(20).await {
             Ok(t) => t,
             Err(e) => {
@@ -690,46 +690,31 @@ impl HeartbeatCoordinator {
                 "Claimed orphaned task, dispatching task lead"
             );
 
-            // Try to spawn a task lead via agent reference
-            if let Some(agent_weak) = &self.agent {
-                if let Some(agent_arc) = agent_weak.upgrade() {
-                    let state = self.state.clone();
-                    let hub = self.hub.clone();
-                    let goal_token_registry = self.goal_token_registry.clone();
-                    let goal_clone = goal.clone();
-                    let session_id = goal.session_id.clone();
-
-                    // Register cancellation token for this goal if not already present
-                    if let Some(ref registry) = goal_token_registry {
-                        registry.register(&goal.id).await;
-                    }
-
-                    // spawn_background_task_lead internally calls tokio::spawn.
-                    // Semaphore gating happens at the Agent level during LLM calls.
-                    // Use the actual pending task description as TaskLead input.
-                    // Passing a generic "resume orphaned tasks" string causes the
-                    // TaskLead to re-scope work away from the user's goal.
-                    let dispatch_task_text = if first_task.description.trim().is_empty() {
-                        goal.description.clone()
-                    } else {
-                        first_task.description.clone()
-                    };
-
-                    crate::agent::spawn_background_task_lead(
-                        agent_arc,
-                        goal_clone,
-                        dispatch_task_text,
-                        session_id,
-                        ChannelContext::internal(),
-                        UserRole::Owner,
-                        state,
-                        hub,
-                        goal_token_registry,
-                        Some(first_task.id.clone()),
-                        None,
-                    );
-                    continue;
+            // Try to spawn a task lead via the agent runtime
+            if let Some(agent_arc) = self.live_agent() {
+                // Register cancellation token for this goal if not already present
+                if let Some(ref registry) = self.goal_token_registry {
+                    registry.register(&goal.id).await;
                 }
+
+                // The host's task lead runs in its own task. Semaphore gating
+                // happens in the runtime during LLM calls. Use the actual
+                // pending task description as TaskLead input. Passing a
+                // generic "resume orphaned tasks" string causes the TaskLead
+                // to re-scope work away from the user's goal.
+                let dispatch_task_text = if first_task.description.trim().is_empty() {
+                    goal.description.clone()
+                } else {
+                    first_task.description.clone()
+                };
+
+                agent_arc.spawn_task_lead(
+                    goal.clone(),
+                    dispatch_task_text,
+                    first_task.id.clone(),
+                    None,
+                );
+                continue;
             }
 
             // No agent available — revert claimed task back to pending so it's
@@ -790,7 +775,7 @@ impl HeartbeatCoordinator {
     /// that would wrongly skip real unfinished work. Scoping by `goal_run_id`
     /// is what prevents a successful prior run from suppressing a new manual
     /// trigger.
-    pub(super) async fn goal_run_mutating_success_tasks(&self, run_id: &str) -> Vec<String> {
+    pub async fn goal_run_mutating_success_tasks(&self, run_id: &str) -> Vec<String> {
         let tasks = match self.state.get_tasks_for_goal_run(run_id).await {
             Ok(t) => t,
             Err(_) => return Vec::new(),
