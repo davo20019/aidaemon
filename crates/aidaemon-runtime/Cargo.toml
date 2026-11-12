@@ -30,6 +30,7 @@ aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 aidaemon-memory = { version = "0.2.0", path = "../aidaemon-memory" }
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
 aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers" }
+aidaemon-store-sqlite = { version = "0.2.0", path = "../aidaemon-store-sqlite" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
 aidaemon-work = { version = "0.2.0", path = "../aidaemon-work" }
 anyhow = "1"

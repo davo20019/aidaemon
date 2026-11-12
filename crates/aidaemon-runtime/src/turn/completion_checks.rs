@@ -281,6 +281,42 @@ pub fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
     }
 }
 
+/// The reply when model recovery returned no usable output, with the
+/// provider's note when there is one.
+pub fn build_empty_response_fallback(response_note: Option<&str>) -> String {
+    let base = "I wasn't able to process that request because automatic model recovery returned no usable output.";
+    let generic = base.to_string();
+    let Some(note) = response_note.map(str::trim).filter(|s| !s.is_empty()) else {
+        return generic;
+    };
+
+    let flattened = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = flattened.trim_matches(|c: char| c == '"' || c == '\'');
+    let trimmed = trimmed.trim_end_matches(['.', '!', '?']);
+    if trimmed.is_empty() {
+        return generic;
+    }
+
+    let note_preview = truncate_with_ellipsis(trimmed, 180);
+    format!("{base} Provider detail: {note_preview}.")
+}
+
+/// `text` cut to `max_chars` characters, with `...` when cut.
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

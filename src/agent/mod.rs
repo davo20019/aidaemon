@@ -118,10 +118,6 @@ use loop_utils::{extract_command_from_args, fixup_message_ordering, is_trigger_s
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
 }
-/// Task outcomes live in `aidaemon-runtime`.
-mod task_outcome {
-    pub use aidaemon_runtime::turn::task_outcome::*;
-}
 use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]

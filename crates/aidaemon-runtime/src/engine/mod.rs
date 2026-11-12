@@ -8,9 +8,14 @@
 
 use std::time::Duration;
 
+pub mod budgets;
 pub mod calls;
+pub mod compaction;
 pub mod hooks;
+pub mod outcome;
 pub mod provider;
+pub mod recovery;
+pub mod stop;
 
 /// Host tools enforce their own timeouts (terminal backgrounding, CLI
 /// agents); this only stops a wedged call from holding the turn forever.

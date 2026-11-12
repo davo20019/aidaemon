@@ -50,7 +50,7 @@ use uuid::Uuid;
 use super::agent_helpers::touch_heartbeat;
 use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
 use super::sdk_provider::{
-    fit_run_values, from_provider_response, message_text, prefix_with_notes, split_injected_notes,
+    fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
     to_chat_options, to_daemon_messages_from, to_daemon_tools, values_to_sdk, DaemonProvider,
     ModelCall,
 };
@@ -76,8 +76,7 @@ mod hooks;
 mod model_call;
 #[path = "sdk_engine/outcome.rs"]
 mod outcome;
-#[path = "sdk_engine/recovery.rs"]
-mod recovery;
+use aidaemon_runtime::engine::recovery;
 #[path = "sdk_engine/stop.rs"]
 mod stop;
 #[path = "sdk_engine/tool_calls.rs"]
