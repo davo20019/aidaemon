@@ -188,3 +188,26 @@ impl Rest {
         }
     }
 }
+
+/// Check a bot token against `users/@me`; returns the bot's name.
+pub async fn validate_token(token: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://discord.com/api/v10/users/@me")
+        .header("Authorization", format!("Bot {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to validate token: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Invalid Discord token (HTTP {}). Make sure you copied the bot token from Discord Developer Portal.",
+            response.status()
+        ));
+    }
+
+    match response.json::<serde_json::Value>().await {
+        Ok(json) => Ok(json["username"].as_str().unwrap_or("unknown").to_string()),
+        Err(_) => Ok("unknown".to_string()),
+    }
+}

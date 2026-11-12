@@ -5,6 +5,8 @@
 //! else. LLM output is loose Markdown, so the converter is deliberately
 //! forgiving: anything it does not recognise is passed through escaped.
 
+pub use crate::plain::{markdown_to_plain_fallback, split_text};
+
 /// Escape `<`, `>` and `&` for Telegram HTML text.
 pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

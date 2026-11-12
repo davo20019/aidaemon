@@ -1,6 +1,6 @@
 //! The Bot API calls and types the Telegram bot uses beyond the channel
 //! contract (reply keyboards, web-app buttons, callback answers, chat
-//! actions), sent through the SDK adapter's HTTP client.
+//! actions), sent through the adapter's HTTP client.
 //!
 //! The shapes follow the Bot API's own JSON: requests are built as JSON
 //! bodies and responses read with serde.
@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aidaemon_channel_telegram::TelegramChannel as Adapter;
+use crate::TelegramChannel as Adapter;
 use aidaemon_channels::ChannelError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 /// A failed Bot API call.
 #[derive(Debug)]
-pub(crate) struct RequestError(pub ChannelError);
+pub struct RequestError(pub ChannelError);
 
 impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -30,7 +30,7 @@ impl std::error::Error for RequestError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct ChatId(pub i64);
+pub struct ChatId(pub i64);
 
 impl std::fmt::Display for ChatId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,7 +40,7 @@ impl std::fmt::Display for ChatId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct MessageId(pub i32);
+pub struct MessageId(pub i32);
 
 impl std::fmt::Display for MessageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,10 +50,10 @@ impl std::fmt::Display for MessageId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct UserId(pub u64);
+pub struct UserId(pub u64);
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct User {
+pub struct User {
     pub id: UserId,
     #[serde(default)]
     pub first_name: String,
@@ -62,7 +62,7 @@ pub(crate) struct User {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Chat {
+pub struct Chat {
     pub id: ChatId,
     /// `private`, `group`, `supergroup` or `channel`.
     #[serde(rename = "type", default)]
@@ -86,7 +86,7 @@ impl Chat {
 
 /// A document, audio, video or voice file.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct FileMeta {
+pub struct FileMeta {
     pub file_id: String,
     #[serde(default)]
     pub file_size: Option<u64>,
@@ -97,12 +97,12 @@ pub(crate) struct FileMeta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct WebAppData {
+pub struct WebAppData {
     pub data: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Message {
+pub struct Message {
     #[serde(rename = "message_id")]
     pub id: MessageId,
     #[serde(with = "chrono::serde::ts_seconds", default = "epoch")]
@@ -161,7 +161,7 @@ impl Message {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CallbackQuery {
+pub struct CallbackQuery {
     pub id: String,
     pub from: User,
     /// The message the button was on (only its chat and id, if old).
@@ -172,7 +172,7 @@ pub(crate) struct CallbackQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Update {
+pub struct Update {
     #[serde(default)]
     pub message: Option<Message>,
     #[serde(default)]
@@ -191,28 +191,28 @@ impl Update {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Me {
+pub struct Me {
     #[serde(default)]
     pub username: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ParseMode {
+pub enum ParseMode {
     Html,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ChatAction {
+pub enum ChatAction {
     Typing,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct LinkPreviewOptions {
+pub struct LinkPreviewOptions {
     pub is_disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct WebAppInfo {
+pub struct WebAppInfo {
     #[serde(serialize_with = "url_as_str")]
     pub url: reqwest::Url,
 }
@@ -222,7 +222,7 @@ fn url_as_str<S: serde::Serializer>(url: &reqwest::Url, serializer: S) -> Result
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct InlineKeyboardButton {
+pub struct InlineKeyboardButton {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     callback_data: Option<String>,
@@ -249,7 +249,7 @@ impl InlineKeyboardButton {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct InlineKeyboardMarkup {
+pub struct InlineKeyboardMarkup {
     inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
 }
 
@@ -263,13 +263,13 @@ impl InlineKeyboardMarkup {
 
 /// A reply-keyboard button that opens a web app.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct KeyboardButton {
+pub struct KeyboardButton {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     web_app: Option<WebAppInfo>,
 }
 
-pub(crate) enum ButtonRequest {
+pub enum ButtonRequest {
     WebApp(WebAppInfo),
 }
 
@@ -289,7 +289,7 @@ impl KeyboardButton {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct KeyboardMarkup {
+pub struct KeyboardMarkup {
     keyboard: Vec<Vec<KeyboardButton>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     resize_keyboard: bool,
@@ -318,7 +318,7 @@ impl KeyboardMarkup {
 }
 
 /// A command in the bot's `/` menu.
-pub(crate) struct BotCommand {
+pub struct BotCommand {
     command: String,
     description: String,
 }
@@ -334,7 +334,7 @@ impl BotCommand {
 
 /// The Bot API, through the adapter's client.
 #[derive(Clone)]
-pub(crate) struct Bot {
+pub struct Bot {
     api: Arc<Adapter>,
 }
 
@@ -412,7 +412,7 @@ impl Bot {
 
 /// One Bot API call, with optional parameters set before it is awaited.
 #[must_use = "a request does nothing until awaited"]
-pub(crate) struct Request<T> {
+pub struct Request<T> {
     api: Arc<Adapter>,
     method: &'static str,
     body: Value,
@@ -481,6 +481,19 @@ impl<T: DeserializeOwned + Send + 'static> IntoFuture for Request<T> {
             })
         })
     }
+}
+
+/// Check a bot token with `getMe`; returns the bot's username.
+pub async fn validate_token(token: &str) -> Result<String, String> {
+    let test_bot = Bot::new(Arc::new(Adapter::new(token.to_string())));
+    let me = test_bot.get_me().await.map_err(|e| {
+        format!(
+            "Invalid token: {}\n\nMake sure you copied the full token from @BotFather.",
+            e
+        )
+    })?;
+
+    Ok(me.username.clone().unwrap_or_else(|| "unknown".to_string()))
 }
 
 #[cfg(test)]

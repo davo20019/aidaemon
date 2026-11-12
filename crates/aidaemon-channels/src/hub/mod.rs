@@ -4,6 +4,7 @@
 //! session-routing stores. Internal to aidaemon, no stability promise; the
 //! public contract is [`crate::channel`].
 
+pub mod bots;
 mod router;
 
 pub use router::{ChannelHub, SessionMap};

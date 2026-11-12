@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use format::split_message;
 pub use mapping::{decode_custom_id, encode_custom_id, CUSTOM_ID_MAX};
+pub use rest::validate_token;
 
 /// Discord's limit for a file sent by a bot without boosts, in bytes.
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
