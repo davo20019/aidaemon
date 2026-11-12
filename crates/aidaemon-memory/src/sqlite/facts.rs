@@ -726,6 +726,17 @@ impl FactStore for SqliteMemory {
         }
         let expand_ms = stage.elapsed().as_millis() as u64;
 
+        // Scores of the leading hits, so a relevance floor can be chosen
+        // from evidence: `key=score (kind)`.
+        let summarize = |hits: &[search::SearchHit]| {
+            hits.iter()
+                .take(3)
+                .map(|h| format!("{}={:.3} ({:?})", h.fact.key, h.score, h.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let top = summarize(&report.hits);
+        let related_top = summarize(&report.related);
         tracing::info!(
             target: "memory_recall",
             load_ms,
@@ -738,6 +749,8 @@ impl FactStore for SqliteMemory {
             returned = report.hits.len(),
             related = report.related.len(),
             reranked = report.reranked,
+            top = %top,
+            related_top = %related_top,
             "explicit fact search"
         );
         Ok(report)
