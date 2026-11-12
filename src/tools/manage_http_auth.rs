@@ -157,7 +157,7 @@ impl ManageHttpAuthTool {
     }
 
     fn keychain_field_name(profile: &str, field: &str) -> String {
-        format!("http_auth_{}_{}", profile, field)
+        aidaemon_secrets::names::http_auth(profile, field)
     }
 
     fn normalize_domains(domains: &[String]) -> anyhow::Result<Vec<String>> {
@@ -673,8 +673,12 @@ impl ManageHttpAuthTool {
                 resource_ids.insert(resource_id.clone());
                 // Same typed readiness as `manage_oauth list`, so whichever
                 // surface an audit consults, it gets the same answer.
-                let readiness =
-                    crate::oauth::CredentialReadiness::for_connection(&connection, now).describe();
+                let readiness = crate::oauth::CredentialReadiness::for_connection(
+                    &connection,
+                    now,
+                    crate::config::secret_store().as_ref(),
+                )
+                .describe();
                 lines.push(format!(
                     "- {} [resource_id: {}] [{}] readiness: {}; manage with OAuth flow tools",
                     connection.service, resource_id, connection.auth_type, readiness

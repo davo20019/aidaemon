@@ -17,8 +17,28 @@ categories = ["api-bindings", "asynchronous"]
 exclude = ["tests/", "benches/"]
 publish = false
 
+[features]
+# The ChatGPT subscription login (`chatgpt_login`): PKCE sign-in, the loopback
+# callback, and a refresh-serializing credential owner over a `SecretStore`.
+chatgpt-login = [
+    "dep:aidaemon-secrets",
+    "dep:anyhow",
+    "dep:base64",
+    "dep:chrono",
+    "dep:rand",
+    "dep:tokio",
+    "dep:uuid",
+]
+
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
+aidaemon-secrets = { version = "0.2.0", path = "../aidaemon-secrets", default-features = false, optional = true }
+anyhow = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+rand = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"

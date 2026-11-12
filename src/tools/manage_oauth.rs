@@ -681,7 +681,7 @@ impl ManageOAuthTool {
         }
         let mut result = String::from("Available OAuth providers:\n");
         for (name, display_name) in &providers {
-            let has_creds = OAuthGateway::has_credentials(name);
+            let has_creds = self.gateway.has_credentials(name);
             let cred_status = if has_creds {
                 "credentials set"
             } else {
@@ -719,7 +719,7 @@ impl ManageOAuthTool {
             OAuthType::OAuth2ClientCredentials => "oauth2_client_credentials",
             OAuthType::OAuth1a => "oauth1a",
         };
-        let has_creds = OAuthGateway::has_credentials(service);
+        let has_creds = self.gateway.has_credentials(service);
         let source = if crate::oauth::providers::get_builtin_provider(service).is_some() {
             "built-in"
         } else {
@@ -829,7 +829,12 @@ impl ManageOAuthTool {
             // Typed readiness instead of a bare expiry: a short-lived bearer
             // that lapsed since the last call is still usable when a refresh
             // path exists, and an audit must not have to guess that.
-            let readiness = crate::oauth::CredentialReadiness::for_connection(conn, now).describe();
+            let readiness = crate::oauth::CredentialReadiness::for_connection(
+                conn,
+                now,
+                self.gateway.secrets().as_ref(),
+            )
+            .describe();
             let account = conn
                 .account_id
                 .as_deref()
@@ -1640,7 +1645,7 @@ mod tests {
         let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
         let profiles: SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let gateway = OAuthGateway::new(
+        let gateway = crate::oauth::daemon_gateway(
             state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
             profiles,
             "http://localhost:8080".to_string(),

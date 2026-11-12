@@ -31,7 +31,7 @@ mod enabled {
             .iter()
             .map(|(name, value)| {
                 let value = if value == "keychain" {
-                    resolve_from_keychain(&format!("otlp_header_{}", name.to_ascii_lowercase()))?
+                    resolve_from_keychain(&aidaemon_secrets::names::otlp_header(name))?
                 } else {
                     value.clone()
                 };

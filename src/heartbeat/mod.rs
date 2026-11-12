@@ -1,125 +1,31 @@
 //! The daemon's background work: its periodic jobs and services, and the
 //! goal cycle from `aidaemon_work::scheduler`, run on one [`ServiceHost`].
 //! The daemon gives the cycle its agent, its channels and its presentation.
+//!
+//! Wiring only: the job telemetry, its observer and the database health gate
+//! are `aidaemon_work::heartbeat`'s; what stays here registers the daemon's
+//! jobs and adapts its agent, hub and wording to the cycle's host traits.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use aidaemon_core::{
-    CancellationToken, FnService, Schedule, Service, ServiceError, ServiceEvent, ServiceGate,
-    ServiceHost, ServiceObserver,
-};
+use aidaemon_core::{CancellationToken, FnService, Schedule, Service, ServiceError, ServiceHost};
 use async_trait::async_trait;
 
-use chrono::Utc;
-use serde::Serialize;
 use tokio::sync::mpsc;
-use tracing::{error, info};
 
 #[allow(unused_imports)]
 pub(crate) use aidaemon_work::scheduler::*;
+
+pub use aidaemon_work::heartbeat::{DbHealthGate, HeartbeatTelemetry, JobObserver};
 
 use crate::agent::Agent;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::runtime_ports::OutboundRouter;
 use crate::traits::{Goal, StateStore, Task};
 use crate::types::{ChannelContext, UserRole};
-
-/// Runtime snapshot of a heartbeat background job.
-#[derive(Debug, Clone, Serialize)]
-pub struct HeartbeatJobSnapshot {
-    pub name: String,
-    pub interval_secs: u64,
-    pub last_run_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error: Option<String>,
-    pub consecutive_failures: u32,
-    pub is_running: bool,
-}
-
-impl HeartbeatJobSnapshot {
-    fn new(name: &str, interval: Duration) -> Self {
-        Self {
-            name: name.to_string(),
-            interval_secs: interval.as_secs(),
-            last_run_at: None,
-            last_success_at: None,
-            last_error_at: None,
-            last_error: None,
-            consecutive_failures: 0,
-            is_running: false,
-        }
-    }
-}
-
-/// Shared telemetry for heartbeat jobs (dashboard/API consumption).
-#[derive(Default)]
-pub struct HeartbeatTelemetry {
-    jobs: Mutex<HashMap<String, HeartbeatJobSnapshot>>,
-}
-
-impl HeartbeatTelemetry {
-    pub fn new() -> Self {
-        Self {
-            jobs: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn register_job(&self, name: &str, interval: Duration) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.entry(name.to_string())
-            .or_insert_with(|| HeartbeatJobSnapshot::new(name, interval));
-    }
-
-    pub fn mark_started(&self, name: &str) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(job) = jobs.get_mut(name) {
-            job.last_run_at = Some(Utc::now().to_rfc3339());
-            job.is_running = true;
-        }
-    }
-
-    pub fn mark_success(&self, name: &str) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(job) = jobs.get_mut(name) {
-            job.last_success_at = Some(Utc::now().to_rfc3339());
-            job.last_error = None;
-            job.last_error_at = None;
-            job.consecutive_failures = 0;
-            job.is_running = false;
-        }
-    }
-
-    pub fn mark_failure(&self, name: &str, consecutive_failures: u32, message: String) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(job) = jobs.get_mut(name) {
-            job.last_error_at = Some(Utc::now().to_rfc3339());
-            job.last_error = Some(message);
-            job.consecutive_failures = consecutive_failures;
-            job.is_running = false;
-        }
-    }
-
-    pub fn mark_not_running(&self, name: &str) {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(job) = jobs.get_mut(name) {
-            job.is_running = false;
-        }
-    }
-
-    pub fn snapshots(&self) -> Vec<HeartbeatJobSnapshot> {
-        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        let mut rows: Vec<HeartbeatJobSnapshot> = jobs.values().cloned().collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        rows
-    }
-}
 
 /// Type alias for the async closure that heartbeat jobs execute.
 type HeartbeatRunFn =
@@ -161,85 +67,6 @@ impl std::ops::Deref for HeartbeatCoordinator {
 impl std::ops::DerefMut for HeartbeatCoordinator {
     fn deref_mut(&mut self) -> &mut GoalCycle {
         &mut self.cycle
-    }
-}
-
-/// Skips a whole tick while the database cannot answer.
-struct DbHealthGate {
-    state: Arc<dyn StateStore>,
-    healthy: AtomicBool,
-}
-
-#[async_trait]
-impl ServiceGate for DbHealthGate {
-    async fn ready(&self) -> bool {
-        match self.state.health_check().await {
-            Ok(_) => {
-                if !self.healthy.swap(true, Ordering::Relaxed) {
-                    info!("DB health restored");
-                }
-                true
-            }
-            Err(e) => {
-                if self.healthy.swap(false, Ordering::Relaxed) {
-                    error!(error = %e, "DB health check failed — skipping tick");
-                }
-                false
-            }
-        }
-    }
-}
-
-/// Logs service outcomes and feeds the dashboard's job table.
-struct JobObserver {
-    telemetry: Option<Arc<HeartbeatTelemetry>>,
-}
-
-impl ServiceObserver for JobObserver {
-    fn event(&self, event: ServiceEvent) {
-        let telemetry = self.telemetry.as_ref();
-        match event {
-            ServiceEvent::Launched { service } => {
-                tracing::debug!(job = %service, "Heartbeat job starting");
-                if let Some(t) = telemetry {
-                    t.mark_started(&service);
-                }
-            }
-            ServiceEvent::Succeeded {
-                service,
-                previous_failures,
-            } => {
-                if previous_failures > 0 {
-                    info!(job = %service, prev_failures = previous_failures, "Heartbeat job recovered");
-                }
-                if let Some(t) = telemetry {
-                    t.mark_success(&service);
-                }
-            }
-            ServiceEvent::Failed {
-                service,
-                failures,
-                error,
-            } => {
-                error!(
-                    job = %service,
-                    error = %error,
-                    consecutive_failures = failures,
-                    "Heartbeat job failed — backing off"
-                );
-                if let Some(t) = telemetry {
-                    t.mark_failure(&service, failures, error);
-                }
-            }
-            ServiceEvent::StartFailed { service, error } => {
-                error!(job = %service, error = %error, "Heartbeat service failed to start");
-            }
-            ServiceEvent::Finished { service } => {
-                if let Some(t) = telemetry {
-                    t.mark_not_running(&service);
-                }
-            }
-        }
     }
 }
 
@@ -486,13 +313,8 @@ impl HeartbeatCoordinator {
     pub(crate) fn into_host(mut self) -> ServiceHost {
         let mut host = ServiceHost::new(self.tick_interval)
             .max_concurrent(self.max_concurrent)
-            .gate(Arc::new(DbHealthGate {
-                state: self.state.clone(),
-                healthy: AtomicBool::new(true),
-            }))
-            .observer(Arc::new(JobObserver {
-                telemetry: self.telemetry.clone(),
-            }));
+            .gate(Arc::new(DbHealthGate::new(self.state.clone())))
+            .observer(Arc::new(JobObserver::new(self.telemetry.clone())));
         for job in std::mem::take(&mut self.jobs) {
             let HeartbeatJob {
                 name,

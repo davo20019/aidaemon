@@ -1291,7 +1291,7 @@ mod tests {
         let profiles: SharedHttpProfiles =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let store: Arc<dyn crate::traits::OAuthStore> = Arc::new(NoOAuthConnections);
-        let gateway = OAuthGateway::new(
+        let gateway = crate::oauth::daemon_gateway(
             Arc::new(NoOAuthConnections) as Arc<dyn crate::traits::OAuthGatewayStore>,
             profiles.clone(),
             "http://localhost:8080".to_string(),

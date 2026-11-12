@@ -1064,7 +1064,7 @@ async fn register_runtime_tool_by_id(
                 .callback_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", config.daemon.health_port));
-            let gateway = crate::oauth::OAuthGateway::new(
+            let gateway = crate::oauth::daemon_gateway(
                 state.clone() as Arc<dyn crate::traits::OAuthGatewayStore>,
                 http_profiles,
                 callback_url,

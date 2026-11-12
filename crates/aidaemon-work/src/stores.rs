@@ -1134,3 +1134,12 @@ impl<T> ScheduledGoalRunsStore for T where
         + MandateStore
 {
 }
+
+/// Database health check: verifies the connection is alive. The scheduler's
+/// [`DbHealthGate`](crate::heartbeat::DbHealthGate) skips a tick while it fails.
+#[async_trait]
+pub trait HealthCheckStore: Send + Sync {
+    async fn health_check(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}

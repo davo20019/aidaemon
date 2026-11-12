@@ -758,28 +758,15 @@ impl ConfigManagerTool {
     }
 
     fn fallback_key_prefix(index: usize) -> String {
-        format!("provider_fallback_{}", index)
+        aidaemon_secrets::names::provider_fallback_prefix(None, index)
     }
 
     fn keychain_field_name(prefix: Option<&str>, field: &str) -> String {
-        prefix
-            .map(|prefix| format!("{}_{}", prefix, field))
-            .unwrap_or_else(|| field.to_string())
-    }
-
-    fn normalized_header_key(header_name: &str) -> String {
-        header_name
-            .to_ascii_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect()
+        aidaemon_secrets::names::provider_field(prefix, field)
     }
 
     fn header_keychain_field_name(prefix: Option<&str>, header_name: &str) -> String {
-        let normalized = Self::normalized_header_key(header_name);
-        prefix
-            .map(|prefix| format!("{}_header_{}", prefix, normalized))
-            .unwrap_or_else(|| format!("provider_header_{}", normalized))
+        aidaemon_secrets::names::provider_header(prefix, header_name)
     }
 
     fn build_models_table(selection: &ResolvedProviderSelection) -> toml::Table {
@@ -1163,8 +1150,10 @@ impl ConfigManagerTool {
                     .as_table()
                     .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))?
                     .clone();
-                let old_nested_prefix = format!("{}_fallback_{}", old_prefix, idx);
-                let new_nested_prefix = format!("{}_fallback_{}", new_prefix, idx);
+                let old_nested_prefix =
+                    aidaemon_secrets::names::provider_fallback_prefix(Some(old_prefix), idx);
+                let new_nested_prefix =
+                    aidaemon_secrets::names::provider_fallback_prefix(Some(new_prefix), idx);
                 *value = toml::Value::Table(Self::rekey_provider_table(
                     &nested,
                     &old_nested_prefix,
