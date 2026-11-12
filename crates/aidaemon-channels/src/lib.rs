@@ -42,6 +42,7 @@ mod render;
 pub mod router;
 pub mod runner;
 pub mod session;
+pub mod slash;
 pub mod split;
 pub mod tasks;
 pub mod turns;

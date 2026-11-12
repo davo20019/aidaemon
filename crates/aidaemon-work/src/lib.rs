@@ -4,6 +4,7 @@
 
 pub mod admissibility;
 pub mod authority;
+pub mod chat_command;
 pub mod goal_tokens;
 pub mod goals;
 pub mod mandates;

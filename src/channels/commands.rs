@@ -1,192 +1,24 @@
-use std::collections::HashMap;
+//! The daemon's slash commands: the shared ones from
+//! [`aidaemon_channels::slash`] on the daemon's stores and agent, plus
+//! `/work` (`aidaemon_work`) and the daemon's own `/reload`, `/checkpoints`
+//! and `/rollback` (its config file and filesystem checkpoints).
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+pub(crate) use aidaemon_channels::slash::{
+    is_slash_command, shared_commands, CommandCategory, CommandDef,
+};
+use aidaemon_channels::slash::{ChatMode, CommandHost, SharedCommands, SlashCall, SlashCommand};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-use super::formatting::format_number;
+use crate::agent::authority::SessionMode;
 use crate::config::AppConfig;
-use crate::duration_format::{compact_chrono_duration, ZeroUnitStyle};
 use crate::runtime_ports::DaemonAgentRuntime;
-use crate::tasks::{TaskRegistry, TaskStatus};
-use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
+use crate::tasks::TaskRegistry;
+use crate::traits::{ConversationSummary, Message, StateStore, TokenUsageRecord};
 use crate::types::UserRole;
-
-/// Whether a chat message is a slash command: `/name` or `/name@bot`, where
-/// `name` is letters, digits and underscores (Telegram's command syntax).
-/// A message that merely starts with a path (`/tmp/x.py is broken`) is not.
-pub(crate) fn is_slash_command(text: &str) -> bool {
-    let Some(first) = text.split_whitespace().next() else {
-        return false;
-    };
-    let Some(rest) = first.strip_prefix('/') else {
-        return false;
-    };
-    let name = rest.split_once('@').map_or(rest, |(name, _bot)| name);
-    !name.is_empty()
-        && name.starts_with(|c: char| c.is_ascii_alphabetic())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-#[cfg(test)]
-mod slash_command_tests {
-    use super::is_slash_command;
-
-    #[test]
-    fn commands_are_names_and_paths_are_messages() {
-        for command in [
-            "/help",
-            "/model gpt-5.6-terra",
-            "/clear",
-            "/start@aidaemon_bot",
-            "/set_up now",
-        ] {
-            assert!(is_slash_command(command), "{command}");
-        }
-        for message in [
-            "/tmp/aidaemon-live/prime/prime.py has a bug",
-            "/Users/alice/notes.txt",
-            "/ what",
-            "/",
-            "/123",
-            "hello /help",
-        ] {
-            assert!(!is_slash_command(message), "{message}");
-        }
-    }
-}
-
-/// Single source of truth for command definitions./// Single source of truth for command definitions.
-///
-/// Each command is defined once here; the registry drives Telegram's
-/// `setMyCommands` API, the `/help` output, and (in the future) Slack/Discord
-/// command registration.
-pub(crate) struct CommandDef {
-    /// Command name without leading `/` or `!`.
-    pub name: &'static str,
-    /// Short description shown in Telegram's command menu and `/help` text.
-    /// Must be 3-256 characters for Telegram's `BotCommand`.
-    pub description: &'static str,
-    /// Optional usage string shown only in `/help` (e.g. "/model [name]").
-    pub usage: Option<&'static str>,
-    /// Which platform group this command belongs to.
-    pub category: CommandCategory,
-}
-
-/// Determines which platforms show a command.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommandCategory {
-    /// Available on all platforms.
-    Core,
-    /// Telegram + Slack (process restart).
-    Restart,
-    /// Telegram-only (dynamic bot management).
-    Connect,
-    /// Telegram-only (terminal/agent bridge).
-    Terminal,
-}
-
-/// Returns the shared commands available on every platform.
-pub(crate) fn shared_commands() -> Vec<CommandDef> {
-    vec![
-        CommandDef {
-            name: "model",
-            description: "Show or switch AI model",
-            usage: Some("/model [name]"),
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "models",
-            description: "List available models",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "auto",
-            description: "Re-enable automatic model routing",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "reload",
-            description: "Reload configuration",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "tasks",
-            description: "List running tasks",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "work",
-            description: "View and manage durable work",
-            usage: Some("/work [ready|running|blocked|show|comment|unblock|retry]"),
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "cancel",
-            description: "Cancel a running task",
-            usage: Some("/cancel <id>"),
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "clear",
-            description: "Start fresh conversation (history kept)",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "wipe",
-            description: "Permanently delete this conversation",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "cost",
-            description: "Show token usage stats",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "context",
-            description: "Show conversation context coverage",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "checkpoints",
-            description: "List filesystem checkpoints",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "readonly",
-            description: "Make this chat read-only for 4 hours",
-            usage: None,
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "private",
-            description: "Don't remember or learn from your next message",
-            usage: Some("/private [off]"),
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "mode",
-            description: "Show or change this chat's access mode",
-            usage: Some("/mode [full|unrestricted|readonly]"),
-            category: CommandCategory::Core,
-        },
-        CommandDef {
-            name: "rollback",
-            description: "Preview or confirm a checkpoint rollback",
-            usage: Some("/rollback [checkpoint-id|confirm TOKEN]"),
-            category: CommandCategory::Core,
-        },
-    ]
-}
 
 /// Shared command dispatcher for commands that behave identically across
 /// Telegram, Slack, and Discord channels.
@@ -208,169 +40,182 @@ impl CommandContext {
         sender_id: Option<&str>,
         user_role: UserRole,
     ) -> Option<String> {
-        match cmd {
-            "/model" => Some(self.handle_model(args).await),
-            "/models" => Some(self.handle_models().await),
-            "/auto" => Some(self.handle_auto().await),
-            "/reload" => Some(self.handle_reload().await),
-            "/tasks" => Some(self.handle_tasks(session_id).await),
-            "/work" => Some(self.handle_work(args, session_id, user_role).await),
-            "/cancel" => Some(self.handle_cancel(args).await),
-            "/clear" => Some(self.handle_clear(session_id).await),
-            "/wipe" => Some(self.handle_wipe(session_id).await),
-            "/cost" => Some(self.handle_cost().await),
-            "/context" => Some(self.handle_context(session_id, user_role).await),
-            "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
-            "/readonly" => Some(self.handle_readonly(session_id, user_role).await),
-            "/private" => Some(self.handle_private(args, session_id, sender_id).await),
-            "/mode" => Some(self.handle_mode(args, session_id, user_role).await),
-            "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
-            _ => None,
-        }
+        self.shared()
+            .dispatch(cmd, args, session_id, sender_id, user_role)
+            .await
     }
 
-    /// `/private [off]`: the sender's next message in this chat is not
-    /// remembered or learned from (it only narrows memory, so anyone may ask).
-    /// `off` cancels. Both are the sender's own: in a shared chat nobody else
-    /// consumes or cancels them.
-    async fn handle_private(
+    fn shared(&self) -> SharedCommands {
+        SharedCommands {
+            agent: self.agent.clone(),
+            host: Arc::new(DaemonCommandHost {
+                state: self.state.clone(),
+            }),
+            task_registry: self.task_registry.clone(),
+            extensions: vec![
+                Arc::new(aidaemon_work::chat_command::WorkCommand::new(
+                    self.state.clone(),
+                )),
+                Arc::new(ReloadCommand {
+                    agent: self.agent.clone(),
+                    config_path: self.config_path.clone(),
+                }),
+                Arc::new(CheckpointCommands),
+            ],
+        }
+    }
+}
+
+/// The daemon's services behind the shared commands.
+struct DaemonCommandHost {
+    state: Arc<dyn StateStore>,
+}
+
+#[async_trait]
+impl CommandHost for DaemonCommandHost {
+    async fn set_next_message_private(
         &self,
-        args: &str,
         session_id: &str,
         sender_id: Option<&str>,
-    ) -> String {
-        let on = match args.trim().to_ascii_lowercase().as_str() {
-            "" => true,
-            "off" => false,
-            _ => return "Usage: /private [off]".to_string(),
-        };
-        match crate::agent::memory_plugin::set_next_message_private(
+        on: bool,
+    ) -> anyhow::Result<()> {
+        crate::agent::memory_plugin::set_next_message_private(
             self.state.as_ref(),
             session_id,
             sender_id,
             on,
         )
         .await
-        {
-            Ok(()) if on => "Your next message won't be remembered or learned from. \
-                             Memory can still be used to answer it."
-                .to_string(),
-            Ok(()) => "Cancelled: your next message is remembered as usual.".to_string(),
-            Err(error) => format!("Could not set that: {error}"),
-        }
     }
 
-    async fn handle_readonly(&self, session_id: &str, user_role: UserRole) -> String {
-        self.handle_mode("readonly", session_id, user_role).await
+    async fn chat_mode(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<(ChatMode, Option<DateTime<Utc>>)> {
+        crate::agent::authority::session_mode_with_expiry(self.state.as_ref(), session_id, now)
+            .await
+            .map(|(mode, until)| (chat_mode(mode), until))
     }
 
-    /// `/mode [full|unrestricted|readonly]`: the owner narrows or restores this
-    /// chat's tool authority. Explicit command syntax, persisted with an expiry.
-    async fn handle_mode(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
-        use crate::agent::authority::{
-            session_mode_with_expiry, set_session_mode, SessionMode, SESSION_MODE_TTL_HOURS,
+    async fn set_chat_mode(
+        &self,
+        session_id: &str,
+        mode: ChatMode,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        let mode = match mode {
+            ChatMode::ReadOnly => SessionMode::ReadOnly,
+            ChatMode::Full => SessionMode::Full,
+            ChatMode::Unrestricted => SessionMode::Unrestricted,
         };
-        const NOT_OWNER: &str = "Only the owner can change the mode.";
-        const USAGE: &str = "Usage: /mode [full|unrestricted|readonly]";
-        if user_role != UserRole::Owner {
-            return NOT_OWNER.to_string();
-        }
-        let now = Utc::now();
-        let left_suffix = |until: Option<chrono::DateTime<Utc>>| {
-            until.map_or_else(String::new, |at| {
-                format!(
-                    " (about {} left)",
-                    compact_chrono_duration(at - now, ZeroUnitStyle::Trim)
-                )
-            })
-        };
-        let requested = match args.trim().to_ascii_lowercase().as_str() {
-            "" => {
-                return match session_mode_with_expiry(self.state.as_ref(), session_id, now).await {
-                    Some((SessionMode::ReadOnly, until)) => {
-                        format!("Mode: read-only{}.", left_suffix(until))
-                    }
-                    Some((SessionMode::Unrestricted, until)) => {
-                        format!("Mode: unrestricted{}.", left_suffix(until))
-                    }
-                    Some((SessionMode::Full, _)) | None => "Mode: full.".to_string(),
-                };
-            }
-            "full" => SessionMode::Full,
-            "unrestricted" => SessionMode::Unrestricted,
-            "readonly" | "read-only" | "read_only" => SessionMode::ReadOnly,
-            _ => return USAGE.to_string(),
-        };
-        match set_session_mode(self.state.as_ref(), session_id, requested, now).await {
-            Ok(_) => match requested {
-                SessionMode::ReadOnly => format!("Read-only for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."),
-                SessionMode::Unrestricted => format!("Unrestricted for this chat for the next {SESSION_MODE_TTL_HOURS} hours, starting with your next message."),
-                SessionMode::Full => "Back to full access from your next message.".to_string(),
+        crate::agent::authority::set_session_mode(self.state.as_ref(), session_id, mode, now).await
+    }
+
+    fn chat_mode_hours(&self) -> i64 {
+        crate::agent::authority::SESSION_MODE_TTL_HOURS
+    }
+
+    async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+        self.state.get_history(session_id, limit).await
+    }
+
+    async fn conversation_summary(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<ConversationSummary>> {
+        self.state.get_conversation_summary(session_id).await
+    }
+
+    fn estimate_message_tokens(&self, messages: &[serde_json::Value]) -> usize {
+        crate::context_budget::estimate_multimodal_message_tokens(messages)
+    }
+
+    fn estimate_text_tokens(&self, text: &str) -> usize {
+        crate::context_budget::estimate_tokens(text)
+    }
+
+    async fn token_usage_since(&self, since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        self.state.get_token_usage_since(since).await
+    }
+}
+
+fn chat_mode(mode: SessionMode) -> ChatMode {
+    match mode {
+        SessionMode::ReadOnly => ChatMode::ReadOnly,
+        SessionMode::Full => ChatMode::Full,
+        SessionMode::Unrestricted => ChatMode::Unrestricted,
+    }
+}
+
+/// `/reload`: reload the daemon's config file, restoring its backup when
+/// the file no longer loads.
+struct ReloadCommand {
+    agent: Arc<dyn DaemonAgentRuntime>,
+    config_path: PathBuf,
+}
+
+#[async_trait]
+impl SlashCommand for ReloadCommand {
+    fn handles(&self, cmd: &str) -> bool {
+        cmd == "/reload"
+    }
+
+    async fn run(&self, _cmd: &str, _args: &str, _call: &SlashCall<'_>) -> String {
+        self.handle_reload().await
+    }
+}
+
+impl ReloadCommand {
+    async fn handle_reload(&self) -> String {
+        match AppConfig::load(&self.config_path) {
+            Ok(new_config) => match self.agent.reload_provider(&new_config).await {
+                Ok(status) => format!("Config reloaded. {}", status),
+                Err(e) => format!("Provider reload failed: {}", e),
             },
-            Err(error) => {
-                tracing::warn!(session_id, %error, "Could not change the session mode");
-                "Couldn't change the mode right now.".to_string()
-            }
-        }
-    }
-
-    async fn handle_context(&self, session_id: &str, user_role: UserRole) -> String {
-        if user_role != UserRole::Owner {
-            return "Only the owner can inspect conversation context coverage.".to_string();
-        }
-        let model = self.agent.current_model().await;
-        let (enabled, model_budget, trigger_tokens, recent_tokens, anchor) =
-            self.agent.context_debug_settings(session_id, &model).await;
-        let history = self.state.get_history(session_id, 10_000).await;
-        let summary = self.state.get_conversation_summary(session_id).await;
-        match (history, summary) {
-            (Ok(history), Ok(summary)) => {
-                let raw_values = history
-                    .iter()
-                    .map(|message| {
-                        serde_json::json!({
-                            "role": message.role,
-                            "content": message.content,
-                            "name": message.tool_name,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let exact_tokens =
-                    crate::context_budget::estimate_multimodal_message_tokens(&raw_values);
-                let compacted_messages = summary
-                    .as_ref()
-                    .map(|value| value.message_count)
-                    .unwrap_or(0);
-                let raw_recent_messages = history.len().saturating_sub(compacted_messages);
-                let summary_line = summary.as_ref().map_or_else(
-                    || "Summary: none yet".to_string(),
-                    |value| {
+            Err(e) => {
+                // Config is broken — try to auto-restore from backup
+                let backup = self.config_path.with_extension("toml.bak");
+                if backup.exists() {
+                    if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
                         format!(
-                            "Summary: {} messages through turn {} / message {} (~{} tokens)",
-                            value.message_count,
-                            value
-                                .last_turn_seq
-                                .map(|seq| seq.to_string())
-                                .unwrap_or_else(|| "legacy".to_string()),
-                            value.last_message_id,
-                            crate::context_budget::estimate_tokens(&value.summary)
+                            "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
+                            e
                         )
-                    },
-                );
-                format!(
-                    "Conversation context\nEnabled: {enabled}\nModel: {model}\nModel window: ~{model_budget} tokens\nCompaction high-water: ~{trigger_tokens} tokens\nRecent raw overlap target: ~{recent_tokens} tokens\n{summary_line}\nPersisted exact messages inspected: {} (~{exact_tokens} tokens)\nEstimated uncompacted messages: {raw_recent_messages}\nCurrent raw-turn anchor: {}\n\nExact retained history remains searchable even when it is not in the active prompt.",
-                    history.len(),
-                    anchor
-                        .map(|seq| seq.to_string())
-                        .unwrap_or_else(|| "not initialized".to_string())
-                )
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                format!("Could not inspect conversation context: {error}")
+                    } else {
+                        format!(
+                            "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
+                            e
+                        )
+                    }
+                } else {
+                    format!("Config reload failed: {}\n\nNo backup available.", e)
+                }
             }
         }
     }
+}
 
+/// `/checkpoints` and `/rollback`: the daemon's filesystem checkpoints.
+struct CheckpointCommands;
+
+#[async_trait]
+impl SlashCommand for CheckpointCommands {
+    fn handles(&self, cmd: &str) -> bool {
+        matches!(cmd, "/checkpoints" | "/rollback")
+    }
+
+    async fn run(&self, cmd: &str, args: &str, call: &SlashCall<'_>) -> String {
+        if cmd == "/checkpoints" {
+            self.handle_checkpoints(call.user_role).await
+        } else {
+            self.handle_rollback(args, call.session_id, call.user_role)
+                .await
+        }
+    }
+}
+
+impl CheckpointCommands {
     async fn handle_checkpoints(&self, user_role: UserRole) -> String {
         if user_role != UserRole::Owner {
             return "Only the owner can inspect filesystem checkpoints.".to_string();
@@ -410,715 +255,6 @@ impl CommandContext {
             Err(error) => format!("Could not prepare rollback: {error}"),
         }
     }
-
-    async fn handle_model(&self, arg: &str) -> String {
-        if arg.is_empty() {
-            let current = self.agent.current_model().await;
-            format!(
-                "Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview",
-                current
-            )
-        } else {
-            self.agent.set_model(arg.to_string()).await;
-            format!(
-                "Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.",
-                arg
-            )
-        }
-    }
-
-    async fn handle_models(&self) -> String {
-        match self.agent.list_models().await {
-            Ok(models) => {
-                if models.is_empty() {
-                    "No models found from provider.".to_string()
-                } else {
-                    let current = self.agent.current_model().await;
-                    let list: Vec<String> = models
-                        .iter()
-                        .map(|m| {
-                            if *m == current {
-                                format!("• {} (active)", m)
-                            } else {
-                                format!("• {}", m)
-                            }
-                        })
-                        .collect();
-                    format!("Available models:\n{}", list.join("\n"))
-                }
-            }
-            Err(e) => format!("Failed to list models: {}", e),
-        }
-    }
-
-    async fn handle_auto(&self) -> String {
-        self.agent.clear_model_override().await;
-        "Auto-routing re-enabled. Model will be selected automatically based on query complexity."
-            .to_string()
-    }
-
-    async fn handle_reload(&self) -> String {
-        match AppConfig::load(&self.config_path) {
-            Ok(new_config) => match self.agent.reload_provider(&new_config).await {
-                Ok(status) => format!("Config reloaded. {}", status),
-                Err(e) => format!("Provider reload failed: {}", e),
-            },
-            Err(e) => {
-                // Config is broken — try to auto-restore from backup
-                let backup = self.config_path.with_extension("toml.bak");
-                if backup.exists() {
-                    if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
-                        format!(
-                            "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
-                            e
-                        )
-                    } else {
-                        format!(
-                            "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
-                            e
-                        )
-                    }
-                } else {
-                    format!("Config reload failed: {}\n\nNo backup available.", e)
-                }
-            }
-        }
-    }
-
-    async fn handle_tasks(&self, session_id: &str) -> String {
-        let entries = self
-            .task_registry
-            .list_for_session(session_id)
-            .await
-            .into_iter()
-            .filter(|entry| !matches!(entry.status, TaskStatus::Completed))
-            .collect::<Vec<_>>();
-        if entries.is_empty() {
-            "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string()
-        } else {
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|e| {
-                    let elapsed = match e.finished_at {
-                        Some(fin) => {
-                            let d = fin - e.started_at;
-                            format!("{}s", d.num_seconds())
-                        }
-                        None => {
-                            let d = Utc::now() - e.started_at;
-                            format!("{}s elapsed", d.num_seconds())
-                        }
-                    };
-                    format!("#{} [{}] {} ({})", e.id, e.status, e.description, elapsed)
-                })
-                .collect();
-            format!(
-                "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
-                lines.join("\n")
-            )
-        }
-    }
-
-    async fn handle_work(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
-        if user_role != UserRole::Owner {
-            return "Only the owner can view or manage durable work.".to_string();
-        }
-
-        let mut parts = args.split_whitespace();
-        let action = parts.next().unwrap_or("overview").to_ascii_lowercase();
-        let project_id = match self.state.get_session_work_project(session_id).await {
-            Ok(project_id) => project_id,
-            Err(error) => return format!("Could not resolve the active project: {error}"),
-        };
-
-        match action.as_str() {
-            "overview" | "all" => self.render_work_overview(&project_id).await,
-            "waiting" | "ready" | "running" | "in_progress" | "blocked" | "attention"
-            | "needs_attention" | "done" => {
-                let lane = match action.as_str() {
-                    "running" => "in_progress",
-                    "attention" => "needs_attention",
-                    value => value,
-                };
-                self.render_work_lane(&project_id, lane).await
-            }
-            "show" => {
-                let Some(reference) = parts.next() else {
-                    return "Usage: /work show <task-id>".to_string();
-                };
-                let task = match self.resolve_work_task(&project_id, reference).await {
-                    Ok(task) => task,
-                    Err(message) => return message,
-                };
-                self.render_work_task(&task).await
-            }
-            "comment" | "unblock" => {
-                let Some(reference) = parts.next() else {
-                    return format!("Usage: /work {action} <task-id> <message>");
-                };
-                let message = parts.collect::<Vec<_>>().join(" ");
-                if message.trim().is_empty() {
-                    return format!("Usage: /work {action} <task-id> <message>");
-                }
-                let task = match self.resolve_work_task(&project_id, reference).await {
-                    Ok(task) => task,
-                    Err(message) => return message,
-                };
-                if action == "unblock" {
-                    return match self
-                        .state
-                        .unblock_task(&task.task_id, &message, "owner", Some(session_id))
-                        .await
-                    {
-                        Ok(true) => format!(
-                            "Task {} was unblocked and returned to the ready queue.",
-                            short_id(&task.task_id)
-                        ),
-                        Ok(false) => "That task is not currently blocked.".to_string(),
-                        Err(error) => format!("Could not unblock task: {error}"),
-                    };
-                }
-                let entry = TaskJournalEntry::new(
-                    &task.project_id,
-                    &task.goal_id,
-                    &task.goal_run_id,
-                    "comment",
-                    "human",
-                    "owner",
-                    &message,
-                )
-                .with_task(Some(&task.task_id), None)
-                .with_source_channel(Some(session_id));
-                match self.state.append_task_journal(&entry).await {
-                    Ok(()) => format!("Comment added to task {}.", short_id(&task.task_id)),
-                    Err(error) => format!("Could not add comment: {error}"),
-                }
-            }
-            "retry" | "cancel" => {
-                let Some(reference) = parts.next() else {
-                    return format!("Usage: /work {action} <task-id>");
-                };
-                let task = match self.resolve_work_task(&project_id, reference).await {
-                    Ok(task) => task,
-                    Err(message) => return message,
-                };
-                let result = if action == "retry" {
-                    self.state
-                        .retry_work_task(&task.task_id, "owner", Some(session_id))
-                        .await
-                } else {
-                    self.state
-                        .cancel_work_task(&task.task_id, "owner", Some(session_id))
-                        .await
-                };
-                match result {
-                    Ok(true) if action == "retry" => {
-                        format!("Task {} was queued for retry.", short_id(&task.task_id))
-                    }
-                    Ok(true) => format!("Task {} was cancelled.", short_id(&task.task_id)),
-                    Ok(false) if action == "retry" => {
-                        format!("Task {} cannot be retried.", short_id(&task.task_id))
-                    }
-                    Ok(false) => format!("Task {} cannot be cancelled.", short_id(&task.task_id)),
-                    Err(error) => format!("Could not {action} task: {error}"),
-                }
-            }
-            "assign" => {
-                let (Some(reference), Some(profile_id)) = (parts.next(), parts.next()) else {
-                    return "Usage: /work assign <task-id> <profile-id>".to_string();
-                };
-                let task = match self.resolve_work_task(&project_id, reference).await {
-                    Ok(task) => task,
-                    Err(message) => return message,
-                };
-                match self
-                    .state
-                    .assign_task_worker_profile(
-                        &task.task_id,
-                        profile_id,
-                        "owner",
-                        Some(session_id),
-                    )
-                    .await
-                {
-                    Ok(true) => format!(
-                        "Task {} assigned to profile {}.",
-                        short_id(&task.task_id),
-                        profile_id
-                    ),
-                    Ok(false) => "Task or worker profile was unavailable.".to_string(),
-                    Err(error) => format!("Could not assign worker profile: {error}"),
-                }
-            }
-            "workspace" => {
-                let Some(reference) = parts.next() else {
-                    return "Usage: /work workspace <task-id> [shared|isolated|worktree]"
-                        .to_string();
-                };
-                let task = match self.resolve_work_task(&project_id, reference).await {
-                    Ok(task) => task,
-                    Err(message) => return message,
-                };
-                if let Some(policy) = parts.next() {
-                    return match self
-                        .state
-                        .set_task_workspace_policy(&task.task_id, policy)
-                        .await
-                    {
-                        Ok(true) => format!(
-                            "Task {} workspace policy set to {}.",
-                            short_id(&task.task_id),
-                            policy
-                        ),
-                        Ok(false) => {
-                            "Workspace policy can only change before execution.".to_string()
-                        }
-                        Err(error) => format!("Could not set workspace policy: {error}"),
-                    };
-                }
-                match self.state.get_task_workspace(&task.task_id).await {
-                    Ok(Some(workspace)) => format!(
-                        "Task {} workspace\nPolicy: {}\nStatus: {}\nPath: {}\nBranch: {}",
-                        short_id(&task.task_id),
-                        workspace.policy,
-                        workspace.status,
-                        workspace.root_path,
-                        workspace.branch_name.as_deref().unwrap_or("—")
-                    ),
-                    Ok(None) => match self.state.get_task_workspace_policy(&task.task_id).await {
-                        Ok(policy) => format!(
-                            "Task {} has policy {}; no workspace has been created yet.",
-                            short_id(&task.task_id),
-                            policy
-                        ),
-                        Err(error) => format!("Could not inspect workspace: {error}"),
-                    },
-                    Err(error) => format!("Could not inspect workspace: {error}"),
-                }
-            }
-            "profiles" => match self.state.list_worker_profiles(Some(&project_id)).await {
-                Ok(profiles) if profiles.is_empty() => "No enabled worker profiles.".to_string(),
-                Ok(profiles) => {
-                    let lines = profiles
-                        .into_iter()
-                        .map(|profile| {
-                            format!(
-                                "• {} — {} (max {}, {})",
-                                profile.id,
-                                profile.name,
-                                profile.max_concurrency,
-                                profile.workspace_policy
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    format!("Worker profiles\n{}", lines.join("\n"))
-                }
-                Err(error) => format!("Could not list worker profiles: {error}"),
-            },
-            "projects" => match self.state.list_work_projects().await {
-                Ok(projects) => {
-                    let lines = projects
-                        .into_iter()
-                        .map(|project| {
-                            let marker = if project.id == project_id {
-                                " (active)"
-                            } else {
-                                ""
-                            };
-                            format!("• {} — {}{}", project.id, project.name, marker)
-                        })
-                        .collect::<Vec<_>>();
-                    format!("Projects\n{}", lines.join("\n"))
-                }
-                Err(error) => format!("Could not list projects: {error}"),
-            },
-            "project" => {
-                let Some(reference_head) = parts.next() else {
-                    return format!("Active project: {project_id}\nUsage: /work project <id>");
-                };
-                if reference_head.eq_ignore_ascii_case("create") {
-                    let name = parts.collect::<Vec<_>>().join(" ");
-                    if name.trim().is_empty() {
-                        return "Usage: /work project create <name>".to_string();
-                    }
-                    return match self.state.create_work_project(&name, None).await {
-                        Ok(project) => match self
-                            .state
-                            .set_session_work_project(session_id, &project.id)
-                            .await
-                        {
-                            Ok(true) => format!(
-                                "Created and selected project {} ({})",
-                                project.name, project.id
-                            ),
-                            Ok(false) => {
-                                "Project was created but could not be selected.".to_string()
-                            }
-                            Err(error) => {
-                                format!("Project was created but selection failed: {error}")
-                            }
-                        },
-                        Err(error) => format!("Could not create project: {error}"),
-                    };
-                }
-                let reference = std::iter::once(reference_head)
-                    .chain(parts)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let projects = match self.state.list_work_projects().await {
-                    Ok(projects) => projects,
-                    Err(error) => return format!("Could not list projects: {error}"),
-                };
-                let matches = projects
-                    .into_iter()
-                    .filter(|project| {
-                        project.id == reference || project.name.eq_ignore_ascii_case(&reference)
-                    })
-                    .collect::<Vec<_>>();
-                let Some(project) = matches.first() else {
-                    return "Project not found. Use /work projects to list choices.".to_string();
-                };
-                match self
-                    .state
-                    .set_session_work_project(session_id, &project.id)
-                    .await
-                {
-                    Ok(true) => format!("Active project set to {}.", project.name),
-                    Ok(false) => "Project not found.".to_string(),
-                    Err(error) => format!("Could not select project: {error}"),
-                }
-            }
-            _ => work_usage(),
-        }
-    }
-
-    async fn render_work_overview(&self, project_id: &str) -> String {
-        match self.state.list_work_goals(project_id, false, 25).await {
-            Ok(goals) if goals.is_empty() => {
-                format!("No active work in project {project_id}.")
-            }
-            Ok(goals) => {
-                let lines = goals
-                    .into_iter()
-                    .map(|goal| {
-                        format!(
-                            "• {} {} — ready {} · running {} · blocked {} · attention {} · done {}",
-                            short_id(&goal.goal_id),
-                            truncate_chars(&goal.description, 72),
-                            goal.ready,
-                            goal.in_progress,
-                            goal.blocked,
-                            goal.needs_attention,
-                            goal.done
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                format!(
-                    "Active work · project {project_id}\n{}\n\nUse /work ready, /work blocked, or /work show <task-id>.",
-                    lines.join("\n")
-                )
-            }
-            Err(error) => format!("Could not load work: {error}"),
-        }
-    }
-
-    async fn render_work_lane(&self, project_id: &str, lane: &str) -> String {
-        match self.state.list_work_tasks(project_id, Some(lane), 50).await {
-            Ok(tasks) if tasks.is_empty() => format!("No tasks in the {lane} lane."),
-            Ok(tasks) => {
-                let lines = tasks
-                    .into_iter()
-                    .map(|task| {
-                        let owner = task
-                            .worker_profile
-                            .as_deref()
-                            .map(|profile| format!(" · {profile}"))
-                            .unwrap_or_default();
-                        format!(
-                            "• {} [{}] {}{}",
-                            short_id(&task.task_id),
-                            task.priority,
-                            truncate_chars(&task.description, 90),
-                            owner
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                format!("{lane}\n{}", lines.join("\n"))
-            }
-            Err(error) => format!("Could not load work: {error}"),
-        }
-    }
-
-    async fn resolve_work_task(
-        &self,
-        project_id: &str,
-        reference: &str,
-    ) -> Result<WorkTaskSummary, String> {
-        let tasks = self
-            .state
-            .list_work_tasks(project_id, None, 500)
-            .await
-            .map_err(|error| format!("Could not load work: {error}"))?;
-        let mut matches = tasks
-            .into_iter()
-            .filter(|task| task.task_id == reference || task.task_id.starts_with(reference))
-            .collect::<Vec<_>>();
-        match matches.len() {
-            0 => Err("Task not found in the active project run.".to_string()),
-            1 => Ok(matches.remove(0)),
-            _ => Err("Task reference is ambiguous; provide more ID characters.".to_string()),
-        }
-    }
-
-    async fn render_work_task(&self, task: &WorkTaskSummary) -> String {
-        let journal = self
-            .state
-            .get_task_journal(&task.task_id, 8)
-            .await
-            .unwrap_or_default();
-        let handoff = self
-            .state
-            .get_latest_task_handoff(&task.task_id)
-            .await
-            .ok()
-            .flatten();
-        let workspace = self
-            .state
-            .get_task_workspace(&task.task_id)
-            .await
-            .ok()
-            .flatten();
-        let mut reply = format!(
-            "Task {}\n{}\nLane: {} · status: {} · priority: {}\nGoal: {}\nWorker: {}",
-            short_id(&task.task_id),
-            task.description,
-            task.lane,
-            task.status,
-            task.priority,
-            truncate_chars(&task.goal_description, 100),
-            task.worker_profile.as_deref().unwrap_or("unassigned")
-        );
-        if let Some(blocker) = &task.blocker {
-            reply.push_str(&format!("\nBlocker: {blocker}"));
-        }
-        if let Some(handoff) = handoff {
-            reply.push_str(&format!("\n\nLatest handoff: {}", handoff.summary));
-            if !handoff.verification.is_empty() {
-                reply.push_str(&format!("\nVerified: {}", handoff.verification.join("; ")));
-            }
-            if let Some(risk) = handoff.remaining_risk {
-                reply.push_str(&format!("\nRemaining risk: {risk}"));
-            }
-            if let Some(next) = handoff.next_step {
-                reply.push_str(&format!("\nNext step: {next}"));
-            }
-        }
-        if let Some(workspace) = workspace {
-            reply.push_str(&format!(
-                "\n\nWorkspace: {} ({})",
-                workspace.root_path, workspace.status
-            ));
-        }
-        if !journal.is_empty() {
-            let lines = journal
-                .into_iter()
-                .map(|entry| {
-                    format!(
-                        "• {} · {}: {}",
-                        entry.created_at,
-                        entry.entry_type,
-                        truncate_chars(&entry.body, 120)
-                    )
-                })
-                .collect::<Vec<_>>();
-            reply.push_str(&format!("\n\nRecent journal\n{}", lines.join("\n")));
-        }
-        reply
-    }
-
-    async fn handle_cancel(&self, arg: &str) -> String {
-        if arg.is_empty() {
-            "Usage: /cancel <task-id>\nExample: /cancel 1".to_string()
-        } else {
-            match arg.parse::<u64>() {
-                Ok(task_id) => {
-                    if self.task_registry.cancel(task_id).await {
-                        format!("Task #{} cancelled.", task_id)
-                    } else {
-                        format!("Task #{} not found or not running.", task_id)
-                    }
-                }
-                Err(_) => "Invalid task ID. Usage: /cancel <task-id>".to_string(),
-            }
-        }
-    }
-
-    async fn handle_clear(&self, session_id: &str) -> String {
-        // Cancel any running tasks for this session so the agent loop aborts
-        // immediately instead of continuing to burn tokens after /clear.
-        let cancelled_tasks = self
-            .task_registry
-            .cancel_running_for_session(session_id)
-            .await;
-        // Also cancel finite orchestration goals associated with this
-        // conversation. Recurring schedules and personal goals intentionally
-        // survive a context clear.
-        let cancelled_goals = self
-            .agent
-            .cancel_active_finite_work_for_session(session_id)
-            .await;
-
-        // Non-destructive: sets a context boundary so the next turn starts
-        // fresh, but the event history remains for memory and audit. Use /wipe
-        // to permanently delete.
-        match self.agent.clear_session_context(session_id).await {
-            Ok(_) => {
-                let mut cancellations = Vec::new();
-                if !cancelled_tasks.is_empty() {
-                    cancellations.push(format!(
-                        "{} running task{}",
-                        cancelled_tasks.len(),
-                        if cancelled_tasks.len() == 1 { "" } else { "s" }
-                    ));
-                }
-                if !cancelled_goals.is_empty() {
-                    cancellations.push(format!(
-                        "{} background goal{}",
-                        cancelled_goals.len(),
-                        if cancelled_goals.len() == 1 { "" } else { "s" }
-                    ));
-                }
-                let suffix = if cancellations.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({} cancelled.)", cancellations.join(" and "))
-                };
-                format!(
-                    "Context cleared. Starting fresh — your active history is kept (use /wipe to \
-                     erase it from the active database).{suffix}"
-                )
-            }
-            Err(e) => format!("Failed to clear context: {}", e),
-        }
-    }
-
-    async fn handle_wipe(&self, session_id: &str) -> String {
-        let cancelled = self
-            .task_registry
-            .cancel_running_for_session(session_id)
-            .await;
-
-        // Destructive: erases this session's active database artifacts.
-        match self.agent.clear_session(session_id).await {
-            Ok(_) => {
-                let suffix = if cancelled.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " ({} running task{} cancelled.)",
-                        cancelled.len(),
-                        if cancelled.len() == 1 { "" } else { "s" }
-                    )
-                };
-                format!(
-                    "Conversation erased from the active database (events, exact-search index, \
-                     summaries, episodes, and raw memory spans). Facts already saved to memory \
-                     are kept without raw-message provenance. Existing encrypted backups may \
-                     retain older copies until their own lifecycle removes them.{suffix}"
-                )
-            }
-            Err(e) => format!("Failed to wipe conversation: {}", e),
-        }
-    }
-
-    async fn handle_cost(&self) -> String {
-        let now = Utc::now();
-        let since_24h = (now - chrono::Duration::hours(24))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        let since_7d = (now - chrono::Duration::days(7))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        let records_24h = match self.state.get_token_usage_since(&since_24h).await {
-            Ok(r) => r,
-            Err(e) => return format!("Failed to query token usage: {}", e),
-        };
-        let records_7d = match self.state.get_token_usage_since(&since_7d).await {
-            Ok(r) => r,
-            Err(e) => return format!("Failed to query token usage: {}", e),
-        };
-
-        let (input_24h, output_24h) = records_24h.iter().fold((0i64, 0i64), |(i, o), r| {
-            (i + r.input_tokens, o + r.output_tokens)
-        });
-        let (input_7d, output_7d) = records_7d.iter().fold((0i64, 0i64), |(i, o), r| {
-            (i + r.input_tokens, o + r.output_tokens)
-        });
-
-        // Top models (by total tokens in 7d)
-        let mut model_totals: HashMap<&str, i64> = HashMap::new();
-        for r in &records_7d {
-            *model_totals.entry(&r.model).or_insert(0) += r.input_tokens + r.output_tokens;
-        }
-        let mut models_sorted: Vec<(&&str, &i64)> = model_totals.iter().collect();
-        models_sorted.sort_by(|a, b| b.1.cmp(a.1));
-
-        let mut reply = format!(
-            "Token usage (last 24h):\n  Input:  {} tokens\n  Output: {} tokens\n\n\
-             Token usage (last 7d):\n  Input:  {} tokens\n  Output: {} tokens",
-            format_number(input_24h),
-            format_number(output_24h),
-            format_number(input_7d),
-            format_number(output_7d),
-        );
-
-        if !models_sorted.is_empty() {
-            reply.push_str("\n\nTop models (7d):");
-            for (model, total) in models_sorted.iter().take(5) {
-                reply.push_str(&format!("\n  {}: {} tokens", model, format_number(**total)));
-            }
-        }
-
-        reply
-    }
-}
-
-fn short_id(id: &str) -> &str {
-    let end = id
-        .char_indices()
-        .nth(8)
-        .map(|(index, _)| index)
-        .unwrap_or(id.len());
-    &id[..end]
-}
-
-fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    let mut truncated = value
-        .chars()
-        .take(max.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
-}
-
-fn work_usage() -> String {
-    "Usage:\n\
-     /work — active overview\n\
-     /work ready|running|blocked|attention|done\n\
-     /work show <task-id>\n\
-     /work comment <task-id> <message>\n\
-     /work unblock <task-id> <resolution>\n\
-     /work retry|cancel <task-id>\n\
-     /work assign <task-id> <profile-id>\n\
-     /work workspace <task-id> [shared|isolated|worktree]\n\
-     /work profiles|projects\n\
-     /work project <id>\n\
-     /work project create <name>"
-        .to_string()
 }
 
 #[cfg(test)]

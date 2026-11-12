@@ -192,82 +192,7 @@ pub(crate) fn split_telegram_text(text: &str, max_units: usize) -> Vec<String> {
     parts
 }
 
-/// Format a number with comma separators (e.g. 12450 → "12,450").
-pub(crate) fn format_number(n: i64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-/// Build the /help response text from a list of command definitions.
-///
-/// `commands`: the command definitions to include (platform-specific).
-/// `prefix`: command prefix character ("/" for Telegram/Discord, "!" for Slack).
-pub(crate) fn build_help_text(commands: &[super::commands::CommandDef], prefix: &str) -> String {
-    let p = prefix;
-    let mut text = String::from(
-        "**What I can do**\n\
-         \n\
-         **Schedule recurring tasks**\n\
-         _\"Check my disk space every 6 hours\"_\n\
-         _\"Remind me to review PRs on weekdays at 9am\"_\n\
-         \n\
-         **Search & browse the web**\n\
-         _\"What's the latest on Rust 2024 edition?\"_\n\
-         _\"Summarize this article: <url>\"_\n\
-         \n\
-         **Run commands & manage your system**\n\
-         _\"Show me docker container status\"_\n\
-         _\"Deploy the staging branch\"_\n\
-         \n\
-         **Switch AI providers with guidance**\n\
-         _\"Switch to Moonshot\"_\n\
-         _\"Move me to Cloudflare Gateway and ask for what you need\"_\n\
-         \n\
-         **Remember things about you**\n\
-         _\"I prefer dark mode and vim keybindings\"_\n\
-         _\"My deploy server is 10.0.1.50\"_\n\
-         \n\
-         **Track your goals**\n\
-         _\"I want to finish the API migration this month\"_\n\
-         _\"How's my progress on learning Rust?\"_\n\
-         \n\
-         **Delegate coding tasks**\n\
-         _\"Refactor the auth module to use JWT\"_\n\
-         _\"Fix the failing tests in src/parser\"_\n\
-         \n\
-         **Send & receive files**\n\
-         _\"Send me the latest log file\"_\n\
-         _\"Analyze this CSV I'm uploading\"_\n\
-         \n\
-         Just ask in plain language — I'll pick the right tools.\n\
-         \n\
-         **Commands**",
-    );
-
-    for cmd in commands {
-        let label = match cmd.usage {
-            Some(usage) => {
-                // Replace the leading "/" with the platform prefix.
-                if let Some(rest) = usage.strip_prefix('/') {
-                    format!("{p}{rest}")
-                } else {
-                    usage.to_string()
-                }
-            }
-            None => format!("{p}{}", cmd.name),
-        };
-        text.push_str(&format!("\n`{}` — {}", label, cmd.description));
-    }
-
-    text
-}
+pub(crate) use aidaemon_channels::slash::build_help_text;
 
 pub(crate) use aidaemon_events::attachments::sanitize_filename;
 
@@ -365,15 +290,6 @@ mod tests {
         for msg in &msgs {
             assert!(msg.len() <= 4096 + 50); // small tolerance for split logic
         }
-    }
-
-    #[test]
-    fn test_format_number() {
-        assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(999), "999");
-        assert_eq!(format_number(1000), "1,000");
-        assert_eq!(format_number(12450), "12,450");
-        assert_eq!(format_number(1_000_000), "1,000,000");
     }
 
     #[test]

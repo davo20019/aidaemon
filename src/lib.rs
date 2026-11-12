@@ -14,7 +14,7 @@ use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
-mod duration_format;
+use aidaemon_tools::duration_format;
 #[allow(dead_code)]
 mod events;
 mod otel_export;
