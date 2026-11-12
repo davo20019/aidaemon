@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 /// Marker prefix for the task context tail message. SHARED between the tail
 /// builder (`system_prompt.rs`) and this module so the constant never drifts.
 /// The tail builder re-exports this constant; do not duplicate the literal.
-pub(crate) const TASK_CONTEXT_TAIL_MARKER: &str = "[Task Context]";
+pub const TASK_CONTEXT_TAIL_MARKER: &str = "[Task Context]";
 
 /// Index of the last user-role message whose content equals `user_text`.
 ///
@@ -33,7 +33,7 @@ pub(crate) const TASK_CONTEXT_TAIL_MARKER: &str = "[Task Context]";
 /// its tool chain + checkpoint). Falls back to `messages.len()` when no
 /// matching user message is present, so the pre-boundary region degrades to
 /// "everything after message zero" rather than panicking.
-pub(crate) fn boundary_pos(messages: &[Value], user_text: &str) -> usize {
+pub fn boundary_pos(messages: &[Value], user_text: &str) -> usize {
     find_current_user_boundary(messages, user_text).unwrap_or(messages.len())
 }
 
@@ -41,7 +41,7 @@ fn find_current_user_boundary(messages: &[Value], user_text: &str) -> Option<usi
     messages.iter().enumerate().rev().find_map(|(i, m)| {
         if m.get("role").and_then(|r| r.as_str()) == Some("user")
             && m.get("content").is_some_and(|content| {
-                crate::agent::vision::user_message_content_matches(content, user_text)
+                crate::message_content::user_message_content_matches(content, user_text)
             })
         {
             Some(i)
@@ -58,7 +58,7 @@ fn find_current_user_boundary(messages: &[Value], user_text: &str) -> Option<usi
 /// provider-call `hash_pre_boundary`). The attribution value is in comparing a
 /// single stage's hash across consecutive builds — a stage whose hash flips
 /// while `keep_from` is stable is content mutation, not window-trim movement.
-pub(crate) fn stage_pre_boundary_hash(messages: &[Value], user_text: &str) -> String {
+pub fn stage_pre_boundary_hash(messages: &[Value], user_text: &str) -> String {
     let boundary = boundary_pos(messages, user_text);
     let skip = usize::from(
         messages
@@ -74,7 +74,7 @@ pub(crate) fn stage_pre_boundary_hash(messages: &[Value], user_text: &str) -> St
 /// SHA-256 hex digest over the canonical (recursively key-sorted) JSON form of
 /// `value`. Exposed for the call site to fingerprint tool definitions and the
 /// session summary as separate region hashes.
-pub(crate) fn hash_canonical(value: &Value) -> String {
+pub fn hash_canonical(value: &Value) -> String {
     let mut canonical = String::new();
     write_canonical(value, &mut canonical);
     let mut hasher = Sha256::new();

@@ -201,15 +201,7 @@ pub fn format_tool_observation_label(tool_name: &str, result_hint: &str) -> Stri
     }
 }
 
-/// Extract plain text from OpenAI-style string or multimodal content.
-pub fn content_value_as_text(content: &Value) -> Option<String> {
-    crate::message_content::content_value_as_text(content)
-}
-
-/// Whether a rendered user message matches the current turn's user text.
-pub fn user_message_content_matches(content: &Value, user_text: &str) -> bool {
-    content_value_as_text(content).is_some_and(|text| text == user_text)
-}
+pub(crate) use crate::message_content::user_message_content_matches;
 
 #[cfg(test)]
 mod tests {

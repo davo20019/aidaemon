@@ -13,13 +13,14 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
-use crate::traits::{
-    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, ToolCall, ToolChoiceMode,
+use aidaemon_events::conversation::ToolCall;
+use aidaemon_events::provider::{
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, ToolChoiceMode,
 };
 
 /// How a provider's models are listed: the SDK has no listing call.
 #[derive(Clone, Debug)]
-pub(crate) enum ModelList {
+pub enum ModelList {
     Fixed(Vec<String>),
     /// `GET {base}/models` with a bearer key (OpenAI-compatible servers).
     OpenAiModels {
@@ -29,7 +30,7 @@ pub(crate) enum ModelList {
 }
 
 impl ModelList {
-    pub(crate) async fn list(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn list(&self) -> anyhow::Result<Vec<String>> {
         match self {
             ModelList::Fixed(models) => Ok(models.clone()),
             ModelList::OpenAiModels { base_url, api_key } => {
@@ -57,7 +58,7 @@ impl ModelList {
 /// Chat-completions calls on any SDK provider, for daemon code that builds
 /// chat JSON. Bring it into scope to call `provider.chat_with_options(..)`.
 #[async_trait]
-pub(crate) trait ChatJson {
+pub trait ChatJson {
     async fn chat_with_options(
         &self,
         model: &str,
@@ -82,7 +83,7 @@ impl<P: sdk::Provider + ?Sized> ChatJson for P {
 
 /// One model call: `messages` and `tools` in chat-completions JSON. A
 /// provider failure comes back as the daemon's classified [`ProviderError`].
-pub(crate) async fn chat_with_options<P: sdk::Provider + ?Sized>(
+pub async fn chat_with_options<P: sdk::Provider + ?Sized>(
     provider: &P,
     model: &str,
     messages: &[Value],
@@ -96,7 +97,7 @@ pub(crate) async fn chat_with_options<P: sdk::Provider + ?Sized>(
 }
 
 /// Stream `request` to its end, noting progress for the watchdog.
-pub(crate) async fn send<P: sdk::Provider + ?Sized>(
+pub async fn send<P: sdk::Provider + ?Sized>(
     provider: &P,
     request: &sdk::ModelRequest,
 ) -> anyhow::Result<sdk::ModelResponse> {
@@ -112,7 +113,7 @@ pub(crate) async fn send<P: sdk::Provider + ?Sized>(
     Err(ProviderError::malformed_shape("provider stream ended without a response").into())
 }
 
-pub(crate) fn to_sdk_request(
+pub fn to_sdk_request(
     model: &str,
     messages: &[Value],
     tools: &[Value],
@@ -214,7 +215,7 @@ fn split_content(content: Option<&Value>) -> (String, Vec<sdk::Image>, Vec<sdk::
 /// needs: images and audio, reasoning signatures on tool calls, and tool
 /// arguments that are not valid JSON (as the SDK's `_raw` form, so the
 /// call is replayed byte for byte).
-pub(crate) fn to_sdk_messages(messages: &[Value]) -> Vec<sdk::Message> {
+pub fn to_sdk_messages(messages: &[Value]) -> Vec<sdk::Message> {
     messages
         .iter()
         .filter_map(|value| {
@@ -268,7 +269,7 @@ fn to_sdk_call(call: &Value) -> Option<sdk::ToolCall> {
     Some(sdk_call)
 }
 
-pub(crate) fn to_provider_response(response: sdk::ModelResponse, model: &str) -> ProviderResponse {
+pub fn to_provider_response(response: sdk::ModelResponse, model: &str) -> ProviderResponse {
     let usage = response.usage;
     ProviderResponse {
         content: (!response.text.is_empty()).then_some(response.text),
@@ -304,7 +305,7 @@ pub(crate) fn to_provider_response(response: sdk::ModelResponse, model: &str) ->
 
 /// The options a request carries, as daemon [`ChatOptions`] (for logging
 /// and assertions in tests).
-pub(crate) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
+pub fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
     ChatOptions {
         response_mode: match &request.options.response_format {
             sdk::ResponseFormat::Text => ResponseMode::Text,
@@ -335,7 +336,7 @@ pub(crate) fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
 }
 
 /// Tool definitions in the wrapped chat-completions shape.
-pub(crate) fn to_chat_tools(specs: &[sdk::ToolSpec]) -> Vec<Value> {
+pub fn to_chat_tools(specs: &[sdk::ToolSpec]) -> Vec<Value> {
     specs
         .iter()
         .map(|spec| {
@@ -373,7 +374,7 @@ fn chat_content(text: &str, images: &[sdk::Image], audio: &[sdk::Audio]) -> Valu
 /// ride on a `tool` message for every backend, so they follow the run of
 /// tool results as a user message; injected user-role directives become
 /// system messages.
-pub(crate) fn to_chat_messages(messages: &[sdk::Message]) -> Vec<Value> {
+pub fn to_chat_messages(messages: &[sdk::Message]) -> Vec<Value> {
     let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let mut out = Vec::with_capacity(messages.len());
     let mut pending_images: Vec<Value> = Vec::new();
@@ -449,7 +450,7 @@ pub(crate) fn to_chat_messages(messages: &[sdk::Message]) -> Vec<Value> {
 }
 
 /// A daemon [`ChatOptions`]-free reply as an SDK response.
-pub(crate) fn to_sdk_response(response: ProviderResponse) -> sdk::ModelResponse {
+pub fn to_sdk_response(response: ProviderResponse) -> sdk::ModelResponse {
     let usage = response.usage.as_ref();
     sdk::ModelResponse {
         text: response.content.unwrap_or_default(),
@@ -489,8 +490,8 @@ pub(crate) fn to_sdk_response(response: ProviderResponse) -> sdk::ModelResponse 
 
 /// A daemon classified error as the SDK's typed error (for test providers
 /// that script daemon errors).
-#[cfg(test)]
-pub(crate) fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
+#[cfg(any(test, feature = "testing"))]
+pub fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
     let detail = match error.status {
         Some(status) => format!("HTTP {status}: {}", error.message),
         None => error.message.clone(),
@@ -539,7 +540,7 @@ fn status_in(message: &str) -> Option<u16> {
 
 /// An SDK error as the daemon's classified error, so the recovery engine
 /// picks the same route it always has.
-pub(crate) fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
+pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
     let text = error.to_string();
     let status = status_in(&text);
     let mut out = ProviderError::from_status(status.unwrap_or(0), &text);
@@ -596,7 +597,7 @@ pub(crate) fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::ProviderRecoveryRoute as Route;
+    use crate::chat_bridge::ProviderRecoveryRoute as Route;
 
     #[test]
     fn requests_carry_options_tools_images_audio_and_signatures() {

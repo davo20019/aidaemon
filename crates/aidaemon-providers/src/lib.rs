@@ -59,6 +59,7 @@ mod chatgpt;
 mod errors;
 mod google;
 mod openai;
+pub mod routing;
 mod sse;
 mod transport;
 mod xai;

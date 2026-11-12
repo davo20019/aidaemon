@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use aidaemon_decisions::{Answer, ConfidenceSource, DecisionResponse};
 
-use crate::config::{DecisionMode, DecisionModes};
+use crate::settings::{DecisionMode, DecisionModes};
 
 /// A decision the daemon asks a decision backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -197,7 +197,7 @@ pub struct GatedResponse {
 }
 
 impl GatedResponse {
-    pub(crate) fn new(response: DecisionResponse, spec: &DecisionSpec, acting: bool) -> Self {
+    pub fn new(response: DecisionResponse, spec: &DecisionSpec, acting: bool) -> Self {
         Self {
             response,
             acts_on: spec.acts_on,
@@ -269,15 +269,15 @@ impl DecisionOutcome {
 /// answer. Routing down to the fast model needs a calibrated answer at 0.8
 /// or more; routing up to the smart model needs 0.6. Anything else stays on
 /// the primary model.
-pub fn model_route_tier(answer: &Answer) -> Option<crate::router::Tier> {
+pub fn model_route_tier(answer: &Answer) -> Option<aidaemon_providers::routing::Tier> {
     match answer.chosen()? {
         "fast"
             if answer.confidence >= 0.8
                 && answer.confidence_source == ConfidenceSource::Calibrated =>
         {
-            Some(crate::router::Tier::Fast)
+            Some(aidaemon_providers::routing::Tier::Fast)
         }
-        "smart" if answer.confidence >= 0.6 => Some(crate::router::Tier::Smart),
+        "smart" if answer.confidence >= 0.6 => Some(aidaemon_providers::routing::Tier::Smart),
         _ => None,
     }
 }
@@ -366,7 +366,7 @@ mod tests {
         let fast = |confidence, source| Answer::choice("fast", confidence, source);
         assert_eq!(
             model_route_tier(&fast(0.9, ConfidenceSource::Calibrated)),
-            Some(crate::router::Tier::Fast)
+            Some(aidaemon_providers::routing::Tier::Fast)
         );
         assert_eq!(
             model_route_tier(&fast(0.7, ConfidenceSource::Calibrated)),
@@ -382,7 +382,7 @@ mod tests {
                 0.65,
                 ConfidenceSource::SelfReported
             )),
-            Some(crate::router::Tier::Smart)
+            Some(aidaemon_providers::routing::Tier::Smart)
         );
         assert_eq!(
             model_route_tier(&Answer::new(

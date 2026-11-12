@@ -1,12 +1,12 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::agent) enum ToolResultNotice {
+pub enum ToolResultNotice {
     ScopeLockBlockedResult { tool_name: String, reason: String },
     ProjectInstructionsDiscovered { tool_name: String, sources: String },
     PathAutoInjectedFromProjectContext { injected_dir: String },
 }
 
 impl ToolResultNotice {
-    pub(in crate::agent) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         match self {
             Self::ScopeLockBlockedResult { tool_name, reason } => format!(
                 "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",

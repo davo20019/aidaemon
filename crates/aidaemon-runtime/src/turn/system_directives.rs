@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::agent) enum SystemDirective {
+pub enum SystemDirective {
     /// The current owner turn is structurally bound to an unresolved mandate
     /// ASK. Mandate-local model text must be inspected before any explanation
     /// or administrative response is produced.
@@ -99,12 +99,11 @@ pub(in crate::agent) enum SystemDirective {
     /// the last click targeted a raw point with no element identity, so it is
     /// not confirmed. Require a verifying observation before the claim ships.
     /// Only constructed under the `computer_use` feature.
-    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
     GuiCoordinateClickUnverified,
 }
 
 impl SystemDirective {
-    pub(in crate::agent) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         match self {
             Self::MandateOwnerInputInspectionRequired { mandate_id } => format!(
                 "[SYSTEM] This owner turn is structurally bound to unresolved mandate {mandate_id}. \

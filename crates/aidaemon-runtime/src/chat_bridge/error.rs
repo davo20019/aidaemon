@@ -63,7 +63,7 @@ pub enum MalformedResponseReason {
 /// waiting inside a state; this enum decides which state is reachable from a
 /// classified outcome, independent of error-message wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderRecoveryRoute {
+pub enum ProviderRecoveryRoute {
     Fail,
     RetryReducedBudgetThenFallback,
     AdaptRequestOnce,
@@ -75,7 +75,7 @@ pub(crate) enum ProviderRecoveryRoute {
 }
 
 impl ProviderError {
-    pub(crate) fn recovery_route(&self, single_attempt_fail_closed: bool) -> ProviderRecoveryRoute {
+    pub fn recovery_route(&self, single_attempt_fail_closed: bool) -> ProviderRecoveryRoute {
         use ProviderRecoveryRoute::*;
 
         if single_attempt_fail_closed {
@@ -308,7 +308,7 @@ impl std::error::Error for ProviderError {}
 
 /// When a quota resets, for the user: the UTC time and how long until then
 /// ("at 14:05 UTC (in 2h 10m)"), with the date when it is not today.
-pub(crate) fn describe_reset(at: std::time::SystemTime, now: std::time::SystemTime) -> String {
+pub fn describe_reset(at: std::time::SystemTime, now: std::time::SystemTime) -> String {
     let when = chrono::DateTime::<chrono::Utc>::from(at);
     let today = chrono::DateTime::<chrono::Utc>::from(now).date_naive();
     let clock = if when.date_naive() == today {

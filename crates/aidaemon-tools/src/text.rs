@@ -104,3 +104,38 @@ pub fn floor_char_boundary(s: &str, byte_limit: usize) -> usize {
     }
     i
 }
+
+/// Build an explicit, instructional truncation notice for tool output that was
+/// cut down before re-entering the model context. A passive marker like
+/// "(truncated)" is routinely ignored — the model fills the gap and fabricates
+/// the omitted content (e.g. inventing the rest of a user list). This notice
+/// states how much is missing and forbids enumerating what isn't visible.
+pub fn truncation_notice(shown_chars: usize, total_chars: usize) -> String {
+    truncation_notice_with_hint(
+        shown_chars,
+        total_chars,
+        "If the user needs the full result, tell them it is longer than you can see \
+         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.",
+    )
+}
+
+/// Like [`truncation_notice`], but with a tool-specific remediation sentence —
+/// the right next step differs per tool (re-run with `wc -l` for terminal,
+/// re-fetch with a larger `max_chars` for web_fetch, etc.).
+pub fn truncation_notice_with_hint(
+    shown_chars: usize,
+    total_chars: usize,
+    remediation_hint: &str,
+) -> String {
+    let omitted = total_chars.saturating_sub(shown_chars);
+    format!(
+        "[⚠ OUTPUT TRUNCATED — {shown} of {total} characters shown; {omitted} omitted and \
+         NOT visible to you. Do NOT enumerate, list, count, or quote any item that is not \
+         literally present in the text you can see — inventing the omitted content is an \
+         error. {hint}]",
+        shown = shown_chars,
+        total = total_chars,
+        omitted = omitted,
+        hint = remediation_hint,
+    )
+}

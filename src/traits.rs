@@ -27,6 +27,7 @@ pub use aidaemon_events::dialogue::{
     RequestVerificationTarget, RequestVerificationTargetKind, RequestedOutcomeCondition,
     UserRequestBinding, UserTurnKind, UserTurnSummary,
 };
+#[allow(unused_imports)]
 pub use aidaemon_events::provider::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord, ToolChoiceMode,
 };

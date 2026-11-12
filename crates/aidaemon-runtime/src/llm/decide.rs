@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 use aidaemon_decisions::DecisionResponse;
 use aidaemon_decisions::{Decider, DecisionRequest, ProviderDecider};
 use serde_json::json;
@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use super::decisions::{Decision, DecisionOutcome, DefaultReason, GatedResponse};
 use super::gateway::SideCallGateway;
 use super::side_calls::SideCall;
-use crate::config::{DecisionBackendKind, DecisionMode, DecisionModes, DecisionsConfig};
+use crate::settings::{DecisionBackendKind, DecisionMode, DecisionModes, DecisionsConfig};
 
 /// Which backend answers.
 #[derive(Clone)]
@@ -254,19 +254,19 @@ impl SideCallGateway {
             return;
         };
         handle.spawn(async move {
-            let emitter = crate::events::EventEmitter::new(event_store.clone(), session.clone())
+            let emitter = aidaemon_events::EventEmitter::new(event_store.clone(), session.clone())
                 .with_task_id(task.clone());
-            let data = crate::events::DecisionPointData {
-                decision_type: crate::events::DecisionType::GateTelemetry,
+            let data = aidaemon_events::DecisionPointData {
+                decision_type: aidaemon_events::DecisionType::GateTelemetry,
                 task_id: task.clone(),
                 iteration: 0,
-                severity: crate::events::DiagnosticSeverity::Info,
+                severity: aidaemon_events::DiagnosticSeverity::Info,
                 code: Some("decision_layer".to_string()),
                 metadata,
                 summary,
             };
             if let Err(error) = emitter
-                .emit(crate::events::EventType::DecisionPoint, data)
+                .emit(aidaemon_events::EventType::DecisionPoint, data)
                 .await
             {
                 tracing::warn!(%error, "decision telemetry write failed");
@@ -276,7 +276,7 @@ impl SideCallGateway {
             }
             match (usage, error) {
                 (_, Some(error)) => {
-                    crate::events::record_background_model_call_failure(
+                    aidaemon_events::model_call_telemetry::record_background_model_call_failure(
                         event_store,
                         state.as_ref(),
                         &session,
@@ -288,10 +288,10 @@ impl SideCallGateway {
                     .await;
                 }
                 (Some(usage), None) => {
-                    let response = crate::traits::ProviderResponse {
+                    let response = aidaemon_events::provider::ProviderResponse {
                         content: None,
                         tool_calls: Vec::new(),
-                        usage: Some(crate::traits::TokenUsage {
+                        usage: Some(aidaemon_events::provider::TokenUsage {
                             input_tokens: usage.input_tokens as u32,
                             output_tokens: usage.output_tokens as u32,
                             cached_input_tokens: None,
@@ -303,7 +303,7 @@ impl SideCallGateway {
                         thinking: None,
                         response_note: None,
                     };
-                    crate::events::record_background_model_call_telemetry(
+                    aidaemon_events::model_call_telemetry::record_background_model_call_telemetry(
                         event_store,
                         state.as_ref(),
                         &session,
@@ -384,8 +384,8 @@ fn answers_json(gated: &GatedResponse) -> serde_json::Value {
 
 /// Turns a backend's answers into a gated response without a call, for
 /// tests of callers.
-#[cfg(test)]
-pub(crate) fn gated_for_tests(
+#[cfg(any(test, feature = "testing"))]
+pub fn gated_for_tests(
     decision: Decision,
     response: DecisionResponse,
     acting: bool,
@@ -412,9 +412,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::config::DecisionModes;
-    use crate::llm_runtime::decisions::digest_keys;
-    use crate::llm_runtime::gateway::test_support::{gateway_with, provider_answering};
+    use crate::llm::decisions::digest_keys;
+    use crate::llm::gateway::test_support::{gateway_with, provider_answering};
+    use crate::settings::DecisionModes;
 
     fn digest_request() -> DecisionRequest {
         DecisionRequest::new("Current user message:\nwhat is my name?")
@@ -520,7 +520,7 @@ mod tests {
                 .await
                 .unwrap();
             if rows.iter().any(|event| {
-                event.event_type == crate::events::EventType::DecisionPoint
+                event.event_type == aidaemon_events::EventType::DecisionPoint
                     && event
                         .data
                         .to_string()
@@ -590,8 +590,8 @@ mod tests {
         let (gateway, events) =
             gateway_with(provider_answering(r#"{"identity":{"p_yes":0.9}}"#)).await;
         gateway.set_decisions(DecisionLayer::from_config(
-            &crate::config::DecisionsConfig {
-                backend: crate::config::DecisionBackendKind::Provider,
+            &crate::settings::DecisionsConfig {
+                backend: crate::settings::DecisionBackendKind::Provider,
                 model: "cheap-model".to_string(),
                 api_key: String::new(),
                 mode: modes(DecisionMode::On),
@@ -610,7 +610,7 @@ mod tests {
         // Identity acts on any source.
         assert!(outcome.acted(digest_keys::IDENTITY).is_some());
         assert!(
-            crate::llm_runtime::gateway::test_support::ok_calls(
+            crate::llm::gateway::test_support::ok_calls(
                 &events,
                 SideCall::DecisionAsk.spec().purpose
             )
@@ -621,8 +621,8 @@ mod tests {
 
     #[test]
     fn a_gemini_backend_reuses_the_gemini_provider_key() {
-        let config = crate::config::DecisionsConfig {
-            backend: crate::config::DecisionBackendKind::Gemini,
+        let config = crate::settings::DecisionsConfig {
+            backend: crate::settings::DecisionBackendKind::Gemini,
             ..Default::default()
         };
         assert!(DecisionLayer::from_config_with_key(&config, Some("synthetic-key")).is_some());
@@ -631,8 +631,8 @@ mod tests {
 
     #[test]
     fn a_gemini_backend_without_a_key_is_off() {
-        let config = crate::config::DecisionsConfig {
-            backend: crate::config::DecisionBackendKind::Gemini,
+        let config = crate::settings::DecisionsConfig {
+            backend: crate::settings::DecisionBackendKind::Gemini,
             ..Default::default()
         };
         assert!(DecisionLayer::from_config(&config).is_none());

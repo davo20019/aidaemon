@@ -6,8 +6,15 @@ use std::path::Path;
 
 /// Files allowed to reach a provider without the gateway, each with its reason.
 const ALLOWED: &[(&str, &str)] = &[
-    ("src/llm_runtime.rs", "defines the runtime"),
-    ("src/llm_runtime/", "the gateway"),
+    (
+        "crates/aidaemon-runtime/src/llm/",
+        "defines the runtime and the gateway",
+    ),
+    (
+        "crates/aidaemon-runtime/src/chat_bridge/",
+        "calls providers",
+    ),
+    ("src/llm_runtime/door_tests.rs", "these tests"),
     ("src/providers/", "builds providers"),
     (
         "src/agent/runtime/sdk_provider.rs",
@@ -51,6 +58,13 @@ fn rust_files_under(dir: &str) -> impl Iterator<Item = String> {
     files.into_iter()
 }
 
+/// The daemon's code and the runtime crate's.
+const SCANNED: &[&str] = &["src", "crates/aidaemon-runtime/src"];
+
+fn scanned_files() -> impl Iterator<Item = String> {
+    SCANNED.iter().flat_map(|dir| rust_files_under(dir))
+}
+
 fn reaches_a_provider(path: &str) -> bool {
     let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
     RAW_ACCESS.iter().any(|needle| text.contains(needle))
@@ -58,7 +72,7 @@ fn reaches_a_provider(path: &str) -> bool {
 
 #[test]
 fn nothing_outside_the_gateway_reaches_a_provider() {
-    let offenders = rust_files_under("src")
+    let offenders = scanned_files()
         .filter(|path| !ALLOWED.iter().any(|(prefix, _)| path.starts_with(prefix)))
         .filter(|path| reaches_a_provider(path))
         .collect::<Vec<_>>();
@@ -72,8 +86,9 @@ fn nothing_outside_the_gateway_reaches_a_provider() {
 /// means the files were read, not skipped.
 #[test]
 fn the_scan_sees_the_gateway() {
-    assert!(rust_files_under("src")
-        .any(|path| path == "src/llm_runtime/gateway.rs" && reaches_a_provider(&path)));
+    assert!(scanned_files()
+        .any(|path| path == "crates/aidaemon-runtime/src/llm/gateway.rs"
+            && reaches_a_provider(&path)));
 }
 
 /// What reaches a decision backend directly. Callers ask through
@@ -89,8 +104,9 @@ const RAW_DECIDER: &[&str] = &[
 
 #[test]
 fn nothing_outside_the_gateway_holds_a_decider() {
-    let offenders = rust_files_under("src")
-        .filter(|path| !path.starts_with("src/llm_runtime/"))
+    let offenders = scanned_files()
+        .filter(|path| !path.starts_with("crates/aidaemon-runtime/src/llm/"))
+        .filter(|path| path != "src/llm_runtime/door_tests.rs")
         .filter(|path| {
             let text =
                 std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
