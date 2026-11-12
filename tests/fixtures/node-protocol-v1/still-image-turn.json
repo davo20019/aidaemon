@@ -1,0 +1,10 @@
+{
+  "input_kind": "still_image",
+  "request_id": "req_fixture_image_001",
+  "content_type": "image/jpeg",
+  "size_bytes": 32768,
+  "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+  "width": 320,
+  "height": 240,
+  "capture_duration_ms": 480
+}
