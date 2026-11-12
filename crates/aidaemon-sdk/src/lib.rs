@@ -20,6 +20,7 @@
 //! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
 //! | [`testing`] | `testing` | Scripted provider for tests |
+//! | [`tool`] | `macros` (default) | `#[tool]`: a tool from a plain function, schema derived |
 //!
 //! ```no_run
 //! # #[cfg(all(feature = "providers", feature = "tools", feature = "policies"))]
@@ -56,6 +57,70 @@
 //! `crates/aidaemon-core/PLAN.md` for the roadmap.
 
 pub use aidaemon_core::*;
+
+pub mod schema;
+
+#[doc(hidden)]
+#[path = "macro_support.rs"]
+pub mod __private;
+
+/// Write a tool as a plain function: `#[tool]` derives its JSON schema from
+/// the parameters (with `schemars`) and emits a unit struct, named after the
+/// function in `PascalCase`, that implements [`Tool`].
+///
+/// ```
+/// use aidaemon_sdk::{tool, Tool};
+///
+/// /// Look up an order: customer, item and total.
+/// #[tool(read_only)]
+/// async fn lookup_order(
+///     /// The order id, like `ORD-1001`.
+///     order_id: String,
+/// ) -> String {
+///     format!("{order_id}: Acme Kettle, 45.00 (synthetic)")
+/// }
+///
+/// let spec = LookupOrder.spec();
+/// assert_eq!(spec.name, "lookup_order");
+/// assert_eq!(spec.parameters["additionalProperties"], false);
+/// ```
+///
+/// - **Description:** the function's doc comment (required; or pass
+///   `description = "..."`). A parameter's doc comment becomes its
+///   description in the schema.
+/// - **Name:** the function's name, or `name = "..."`.
+/// - **Arguments:** each parameter is one key of the argument object
+///   (owned types implementing `Deserialize` and `JsonSchema`; `Option<T>`
+///   is optional). `#[serde(...)]` and `#[schemars(...)]` attributes on a
+///   parameter are kept. Or mark one parameter `#[args]` to take the whole
+///   object as your own type (`#[derive(Deserialize, JsonSchema)]`). A
+///   `&ToolContext` parameter, anywhere, receives the call's context
+///   (session, cancellation, the application's `extensions`).
+/// - **Returns:** `String`, `&str`, `ToolOutput`, `serde_json::Value`, or a
+///   `Result` of one of them whose error displays (an error reaches the
+///   model as a failed call). The function may be sync or async.
+/// - **Annotations** are explicit, never guessed. With no preset a tool is
+///   [`ToolAnnotations::DESTRUCTIVE`], the same conservative default as a
+///   hand-written tool. `read_only`, `write` and `destructive` pick
+///   [`ToolAnnotations::READ_ONLY`], [`ToolAnnotations::WRITE`] or
+///   [`ToolAnnotations::DESTRUCTIVE`]; `idempotent = bool` and
+///   `egress = bool` (alias `open_world`) then override that one field. A
+///   read-only tool that contacts another host must say `egress = true`.
+/// - **Trust:** output is untrusted unless you pass `trusted` (the result
+///   is the owner's own data, not content someone else wrote).
+/// - **Effects and access:** `effects = path` names a
+///   `fn(&Args) -> CallEffects`, `access = path` a
+///   `fn(&Args) -> AccessManifest` (with `#[args]`, `Args` is your type).
+///   Without them a tool gets the kernel's defaults: no effects for a
+///   read-only call that is not egress, unknown otherwise.
+/// - `timeout_secs = N` overrides `Limits::tool_timeout`; `crate = path`
+///   points the generated code at a re-export of `aidaemon_sdk`.
+///
+/// Arguments are checked before anything runs: a call that is not an
+/// object, has a key the schema does not declare, or does not deserialize
+/// is refused by `validate` and answered with an error result by `call`.
+#[cfg(feature = "macros")]
+pub use aidaemon_macros::tool;
 
 #[cfg(feature = "providers")]
 pub use aidaemon_providers as providers;
@@ -107,6 +172,9 @@ pub mod prelude {
         RunOutcome, RunState, RunStatus, StopDecision, Tool, ToolAnnotations, ToolContext,
         ToolDecision, ToolInfo, ToolOutput, ToolResult, ToolSpec,
     };
+
+    #[cfg(feature = "macros")]
+    pub use crate::tool;
 
     #[cfg(feature = "agents")]
     pub use crate::agents;
