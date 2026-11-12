@@ -440,3 +440,108 @@ async fn the_default_memory_remembers_across_runs() {
         request.messages
     );
 }
+
+/// The full memory system's background jobs learn from an SDK agent's runs
+/// the way the daemon's do: once a session has 20 turns no episode covers,
+/// an episode pass records one, and a consolidation pass an hour later
+/// turns the owner's words into a fact.
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn the_full_memory_jobs_learn_from_runs() {
+    use aidaemon_sdk::memory::full::FullMemory;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let mut script = Vec::new();
+    for _ in 0..10 {
+        script.push(text("Noted."));
+    }
+    script.push(text(
+        r#"{"summary":"The owner talked about their editor","topics":["editor"],
+            "emotional_tone":"productive","outcome":"resolved","goals_mentioned":[],
+            "emotional_intensity":0.2}"#,
+    ));
+    script.push(text(
+        r#"[{"category":"preference","key":"editor","value":"Helix","privacy":"global"}]"#,
+    ));
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let system = Arc::new(
+        FullMemory::open(Some(&path))
+            .await
+            .unwrap()
+            .with_background(provider.clone(), "scripted")
+            .await
+            .unwrap(),
+    );
+    let jobs = system.jobs().expect("background jobs").clone();
+    let names: Vec<String> = system
+        .services()
+        .iter()
+        .map(|service| service.name().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "embeddings",
+            "consolidation",
+            "memory_decay",
+            "episodes",
+            "pattern_detection"
+        ]
+    );
+    let agent = preset("assistant")
+        .provider(provider.clone())
+        .model("scripted")
+        .memory(system.clone(), MemoryTurn::owner("assistant"))
+        .build()
+        .await
+        .unwrap();
+    for index in 0..10 {
+        let outcome = agent
+            .run(
+                "test:synthetic-user",
+                &format!("Important: remember that I prefer Helix as my editor ({index})."),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, RunStatus::Completed, "{outcome:?}");
+    }
+
+    let now = chrono::Utc::now();
+    jobs.episodes(now).await.unwrap();
+    let analysis = &provider.requests()[10];
+    assert!(
+        analysis
+            .messages
+            .iter()
+            .any(|m| m.content.contains("prefer Helix")),
+        "{analysis:?}"
+    );
+    // Nothing new since the episode: another pass asks nothing.
+    jobs.episodes(now).await.unwrap();
+    assert_eq!(provider.requests().len(), 11);
+
+    jobs.consolidate(now + chrono::Duration::hours(2))
+        .await
+        .unwrap();
+    assert_eq!(provider.requests().len(), 12);
+    // A later run recalls the consolidated fact.
+    let later = Arc::new(ScriptedProvider::new([text("Helix.")]));
+    let agent = preset("assistant")
+        .provider(later.clone())
+        .model("scripted")
+        .memory(system.clone(), MemoryTurn::owner("assistant"))
+        .build()
+        .await
+        .unwrap();
+    agent
+        .run("test:another-session", "Which editor do I use?")
+        .await
+        .unwrap();
+    let request = &later.requests()[0];
+    assert!(
+        request.messages.iter().any(|m| m.content.contains("Helix")),
+        "the fact is not recalled: {:?}",
+        request.messages
+    );
+}
