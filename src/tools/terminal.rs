@@ -812,8 +812,10 @@ pub(crate) async fn deliver_background_completion_ping(
 }
 
 /// Resolve an edited background status surface after the promised result has
-/// actually been delivered. The completion ping is deliberately nonterminal;
-/// only this post-delivery transition gets a checkmark.
+/// actually been delivered. Once the result is in the chat the status bubble
+/// has nothing left to say, so it is removed; where the channel cannot delete
+/// it, it is edited to a plain pointer at the result (no checkmark, which could
+/// sit above a result that says the work did not go well).
 pub(crate) async fn finalize_background_completion_surface(
     hub: Option<&Arc<dyn OutboundRouter>>,
     session_id: &str,
@@ -823,17 +825,147 @@ pub(crate) async fn finalize_background_completion_surface(
     let (Some(hub), Some(surface_id)) = (hub, surface_id) else {
         return;
     };
-    let text = match outcome {
-        BackgroundSurfaceOutcome::Delivered => "✅ Result delivered.",
+    if outcome == BackgroundSurfaceOutcome::Delivered
+        && matches!(hub.delete_message(session_id, surface_id).await, Ok(true))
+    {
+        return;
+    }
+    let _ = hub
+        .edit_text(session_id, surface_id, background_surface_text(outcome))
+        .await;
+}
+
+/// What the background status bubble says once its step has ended.
+pub(crate) fn background_surface_text(outcome: BackgroundSurfaceOutcome) -> &'static str {
+    match outcome {
+        BackgroundSurfaceOutcome::Delivered => "Background job finished – result below.",
         BackgroundSurfaceOutcome::StillWorking => {
-            "⏳ Still working — another background step is running."
+            "⏳ Still working – another background step is running."
         }
-        BackgroundSurfaceOutcome::Queued => "📨 Result queued for delivery.",
+        BackgroundSurfaceOutcome::Queued => {
+            "📨 Background job finished – the result is on its way."
+        }
         BackgroundSurfaceOutcome::DeliveryFailed => {
-            "⚠️ The background step finished, but I couldn't deliver the remaining result."
+            "⚠️ The background step finished, but I couldn't send you the rest of the result."
         }
-    };
-    let _ = hub.edit_text(session_id, surface_id, text).await;
+    }
+}
+
+#[cfg(test)]
+mod background_surface_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records deletes and edits; `can_delete` decides whether a delete works.
+    #[derive(Default)]
+    struct SurfaceHub {
+        can_delete: bool,
+        deleted: StdMutex<Vec<String>>,
+        edits: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl OutboundRouter for SurfaceHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<bool> {
+            self.edits.lock().unwrap().push(text.to_string());
+            Ok(true)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &crate::types::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn take_background_status_surface(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn delete_message(
+            &self,
+            _session_id: &str,
+            message_id: &str,
+        ) -> anyhow::Result<bool> {
+            if self.can_delete {
+                self.deleted.lock().unwrap().push(message_id.to_string());
+            }
+            Ok(self.can_delete)
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: crate::tools::command_risk::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: crate::tools::command_risk::PermissionMode,
+        ) -> anyhow::Result<crate::types::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            false
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    async fn finalize(can_delete: bool, outcome: BackgroundSurfaceOutcome) -> Arc<SurfaceHub> {
+        let hub = Arc::new(SurfaceHub {
+            can_delete,
+            ..Default::default()
+        });
+        let router: Arc<dyn OutboundRouter> = hub.clone();
+        finalize_background_completion_surface(Some(&router), "s", Some("m-1"), outcome).await;
+        hub
+    }
+
+    #[tokio::test]
+    async fn a_delivered_result_removes_its_status_bubble() {
+        let hub = finalize(true, BackgroundSurfaceOutcome::Delivered).await;
+        assert_eq!(*hub.deleted.lock().unwrap(), vec!["m-1".to_string()]);
+        assert!(hub.edits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_delete_the_bubble_points_at_the_result_without_a_checkmark() {
+        let hub = finalize(false, BackgroundSurfaceOutcome::Delivered).await;
+        let edits = hub.edits.lock().unwrap();
+        assert_eq!(
+            *edits,
+            vec!["Background job finished – result below.".to_string()]
+        );
+        assert!(!edits[0].contains('✅'));
+    }
+
+    #[tokio::test]
+    async fn a_step_still_running_keeps_its_bubble() {
+        let hub = finalize(true, BackgroundSurfaceOutcome::StillWorking).await;
+        assert!(hub.deleted.lock().unwrap().is_empty());
+        assert!(hub.edits.lock().unwrap()[0].starts_with("⏳ Still working"));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

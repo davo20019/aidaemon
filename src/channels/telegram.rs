@@ -1030,11 +1030,18 @@ impl TelegramChannel {
                 .await
             }
             "/bots" => self.handle_bots_command().await,
-            "/help" | "/start" => build_help_text(&telegram_commands(), "/"),
-            _ => format!(
-                "Unknown command: {}\nType /help for available commands.",
-                cmd_raw
-            ),
+            "/help" | "/start" => {
+                let help = build_help_text(
+                    &telegram_commands(),
+                    "/",
+                    aidaemon_channels::slash::HelpScope::from_args(arg),
+                );
+                send_markdown_chunks_or_fallback(bot, msg.chat.id, &help).await;
+                return;
+            }
+            _ => {
+                aidaemon_channels::slash::unknown_command_reply(cmd_raw, &telegram_commands(), "/")
+            }
         };
 
         for chunk in split_telegram_text(&reply, 4096) {
@@ -3361,9 +3368,7 @@ impl TelegramChannel {
             Ok(_) => "",
             Err(_) => "\n\nI couldn't delete your message, so please delete it yourself.",
         };
-        let reply = self
-            .install_key(msg.chat.id.0, user_id, &pending, text)
-            .await;
+        let reply = self.install_key(&pending, text).await;
         let _ = bot
             .send_message(msg.chat.id, format!("{reply}{delete_note}"))
             .await;
@@ -3371,13 +3376,7 @@ impl TelegramChannel {
     }
 
     /// Test the key against its provider and save it only if it is accepted.
-    async fn install_key(
-        &self,
-        chat_id: i64,
-        user_id: u64,
-        pending: &PendingKey,
-        key: &str,
-    ) -> String {
+    async fn install_key(&self, pending: &PendingKey, key: &str) -> String {
         use super::set_key::{check_key, key_targets, save_key, KeyCheck};
         let label = &pending.label;
         let target = tokio::fs::read_to_string(&self.config_path)
@@ -3401,20 +3400,15 @@ impl TelegramChannel {
             }
             KeyCheck::Accepted => match save_key(&self.config_path, pending.slot, key).await {
                 Err(error) => format!("{label}: the key works, but saving it failed: {error}"),
-                Ok(note) => {
+                Ok(stored) => {
                     let ctx = crate::channels::commands::CommandContext {
                         agent: Arc::clone(&self.agent),
                         state: Arc::clone(&self.state),
                         task_registry: Arc::clone(&self.task_registry),
                         config_path: self.config_path.clone(),
                     };
-                    let session_id = self.session_id(chat_id).await;
-                    let role = determine_role(&self.owner_user_ids, user_id);
-                    let reload = ctx
-                        .dispatch("/reload", "", &session_id, None, role)
-                        .await
-                        .unwrap_or_default();
-                    format!("{label}: the new key works and is saved. {note}\n{reload}")
+                    let reload = ctx.reload_config().await.unwrap_or_else(|error| error);
+                    super::set_key::key_saved_reply(&target.provider_name(), stored, &reload)
                 }
             },
         }
@@ -4510,6 +4504,39 @@ impl TelegramChannel {
         // so running it inline would deadlock: the callback can't be delivered
         // until the message handler returns, but the message handler is waiting
         // for that callback.
+        // `/private` sent with its message ("/private what's my balance?",
+        // "/privateWhat's…") keeps that message private and handles it now;
+        // "/private/private" is just `/private`.
+        let text = match aidaemon_channels::slash::private_request(&text) {
+            Some(aidaemon_channels::slash::PrivateRequest::With(message)) => {
+                let session_id = self.session_id(msg.chat.id.0).await;
+                let sender_id = format!("telegram:{user_id}");
+                if let Err(error) = crate::agent::memory_plugin::set_next_message_private(
+                    self.state.as_ref(),
+                    &session_id,
+                    Some(&sender_id),
+                    true,
+                )
+                .await
+                {
+                    warn!(%error, "Could not keep a /private message out of memory");
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            "I couldn't keep that message private, so I didn't read it. \
+                             Please send it again.",
+                        )
+                        .await;
+                    return;
+                }
+                let _ = bot
+                    .send_message(msg.chat.id, "🔒 I won't remember or learn from this one.")
+                    .await;
+                message.to_string()
+            }
+            Some(aidaemon_channels::slash::PrivateRequest::Next) => "/private".to_string(),
+            None => text,
+        };
         if super::commands::is_slash_command(&text) {
             // Slash commands `return` before the message dedup gate below, so a
             // duplicate Telegram delivery of the same update (same message id)
@@ -4673,6 +4700,18 @@ impl TurnSurface for TelegramSurface {
 
     async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
         send_markdown_chunks_or_fallback_result(&self.bot, self.chat_id, text).await
+    }
+
+    async fn edit(&self, message_id: &str, text: &str) -> anyhow::Result<bool> {
+        let Ok(mid) = message_id.parse::<i32>() else {
+            return Ok(false);
+        };
+        Ok(self
+            .bot
+            .edit_message_text(self.chat_id, MessageId(mid), text)
+            .link_preview_options(disabled_link_preview())
+            .await
+            .is_ok())
     }
 
     /// Telegram's typing indicator lasts about five seconds.

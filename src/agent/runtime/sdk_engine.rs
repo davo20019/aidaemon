@@ -676,6 +676,10 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// System context raised during the run and not yet sent; the next model
     /// call pins it at the run's current end (`placed_directives`).
     extra_system: std::sync::Mutex<Vec<String>>,
+    /// When the turn started, and the notices delivered since then that a
+    /// model call already carried: each model call reads the new ones, so
+    /// the reply agrees with what the owner was told meanwhile.
+    notices_seen: std::sync::Mutex<(chrono::DateTime<chrono::Utc>, HashSet<String>)>,
     /// Directives and mid-turn user messages, with the run position they
     /// arrived at.
     placed_directives: std::sync::Mutex<Vec<(usize, Value)>>,
@@ -1492,6 +1496,7 @@ impl Agent {
             projected_source_turn_ids,
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
+            notices_seen: std::sync::Mutex::new((chrono::Utc::now(), HashSet::new())),
             placed_directives: std::sync::Mutex::new(Vec::new()),
             absorbed_steering: std::sync::Mutex::new(Vec::new()),
             compaction: std::sync::Mutex::new(None),

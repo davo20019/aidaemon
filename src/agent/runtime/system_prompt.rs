@@ -242,8 +242,8 @@ impl Agent {
 
         // Current date and time — volatile by definition; lives in the tail so
         // message zero (the core) stays byte-stable across turns.
-        let now_utc = chrono::Utc::now();
-        let date_time_str = now_utc.format("%A, %B %-d, %Y %H:%M UTC").to_string();
+        // In the owner's zone, so replies say their time, not UTC.
+        let date_time_str = aidaemon_work::schedule::owner_date_time_long(&chrono::Utc::now());
 
         // Resume checkpoint — MOVED out of the core (Pillar A §Tail).
         let resume_section = (user_role == UserRole::Owner && !mandate_context)
@@ -613,7 +613,7 @@ impl Agent {
         // particular, do not call the generic memory renderer: even an empty
         // MemoryContext emits owner-memory affordances and a `Your Memory`
         // shell that do not belong in an externally acting mandate worker.
-        let date_time_str = prompt_now.format("%A, %B %-d, %Y %H:%M UTC").to_string();
+        let date_time_str = aidaemon_work::schedule::owner_date_time_long(&prompt_now);
         let tail = Self::build_context_tail(None, "", None, "", &date_time_str, None);
 
         if self.record_decision_points {

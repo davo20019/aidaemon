@@ -149,6 +149,7 @@ impl PlanStore {
                 expected_targets: item.expected_targets.clone(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
+                not_done: None,
                 status: item.status,
                 tool_call_ids: Vec::new(),
                 result_summary: None,

@@ -280,23 +280,20 @@ fn format_background_completion(
         TaskOutcome::Succeeded => (
             "completed",
             format!(
-                "\u{2705} Background task complete\nMission: {}\n\n{}",
+                "\u{2705} Finished in the background: {}\n\n{}",
                 mission, text
             ),
         ),
         TaskOutcome::Partial => (
             "partial",
             format!(
-                "\u{26a0}\u{fe0f} Background task incomplete\nMission: {}\n\n{}",
+                "\u{26a0}\u{fe0f} Didn't finish in the background: {}\n\n{}",
                 mission, text
             ),
         ),
         TaskOutcome::Failed => (
             "failed",
-            format!(
-                "\u{274c} Background task failed\nMission: {}\n\n{}",
-                mission, text
-            ),
+            format!("\u{274c} Failed in the background: {}\n\n{}", mission, text),
         ),
     }
 }
@@ -315,8 +312,7 @@ pub(crate) async fn report_interrupted_background_children(state: &Arc<dyn State
     };
     for spawn in spawns {
         let message = format!(
-            "\u{26a0}\u{fe0f} A background task was interrupted by a restart and did not finish.\n\
-             Mission: {}\n\n\
+            "\u{26a0}\u{fe0f} A restart stopped this background job before it finished: {}\n\n\
              It may have done part of the work. Check before running it again.",
             spawn.mission
         );
@@ -1178,7 +1174,7 @@ impl Tool for SpawnAgentTool {
                     _ if cancelled_by_owner => (
                         "failed",
                         format!(
-                            "\u{23f9}\u{fe0f} Background task cancelled\nMission: {}\n\n\
+                            "\u{23f9}\u{fe0f} Cancelled in the background: {}\n\n\
                          It may have done part of the work.",
                             mission
                         ),
@@ -1203,7 +1199,7 @@ impl Tool for SpawnAgentTool {
                         None => (
                             "failed",
                             format!(
-                                "\u{274c} Background task failed\nMission: {}\nError: {}",
+                                "\u{274c} Failed in the background: {}\n\n{}",
                                 mission, error
                             ),
                         ),
@@ -1232,28 +1228,28 @@ impl Tool for SpawnAgentTool {
                                 Some(outcome) if outcome.status == "completed" => (
                                     "completed",
                                     format!(
-                                        "\u{2705} Background task complete\nMission: {}\n\n{}",
+                                        "\u{2705} Finished in the background: {}\n\n{}",
                                         mission, outcome.details
                                     ),
                                 ),
                                 Some(outcome) if outcome.status == "blocked" => (
                                     "blocked",
                                     format!(
-                                    "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
-                                    mission, outcome.details
-                                ),
+                                        "\u{26a0}\u{fe0f} Stuck in the background: {}\n\n{}",
+                                        mission, outcome.details
+                                    ),
                                 ),
                                 Some(outcome) => (
                                     "failed",
                                     format!(
-                                        "\u{274c} Background task failed\nMission: {}\n\n{}",
+                                        "\u{274c} Failed in the background: {}\n\n{}",
                                         mission, outcome.details
                                     ),
                                 ),
                                 None => (
                                     "failed",
                                     format!(
-                                        "\u{23f1} Background task timed out\nMission: {}\n\n{}",
+                                        "\u{23f1} Ran out of time in the background: {}\n\n{}",
                                         mission,
                                         timed_out.render()
                                     ),
@@ -1282,7 +1278,7 @@ impl Tool for SpawnAgentTool {
                     "Background sub-agent panicked; reporting it as failed"
                 );
                 let message = format!(
-                    "\u{274c} Background task failed\nMission: {}\n\nIt stopped unexpectedly.",
+                    "\u{274c} Failed in the background: {}\n\nIt stopped unexpectedly.",
                     mission
                 );
                 // The note is the daemon's own text, so it is trusted.
@@ -1719,8 +1715,8 @@ mod tests {
             8_000,
         );
         assert_eq!(notification_type, "partial");
-        assert!(message.starts_with("\u{26a0}\u{fe0f} Background task incomplete"));
-        assert!(!message.contains("\u{2705} Background task complete"));
+        assert!(message.starts_with("\u{26a0}\u{fe0f} Didn't finish in the background"));
+        assert!(!message.contains("\u{2705} Finished in the background"));
     }
 
     #[test]
@@ -1732,7 +1728,7 @@ mod tests {
             8_000,
         );
         assert_eq!(notification_type, "completed");
-        assert!(message.starts_with("\u{2705} Background task complete"));
+        assert!(message.starts_with("\u{2705} Finished in the background"));
     }
 
     #[test]
@@ -3034,7 +3030,9 @@ mod child_runtime_tests {
 
         let entry = wait_for_notification(&store).await;
         assert_eq!(entry.session_id, "telegram:synthetic-user-1");
-        assert!(entry.message.contains("interrupted by a restart"));
+        assert!(entry
+            .message
+            .contains("A restart stopped this background job"));
         assert!(entry.message.contains("Publish the synthetic report"));
         assert!(store.take_background_spawns().await.unwrap().is_empty());
     }
@@ -3314,7 +3312,7 @@ mod child_runtime_tests {
         let (card, plan) = background_card_after(&child).await;
         assert!(card.starts_with("❌ Stopped · 1 of 3 done"), "{card}");
         assert!(
-            card.contains("Resume the first setup (needs attention)"),
+            card.contains("Resume the first setup (couldn't be done)"),
             "{card}"
         );
         assert_eq!(plan.steps[1].status, crate::plans::StepStatus::Failed);

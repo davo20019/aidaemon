@@ -100,6 +100,13 @@ pub trait TurnSurface: Send + Sync + 'static {
     /// sent, or an error if any part failed.
     async fn say(&self, text: &str) -> anyhow::Result<Vec<String>>;
 
+    /// Replace the text of message `message_id` that [`Self::say`] sent.
+    /// `Ok(false)` when the platform cannot edit it; the default suits
+    /// surfaces that never can.
+    async fn edit(&self, _message_id: &str, _text: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Show that work is in progress until `stop` is cancelled. When the
     /// heartbeat has been quiet for `stale_secs` (0 = never), stop showing it.
     fn show_working(&self, stop: CancellationToken, heartbeat: Arc<AtomicU64>, stale_secs: u64);
@@ -152,15 +159,52 @@ pub struct TurnDeps {
     pub watchdog_stale_threshold_secs: u64,
 }
 
+/// Per session: each queued message's text and its notice's message id.
+type QueuedNotices = std::collections::HashMap<String, Vec<(String, String)>>;
+
 /// Runs turns for one channel (bot).
 #[derive(Clone)]
 pub struct TurnRunner {
     deps: TurnDeps,
+    /// Per session, the "got it" notice sent for each queued message (its
+    /// text and the notice's message id), so the notice can be edited when
+    /// that message's turn starts instead of a second bubble being sent.
+    queued_notices: Arc<std::sync::Mutex<QueuedNotices>>,
 }
 
 impl TurnRunner {
     pub fn new(deps: TurnDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            queued_notices: Arc::default(),
+        }
+    }
+
+    fn remember_queued_notice(&self, session_id: &str, text: &str, message_id: String) {
+        if let Ok(mut notices) = self.queued_notices.lock() {
+            notices
+                .entry(session_id.to_string())
+                .or_default()
+                .push((text.to_string(), message_id));
+        }
+    }
+
+    /// The notice sent for the queued `text`, taken out of the map.
+    fn take_queued_notice(&self, session_id: &str, text: &str) -> Option<String> {
+        let mut notices = self.queued_notices.lock().ok()?;
+        let session = notices.get_mut(session_id)?;
+        let at = session.iter().position(|(queued, _)| queued == text)?;
+        let (_, message_id) = session.remove(at);
+        if session.is_empty() {
+            notices.remove(session_id);
+        }
+        Some(message_id)
+    }
+
+    fn forget_queued_notices(&self, session_id: &str) {
+        if let Ok(mut notices) = self.queued_notices.lock() {
+            notices.remove(session_id);
+        }
     }
 
     /// Remember that `session_id` belongs to `channel_name`, so outbound
@@ -210,16 +254,18 @@ impl TurnRunner {
                     // Notify for the first few only: a long message pasted
                     // in parts can arrive as many.
                     if position <= 3 {
-                        let current = registry
-                            .get_running_task_description(&session_id)
-                            .await
-                            .unwrap_or_else(|| "processing".to_string());
                         let notice = crate::presentation::queued_message_notice(
-                            &turn.text,
-                            &current,
                             !turn.attachments.is_empty(),
                         );
-                        let _ = surface.say(&notice).await;
+                        if let Ok(ids) = surface.say(&notice).await {
+                            if let [message_id] = ids.as_slice() {
+                                self.remember_queued_notice(
+                                    &session_id,
+                                    &turn.text,
+                                    message_id.clone(),
+                                );
+                            }
+                        }
                     }
                     return;
                 }
@@ -431,16 +477,23 @@ impl TurnRunner {
                 .finalize_and_drain(task_id, &session_id, error.as_deref())
                 .await
             else {
+                self.forget_queued_notices(&session_id);
                 break;
             };
             // Let the finished turn's messages commit first.
             tokio::time::sleep(Duration::from_millis(100)).await;
+            let notice = self.take_queued_notice(&session_id, &queued.text);
             let queued = surface.before_queued(queued).await;
             let preview = crate::presentation::word_preview(&queued.text, 50);
             info!(session_id, "Processing queued message: {}", preview);
-            let _ = surface
-                .say(&format!("▶️ Processing queued: \"{preview}\""))
-                .await;
+            let starting = crate::presentation::queued_message_starting(&queued.text);
+            let edited = match notice {
+                Some(message_id) => matches!(surface.edit(&message_id, &starting).await, Ok(true)),
+                None => false,
+            };
+            if !edited {
+                let _ = surface.say(&starting).await;
+            }
             text = queued.text;
             role = queued.user_role;
             channel_ctx = queued.channel_ctx;

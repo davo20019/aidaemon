@@ -88,27 +88,44 @@ pub fn present_notification(notification_type: &str, message: &str) -> String {
     }
 }
 
+/// Whether a scheduled run's work had ended when its card was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRunProgress {
+    /// The run's work is over; the card reports its outcome.
+    Finished,
+    /// The run handed long work to the background: it is still going, and its
+    /// result arrives later.
+    StillRunning,
+}
+
 /// Render a recurring scheduled-run result as a compact mobile card.
 ///
 /// Executor results deliberately retain detailed paths, commands, versions, and
 /// verification evidence in the durable task ledger. A chat notification has a
 /// different job: state the outcome, link the deliverable, and make the schedule
 /// state obvious. Keeping that boundary here prevents raw execution transcripts
-/// from becoming the default Telegram experience.
+/// from becoming the default Telegram experience. The card claims only what
+/// the run's typed state shows: never "complete" while its work still runs,
+/// and no checks it did not report.
 pub fn present_scheduled_run_notification(
     notification_type: &str,
     message: &str,
     recurring: bool,
+    progress: ScheduledRunProgress,
 ) -> String {
     let prepared = prepare_chat_message(message);
     let links = presentable_urls(&prepared);
-    let schedule_note = recurring.then_some("_Recurring schedule remains active._");
+    let schedule_note = recurring.then_some("_It will run again on its schedule._");
+
+    if notification_type == "completed" && progress == ScheduledRunProgress::StillRunning {
+        return "⏳ **Scheduled run still going**\n\nI'll tell you when it's done.".to_string();
+    }
 
     if notification_type == "completed" {
         let outcome = concise_scheduled_outcome(&prepared);
         let mut sections = vec!["✅ **Scheduled run complete**".to_string()];
         sections.push(if outcome.is_empty() {
-            "Completed successfully.".to_string()
+            "It finished.".to_string()
         } else {
             outcome
         });
@@ -121,7 +138,6 @@ pub fn present_scheduled_run_notification(
             };
             sections.push(format!("🔗 [{label}]({url})"));
         }
-        sections.push("**Checks:** Passed".to_string());
         if let Some(schedule_note) = schedule_note {
             sections.push(schedule_note.to_string());
         }
@@ -174,6 +190,7 @@ fn concise_scheduled_outcome(text: &str) -> String {
         // Headings and lead-in labels ("Goal completed:") introduce the
         // outcome; they are not it.
         if line.is_empty()
+            || has_status_heading(line)
             || TASK_COUNT_RE.is_match(line)
             || (line.starts_with("**") && line.ends_with("**"))
             || line.ends_with(':')
@@ -354,13 +371,18 @@ mod tests {
                      successfully with Vite 7.3.1 and uploaded 5 assets. Exact public URL \
                      https://blog.example.com/posts/example/ returned HTTP 200.";
 
-        let output = present_scheduled_run_notification("completed", input, true);
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
 
         assert!(output.starts_with("✅ **Scheduled run complete**"));
         assert!(output.contains("Published `2026-08-12-example.md`."));
         assert!(output.contains("[Open blog.example.com](https://blog.example.com/posts/example/)"));
-        assert!(output.contains("**Checks:** Passed"));
-        assert!(output.contains("_Recurring schedule remains active._"));
+        assert!(!output.contains("Checks"));
+        assert!(output.contains("_It will run again on its schedule._"));
         assert!(!output.contains("/Users/synthetic"));
         assert!(!output.contains("Vite 7.3.1"));
         assert!(!output.contains("uploaded 5 assets"));
@@ -371,7 +393,12 @@ mod tests {
         let input = "Goal completed:\n\n**Deliver the scheduled reminder now.**\nPrepared \
                      reminder: Check the oven now. No rescheduling.";
 
-        let output = present_scheduled_run_notification("completed", input, false);
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            false,
+            ScheduledRunProgress::Finished,
+        );
 
         assert!(output.contains("Check the oven"), "{output}");
         assert!(!output.contains("Goal completed:"), "{output}");
@@ -383,7 +410,12 @@ mod tests {
                      Previewed at http://localhost:4173/ and deployed to \
                      https://blog.example.com/posts/article/.";
 
-        let output = present_scheduled_run_notification("completed", input, true);
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
 
         assert!(output.contains("Published the article."));
         assert!(output.contains("https://blog.example.com/posts/article/"));
@@ -392,16 +424,54 @@ mod tests {
     }
 
     #[test]
+    fn a_run_still_going_is_never_called_complete() {
+        let input = "⏳ **Still on it**\n\nThis is taking a little longer, so it's running \
+                     in the background now.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            true,
+            ScheduledRunProgress::StillRunning,
+        );
+
+        assert_eq!(
+            output,
+            "⏳ **Scheduled run still going**\n\nI'll tell you when it's done."
+        );
+    }
+
+    #[test]
+    fn a_status_card_inside_the_result_is_not_taken_as_its_outcome() {
+        let input = "⏳ **Still on it**\nPublished the weekly post.";
+
+        let output = present_scheduled_run_notification(
+            "completed",
+            input,
+            false,
+            ScheduledRunProgress::Finished,
+        );
+
+        assert!(output.contains("Published the weekly post."), "{output}");
+        assert!(!output.contains("Still on it"), "{output}");
+    }
+
+    #[test]
     fn scheduled_failure_keeps_actionable_detail_but_shortens_paths() {
         let input = "Deployment failed while reading /Users/synthetic/projects/blog/wrangler.toml.\n\nNeeded: refresh the deployment token.";
 
-        let output = present_scheduled_run_notification("failed", input, true);
+        let output = present_scheduled_run_notification(
+            "failed",
+            input,
+            true,
+            ScheduledRunProgress::Finished,
+        );
 
         assert!(output.starts_with("⚠️ **Scheduled run needs attention**"));
         assert!(output.contains("`wrangler.toml`"));
         assert!(output.contains("refresh the deployment token"));
         assert!(!output.contains("/Users/synthetic"));
-        assert!(output.contains("_Recurring schedule remains active._"));
+        assert!(output.contains("_It will run again on its schedule._"));
     }
 }
 
@@ -432,31 +502,39 @@ pub fn word_preview(text: &str, max_chars: usize) -> String {
 /// Without attachments the running task takes it in at its next step that
 /// can act on it (one offering tools) when it is from the same sender
 /// (`TaskRegistry::take_steering_messages`); otherwise, or when no model
-/// call answered it, it runs as its own turn once the current one ends.
-pub fn queued_message_notice(text: &str, current_task: &str, has_attachments: bool) -> String {
-    let preview = word_preview(text, 50);
+/// call answered it, it runs as its own turn once the current one ends, and
+/// this notice is edited into [`queued_message_starting`] then.
+pub fn queued_message_notice(has_attachments: bool) -> String {
     if has_attachments {
-        format!("📥 Got \"{preview}\". I'll handle it right after the current task: {current_task}")
+        "📥 Got it – I'll get to this right after what I'm doing now.".to_string()
     } else {
-        format!(
-            "📥 Got \"{preview}\". I'll take it into account in the current task \
-             ({current_task}), or handle it right after if it can't join."
-        )
+        "📥 Got it – I'll add this to what I'm doing now.".to_string()
     }
+}
+
+/// What a queued message's notice says once its own turn starts.
+pub fn queued_message_starting(text: &str) -> String {
+    format!("▶️ Now on: \"{}\"", word_preview(text, 50))
 }
 
 #[cfg(test)]
 mod queued_notice_tests {
-    use super::queued_message_notice;
+    use super::{queued_message_notice, queued_message_starting};
 
     #[test]
-    fn the_notice_says_what_will_happen_to_the_message() {
-        let joining = queued_message_notice("Also count the lines", "Read four files", false);
-        assert!(joining.contains("take it into account in the current task (Read four files)"));
-        let waiting = queued_message_notice("see the attached log", "Read four files", true);
-        assert!(waiting.contains("right after the current task: Read four files"));
-        let long = queued_message_notice(&"x".repeat(80), "t", false);
-        assert!(long.contains(&format!("{}…", "x".repeat(49))));
+    fn the_notice_is_short_and_says_what_will_happen() {
+        assert_eq!(
+            queued_message_notice(false),
+            "📥 Got it – I'll add this to what I'm doing now."
+        );
+        assert_eq!(
+            queued_message_notice(true),
+            "📥 Got it – I'll get to this right after what I'm doing now."
+        );
+        assert_eq!(
+            queued_message_starting(&"x".repeat(80)),
+            format!("▶️ Now on: \"{}…\"", "x".repeat(49))
+        );
     }
 
     #[test]
@@ -473,21 +551,9 @@ mod queued_notice_tests {
             word_preview(&"y".repeat(90), 10),
             format!("{}…", "y".repeat(9))
         );
-        let notice = queued_message_notice(
-            "What scheduled goals do I have?",
-            &word_preview(request, 80),
-            false,
-        );
-        assert!(
-            notice.contains(
-                "(Every day at 7:13 am, send me a one-line synthetic test reminder that says:…)"
-            ),
-            "{notice}"
-        );
-        let queued = queued_message_notice(request, "t", false);
-        assert!(
-            queued.contains("\"Every day at 7:13 am, send me a one-line…\""),
-            "{queued}"
+        assert_eq!(
+            queued_message_starting(request),
+            "▶️ Now on: \"Every day at 7:13 am, send me a one-line…\""
         );
     }
 }

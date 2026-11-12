@@ -127,6 +127,12 @@ pub fn shared_commands() -> Vec<CommandDef> {
             category: CommandCategory::Core,
         },
         CommandDef {
+            name: "status",
+            description: "Show this chat's mode, running tasks and what's next",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
             name: "work",
             description: "View and manage durable work",
             usage: Some("/work [ready|running|blocked|show|comment|unblock|retry]"),
@@ -239,6 +245,188 @@ pub trait CommandHost: Send + Sync {
     fn estimate_text_tokens(&self, text: &str) -> usize;
     /// Token usage recorded since `since` (`%Y-%m-%d %H:%M:%S`, UTC).
     async fn token_usage_since(&self, since: &str) -> anyhow::Result<Vec<TokenUsageRecord>>;
+    /// The owner's next scheduled item, for `/status`; `None` when nothing
+    /// is scheduled (or the host keeps no schedules).
+    async fn next_scheduled(&self) -> Option<ScheduledItem> {
+        None
+    }
+}
+
+/// One scheduled item as `/status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledItem {
+    /// What runs, in the owner's words.
+    pub what: String,
+    /// When, already in the owner's local time ("2:39 PM ET").
+    pub when: String,
+}
+
+/// What `/status` reports, read from typed state.
+#[derive(Debug, Clone)]
+pub struct StatusView {
+    /// The chat's mode and when it ends; `None` is full access.
+    pub mode: Option<(ChatMode, Option<DateTime<Utc>>)>,
+    /// Running chat tasks: id, description, when it started.
+    pub running: Vec<(u64, String, DateTime<Utc>)>,
+    pub next_scheduled: Option<ScheduledItem>,
+}
+
+/// The one line that says a chat's mode, as `/mode` and `/status` show it.
+fn mode_line(mode: Option<(ChatMode, Option<DateTime<Utc>>)>, now: DateTime<Utc>) -> String {
+    let left = |until: Option<DateTime<Utc>>| {
+        until.map_or_else(String::new, |at| {
+            format!(
+                " (about {} left)",
+                compact_chrono_duration(at - now, ZeroUnitStyle::Trim)
+            )
+        })
+    };
+    match mode {
+        Some((ChatMode::ReadOnly, until)) => format!("Mode: read-only{}.", left(until)),
+        Some((ChatMode::Unrestricted, until)) => format!("Mode: unrestricted{}.", left(until)),
+        Some((ChatMode::Full, _)) | None => "Mode: full.".to_string(),
+    }
+}
+
+/// `/status`: the chat's mode, what is running and what is scheduled next.
+pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
+    let mut lines = vec![mode_line(view.mode, now)];
+    if view.running.is_empty() {
+        lines.push("Running: nothing right now.".to_string());
+    } else {
+        lines.push("Running:".to_string());
+        for (id, description, started) in &view.running {
+            lines.push(format!(
+                "• {} ({} so far, /cancel {id} to stop it)",
+                crate::presentation::word_preview(description, 80),
+                compact_chrono_duration(now - *started, ZeroUnitStyle::Trim)
+            ));
+        }
+    }
+    lines.push(match &view.next_scheduled {
+        Some(item) => format!(
+            "Next scheduled: {} – {}",
+            crate::presentation::word_preview(&item.what, 80),
+            item.when
+        ),
+        None => "Next scheduled: nothing.".to_string(),
+    });
+    lines.join("\n")
+}
+
+/// The command closest to an unknown `name` (without its prefix) by edit
+/// distance, when one is close enough to be a likely typo.
+pub fn closest_command<'a>(name: &str, commands: &'a [CommandDef]) -> Option<&'a str> {
+    let name = name.to_ascii_lowercase();
+    let len = name.chars().count();
+    if len == 0 {
+        return None;
+    }
+    let limit = if len <= 4 { 1 } else { 2 };
+    commands
+        .iter()
+        .map(|command| (edit_distance(&name, command.name), command.name))
+        .filter(|(distance, _)| *distance <= limit)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, command)| command)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut current = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != *cb);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+/// The reply to a command nobody handles: a likely intended command when one
+/// is close, and where to find the rest.
+pub fn unknown_command_reply(cmd: &str, commands: &[CommandDef], prefix: &str) -> String {
+    let name = cmd
+        .trim_start_matches(prefix)
+        .split('@')
+        .next()
+        .unwrap_or("");
+    match closest_command(name, commands) {
+        Some(suggestion) => format!(
+            "I don't know {cmd}. Did you mean {prefix}{suggestion}? Send {prefix}help to see \
+             the commands."
+        ),
+        None => format!("I don't know {cmd}. Send {prefix}help to see the commands."),
+    }
+}
+
+/// How `/private` was sent when it carries more than the bare command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateRequest<'a> {
+    /// Only `/private` (said once or more, "/private/private"): the next
+    /// message is kept private.
+    Next,
+    /// `/private` with the message itself ("/private what's my balance?",
+    /// "/privateWhat's…"): this message is the private one.
+    With(&'a str),
+}
+
+/// Read `/private` sent together with its message. `None` for anything
+/// else, including `/private off` and the bare `/private`, which the
+/// command itself answers.
+pub fn private_request(text: &str) -> Option<PrivateRequest<'_>> {
+    let mut rest = text.trim_start();
+    let mut seen = 0usize;
+    while let Some(after) = strip_prefix_ignore_case(rest, "/private") {
+        seen += 1;
+        // Telegram may append the bot name in groups: `/private@my_bot`.
+        rest = match after.strip_prefix('@') {
+            Some(bot) => bot.find(char::is_whitespace).map_or("", |at| &bot[at..]),
+            None => after,
+        };
+        rest = rest.trim_start();
+    }
+    if seen == 0 {
+        return None;
+    }
+    let message = rest.trim();
+    if message.is_empty() {
+        return (seen > 1).then_some(PrivateRequest::Next);
+    }
+    if message.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    Some(PrivateRequest::With(message))
+}
+
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+/// The commands `/help` shows first: the ones used day to day.
+pub const EVERYDAY_COMMANDS: &[&str] = &["clear", "tasks", "status", "private", "readonly", "mode"];
+
+/// How much `/help` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpScope {
+    /// The everyday commands and how to see the rest.
+    Everyday,
+    /// Every command the platform has (`/help all`).
+    All,
+}
+
+impl HelpScope {
+    pub fn from_args(args: &str) -> Self {
+        if args.trim().eq_ignore_ascii_case("all") {
+            Self::All
+        } else {
+            Self::Everyday
+        }
+    }
 }
 
 /// Who sent a command, and where.
@@ -283,7 +471,8 @@ impl SharedCommands {
             "/auto" => self.handle_auto().await,
             "/tasks" => self.handle_tasks(session_id).await,
             "/cancel" => self.handle_cancel(args).await,
-            "/clear" => self.handle_clear(session_id).await,
+            "/clear" | "/new" => self.handle_clear(session_id).await,
+            "/status" => self.handle_status(session_id).await,
             "/wipe" => self.handle_wipe(session_id).await,
             "/cost" => self.handle_cost().await,
             "/context" => self.handle_context(session_id, user_role).await,
@@ -300,6 +489,24 @@ impl SharedCommands {
                 extension.run(cmd, args, &call).await
             }
         })
+    }
+
+    async fn handle_status(&self, session_id: &str) -> String {
+        let now = Utc::now();
+        let running = self
+            .task_registry
+            .list_for_session(session_id)
+            .await
+            .into_iter()
+            .filter(|entry| matches!(entry.status, TaskStatus::Running))
+            .map(|entry| (entry.id, entry.description, entry.started_at))
+            .collect();
+        let view = StatusView {
+            mode: self.host.chat_mode(session_id, now).await,
+            running,
+            next_scheduled: self.host.next_scheduled().await,
+        };
+        render_status(&view, now)
     }
 
     /// `/private [off]`: the sender's next message in this chat is not
@@ -344,26 +551,8 @@ impl SharedCommands {
             return NOT_OWNER.to_string();
         }
         let now = Utc::now();
-        let left_suffix = |until: Option<chrono::DateTime<Utc>>| {
-            until.map_or_else(String::new, |at| {
-                format!(
-                    " (about {} left)",
-                    compact_chrono_duration(at - now, ZeroUnitStyle::Trim)
-                )
-            })
-        };
         let requested = match args.trim().to_ascii_lowercase().as_str() {
-            "" => {
-                return match self.host.chat_mode(session_id, now).await {
-                    Some((ChatMode::ReadOnly, until)) => {
-                        format!("Mode: read-only{}.", left_suffix(until))
-                    }
-                    Some((ChatMode::Unrestricted, until)) => {
-                        format!("Mode: unrestricted{}.", left_suffix(until))
-                    }
-                    Some((ChatMode::Full, _)) | None => "Mode: full.".to_string(),
-                };
-            }
+            "" => return mode_line(self.host.chat_mode(session_id, now).await, now),
             "full" => ChatMode::Full,
             "unrestricted" => ChatMode::Unrestricted,
             "readonly" | "read-only" | "read_only" => ChatMode::ReadOnly,
@@ -576,8 +765,8 @@ impl SharedCommands {
                     format!(" ({} cancelled.)", cancellations.join(" and "))
                 };
                 format!(
-                    "Context cleared. Starting fresh — your active history is kept (use /wipe to \
-                     erase it from the active database).{suffix}"
+                    "Context cleared. Starting fresh – your history is kept; use /wipe to \
+                     delete this chat's history.{suffix}"
                 )
             }
             Err(e) => format!("Failed to clear context: {}", e),
@@ -683,49 +872,26 @@ pub fn format_number(n: i64) -> String {
 ///
 /// `commands`: the command definitions to include (platform-specific).
 /// `prefix`: command prefix character ("/" for Telegram/Discord, "!" for Slack).
-pub fn build_help_text(commands: &[CommandDef], prefix: &str) -> String {
+/// `scope`: the everyday commands, or all of them (`/help all`). The text is
+/// Markdown; each channel renders it in its own format.
+pub fn build_help_text(commands: &[CommandDef], prefix: &str, scope: HelpScope) -> String {
     let p = prefix;
-    let mut text = String::from(
-        "**What I can do**\n\
-         \n\
-         **Schedule recurring tasks**\n\
-         _\"Check my disk space every 6 hours\"_\n\
-         _\"Remind me to review PRs on weekdays at 9am\"_\n\
-         \n\
-         **Search & browse the web**\n\
-         _\"What's the latest on Rust 2024 edition?\"_\n\
-         _\"Summarize this article: <url>\"_\n\
-         \n\
-         **Run commands & manage your system**\n\
-         _\"Show me docker container status\"_\n\
-         _\"Deploy the staging branch\"_\n\
-         \n\
-         **Switch AI providers with guidance**\n\
-         _\"Switch to Moonshot\"_\n\
-         _\"Move me to Cloudflare Gateway and ask for what you need\"_\n\
-         \n\
-         **Remember things about you**\n\
-         _\"I prefer dark mode and vim keybindings\"_\n\
-         _\"My deploy server is 10.0.1.50\"_\n\
-         \n\
-         **Track your goals**\n\
-         _\"I want to finish the API migration this month\"_\n\
-         _\"How's my progress on learning Rust?\"_\n\
-         \n\
-         **Delegate coding tasks**\n\
-         _\"Refactor the auth module to use JWT\"_\n\
-         _\"Fix the failing tests in src/parser\"_\n\
-         \n\
-         **Send & receive files**\n\
-         _\"Send me the latest log file\"_\n\
-         _\"Analyze this CSV I'm uploading\"_\n\
-         \n\
-         Just ask in plain language — I'll pick the right tools.\n\
-         \n\
-         **Commands**",
-    );
-
-    for cmd in commands {
+    let shown: Vec<&CommandDef> = match scope {
+        HelpScope::Everyday => EVERYDAY_COMMANDS
+            .iter()
+            .filter_map(|name| commands.iter().find(|cmd| cmd.name == *name))
+            .collect(),
+        HelpScope::All => commands.iter().collect(),
+    };
+    let mut text = match scope {
+        HelpScope::Everyday => String::from(
+            "Just ask in plain words – I'll pick the right tools. For example: \
+             _\"Check my disk space every 6 hours\"_ or _\"Send me the latest log file\"_.\n\n\
+             **Everyday commands**",
+        ),
+        HelpScope::All => String::from("**All commands**"),
+    };
+    for cmd in shown {
         let label = match cmd.usage {
             Some(usage) => {
                 // Replace the leading "/" with the platform prefix.
@@ -737,10 +903,117 @@ pub fn build_help_text(commands: &[CommandDef], prefix: &str) -> String {
             }
             None => format!("{p}{}", cmd.name),
         };
-        text.push_str(&format!("\n`{}` — {}", label, cmd.description));
+        text.push_str(&format!("\n{} – {}", label, cmd.description));
+    }
+    if scope == HelpScope::Everyday {
+        text.push_str(&format!("\n\nSend {p}help all for every command."));
+    }
+    text
+}
+
+#[cfg(test)]
+mod help_and_status_tests {
+    use super::*;
+
+    fn defs() -> Vec<CommandDef> {
+        shared_commands()
     }
 
-    text
+    #[test]
+    fn help_shows_the_everyday_commands_and_how_to_see_the_rest() {
+        let help = build_help_text(&defs(), "/", HelpScope::Everyday);
+        for name in EVERYDAY_COMMANDS {
+            assert!(help.contains(&format!("\n/{name}")), "{name}: {help}");
+        }
+        assert!(!help.contains("/models"), "{help}");
+        assert!(!help.contains('`'), "{help}");
+        assert!(
+            help.ends_with("Send /help all for every command."),
+            "{help}"
+        );
+        let all = build_help_text(&defs(), "!", HelpScope::All);
+        assert!(all.contains("!models – List available models"), "{all}");
+        assert_eq!(HelpScope::from_args(" ALL "), HelpScope::All);
+        assert_eq!(HelpScope::from_args(""), HelpScope::Everyday);
+    }
+
+    #[test]
+    fn an_unknown_command_suggests_the_closest_one() {
+        let commands = defs();
+        assert_eq!(closest_command("cleer", &commands), Some("clear"));
+        assert_eq!(closest_command("stauts", &commands), Some("status"));
+        assert_eq!(closest_command("weather", &commands), None);
+        assert_eq!(
+            unknown_command_reply("/claer", &commands, "/"),
+            "I don't know /claer. Did you mean /clear? Send /help to see the commands."
+        );
+        assert_eq!(
+            unknown_command_reply("/weather@my_bot", &commands, "/"),
+            "I don't know /weather@my_bot. Send /help to see the commands."
+        );
+    }
+
+    #[test]
+    fn private_can_carry_its_message() {
+        assert_eq!(private_request("/private"), None);
+        assert_eq!(private_request("/private off"), None);
+        assert_eq!(private_request("/clear"), None);
+        assert_eq!(
+            private_request("/private/private"),
+            Some(PrivateRequest::Next)
+        );
+        assert_eq!(
+            private_request("/privateAnother test"),
+            Some(PrivateRequest::With("Another test"))
+        );
+        assert_eq!(
+            private_request("/private@my_bot what's my balance?"),
+            Some(PrivateRequest::With("what's my balance?"))
+        );
+        assert_eq!(
+            private_request("/private /private hi"),
+            Some(PrivateRequest::With("hi"))
+        );
+    }
+
+    #[test]
+    fn status_says_mode_running_work_and_whats_next() {
+        let now = Utc::now();
+        let quiet = StatusView {
+            mode: None,
+            running: Vec::new(),
+            next_scheduled: None,
+        };
+        assert_eq!(
+            render_status(&quiet, now),
+            "Mode: full.\nRunning: nothing right now.\nNext scheduled: nothing."
+        );
+        let busy = StatusView {
+            mode: Some((ChatMode::ReadOnly, Some(now + chrono::Duration::hours(3)))),
+            running: vec![(
+                7,
+                "Read four files".to_string(),
+                now - chrono::Duration::minutes(2),
+            )],
+            next_scheduled: Some(ScheduledItem {
+                what: "Check disk space".to_string(),
+                when: "2:39 PM ET".to_string(),
+            }),
+        };
+        let status = render_status(&busy, now);
+        assert!(
+            status.starts_with("Mode: read-only (about 3h left)."),
+            "{status}"
+        );
+        assert!(
+            status.contains("• Read four files (2m so far, /cancel 7 to stop it)"),
+            "{status}"
+        );
+        assert!(
+            status.ends_with("Next scheduled: Check disk space – 2:39 PM ET"),
+            "{status}"
+        );
+    }
 }
 
 #[cfg(test)]

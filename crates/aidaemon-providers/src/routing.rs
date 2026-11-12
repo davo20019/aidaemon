@@ -18,6 +18,99 @@ pub enum ProviderKind {
     OpenaiChatgpt,
 }
 
+impl ProviderKind {
+    /// The provider family as the owner knows it.
+    pub fn plain_name(self) -> &'static str {
+        match self {
+            Self::OpenaiCompatible => "an OpenAI-compatible provider",
+            Self::XaiNative => "xAI",
+            Self::GoogleGenai => "Google Gemini",
+            Self::Anthropic => "Anthropic",
+            Self::OpenaiChatgpt => "your ChatGPT subscription",
+        }
+    }
+}
+
+/// What a provider reload changed, said in plain words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderReload {
+    pub old_provider: ProviderKind,
+    pub new_provider: ProviderKind,
+    pub old_model: String,
+    pub new_model: String,
+    /// A model the owner had picked by hand was dropped for automatic choice.
+    pub manual_model_cleared: bool,
+}
+
+impl ProviderReload {
+    /// Only what changed; "Nothing else changed." when nothing did.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.old_provider != self.new_provider {
+            parts.push(format!(
+                "Now using {} ({}).",
+                self.new_provider.plain_name(),
+                self.new_model
+            ));
+        } else if self.old_model != self.new_model {
+            parts.push(format!(
+                "The model is now {} (was {}).",
+                self.new_model, self.old_model
+            ));
+        }
+        if self.manual_model_cleared {
+            parts.push("The model is picked automatically again.".to_string());
+        }
+        if parts.is_empty() {
+            "Nothing else changed.".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+#[cfg(test)]
+mod reload_summary_tests {
+    use super::*;
+
+    fn reload(old: ProviderKind, new: ProviderKind, models: (&str, &str)) -> ProviderReload {
+        ProviderReload {
+            old_provider: old,
+            new_provider: new,
+            old_model: models.0.to_string(),
+            new_model: models.1.to_string(),
+            manual_model_cleared: false,
+        }
+    }
+
+    #[test]
+    fn a_reload_says_only_what_changed() {
+        let same = reload(
+            ProviderKind::OpenaiChatgpt,
+            ProviderKind::OpenaiChatgpt,
+            ("gpt-6-sol", "gpt-6-sol"),
+        );
+        assert_eq!(same.summary(), "Nothing else changed.");
+        let switched = reload(
+            ProviderKind::OpenaiCompatible,
+            ProviderKind::Anthropic,
+            ("mock-model", "claude-x"),
+        );
+        assert_eq!(switched.summary(), "Now using Anthropic (claude-x).");
+        let mut model_only = reload(
+            ProviderKind::Anthropic,
+            ProviderKind::Anthropic,
+            ("claude-a", "claude-b"),
+        );
+        model_only.manual_model_cleared = true;
+        assert_eq!(
+            model_only.summary(),
+            "The model is now claude-b (was claude-a). The model is picked automatically again."
+        );
+        assert!(!switched.summary().contains("Openai"));
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ModelsConfig {
     /// Canonical default model used for normal requests.

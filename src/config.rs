@@ -75,11 +75,6 @@ pub fn shared_secret_store() -> std::sync::Arc<dyn aidaemon_secrets::SecretStore
     secret_store().clone()
 }
 
-/// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
-pub(crate) fn keychain_disabled() -> bool {
-    secret_store().keychain_disabled()
-}
-
 #[cfg(test)]
 fn resolve_env_file_path() -> PathBuf {
     secret_store().env_store().env_file_path()

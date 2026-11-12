@@ -9,7 +9,9 @@ use std::sync::Arc;
 pub(crate) use aidaemon_channels::slash::{
     is_slash_command, shared_commands, CommandCategory, CommandDef,
 };
-use aidaemon_channels::slash::{ChatMode, CommandHost, SharedCommands, SlashCall, SlashCommand};
+use aidaemon_channels::slash::{
+    ChatMode, CommandHost, ScheduledItem, SharedCommands, SlashCall, SlashCommand,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -43,6 +45,12 @@ impl CommandContext {
         self.shared()
             .dispatch(cmd, args, session_id, sender_id, user_role)
             .await
+    }
+
+    /// Reload the config file (restoring its backup when it no longer
+    /// loads). `Ok` says what changed; `Err` says what went wrong.
+    pub(crate) async fn reload_config(&self) -> Result<String, String> {
+        reload_config(self.agent.as_ref(), &self.config_path).await
     }
 
     fn shared(&self) -> SharedCommands {
@@ -138,6 +146,29 @@ impl CommandHost for DaemonCommandHost {
     async fn token_usage_since(&self, since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
         self.state.get_token_usage_since(since).await
     }
+
+    async fn next_scheduled(&self) -> Option<ScheduledItem> {
+        let goals = self.state.get_scheduled_goals().await.ok()?;
+        let mut next: Option<(DateTime<Utc>, String)> = None;
+        for goal in goals.into_iter().filter(|goal| goal.status == "active") {
+            let Ok(schedules) = self.state.get_schedules_for_goal(&goal.id).await else {
+                continue;
+            };
+            for schedule in schedules.iter().filter(|schedule| !schedule.is_paused) {
+                let Ok(at) = DateTime::parse_from_rfc3339(&schedule.next_run_at) else {
+                    continue;
+                };
+                let at = at.with_timezone(&Utc);
+                if next.as_ref().is_none_or(|(earliest, _)| at < *earliest) {
+                    next = Some((at, goal.description.clone()));
+                }
+            }
+        }
+        next.map(|(at, what)| ScheduledItem {
+            what,
+            when: aidaemon_work::schedule::owner_time(&at),
+        })
+    }
 }
 
 fn chat_mode(mode: SessionMode) -> ChatMode {
@@ -168,30 +199,40 @@ impl SlashCommand for ReloadCommand {
 
 impl ReloadCommand {
     async fn handle_reload(&self) -> String {
-        match AppConfig::load(&self.config_path) {
-            Ok(new_config) => match self.agent.reload_provider(&new_config).await {
-                Ok(status) => format!("Config reloaded. {}", status),
-                Err(e) => format!("Provider reload failed: {}", e),
-            },
-            Err(e) => {
-                // Config is broken — try to auto-restore from backup
-                let backup = self.config_path.with_extension("toml.bak");
-                if backup.exists() {
-                    if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
-                        format!(
-                            "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
-                            e
-                        )
-                    } else {
-                        format!(
-                            "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
-                            e
-                        )
-                    }
+        match reload_config(self.agent.as_ref(), &self.config_path).await {
+            Ok(summary) => format!("Config reloaded. {summary}"),
+            Err(error) => error,
+        }
+    }
+}
+
+async fn reload_config(
+    agent: &dyn DaemonAgentRuntime,
+    config_path: &std::path::Path,
+) -> Result<String, String> {
+    match AppConfig::load(config_path) {
+        Ok(new_config) => agent
+            .reload_provider(&new_config)
+            .await
+            .map_err(|e| format!("Provider reload failed: {}", e)),
+        Err(e) => {
+            // Config is broken — try to auto-restore from backup
+            let backup = config_path.with_extension("toml.bak");
+            Err(if backup.exists() {
+                if tokio::fs::copy(&backup, config_path).await.is_ok() {
+                    format!(
+                        "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
+                        e
+                    )
                 } else {
-                    format!("Config reload failed: {}\n\nNo backup available.", e)
+                    format!(
+                        "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
+                        e
+                    )
                 }
-            }
+            } else {
+                format!("Config reload failed: {}\n\nNo backup available.", e)
+            })
         }
     }
 }

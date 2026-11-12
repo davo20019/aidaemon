@@ -768,6 +768,18 @@ fn clear_partial_success_context(goal: &mut crate::traits::Goal) {
     goal.context = (!object.is_empty()).then(|| context.to_string());
 }
 
+/// A task lead that handed its work to the background finishes `Partial`:
+/// its run is still going, so its card must not call it complete.
+fn scheduled_run_progress(
+    task_lead_outcome: Option<TaskOutcome>,
+) -> crate::channels::ScheduledRunProgress {
+    if task_lead_outcome == Some(TaskOutcome::Partial) {
+        crate::channels::ScheduledRunProgress::StillRunning
+    } else {
+        crate::channels::ScheduledRunProgress::Finished
+    }
+}
+
 fn recovery_task_succeeded(outcome: TaskOutcome, persisted: Option<&crate::traits::Task>) -> bool {
     outcome == TaskOutcome::Succeeded
         && persisted.is_some_and(crate::traits::Task::completed_successfully)
@@ -2690,6 +2702,7 @@ pub fn spawn_background_task_lead(
                             notification_type,
                             &msg,
                             true,
+                            scheduled_run_progress(task_lead_outcome),
                         );
                         let entry = crate::traits::NotificationEntry::new(
                             &goal_id,
@@ -3175,7 +3188,12 @@ pub fn spawn_background_task_lead(
             };
 
             let msg = if is_scheduled_run {
-                crate::channels::present_scheduled_run_notification(notification_type, &msg, false)
+                crate::channels::present_scheduled_run_notification(
+                    notification_type,
+                    &msg,
+                    false,
+                    scheduled_run_progress(task_lead_outcome),
+                )
             } else {
                 crate::channels::present_notification(notification_type, &msg)
             };
