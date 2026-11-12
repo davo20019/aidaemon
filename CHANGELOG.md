@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Dependencies updated
+
+- Every dependency moved to its latest semver-compatible release, and to its latest major: reqwest 0.13 (one HTTP client in the tree, rustls), sqlx 0.9 with libsqlite3-sys 0.37 (SQLCipher builds unchanged), rand 0.10 with the RustCrypto 0.11 generation (sha2, hmac, hkdf, aes-gcm, p256 0.14), tokio-tungstenite 0.30, toml 1.2 and toml_edit 0.25, self_update 1.3, sysinfo 0.40, dirs 7, croner 4, strum 0.28, dialoguer 0.12, base64 0.23, htmd 0.5, portable-pty 0.9 and others. serde_yaml (deprecated) is replaced by serde-saphyr, read with YAML 1.2 scalars so config and scenario files parse as before. Digests, keys and signatures are byte-for-byte the same. Built and linted on Rust 1.99.
+
 ### Added
 
 - **The SDK's shell is sandboxed by default on Linux too.** `aidaemon_tools::default_tools` (and `Shell::sandboxed`) run commands in bubblewrap on Linux, as they use seatbelt on macOS: the workspace is writable, the rest of the filesystem read-only, `/tmp` private, the network off unless allowed. Without a working `bwrap` the shell runs on the host and logs a one-time warning instead of pretending. Override with `default_tools_with_sandbox` or `AIDAEMON_SHELL_SANDBOX=auto|bubblewrap|seatbelt|local`; `Shell::deny_read` hides host paths from the contained backends. The bubblewrap backend's confinement tests now run for real on Linux CI. The daemon's `terminal` tool is unchanged (`[terminal] confinement = "host"` by default on every platform).
