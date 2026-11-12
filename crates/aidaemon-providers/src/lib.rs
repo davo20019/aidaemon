@@ -56,6 +56,8 @@
 
 mod anthropic;
 mod chatgpt;
+#[cfg(feature = "chatgpt-login")]
+pub mod chatgpt_login;
 mod errors;
 mod google;
 mod openai;

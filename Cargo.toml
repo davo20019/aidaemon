@@ -135,7 +135,7 @@ aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 # Secrets: the keychain, its env-file mode and the account names.
 aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
 aidaemon-tool-browser = { version = "=0.2.0", path = "crates/aidaemon-tool-browser" }
-aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers" }
+aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { version = "=0.2.0", path = "crates/aidaemon-mcp" }
 # Channel contract and platform adapters (formatting today; transport next).

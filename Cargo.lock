@@ -405,9 +405,14 @@ name = "aidaemon-providers"
 version = "0.2.0"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-secrets",
+ "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
+ "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -415,6 +420,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
