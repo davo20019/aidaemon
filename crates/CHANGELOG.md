@@ -15,6 +15,7 @@ stability promise.
 ### Security
 - `aidaemon-sdk`: `preset` without a workspace no longer runs a tool that may change things but declares no access without anyone seeing it: the approval policy asks the owner first (a `#[tool(write)] fn save(path, ..)` with no `access` could write `~/.bashrc` unchecked). With a workspace, a read-only tool that declares no paths is now refused like a writer (it could read `~/.ssh`). New `Preset::path_free_tool` marks tools that touch no files (business APIs); the tools a `Preset::memory` system gives are marked automatically; new `Preset::undeclared_reads`. An explicit `Preset::undeclared_writes(Allow)` still runs undeclared writers without asking.
 - `aidaemon-policies`: `ScopeGuard::path_free_tool`, `ApprovalPolicy::ask_undeclared_writes` and `ApprovalPolicy::path_free_tool`.
+- `aidaemon-tools`: the shell refuses a command when its backend cannot enforce a restriction the shell was given (`Shell::deny_read`, or an explicit `Shell::allow_network(false)`), instead of running it unrestricted on `LocalSandbox`. New `Sandbox::enforces_deny_read` and `Sandbox::enforces_network_off` (default `false`). `DockerSandbox` now covers denied paths inside the workspace. Bubblewrap and seatbelt deny reads of `HOME_SECRET_PATHS` under `$HOME` by default (`default_deny_read(..)` replaces the list; `SeatbeltSandbox` is no longer a unit struct).
 
 ### Fixed
 - `aidaemon-policies`: `ContextWindow` pins the user's latest message as well as the first, so a second question is never dropped behind big tool rounds.

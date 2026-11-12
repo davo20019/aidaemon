@@ -37,7 +37,8 @@ pub struct Shell {
     default_timeout: Duration,
     max_timeout: Duration,
     max_output_bytes: usize,
-    allow_network: bool,
+    /// `None`: the backend's default (off where it can cut the network).
+    allow_network: Option<bool>,
     deny_read: Vec<std::path::PathBuf>,
 }
 
@@ -64,7 +65,7 @@ impl Shell {
             default_timeout: Duration::from_secs(60),
             max_timeout: Duration::from_secs(110),
             max_output_bytes: 20_000,
-            allow_network: false,
+            allow_network: None,
             deny_read: Vec::new(),
         }
     }
@@ -100,16 +101,21 @@ impl Shell {
         self
     }
 
-    /// Let sandboxed commands use the network (ignored by `LocalSandbox`,
-    /// which never restricts it).
+    /// Let commands use the network, or not. Unset, a backend that can cut
+    /// the network ([`Sandbox::enforces_network_off`]) does, and one that
+    /// cannot (`LocalSandbox`) leaves it on and says so in the tool's
+    /// description. Set to `false`, commands are refused on a backend that
+    /// cannot enforce it, rather than run with the network on.
     pub fn allow_network(mut self, allow: bool) -> Self {
-        self.allow_network = allow;
+        self.allow_network = Some(allow);
         self
     }
 
     /// Host paths commands must not read, for example credential
-    /// directories (contained backends only; see
-    /// [`SandboxCommand::deny_read`]).
+    /// directories (on top of the backend's own defaults; see
+    /// [`SandboxCommand::deny_read`]). On a backend that cannot enforce it
+    /// ([`Sandbox::enforces_deny_read`], for example `LocalSandbox`), every
+    /// command is refused rather than run with the paths readable.
     pub fn deny_read(
         mut self,
         paths: impl IntoIterator<Item = impl Into<std::path::PathBuf>>,
@@ -120,6 +126,34 @@ impl Shell {
 
     pub fn backend(&self) -> &Arc<dyn Sandbox> {
         &self.backend
+    }
+
+    /// Why no command may run: a restriction this shell was configured
+    /// with that its backend cannot enforce. Fails closed instead of
+    /// running the command without it.
+    fn unenforceable(&self) -> Option<String> {
+        let backend = self.backend.name();
+        if !self.deny_read.is_empty() && !self.backend.enforces_deny_read() {
+            let paths = self
+                .deny_read
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!(
+                "refused: this shell must keep commands from reading {paths}, but its \
+                 `{backend}` backend cannot enforce that, so the command was not run. Use a \
+                 contained backend (bubblewrap, seatbelt or docker) for this shell."
+            ));
+        }
+        if self.allow_network == Some(false) && !self.backend.enforces_network_off() {
+            return Some(format!(
+                "refused: this shell must run commands without network access, but its \
+                 `{backend}` backend cannot cut the network, so the command was not run. Use a \
+                 contained backend (bubblewrap, seatbelt or docker) for this shell."
+            ));
+        }
+        None
     }
 
     fn environment(&self) -> Vec<(String, String)> {
@@ -158,7 +192,7 @@ impl Tool for Shell {
         } else {
             "Commands run directly on the host"
         };
-        let network = if self.allow_network || !self.backend.is_contained() {
+        let network = if self.allow_network == Some(true) || !self.backend.enforces_network_off() {
             "network available"
         } else {
             "no network access"
@@ -216,6 +250,9 @@ impl Tool for Shell {
         if let Err(e) = self.validate(&arguments) {
             return Ok(fail(e));
         }
+        if let Some(refusal) = self.unenforceable() {
+            return Ok(fail(refusal));
+        }
         let args: ShellArgs = match parse_args("shell", arguments) {
             Ok(a) => a,
             Err(e) => return Ok(fail(e)),
@@ -246,7 +283,7 @@ impl Tool for Shell {
             env: self.environment(),
             timeout,
             max_output_bytes: self.max_output_bytes,
-            allow_network: self.allow_network,
+            allow_network: self.allow_network.unwrap_or(false),
             deny_read: self.deny_read.clone(),
             cancel: ctx.cancel.clone(),
         };
@@ -404,6 +441,43 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("[][hi]"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn restrictions_the_backend_cannot_enforce_refuse_the_command() {
+        let (dir, ws) = ws();
+        let local = Arc::new(crate::exec::LocalSandbox);
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(secrets.path().join("credentials"), "synthetic-secret").unwrap();
+        let cat = json!({"command": format!(
+            "cat {}/credentials; touch ran", secrets.path().display()
+        )});
+
+        let shell = Shell::new(ws.clone(), local.clone()).deny_read([secrets.path()]);
+        let out = shell.call(cat.clone(), &ctx()).await.unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("cannot enforce"), "{}", out.content);
+        assert!(!out.content.contains("synthetic-secret"), "{}", out.content);
+        assert!(!dir.path().join("ran").exists(), "the command must not run");
+
+        let shell = Shell::new(ws.clone(), local.clone()).allow_network(false);
+        let out = shell
+            .call(json!({"command": "touch ran"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("network"), "{}", out.content);
+        assert!(!dir.path().join("ran").exists(), "the command must not run");
+
+        // Unrestricted, the host backend runs and says the network is on.
+        let shell = Shell::new(ws, local);
+        assert!(shell.spec().description.contains("network available"));
+        let out = shell
+            .call(json!({"command": "touch ran"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(dir.path().join("ran").exists());
     }
 
     #[test]

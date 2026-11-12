@@ -62,9 +62,11 @@ pub struct SandboxCommand {
     pub max_output_bytes: usize,
     /// Whether the command may use the network (sandboxes only).
     pub allow_network: bool,
-    /// Host paths the command must not read (contained sandboxes only;
-    /// [`LocalSandbox`] cannot enforce it). Paths that do not exist are
-    /// skipped. Under bubblewrap a denied directory appears empty and a
+    /// Host paths the command must not read, on top of the backend's own
+    /// defaults ([`HOME_SECRET_PATHS`] for bubblewrap and seatbelt). Only
+    /// backends whose [`Sandbox::enforces_deny_read`] is true honour it;
+    /// the shell tool refuses to run a command with a deny list on any
+    /// other. Paths that do not exist are skipped. Under bubblewrap a denied directory appears empty and a
     /// denied file reads as empty; under seatbelt reading either fails.
     pub deny_read: Vec<PathBuf>,
     /// Cancelled when the run is cancelled; the command is killed.
@@ -124,6 +126,18 @@ pub trait Sandbox: Send + Sync {
     fn is_available(&self) -> bool;
     /// Whether the backend confines writes to the workspace.
     fn is_contained(&self) -> bool;
+    /// Whether the backend keeps a command from reading the paths in
+    /// [`SandboxCommand::deny_read`]. Default `false`: a backend claims it
+    /// only when it enforces it, and callers refuse rather than pretend.
+    fn enforces_deny_read(&self) -> bool {
+        false
+    }
+    /// Whether the backend cuts the network when
+    /// [`SandboxCommand::allow_network`] is false. Default `false`, as for
+    /// [`Sandbox::enforces_deny_read`].
+    fn enforces_network_off(&self) -> bool {
+        false
+    }
     async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput>;
 }
 
@@ -227,6 +241,57 @@ fn probe(program: &str, args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+// ------------------------------------------------------------ secret paths
+
+/// Credential locations under the home directory that the contained
+/// backends ([`BubblewrapSandbox`], [`SeatbeltSandbox`]) keep commands from
+/// reading by default: SSH keys, cloud and cluster credentials, GnuPG,
+/// registry logins, `.netrc` and git's stored credentials. Replace the
+/// list per backend with `default_deny_read(..)` (an empty list turns the
+/// defaults off).
+pub const HOME_SECRET_PATHS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gcloud",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".git-credentials",
+];
+
+/// [`HOME_SECRET_PATHS`] under `home`.
+pub fn home_secret_paths(home: &Path) -> Vec<PathBuf> {
+    HOME_SECRET_PATHS.iter().map(|rel| home.join(rel)).collect()
+}
+
+/// [`HOME_SECRET_PATHS`] under `$HOME` (empty when `HOME` is unset): the
+/// contained backends' default deny-read list.
+pub fn default_deny_read() -> Vec<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| home_secret_paths(Path::new(&home)))
+        .unwrap_or_default()
+}
+
+/// The backend's defaults plus the command's own list. A default that
+/// contains the workspace is left out, so a workspace under, say, `~/.ssh`
+/// is not hidden from itself; a path the caller names is always kept.
+fn deny_list(defaults: &[PathBuf], cmd: &SandboxCommand) -> Vec<PathBuf> {
+    let root =
+        std::fs::canonicalize(&cmd.workspace_root).unwrap_or_else(|_| cmd.workspace_root.clone());
+    let mut out: Vec<PathBuf> = existing_canonical(defaults)
+        .into_iter()
+        .filter(|path| !root.starts_with(path))
+        .collect();
+    for path in existing_canonical(&cmd.deny_read) {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 // -------------------------------------------------------------------- local
 
 /// Runs commands directly on the host with `sh -c`.
@@ -265,16 +330,19 @@ impl Sandbox for LocalSandbox {
 /// Linux sandbox using `bwrap`: the host filesystem is mounted read-only,
 /// the workspace read-write, `/tmp` is a private tmpfs, PID and (unless
 /// allowed) network namespaces are unshared, and the sandbox dies with its
-/// parent.
+/// parent. The credential locations in [`HOME_SECRET_PATHS`] are hidden by
+/// default.
 #[derive(Debug, Clone)]
 pub struct BubblewrapSandbox {
     program: String,
+    default_deny_read: Vec<PathBuf>,
 }
 
 impl Default for BubblewrapSandbox {
     fn default() -> Self {
         Self {
             program: "bwrap".into(),
+            default_deny_read: default_deny_read(),
         }
     }
 }
@@ -282,6 +350,14 @@ impl Default for BubblewrapSandbox {
 impl BubblewrapSandbox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the paths hidden from every command (default:
+    /// [`default_deny_read`]). An empty list hides nothing beyond each
+    /// command's own [`SandboxCommand::deny_read`].
+    pub fn default_deny_read(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.default_deny_read = paths.into_iter().collect();
+        self
     }
 
     /// The `bwrap` argument list for a spec (before `sh -c <command>`).
@@ -304,7 +380,7 @@ impl BubblewrapSandbox {
         // After the tmpfs so a workspace under /tmp stays visible.
         args.extend(["--bind".into(), ws.clone(), ws]);
         // After the workspace so a denied path inside it is hidden too.
-        for path in existing_canonical(&cmd.deny_read) {
+        for path in deny_list(&self.default_deny_read, cmd) {
             let path = path.display().to_string();
             if Path::new(&path).is_dir() {
                 args.extend(["--tmpfs".into(), path]);
@@ -369,6 +445,14 @@ impl Sandbox for BubblewrapSandbox {
         true
     }
 
+    fn enforces_deny_read(&self) -> bool {
+        true
+    }
+
+    fn enforces_network_off(&self) -> bool {
+        true
+    }
+
     async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         if !self.is_available() {
             return Err(ExecError::Unavailable("bubblewrap"));
@@ -382,10 +466,22 @@ impl Sandbox for BubblewrapSandbox {
 // ----------------------------------------------------------------- seatbelt
 
 /// macOS sandbox using `sandbox-exec` with a generated profile: everything
-/// is readable, writes are allowed only under the workspace (plus the
-/// `/dev` null/tty nodes), and the network is denied unless allowed.
-#[derive(Debug, Clone, Default)]
-pub struct SeatbeltSandbox;
+/// is readable except the credential locations in [`HOME_SECRET_PATHS`]
+/// (by default) and each command's deny list, writes are allowed only under
+/// the workspace (plus the `/dev` null/tty nodes), and the network is
+/// denied unless allowed.
+#[derive(Debug, Clone)]
+pub struct SeatbeltSandbox {
+    default_deny_read: Vec<PathBuf>,
+}
+
+impl Default for SeatbeltSandbox {
+    fn default() -> Self {
+        Self {
+            default_deny_read: default_deny_read(),
+        }
+    }
+}
 
 /// The canonical form of each path that exists (sandboxes match real paths:
 /// `/tmp` is `/private/tmp` on macOS, and bwrap cannot mount over a missing
@@ -404,7 +500,15 @@ fn sbpl_string(path: &Path) -> String {
 
 impl SeatbeltSandbox {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Replace the paths no command may read (default:
+    /// [`default_deny_read`]). An empty list denies nothing beyond each
+    /// command's own [`SandboxCommand::deny_read`].
+    pub fn default_deny_read(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.default_deny_read = paths.into_iter().collect();
+        self
     }
 
     /// The generated sandbox profile (SBPL) for a spec.
@@ -418,7 +522,7 @@ impl SeatbeltSandbox {
         if !cmd.allow_network {
             profile.push_str("(deny network*)\n");
         }
-        for path in existing_canonical(&cmd.deny_read) {
+        for path in deny_list(&self.default_deny_read, cmd) {
             profile.push_str(&format!(
                 "(deny file-read* file-write* (subpath {}))\n",
                 sbpl_string(&path)
@@ -452,6 +556,14 @@ impl Sandbox for SeatbeltSandbox {
         true
     }
 
+    fn enforces_deny_read(&self) -> bool {
+        true
+    }
+
+    fn enforces_network_off(&self) -> bool {
+        true
+    }
+
     async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
         if !self.is_available() {
             return Err(ExecError::Unavailable("seatbelt"));
@@ -466,7 +578,10 @@ impl Sandbox for SeatbeltSandbox {
 
 /// Runs each command in a fresh container: the workspace is mounted at
 /// `/workspace`, `--network none` unless allowed, and the container is
-/// removed afterwards (and killed on timeout). On Unix the container runs as
+/// removed afterwards (and killed on timeout). No other host path is
+/// mounted, so host paths in [`SandboxCommand::deny_read`] are out of reach
+/// already; denied paths inside the workspace are covered by an empty
+/// mount. On Unix the container runs as
 /// the calling user so files it creates stay editable.
 ///
 /// The `docker` CLI keeps the host environment (it needs `DOCKER_HOST`,
@@ -521,6 +636,19 @@ impl DockerSandbox {
             "-w".into(),
             workdir.display().to_string(),
         ]);
+        let root = std::fs::canonicalize(&cmd.workspace_root)
+            .unwrap_or_else(|_| cmd.workspace_root.clone());
+        for path in existing_canonical(&cmd.deny_read) {
+            let Ok(rel) = path.strip_prefix(&root) else {
+                continue; // not mounted at all
+            };
+            let inside = Path::new("/workspace").join(rel).display().to_string();
+            if path.is_dir() {
+                args.extend(["--tmpfs".into(), inside]);
+            } else {
+                args.extend(["-v".into(), format!("/dev/null:{inside}:ro")]);
+            }
+        }
         for (key, value) in &cmd.env {
             if key != "PATH" && key != "HOME" {
                 args.extend(["-e".into(), format!("{key}={value}")]);
@@ -548,6 +676,14 @@ impl Sandbox for DockerSandbox {
     }
 
     fn is_contained(&self) -> bool {
+        true
+    }
+
+    fn enforces_deny_read(&self) -> bool {
+        true
+    }
+
+    fn enforces_network_off(&self) -> bool {
         true
     }
 
@@ -789,6 +925,75 @@ mod tests {
     }
 
     #[test]
+    fn home_secrets_are_denied_by_default_after_the_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(home.join(".netrc"), "machine x").unwrap();
+        let ws = home.join("project");
+        std::fs::create_dir(&ws).unwrap();
+        let s = SandboxCommand::new("true", &ws);
+
+        let seatbelt = SeatbeltSandbox::new().default_deny_read(home_secret_paths(&home));
+        let profile = seatbelt.profile(&s);
+        for denied in [".aws", ".netrc"] {
+            assert!(
+                profile.contains(&format!(
+                    "(deny file-read* file-write* (subpath {}))",
+                    sbpl_string(&home.join(denied))
+                )),
+                "{profile}"
+            );
+        }
+        assert!(!profile.contains(".ssh"), "missing paths are skipped");
+        let none = SeatbeltSandbox::new().default_deny_read(Vec::new());
+        assert!(!none.profile(&s).contains(".aws"));
+
+        let bwrap = BubblewrapSandbox::new().default_deny_read(home_secret_paths(&home));
+        let joined = bwrap.args(&s).join(" ");
+        let ws_bind = format!("--bind {0} {0}", ws.display());
+        let aws = format!("--tmpfs {}", home.join(".aws").display());
+        let netrc = format!("--ro-bind /dev/null {}", home.join(".netrc").display());
+        let at = |needle: &str| {
+            joined
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {joined}"))
+        };
+        assert!(at(&ws_bind) < at(&aws) && at(&ws_bind) < at(&netrc));
+
+        // A workspace inside a default location is not hidden from itself.
+        let inside = home.join(".aws/project");
+        std::fs::create_dir(&inside).unwrap();
+        let s = SandboxCommand::new("true", &inside);
+        let joined = bwrap.args(&s).join(" ");
+        assert!(!joined.contains(&aws), "{joined}");
+        assert!(!seatbelt
+            .profile(&s)
+            .contains(&sbpl_string(&home.join(".aws"))));
+
+        // The real defaults cover the usual locations under $HOME.
+        let defaults = default_deny_read();
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            assert!(defaults.contains(&Path::new(&home).join(".ssh")));
+            assert!(defaults.contains(&Path::new(&home).join(".aws")));
+        }
+    }
+
+    #[test]
+    fn backends_say_what_they_enforce() {
+        assert!(!LocalSandbox.enforces_deny_read());
+        assert!(!LocalSandbox.enforces_network_off());
+        for backend in [
+            Arc::new(BubblewrapSandbox::new()) as Arc<dyn Sandbox>,
+            Arc::new(SeatbeltSandbox::new()),
+            Arc::new(DockerSandbox::new("alpine:3")),
+        ] {
+            assert!(backend.enforces_deny_read(), "{}", backend.name());
+            assert!(backend.enforces_network_off(), "{}", backend.name());
+        }
+    }
+
+    #[test]
     fn explicit_choice_wins_even_when_unavailable() {
         for kind in [
             SandboxKind::Bubblewrap,
@@ -851,6 +1056,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seatbelt_blocks_reads_of_home_secrets_by_default() {
+        if !SeatbeltSandbox::new().is_available() {
+            println!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".aws")).unwrap();
+        std::fs::write(home.path().join(".aws/credentials"), "synthetic-secret").unwrap();
+        let backend = SeatbeltSandbox::new().default_deny_read(home_secret_paths(home.path()));
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let cat = format!("cat {}/.aws/credentials", home.path().display());
+        let mut s = SandboxCommand::new(cat.clone(), &root);
+        s.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        let out = backend.run(&s).await.unwrap();
+        assert_ne!(out.exit_code, Some(0), "{}", out.output);
+        assert!(!out.output.contains("synthetic-secret"), "{}", out.output);
+        // Readable without the defaults, so the denial is the sandbox's.
+        let open = SeatbeltSandbox::new().default_deny_read(Vec::new());
+        let out = open.run(&s).await.unwrap();
+        assert!(out.output.contains("synthetic-secret"), "{}", out.output);
+    }
+
+    #[tokio::test]
     async fn seatbelt_blocks_reads_of_denied_paths() {
         let backend = SeatbeltSandbox::new();
         if !backend.is_available() {
@@ -894,6 +1123,26 @@ mod tests {
         assert!(joined.contains("-e LANG=C"));
         assert!(!joined.contains("PATH="));
         assert!(joined.ends_with("alpine:3 sh -c echo hi"));
+    }
+
+    #[test]
+    fn docker_args_cover_denied_paths_inside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::fs::write(root.join("token"), "t").unwrap();
+        let mut s = SandboxCommand::new("true", &root);
+        s.deny_read = vec![root.join("private"), root.join("token"), "/etc".into()];
+        let joined = DockerSandbox::new("alpine:3").args(&s, "c1").join(" ");
+        assert!(joined.contains("--tmpfs /workspace/private"), "{joined}");
+        assert!(
+            joined.contains("-v /dev/null:/workspace/token:ro"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("/etc"),
+            "not mounted, nothing to cover: {joined}"
+        );
     }
 
     #[tokio::test]
