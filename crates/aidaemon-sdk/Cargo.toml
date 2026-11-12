@@ -36,7 +36,7 @@ channels = ["dep:aidaemon-channels"]
 telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
-testing = ["aidaemon-core/testing", "aidaemon-channels?/testing"]
+testing = ["aidaemon-core/testing", "aidaemon-channels?/testing", "dep:tokio"]
 full = ["macros", "providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
 
 [dependencies]
@@ -47,6 +47,7 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
 aidaemon-providers = { version = "0.1.0", path = "../aidaemon-providers", optional = true }
 aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools", optional = true }
 aidaemon-policies = { version = "0.1.0", path = "../aidaemon-policies", optional = true }
@@ -130,3 +131,7 @@ required-features = ["macros", "testing"]
 [[example]]
 name = "otel_traces"
 required-features = ["macros", "testing", "otel"]
+
+[[test]]
+name = "behavior"
+required-features = ["testing", "macros", "agents", "channels", "memory"]

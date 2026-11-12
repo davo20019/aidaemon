@@ -99,6 +99,22 @@ pub struct MemoryTurn {
     pub host: HostTurn,
 }
 
+impl MemoryTurn {
+    /// The owner's turn in `session_id`: the `"owner"` memory, read and
+    /// written, learned from at run end.
+    pub fn owner(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            scope: "owner".to_string(),
+            read: true,
+            write: true,
+            explicit_writes_only: false,
+            learning: Default::default(),
+            host: Default::default(),
+        }
+    }
+}
+
 /// Host-specific facts about a turn, for a memory system that knows its
 /// host's types (the turn's full audience, a diagnostics sink). A system
 /// that does not ask for them works from the [`MemoryTurn`] fields alone.

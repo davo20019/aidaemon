@@ -48,6 +48,7 @@ members = [
     "crates/aidaemon-channel-discord",
     "crates/aidaemon-sdk",
     "crates/aidaemon-macros",
+    "examples/parity-agent",
 ]
 resolver = "2"
 

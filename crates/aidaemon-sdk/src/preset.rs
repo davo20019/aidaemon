@@ -21,7 +21,7 @@
 //! |---|---|---|
 //! | Provider | none: name one | [`Preset::provider`], [`Preset::provider_from_env`], [`Preset::provider_from_env_or`] |
 //! | Model | `AIDAEMON_MODEL`, else the provider's default | [`Preset::model`] |
-//! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`](crate::policies::ScopeGuard) over the workspace, [`EgressGuard`](crate::policies::EgressGuard), [`ApprovalPolicy`](crate::policies::ApprovalPolicy) (`DestructiveOnly`), [`Redactor`](crate::policies::Redactor), [`UntrustedOutput`](crate::policies::UntrustedOutput) | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
+//! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`] over the workspace, [`EgressGuard`], [`ApprovalPolicy`] (`DestructiveOnly`), [`Redactor`], [`UntrustedOutput`] | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
 //! | Memory | with the `memory` feature (default), aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus `remember_fact`, `manage_memories`, `manage_people`, `share_memory`), in memory or in [`Preset::memory_path`]; else none | [`Preset::memory`]: any [`MemorySystem`]; [`Preset::without_memory`] |
@@ -102,15 +102,7 @@ pub fn provider_from_env() -> Result<Option<EnvProvider>, PresetError> {
 /// memory.
 #[cfg(feature = "memory")]
 fn owner_turn(id: &str) -> MemoryTurn {
-    MemoryTurn {
-        session_id: id.to_string(),
-        scope: "owner".to_string(),
-        read: true,
-        write: true,
-        explicit_writes_only: false,
-        learning: Default::default(),
-        host: Default::default(),
-    }
+    MemoryTurn::owner(id)
 }
 
 fn env(name: &str) -> Option<String> {
