@@ -109,7 +109,7 @@ impl ChatGptAuth for StaticChatGptAuth {
 ///   directives) stay in place as `developer` input.
 /// - `store` is always false: the app owns the history, so the encrypted
 ///   reasoning of a tool-calling reply rides on its first tool call
-///   ([`REASONING_ITEMS_KEY`]) and is replayed beside it.
+///   (`REASONING_ITEMS_KEY`) and is replayed beside it.
 /// - No output cap is sent: the backend rejects `max_output_tokens`.
 /// - A 401 refreshes the token once and replays the request (inference is
 ///   side-effect free); a second 401 is reported to the [`ChatGptAuth`].

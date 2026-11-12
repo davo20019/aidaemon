@@ -958,7 +958,7 @@ impl Channel for TelegramChannel {
         self.strip_latex
     }
 
-    /// Cached; see [`Self::fetch_name`] for where the name comes from.
+    /// Cached; see `Self::fetch_name` for where the name comes from.
     async fn display_name(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
         self.names
             .lookup(user_id, || self.fetch_name(user_id))

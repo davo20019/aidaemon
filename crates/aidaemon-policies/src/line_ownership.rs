@@ -53,7 +53,7 @@ pub fn lines(bytes: &[u8]) -> Vec<&[u8]> {
 const MAX_EDIT_DISTANCE: usize = 512;
 
 /// The runs of lines that differ between `before` and `after`, in order.
-/// Versions further apart than [`MAX_EDIT_DISTANCE`] line edits come back as
+/// Versions further apart than `MAX_EDIT_DISTANCE` line edits come back as
 /// one hunk covering everything between their common start and end.
 pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<Hunk> {
     let (a, b) = (lines(before), lines(after));
@@ -96,7 +96,7 @@ pub fn diff_lines(before: &[u8], after: &[u8]) -> Vec<Hunk> {
 }
 
 /// The line pairs a shortest edit script keeps, in order (Myers). `None`
-/// when the versions are more than [`MAX_EDIT_DISTANCE`] edits apart.
+/// when the versions are more than `MAX_EDIT_DISTANCE` edits apart.
 fn matched_lines(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<(usize, usize)>> {
     let (n, m) = (a.len() as isize, b.len() as isize);
     let limit = MAX_EDIT_DISTANCE.min(a.len() + b.len()) as isize;
