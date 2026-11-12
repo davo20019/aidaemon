@@ -39,6 +39,8 @@ struct Shared {
 /// the hook does nothing.
 pub struct MemoryWriter {
     memory: Memory,
+    /// The turn's learning consent; an opted-out turn is not extracted.
+    learning: aidaemon_policies::TurnLearning,
     shared: Arc<Shared>,
     pending: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -47,9 +49,17 @@ impl MemoryWriter {
     pub fn new(memory: Memory) -> Self {
         Self {
             memory,
+            learning: aidaemon_policies::TurnLearning::default(),
             shared: Arc::new(Shared::default()),
             pending: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Extract only while `learning` allows it: a turn opted out of
+    /// learning (see [`aidaemon_policies::Learning`]) is never extracted.
+    pub fn honoring(mut self, learning: aidaemon_policies::TurnLearning) -> Self {
+        self.learning = learning;
+        self
     }
 
     /// Number of extractions still running.
@@ -96,7 +106,10 @@ fn completed_with_work(outcome: &RunOutcome) -> bool {
 #[async_trait]
 impl Hook for MemoryWriter {
     async fn on_run_end(&self, ctx: &HookContext<'_>, outcome: &RunOutcome) {
-        if !completed_with_work(outcome) || self.memory.extractor().is_none() {
+        if !completed_with_work(outcome)
+            || self.memory.extractor().is_none()
+            || !self.learning.allowed()
+        {
             return;
         }
         let Some(index) = aidaemon_policies::last_user_message_index(ctx.messages) else {

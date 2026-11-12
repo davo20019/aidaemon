@@ -63,8 +63,8 @@ pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, NestedInstructions, ProjectInstructions};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
 pub use memory::{
-    HistoryIntake, InMemoryRecall, MemoryInjection, MemoryParts, MemorySystem, MemoryTurn,
-    PastMessage, PastRole, Recall,
+    HistoryIntake, InMemoryRecall, Learning, MemoryInjection, MemoryParts, MemorySystem,
+    MemoryTurn, PastMessage, PastRole, Recall, TurnLearning,
 };
 #[cfg(feature = "otel")]
 pub use otel::{otlp_provider, OtelSink};

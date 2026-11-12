@@ -354,6 +354,9 @@ pub(in crate::agent) struct SdkTurnSetup {
         Option<crate::project_instructions::ProjectInstructionTracker>,
     /// The compiled memory policy allows recall on this turn.
     pub(in crate::agent) memory_recall_allowed: bool,
+    /// Whether the turn may be learned from; `/private` opted it out before
+    /// it started, and `skip_learning` can during the run.
+    pub(in crate::agent) learning: aidaemon_policies::TurnLearning,
     /// The conversation summary standing for the turns `prefix` leaves out,
     /// on a turn that continues the conversation.
     pub(in crate::agent) conversation_summary: Option<crate::traits::ConversationSummary>,
@@ -958,6 +961,7 @@ impl Agent {
             restrict_untrusted_reference_tools,
             untrusted_reference_skills,
             memory_recall_allowed,
+            learning: learning_consent,
             conversation_summary,
             known_project_dir,
             project_scope,
@@ -1052,6 +1056,7 @@ impl Agent {
             model: model.clone(),
             learning: learning.clone(),
             verdict: verdict.clone(),
+            learning_consent,
         };
         let memory = memory_parts(self.memory.as_ref(), &memory_turn).await;
         // Tools: the set bootstrap offered for this turn (role, policy and
@@ -1159,6 +1164,22 @@ impl Agent {
                     tool.annotations().read_only,
                 );
                 builder = builder.tool_arc(tool);
+            }
+            // "Don't remember this" is the host's, so it is offered under any
+            // memory system, on a turn that would otherwise learn. A turn
+            // offered no tools stays tool-free (`/private` still works there).
+            if !offered_tools.is_empty()
+                && !memory_turn.mandate
+                && memory_turn.memory_persistence_allowed
+                && !memory_turn.memory_isolated()
+                && memory_turn.learning_consent.allowed()
+            {
+                builder = builder.tool(crate::agent::memory_plugin::SkipLearningTool::new(
+                    memory_turn.learning_consent.clone(),
+                    emitter.clone(),
+                    task_id.clone(),
+                    turn_id.clone(),
+                ));
             }
         }
         // Owner approvals: the daemon's rules for this turn and the chat's

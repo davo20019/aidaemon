@@ -132,9 +132,9 @@ impl MemorySystem for ScopedMemory {
                 .tools
                 .push(Arc::new(RememberTool::new(self.memory.clone())));
             if !turn.explicit_writes_only {
-                parts
-                    .hooks
-                    .push(Arc::new(MemoryWriter::new(self.memory.clone())));
+                parts.hooks.push(Arc::new(
+                    MemoryWriter::new(self.memory.clone()).honoring(turn.learning.clone()),
+                ));
             }
         }
         parts
@@ -253,6 +253,7 @@ mod tests {
             read,
             write,
             explicit_writes_only,
+            learning: Default::default(),
         }
     }
 

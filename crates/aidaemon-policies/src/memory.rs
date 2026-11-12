@@ -3,6 +3,7 @@
 //! a [`Recall`] backend.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Service, Tool};
@@ -89,7 +90,73 @@ pub struct MemoryTurn {
     /// Writes come only from explicit tool calls: no background learning
     /// from the transcript (worker and child sessions).
     pub explicit_writes_only: bool,
+    /// Whether the turn may be learned from. Read it when about to learn
+    /// (at run end, in background work), not when the turn starts: the
+    /// user or the model may opt the turn out while it runs.
+    pub learning: TurnLearning,
 }
+
+/// Whether a turn may be learned from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Learning {
+    #[default]
+    Allowed,
+    /// "Don't remember this": nothing from the turn may become long-term
+    /// memory (facts, episodes, procedures, people, skills), now or later.
+    /// Recall is unaffected, and so are writes the turn makes on purpose
+    /// with a memory tool.
+    OptedOut,
+}
+
+/// A turn's [`Learning`], shared by the host and the memory system for the
+/// whole turn. The host opts the turn out (an explicit command before the
+/// message, or the model's call to the host's opt-out tool); a memory system
+/// checks [`TurnLearning::allowed`] before it learns anything from the turn.
+/// Opting out cannot be undone within the turn.
+#[derive(Clone, Default)]
+pub struct TurnLearning(Arc<AtomicBool>);
+
+impl TurnLearning {
+    pub fn new(learning: Learning) -> Self {
+        let handle = Self::default();
+        if learning == Learning::OptedOut {
+            handle.opt_out();
+        }
+        handle
+    }
+
+    pub fn get(&self) -> Learning {
+        if self.0.load(Ordering::Acquire) {
+            Learning::OptedOut
+        } else {
+            Learning::Allowed
+        }
+    }
+
+    pub fn allowed(&self) -> bool {
+        self.get() == Learning::Allowed
+    }
+
+    /// Opt the turn out. Returns whether this call changed it.
+    pub fn opt_out(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+}
+
+impl std::fmt::Debug for TurnLearning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TurnLearning").field(&self.get()).finish()
+    }
+}
+
+/// Compares the current values.
+impl PartialEq for TurnLearning {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for TurnLearning {}
 
 /// What a [`MemorySystem`] adds to one turn.
 #[derive(Default)]
@@ -266,6 +333,18 @@ impl Recall for InMemoryRecall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opting_out_is_shared_by_every_holder_of_the_turn() {
+        let host = TurnLearning::default();
+        let system = host.clone();
+        assert_eq!(system.get(), Learning::Allowed);
+        assert!(host.opt_out());
+        assert!(!host.opt_out(), "already opted out");
+        assert_eq!(system.get(), Learning::OptedOut);
+        assert!(!system.allowed());
+        assert!(!TurnLearning::new(Learning::OptedOut).allowed());
+    }
 
     #[tokio::test]
     async fn word_overlap_ranks_and_scopes_by_session() {

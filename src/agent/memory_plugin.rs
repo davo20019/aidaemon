@@ -19,12 +19,18 @@ use async_trait::async_trait;
 use crate::traits::StateStore;
 use crate::types::{ChannelContext, UserRole};
 
+mod opt_out;
+#[cfg(test)]
+mod opt_out_tests;
 mod recall;
 #[cfg(test)]
 mod swap_tests;
 mod system_memory;
 mod tool_facts;
 mod writer;
+pub(crate) use opt_out::{
+    mark_turn_opted_out, set_next_message_private, take_next_message_private, SkipLearningTool,
+};
 pub(crate) use recall::DaemonRecall;
 #[cfg_attr(not(feature = "sdk-memory"), allow(unused_imports))]
 pub(crate) use system_memory::SystemMemory;
@@ -153,6 +159,9 @@ pub(crate) struct MemoryTurn {
     pub learning: Arc<std::sync::Mutex<crate::agent::post_task::LearningContext>>,
     /// How the turn judges the run's final status.
     pub verdict: Arc<crate::agent::sdk_engine::TurnVerdict>,
+    /// Whether the turn may be learned from ("don't remember this"), shared
+    /// with whatever memory system serves the turn.
+    pub learning_consent: aidaemon_policies::TurnLearning,
 }
 
 impl MemoryTurn {
@@ -509,6 +518,7 @@ pub(super) mod test_support {
             model: "mock-model".to_string(),
             learning: Arc::new(Mutex::new(learning(user_text))),
             verdict: Arc::default(),
+            learning_consent: Default::default(),
         }
     }
 }

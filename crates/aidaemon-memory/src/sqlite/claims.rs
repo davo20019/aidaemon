@@ -1085,6 +1085,11 @@ pub async fn project_event_span(
                WHERE policy.task_id = e.task_id
                  AND policy.event_type = 'memory_policy_compiled'
                  AND json_extract(policy.data, '$.access') = 'allowed'
+           ) AND NOT EXISTS (
+               SELECT 1 FROM events policy
+               WHERE policy.task_id = e.task_id
+                 AND policy.event_type = 'memory_policy_compiled'
+                 AND json_extract(policy.data, '$.access') = 'suppressed'
            ))",
     )
     .bind(event_id)

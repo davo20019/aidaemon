@@ -790,6 +790,44 @@ mod tests {
         }
     }
 
+    /// "Don't remember this": consolidation later passes over an opted-out
+    /// turn's events without learning, and still learns from a normal turn.
+    #[tokio::test]
+    async fn consolidation_skips_a_turn_opted_out_of_learning() {
+        let (state, event_store, consolidator, _db_file) = setup_consolidator_test().await;
+        append_old_procedure_trace(&event_store, "opted-out-session", "private-task", None).await;
+        append_old_procedure_trace(&event_store, "normal-session", "normal-task", None).await;
+        crate::agent::memory_plugin::mark_turn_opted_out(
+            &crate::events::EventEmitter::new(event_store.clone(), "opted-out-session"),
+            "private-task",
+            "message-private-task",
+        )
+        .await
+        .expect("mark opted out");
+
+        let skipped = consolidator
+            .consolidate_session("opted-out-session")
+            .await
+            .expect("consolidate opted-out session");
+        assert_eq!(skipped.procedures_created, 0);
+        assert!(event_store
+            .query_unconsolidated("opted-out-session")
+            .await
+            .unwrap()
+            .is_empty());
+        let procedures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM procedures")
+            .fetch_one(&state.pool())
+            .await
+            .unwrap();
+        assert_eq!(procedures, 0, "nothing learned from the opted-out turn");
+
+        let learned = consolidator
+            .consolidate_session("normal-session")
+            .await
+            .expect("consolidate normal session");
+        assert_eq!(learned.procedures_created, 1, "a normal turn still learns");
+    }
+
     #[tokio::test]
     async fn test_consolidation_records_failure_patterns_from_warning_decisions() {
         let (state, event_store, consolidator, _db_file) = setup_consolidator_test().await;

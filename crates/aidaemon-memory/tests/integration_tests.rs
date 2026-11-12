@@ -329,6 +329,33 @@ async fn memory_writer_does_not_block_or_alter_the_run() {
     assert_eq!(memory.facts(SESSION).await.unwrap()[0].value, "window");
 }
 
+/// "Don't remember this": a turn opted out, even mid-run, is not extracted.
+#[tokio::test]
+async fn memory_writer_skips_a_turn_opted_out_of_learning() {
+    let extraction = ScriptedProvider::new([facts_reply(json!([
+        {"category": "preference", "key": "seat", "value": "window", "confidence": 0.9}
+    ]))]);
+    let memory = memory_with(Some(FactExtractor::new(extraction, "small")), None);
+    let learning = aidaemon_policies::TurnLearning::default();
+    let writer = Arc::new(MemoryWriter::new(memory.clone()).honoring(learning.clone()));
+    let agent = Agent::builder("assistant")
+        .allow_unguarded()
+        .model("m")
+        .provider(ScriptedProvider::new([text("Booked a window seat.")]))
+        .hook_arc(writer.clone())
+        .build()
+        .unwrap();
+    learning.opt_out();
+
+    let outcome = agent
+        .run(SESSION, "I always prefer a window seat when I fly")
+        .await
+        .unwrap();
+    assert!(outcome.is_completed());
+    assert!(writer.drain().await.is_empty(), "nothing was extracted");
+    assert!(memory.facts(SESSION).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn memory_writer_failures_never_reach_the_run() {
     let failing = ScriptedProvider::with_results([Err(ProviderError::Auth("bad key".into()))]);

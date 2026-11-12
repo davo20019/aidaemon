@@ -149,6 +149,11 @@ impl HistoryIntake {
                    WHERE policy.task_id = e.task_id
                      AND policy.event_type = 'memory_policy_compiled'
                      AND json_extract(policy.data, '$.access') = 'allowed'
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM events policy
+                   WHERE policy.task_id = e.task_id
+                     AND policy.event_type = 'memory_policy_compiled'
+                     AND json_extract(policy.data, '$.access') = 'suppressed'
                ))
              ORDER BY e.id LIMIT ?",
         )
@@ -366,6 +371,52 @@ mod tests {
             ]
         );
         assert_eq!(batches[0][1].role, PastRole::Assistant);
+    }
+
+    /// A turn opted out of learning ("don't remember this") is not handed
+    /// to the memory system, even though its task's policy allowed memory.
+    #[tokio::test]
+    async fn an_opted_out_turn_is_not_absorbed() {
+        let (_db, state, system, intake) = setup().await;
+        for (task, text) in [
+            ("kept-task", "kept question"),
+            ("private-task", "private question"),
+        ] {
+            let data = serde_json::json!({
+                "content": text, "user_role": "owner", "channel_visibility": "private",
+                "task_id": task,
+            });
+            let policy = serde_json::json!({"task_id": task, "access": "allowed"});
+            for (kind, data) in [("memory_policy_compiled", policy), ("user_message", data)] {
+                sqlx::query(
+                    "INSERT INTO events (session_id, event_type, data, task_id, created_at)
+                     VALUES ('owner-dm', ?, ?, ?, '2026-01-01T00:00:00+00:00')",
+                )
+                .bind(kind)
+                .bind(data.to_string())
+                .bind(task)
+                .execute(&state.pool())
+                .await
+                .unwrap();
+            }
+        }
+        let events = Arc::new(
+            <crate::events::EventStore as crate::events::EventStoreForTests>::new(state.pool())
+                .await
+                .unwrap(),
+        );
+        crate::agent::memory_plugin::mark_turn_opted_out(
+            &crate::events::EventEmitter::new(events, "owner-dm"),
+            "private-task",
+            "private-turn",
+        )
+        .await
+        .unwrap();
+
+        intake.step().await.unwrap();
+        let batches = system.batches.lock().unwrap();
+        let seen: Vec<&str> = batches.iter().flatten().map(|m| m.text.as_str()).collect();
+        assert_eq!(seen, ["kept question"]);
     }
 
     #[tokio::test]

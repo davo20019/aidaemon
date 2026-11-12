@@ -48,6 +48,7 @@ fn system_turn(turn: &MemoryTurn) -> Option<aidaemon_policies::MemoryTurn> {
         read: turn.memory_pipeline_allowed,
         write: turn.memory_persistence_allowed,
         explicit_writes_only: turn.memory_isolated(),
+        learning: turn.learning_consent.clone(),
     })
 }
 
