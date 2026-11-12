@@ -53,7 +53,7 @@ sha2 = "0.10"
 shell-words = "1.1"
 shellexpand = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "sync"] }
