@@ -182,12 +182,12 @@ pub struct FactSearchConfig {
 impl Default for FactSearchConfig {
     fn default() -> Self {
         Self {
-            lexical_pool: 50,
-            semantic_pool: 50,
+            lexical_pool: 25,
+            semantic_pool: 25,
             semantic_min_cosine: 0.22,
             rrf_k: 60.0,
             related_max: 5,
-            related_pool: 100,
+            related_pool: 30,
         }
     }
 }
@@ -540,7 +540,7 @@ mod tests {
         let lex: Vec<LexicalHit> = (0..60).map(|i| lexical(i, false)).collect();
         let cosine: Vec<(usize, f32)> = (60..65).map(|i| (i, 0.5)).collect();
         let pool = candidates(&facts, &lex, &cosine, &cfg);
-        assert_eq!(pool.len(), 55, "lexical capped at 50, plus 5 semantic");
+        assert_eq!(pool.len(), 30, "lexical capped at 25, plus 5 semantic");
         let rerank: Vec<(usize, f32)> = pool
             .iter()
             .enumerate()
@@ -557,7 +557,10 @@ mod tests {
     #[test]
     fn floor_drops_weak_candidates_and_reports_counts() {
         let facts = filler(50);
-        let cfg = FactSearchConfig::default();
+        let cfg = FactSearchConfig {
+            lexical_pool: 50,
+            ..FactSearchConfig::default()
+        };
         let lex: Vec<LexicalHit> = (0..50).map(|i| lexical(i, false)).collect();
         let pool = candidates(&facts, &lex, &[], &cfg);
         let rerank: Vec<(usize, f32)> = (0..50)
