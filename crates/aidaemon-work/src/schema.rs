@@ -941,6 +941,7 @@ pub async fn migrate_work_tables(
             id TEXT PRIMARY KEY,
             goal_id TEXT NOT NULL UNIQUE REFERENCES goals(id) ON DELETE CASCADE,
             source_goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+            name TEXT,
             objective TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'paused', 'awaiting_input', 'completed', 'cancelled')),
@@ -977,6 +978,10 @@ pub async fn migrate_work_tables(
         .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN objective_control_json TEXT")
+        .execute(pool)
+        .await;
+    // The owner-given name (nullable: mandates created before it have none).
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN name TEXT")
         .execute(pool)
         .await;
     sqlx::query(

@@ -168,6 +168,11 @@ pub struct Mandate {
     pub goal_id: String,
     /// Optional personal goal that motivated this delegation.
     pub source_goal_id: Option<String>,
+    /// The short name the owner gave the mandate when creating it, as the
+    /// model passed it (never parsed from the objective). Shown in lists and
+    /// cards, and a selector for later actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub objective: String,
     pub status: MandateStatus,
     /// Explicit owner-confirmed operating posture. This is separate from the
@@ -238,6 +243,7 @@ impl Mandate {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal_id.to_string(),
             source_goal_id,
+            name: None,
             objective: objective.trim().to_string(),
             status: MandateStatus::Active,
             autonomy_mode: MandateAutonomyMode::Bounded,
@@ -268,6 +274,13 @@ impl Mandate {
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    /// Whether the owner gave this mandate `name` (trimmed, ignoring case).
+    pub fn has_name(&self, name: &str) -> bool {
+        self.name
+            .as_deref()
+            .is_some_and(|own| own.trim().eq_ignore_ascii_case(name.trim()))
     }
 
     /// When the next review will wake this mandate; `None` unless it is

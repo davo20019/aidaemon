@@ -34,6 +34,7 @@ const MIN_MANDATE_TOKEN_BUDGET: i64 = 30_000;
 const MAX_MANDATE_TOKEN_BUDGET_PER_CYCLE: i64 = 1_000_000;
 const MAX_MANDATE_TOKEN_BUDGET_DAILY: i64 = 50_000_000;
 const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
+const MAX_NAME_TEXT: usize = 80;
 const MAX_POLICY_ENTRIES: usize = 16;
 const MAX_POLICY_ENTRY_TEXT: usize = 500;
 const MAX_POLICY_TEXT: usize = 8 * 1024;
@@ -53,6 +54,7 @@ const MAX_EVIDENCE_RECEIPTS: usize = 16;
 const MAX_STRATEGY_EVIDENCE_RECEIPTS: usize = 8;
 const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
 const LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.";
+const NAME_FIELD_DESCRIPTION: &str = "draft/create: the short name the owner gave the mandate, exactly as given; omit when none. Other actions: selects the mandate by that name when mandate_id is omitted.";
 const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
 const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
 const PRIORITY_FIELD_DESCRIPTION: &str = "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.";
@@ -640,6 +642,7 @@ impl ManageMandatesTool {
         }
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let name = mandate_name(args)?;
         let autonomy_mode = Self::autonomy_mode_from_args(args, None)?;
         let authority = Self::authority_from_args(args)?;
         let min_review_secs = minutes_to_secs(
@@ -737,6 +740,7 @@ impl ManageMandatesTool {
                 .or(control_validation.as_deref())
                 .unwrap_or("ready"),
             "proposal": {
+                "name": name,
                 "objective": objective,
                 "autonomy_mode": autonomy_mode,
                 "constraints": constraints,
@@ -805,6 +809,45 @@ impl ManageMandatesTool {
         }
     }
 
+    /// The mandate a call names: by `mandate_id` (full ID or unique prefix),
+    /// else by the owner-given `name` it was created with (case-insensitive,
+    /// exact). A name prefers live mandates; only when none carries it does
+    /// it select a finished one.
+    async fn resolve_selected_mandate(
+        &self,
+        args: &ManageMandatesArgs,
+        owner_session: &str,
+    ) -> anyhow::Result<Mandate> {
+        if let Some(id) = args.mandate_id.as_deref() {
+            return self.resolve_owned_mandate(id, owner_session).await;
+        }
+        let Some(name) = args.name.as_deref() else {
+            anyhow::bail!("mandate_id is required (or the mandate's name)");
+        };
+        for include_terminal in [false, true] {
+            let named = self
+                .state
+                .list_mandates(Some(owner_session), include_terminal)
+                .await?
+                .into_iter()
+                .filter(|mandate| mandate.has_name(name))
+                .collect::<Vec<_>>();
+            match named.as_slice() {
+                [] => continue,
+                [mandate] => return Ok(mandate.clone()),
+                several => anyhow::bail!(
+                    "more than one mandate is named \"{name}\" ({}); use mandate_id",
+                    several
+                        .iter()
+                        .map(|mandate| mandate.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        anyhow::bail!("no mandate named \"{name}\" in this owner session")
+    }
+
     /// Validate a `create` exactly as it commits, without storing anything.
     /// `Ok(Err(answer))`: the call answers without creating a mandate.
     async fn create_plan(
@@ -820,6 +863,23 @@ impl ManageMandatesTool {
         let session_id = Self::owner_session(args)?;
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let name = mandate_name(args)?;
+        if let Some(name) = name.as_deref() {
+            // A name selects a mandate later, so it must stay unambiguous
+            // among the owner's live mandates.
+            if let Some(taken) = self
+                .state
+                .list_mandates(Some(session_id), false)
+                .await?
+                .into_iter()
+                .find(|mandate| mandate.has_name(name))
+            {
+                anyhow::bail!(
+                    "a live mandate is already named \"{name}\" ({}); pick another name or cancel that one first",
+                    taken.id
+                );
+            }
+        }
         let autonomy_mode = Self::autonomy_mode_from_args(args, None)?;
         let authority = Self::authority_from_args(args)?;
         anyhow::ensure!(
@@ -902,6 +962,7 @@ impl ManageMandatesTool {
         // Once activated, this timestamp makes the first deliberation immediately due.
         mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
+        mandate.name = name;
         mandate.autonomy_mode = autonomy_mode;
         mandate.next_review_at = chrono::Utc::now().to_rfc3339();
         mandate.constraints = clean_strings(args.constraints.as_deref());
@@ -958,11 +1019,15 @@ impl ManageMandatesTool {
                     .to_string(),
             );
         }
+        let titled = match mandate.name.as_deref() {
+            Some(name) => format!(" \"{name}\": {objective}"),
+            None => format!(": {objective}"),
+        };
         let card = MandateCard {
             summary: if autonomy_mode.is_autopilot() {
-                format!("Enable Autopilot: {objective}")
+                format!("Enable Autopilot{titled}")
             } else {
-                format!("Delegate mandate: {objective}")
+                format!("Delegate mandate{titled}")
             },
             risk: if mandate.authority.max_mutating_actions_per_cycle == 0 {
                 aidaemon_core::ApprovalRisk::Medium
@@ -1012,13 +1077,14 @@ impl ManageMandatesTool {
             .await?
             .ok_or_else(|| anyhow::anyhow!("activated mandate could not be reloaded"))?;
         Ok(format!(
-            "{} {} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+            "{} {}{} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
             if activated.autonomy_mode.is_autopilot() {
                 "Autopilot enabled for mandate"
             } else {
                 "Activated mandate"
             },
             activated.id,
+            named_suffix(&activated),
             activated.confirmed_at.as_deref().unwrap_or("unavailable"),
             activated.version,
             activated.expires_at.as_deref().unwrap_or("none"),
@@ -1081,8 +1147,9 @@ impl ManageMandatesTool {
                 None => "controller-missing".to_string(),
             };
             mandate_details.push_str(&format!(
-                "- {} [objective {}] [{} {} v{}] {} — next review {}; review admission {}; {}/cycle, {}/rolling-24h mutations\n",
+                "- {}{} [objective {}] [{} {} v{}] {} — next review {}; review admission {}; {}/cycle, {}/rolling-24h mutations\n",
                 mandate.id,
+                named_suffix(mandate),
                 crate::tools::objective_status::objective_resource_id(&mandate.goal_id),
                 mandate.status,
                 mandate.autonomy_mode,
@@ -1224,8 +1291,7 @@ impl ManageMandatesTool {
             );
         }
         let owner = Self::owner_session(args)?;
-        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
-        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let mandate = self.resolve_selected_mandate(args, owner).await?;
         let strategy = mandate.strategy.as_ref().map(|value| {
             json!({
                 "skill_name": value.skill_name,
@@ -1314,6 +1380,7 @@ impl ManageMandatesTool {
                         "id": mandate.id,
                         "controller_goal_id": mandate.goal_id,
                         "source_goal_id": mandate.source_goal_id,
+                        "name": mandate.name,
                         "objective": mandate.objective,
                         "status": mandate.status,
                         "autonomy_mode": mandate.autonomy_mode,
@@ -1447,8 +1514,7 @@ impl ManageMandatesTool {
             );
         }
         let owner = Self::owner_session(args)?;
-        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
-        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let mandate = self.resolve_selected_mandate(args, owner).await?;
         anyhow::ensure!(
             !mandate.status.is_terminal(),
             "terminal mandates cannot be changed"
@@ -1684,7 +1750,6 @@ impl ManageMandatesTool {
             ));
         }
         let owner = Self::owner_session(args)?;
-        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
         let target = required_trimmed(args.target_session_id.as_deref(), "target_session_id")?;
         anyhow::ensure!(
             target != owner && target.len() <= 256 && !target.chars().any(char::is_control),
@@ -1700,7 +1765,7 @@ impl ManageMandatesTool {
             known_target,
             "target_session_id is not a registered channel session; send a message from that session first"
         );
-        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let mandate = self.resolve_selected_mandate(args, owner).await?;
         let card = MandateCard {
             summary: format!("Transfer mandate {} to session {}", mandate.id, target),
             risk: aidaemon_core::ApprovalRisk::High,
@@ -1759,8 +1824,7 @@ impl ManageMandatesTool {
             ));
         }
         let owner = Self::owner_session(args)?;
-        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
-        let mut mandate = self.resolve_owned_mandate(id, owner).await?;
+        let mut mandate = self.resolve_selected_mandate(args, owner).await?;
         let previous_autonomy_mode = mandate.autonomy_mode;
         let has_change = args.objective.is_some()
             || args.autonomy_mode.is_some()
@@ -2365,8 +2429,7 @@ impl ManageMandatesTool {
             );
         }
         let owner = Self::owner_session(args)?;
-        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
-        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let mandate = self.resolve_selected_mandate(args, owner).await?;
         let intentions = self
             .state
             .list_intentions(&mandate.id, args.limit.unwrap_or(20).clamp(1, 100))
@@ -2379,6 +2442,7 @@ impl ManageMandatesTool {
 struct ManageMandatesArgs {
     action: String,
     mandate_id: Option<String>,
+    name: Option<String>,
     objective: Option<String>,
     autonomy_mode: Option<String>,
     objective_control: Option<MandateObjectiveControl>,
@@ -2485,6 +2549,7 @@ impl ManageMandatesArgs {
         }
 
         trim_optional(&mut self.mandate_id);
+        trim_optional(&mut self.name);
         trim_optional(&mut self.objective);
         trim_optional(&mut self.autonomy_mode);
         trim_optional(&mut self.source_goal_id);
@@ -2705,7 +2770,7 @@ impl Tool for ManageMandatesTool {
                 "type": "object",
                 "properties": {
                     "action": text_enum(MANAGE_MANDATE_ACTIONS),
-                    "mandate_id": bounded_text(256), "objective": bounded_text(MAX_OBJECTIVE_TEXT), "autonomy_mode": text_enum(AUTONOMY_MODES), "objective_control": objective_control_schema(), "source_goal_id": described(bounded_text(256), SOURCE_GOAL_FIELD_DESCRIPTION),
+                    "mandate_id": bounded_text(256), "name": described(bounded_text(MAX_NAME_TEXT), NAME_FIELD_DESCRIPTION), "objective": bounded_text(MAX_OBJECTIVE_TEXT), "autonomy_mode": text_enum(AUTONOMY_MODES), "objective_control": objective_control_schema(), "source_goal_id": described(bounded_text(256), SOURCE_GOAL_FIELD_DESCRIPTION),
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
@@ -2964,6 +3029,28 @@ fn validate_bounded_text(value: &str, name: &str, max_text: usize) -> anyhow::Re
         "{name} exceeds its {max_text}-character/byte bound"
     );
     Ok(())
+}
+
+/// The owner-given name a draft or create carries, bounded and single-line.
+fn mandate_name(args: &ManageMandatesArgs) -> anyhow::Result<Option<String>> {
+    let Some(name) = args.name.as_deref() else {
+        return Ok(None);
+    };
+    validate_bounded_text(name, "name", MAX_NAME_TEXT)?;
+    anyhow::ensure!(
+        !name.chars().any(char::is_control),
+        "name must be a single line"
+    );
+    Ok(Some(name.to_string()))
+}
+
+/// ` "name"` after a mandate's ID in owner-facing lines, or nothing.
+fn named_suffix(mandate: &Mandate) -> String {
+    mandate
+        .name
+        .as_deref()
+        .map(|name| format!(" \"{name}\""))
+        .unwrap_or_default()
 }
 
 fn bounded_optional_text(
