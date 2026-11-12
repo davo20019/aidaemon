@@ -78,14 +78,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-check-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-v2-
+          prefix-key: v3-check
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -316,14 +316,14 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-test-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-v2-
+          prefix-key: v3-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Cache fastembed model
         uses: actions/cache@v4
