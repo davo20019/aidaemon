@@ -48,7 +48,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
-use crate::tools::ProgressClock;
 use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
 use super::sdk_provider::{
     fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
@@ -60,6 +59,7 @@ use super::Agent;
 use crate::agent::vision::encode_image_attachment;
 use crate::config::{AppConfig, ProviderKind, VisionConfig};
 use crate::events::{EventEmitter, EventType, TaskOutcome, TaskStatus};
+use crate::tools::ProgressClock;
 use crate::traits::{AttachmentProvenance, Message, MessageAttachment};
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use aidaemon_runtime::engine::calls::{
