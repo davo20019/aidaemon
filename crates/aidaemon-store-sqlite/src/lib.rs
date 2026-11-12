@@ -10,6 +10,11 @@
 //! [`SqliteStore::in_flight_runs`] (stopped mid tool batch, continue with
 //! `Agent::run_from`).
 //!
+//! With the `channels` feature, [`SqliteApprovalStore`] keeps a
+//! `ChannelRunner`'s open approvals in the same database, so they survive a
+//! restart (it is the crate that depends on `aidaemon-channels`, not the
+//! other way round, so channels stay free of SQL).
+//!
 //! [`maintenance`] keeps a long-lived database healthy: planner statistics
 //! ([`maintenance::optimize`]) and consistent live copies
 //! ([`maintenance::snapshot`]). Write transactions on a shared database
@@ -30,8 +35,13 @@
 //! # Ok(()) }
 //! ```
 
+#[cfg(feature = "channels")]
+mod approvals;
 pub mod maintenance;
 mod migrations;
+
+#[cfg(feature = "channels")]
+pub use approvals::SqliteApprovalStore;
 
 use std::path::Path;
 use std::str::FromStr;

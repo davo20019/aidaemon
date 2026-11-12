@@ -415,6 +415,7 @@ dependencies = [
 name = "aidaemon-store-sqlite"
 version = "0.0.1"
 dependencies = [
+ "aidaemon-channels",
  "aidaemon-core",
  "async-trait",
  "serde_json",

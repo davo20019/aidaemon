@@ -14,7 +14,8 @@ store, ...) use exactly the same traits, so they double as templates.
 | A model provider | `Provider` | `aidaemon-core` | `aidaemon-providers` (`OpenAiCompatible`) |
 | A tool | `Tool` | `aidaemon-core` | `aidaemon-tools` (`ReadFile`) |
 | A policy or guardrail | `Hook` | `aidaemon-core` | `aidaemon-policies` (`ScopeGuard`) |
-| A memory store | `MemoryStore` | `aidaemon-memory` | `InMemoryMemoryStore` |
+| A memory store | `ApprovalStore` | `aidaemon_channels::approval_conformance::check_approval_store` (takes a factory) | `aidaemon-channels/conformance` |
+| `MemoryStore` | `aidaemon-memory` | `InMemoryMemoryStore` |
 | An embedding model | `Embedder` | `aidaemon-memory` | `HashEmbedder`, `FastEmbedder` |
 | Memory ranking | `Scorer` | `aidaemon-memory` | `HybridScorer` |
 | A whole memory system | `Recall` | `aidaemon-policies` | `aidaemon_memory::MemoryRecall` |
@@ -229,6 +230,22 @@ channel kit needs a small `ChannelHarness` that injects messages and button
 presses into your platform mock; see the Telegram, Slack and Discord test
 suites for examples. If a tool's schema alone cannot produce valid
 arguments, use `check_tool_with(..., ToolKitOptions::default().valid_arguments(..))`.
+
+## Keeping approvals across a restart
+
+`ChannelRunner` keeps open approvals in memory unless you give it an
+`ApprovalStore` (needs a `RunStore` too). With `aidaemon-store-sqlite`'s
+`channels` feature, one database holds both:
+
+```rust
+let store = SqliteStore::open("agent.db").await?;
+let runner = ChannelRunner::builder(agent)
+    .store(Arc::new(store.clone()))
+    .approval_store(Arc::new(SqliteApprovalStore::new(&store)));
+```
+
+After a restart the runner restores each open approval, denies one that
+expired while stopped (and tells the chat), and drops one whose run is gone.
 
 ## Naming and publishing your crate
 
