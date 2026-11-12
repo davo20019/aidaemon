@@ -14,13 +14,217 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 | Item | State |
 |---|---|
 | Branch | `ccr-695cf12a-023uky` (carries the earlier `ccr-986102ee-12nt48` work) |
-| Crates | `aidaemon-core` plus 13 SDK crates (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
-| Tests | all passing across the 14 crates (incl. conformance kits); clippy and fmt clean |
-| CI | Lint and tests for every SDK crate run in `ci.yml`. macOS job never gets a runner (see "Known issues") |
+| Crates | `aidaemon-core` plus 16 SDK crates under `crates/aidaemon-*` (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
+| Tests | passing across the crates CI covers (incl. conformance kits); clippy and fmt clean |
+| CI | Lint and tests for 16 of the 17 crates run in `ci.yml`, on Linux and macOS. `aidaemon-decisions` (experimental) is not in either `-p` list |
 | PR | #14 (draft). #13 was closed without merging |
 | Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
 
-### What exists
+### Next up
+
+First: 8.7 items 1 and 3 together (honest final status and the typed final
+outcome are one status mapping). Write the failing test first: the engine
+already ends a run `Partial` when `RunOutcome::is_succeeded()` is false
+(`sdk_engine/outcome.rs`) and the ledger reconciles at task end, so confirm
+what is actually recorded before changing the stop logic.
+
+## Definition of done
+
+The goal is met when all four hold (from the thin-app design, "How we know
+it's done", plus an outside-user check):
+
+1. **An outsider can build an agent.** From the published crates and the
+   getting-started guide alone, a new project assembles a non-coding agent
+   (`support_triage` is the model) and it completes its task against a live
+   model, N-of-M. The first working agent, with one custom tool written
+   with `#[tool]`, fits in about 30 lines.
+2. **Parity example.** An example that depends only on SDK crates assembles
+   the preset in a short `main.rs` and passes the shared behavior suite
+   (scripted provider, in-process channel): memory recall and writing, tool
+   use, approvals, sub-agents, a channel round trip. Run again with another
+   `MemorySystem`, everything but the daemon memory's own tests passes.
+3. **Published.** `cargo package` passes for every crate and `0.1.0` is on
+   crates.io.
+4. **The daemon runs on the same crates** with no behavior change, checked
+   live N-of-M.
+
+The aim (owner, 2026-11-11) is not to beat other frameworks but to be the
+comparable product in the Rust ecosystem: someone who has used the Claude
+Agent SDK, the Vercel AI SDK or LangGraph should find the same things
+here.
+
+Milestone 2 meets all four. Milestone 3 is the owner's further goal (the
+app is only wiring) and is not needed for outside users.
+
+## Milestones
+
+Every open item belongs to exactly one. Details stay under each phase.
+
+### Milestone 1: merge PR #14 (the daemon is built on the SDK)
+
+Gate: decision 7.
+
+- [ ] 8.7 items 1+3: honest final status and typed final outcome (test
+      first).
+- [ ] 8.7 item 7: learning opt-out.
+- [ ] Delete the task wall-clock timeout setting (decision 1).
+- [ ] Add `aidaemon-decisions` to CI and `DESIGN.md` (decision 6).
+- [ ] Commit the background-handoff work in the tree.
+- [ ] Whole-branch review.
+- [ ] Live N-of-M on goals and mandates.
+
+After the merge the daemon releases as GitHub binaries and Homebrew only;
+its crates.io publish is paused until Milestone 2, because it cannot be
+published while it depends on unpublished path crates.
+
+### Milestone 2: SDK 0.1.0 on crates.io (the framework goal)
+
+Proof that the SDK works without the daemon:
+- [ ] Run `coding_agent`, `support_triage` and
+      `crates/aidaemon-eval/scenarios` against live models, N-of-M. Fix
+      what breaks; this path has never run live.
+- [ ] Plain-kernel baseline, then each policy on/off (Phases 4 and 5,
+      decision 4). Remove a policy that shows no gain before it becomes
+      public API.
+- [ ] The parity example and its behavior suite (definition 2).
+- [ ] Sandbox: run the bubblewrap backend's tests for real on Linux CI
+      (only argument-level today), and make a sandbox the default for the
+      shell tool on Linux.
+- [ ] SQLite `ApprovalStore`, so a `ChannelRunner` user keeps pending
+      approvals across a restart.
+
+Contracts settle before they are published:
+- [ ] Phase 9 step 0: contracts out of `src/types.rs` and the facade store
+      traits, into crates.
+- [ ] Phase 9 step 1: the daemon's memory system becomes
+      `aidaemon-memory`'s full `MemorySystem`, the preset's default. This
+      closes 8.7's `src/memory/` port ruling, item 2 (the crate's SQL
+      reading the host's `events` table) and item 8 (memory policy from
+      role and channel).
+- [ ] 8.7 leftovers: tool names matched outside the dispatcher,
+      `context_window.rs` to policies, `skill_promotion.rs` to skills.
+- [ ] 8.7 item 4 (end check), only if decision 5's condition holds.
+- [ ] Review `public-api.txt` for `aidaemon-core`: anything not meant to be
+      a promise becomes private or `#[doc(hidden)]` now.
+
+Developer experience, so it feels like the SDKs people already know
+(Claude Agent SDK, Vercel AI SDK, LangGraph), in Rust:
+- [ ] A short start: a builder preset in `aidaemon-sdk` (provider, default
+      tools, store) so a working agent is about 15 lines. `quickstart.rs`
+      is 121 today. This is the assembly half of 9.7, pulled forward; the
+      daemon moving onto the preset stays in Milestone 3.
+- [ ] Tools without hand-written JSON: a `#[tool]` attribute macro (new
+      `aidaemon-macros` crate, re-exported by `aidaemon-sdk`) over an async
+      fn or a typed args struct, with the schema derived through
+      `schemars`. It emits the full function object the schema lint
+      expects, and annotations/effects stay explicit arguments of the
+      macro: a derived tool never gets a looser default than a
+      hand-written one. Add it to the `Tool` conformance kit.
+- [ ] Typed structured output: a call that returns `T: DeserializeOwned +
+      JsonSchema` on top of the existing `ResponseFormat::JsonSchema`, with
+      one repair retry on a parse failure, for a single model call and as
+      an agent's final answer.
+- [ ] Examples, each short and run in CI against the scripted provider:
+      custom tool, approval and decline, resume after a crash, sub-agent,
+      memory swap, channel bot, a run streamed over SSE from axum, and
+      traces exported with the existing `otel` feature of
+      `aidaemon-policies`.
+- Not doing: graph or workflow authoring (LangGraph's core). Interrupt and
+  resume, agents-as-tools and services cover the uses; revisit only if
+  outside users ask.
+
+Publish prep (`crates/PUBLISHING.md`, as amended by decision 3):
+- [ ] `[workspace.package]` version `0.1.0`, `rust-version`, and per-crate
+      `readme`, `keywords`, `categories`, `documentation`. Internal crates
+      say so in their description.
+- [ ] A `README.md` per crate (none exist), and a `crates/CHANGELOG.md`.
+- [ ] Getting-started guide on docs.aidaemon.ai: install, quickstart,
+      a custom tool, a hook, swapping memory, a channel. Present it as a
+      general agent SDK for Rust; approvals, receipts and untrusted-content
+      handling are features, not the pitch. One page mapping concepts from
+      the Claude Agent SDK, Vercel AI SDK and LangGraph to ours.
+- [ ] CI: `cargo doc --no-deps --all-features` per crate, MSRV job,
+      `cargo-semver-checks` on the public-contract tier.
+- [ ] `cargo package --list` reviewed for every crate.
+- [ ] `release.yml` publishes the crates in dependency order, then the
+      daemon with exact pins.
+- [ ] Re-check the crate names are free, then the owner approves the
+      publish. `publish = false` is removed only then.
+- [ ] The outsider check (definition 1), from the published crates.
+
+### Milestone 3: the app is only wiring (Phase 9 steps 2-7)
+
+Not needed for outside users; see Phase 9. It ends with the app boundary
+check in CI and the daemon running on the preset.
+
+## Decisions (2026-11-11)
+
+Delegated by the owner to the reviewing session; the owner can overrule any
+of them.
+
+1. **Task wall-clock timeout: delete the setting.** A run is bounded by
+   progress and cost (inactivity watchdog, per-call timeouts, limits, token
+   budgets), not by elapsed time; a wall clock kills legitimate long work
+   and `cfd4fce` already removed the channel's for that reason.
+   `subagents.task_timeout_secs` becomes accepted-and-ignored with one log
+   line, like `daily_token_budget`; remove `Limits::task_timeout` and the
+   dead `_effective_task_timeout` in `turn/main_loop.rs`.
+2. **How `aidaemon-core` ships: publish the crates, do not fold them in.**
+   Folding the kernel into the main crate would undo Phase 8 (the app is
+   built on the SDK). `cargo publish` of the daemon needs every path
+   dependency on crates.io, so all crates the daemon depends on are
+   published, including the daemon-shaped ones.
+3. **Publishing shape.**
+   - One shared version for all SDK crates (`[workspace.package]`),
+     starting at `0.1.0`, separate from the daemon's version. Independent
+     versions (the draft in `PUBLISHING.md`) cost more than they return
+     with one maintainer and one consumer; split later if outside users
+     need it.
+   - The daemon pins them exactly (`=0.1.x`), so a daemon release always
+     builds against the crates it was tested with.
+   - Two tiers. Public contract: `aidaemon-core`, `aidaemon-sdk`, the
+     `channel` module, the memory traits; semver-checked in CI. Everything
+     else, and `aidaemon-events`, `aidaemon-work` and `aidaemon-decisions`
+     in particular, is published as internal: description says "internal
+     to aidaemon, no stability promise".
+   - Automation: `release.yml` publishes the SDK crates in dependency
+     order, skipping versions already on crates.io, then the daemon. No
+     separate tag scheme.
+   - Timing: first publish is Milestone 2, after Phase 9 steps 0 and 1,
+     so the contracts are settled and proven by the daemon before they
+     become permanent. No placeholder 0.0.x versions to reserve names;
+     until then the daemon ships as GitHub binaries and Homebrew only.
+     These settle the thin-app design's two open decisions. Publishing is
+     permanent, so the owner runs or approves that release.
+4. **Decision 4 is amended**, since the old loop no longer exists to
+   compare against: what is already ported stays; the plain-kernel baseline
+   and per-policy on/off numbers are still collected, and a policy that
+   shows no gain is removed. From now on no new policy, gate or stop-time
+   demand lands without an N-of-M number. The Phase 4 old-vs-new comparison
+   is dropped.
+5. **8.7 items 4-6.**
+   - Item 5 (checklist before the first change): dropped. A gate on the
+     first mutating call is the kind that composes into dead ends, and the
+     checklist is already demanded at stop time, where receipts can judge
+     it.
+   - Item 6 (three-routes stuck rule): dropped as a separate rule. Budgets,
+     the streak guard and kernel stuck detection bound the same failure;
+     reopen only if `db_probe --gate-outcomes` shows runs burning budget on
+     repeated failed routes.
+   - Item 4 (independent end check): deferred, not dropped. Build it after
+     items 1+3, and only if the fabrication audit and N-of-M runs still
+     show runs recorded as succeeded with unmet work. Then it is one
+     `StopDemand` with a budget of one reopen, calling a declared
+     `SideCall`.
+6. **`aidaemon-decisions` joins CI's clippy and test `-p` lists** and the
+   "SDK crates" section of `DESIGN.md`. Every workspace crate is linted
+   and tested, experimental or not.
+7. **Merging PR #14.** Gate: CI green, the whole-branch review done, and
+   live N-of-M on goals and mandates. Merge with a merge commit, not a
+   squash: this plan and the memory notes cite commit hashes on the
+   branch.
+
+## What exists
 
 - **Kernel** (`aidaemon-core`): agent builder, streaming `Provider` + `Retry`,
   `Tool` with annotations, access manifests and timeout hints, five hook
@@ -44,9 +248,9 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
    becomes its first user. No separate repository.
 2. **Small kernel, everything else is a hook.** If a feature cannot be built
    on the public hooks, add a hook point; do not add a kernel primitive.
-3. **New loop, not an extraction.** `src/agent/loop/` (~62k lines) is not
-   moved into the SDK. Daemon policies are re-implemented as hooks one at a
-   time.
+3. **New loop, not an extraction.** The daemon's legacy loop
+   (`src/agent/loop/`, ~62k lines, deleted in `2ae738d`) was not moved into
+   the SDK. Daemon policies are re-implemented as hooks one at a time.
 4. **Port only what measures well.** A daemon policy is ported only if
    repeated live runs (N-of-M pass rates, not single runs) show it helps.
 5. **Receipts are the source of truth** for "did the work happen"; completion
@@ -186,7 +390,10 @@ adapters, tested against local mock servers.
 - [ ] Owner decision on publishing (names, 0.1.0, release automation).
 
 ### Phase 7: the daemon runs on the SDK (done except packaging)
-- [x] Engine switch: build with `--features sdk-engine` and set
+- [x] Engine switch (historical: the `sdk-engine` feature and the engine
+      setting are gone, and the engine is no longer Anthropic-only; see
+      "Close the remaining gaps" below). As shipped: build with
+      `--features sdk-engine` and set
       `[agent.engine] kind = "sdk"`. Every turn that reaches
       `handle_message_impl` (channels, continuations, goal task leads,
       spawned children) runs on the kernel (`src/agent/runtime/sdk_engine.rs`).
@@ -219,6 +426,11 @@ adapters, tested against local mock servers.
       exempt); the SDK engine leaves `sdk::Limits::timeout` unset, so
       nothing enforces it. Set it in `sdk_engine.rs` where the limits are
       built.
+      Checked 2026-11-11: still unenforced; `turn/main_loop.rs` computes
+      `_effective_task_timeout` and drops it. `cfd4fce` removed the
+      channel's 20-minute clock on purpose (long work is bounded by
+      inactivity, timeouts, limits and budgets), so the choice is to
+      enforce `subagents.task_timeout_secs` or delete the setting.
 - [x] Global daily token budget: dropped. `[state] daily_token_budget` is
       accepted and ignored (logged once); a daily cap has to count every
       model call, so it belongs at the provider, not in the turn loop.
@@ -227,13 +439,13 @@ adapters, tested against local mock servers.
       (`sdk_engine/budgets.rs`, `task_token_budget`).
 - [ ] Whole-branch review, then live N-of-M runs on goals and mandates.
 
-### Phase 8: the daemon is built on the SDK  ← In progress (2026-11-07)
+### Phase 8: the daemon is built on the SDK  ← In progress (only 8.7 open)
 
-Status (2026-11-09): 8.1, 8.1b, 8.2, 8.5, 8.6 and 8.7b done; 8.3 mostly done;
-8.4's ten steps done, and the daemon's tools are SDK tools; 8.7's memory port
-done, compared live; 8.8
-providers, MCP and channels done, the store mapped (what has a second consumer
-is already in crates). 8.9 is in progress.
+Status (2026-11-11): 8.1, 8.1b, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7b, 8.8 and 8.9
+done. 8.7: the memory port is done (compared live), the assessor is deleted
+(`e857faf`) and budgets and stuck recording run through the kernel
+(`2c443dc`, `b510f61`); Authority Phase 4's end check, typed final outcome,
+checklist-before-change gate, stuck rule and learning opt-out are open.
 
 Owner ruling (2026-11-04): the app is built on top of the SDK, so effort is
 never duplicated. Mechanisms live in `aidaemon-core`. Reusable policy lives
@@ -298,7 +510,7 @@ Order:
       execute the instance judged at turn start, and their annotation
       hints never loosen a safeguard. The approval rules and the
       dispatcher no longer match tools by name or downcast.
-- [ ] 8.3 The dispatcher bridge becomes SDK hooks. Done 2026-11-07:
+- [x] 8.3 The dispatcher bridge becomes SDK hooks. Done 2026-11-07:
       - `2134409`: the kernel's `ToolDecision::Answer` lets a hook answer in
         the tool's place (`ReceiptStatus::Answered`: not a success, never
         ends the run).
@@ -347,7 +559,7 @@ Order:
         backend for tests that construct a tool directly;
       - Done 2026-11-09: the goals/mandates store slice and the concrete
         `EventStore` are in `aidaemon-work` and `aidaemon-events` (8.8).
-- [ ] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
+- [x] 8.4 Tools converge into `aidaemon-tools`. Map (2026-11-07): no
       daemon tool can wrap today's thin crate tools without behavior
       changes. The crate tools implement only the kernel `Tool` and do I/O
       through `Workspace`, not `ExecutionBackend`. So the daemon versions
@@ -450,6 +662,55 @@ Order:
       Phase 5 (memory policy; `aidaemon-memory` becomes the daemon's
       default memory instead of the opt-in `sdk-memory` feature; the
       assessor is retired).
+      Done 2026-11-08: the pre-turn assessor is deleted (`e857faf`); the
+      model's `track_requirements` checklist is the only author of stop-time
+      expectations. Budgets, forced text and stuck recording go through the
+      kernel (`2c443dc`), and a request's sub-agent tree shares one token
+      budget (`b510f61`).
+      In the working tree, uncommitted (2026-11-11): a stop while a job the
+      run launched is still running is a background handoff
+      (`sdk_background_handoff` in `stop.rs`); the run ships the handoff
+      reply and ends `Partial` (`outcome.rs`, `finish_tests.rs`).
+      Open, checked against the code (2026-11-11). Order: 1 and 3 together,
+      then 7; 4-6 only with evidence (see "Next up"); 2 and 8 with Phase 9:
+      1. Honest final status. The daemon's stop logic
+         (`sdk_engine/stop.rs`, `LedgerStop`) only returns `Accept` or
+         `Continue`, never `AcceptUnmet` or `Halt`, so a run that stops with
+         checklist items open is recorded as succeeded. A run closed by a
+         policy refusal maps to `WorkSucceeded`
+         (`aidaemon-events/src/run_aggregate.rs`, `ClosedByPolicyDenial`).
+         Unverified: whether the task is actually recorded as succeeded.
+         `outcome.rs` already maps a `Completed` run that is not
+         `is_succeeded()` to `Partial`, and the ledger reconciles at task
+         end; prove the gap with a test before fixing it.
+      2. The memory crate's own SQL still reads the host's `events` table
+         in three places (`sqlite/claims.rs`, `sqlite/mod.rs`,
+         `sqlite/retention.rs`); the 11-09 ruling lists this as a gap.
+      3. Typed final outcome: the working agent states
+         `done | partial | blocked`, and the run's status follows it.
+      4. Independent end check: an `on_stop` hook in which a cheap fresh
+         agent compares the request with the checklist and receipts and
+         may reopen the run once.
+      5. Checklist before the first change: `checklist_declared` is tracked
+         but only words a prompt header; nothing gates on it.
+      6. Stuck rule: stop and report after about three different routes
+         fail with nothing new learned (today: stuck recording and the
+         same-tool streak guard only).
+      7. "Don't remember this": a typed per-turn learning opt-out that
+         extraction and consolidation honor.
+      8. Memory policy from role and channel (authority design section 5):
+         `compile_memory_pipeline_policy` still keys on the compiled
+         contract, and `RecallOnlyNonUserTurn` remains.
+      Smaller leftovers from earlier items:
+      - Tool names still matched outside the dispatcher:
+        `runtime/post_task.rs`, `runtime/turn_context.rs`,
+        `turn/tool_execution/project_dir.rs`.
+      - `memory/context_window.rs` belongs with the policies crate's
+        `ContextWindow`; `memory/skill_promotion.rs` with skills.
+      - The daemon's own memory system (`DaemonMemory`, recall, writer,
+        its tools) is still in the app: the thin-app design's Phase 9
+        step 1 (`docs/superpowers/specs/2026-11-11-sdk-thin-app-design.md`,
+        local).
       - [x] Memory is replaceable as one unit: `aidaemon_policies::MemorySystem`
         (`MemoryTurn` in, `MemoryParts` out). `aidaemon_memory::ScopedMemory`
         implements it, and the daemon's `SystemMemory` plugs any
@@ -502,14 +763,13 @@ Order:
            over one synthetic history on separate in-memory databases and
            compares the rows; `078c4cc` deletes the old path and keeps the
            expected rows in `src/events/testdata/consolidation.golden`.
-        2. (was 3, below)
-        3. Done 2026-11-09 (`159bee6`, `643a42d`): the SQLite stores are
+        2. Done 2026-11-09 (`159bee6`, `643a42d`): the SQLite stores are
            `aidaemon_memory::sqlite::SqliteMemory`, and the crate creates
            and upgrades the memory tables (`sqlite::migrate`). The state
            store forwards the memory traits to it. Retention's memory half
            is `sqlite::MemoryRetention` and stops under another system. The
            store runs without any host tables.
-        4. Owner ruling (2026-11-09): people must be able to update and keep
+        3. Owner ruling (2026-11-09): people must be able to update and keep
            their data, and memory must stay replaceable by other open source
            systems. So:
            - No data migration for the default backend. The crate owns the
@@ -551,7 +811,7 @@ Order:
              default, resumable, same privacy rules as a live turn), and
              `aidaemon memory-export DIR` writes the daemon's memory as
              Markdown.
-        5. Done 2026-11-09: the old modules' memory logic is in the crate
+        4. Done 2026-11-09: the old modules' memory logic is in the crate
            (`TaskLearner`, the stores). Consolidation parity was proved on one
            commit with both paths (`2a590d0`) and is guarded by a golden file.
            Live on Telegram, save/recall/forget with synthetic data: 3 of 3 on
@@ -570,7 +830,7 @@ Order:
       SIGTERM reaches the graceful path, and `heartbeat.rs` is split by
       phase. A long agent run is still interrupted by a restart and resumed
       by startup recovery.
-- [ ] 8.8 Channels, MCP and store, each promoted into its SDK crate.
+- [x] 8.8 Channels, MCP and store, each promoted into its SDK crate.
       Providers are done: every daemon model call runs on an
       `aidaemon-providers` backend and the daemon `ModelProvider` trait is
       deleted (`e0e8899`..`29c3824`).
@@ -747,6 +1007,33 @@ Order:
       wrong mappings made it fail. Proposals and receipts match in every
       fixture, so the lane split rests on a synthetic control run.
 
+### Phase 9: the app is only wiring
+
+Design: `docs/superpowers/specs/2026-11-11-sdk-thin-app-design.md` (local;
+its rules for every move and its rulings apply). Steps 0 and 1 are in
+Milestone 2, the rest in Milestone 3.
+
+- [ ] 9.0 Contracts: the types in `src/types.rs` and the facade store
+      traits move into crates, split by owner; each crate takes settings
+      structs in place of `crate::config`.
+- [ ] 9.1 The daemon's memory system (`DaemonMemory`, `DaemonRecall` and
+      its guardrails, the run-end writer, its four tools, the orchestration
+      in `src/memory/manager.rs`) becomes `aidaemon-memory`'s full
+      `MemorySystem` over `SqliteMemory`, plugged in through `SystemMemory`.
+- [ ] 9.2 The turn runtime (`src/agent/runtime/`, `src/agent/turn/`, intent
+      and policy modules, the system prompt builder) into its crate; model
+      routing next to the providers.
+- [ ] 9.3 Work: background task lead, tasks, plans, mandates, triggers and
+      reminders into `aidaemon-work`.
+- [ ] 9.4 The remaining general tools into `aidaemon-tools`, or one crate
+      per heavy tool behind features.
+- [ ] 9.5 Channels: the daemon's turn runner, access, sessions, queueing,
+      approvals, dynamic bots and slash commands into `aidaemon-channels`.
+- [ ] 9.6 Platform services: execution backend, workspaces, checkpoints,
+      OAuth and secrets, nodes, terminal bridge, skills, health.
+- [ ] 9.7 Assembly and proof: the daemon runs on the `aidaemon-sdk` preset;
+      a CI check fails on any `src/` module outside the product-shell list.
+
 ## Parallel track: fixes found in the daemon
 
 Independent of the SDK; each is a small PR against `master`.
@@ -775,7 +1062,9 @@ Independent of the SDK; each is a small PR against `master`.
 
 ## Known issues
 
-- None open. (The macOS CI job ran again once it moved from the rejected
+- `aidaemon-decisions` is in the workspace and used by the daemon but is
+  not in CI's SDK clippy/test lists and is not described in this plan.
+- No other issue open. (The macOS CI job ran again once it moved from the rejected
   `macos-14` label to `macos-latest`, `43a5cd8`; it passed on `2d7d2e9`.)
 
 ## Working agreements
@@ -800,7 +1089,10 @@ git config user.name "David Loor M."
 git config user.email "davo20019@gmail.com"
 cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools \
   -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents \
-  -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk --all-features
+  -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory \
+  -p aidaemon-events -p aidaemon-work \
+  -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack \
+  -p aidaemon-channel-discord --all-features   # the list in ci.yml
 cargo run -p aidaemon-core --example quickstart --features testing
 ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example coding_agent -- <dir> "<task>"
 ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example support_triage
@@ -810,5 +1102,5 @@ Prompt to start a new session:
 
 > Continue the aidaemon SDK work. Check out branch `ccr-695cf12a-023uky`,
 > read `crates/aidaemon-core/PLAN.md` and `DESIGN.md`, then work on the
-> first unchecked step in Phase 8. Commit as David Loor M. with no Claude
+> item under "Next up". Commit as David Loor M. with no Claude
 > attribution.
