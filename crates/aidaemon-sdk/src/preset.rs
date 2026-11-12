@@ -24,7 +24,7 @@
 //! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`](crate::policies::ScopeGuard) over the workspace, [`EgressGuard`](crate::policies::EgressGuard), [`ApprovalPolicy`](crate::policies::ApprovalPolicy) (`DestructiveOnly`), [`Redactor`](crate::policies::Redactor), [`UntrustedOutput`](crate::policies::UntrustedOutput) | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
-//! | Memory | none | [`Preset::memory`]: any [`MemorySystem`] |
+//! | Memory | with the `memory` feature (default), aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus `remember_fact`, `manage_memories`, `manage_people`, `share_memory`), in memory or in [`Preset::memory_path`]; else none | [`Preset::memory`]: any [`MemorySystem`]; [`Preset::without_memory`] |
 //! | Anything else | | [`Preset::hook`], [`Preset::configure`] (the [`AgentBuilder`]) |
 //!
 //! A destructive call pauses the run for the owner
@@ -66,6 +66,8 @@ pub enum PresetError {
     Workspace(String),
     #[error("run store: {0}")]
     Store(String),
+    #[error("memory: {0}")]
+    Memory(String),
     #[error(transparent)]
     Build(#[from] BuildError),
 }
@@ -93,6 +95,21 @@ pub fn provider_from_env() -> Result<Option<EnvProvider>, PresetError> {
     Ok(None)
 }
 
+/// The default memory's turn: the agent's owner, reading and writing one
+/// memory.
+#[cfg(feature = "memory")]
+fn owner_turn(id: &str) -> MemoryTurn {
+    MemoryTurn {
+        session_id: id.to_string(),
+        scope: "owner".to_string(),
+        read: true,
+        write: true,
+        explicit_writes_only: false,
+        learning: Default::default(),
+        host: Default::default(),
+    }
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -102,6 +119,14 @@ enum ProviderChoice {
     Explicit(Arc<dyn Provider>),
     Env,
     EnvOr(Arc<dyn Provider>),
+}
+
+enum MemoryChoice {
+    /// The full memory system, when built with the `memory` feature.
+    #[cfg_attr(not(feature = "memory"), allow(dead_code))]
+    Default(Option<PathBuf>),
+    None,
+    Given(Arc<dyn MemorySystem>, MemoryTurn),
 }
 
 enum StoreChoice {
@@ -127,7 +152,7 @@ pub struct Preset {
     approvals: ApprovalMode,
     default_hooks: bool,
     undeclared_writes: Option<UndeclaredAccess>,
-    memory: Option<(Arc<dyn MemorySystem>, MemoryTurn)>,
+    memory: MemoryChoice,
     configure: Vec<Box<dyn FnOnce(AgentBuilder) -> AgentBuilder + Send>>,
 }
 
@@ -146,7 +171,7 @@ impl Preset {
             approvals: ApprovalMode::DestructiveOnly,
             default_hooks: true,
             undeclared_writes: None,
-            memory: None,
+            memory: MemoryChoice::Default(None),
             configure: Vec::new(),
         }
     }
@@ -275,7 +300,21 @@ impl Preset {
     /// and its guidance appended to the instructions. Any [`MemorySystem`]
     /// works (`aidaemon-memory`'s or your own).
     pub fn memory(mut self, system: Arc<dyn MemorySystem>, turn: MemoryTurn) -> Self {
-        self.memory = Some((system, turn));
+        self.memory = MemoryChoice::Given(system, turn);
+        self
+    }
+
+    /// Keep the default memory in this SQLite file, so it survives a
+    /// restart (default: in memory, for the life of the agent).
+    #[cfg(feature = "memory")]
+    pub fn memory_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.memory = MemoryChoice::Default(Some(path.into()));
+        self
+    }
+
+    /// No long-term memory.
+    pub fn without_memory(mut self) -> Self {
+        self.memory = MemoryChoice::None;
         self
     }
 
@@ -307,7 +346,7 @@ impl Preset {
             .or_else(|| env("AIDAEMON_MODEL").filter(|_| default_model != Some("scripted")))
             .or_else(|| default_model.map(str::to_string));
 
-        let mut builder = Agent::builder(self.id).provider(provider);
+        let mut builder = Agent::builder(self.id.clone()).provider(provider);
         if let Some(model) = model {
             builder = builder.model(model);
         }
@@ -315,7 +354,20 @@ impl Preset {
         let mut instructions = self.instructions;
         let mut tools = self.tools;
         let mut extra_hooks = Vec::new();
-        if let Some((system, turn)) = &self.memory {
+        let memory: Option<(Arc<dyn MemorySystem>, MemoryTurn)> = match self.memory {
+            MemoryChoice::None => None,
+            MemoryChoice::Given(system, turn) => Some((system, turn)),
+            #[cfg(feature = "memory")]
+            MemoryChoice::Default(path) => {
+                let system = aidaemon_memory::full::FullMemory::open(path.as_deref())
+                    .await
+                    .map_err(|err| PresetError::Memory(err.to_string()))?;
+                Some((Arc::new(system), owner_turn(&self.id)))
+            }
+            #[cfg(not(feature = "memory"))]
+            MemoryChoice::Default(_) => None,
+        };
+        if let Some((system, turn)) = &memory {
             let parts = system.turn(turn).await;
             extra_hooks.extend(parts.hooks);
             tools.extend(parts.tools);

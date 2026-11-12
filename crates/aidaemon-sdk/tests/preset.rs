@@ -201,3 +201,74 @@ async fn any_memory_system_plugs_in() {
     assert!(system.starts_with("Be brief."), "{system}");
     assert!(system.contains("notebook"), "{system}");
 }
+
+/// The default memory is aidaemon's full memory system: a fact the agent
+/// stores in one run is recalled in a later one, here by a second agent on
+/// the same memory file.
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn the_default_memory_remembers_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = dir.path().join("memory.db");
+
+    let first = Arc::new(ScriptedProvider::new([
+        tool_calls([call(
+            "c1",
+            "remember_fact",
+            json!({"category": "preference", "key": "favorite_color", "value": "teal"}),
+        )]),
+        text("Saved."),
+    ]));
+    let agent = preset("assistant")
+        .provider(first.clone())
+        .model("scripted")
+        .memory_path(&memory)
+        .build()
+        .await
+        .unwrap();
+    let names: Vec<String> = agent
+        .tool_specs()
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    for tool in [
+        "remember_fact",
+        "manage_memories",
+        "manage_people",
+        "share_memory",
+    ] {
+        assert!(names.contains(&tool.to_string()), "{names:?}");
+    }
+    let outcome = agent
+        .run("test:synthetic-user", "Note my favorite color: teal.")
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, RunStatus::Completed, "{outcome:?}");
+    let result = &first.requests()[1].messages;
+    assert!(
+        result.iter().any(|m| m.content.contains("Stored")
+            || m.content.contains("Remembered")
+            || m.content.contains("favorite_color")),
+        "{result:?}"
+    );
+    drop(agent);
+
+    let second = Arc::new(ScriptedProvider::new([text("Teal.")]));
+    let agent = preset("assistant")
+        .provider(second.clone())
+        .model("scripted")
+        .memory_path(&memory)
+        .build()
+        .await
+        .unwrap();
+    agent
+        .run("test:synthetic-user", "What is my favorite color?")
+        .await
+        .unwrap();
+    let request = &second.requests()[0];
+    assert!(
+        request.messages.iter().any(|m| m.content.contains("teal")),
+        "the fact is not recalled: {:?}",
+        request.messages
+    );
+}
