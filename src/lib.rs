@@ -72,6 +72,8 @@ mod wizard;
 mod workspaces;
 
 #[cfg(test)]
+mod contract_shape_tests;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod live_e2e_tests;
