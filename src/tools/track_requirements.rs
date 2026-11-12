@@ -415,10 +415,12 @@ impl Tool for TrackRequirementsTool {
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
-         Mark items 'completed' as you finish them, 'failed' if you tried one and did not get what \
-         it asks for (the thing was not found, the step did not work), or 'deferred' if you will \
-         not do one: the run may then end, but a failed, deferred or removed item is reported as \
-         not done, never as done. \
+         Mark items 'completed' as you finish them, 'skipped' if one turned out to have nothing \
+         to do (you looked and nothing matched, there was nothing to cancel), 'failed' if you \
+         tried one and it did not work, or 'deferred' if you will not do one: the run may then \
+         end, but a failed, deferred or removed item is reported as not done, never as done. \
+         Write each item as the person you are helping reads it, speaking to them ('your \
+         calendar'). \
          Mark 'background' an item a background job you launch will do and report on (give that \
          launch the item's index in its checklist_items): the card shows it running, and only the \
          job's end marks it done or failed. \
@@ -461,7 +463,7 @@ impl Tool for TrackRequirementsTool {
                                 },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "failed", "deferred", "background"]
+                                    "enum": ["pending", "in_progress", "completed", "skipped", "failed", "deferred", "background"]
                                 },
                                 "note": {
                                     "type": "string"
@@ -694,6 +696,16 @@ impl TrackRequirementsTool {
             }
         }
 
+        // A turn that cannot make changes did what it was allowed to: steps
+        // it left undone were held back, not failed, and the card says so.
+        if facts.mutation_forbidden
+            && plan.hold_back_unfinished_steps(crate::plans::NotDoneReason::ChangesOff)
+        {
+            if let Err(e) = self.plan_store.update(&plan).await {
+                tracing::warn!(error = %e, "track_requirements: failed to record held-back steps");
+            }
+        }
+
         // The rendered checklist is returned to the agent loop, which surfaces it
         // to the user via the single live status surface (StatusUpdate::Checklist).
         // This tool no longer posts/edits channel messages directly. Anything
@@ -704,11 +716,19 @@ impl TrackRequirementsTool {
             output.push_str(&self.vocabulary.render_notice(&dropped_targets));
             output.push_str("\n\n");
         }
+        // A one-step plan gets no card: the step is the request, and the
+        // reply says how it went. The model still reads where it stands.
+        let card = if plan.steps.len() == 1 {
+            output.push_str(&format!("{}\n\n", plan.render_compact_checklist()));
+            String::new()
+        } else {
+            plan.render_compact_checklist()
+        };
         output.push_str(&format!(
             "{CHECKLIST_HEADER} ({}/{} done):\n{}",
             plan.completed_steps(),
             plan.steps.len(),
-            plan.render_compact_checklist()
+            card
         ));
         Ok(output)
     }
@@ -940,6 +960,83 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("✅ Done · 2 of 2 steps"), "{out}");
+    }
+
+    /// A step with nothing to do is finished, not failed: the card reads
+    /// done and can go once the reply lands.
+    #[tokio::test]
+    async fn a_step_with_nothing_to_do_reads_as_not_needed() {
+        let (tool, _plan_store) = test_tool().await;
+        let args = json!({
+            "items": [
+                {"text": "Find your open orders", "status": "completed"},
+                {"text": "Cancel the open orders", "status": "skipped"}
+            ],
+            "outcome": "done"
+        })
+        .to_string();
+        tool.validate_arguments(&args).unwrap();
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-skip"))
+            .await
+            .unwrap();
+        assert!(out.contains("✅ Done · 1 done, 1 not needed"), "{out}");
+        assert!(
+            out.contains("➖ Cancel the open orders (not needed)"),
+            "{out}"
+        );
+        assert!(!out.contains('⚠'), "{out}");
+    }
+
+    /// Read-only correctly kept a write from happening: the card says why it
+    /// was not done instead of "❌ Stopped".
+    #[tokio::test]
+    async fn read_only_holds_steps_back_instead_of_failing_them() {
+        let (tool, plan_store) = test_tool().await;
+        let args = json!({
+            "items": [
+                {"text": "Read your config", "status": "completed"},
+                {"text": "Write the new setting", "status": "failed"}
+            ],
+            "outcome": "blocked"
+        })
+        .to_string();
+        let mut facts = crate::testing::call_facts("sess-ro");
+        facts.mutation_forbidden = true;
+        let out = tool.call_with(&args, facts).await.unwrap();
+        assert!(
+            out.contains("⏭️ Not done: read-only is on · 1 of 2 done"),
+            "{out}"
+        );
+        assert!(
+            out.contains("⏭️ Write the new setting (not done: read-only is on)"),
+            "{out}"
+        );
+        assert!(!out.contains('❌') && !out.contains("Stopped"), "{out}");
+        let plan = plan_store
+            .get_recent_for_session("sess-ro", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan[0].steps[1].not_done,
+            Some(crate::plans::NotDoneReason::ChangesOff)
+        );
+    }
+
+    /// One step is the request itself: no card, the reply says how it went.
+    #[tokio::test]
+    async fn a_one_step_checklist_gets_no_card() {
+        let (tool, _plan_store) = test_tool().await;
+        let args = json!({"items": [{"text": "Save your test name", "status": "in_progress"}]})
+            .to_string();
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-one"))
+            .await
+            .unwrap();
+        let (_, after_header) = out.split_once(CHECKLIST_HEADER).expect("header");
+        let (_, card) = after_header.split_once(":\n").expect("card");
+        assert!(card.trim().is_empty(), "{out}");
+        assert!(out.contains("Save your test name"), "{out}");
     }
 
     #[tokio::test]

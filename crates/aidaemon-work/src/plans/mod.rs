@@ -80,6 +80,7 @@ impl TaskPlan {
                 expected_targets: Vec::new(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
+                not_done: None,
                 status: if index == 0 {
                     StepStatus::InProgress
                 } else {
@@ -406,37 +407,104 @@ impl TaskPlan {
         changed
     }
 
+    /// Record that the steps not done in this plan were held back because
+    /// the turn could not make changes: a failed or deferred step becomes a
+    /// deferred step with [`NotDoneReason::ChangesOff`], which the card shows
+    /// as correctly not done. Returns whether anything changed.
+    pub fn hold_back_unfinished_steps(&mut self, reason: NotDoneReason) -> bool {
+        let mut changed = false;
+        for step in &mut self.steps {
+            if matches!(step.status, StepStatus::Failed | StepStatus::Deferred)
+                && step.not_done.is_none()
+            {
+                step.status = StepStatus::Deferred;
+                step.not_done = Some(reason);
+                step.completed_at.get_or_insert_with(Utc::now);
+                changed = true;
+            }
+        }
+        if changed {
+            if self.is_finished() {
+                self.status = self.resolved_status();
+            }
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    /// The reason every step left undone shares, when all of them were held
+    /// back for a known reason (and at least one was).
+    fn shared_hold_reason(&self) -> Option<NotDoneReason> {
+        let mut reason = None;
+        for step in &self.steps {
+            match (step.status, step.not_done) {
+                (StepStatus::Completed | StepStatus::Skipped, _) => {}
+                (StepStatus::Deferred, Some(found)) if reason.is_none_or(|r| r == found) => {
+                    reason = Some(found);
+                }
+                _ => return None,
+            }
+        }
+        reason
+    }
+
     /// Compact, channel-friendly checklist for the live status card.
     ///
     /// One header line carries the state and the count; the steps follow, a
     /// blank line apart so wrapped descriptions stay readable on a phone. A
     /// one-step plan is just that step (a header and a "1 of 1" would only
-    /// repeat it). A fully
-    /// completed card starts with ✅ ([`is_completed_checklist`]) so the
-    /// channel can drop it once the reply, which says what was done, lands.
+    /// repeat it). A fully completed card starts with ✅
+    /// ([`is_completed_checklist`]) so the channel can drop it once the reply,
+    /// which says what was done, lands. A step that turned out not to be
+    /// needed, or that was held back for a known reason, is never shown as a
+    /// failure.
     pub fn render_compact_checklist(&self) -> String {
         let total = self.steps.len();
         let done = self.completed_steps();
-        if total == 1 && !matches!(self.status, PlanStatus::PartiallyCompleted) {
+        let not_needed = self
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Skipped)
+            .count();
+        let held = self.shared_hold_reason();
+        if total == 1 && (self.status != PlanStatus::PartiallyCompleted || held.is_some()) {
             let step = &self.steps[0];
             let mark = match (self.status, step.status) {
                 (_, StepStatus::Completed) => "✅",
+                (_, StepStatus::Skipped) => "✅",
+                _ if held.is_some() => "⏭️",
                 (PlanStatus::Failed, _) | (_, StepStatus::Failed) => "❌",
                 (PlanStatus::Abandoned, _) => "⏹️",
                 (PlanStatus::Paused, _) => "⏸️",
                 _ => "⏳",
             };
-            if step.status == StepStatus::Background {
-                return format!("{mark} {} (running in the background)", step.description);
-            }
-            return format!("{mark} {}", step.description);
+            return match (step.status, held) {
+                (StepStatus::Background, _) => {
+                    format!("{mark} {} (running in the background)", step.description)
+                }
+                (StepStatus::Skipped, _) => format!("{mark} {} (not needed)", step.description),
+                (_, Some(reason)) => {
+                    format!("{mark} {} (not done: {})", step.description, reason.plain())
+                }
+                _ => format!("{mark} {}", step.description),
+            };
         }
         let in_background = self.has_background_steps();
+        let finished = !matches!(
+            self.status,
+            PlanStatus::Planning | PlanStatus::InProgress | PlanStatus::Paused
+        );
         let header = match self.status {
             // Work handed to a job that reports back is still being done:
             // never "stopped short" while it runs.
             _ if in_background => {
                 format!("⏳ Continuing in the background · {done} of {total} done")
+            }
+            // Everything left was held back for a known reason: the turn did
+            // what it was allowed to, which is not a failure.
+            _ if finished && held.is_some() => {
+                let reason = held.map(NotDoneReason::plain).unwrap_or_default();
+                format!("⏭️ Not done: {reason} · {done} of {total} done")
             }
             PlanStatus::Planning => "🧭 Planning…".to_string(),
             PlanStatus::InProgress => {
@@ -446,6 +514,9 @@ impl TaskPlan {
             PlanStatus::Paused => format!("⏸️ Paused · {done} of {total} done"),
             // The execution plan is resolved; the reply is still on its way,
             // which the typing indicator shows. Never claim the task is over.
+            PlanStatus::Completed if not_needed > 0 => {
+                format!("✅ Done · {done} done, {not_needed} not needed")
+            }
             PlanStatus::Completed => format!("✅ Done · {done} of {total} steps"),
             PlanStatus::PartiallyCompleted => {
                 format!("⚠️ Stopped short · {done} of {total} done")
@@ -455,25 +526,28 @@ impl TaskPlan {
         };
         let mut out = header;
         for step in &self.steps {
-            let line = match step.status {
-                StepStatus::Completed => format!("✅ {}", step.description),
-                StepStatus::InProgress => format!("▶️ {}", step.description),
-                StepStatus::Background => {
+            let line = match (step.status, step.not_done) {
+                (StepStatus::Completed, _) => format!("✅ {}", step.description),
+                (StepStatus::InProgress, _) => format!("▶️ {}", step.description),
+                (StepStatus::Background, _) => {
                     format!("⏳ {} (running in the background)", step.description)
+                }
+                (StepStatus::Deferred, Some(reason)) => {
+                    format!("⏭️ {} (not done: {})", step.description, reason.plain())
                 }
                 // `deferred` is the model's typed "set aside": the owner
                 // reads what it means for them.
-                StepStatus::Deferred => format!("⏭️ {} (not done)", step.description),
-                StepStatus::Failed => format!("⚠️ {} (needs attention)", step.description),
-                StepStatus::Skipped => format!("➖ {} (skipped)", step.description),
-                StepStatus::Pending => format!("○ {}", step.description),
+                (StepStatus::Deferred, None) => format!("⏭️ {} (not done)", step.description),
+                (StepStatus::Failed, _) => format!("⚠️ {} (couldn't be done)", step.description),
+                (StepStatus::Skipped, _) => format!("➖ {} (not needed)", step.description),
+                (StepStatus::Pending, _) => format!("○ {}", step.description),
             };
             // A blank line between steps: descriptions wrap on a phone, and
             // without a gap the wrapped lines run into the next step.
             out.push_str("\n\n");
             out.push_str(&line);
         }
-        if self.status == PlanStatus::PartiallyCompleted && !in_background {
+        if self.status == PlanStatus::PartiallyCompleted && !in_background && held.is_none() {
             out.push_str("\n\nThe reply below says what was left undone and why.");
         }
         out
@@ -576,6 +650,12 @@ pub struct PlanStep {
     /// settles the step ([`TaskPlan::settle_background_job`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_jobs: Vec<String>,
+
+    /// Why a step that was not done was left undone, when the daemon knows it
+    /// from typed state (never from the step's text). Such a step was held
+    /// back correctly, so the card does not show it as a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_done: Option<NotDoneReason>,
 
     /// Step status
     pub status: StepStatus,
@@ -710,6 +790,23 @@ impl StepStatus {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
+    }
+}
+
+/// Why a step was correctly left undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotDoneReason {
+    /// The turn could not change anything (read-only access or a request
+    /// that forbids changes), and this step needed a change.
+    ChangesOff,
+}
+
+impl NotDoneReason {
+    fn plain(self) -> &'static str {
+        match self {
+            Self::ChangesOff => "read-only is on",
+        }
     }
 }
 
