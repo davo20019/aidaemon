@@ -439,6 +439,7 @@ dependencies = [
  "aidaemon-work",
  "async-trait",
  "axum",
+ "chrono",
  "futures",
  "opentelemetry_sdk",
  "schemars",

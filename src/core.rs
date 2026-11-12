@@ -109,7 +109,7 @@ pub async fn run(
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,
         pruner,
-        memory_manager,
+        memory_jobs,
     } = memory_pipeline::build_memory_pipeline(
         &config,
         state.clone(),
@@ -337,7 +337,7 @@ pub async fn run(
             pool: pool.clone(),
             event_store: event_store.clone(),
             pruner: pruner.clone(),
-            memory_manager: memory_manager.clone(),
+            memory_jobs: memory_jobs.clone(),
             own_memory,
             memory_store: memory_store.clone(),
             memory_services,

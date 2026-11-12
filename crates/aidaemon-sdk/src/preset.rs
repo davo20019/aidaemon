@@ -24,7 +24,7 @@
 //! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`] over the workspace, [`EgressGuard`], [`ApprovalPolicy`] (`DestructiveOnly`), [`Redactor`], [`UntrustedOutput`] | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
-//! | Memory | with the `memory` feature (default), aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus `remember_fact`, `manage_memories`, `manage_people`, `share_memory`), in memory or in [`Preset::memory_path`]; else none | [`Preset::memory`]: any [`MemorySystem`]; [`Preset::without_memory`] |
+//! | Memory | with the `memory` feature (default), aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus `remember_fact`, `manage_memories`, `manage_people`, `share_memory`), in memory or in [`Preset::memory_path`] (there it also learns in the background: episodes, fact consolidation, decay, on the agent's provider); else none. A memory system's `services()` run while the agent lives | [`Preset::memory`]: any [`MemorySystem`]; [`Preset::without_memory`] |
 //! | Anything else | | [`Preset::hook`], [`Preset::configure`] (the [`AgentBuilder`]) |
 //!
 //! A destructive call pauses the run for the owner
@@ -103,6 +103,52 @@ pub fn provider_from_env() -> Result<Option<EnvProvider>, PresetError> {
 #[cfg(feature = "memory")]
 fn owner_turn(id: &str) -> MemoryTurn {
     MemoryTurn::owner(id)
+}
+
+#[cfg(feature = "memory")]
+fn memory_error(err: impl std::fmt::Display) -> PresetError {
+    PresetError::Memory(err.to_string())
+}
+
+/// How often the preset looks for due memory services.
+#[cfg(feature = "memory")]
+const SERVICE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a memory system's background services until the agent is dropped:
+/// the returned hook goes with the agent and stops them on drop. `None`
+/// when there are none, or no Tokio runtime to run them on.
+#[cfg(feature = "memory")]
+fn run_services(services: Vec<Arc<dyn aidaemon_core::Service>>) -> Option<Arc<dyn Hook>> {
+    if services.is_empty() {
+        return None;
+    }
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let mut host = aidaemon_core::ServiceHost::new(SERVICE_TICK).max_concurrent(1);
+    for service in services {
+        host = host.service(service);
+    }
+    let token = aidaemon_core::CancellationToken::new();
+    runtime.spawn(host.run(token.clone()));
+    Some(Arc::new(ServicesRunning(token)))
+}
+
+/// Held by the agent's hooks; stops the memory services when dropped.
+#[cfg(feature = "memory")]
+struct ServicesRunning(aidaemon_core::CancellationToken);
+
+#[cfg(feature = "memory")]
+impl Drop for ServicesRunning {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(feature = "memory")]
+#[async_trait::async_trait]
+impl Hook for ServicesRunning {
+    fn name(&self) -> &'static str {
+        "memory_services"
+    }
 }
 
 fn env(name: &str) -> Option<String> {
@@ -369,8 +415,8 @@ impl Preset {
             .or_else(|| env("AIDAEMON_MODEL").filter(|_| default_model != Some("scripted")))
             .or_else(|| default_model.map(str::to_string));
 
-        let mut builder = Agent::builder(self.id.clone()).provider(provider);
-        if let Some(model) = model {
+        let mut builder = Agent::builder(self.id.clone()).provider(provider.clone());
+        if let Some(model) = model.clone() {
             builder = builder.model(model);
         }
 
@@ -383,9 +429,17 @@ impl Preset {
             MemoryChoice::Given(system, turn) => Some((system, turn)),
             #[cfg(feature = "memory")]
             MemoryChoice::Default(path) => {
-                let system = aidaemon_memory::full::FullMemory::open(path.as_deref())
+                let mut system = aidaemon_memory::full::FullMemory::open(path.as_deref())
                     .await
-                    .map_err(|err| PresetError::Memory(err.to_string()))?;
+                    .map_err(memory_error)?;
+                // A memory kept in a file learns in the background too, on
+                // the agent's own provider and model.
+                if path.is_some() {
+                    system = system
+                        .with_background(provider.clone(), model.clone().unwrap_or_default())
+                        .await
+                        .map_err(memory_error)?;
+                }
                 Some((Arc::new(system), owner_turn(&self.id)))
             }
             #[cfg(not(feature = "memory"))]
@@ -402,6 +456,10 @@ impl Preset {
                     instructions.push_str("\n\n");
                 }
                 instructions.push_str(&guidance);
+            }
+            #[cfg(feature = "memory")]
+            if let Some(running) = run_services(system.services()) {
+                extra_hooks.push(running);
             }
         }
 

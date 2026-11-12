@@ -28,7 +28,7 @@ agents = ["dep:aidaemon-agents"]
 sqlite = ["dep:aidaemon-store-sqlite"]
 mcp = ["dep:aidaemon-mcp"]
 eval = ["dep:aidaemon-eval"]
-memory = ["dep:aidaemon-memory"]
+memory = ["dep:aidaemon-memory", "dep:tokio"]
 events = ["dep:aidaemon-events"]
 work = ["events", "dep:aidaemon-work"]
 fastembed = ["memory", "aidaemon-memory/fastembed"]
@@ -71,6 +71,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tempfile = "3"
+chrono = "0.4"
 
 [[test]]
 name = "web_fetch_egress"

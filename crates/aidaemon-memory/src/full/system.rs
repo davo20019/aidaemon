@@ -3,13 +3,15 @@
 
 use std::sync::Arc;
 
-use aidaemon_core::{ChannelVisibility, Hook, Tool};
+use aidaemon_core::{ChannelVisibility, Hook, Provider, Service, Tool};
 use aidaemon_policies::{MemoryInjection, MemoryParts, MemorySystem, MemoryTurn};
 use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
 
+use super::jobs::{JobCall, JobsHost, MemoryJobs};
 use super::recall::{FullRecall, RecallHost, RecallSettings, RecallSource, RecallTurn};
 use super::tools;
+use super::transcript::{TranscriptLog, TranscriptRecorder};
 use crate::render::RecallGoal;
 use crate::stores::MemoryStores;
 
@@ -32,6 +34,31 @@ pub struct FullTurn {
 pub struct FullMemory {
     recall: Arc<RecallSource>,
     tools: Vec<Arc<dyn Tool>>,
+    /// Its background jobs, when it runs them.
+    jobs: Option<Arc<MemoryJobs>>,
+    /// Records owner turns for the jobs, when the host keeps no log.
+    recorder: Option<Arc<TranscriptRecorder>>,
+    /// What [`FullMemory::open`] opened, for [`FullMemory::with_background`].
+    opened: Option<Opened>,
+}
+
+struct Opened {
+    pool: sqlx::SqlitePool,
+    store: Arc<dyn MemoryStores>,
+    embedder: Arc<dyn crate::Embedder>,
+}
+
+/// One provider and model for every background call.
+struct OneModel {
+    provider: Arc<dyn Provider>,
+    model: String,
+}
+
+#[async_trait]
+impl JobsHost for OneModel {
+    fn model(&self, _call: JobCall) -> (Arc<dyn Provider>, String) {
+        (self.provider.clone(), self.model.clone())
+    }
 }
 
 impl FullMemory {
@@ -41,7 +68,44 @@ impl FullMemory {
         Self {
             recall,
             tools: Vec::new(),
+            jobs: None,
+            recorder: None,
+            opened: None,
         }
+    }
+
+    /// Run `jobs` as this system's [`services`](MemorySystem::services).
+    pub fn with_jobs(mut self, jobs: Arc<MemoryJobs>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    /// For a system from [`FullMemory::open`]: record the owner's turns in
+    /// the memory database ([`TranscriptLog`]) and run the background jobs
+    /// over them, their model calls on `provider` with `model`. A system
+    /// built another way is returned as it is.
+    pub async fn with_background(
+        mut self,
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let Some(opened) = &self.opened else {
+            return Ok(self);
+        };
+        let log = Arc::new(TranscriptLog::open(opened.pool.clone()).await?);
+        self.recorder = Some(Arc::new(log.recorder()));
+        let host = Arc::new(OneModel {
+            provider,
+            model: model.into(),
+        });
+        let jobs = MemoryJobs::new(opened.store.clone(), log, host, opened.embedder.clone());
+        self.jobs = Some(Arc::new(jobs));
+        Ok(self)
+    }
+
+    /// Its background jobs, when it runs them.
+    pub fn jobs(&self) -> Option<&Arc<MemoryJobs>> {
+        self.jobs.as_ref()
     }
 
     /// The whole system over `store`: recall with `settings`, and the four
@@ -91,15 +155,24 @@ impl FullMemory {
         let embedder: Arc<dyn crate::Embedder> = Arc::new(crate::FastEmbedder::new());
         #[cfg(not(feature = "fastembed"))]
         let embedder: Arc<dyn crate::Embedder> = Arc::new(crate::HashEmbedder::new(384));
-        let store = Arc::new(crate::sqlite::SqliteMemory::new(pool, embedder));
-        Ok(Self::over(
-            store,
+        let store: Arc<dyn MemoryStores> = Arc::new(crate::sqlite::SqliteMemory::new(
+            pool.clone(),
+            embedder.clone(),
+        ));
+        let mut system = Self::over(
+            store.clone(),
             RecallSettings {
                 max_facts: DEFAULT_MAX_FACTS,
                 assistant_name: None,
             },
             Arc::new(tools::LocalSettings::default()),
-        ))
+        );
+        system.opened = Some(Opened {
+            pool,
+            store,
+            embedder,
+        });
+        Ok(system)
     }
 
     /// Offer `tools` on every turn that may read or write memory.
@@ -159,6 +232,12 @@ impl MemorySystem for FullMemory {
         let recall = FullRecall::new(self.recall.clone(), host, recall_turn);
         let mut hooks: Vec<Arc<dyn Hook>> = vec![Arc::new(MemoryInjection::new(recall))];
         hooks.extend(extra);
+        // Only the owner's own turns teach the jobs.
+        if let Some(recorder) = &self.recorder {
+            if turn.write && turn.scope == "owner" {
+                hooks.push(recorder.clone());
+            }
+        }
         MemoryParts {
             hooks,
             tools: if turn.read || turn.write {
@@ -167,6 +246,13 @@ impl MemorySystem for FullMemory {
                 Vec::new()
             },
         }
+    }
+
+    fn services(&self) -> Vec<Arc<dyn Service>> {
+        self.jobs
+            .as_ref()
+            .map(MemoryJobs::services)
+            .unwrap_or_default()
     }
 }
 
