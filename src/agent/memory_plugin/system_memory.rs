@@ -49,7 +49,26 @@ fn system_turn(turn: &MemoryTurn) -> Option<aidaemon_policies::MemoryTurn> {
         write: turn.memory_persistence_allowed,
         explicit_writes_only: turn.memory_isolated(),
         learning: turn.learning_consent.clone(),
+        host: Default::default(),
     })
+}
+
+/// The daemon's [`MemoryTurn`] for a memory system that reads its host's
+/// facts (`host`). Such a system scopes the turn itself, so a turn with no
+/// scope of its own (public-external) is passed on with an empty one.
+pub(super) fn host_system_turn(
+    turn: &MemoryTurn,
+    host: aidaemon_policies::HostTurn,
+) -> aidaemon_policies::MemoryTurn {
+    aidaemon_policies::MemoryTurn {
+        session_id: turn.session_id.clone(),
+        scope: turn_scope(turn).unwrap_or_default(),
+        read: turn.memory_pipeline_allowed,
+        write: turn.memory_persistence_allowed,
+        explicit_writes_only: turn.memory_isolated(),
+        learning: turn.learning_consent.clone(),
+        host,
+    }
 }
 
 #[async_trait]

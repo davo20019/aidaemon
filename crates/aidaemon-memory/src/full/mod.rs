@@ -5,8 +5,10 @@
 //! diagnostics) through small traits.
 
 pub mod recall;
+pub mod system;
 
 pub use recall::{
     FullRecall, RecallDecision, RecallHost, RecallSettings, RecallSource, RecallTurn,
     IDENTITY_CATEGORIES,
 };
+pub use system::{FullMemory, FullTurn};

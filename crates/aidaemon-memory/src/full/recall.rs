@@ -37,8 +37,9 @@ pub const IDENTITY_CATEGORIES: &[&str] = &[
 pub struct RecallTurn {
     pub session_id: String,
     pub task_id: String,
-    /// The user's message: recall is scoped to the current request.
-    pub user_text: String,
+    /// The user's message: recall is scoped to the current request. `None`
+    /// recalls for the latest user message of the request instead.
+    pub user_text: Option<String>,
     /// The owner wrote the message.
     pub owner: bool,
     /// The owner wrote it in a private chat: personal memory (identity,
@@ -157,6 +158,7 @@ impl FullRecall {
     /// dropped.
     fn spawn_fact_filter(
         &self,
+        query: &str,
         facts: &[Fact],
     ) -> Option<tokio::task::JoinHandle<Option<HashSet<i64>>>> {
         let host = self.host.clone();
@@ -165,7 +167,7 @@ impl FullRecall {
         }
         let message = format!(
             "User message:\n{}",
-            crate::text::truncate_chars(&self.turn.user_text, 3000)
+            crate::text::truncate_chars(query, 3000)
         );
         let mut questions = Vec::new();
         let mut asked = std::collections::BTreeMap::new();
@@ -203,14 +205,16 @@ impl FullRecall {
 
     /// The memory block: critical facts, core profile, then the query-ranked
     /// memory sections. Channel, role and policy scoping are applied here.
-    pub async fn render_block(&self) -> String {
+    /// `query` is the request's latest user message, used when the turn
+    /// gives no user text.
+    pub async fn render_block(&self, query: &str) -> String {
         let source = &self.source;
         let turn = &self.turn;
         let store = &source.store;
         let host = &self.host;
         let allowed = turn.allowed;
         // Memory retrieval is current-request-scoped.
-        let query = turn.user_text.as_str();
+        let query = turn.user_text.as_deref().unwrap_or(query);
         let inject_personal = turn.personal;
         let public_external = matches!(turn.visibility, ChannelVisibility::PublicExternal);
 
@@ -236,7 +240,7 @@ impl FullRecall {
         // The optional recall filter asks which of these facts matter to the
         // message. It runs beside the lookups below and is awaited where the
         // facts are rendered.
-        let fact_filter = self.spawn_fact_filter(&facts);
+        let fact_filter = self.spawn_fact_filter(query, &facts);
 
         // Critical facts (identity/profile): bounded identity categories only,
         // owner DMs (delegated agents included).
@@ -509,8 +513,8 @@ impl aidaemon_policies::Recall for FullRecall {
     }
 
     /// The full memory block with its section headings.
-    async fn render(&self, _session_id: &str, _query: &str, _limit: usize) -> Option<String> {
-        let block = self.render_block().await;
+    async fn render(&self, _session_id: &str, query: &str, _limit: usize) -> Option<String> {
+        let block = self.render_block(query).await;
         (!block.trim().is_empty()).then_some(block)
     }
 }

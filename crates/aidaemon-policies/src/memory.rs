@@ -94,7 +94,47 @@ pub struct MemoryTurn {
     /// (at run end, in background work), not when the turn starts: the
     /// user or the model may opt the turn out while it runs.
     pub learning: TurnLearning,
+    /// What the host knows about the turn beyond the above, for a memory
+    /// system built to read it (see [`HostTurn`]). Empty by default.
+    pub host: HostTurn,
 }
+
+/// Host-specific facts about a turn, for a memory system that knows its
+/// host's types (the turn's full audience, a diagnostics sink). A system
+/// that does not ask for them works from the [`MemoryTurn`] fields alone.
+/// Not compared: two turns with the same fields are equal whatever they
+/// carry here.
+#[derive(Clone, Default)]
+pub struct HostTurn(Option<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl HostTurn {
+    pub fn new<T: std::any::Any + Send + Sync>(facts: T) -> Self {
+        Self(Some(Arc::new(facts)))
+    }
+
+    /// The facts, if the host gave a `T`.
+    pub fn get<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.as_deref().and_then(|facts| facts.downcast_ref())
+    }
+}
+
+impl std::fmt::Debug for HostTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "HostTurn(..)"
+        } else {
+            "HostTurn(none)"
+        })
+    }
+}
+
+impl PartialEq for HostTurn {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostTurn {}
 
 /// Whether a turn may be learned from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

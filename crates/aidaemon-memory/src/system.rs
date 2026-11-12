@@ -254,6 +254,7 @@ mod tests {
             write,
             explicit_writes_only,
             learning: Default::default(),
+            host: Default::default(),
         }
     }
 

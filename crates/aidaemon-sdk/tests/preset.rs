@@ -189,6 +189,7 @@ async fn any_memory_system_plugs_in() {
                 write: true,
                 explicit_writes_only: false,
                 learning: Default::default(),
+                host: Default::default(),
             },
         )
         .build()

@@ -64,7 +64,7 @@ pub use grants::SessionGrants;
 pub use instructions::{InstructionSource, NestedInstructions, ProjectInstructions};
 pub use loop_guard::{same_tool_loop, SameToolStreakGuard, StreakLimits};
 pub use memory::{
-    HistoryIntake, InMemoryRecall, Learning, MemoryInjection, MemoryParts, MemorySystem,
+    HistoryIntake, HostTurn, InMemoryRecall, Learning, MemoryInjection, MemoryParts, MemorySystem,
     MemoryTurn, PastMessage, PastRole, Recall, TurnLearning,
 };
 pub use opt_out::{

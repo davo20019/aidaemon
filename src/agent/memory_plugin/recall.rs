@@ -5,27 +5,40 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aidaemon_memory::full::{FullRecall, RecallDecision, RecallHost, RecallTurn};
+use aidaemon_memory::full::{RecallDecision, RecallHost, RecallTurn};
 use async_trait::async_trait;
 
 use super::{DaemonMemoryInner, MemoryTurn};
 use crate::events::{DecisionType, DiagnosticSeverity};
 use crate::types::UserRole;
 
-/// The daemon's recall: [`FullRecall`] over the daemon store.
+/// The daemon's recall: `aidaemon_memory::full::FullRecall` over the daemon store, with the
+/// daemon as its host.
 pub(crate) struct DaemonRecall;
 
 impl DaemonRecall {
     #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new(memory: Arc<DaemonMemoryInner>, turn: MemoryTurn) -> FullRecall {
+    #[cfg(test)]
+    pub(crate) fn new(
+        memory: Arc<DaemonMemoryInner>,
+        turn: MemoryTurn,
+    ) -> aidaemon_memory::full::FullRecall {
         let recall_turn = recall_turn(&turn);
-        let host = Arc::new(DaemonRecallHost {
+        aidaemon_memory::full::FullRecall::new(
+            memory.recall.clone(),
+            Self::host(&memory, turn),
+            recall_turn,
+        )
+    }
+
+    /// The daemon's end of recall for `turn`.
+    pub(crate) fn host(memory: &DaemonMemoryInner, turn: MemoryTurn) -> Arc<dyn RecallHost> {
+        Arc::new(DaemonRecallHost {
             state: memory.state.clone(),
             side_calls: memory.side_calls.clone(),
             record_decision_points: memory.record_decision_points,
             turn,
-        });
-        FullRecall::new(memory.recall.clone(), host, recall_turn)
+        })
     }
 }
 
@@ -35,7 +48,7 @@ pub(crate) fn recall_turn(turn: &MemoryTurn) -> RecallTurn {
     RecallTurn {
         session_id: turn.session_id.clone(),
         task_id: turn.task_id.clone(),
-        user_text: turn.user_text.clone(),
+        user_text: Some(turn.user_text.clone()),
         owner,
         personal: owner && turn.channel_ctx.should_inject_personal_memory(),
         visibility: turn.channel_ctx.visibility,
