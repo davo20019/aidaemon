@@ -163,10 +163,10 @@ pub use fast::FastEmbedder;
 #[cfg(feature = "fastembed")]
 mod fast {
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
     use tokio::sync::OnceCell;
 
     use super::Embedder;
@@ -178,7 +178,8 @@ mod fast {
     pub struct FastEmbedder {
         cache_dir: Option<PathBuf>,
         show_download_progress: bool,
-        model: OnceCell<Arc<TextEmbedding>>,
+        // fastembed's `embed` takes `&mut self`: one call at a time.
+        model: OnceCell<Arc<Mutex<TextEmbedding>>>,
     }
 
     impl FastEmbedder {
@@ -204,19 +205,19 @@ mod fast {
             self
         }
 
-        async fn model(&self) -> Result<Arc<TextEmbedding>> {
+        async fn model(&self) -> Result<Arc<Mutex<TextEmbedding>>> {
             let cache_dir = self.cache_dir.clone();
             let progress = self.show_download_progress;
             self.model
                 .get_or_try_init(|| async move {
                     tokio::task::spawn_blocking(move || {
-                        let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                        let mut options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
                             .with_show_download_progress(progress);
                         if let Some(dir) = cache_dir {
                             options = options.with_cache_dir(dir);
                         }
                         TextEmbedding::try_new(options)
-                            .map(Arc::new)
+                            .map(|model| Arc::new(Mutex::new(model)))
                             .map_err(|e| MemoryError::Embedding(e.to_string()))
                     })
                     .await
@@ -249,10 +250,16 @@ mod fast {
             }
             let model = self.model().await?;
             let texts = texts.to_vec();
-            tokio::task::spawn_blocking(move || model.embed(texts, None))
-                .await
-                .map_err(|e| MemoryError::Embedding(e.to_string()))?
-                .map_err(|e| MemoryError::Embedding(e.to_string()))
+            tokio::task::spawn_blocking(move || {
+                let mut model = model.lock().map_err(|e| {
+                    MemoryError::Embedding(format!("embedding model lock poisoned: {e}"))
+                })?;
+                model
+                    .embed(texts, None)
+                    .map_err(|e| MemoryError::Embedding(e.to_string()))
+            })
+            .await
+            .map_err(|e| MemoryError::Embedding(e.to_string()))?
         }
     }
 }

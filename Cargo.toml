@@ -90,7 +90,7 @@ axum = "0.8"
 dialoguer = "0.12"
 shellexpand = "3"
 dirs = "7"
-fastembed = "4"
+fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 tokio-util = "0.7.20"
 libc = "0.2"
 libsqlite3-sys = { version = "0.37", optional = true }
