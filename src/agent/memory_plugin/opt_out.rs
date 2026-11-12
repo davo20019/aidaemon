@@ -11,7 +11,9 @@
 //! turn's events are marked like a turn the memory policy suppressed (a
 //! `memory_policy_compiled` event with access `suppressed`), so background
 //! work that later passes over them (consolidation, episodes, fact
-//! consolidation, history intake, summaries) leaves them out. Recall still
+//! consolidation, history intake, summaries) leaves them out, and exact
+//! history search never returns them, so once the conversation moves on
+//! (`/clear`, a new session) nothing brings the turn back. Recall still
 //! works on the turn: opting out is about learning, not reading.
 
 use aidaemon_core as sdk;

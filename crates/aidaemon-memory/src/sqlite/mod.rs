@@ -99,7 +99,19 @@ pub trait Reranker: Send + Sync {
     fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
         None
     }
+
+    /// How long a search waits for one rerank before it keeps the
+    /// unreranked order. Reranking only refines an answer the search already
+    /// has, so a model starved of CPU (or queued behind another rerank) must
+    /// cost the search a bounded wait, never minutes.
+    fn deadline(&self) -> std::time::Duration {
+        DEFAULT_RERANK_DEADLINE
+    }
 }
+
+/// [`Reranker::deadline`]'s default: a few times a cross-encoder's normal
+/// latency on a few dozen short facts.
+pub const DEFAULT_RERANK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The store's embedding and reranking models.
 #[derive(Clone)]
@@ -144,7 +156,12 @@ impl StoreModels {
         documents: Vec<String>,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         match &self.reranker {
-            Some(reranker) => reranker.rerank(query, documents).await,
+            Some(reranker) => {
+                let deadline = reranker.deadline();
+                tokio::time::timeout(deadline, reranker.rerank(query, documents))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("rerank missed its {deadline:?} deadline"))?
+            }
             None => anyhow::bail!("no reranker configured"),
         }
     }

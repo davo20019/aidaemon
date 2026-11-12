@@ -676,6 +676,19 @@ fn push_scope(qb: &mut QueryBuilder<'_, Sqlite>, scope: &HistoryScope, alias: &s
     {
         qb.push(format!(" AND {alias}.source_kind = 'root'"));
     }
+    // A turn opted out of learning (`/private`, `skip_learning`) stays in
+    // the stored history but is never searched or opened later: the live
+    // conversation that held it already has it, and anything after it must
+    // not get it back.
+    qb.push(format!(
+        " AND NOT EXISTS (SELECT 1 FROM events opt_out
+             WHERE opt_out.session_id = {alias}.session_id
+               AND opt_out.turn_id = {alias}.turn_id
+               AND opt_out.event_type = 'memory_policy_compiled'
+               AND json_extract(opt_out.data, '$.reason_code') = "
+    ));
+    qb.push_bind(crate::agent::memory_plugin::OPTED_OUT_REASON);
+    qb.push(")");
     if let Some(session) = scope.session_filter.as_deref() {
         qb.push(format!(" AND {alias}.session_id = "));
         qb.push_bind(session.to_string());

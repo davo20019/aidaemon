@@ -183,6 +183,41 @@ async fn search_facts_survives_reranker_error() {
     assert_eq!(report.hits[0].fact.key, "reply_style");
 }
 
+/// A reranker that never answers in time, like a cross-encoder starved of
+/// CPU: the search must not wait for it.
+struct StalledReranker;
+
+#[async_trait]
+impl Reranker for StalledReranker {
+    async fn rerank(
+        &self,
+        _query: String,
+        _documents: Vec<String>,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        anyhow::bail!("unreachable")
+    }
+
+    fn deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(50)
+    }
+}
+
+#[tokio::test]
+async fn search_facts_falls_back_when_the_reranker_misses_its_deadline() {
+    let (memory, _file, _) = seeded().await;
+    let memory = memory.with_reranker(Arc::new(StalledReranker));
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        memory.search_facts("mother", 3, &FactSearchConfig::default()),
+    )
+    .await
+    .expect("a stalled reranker must not stall the search")
+    .unwrap();
+    assert!(!report.reranked);
+    assert!(!report.hits.is_empty());
+}
+
 /// Scores documents by how many query words they contain, with a floor of 1.
 struct OverlapReranker;
 
