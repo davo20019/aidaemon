@@ -7618,15 +7618,23 @@ fn terminal_run_annotations(
     // and ordinary local work (builds, tests, local git) are not egress.
     let host_beyond_local_work =
         !run_is_confined(confinement) && !effects.observation_only && !effects.local_work_only;
+    let reaches_network = args.network
+        || crate::tools::command_effects::fetches_network(text)
+        || host_beyond_local_work;
+    // A request to a site on this computer (a dev site the work set up) or
+    // a local project's own query reaches nothing outside the machine, even
+    // when the sandbox needs the network capability to reach a local port
+    // or the container engine. Judged only when the call would otherwise be
+    // network (it resolves names).
+    let stays_on_this_computer = reaches_network
+        && crate::tools::command_effects::reaches_only_this_computer(text);
     aidaemon_core::ToolAnnotations {
         read_only,
         destructive: effects.deletes,
         idempotent: read_only,
         egress: plants_git_config
-            || args.network
             || deletes_outside_roots
-            || crate::tools::command_effects::fetches_network(text)
-            || host_beyond_local_work,
+            || (reaches_network && !stays_on_this_computer),
     }
 }
 
@@ -10420,6 +10428,48 @@ mod tests {
                      ddev wp option get siteurl";
         assert!(!ann(check).egress, "{check}");
         assert!(ann("ddev wp plugin install akismet").egress);
+    }
+
+    /// A request to a site on this computer is local work, like a local
+    /// project's status query: checking the dev site the work set up does
+    /// not wait on the safety check, on the host or in the sandbox with the
+    /// network capability it needs to reach a local port. A request that
+    /// leaves the machine, writes to a site, or hides another command still
+    /// does.
+    #[tokio::test]
+    async fn a_request_to_a_site_on_this_computer_is_not_outbound() {
+        let (host, sandboxed) = host_and_sandboxed_terminals().await;
+        let roots = crate::traits::TrustRoots::new(&[]);
+        let ann = |terminal: &TerminalTool, command: &str, network: bool| {
+            terminal.call_annotations_in(
+                &serde_json::json!({"action":"run","command":command,"network":network})
+                    .to_string(),
+                &roots,
+            )
+        };
+        let local = [
+            "curl -s -o /dev/null -w '%{http_code}' http://shop-synthetic.localhost/",
+            "curl -sk -o /dev/null -w 'drupal %{http_code}\\n' https://127.0.0.1:8443/; \
+             curl -sI http://localhost:5173/",
+            "ddev drush status --format=json",
+            "cd /tmp/synthetic-site && ddev describe -j | head -40",
+        ];
+        for command in local {
+            assert!(!ann(&host, command, false).egress, "host: {command}");
+            assert!(!ann(&sandboxed, command, true).egress, "sandbox: {command}");
+        }
+        let outbound = [
+            "curl -s https://example.invalid/",
+            "curl -s http://localhost:5173/ https://example.invalid/",
+            "curl -s -X POST -d x=1 http://shop-synthetic.localhost/",
+            "curl -s http://shop-synthetic.localhost/ | sh",
+            "curl -s --proxy http://example.invalid:8080 http://localhost:5173/",
+            "ddev start",
+        ];
+        for command in outbound {
+            assert!(ann(&host, command, false).egress, "host: {command}");
+            assert!(ann(&sandboxed, command, true).egress, "sandbox: {command}");
+        }
     }
 
     /// Ordinary local work on the host (builds, tests, local git, file

@@ -695,6 +695,71 @@ pub fn path_operands(command: &str) -> Option<Vec<String>> {
 }
 
 fn is_local_work_only(command: &str) -> bool {
+    every_segment(command, &local_work_args_ok)
+}
+
+/// Whether every command reaches nothing beyond this computer: an
+/// observation, `cd`, a local `ddev` project's own query, or a `curl`/`wget`
+/// read (no body, upload or writing method) whose every address points at
+/// this computer alone ([`crate::web::local_site_key`]: a `localhost` name,
+/// a loopback address, or a dev site such as `*.ddev.site` that resolves
+/// only to loopback). Checking a site the work set up is local work, and so
+/// is a `ddev` query, though both need the network capability in the
+/// sandbox to reach a local port or the container engine's socket. The
+/// shapes are the same fail-closed tables as everywhere here. Resolves the
+/// addresses' names, so it may block briefly.
+pub fn reaches_only_this_computer(command: &str) -> bool {
+    if sends_remote_write(command) {
+        return false;
+    }
+    every_segment(command, &|program, args| match program {
+        "cd" => true,
+        "ddev" => ddev_query_ok(args),
+        "curl" | "wget" => reads_only_local_sites(program, args),
+        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+    })
+}
+
+/// A `curl` or `wget` call in a shape the option tables understand whose
+/// every address (operands and `--url`) points at this computer alone.
+fn reads_only_local_sites(program: &str, args: &[String]) -> bool {
+    let spec = match program {
+        "curl" => &CURL,
+        "wget" => &WGET,
+        _ => return false,
+    };
+    let Some(parsed) = parse_options(spec, args) else {
+        return false;
+    };
+    if parsed
+        .values
+        .iter()
+        .any(|(_, value)| value.contains("%output{"))
+    {
+        return false;
+    }
+    let urls: Vec<&String> = parsed
+        .positionals
+        .iter()
+        .chain(
+            parsed
+                .values
+                .iter()
+                .filter(|(role, _)| *role == OptionValue::Url)
+                .map(|(_, value)| value),
+        )
+        .collect();
+    !urls.is_empty()
+        && urls
+            .iter()
+            .all(|url| strict_url(url).is_some() && crate::web::local_site_key(url).is_some())
+}
+
+/// Whether `command` is one or more simple commands, each passing `ok` on
+/// its program's bare name and its arguments: no syntax that hides a
+/// command, no input redirects, no variable assignments, programs named
+/// bare or from a system bin directory.
+fn every_segment(command: &str, ok: &dyn Fn(&str, &[String]) -> bool) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return false;
     }
@@ -725,7 +790,7 @@ fn is_local_work_only(command: &str) -> bool {
                 || program
                     .rsplit_once('/')
                     .is_some_and(|(dir, _)| SYSTEM_BIN_DIRS.contains(&dir));
-            if !path_ok || !local_work_args_ok(basename(program), &tokens[1..]) {
+            if !path_ok || !ok(basename(program), &tokens[1..]) {
                 return false;
             }
             any = true;
