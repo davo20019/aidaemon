@@ -1,7 +1,7 @@
 //! The daemon's slash commands: the shared ones from
 //! [`aidaemon_channels::slash`] on the daemon's stores and agent, plus
-//! `/work` (`aidaemon_work`) and the daemon's own `/reload`, `/checkpoints`
-//! and `/rollback` (its config file and filesystem checkpoints).
+//! `/work` (`aidaemon_work`), `/checkpoints` and `/rollback`, and `/reload`
+//! on the daemon's config file.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,9 +9,8 @@ use std::sync::Arc;
 pub(crate) use aidaemon_channels::slash::{
     is_slash_command, shared_commands, CommandCategory, CommandDef,
 };
-use aidaemon_channels::slash::{
-    ChatMode, CommandHost, ScheduledItem, SharedCommands, SlashCall, SlashCommand,
-};
+use aidaemon_channels::admin_commands::{CheckpointCommands, ConfigReload, ReloadCommand};
+use aidaemon_channels::slash::{ChatMode, CommandHost, ScheduledItem, SharedCommands};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -64,10 +63,10 @@ impl CommandContext {
                 Arc::new(aidaemon_work::chat_command::WorkCommand::new(
                     self.state.clone(),
                 )),
-                Arc::new(ReloadCommand {
+                Arc::new(ReloadCommand::new(Arc::new(DaemonConfigReload {
                     agent: self.agent.clone(),
                     config_path: self.config_path.clone(),
-                }),
+                }))),
                 Arc::new(CheckpointCommands),
             ],
         }
@@ -187,33 +186,20 @@ fn chat_mode(mode: SessionMode) -> ChatMode {
     }
 }
 
-/// `/reload`: reload the daemon's config file, restoring its backup when
-/// the file no longer loads.
-struct ReloadCommand {
+/// `/reload` on the daemon's config file.
+struct DaemonConfigReload {
     agent: Arc<dyn DaemonAgentRuntime>,
     config_path: PathBuf,
 }
 
 #[async_trait]
-impl SlashCommand for ReloadCommand {
-    fn handles(&self, cmd: &str) -> bool {
-        cmd == "/reload"
-    }
-
-    async fn run(&self, _cmd: &str, _args: &str, _call: &SlashCall<'_>) -> String {
-        self.handle_reload().await
+impl ConfigReload for DaemonConfigReload {
+    async fn reload_config(&self) -> Result<String, String> {
+        reload_config(self.agent.as_ref(), &self.config_path).await
     }
 }
 
-impl ReloadCommand {
-    async fn handle_reload(&self) -> String {
-        match reload_config(self.agent.as_ref(), &self.config_path).await {
-            Ok(summary) => format!("Config reloaded. {summary}"),
-            Err(error) => error,
-        }
-    }
-}
-
+/// Reload the config file, restoring its backup when it no longer loads.
 async fn reload_config(
     agent: &dyn DaemonAgentRuntime,
     config_path: &std::path::Path,
@@ -241,67 +227,6 @@ async fn reload_config(
             } else {
                 format!("Config reload failed: {}\n\nNo backup available.", e)
             })
-        }
-    }
-}
-
-/// `/checkpoints` and `/rollback`: the daemon's filesystem checkpoints.
-struct CheckpointCommands;
-
-#[async_trait]
-impl SlashCommand for CheckpointCommands {
-    fn handles(&self, cmd: &str) -> bool {
-        matches!(cmd, "/checkpoints" | "/rollback")
-    }
-
-    async fn run(&self, cmd: &str, args: &str, call: &SlashCall<'_>) -> String {
-        if cmd == "/checkpoints" {
-            self.handle_checkpoints(call.user_role).await
-        } else {
-            self.handle_rollback(args, call.session_id, call.user_role)
-                .await
-        }
-    }
-}
-
-impl CheckpointCommands {
-    async fn handle_checkpoints(&self, user_role: UserRole) -> String {
-        if user_role != UserRole::Owner {
-            return "Only the owner can inspect filesystem checkpoints.".to_string();
-        }
-        match aidaemon_tools::checkpoints::active_manager() {
-            Some(manager) => manager.list_text(30, None).await,
-            None => "Filesystem checkpoints are disabled.".to_string(),
-        }
-    }
-
-    async fn handle_rollback(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
-        if user_role != UserRole::Owner {
-            return "Only the owner can roll back filesystem checkpoints.".to_string();
-        }
-        let Some(manager) = aidaemon_tools::checkpoints::active_manager() else {
-            return "Filesystem checkpoints are disabled.".to_string();
-        };
-        let mut parts = args.split_whitespace();
-        let first = parts.next();
-        if first.is_some_and(|value| value.eq_ignore_ascii_case("confirm")) {
-            let Some(token) = parts.next() else {
-                return "Usage: /rollback confirm <token>".to_string();
-            };
-            if parts.next().is_some() {
-                return "Usage: /rollback confirm <token>".to_string();
-            }
-            return match manager.apply_rollback(session_id, token).await {
-                Ok(result) => result.render(),
-                Err(error) => format!("Rollback failed: {error}"),
-            };
-        }
-        if parts.next().is_some() {
-            return "Usage: /rollback [checkpoint-id]".to_string();
-        }
-        match manager.prepare_rollback(session_id, first).await {
-            Ok(preview) => preview.render(),
-            Err(error) => format!("Could not prepare rollback: {error}"),
         }
     }
 }

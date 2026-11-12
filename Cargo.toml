@@ -132,7 +132,7 @@ aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers", f
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { version = "=0.2.0", path = "crates/aidaemon-mcp" }
 # Channel contract and platform adapters (formatting today; transport next).
-aidaemon-channels = { version = "=0.2.0", path = "crates/aidaemon-channels", features = ["http"] }
+aidaemon-channels = { version = "=0.2.0", path = "crates/aidaemon-channels", features = ["http", "checkpoints"] }
 aidaemon-channel-telegram = { version = "=0.2.0", path = "crates/aidaemon-channel-telegram", features = ["bot"] }
 aidaemon-channel-slack = { version = "=0.2.0", path = "crates/aidaemon-channel-slack", optional = true }
 aidaemon-channel-discord = { version = "=0.2.0", path = "crates/aidaemon-channel-discord", optional = true }
