@@ -677,7 +677,12 @@ async fn test_heartbeat_job_fires() {
 
     let shutdown = CancellationToken::new();
     let host = tokio::spawn(coordinator.into_host().run(shutdown.clone()));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the first run rather than a fixed delay: under load the host
+    // can take longer than a fixed sleep to start the job.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     shutdown.cancel();
     host.await.unwrap();
 
