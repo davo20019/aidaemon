@@ -103,3 +103,12 @@ fn skills_tools_schema_goldens() {
         std::sync::Arc::new(aidaemon_skills::InMemorySkillStore::new()),
     ));
 }
+
+#[tokio::test]
+async fn health_probe_schema_golden() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let store = crate::health::HealthProbeStore::new(pool).await.unwrap();
+    check_golden(&crate::tools::HealthProbeTool::new(std::sync::Arc::new(
+        store,
+    )));
+}

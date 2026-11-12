@@ -13,7 +13,7 @@ use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
-mod duration_format;
+use aidaemon_tools::duration_format;
 #[allow(dead_code)]
 mod events;
 mod otel_export;
@@ -67,7 +67,6 @@ mod tasks;
 #[cfg(feature = "terminal-bridge")]
 mod terminal_bridge;
 mod terminal_lite;
-mod token_alerts;
 mod tools;
 #[cfg(feature = "computer_use")]
 pub use config::ComputerUseConfig;

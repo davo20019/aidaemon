@@ -6,6 +6,7 @@ pub mod admissibility;
 pub mod authority;
 pub mod goal_tokens;
 pub mod goals;
+pub mod health;
 pub mod mandates;
 pub mod plans;
 pub mod reminders;
@@ -15,6 +16,7 @@ pub mod schema;
 pub mod sqlite;
 pub mod stores;
 pub mod task_workspaces;
+pub mod token_alerts;
 pub mod tools;
 pub mod triggers;
 

@@ -1,10 +1,12 @@
+//! Compact durations for messages to the owner (`45s`, `3m 10s`, `2h`).
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ZeroUnitStyle {
+pub enum ZeroUnitStyle {
     Keep,
     Trim,
 }
 
-pub(crate) fn compact_seconds(secs: i64, zero_style: ZeroUnitStyle) -> String {
+pub fn compact_seconds(secs: i64, zero_style: ZeroUnitStyle) -> String {
     let secs = secs.max(0);
     if secs < 60 {
         format!("{}s", secs)
@@ -27,14 +29,11 @@ pub(crate) fn compact_seconds(secs: i64, zero_style: ZeroUnitStyle) -> String {
     }
 }
 
-pub(crate) fn compact_chrono_duration(
-    duration: chrono::Duration,
-    zero_style: ZeroUnitStyle,
-) -> String {
+pub fn compact_chrono_duration(duration: chrono::Duration, zero_style: ZeroUnitStyle) -> String {
     compact_seconds(duration.num_seconds(), zero_style)
 }
 
-pub(crate) fn compact_elapsed_timestamps(
+pub fn compact_elapsed_timestamps(
     started_at: Option<&str>,
     completed_at: Option<&str>,
     zero_style: ZeroUnitStyle,

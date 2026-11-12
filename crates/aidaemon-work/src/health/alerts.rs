@@ -8,7 +8,14 @@ use tracing::{info, warn};
 
 use super::probes::{HealthProbe, ProbeResult, ProbeStatus};
 use super::store::HealthProbeStore;
-use crate::channels::ChannelHub;
+
+/// Where health alerts go: the host's channels.
+#[async_trait::async_trait]
+pub trait AlertDelivery: Send + Sync {
+    /// Send `text` to each of `session_ids`; a failed send is the host's to
+    /// log, never the caller's.
+    async fn broadcast_text(&self, session_ids: &[String], text: &str);
+}
 
 /// Alert types for health probes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +58,10 @@ struct ProbeAlertState {
 
 /// Manager for health probe alerts.
 ///
-/// Tracks consecutive failures, sends alerts via ChannelHub, and handles recovery notifications.
+/// Tracks consecutive failures, sends alerts through the host's `AlertDelivery`, and handles recovery notifications.
 pub struct AlertManager {
     store: Arc<HealthProbeStore>,
-    hub: Arc<ChannelHub>,
+    hub: Arc<dyn AlertDelivery>,
     /// In-memory state for each probe (keyed by probe ID)
     states: RwLock<HashMap<String, ProbeAlertState>>,
     /// Minimum time between repeated alerts for the same probe (default: 5 minutes)
@@ -63,7 +70,7 @@ pub struct AlertManager {
 
 impl AlertManager {
     /// Create a new alert manager.
-    pub fn new(store: Arc<HealthProbeStore>, hub: Arc<ChannelHub>) -> Self {
+    pub fn new(store: Arc<HealthProbeStore>, hub: Arc<dyn AlertDelivery>) -> Self {
         Self {
             store,
             hub,
@@ -334,9 +341,9 @@ impl AlertManager {
 
 /// Format a duration in a human-readable way.
 fn format_duration(duration: Duration) -> String {
-    crate::duration_format::compact_chrono_duration(
+    aidaemon_tools::duration_format::compact_chrono_duration(
         duration,
-        crate::duration_format::ZeroUnitStyle::Trim,
+        aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
     )
 }
 

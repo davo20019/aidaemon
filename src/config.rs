@@ -2540,66 +2540,7 @@ pub struct CliToolConfig {
 #[allow(unused_imports)]
 pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct HealthConfig {
-    #[serde(default = "default_health_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_health_tick_interval_secs")]
-    pub tick_interval_secs: u64,
-    #[serde(default = "default_health_result_retention_days")]
-    pub result_retention_days: u32,
-    #[serde(default)]
-    pub probes: Vec<HealthProbeConfig>,
-}
-
-fn default_health_enabled() -> bool {
-    false
-}
-
-fn default_health_tick_interval_secs() -> u64 {
-    30
-}
-
-fn default_health_result_retention_days() -> u32 {
-    7
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct HealthProbeConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub probe_type: String,
-    pub target: String,
-    pub schedule: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub config: HealthProbeConfigOptions,
-    #[serde(default)]
-    pub consecutive_failures_alert: Option<u32>,
-    #[serde(default)]
-    pub latency_threshold_ms: Option<u32>,
-    #[serde(default)]
-    pub alert_session_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct HealthProbeConfigOptions {
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub expected_status: Option<u16>,
-    #[serde(default)]
-    pub expected_body: Option<String>,
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub headers: Option<std::collections::HashMap<String, String>>,
-    #[serde(default)]
-    pub max_age_secs: Option<u64>,
-    #[serde(default)]
-    pub expected_exit_code: Option<i32>,
-}
+pub use aidaemon_work::health::HealthConfig;
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]

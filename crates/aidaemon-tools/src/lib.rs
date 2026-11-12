@@ -52,6 +52,7 @@ pub mod command_effects;
 pub mod command_risk;
 pub mod consequential;
 pub mod daemon_guard;
+pub mod duration_format;
 mod exec;
 pub mod execution;
 pub mod file_delivery;

@@ -1,4 +1,6 @@
-#![allow(dead_code)] // Phase 1 token alert code is staged but not yet wired into runtime.
+//! Token spike alerts: bursts of model tokens or calls on an active goal or
+//! session become critical owner notifications, with a cooldown per scope.
+//! Staged: no host runs the scan yet.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -8,7 +10,25 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
-use crate::traits::{NotificationEntry, StateStore};
+use crate::stores::NotificationStore;
+use crate::traits::NotificationEntry;
+
+/// Create the alert detector's dedupe and cooldown table if missing.
+pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS token_alert_state (
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            last_alert_at TEXT NOT NULL,
+            last_metric_tokens INTEGER NOT NULL DEFAULT 0,
+            last_metric_calls INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (scope_type, scope_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
 const TOKENS_THRESHOLD_15M: i64 = 200_000;
 const CALLS_THRESHOLD_10M: i64 = 40;
@@ -48,7 +68,7 @@ struct SessionSpike {
 /// - Enqueue critical notifications with cooldown + growth gating.
 /// - No automatic cancellation yet.
 pub async fn run_phase1_token_alert_scan(
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn NotificationStore>,
     pool: SqlitePool,
     owner_alert_sessions: Vec<String>,
 ) -> anyhow::Result<usize> {
