@@ -1,18 +1,19 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
+use crate::semantics::{
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
 };
+use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 
 pub struct GitCommitTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: crate::backend::SharedExecutionBackend,
 }
 
 impl GitCommitTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -57,8 +58,8 @@ impl Tool for GitCommitTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: Value = serde_json::from_str(arguments)?;
             let message = args["message"]
@@ -152,11 +153,11 @@ impl Tool for GitCommitTool {
             Ok(output)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for GitCommitTool {
+impl crate::semantics::ToolSemantics for GitCommitTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }
@@ -174,7 +175,7 @@ impl crate::traits::ToolSemantics for GitCommitTool {
     fn output_trust(
         &self,
         _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
+        _roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         aidaemon_core::SourceTrust::Trusted
     }
@@ -197,11 +198,11 @@ impl crate::traits::ToolSemantics for GitCommitTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
+    use crate::testing::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = GitCommitTool::new(crate::execution::active_execution_backend());
+        let tool = GitCommitTool::new(crate::testing::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "git_commit");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -217,7 +218,7 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+        let result = GitCommitTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await;
         assert!(result.is_err());
@@ -228,7 +229,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Init a git repo with an initial commit
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git init",
             Some(dir.path()),
             5,
@@ -236,7 +237,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.email 'test@test.com'",
             Some(dir.path()),
             5,
@@ -244,7 +245,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.name 'Test'",
             Some(dir.path()),
             5,
@@ -253,7 +254,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("README.md"), "# Test").unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git add -A && git commit -m 'init'",
             Some(dir.path()),
             5,
@@ -267,7 +268,7 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+        let result = GitCommitTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await;
         assert!(result.is_err());
@@ -278,7 +279,7 @@ mod tests {
     async fn test_git_commit_success() {
         let dir = tempfile::tempdir().unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git init",
             Some(dir.path()),
             5,
@@ -286,7 +287,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.email 'test@test.com'",
             Some(dir.path()),
             5,
@@ -294,7 +295,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.name 'Test'",
             Some(dir.path()),
             5,
@@ -310,7 +311,7 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+        let result = GitCommitTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -322,7 +323,7 @@ mod tests {
     async fn test_git_commit_specific_files() {
         let dir = tempfile::tempdir().unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git init",
             Some(dir.path()),
             5,
@@ -330,7 +331,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.email 'test@test.com'",
             Some(dir.path()),
             5,
@@ -338,7 +339,7 @@ mod tests {
         .await
         .unwrap();
         fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git config user.name 'Test'",
             Some(dir.path()),
             5,
@@ -356,7 +357,7 @@ mod tests {
         })
         .to_string();
 
-        let result = GitCommitTool::new(crate::execution::active_execution_backend())
+        let result = GitCommitTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -364,7 +365,7 @@ mod tests {
 
         // b.txt should still be untracked
         let status = fs_utils::run_cmd(
-            &*crate::execution::active_execution_backend(),
+            &*crate::testing::active_execution_backend(),
             "git status --porcelain",
             Some(dir.path()),
             5,

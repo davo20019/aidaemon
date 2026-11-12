@@ -73,3 +73,14 @@ fn send_file_schema_golden() {
         "/tmp/aidaemon-golden-inbox",
     ));
 }
+
+#[test]
+fn dev_tool_schema_goldens() {
+    let backend = crate::execution::active_execution_backend;
+    check_golden(&crate::tools::SystemInfoTool::new(backend()));
+    check_golden(&crate::tools::GitInfoTool::new(backend()));
+    check_golden(&crate::tools::GitCommitTool::new(backend()));
+    check_golden(&crate::tools::ProjectInspectTool::new(backend()));
+    check_golden(&crate::tools::CheckEnvironmentTool::new(backend()));
+    check_golden(&crate::tools::ServiceStatusTool::new(backend()));
+}

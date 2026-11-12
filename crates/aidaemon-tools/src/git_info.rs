@@ -1,17 +1,18 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{BackendPath, ExecutionBackend};
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::backend::{BackendPath, ExecutionBackend};
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 
 pub struct GitInfoTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: crate::backend::SharedExecutionBackend,
 }
 
 impl GitInfoTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -56,8 +57,8 @@ impl Tool for GitInfoTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: Value = serde_json::from_str(arguments)?;
             let path_str = args["path"].as_str().unwrap_or(".");
@@ -104,11 +105,11 @@ impl Tool for GitInfoTool {
             Ok(output)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for GitInfoTool {
+impl crate::semantics::ToolSemantics for GitInfoTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }
@@ -128,7 +129,7 @@ impl crate::traits::ToolSemantics for GitInfoTool {
     fn output_trust(
         &self,
         arguments: &str,
-        roots: &crate::traits::TrustRoots<'_>,
+        roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         let args = serde_json::from_str::<Value>(arguments).ok();
         let path = match args.as_ref().map(|args| args.get("path")) {
@@ -269,11 +270,11 @@ async fn get_stash(backend: &dyn ExecutionBackend, dir: &BackendPath) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
+    use crate::testing::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = GitInfoTool::new(crate::execution::active_execution_backend());
+        let tool = GitInfoTool::new(crate::testing::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "git_info");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -284,7 +285,7 @@ mod tests {
     async fn test_git_info_on_current_repo() {
         // This test assumes we're running from within a git repo
         let args = json!({"include": ["status"]}).to_string();
-        let result = GitInfoTool::new(crate::execution::active_execution_backend())
+        let result = GitInfoTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await;
         // Should succeed if running from aidaemon project
@@ -297,7 +298,7 @@ mod tests {
     async fn test_git_info_not_a_repo() {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = GitInfoTool::new(crate::execution::active_execution_backend())
+        let result = GitInfoTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await;
         assert!(result.is_err());
@@ -315,15 +316,15 @@ mod tests {
 #[cfg(test)]
 mod trust_tests {
     use super::*;
-    use crate::traits::ToolSemantics;
+    use crate::semantics::ToolSemantics;
 
     #[test]
     fn a_repository_outside_the_trusted_roots_is_untrusted() {
-        let tool = GitInfoTool::new(crate::execution::active_execution_backend());
+        let tool = GitInfoTool::new(crate::testing::active_execution_backend());
         let root = std::env::temp_dir().join("aidaemon-synthetic-root");
         let root = root.to_string_lossy().into_owned();
         let grants = [root.clone()];
-        let roots = crate::traits::TrustRoots::new(&grants);
+        let roots = crate::semantics::TrustRoots::new(&grants);
         let inside = serde_json::json!({"path": format!("{root}/repo")}).to_string();
         assert_eq!(
             tool.output_trust(&inside, &roots),

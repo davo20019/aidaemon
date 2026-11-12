@@ -16,6 +16,11 @@ fn tools_dir() -> PathBuf {
 const MOVED_TOOL_SOURCES: &[&str] = &[
     "crates/aidaemon-tools/src/web_search.rs",
     "crates/aidaemon-tools/src/http_request.rs",
+    "crates/aidaemon-tools/src/system.rs",
+    "crates/aidaemon-tools/src/git_info.rs",
+    "crates/aidaemon-tools/src/git_commit.rs",
+    "crates/aidaemon-tools/src/project_inspect.rs",
+    "crates/aidaemon-tools/src/service_status.rs",
 ];
 
 fn tool_source_files() -> Vec<PathBuf> {

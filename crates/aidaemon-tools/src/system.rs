@@ -3,15 +3,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{ExecutionRequest, SharedExecutionBackend};
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::backend::{ExecutionRequest, SharedExecutionBackend};
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
 
 pub struct SystemInfoTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: crate::backend::SharedExecutionBackend,
 }
 
 impl SystemInfoTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -42,8 +43,8 @@ impl Tool for SystemInfoTool {
     async fn execute(
         &self,
         _arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let backend = self.backend.clone();
             let mut info = format!(
@@ -89,11 +90,11 @@ impl Tool for SystemInfoTool {
             Ok(info)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for SystemInfoTool {
+impl crate::semantics::ToolSemantics for SystemInfoTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }

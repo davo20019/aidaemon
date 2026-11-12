@@ -1,0 +1,32 @@
+{
+  "description": "Stage files and create a git commit. Use this instead of running separate git add + git commit terminal commands. Validates changes exist before committing.",
+  "name": "git_commit",
+  "schema": {
+    "description": "Stage files and create a git commit. Use this instead of running separate git add + git commit terminal commands. Validates changes exist before committing.",
+    "name": "git_commit",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "description": "Specific files to stage (default: all changed files)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "message": {
+          "description": "Commit message",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the git repository (default: current directory)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    }
+  }
+}

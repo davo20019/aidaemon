@@ -3,19 +3,20 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::execution::{BackendPath, SharedExecutionBackend};
-use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+use crate::backend::{BackendPath, SharedExecutionBackend};
+use crate::semantics::{
+    ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
+use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 
 pub struct ProjectInspectTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: crate::backend::SharedExecutionBackend,
 }
 
 impl ProjectInspectTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -59,8 +60,8 @@ impl Tool for ProjectInspectTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: Value = serde_json::from_str(arguments)?;
             let paths = parse_project_paths(&args)?;
@@ -101,11 +102,11 @@ impl Tool for ProjectInspectTool {
             Ok(output)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for ProjectInspectTool {
+impl crate::semantics::ToolSemantics for ProjectInspectTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }
@@ -123,7 +124,7 @@ impl crate::traits::ToolSemantics for ProjectInspectTool {
     fn output_trust(
         &self,
         arguments: &str,
-        roots: &crate::traits::TrustRoots<'_>,
+        roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         // Exactly the paths the call inspects (`.` when it names none):
         // trusted only when every one is inside the trusted roots.
@@ -508,18 +509,18 @@ fn get_directory_structure(
 
 #[cfg(test)]
 mod tests {
-    use crate::traits::ToolCalls as _;
+    use crate::testing::ToolCalls as _;
 
-    use crate::traits::ToolSemantics;
+    use crate::semantics::ToolSemantics;
     /// Every inspected path decides: one outside the trusted roots makes
     /// the whole output someone else's.
     #[test]
     fn output_trust_checks_every_path() {
         use aidaemon_core::SourceTrust;
         let roots_list = vec!["/tmp/aidaemon-test/project".to_string()];
-        let roots = crate::traits::TrustRoots::new(&roots_list);
+        let roots = crate::semantics::TrustRoots::new(&roots_list);
         let trust = |args: serde_json::Value| {
-            ProjectInspectTool::new(crate::execution::active_execution_backend())
+            ProjectInspectTool::new(crate::testing::active_execution_backend())
                 .output_trust(&args.to_string(), &roots)
         };
         assert_eq!(
@@ -546,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = ProjectInspectTool::new(crate::execution::active_execution_backend());
+        let tool = ProjectInspectTool::new(crate::testing::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "project_inspect");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -589,7 +590,7 @@ mod tests {
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
 
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+        let result = ProjectInspectTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -610,7 +611,7 @@ mod tests {
         .unwrap();
 
         let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
-        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+        let result = ProjectInspectTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -623,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_inspect_nonexistent() {
         let args = json!({"path": "/tmp/nonexistent_project_12345"}).to_string();
-        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+        let result = ProjectInspectTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await;
         assert!(result.is_err());
@@ -652,7 +653,7 @@ mod tests {
             ]
         })
         .to_string();
-        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+        let result = ProjectInspectTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
@@ -678,7 +679,7 @@ mod tests {
             ]
         })
         .to_string();
-        let result = ProjectInspectTool::new(crate::execution::active_execution_backend())
+        let result = ProjectInspectTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();

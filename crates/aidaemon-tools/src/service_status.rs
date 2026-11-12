@@ -1,16 +1,17 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
 
 use super::fs_utils;
 
 pub struct ServiceStatusTool {
-    backend: crate::execution::SharedExecutionBackend,
+    backend: crate::backend::SharedExecutionBackend,
 }
 
 impl ServiceStatusTool {
-    pub fn new(backend: crate::execution::SharedExecutionBackend) -> Self {
+    pub fn new(backend: crate::backend::SharedExecutionBackend) -> Self {
         Self { backend }
     }
 }
@@ -56,8 +57,8 @@ impl Tool for ServiceStatusTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: Value = serde_json::from_str(arguments)?;
             let filters: Vec<String> = args["services"]
@@ -103,11 +104,11 @@ impl Tool for ServiceStatusTool {
             Ok(output)
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for ServiceStatusTool {
+impl crate::semantics::ToolSemantics for ServiceStatusTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Universal
     }
@@ -132,7 +133,7 @@ fn capitalize_first(s: &str) -> String {
 }
 
 async fn get_listening_ports(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn crate::backend::ExecutionBackend,
     filters: &[String],
 ) -> String {
     let cmd = if cfg!(target_os = "macos") {
@@ -154,7 +155,7 @@ async fn get_listening_ports(
 }
 
 async fn get_docker_status(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn crate::backend::ExecutionBackend,
     filters: &[String],
 ) -> String {
     // Check if docker is available
@@ -186,7 +187,7 @@ async fn get_docker_status(
 }
 
 async fn get_dev_processes(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn crate::backend::ExecutionBackend,
     filters: &[String],
 ) -> String {
     // Look for common dev server processes
@@ -221,7 +222,7 @@ async fn get_dev_processes(
                     let cmd_parts = &parts[10..];
                     let cmd_str: String = cmd_parts.join(" ");
                     // Truncate long commands
-                    let cmd_display = crate::utils::truncate_str(&cmd_str, 83);
+                    let cmd_display = crate::text::truncate_str(&cmd_str, 83);
                     result.push_str(&format!(
                         "  PID {} ({}): CPU {}% MEM {}% {}\n",
                         pid, user, cpu, mem, cmd_display
@@ -254,11 +255,11 @@ fn filter_output(output: &str, filters: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolCalls as _;
+    use crate::testing::ToolCalls as _;
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = ServiceStatusTool::new(crate::execution::active_execution_backend());
+        let tool = ServiceStatusTool::new(crate::testing::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "service_status");
         assert!(!schema["description"].as_str().unwrap().is_empty());
@@ -268,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_service_status_runs() {
         let args = json!({"include": ["ports"]}).to_string();
-        let result = ServiceStatusTool::new(crate::execution::active_execution_backend())
+        let result = ServiceStatusTool::new(crate::testing::active_execution_backend())
             .call(&args)
             .await
             .unwrap();
