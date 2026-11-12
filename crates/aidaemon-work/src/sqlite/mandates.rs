@@ -1380,7 +1380,7 @@ async fn resume_unanswered_agent_questions(
     now: &str,
 ) -> anyhow::Result<()> {
     let rows = sqlx::query(
-        "SELECT m.id, m.goal_id, m.version, m.created_by_session, m.objective,
+        "SELECT m.id, m.goal_id, m.version, m.created_by_session, m.objective, m.name,
                 d.id AS decision_id, d.question
          FROM mandates m
          LEFT JOIN mandate_decision_cycles d
@@ -1404,6 +1404,7 @@ async fn resume_unanswered_agent_questions(
         let decision_id: Option<String> = row.get("decision_id");
         let question: Option<String> = row.get("question");
         let objective: String = row.get("objective");
+        let name: Option<String> = row.get("name");
         // Authority is unchanged, so the policy version is kept: a late
         // owner answer still applies to the same policy.
         let resumed = sqlx::query(
@@ -1422,17 +1423,16 @@ async fn resume_unanswered_agent_questions(
             continue;
         }
         update_controller_status(connection, &goal_id, MandateStatus::Active, now).await?;
-        let label = crate::traits::mandate_owner_label(Some(&objective));
-        let reference = mandate_id.chars().take(8).collect::<String>();
+        let label = crate::traits::mandate_named_label(name.as_deref(), Some(&objective));
         let message = match question
             .as_deref()
             .and_then(crate::traits::owner_question_excerpt)
         {
             Some(question) => format!(
-                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed.\n\nIt had asked: \"{question}\"\n\nNo reply is needed. If you still want to answer, reply here. (ref {reference})"
+                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed.\n\nIt had asked: \"{question}\"\n\nNo reply is needed. If you still want to answer, reply here."
             ),
             None => format!(
-                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed. (ref {reference})"
+                "{label} is continuing on its own because its question went unanswered. Its limits are unchanged; nothing new was allowed."
             ),
         };
         sqlx::query(
@@ -6284,7 +6284,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert!(notification_message.contains("will try again on its own"));
+        assert!(notification_message.contains("will retry automatically"));
         let intention_status =
             sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
                 .bind(&intention.id)
@@ -6357,9 +6357,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notification.0, "mandate_review_failed");
-        assert!(notification
-            .1
-            .contains("interrupted before it decided anything"));
+        assert!(notification.1.contains("before it decided anything"));
+        assert!(!notification.1.contains("decision missing"));
         assert!(notification.1.contains("Nothing was done"));
         assert!(!notification.1.contains("check the account"));
     }

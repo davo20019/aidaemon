@@ -44,6 +44,9 @@ const MAX_OBSERVATION_TEXT: usize = 750;
 const MAX_OBSERVATIONS_JSON: usize = 6 * 1024;
 const MAX_QUESTION_TEXT: usize = 500;
 const MAX_INTENTION_TEXT: usize = 1024;
+use crate::mandates::card::{
+    CanDo, EndLimit, Ends, MandateConfirmationCard, NoticeTrigger, ReviewCadence,
+};
 use crate::mandates::MAX_INTENTION_METADATA_TEXT;
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
@@ -552,85 +555,117 @@ impl ManageMandatesTool {
         Ok(Some(snapshot))
     }
 
-    fn confirmation_warnings(
+    /// The owner's confirmation card: five essentials (what, how often,
+    /// what it can do, when it tells you, when it ends), then the details.
+    fn confirmation_card(
         mandate: &Mandate,
         capacity: ResolvedReviewCapacity,
         activation_duration_secs: Option<i64>,
         proposed_policy_version: i64,
-    ) -> Vec<String> {
-        let mut warnings = vec![
-            format!("Objective: {}", mandate.objective),
-            format!("Constraints: {}", display_policy(&mandate.constraints)),
-            format!(
-                "Success criteria: {}",
-                display_policy(&mandate.success_criteria)
-            ),
-            format!("Stop conditions: {}", display_policy(&mandate.stop_conditions)),
-            format!(
-                "Guidance: {}",
-                mandate.strategy.as_ref().map_or_else(
-                    || "No additional playbook".to_string(),
-                    |strategy| strategy.description.trim().to_string()
-                )
-            ),
-            format!("Access summary: {}", display_access_summary(&mandate.authority)),
-            format!(
-                "Mutation limits: Up to {} change{} per review and {} in any 24 hours. At least {} between changes.",
-                mandate.authority.max_mutating_actions_per_cycle,
-                if mandate.authority.max_mutating_actions_per_cycle == 1 { "" } else { "s" },
-                mandate.authority.max_mutating_actions_per_rolling_24h,
-                display_duration(mandate.authority.min_seconds_between_mutations.into())
-            ),
-            if mandate.min_review_secs == mandate.max_review_secs {
-                format!(
-                    "Review interval: Every {}.",
-                    display_duration(mandate.default_review_secs)
-                )
-            } else {
-                format!(
-                    "Review interval: Usually every {}; may vary from {} to {}.",
-                    display_duration(mandate.default_review_secs),
-                    display_duration(mandate.min_review_secs),
-                    display_duration(mandate.max_review_secs)
-                )
+    ) -> MandateConfirmationCard {
+        let authority = &mandate.authority;
+        let labels = access_labels(authority);
+        let changes = can_change(authority, &labels);
+        let can_do = if changes {
+            CanDo::Changes {
+                what: labels.changes.iter().cloned().collect(),
+                per_review: authority.max_mutating_actions_per_cycle,
+                per_day: authority.max_mutating_actions_per_rolling_24h,
+                min_gap_secs: authority.min_seconds_between_mutations,
+            }
+        } else {
+            CanDo::ReadOnly
+        };
+        let mut triggers = Vec::new();
+        if authority.owner_alerts {
+            triggers.push(NoticeTrigger::Finding);
+        }
+        if changes {
+            triggers.push(NoticeTrigger::Change);
+        }
+        triggers.extend([NoticeTrigger::NeedsInput, NoticeTrigger::Problem]);
+        let ends = Ends {
+            limit: match (activation_duration_secs, mandate.expires_at.as_deref()) {
+                (Some(secs), _) => EndLimit::AfterApproval { secs },
+                (None, Some(at)) => EndLimit::At(
+                    crate::schedule::owner_time_rfc3339(at)
+                        .unwrap_or_else(|| "at the end date you set".to_string()),
+                ),
+                (None, None) => EndLimit::None,
             },
-            format!(
-                "Expiration: {}",
-                activation_duration_secs.map_or_else(
-                    || display_expiration(mandate.expires_at.as_deref()),
-                    |duration_secs| format!("{} after activation", display_duration(duration_secs))
-                )
-            ),
-            format!(
-                "Review depth: {}",
-                friendly_review_effort(capacity.display_mode())
-            ),
-            format!(
-                "Autonomy mode: {}",
-                match mandate.autonomy_mode {
-                    MandateAutonomyMode::Bounded => {
-                        "Bounded — works independently only within the rules shown here"
-                    }
-                    MandateAutonomyMode::Autopilot => {
-                        "Autopilot — handles routine decisions within the rules shown here"
-                    }
+            has_stop_conditions: !mandate.stop_conditions.is_empty(),
+        };
+
+        let mut details = Vec::new();
+        if !mandate.constraints.is_empty() {
+            details.push(format!(
+                "Constraints: {}",
+                display_policy(&mandate.constraints)
+            ));
+        }
+        details.push(format!(
+            "Success criteria: {}",
+            display_policy(&mandate.success_criteria)
+        ));
+        if !mandate.stop_conditions.is_empty() {
+            details.push(format!(
+                "Stop conditions: {}",
+                display_policy(&mandate.stop_conditions)
+            ));
+        }
+        if let Some(strategy) = mandate.strategy.as_ref() {
+            details.push(format!("Guidance: {}", strategy.description.trim()));
+        }
+        details.push(format!(
+            "Access summary: {}",
+            display_access_summary(authority)
+        ));
+        details.push(format!(
+            "Review depth: {}",
+            friendly_review_effort(capacity.display_mode())
+        ));
+        details.push(format!(
+            "Autonomy mode: {}",
+            match mandate.autonomy_mode {
+                MandateAutonomyMode::Bounded => {
+                    "Bounded — works on its own only within the rules shown here"
                 }
-            ),
-            format!(
-                "Policy reference: Version {proposed_policy_version}. Approval applies only to the rules and limits summarized here."
-            ),
-        ];
+                MandateAutonomyMode::Autopilot => {
+                    "Autopilot — handles routine decisions within the rules shown here"
+                }
+            }
+        ));
         if mandate.autonomy_mode.is_autopilot() {
-            warnings.push(
-                "Owner checkpoints: It will ask before using a new account, capability, destination, sensitive data, spending authority, destructive action, or a judgment only you can make."
+            details.push(
+                "Owner checkpoints: It asks you before using a new account, capability, destination, sensitive data, spending authority, destructive action, or a judgment only you can make."
                     .to_string(),
             );
-            warnings.push(
-                "Recovery policy: It may retry safe internal failures and resume after restart, but it will never blindly repeat an external action when the result is unclear."
+            details.push(
+                "Recovery policy: It may retry safe internal failures and resume after a restart, but it never blindly repeats an external action when the result is unclear."
                     .to_string(),
             );
         }
-        warnings
+        details.push(format!(
+            "Policy reference: Your approval covers only the rules and limits shown here (policy version {proposed_policy_version})."
+        ));
+
+        MandateConfirmationCard {
+            what: mandate
+                .objective
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            how_often: ReviewCadence {
+                min_secs: mandate.min_review_secs,
+                default_secs: mandate.default_review_secs,
+                max_secs: mandate.max_review_secs,
+            }
+            .render(),
+            can_do: can_do.render(),
+            tells_you_when: NoticeTrigger::render(&triggers),
+            ends: ends.render(),
+            details,
+        }
     }
 
     async fn draft(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
@@ -765,14 +800,18 @@ impl ManageMandatesTool {
                     "maximum": max_review_secs / 60,
                 },
                 "expires_at": timing.expires_at,
+                "owner_times": owner_times([("ends", timing.expires_at.as_deref())]),
                 "duration_minutes": timing.duration_secs.map(|value| value / 60),
                 "timing_normalization": timing.normalized_redundant_expiry.then_some(
                     "duration_minutes is authoritative; the redundant expires_at value was ignored"
                 ),
                 "priority": args.priority.as_deref().unwrap_or("high"),
             },
+            // The owner confirms a ready proposal on the card create shows,
+            // so a text "reply create" confirmation before it asks twice.
+            "owner_confirms_on_card": ready_to_confirm,
             "next_step": if ready_to_confirm {
-                "Call create with this proposal to show the complete owner confirmation."
+                "If the owner asked for this to run, call create with this proposal now: create shows the owner the confirmation card, so do not ask for a separate confirmation in chat first."
             } else {
                 "Supply every required input, then draft again before create."
             }
@@ -1007,18 +1046,19 @@ impl ManageMandatesTool {
         }))?);
 
         let proposed_policy_version = mandate.version + 1;
-        let mut warnings = Self::confirmation_warnings(
+        let mut card = Self::confirmation_card(
             &mandate,
             capacity,
             timing.duration_secs,
             proposed_policy_version,
         );
         if timing.normalized_redundant_expiry {
-            warnings.push(
-                "Timing normalized: duration_minutes is authoritative; the redundant expires_at value was ignored before persistence."
+            card.details.push(
+                "Timing note: You gave both a length and an end date; it uses the length, so the end date was ignored."
                     .to_string(),
             );
         }
+        let warnings = card.into_lines();
         let titled = match mandate.name.as_deref() {
             Some(name) => format!(" \"{name}\": {objective}"),
             None => format!(": {objective}"),
@@ -1076,8 +1116,16 @@ impl ManageMandatesTool {
             .get_mandate(&mandate.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("activated mandate could not be reloaded"))?;
+        let ends = match activated.expires_at.as_deref() {
+            Some(expires_at) => format!(
+                "it ends {} (expires_at {expires_at})",
+                crate::schedule::owner_time_rfc3339(expires_at)
+                    .unwrap_or_else(|| expires_at.to_string())
+            ),
+            None => "it has no end date".to_string(),
+        };
         Ok(format!(
-            "{} {}{} at {} under policy version {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+            "{} {}{} at {} under policy version {}; {ends}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
             if activated.autonomy_mode.is_autopilot() {
                 "Autopilot enabled for mandate"
             } else {
@@ -1085,9 +1133,12 @@ impl ManageMandatesTool {
             },
             activated.id,
             named_suffix(&activated),
-            activated.confirmed_at.as_deref().unwrap_or("unavailable"),
+            activated
+                .confirmed_at
+                .as_deref()
+                .and_then(crate::schedule::owner_time_rfc3339)
+                .unwrap_or_else(|| "unavailable".to_string()),
             activated.version,
-            activated.expires_at.as_deref().unwrap_or("none"),
             activated.min_review_secs / 60,
             activated.max_review_secs / 60
         ))
@@ -1393,6 +1444,14 @@ impl ManageMandatesTool {
                         "suspension": mandate.suspension,
                         "created_at": mandate.created_at,
                         "updated_at": mandate.updated_at,
+                        // The same times as the owner reads them; quote these
+                        // to the owner, never the RFC 3339 values.
+                        "owner_times": owner_times([
+                            ("confirmed", mandate.confirmed_at.as_deref()),
+                            ("next_review", mandate.scheduled_next_review()),
+                            ("ends", mandate.expires_at.as_deref()),
+                            ("created", Some(mandate.created_at.as_str())),
+                        ]),
                     },
                     "review_policy": {
                         "effort": mandate.review_effort,
@@ -2032,7 +2091,7 @@ impl ManageMandatesTool {
         mandate.review_effort = capacity.display_mode().to_string();
         let proposed_policy_version = mandate.version + 1;
         let warnings =
-            Self::confirmation_warnings(&mandate, capacity, None, proposed_policy_version);
+            Self::confirmation_card(&mandate, capacity, None, proposed_policy_version).into_lines();
         let card = MandateCard {
             summary: if mandate.autonomy_mode.is_autopilot() {
                 format!("Enable or update Autopilot: {}", mandate.objective)
@@ -3450,38 +3509,17 @@ fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Resu
     Ok(serde_json::to_string(&context)?)
 }
 
-fn display_duration(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    if seconds == 0 {
-        return "no delay".to_string();
-    }
-    if seconds % 86_400 == 0 {
-        let days = seconds / 86_400;
-        return format!("{days} day{}", if days == 1 { "" } else { "s" });
-    }
-    if seconds % 3_600 == 0 {
-        let hours = seconds / 3_600;
-        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
-    }
-    if seconds % 60 == 0 {
-        let minutes = seconds / 60;
-        return format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" });
-    }
-    format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
-}
-
-fn display_expiration(expires_at: Option<&str>) -> String {
-    let Some(expires_at) = expires_at else {
-        return "No automatic end date".to_string();
-    };
-    chrono::DateTime::parse_from_rfc3339(expires_at).map_or_else(
-        |_| "At the configured end date".to_string(),
-        |value| {
-            value
-                .with_timezone(&chrono::Utc)
-                .format("%B %-d, %Y at %-I:%M %p UTC")
-                .to_string()
-        },
+/// Named times in the owner's zone and format ("2:39 PM ET"), leaving out
+/// the ones that are unset or unreadable.
+fn owner_times<const N: usize>(times: [(&str, Option<&str>); N]) -> Value {
+    Value::Object(
+        times
+            .into_iter()
+            .filter_map(|(name, at)| {
+                let shown = crate::schedule::owner_time_rfc3339(at?)?;
+                Some((name.to_string(), Value::String(shown)))
+            })
+            .collect(),
     )
 }
 
@@ -3548,7 +3586,15 @@ fn operation_target_label(scope: &MandateOperationScope) -> String {
     }
 }
 
-fn display_access_summary(authority: &MandateAuthority) -> String {
+/// What a policy lets a mandate read and change, in plain words.
+struct AccessLabels {
+    reads: BTreeSet<String>,
+    changes: BTreeSet<String>,
+    account_ids: BTreeSet<String>,
+    connection_names: BTreeSet<String>,
+}
+
+fn access_labels(authority: &MandateAuthority) -> AccessLabels {
     let mut reads = BTreeSet::new();
     let mut changes = BTreeSet::new();
     let mut account_ids = BTreeSet::new();
@@ -3599,6 +3645,28 @@ fn display_access_summary(authority: &MandateAuthority) -> String {
         }
     }
 
+    AccessLabels {
+        reads,
+        changes,
+        account_ids,
+        connection_names,
+    }
+}
+
+/// Whether a policy may change anything outside the daemon.
+fn can_change(authority: &MandateAuthority, labels: &AccessLabels) -> bool {
+    authority.max_mutating_actions_per_cycle > 0 && !labels.changes.is_empty()
+}
+
+fn display_access_summary(authority: &MandateAuthority) -> String {
+    let labels = access_labels(authority);
+    let may_change = can_change(authority, &labels);
+    let AccessLabels {
+        reads,
+        changes,
+        account_ids,
+        connection_names,
+    } = labels;
     let mut lines = Vec::new();
     if reads.is_empty() {
         lines.push("Read: No autonomous read access".to_string());
@@ -3608,7 +3676,7 @@ fn display_access_summary(authority: &MandateAuthority) -> String {
             reads.into_iter().collect::<Vec<_>>().join("; ")
         ));
     }
-    if changes.is_empty() {
+    if !may_change {
         lines.push("Change: No external changes".to_string());
     } else {
         lines.push(format!(
@@ -3695,10 +3763,21 @@ mod tests {
             }
             ]))
             .unwrap(),
+            max_mutating_actions_per_cycle: 1,
+            max_mutating_actions_per_rolling_24h: 8,
             ..MandateAuthority::default()
         };
 
         let summary = display_access_summary(&authority);
+        // With no change allowed per review, the same scopes change nothing.
+        let read_only = display_access_summary(&MandateAuthority {
+            max_mutating_actions_per_cycle: 0,
+            ..authority.clone()
+        });
+        assert!(
+            read_only.contains("Change: No external changes"),
+            "{read_only}"
+        );
         assert!(summary.contains("read mentions of the connected X account"));
         assert!(summary.contains("search recent public posts on X"));
         assert!(summary.contains("publish public posts and replies on X"));
@@ -3712,6 +3791,76 @@ mod tests {
         ] {
             assert!(!summary.contains(internal_term), "leaked {internal_term}");
         }
+    }
+
+    /// A read-only hourly mandate with zero change limits reads as five
+    /// plain essentials, with no "0 changes", "no delay", "none specified",
+    /// version or decision-check line among them.
+    #[test]
+    fn confirmation_card_is_five_essentials_then_details() {
+        let mut mandate = Mandate::new(
+            "goal-synthetic",
+            None,
+            "Every hour, check the synthetic status page",
+            "owner-session",
+            MandateAuthority {
+                owner_alerts: true,
+                ..MandateAuthority::default()
+            },
+            3_600,
+            3_600,
+            3_600,
+        );
+        mandate.success_criteria = vec!["You hear about outages within the hour".to_string()];
+        let capacity = ResolvedReviewCapacity {
+            effort: Some(ReviewEffort::Efficient),
+            per_cycle: 1,
+            daily: 1,
+        };
+        let lines = ManageMandatesTool::confirmation_card(&mandate, capacity, None, 2).into_lines();
+        assert_eq!(
+            &lines[..5],
+            [
+                "What: Every hour, check the synthetic status page",
+                "How often: Every hour",
+                "Can do: Read only – makes no changes",
+                "Tells you when: it finds something you asked to hear about, it needs your input, or it hits a problem",
+                "Ends: Only when you stop it",
+            ]
+        );
+        let card = MandateConfirmationCard::from_lines(&lines).expect("all five essentials");
+        assert_eq!(card.how_often, "Every hour");
+        let rendered = lines.join("\n");
+        for nonsense in [
+            "0 change",
+            "no delay",
+            "none specified",
+            "Stop conditions:",
+            "Mutation limits:",
+            "Review interval:",
+            "Expiration:",
+        ] {
+            assert!(!rendered.contains(nonsense), "{nonsense}: {rendered}");
+        }
+        // Version and decision checks stay available, as details only.
+        assert!(card
+            .details
+            .iter()
+            .any(|detail| detail.starts_with("Policy reference:") && detail.contains("version 2")));
+        assert!(card
+            .details
+            .iter()
+            .any(|detail| detail.starts_with("Review depth:")));
+
+        // An end date reads in the owner's zone and format, never RFC 3339.
+        let expires_at = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        mandate.expires_at = Some(expires_at.clone());
+        let card = ManageMandatesTool::confirmation_card(&mandate, capacity, None, 2);
+        assert_eq!(
+            card.ends,
+            crate::schedule::owner_time_rfc3339(&expires_at).unwrap()
+        );
+        assert_ne!(card.ends, expires_at);
     }
 
     #[test]

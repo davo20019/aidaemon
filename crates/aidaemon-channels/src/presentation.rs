@@ -149,7 +149,7 @@ fn presentable_urls(text: &str) -> Vec<(String, String)> {
         let candidate = found
             .as_str()
             .trim_end_matches(['.', ',', ';', ':', ')', ']', '}']);
-        let Ok(parsed) = reqwest::Url::parse(candidate) else {
+        let Ok(parsed) = url::Url::parse(candidate) else {
             continue;
         };
         let Some(host) = parsed.host_str() else {

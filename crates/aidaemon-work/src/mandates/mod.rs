@@ -1,3 +1,4 @@
+pub mod card;
 pub mod history;
 pub mod policy;
 
@@ -2347,6 +2348,39 @@ pub enum MandateReconciliationReason {
 }
 
 impl MandateReconciliationReason {
+    /// Why the mandate paused, as a clause the owner reads after "paused for
+    /// safety:". Never an internal code.
+    pub fn owner_sentence(self) -> String {
+        match self {
+            Self::RootTaskNotSuccessful => "its last review did not finish its work".to_string(),
+            Self::ActMissingIntention => {
+                "it decided to act but did not record what it meant to do".to_string()
+            }
+            Self::ActMissingWorkTask => "it decided to act but never started the work".to_string(),
+            Self::ActBlockedBeforeDispatch { gate } => format!(
+                "it decided to act, but {} refused the action before it ran",
+                gate.owner_label()
+            ),
+            Self::WorkTasksIncomplete => "some of its work did not finish".to_string(),
+            Self::ActMissingVerifiedMutation => {
+                "it decided to act but could not confirm the change happened".to_string()
+            }
+            Self::ActionLedgerMismatch => {
+                "its record of changes does not match what it reported".to_string()
+            }
+            Self::MutationOutcomeFailed => "a change it tried failed".to_string(),
+            Self::MutationOutcomeAmbiguous => {
+                "it cannot tell whether a change it tried went through".to_string()
+            }
+            Self::NonActionCreatedWork => {
+                "it started work during a review that was not meant to act".to_string()
+            }
+            Self::NonActionReservedMutation => {
+                "it prepared a change during a review that was not meant to act".to_string()
+            }
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RootTaskNotSuccessful => "root_task_not_successful",
@@ -2418,6 +2452,28 @@ pub enum MandateFinalizationRejectReason {
 }
 
 impl MandateFinalizationRejectReason {
+    /// What happened to the review, as the owner reads it after "a review".
+    pub fn owner_sentence(self) -> &'static str {
+        match self {
+            Self::InvalidRequest | Self::InvalidDecisionState => {
+                "could not be checked, so nothing was done"
+            }
+            Self::DecisionMissing => "was interrupted before it decided anything. Nothing was done",
+            Self::DeliberatorFailed => "stopped before it finished",
+            Self::ActChangedNothing => {
+                "decided to act, but the action did not go through, so nothing changed"
+            }
+        }
+    }
+
+    /// Whether the mandate retries on its own after this failure.
+    pub fn retries_automatically(self) -> bool {
+        matches!(
+            self,
+            Self::DecisionMissing | Self::DeliberatorFailed | Self::ActChangedNothing
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
@@ -2522,13 +2578,26 @@ pub struct MandateRunNotification {
     /// [`mandate_owner_label`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
+    /// The short name the owner gave the mandate, which the notice uses
+    /// before the objective.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// How owner-facing notices name a mandate: its owner-confirmed objective,
 /// flattened and capped at a word boundary so it reads as a title.
 pub fn mandate_owner_label(objective: Option<&str>) -> String {
+    mandate_named_label(None, objective)
+}
+
+/// How owner-facing notices name a mandate: the name the owner gave it, else
+/// its objective, flattened and capped at a word boundary so it reads as a
+/// title.
+pub fn mandate_named_label(name: Option<&str>, objective: Option<&str>) -> String {
     const MAX_CHARS: usize = 72;
-    let flattened = objective
+    let flattened = name
+        .filter(|name| !name.trim().is_empty())
+        .or(objective)
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -2601,11 +2670,17 @@ impl MandateRunNotification {
             owner_question: None,
             owner_alert: None,
             objective: None,
+            name: None,
         }
     }
 
     pub fn with_objective(mut self, objective: Option<&str>) -> Self {
         self.objective = objective.map(str::to_string);
+        self
+    }
+
+    pub fn with_name(mut self, name: Option<&str>) -> Self {
+        self.name = name.map(str::to_string);
         self
     }
 
@@ -2649,14 +2724,11 @@ impl MandateRunNotification {
         format!("mandate-run-notice:{}", self.goal_run_id)
     }
 
+    /// The notice as the owner reads it: the mandate by its name, what
+    /// happened in plain words, and no internal codes or ids (the owner's
+    /// next turn finds the mandate by name, or from the typed notice).
     pub fn message(&self) -> String {
-        let label = mandate_owner_label(self.objective.as_deref());
-        // A compact reference so a follow-up turn can find the mandate; the
-        // owner never needs to read or type it.
-        let reference = format!(
-            "(ref {})",
-            self.mandate_id.chars().take(8).collect::<String>()
-        );
+        let label = mandate_named_label(self.name.as_deref(), self.objective.as_deref());
         let unresolved = self.counts.ambiguous_or_reserved_mutations;
         let check_target = format!(
             "{} may not have completed cleanly. Please check the account for a missing or duplicate action before resuming it.",
@@ -2668,32 +2740,32 @@ impl MandateRunNotification {
                     0 => "finished a review and completed its planned work".to_string(),
                     count => format!("completed {}", plural(count, "verified action", "verified actions")),
                 };
-                format!("{label} {done}. It keeps running on its own. {reference}")
+                format!("{label} {done}. It keeps running on its own.")
             }
             MandateRunNotificationKind::Ask => match self.owner_question.as_deref() {
                 Some(question) => format!(
-                    "{label} needs your input. It asked: \"{question}\"\n\nReply here to answer. Your answer guides it, but never gives it new permissions. If you don't reply, it continues on its own within its current limits at its next review. {reference}"
+                    "{label} needs your input. It asked: \"{question}\"\n\nReply here to answer. Your answer guides it, but never gives it new permissions. If you don't reply, it continues on its own within its current limits at its next review."
                 ),
                 None => format!(
-                    "{label} needs your input. Ask me what it wants to know. If you don't reply, it continues on its own within its current limits at its next review. {reference}"
+                    "{label} needs your input. Ask me what it wants to know. If you don't reply, it continues on its own within its current limits at its next review."
                 ),
             },
             MandateRunNotificationKind::Alert => match self.owner_alert.as_deref() {
                 Some(alert) => format!(
-                    "{label} has something you asked to hear about. It reported: \"{alert}\"\n\nIt keeps running on its own; nothing new was allowed. {reference}"
+                    "{label} has something you asked to hear about. It reported: \"{alert}\"\n\nIt keeps running on its own; nothing new was allowed."
                 ),
                 None => format!(
-                    "{label} has something you asked to hear about. Ask me what it found. It keeps running on its own. {reference}"
+                    "{label} has something you asked to hear about. Ask me what it found. It keeps running on its own."
                 ),
             },
-            MandateRunNotificationKind::Stopped => format!(
-                "{label} has stopped. Ask me why if you want the details. {reference}"
-            ),
+            MandateRunNotificationKind::Stopped => {
+                format!("{label} has stopped. Ask me why if you want the details.")
+            }
             MandateRunNotificationKind::ReconciliationRequired {
-                reason: MandateReconciliationReason::ActBlockedBeforeDispatch { gate },
+                reason: reason @ MandateReconciliationReason::ActBlockedBeforeDispatch { .. },
             } => format!(
-                "{label} is paused: it decided to act, but {} refused the action before it ran, so nothing was published or changed. Ask me for the details, then resume it when you're ready. {reference}",
-                gate.owner_label(),
+                "{label} is paused: {}, so nothing was published or changed. Ask me for the details, then resume it when you're ready.",
+                reason.owner_sentence(),
             ),
             MandateRunNotificationKind::ReconciliationRequired { reason } => {
                 let detail = if unresolved > 0 {
@@ -2702,38 +2774,29 @@ impl MandateRunNotification {
                     " Ask me for the details, then resume it when you're ready.".to_string()
                 };
                 format!(
-                    "{label} is paused for safety: {}.{detail} {reference}",
-                    reason.owner_text(),
+                    "{label} is paused for safety: {}.{detail}",
+                    reason.owner_sentence(),
                 )
             }
-            MandateRunNotificationKind::ReviewFailed {
-                reason: MandateFinalizationRejectReason::DecisionMissing,
-            } => format!(
-                "{label}: a review was interrupted before it decided anything. Nothing was done. It's still active and will try again on its own. {reference}",
-            ),
             // The deliberator may fail after committing an ACT and starting an
-            // executor, so this notice claims neither "nothing decided" nor
+            // executor, so its notice claims neither "nothing decided" nor
             // "nothing done"; an unconfirmed external change takes the
             // reconciliation path instead.
-            MandateRunNotificationKind::ReviewFailed {
-                reason: MandateFinalizationRejectReason::DeliberatorFailed,
-            } => format!(
-                "{label}: a review couldn't finish. Ask me what it got to if you want the details. It's still active and will try again on its own. {reference}",
-            ),
-            MandateRunNotificationKind::ReviewFailed {
-                reason: MandateFinalizationRejectReason::ActChangedNothing,
-            } => format!(
-                "{label}: a review decided to act, but the action did not go through, so nothing changed. It's still active and will try again on its own. {reference}",
-            ),
-            MandateRunNotificationKind::ReviewFailed { reason } => format!(
-                "{label}: a review could not be verified ({}), so nothing was done. {reference}",
-                reason.owner_text(),
-            ),
+            MandateRunNotificationKind::ReviewFailed { reason } => {
+                let mut text = format!("{label}: a review {}.", reason.owner_sentence());
+                if reason == MandateFinalizationRejectReason::DeliberatorFailed {
+                    text.push_str(" Ask me what it got to if you want the details.");
+                }
+                if reason.retries_automatically() {
+                    text.push_str(" It's still active and will retry automatically.");
+                }
+                text
+            }
             MandateRunNotificationKind::ExecutionLeaseLost => format!(
-                "{label} is paused for safety: a review was cut off before its results could be confirmed. {check_target} {reference}"
+                "{label} is paused for safety: a review was cut off before its results could be confirmed. {check_target}"
             ),
             MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation => format!(
-                "{label}: a review was cancelled after it had already started work outside aidaemon. {check_target} {reference}"
+                "{label}: a review was cancelled after it had already started work outside aidaemon. {check_target}"
             ),
         }
     }
@@ -2801,7 +2864,7 @@ mod tests {
         assert!(!message.contains("decided anything"), "{message}");
         assert!(!message.contains("Nothing was done"), "{message}");
         assert!(message.contains("still active"));
-        assert!(message.contains("will try again on its own"));
+        assert!(message.contains("will retry automatically"));
 
         let missing = MandateRunNotification::new(
             "08012d3d-synthetic",
@@ -2820,21 +2883,74 @@ mod tests {
         assert!(missing.contains("Nothing was done"), "{missing}");
     }
 
-    /// Owner notices say what happened in plain words, from the typed
-    /// failure kind: never an internal code or component name.
+    fn review_notice(kind: MandateRunNotificationKind) -> MandateRunNotification {
+        MandateRunNotification::new(
+            "2561769c-0000-4000-8000-synthetic",
+            2,
+            "goal-synthetic",
+            "run-synthetic",
+            "owner-synthetic",
+            kind,
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        )
+        .with_objective(Some("Every hour, check the synthetic status page"))
+    }
+
     #[test]
-    fn failure_notices_never_name_internal_codes() {
-        let reject = [
+    fn notices_use_the_owner_given_name_and_plain_reasons() {
+        let named = review_notice(MandateRunNotificationKind::ReviewFailed {
+            reason: MandateFinalizationRejectReason::DeliberatorFailed,
+        })
+        .with_name(Some("Status watch"));
+        assert_eq!(
+            named.message(),
+            "Your automation \"Status watch\": a review stopped before it finished. Ask me what \
+             it got to if you want the details. It's still active and will retry automatically."
+        );
+        let unnamed = review_notice(MandateRunNotificationKind::Stopped);
+        assert_eq!(
+            unnamed.message(),
+            "Your automation \"Every hour, check the synthetic status page\" has stopped. Ask me \
+             why if you want the details."
+        );
+        let paused = review_notice(MandateRunNotificationKind::ReconciliationRequired {
+            reason: MandateReconciliationReason::MutationOutcomeFailed,
+        })
+        .with_name(Some("Status watch"));
+        assert_eq!(
+            paused.message(),
+            "Your automation \"Status watch\" is paused for safety: a change it tried failed. \
+             Ask me for the details, then resume it when you're ready."
+        );
+    }
+
+    #[test]
+    fn no_notice_shows_an_internal_code_or_id() {
+        let mut kinds = vec![
+            MandateRunNotificationKind::ActSatisfied,
+            MandateRunNotificationKind::Ask,
+            MandateRunNotificationKind::Alert,
+            MandateRunNotificationKind::Stopped,
+            MandateRunNotificationKind::ExecutionLeaseLost,
+            MandateRunNotificationKind::AuthorityRevokedWithUnresolvedMutation,
+        ];
+        for reason in [
             MandateFinalizationRejectReason::InvalidRequest,
             MandateFinalizationRejectReason::DecisionMissing,
             MandateFinalizationRejectReason::InvalidDecisionState,
             MandateFinalizationRejectReason::DeliberatorFailed,
             MandateFinalizationRejectReason::ActChangedNothing,
-        ];
-        let reconcile = [
+        ] {
+            kinds.push(MandateRunNotificationKind::ReviewFailed { reason });
+        }
+        for reason in [
             MandateReconciliationReason::RootTaskNotSuccessful,
             MandateReconciliationReason::ActMissingIntention,
             MandateReconciliationReason::ActMissingWorkTask,
+            MandateReconciliationReason::ActBlockedBeforeDispatch {
+                gate: MandateDispatchGate::MandateAuthority,
+            },
             MandateReconciliationReason::WorkTasksIncomplete,
             MandateReconciliationReason::ActMissingVerifiedMutation,
             MandateReconciliationReason::ActionLedgerMismatch,
@@ -2842,41 +2958,15 @@ mod tests {
             MandateReconciliationReason::MutationOutcomeAmbiguous,
             MandateReconciliationReason::NonActionCreatedWork,
             MandateReconciliationReason::NonActionReservedMutation,
-        ];
-        let notice = |kind| {
-            MandateRunNotification::new(
-                "08012d3d-synthetic",
-                1,
-                "goal-synthetic",
-                "566978b6-synthetic",
-                "owner-synthetic",
-                kind,
-                MandateRunProofCounts::default(),
-                "2026-08-11T12:00:00Z",
-            )
-            .message()
-        };
-        let messages = reject
-            .iter()
-            .map(|reason| {
-                (
-                    reason.as_str(),
-                    notice(MandateRunNotificationKind::ReviewFailed { reason: *reason }),
-                )
-            })
-            .chain(reconcile.iter().map(|reason| {
-                (
-                    reason.as_str(),
-                    notice(MandateRunNotificationKind::ReconciliationRequired { reason: *reason }),
-                )
-            }));
-        for (code, message) in messages {
-            let lower = message.to_lowercase();
-            assert!(!lower.contains(code), "{message}");
-            assert!(!lower.contains(&code.replace('_', " ")), "{message}");
-            for internal in ["deliberator", "ledger", "mutation", "executor"] {
-                assert!(!lower.contains(internal), "{message}");
-            }
+        ] {
+            kinds.push(MandateRunNotificationKind::ReconciliationRequired { reason });
+        }
+        for kind in kinds {
+            let message = review_notice(kind).message();
+            assert!(!message.contains("2561769c"), "{message}");
+            assert!(!message.contains("(ref"), "{message}");
+            assert!(!message.contains('_'), "{message}");
+            assert!(!message.contains("deliberator"), "{message}");
         }
     }
 

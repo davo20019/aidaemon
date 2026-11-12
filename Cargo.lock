@@ -237,6 +237,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -618,6 +619,7 @@ dependencies = [
  "chrono",
  "croner",
  "futures",
+ "iana-time-zone",
  "regex",
  "reqwest 0.12.28",
  "serde",

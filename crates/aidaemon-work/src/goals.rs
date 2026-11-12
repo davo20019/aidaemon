@@ -787,6 +787,50 @@ pub struct NotificationEntry {
     pub untrusted: bool,
 }
 
+/// A notice already delivered to the owner, as a running turn sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredNotice {
+    pub id: String,
+    /// The notification type ("mandate_review_failed", "mandate_ask", ...).
+    pub notification_type: String,
+    /// The text the owner read.
+    pub message: String,
+    /// When it was delivered (RFC 3339, UTC).
+    pub delivered_at: String,
+    /// The mandate it is about, when it is about one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate_id: Option<String>,
+}
+
+/// The context a turn's reply needs about notices the owner received while
+/// the turn ran: they were sent a minute before the reply arrives, so the
+/// reply must not contradict them ("I haven't seen the first review run"
+/// right after "a review failed"). `None` when there were none.
+///
+/// The host adds it to the turn before the final reply, from
+/// [`crate::traits::NotificationStore::notices_delivered_since`] with the
+/// turn's start time.
+pub fn notices_turn_context(notices: &[DeliveredNotice]) -> Option<String> {
+    if notices.is_empty() {
+        return None;
+    }
+    let mut context = String::from(
+        "[NOTICES SENT DURING THIS TURN] While you worked, the owner already received these \
+         messages. Your reply must agree with them; do not repeat them in full, and do not \
+         say something has not happened when a notice says it has.",
+    );
+    for notice in notices {
+        let at = crate::schedule::owner_time_rfc3339(&notice.delivered_at)
+            .unwrap_or_else(|| notice.delivered_at.clone());
+        context.push_str(&format!("\n- at {at} ({}", notice.notification_type));
+        if let Some(mandate_id) = notice.mandate_id.as_deref() {
+            context.push_str(&format!(", mandate_id {mandate_id}"));
+        }
+        context.push_str(&format!("): {}", notice.message.trim()));
+    }
+    Some(context)
+}
+
 impl NotificationEntry {
     pub const DEFAULT_QUIET_HOURS_START: u32 = 22;
     pub const DEFAULT_QUIET_HOURS_END: u32 = 7;

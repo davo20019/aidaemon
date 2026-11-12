@@ -1092,9 +1092,110 @@ pub fn compute_next_run_local(cron_expr: &str) -> anyhow::Result<DateTime<Local>
         .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))
 }
 
-/// Human-readable system timezone label used in schedule confirmations.
+/// Human-readable system timezone label used in schedule confirmations: the
+/// same short label every owner-facing time carries ([`owner_time`]).
 pub fn system_timezone_display() -> String {
-    Local::now().format("%Z (UTC%:z)").to_string()
+    owner_zone_label(Local::now().offset().local_minus_utc())
+}
+
+/// The IANA name of the owner's time zone. The daemon runs on the owner's
+/// machine, so the owner's zone is the system one: `TZ` when it names a zone,
+/// else the system setting.
+fn owner_zone_name() -> Option<String> {
+    static NAME: LazyLock<Option<String>> = LazyLock::new(|| {
+        std::env::var("TZ")
+            .ok()
+            .map(|tz| tz.trim().trim_start_matches(':').to_string())
+            .filter(|tz| tz.contains('/') || tz.eq_ignore_ascii_case("UTC"))
+            .or_else(|| iana_time_zone::get_timezone().ok())
+    });
+    NAME.clone()
+}
+
+/// The owner's zone as a short label at a given UTC offset.
+pub fn owner_zone_label(offset_secs: i32) -> String {
+    zone_label(owner_zone_name().as_deref(), offset_secs)
+}
+
+/// A short label for a zone: the everyday name for zones people say by
+/// name ("ET", "PT"), else the offset ("UTC+5:30"). One label per zone all
+/// year, so a time never reads "EST" in one message and "UTC-05:00" in the
+/// next.
+pub fn zone_label(iana: Option<&str>, offset_secs: i32) -> String {
+    const NAMED: &[(&str, &str)] = &[
+        ("America/New_York", "ET"),
+        ("America/Detroit", "ET"),
+        ("America/Toronto", "ET"),
+        ("America/Indiana/Indianapolis", "ET"),
+        ("America/Kentucky/Louisville", "ET"),
+        ("US/Eastern", "ET"),
+        ("America/Chicago", "CT"),
+        ("America/Winnipeg", "CT"),
+        ("US/Central", "CT"),
+        ("America/Denver", "MT"),
+        ("America/Edmonton", "MT"),
+        ("America/Boise", "MT"),
+        ("America/Phoenix", "MT"),
+        ("US/Mountain", "MT"),
+        ("America/Los_Angeles", "PT"),
+        ("America/Vancouver", "PT"),
+        ("US/Pacific", "PT"),
+        ("America/Anchorage", "AKT"),
+        ("Pacific/Honolulu", "HT"),
+        ("UTC", "UTC"),
+        ("Etc/UTC", "UTC"),
+        ("Etc/GMT", "UTC"),
+    ];
+    if let Some(label) = iana.and_then(|name| {
+        NAMED
+            .iter()
+            .find(|(zone, _)| *zone == name)
+            .map(|(_, label)| *label)
+    }) {
+        return label.to_string();
+    }
+    if offset_secs == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let minutes = offset_secs.unsigned_abs() / 60;
+    match minutes % 60 {
+        0 => format!("UTC{sign}{}", minutes / 60),
+        rest => format!("UTC{sign}{}:{rest:02}", minutes / 60),
+    }
+}
+
+/// A time as the owner reads it, in their zone and one format: "2:39 PM ET"
+/// today, "Thu, Nov 13, 2:39 PM ET" another day this year, and
+/// "Jan 4, 2027, 2:39 PM ET" another year. Tool outputs keep the RFC 3339
+/// value beside it where the model needs one.
+pub fn owner_time<Tz: TimeZone>(at: &DateTime<Tz>) -> String {
+    let at = at.with_timezone(&Local);
+    let label = owner_zone_label(at.offset().local_minus_utc());
+    format_owner_time(&at.fixed_offset(), &Local::now().fixed_offset(), &label)
+}
+
+/// [`owner_time`] for an RFC 3339 timestamp; `None` when it does not parse.
+pub fn owner_time_rfc3339(value: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|at| owner_time(&at))
+}
+
+/// Testable core of [`owner_time`]: `at` and `now` in the owner's zone.
+pub fn format_owner_time(
+    at: &DateTime<FixedOffset>,
+    now: &DateTime<FixedOffset>,
+    zone_label: &str,
+) -> String {
+    let clock = at.format("%-I:%M %p");
+    if at.date_naive() == now.with_timezone(at.offset()).date_naive() {
+        format!("{clock} {zone_label}")
+    } else if at.year() == now.year() {
+        format!("{}, {clock} {zone_label}", at.format("%a, %b %-d"))
+    } else {
+        format!("{}, {clock} {zone_label}", at.format("%b %-d, %Y"))
+    }
 }
 
 /// Render a run time the way a person would say it: "today at 1:46 PM
@@ -1143,6 +1244,36 @@ pub fn is_one_shot_schedule(cron_expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_time_is_one_local_format_with_one_zone_label() {
+        let eastern = FixedOffset::west_opt(5 * 3600).unwrap();
+        let now = eastern.with_ymd_and_hms(2026, 11, 12, 9, 0, 0).unwrap();
+        let today = eastern.with_ymd_and_hms(2026, 11, 12, 14, 39, 0).unwrap();
+        let tomorrow = eastern.with_ymd_and_hms(2026, 11, 13, 14, 39, 0).unwrap();
+        let next_year = eastern.with_ymd_and_hms(2027, 1, 4, 6, 0, 0).unwrap();
+        assert_eq!(format_owner_time(&today, &now, "ET"), "2:39 PM ET");
+        assert_eq!(
+            format_owner_time(&tomorrow, &now, "ET"),
+            "Fri, Nov 13, 2:39 PM ET"
+        );
+        assert_eq!(
+            format_owner_time(&next_year, &now, "ET"),
+            "Jan 4, 2027, 6:00 AM ET"
+        );
+    }
+
+    #[test]
+    fn zone_label_names_common_zones_and_falls_back_to_the_offset() {
+        assert_eq!(zone_label(Some("America/New_York"), -5 * 3600), "ET");
+        // The label does not change with daylight saving time.
+        assert_eq!(zone_label(Some("America/New_York"), -4 * 3600), "ET");
+        assert_eq!(zone_label(Some("America/Los_Angeles"), -8 * 3600), "PT");
+        assert_eq!(zone_label(Some("Asia/Kolkata"), 19_800), "UTC+5:30");
+        assert_eq!(zone_label(Some("Europe/Berlin"), 3600), "UTC+1");
+        assert_eq!(zone_label(None, -5 * 3600), "UTC-5");
+        assert_eq!(zone_label(None, 0), "UTC");
+    }
 
     #[test]
     fn test_humanize_run_time() {
