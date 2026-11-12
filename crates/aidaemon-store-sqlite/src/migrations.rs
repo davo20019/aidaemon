@@ -19,10 +19,11 @@ pub struct Migration {
 }
 
 /// Every migration this build knows, in order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "run_events_and_run_states",
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "run_events_and_run_states",
+        sql: r#"
 CREATE TABLE run_events (
     run_id     TEXT    NOT NULL,
     seq        INTEGER NOT NULL,
@@ -48,7 +49,28 @@ BEGIN SELECT RAISE(ABORT, 'run_events is append-only'); END;
 CREATE TRIGGER run_events_no_delete BEFORE DELETE ON run_events
 BEGIN SELECT RAISE(ABORT, 'run_events is append-only'); END;
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "channel_approvals",
+        sql: r#"
+-- Open `ChannelRunner` approvals (`SqliteApprovalStore`). The scope columns
+-- mirror the JSON so they can be queried and indexed; `record` is the whole
+-- `StoredApproval` and is what is loaded back.
+CREATE TABLE channel_approvals (
+    prompt_id       TEXT    PRIMARY KEY NOT NULL,
+    session_id      TEXT    NOT NULL,
+    channel         TEXT    NOT NULL,
+    conversation_id TEXT    NOT NULL,
+    expires_at_ms   INTEGER NOT NULL,
+    record          TEXT    NOT NULL CHECK (json_valid(record)),
+    saved_at        TEXT    NOT NULL
+);
+
+CREATE INDEX idx_channel_approvals_session ON channel_approvals (session_id);
+"#,
+    },
+];
 
 /// The newest schema version this build understands.
 pub fn latest_version() -> i64 {
