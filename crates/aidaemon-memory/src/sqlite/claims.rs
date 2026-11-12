@@ -1070,50 +1070,22 @@ async fn find_evidence_span(
     Ok(row.map(|row| (row.get("id"), row.get("source_event_id"))))
 }
 
-/// Index a user message as a searchable span. `channels` derives the span's
+/// Index a user message from the host's log as a searchable span. The host
+/// passes only messages memory may learn from. `channels` derives the span's
 /// channel from its session.
-pub async fn project_event_span(
+pub async fn project_message_span(
     pool: &SqlitePool,
     channels: &dyn ChannelIds,
-    event_id: i64,
+    message: &crate::history::LoggedMessage,
 ) -> anyhow::Result<()> {
-    let Some(row) = sqlx::query(
-        "SELECT e.id, e.session_id, e.data, e.created_at FROM events e
-         WHERE e.id = ? AND e.event_type = 'user_message'
-           AND (e.task_id IS NULL OR EXISTS (
-               SELECT 1 FROM events policy
-               WHERE policy.task_id = e.task_id
-                 AND policy.event_type = 'memory_policy_compiled'
-                 AND json_extract(policy.data, '$.access') = 'allowed'
-           ) AND NOT EXISTS (
-               SELECT 1 FROM events policy
-               WHERE policy.task_id = e.task_id
-                 AND policy.event_type = 'memory_policy_compiled'
-                 AND json_extract(policy.data, '$.access') = 'suppressed'
-           ))",
-    )
-    .bind(event_id)
-    .fetch_optional(pool)
-    .await?
-    else {
-        return Ok(());
-    };
-    let data: String = row.get("data");
-    let content = serde_json::from_str::<serde_json::Value>(&data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
+    let event_id = message.id;
+    let content = &message.content;
     if content.trim().is_empty() {
         return Ok(());
     }
-    let session_id: String = row.get("session_id");
-    let channel_id = channels.channel_of_session(&session_id);
-    let created_at: String = row.get("created_at");
+    let session_id = &message.session_id;
+    let channel_id = channels.channel_of_session(session_id);
+    let created_at = &message.created_at;
     sqlx::query(
         "INSERT INTO memory_spans
             (span_kind, source_event_id, session_id, channel_id, role, content,
@@ -1126,12 +1098,12 @@ pub async fn project_event_span(
             deleted_at = NULL",
     )
     .bind(event_id)
-    .bind(&session_id)
+    .bind(session_id)
     .bind(channel_id.as_deref())
-    .bind(&content)
-    .bind(content_hash(&content))
-    .bind(&created_at)
-    .bind(&created_at)
+    .bind(content)
+    .bind(content_hash(content))
+    .bind(created_at)
+    .bind(created_at)
     .execute(pool)
     .await?;
     Ok(())

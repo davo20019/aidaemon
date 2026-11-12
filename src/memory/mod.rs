@@ -53,8 +53,24 @@ pub(crate) fn sqlite_memory(
             .collect::<Vec<_>>()
             .join("\n")
     }
-    aidaemon_memory::sqlite::SqliteMemory::new(pool, embeddings.clone())
+    aidaemon_memory::sqlite::SqliteMemory::new(pool.clone(), embeddings.clone())
+        .with_message_log(std::sync::Arc::new(history_source::EventHistory::new(
+            pool, None,
+        )))
         .with_reranker(embeddings)
         .with_channel_ids(std::sync::Arc::new(DaemonChannelIds))
         .with_error_cleaner(without_scaffolding)
+}
+
+/// Index the user message event `event_id` as a searchable memory span, if
+/// memory may learn from it.
+pub(crate) async fn project_event_span(
+    pool: &sqlx::SqlitePool,
+    event_id: i64,
+) -> anyhow::Result<()> {
+    let history = history_source::EventHistory::new(pool.clone(), None);
+    if let Some(message) = history.learnable_user_message(event_id).await? {
+        aidaemon_memory::sqlite::project_message_span(pool, &DaemonChannelIds, &message).await?;
+    }
+    Ok(())
 }

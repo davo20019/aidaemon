@@ -361,13 +361,9 @@ async fn selected_fact_projects_only_its_canonical_source_message() {
     .await
     .unwrap();
 
-    project_event_span(
-        &store.pool,
-        &crate::memory::DaemonChannelIds,
-        selected_event_id,
-    )
-    .await
-    .unwrap();
+    crate::memory::project_event_span(&store.pool, selected_event_id)
+        .await
+        .unwrap();
     store.project_fact_memory(fact_id).await.unwrap();
 
     let selected_count: i64 =

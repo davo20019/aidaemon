@@ -96,3 +96,32 @@ pub trait ConsolidationCursors: Send + Sync {
 
     async fn set_cursor(&self, session_id: &str, turn_id: i64) -> anyhow::Result<()>;
 }
+
+/// One user message from the host's log, to index as a searchable span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedMessage {
+    /// The host's id for the message; spans keep it as their source.
+    pub id: i64,
+    pub session_id: String,
+    pub content: String,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+/// The host's message log, as the memory store links into it: episodes
+/// record the messages they cover, and indexed messages are dropped once the
+/// host no longer keeps them. Memory never reads the host's tables itself.
+#[async_trait]
+pub trait MessageLog: Send + Sync {
+    /// The first and last user or assistant message of `session_id` from
+    /// `start` to `end`, both inclusive.
+    async fn message_bounds(
+        &self,
+        session_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<(Option<i64>, Option<i64>)>;
+
+    /// Which of `ids` the host still keeps.
+    async fn retained(&self, ids: &[i64]) -> anyhow::Result<std::collections::HashSet<i64>>;
+}

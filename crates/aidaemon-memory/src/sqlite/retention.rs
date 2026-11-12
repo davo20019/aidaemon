@@ -2,8 +2,12 @@
 //! superseded facts, unrecalled episodes, decayed patterns, zero-success
 //! procedures and net-negative error solutions go, in small batches.
 
+use std::sync::Arc;
+
 use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
+
+use crate::history::MessageLog;
 use tracing::warn;
 
 /// How long each kind of memory is kept, in days. Zero keeps it forever.
@@ -31,11 +35,56 @@ pub struct MemoryRetentionStats {
 pub struct MemoryRetention {
     pool: SqlitePool,
     config: MemoryRetentionPolicy,
+    messages: Option<Arc<dyn MessageLog>>,
 }
 
 impl MemoryRetention {
     pub fn new(pool: SqlitePool, config: MemoryRetentionPolicy) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            messages: None,
+        }
+    }
+
+    /// Drops indexed messages the host no longer keeps. Without a log,
+    /// indexed messages stay until their claims and episodes go.
+    pub fn with_message_log(mut self, messages: Arc<dyn MessageLog>) -> Self {
+        self.messages = Some(messages);
+        self
+    }
+
+    /// Delete message spans, not backing any claim, whose message the host
+    /// no longer keeps.
+    async fn cleanup_spans_of_dropped_messages(&self) -> anyhow::Result<u64> {
+        let Some(messages) = &self.messages else {
+            return Ok(0);
+        };
+        let spans: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, source_event_id FROM memory_spans
+             WHERE source_event_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
+               )",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut deleted = 0;
+        for chunk in spans.chunks(500) {
+            let sources: Vec<i64> = chunk.iter().map(|(_, source)| *source).collect();
+            let kept = messages.retained(&sources).await?;
+            for (span_id, source) in chunk {
+                if kept.contains(source) {
+                    continue;
+                }
+                deleted += sqlx::query("DELETE FROM memory_spans WHERE id = ?")
+                    .bind(span_id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+            }
+        }
+        Ok(deleted)
     }
 
     /// Run every step. One failing does not stop the others.
@@ -235,10 +284,8 @@ impl MemoryRetention {
         .rows_affected();
         deleted += sqlx::query(
             "DELETE FROM memory_spans
-             WHERE ((source_event_id IS NOT NULL AND NOT EXISTS (
-                       SELECT 1 FROM events e WHERE e.id = source_event_id))
-                OR (source_episode_id IS NOT NULL AND NOT EXISTS (
-                       SELECT 1 FROM episodes ep WHERE ep.id = source_episode_id)))
+             WHERE source_episode_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM episodes ep WHERE ep.id = source_episode_id)
                AND NOT EXISTS (
                    SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
                )",
@@ -246,6 +293,7 @@ impl MemoryRetention {
         .execute(&self.pool)
         .await?
         .rows_affected();
+        deleted += self.cleanup_spans_of_dropped_messages().await?;
         deleted += sqlx::query(
             "DELETE FROM memory_embeddings
              WHERE (owner_type = 'claim' AND NOT EXISTS (

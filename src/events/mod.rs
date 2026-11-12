@@ -62,13 +62,7 @@ impl EventHost for DaemonEventHost {
         pool: &sqlx::SqlitePool,
         event_id: i64,
     ) -> anyhow::Result<()> {
-        aidaemon_memory::sqlite::project_event_span(
-            pool,
-            &crate::memory::DaemonChannelIds,
-            event_id,
-        )
-        .await?;
-        Ok(())
+        crate::memory::project_event_span(pool, event_id).await
     }
 
     fn error_pattern(&self, error: &str) -> String {
