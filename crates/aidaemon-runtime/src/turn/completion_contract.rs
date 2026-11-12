@@ -11,18 +11,40 @@ use super::followup::{looks_like_retry_followup, text_contains_any_phrase};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::execution_graph::{
+use aidaemon_events::execution_graph::{
     ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
 };
-use crate::traits::{
+use aidaemon_events::traits::{
     RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction,
     RequestResponseContract, RequestTaskKind, RequestVerificationTarget,
     RequestVerificationTargetKind,
 };
-use crate::traits::{ToolCallSemantics, ToolMutationEffects, ToolOutcomeStatus};
+use aidaemon_events::traits::{ToolCallSemantics, ToolMutationEffects, ToolOutcomeStatus};
+
+/// How a request treats connected-service content (drafting copy, delivering
+/// it live, or both). Advisory only: nothing in the runtime decides tools,
+/// mutation or completion from it, and production turns leave it `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectedContentMode {
+    #[default]
+    None,
+    DraftOnly,
+    DeliverOnly,
+    DraftThenDeliver,
+}
+
+impl ConnectedContentMode {
+    pub fn is_authoring_only(self) -> bool {
+        matches!(self, Self::DraftOnly)
+    }
+
+    pub fn expects_live_delivery(self) -> bool {
+        matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum CompletionTaskKind {
+pub enum CompletionTaskKind {
     #[default]
     Conversational,
     Answer,
@@ -36,20 +58,20 @@ pub(super) enum CompletionTaskKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VerificationTargetKind {
+pub enum VerificationTargetKind {
     Url,
     Path,
     ResourceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct VerificationTarget {
+pub struct VerificationTarget {
     pub kind: VerificationTargetKind,
     pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ForbiddenMutationAction {
+pub enum ForbiddenMutationAction {
     Create,
     Delete,
     Deploy,
@@ -61,7 +83,7 @@ pub(super) enum ForbiddenMutationAction {
 impl ForbiddenMutationAction {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct CompletionContract {
+pub struct CompletionContract {
     /// Current task that owns every field, target, requirement, and constraint
     /// in this contract. The container is the authoritative scope boundary: no
     /// unbound or differently-bound contract may drive execution/finalization.
@@ -86,11 +108,11 @@ pub(super) struct CompletionContract {
     pub owner_control_plane_tools: Vec<String>,
     /// Explicit, grounded capability deny-set for this request. Enforcement
     /// happens both when definitions are offered and again before dispatch.
-    pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
+    pub forbidden_tool_scopes: Vec<aidaemon_events::traits::ToolSemanticScope>,
     /// Typed receipt-triggered lane closures for conditional workflows.
     /// These are task-local attenuation rules, never inferred from prose at
     /// execution time and never allowed to grant a capability.
-    pub dispatch_stop_rules: Vec<crate::traits::RequestDispatchStopRule>,
+    pub dispatch_stop_rules: Vec<aidaemon_events::traits::RequestDispatchStopRule>,
     /// Retained for persisted-schema compatibility. Final prose is not proof;
     /// runtime completion deliberately ignores these legacy labels.
     pub required_response_fields: Vec<String>,
@@ -112,13 +134,13 @@ pub(super) struct CompletionContract {
     pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     /// Durable source obligation -> semantic requirement bindings for typed
     /// continuation adoption. Never infer these from local vector positions.
-    pub adopted_evidence_bindings: Vec<crate::traits::AdoptedEvidenceBinding>,
-    pub connected_content_mode: super::intent_routing::ConnectedContentMode,
+    pub adopted_evidence_bindings: Vec<aidaemon_events::traits::AdoptedEvidenceBinding>,
+    pub connected_content_mode: ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
 }
 
 impl CompletionContract {
-    pub(super) fn adopt_for_task(&mut self, task_id: &str) {
+    pub fn adopt_for_task(&mut self, task_id: &str) {
         if let Some(prior) = self
             .scope_task_id
             .as_deref()
@@ -131,12 +153,12 @@ impl CompletionContract {
         self.scope_task_id = Some(task_id.to_string());
     }
 
-    pub(super) fn belongs_to_task(&self, task_id: &str) -> bool {
+    pub fn belongs_to_task(&self, task_id: &str) -> bool {
         self.scope_task_id.as_deref() == Some(task_id)
     }
 }
 
-pub(super) fn persistable_completion_contract(
+pub fn persistable_completion_contract(
     contract: &CompletionContract,
 ) -> RequestCompletionContract {
     RequestCompletionContract {
@@ -197,7 +219,7 @@ pub(super) fn persistable_completion_contract(
     }
 }
 
-pub(super) fn completion_contract_from_persisted(
+pub fn completion_contract_from_persisted(
     contract: &RequestCompletionContract,
 ) -> CompletionContract {
     // Durable open requests can outlive an evidence-ontology upgrade. Recheck
@@ -209,7 +231,7 @@ pub(super) fn completion_contract_from_persisted(
         .evidence_requirements
         .iter()
         .filter(|requirement| {
-            crate::agent::inquiry::requirement_has_builtin_evidence_route(requirement)
+            super::inquiry::requirement_has_builtin_evidence_route(requirement)
         })
         .cloned()
         .collect();
@@ -260,14 +282,14 @@ pub(super) fn completion_contract_from_persisted(
             .adopted_evidence_bindings
             .iter()
             .filter(|binding| {
-                crate::agent::inquiry::requirement_has_builtin_evidence_route(&binding.requirement)
+                super::inquiry::requirement_has_builtin_evidence_route(&binding.requirement)
                     && contract
                         .evidence_requirements
                         .contains(&binding.requirement)
             })
             .cloned()
             .collect(),
-        connected_content_mode: super::intent_routing::ConnectedContentMode::None,
+        connected_content_mode: ConnectedContentMode::None,
         verification_targets: contract
             .verification_targets
             .iter()
@@ -286,7 +308,7 @@ pub(super) fn completion_contract_from_persisted(
 /// Preserve the typed obligations of a persisted request that has not reached
 /// a terminal outcome. The caller decides whether the requests are related
 /// from dialogue state; this function deliberately performs no text matching.
-pub(super) fn inherit_unfinished_request_contract(
+pub fn inherit_unfinished_request_contract(
     mut current: CompletionContract,
     unfinished: &CompletionContract,
 ) -> CompletionContract {
@@ -338,7 +360,7 @@ pub(super) fn inherit_unfinished_request_contract(
             {
                 current
                     .adopted_evidence_bindings
-                    .push(crate::traits::AdoptedEvidenceBinding {
+                    .push(aidaemon_events::traits::AdoptedEvidenceBinding {
                         source_obligation_id,
                         requirement: requirement.clone(),
                     });
@@ -422,7 +444,7 @@ pub(super) fn inherit_unfinished_request_contract(
 /// antecedent into a semantically related new turn. Satisfied response fields,
 /// evidence requirements, mutation effects, and verification targets belong
 /// to the completed lifecycle and must never become fresh obligations.
-pub(super) fn inherit_request_constraints(
+pub fn inherit_request_constraints(
     mut current: CompletionContract,
     antecedent: &CompletionContract,
 ) -> CompletionContract {
@@ -490,20 +512,20 @@ fn structural_evidence_requirement(
         .iter()
         .any(|target| target.kind == VerificationTargetKind::Path)
     {
-        acceptable_scopes.push(crate::traits::ToolSemanticScope::LocalWorkspace);
+        acceptable_scopes.push(aidaemon_events::traits::ToolSemanticScope::LocalWorkspace);
     }
     if targets
         .iter()
         .any(|target| target.kind == VerificationTargetKind::Url)
     {
-        acceptable_scopes.push(crate::traits::ToolSemanticScope::ExternalRemote);
+        acceptable_scopes.push(aidaemon_events::traits::ToolSemanticScope::ExternalRemote);
     }
     Some(RequestEvidenceRequirement {
         summary: "Observe the current state of one exact resource named by the request".to_string(),
         acceptable_scopes,
-        purpose: crate::traits::EvidencePurpose::CurrentState,
-        minimum_authority: crate::traits::EvidenceAuthority::Direct,
-        temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+        purpose: aidaemon_events::traits::EvidencePurpose::CurrentState,
+        minimum_authority: aidaemon_events::traits::EvidenceAuthority::Direct,
+        temporal_scope: aidaemon_events::traits::EvidenceTemporalScope::Current,
         required_content_markers: Vec::new(),
         receipt: None,
         // Target matching remains a separate OR across structural identities.
@@ -524,7 +546,7 @@ fn structural_evidence_requirement(
 /// The successful observation must still match at least one exact target, but
 /// the fallback creates only one evidence need regardless of how many
 /// identities were extracted.
-pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
+pub fn retain_structural_completion_contract(contract: &mut CompletionContract) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let scope_task_id = contract.scope_task_id.take();
     let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
@@ -551,8 +573,8 @@ pub(super) fn retain_structural_completion_contract(contract: &mut CompletionCon
 /// Construct the bootstrap contract from concrete resource identities only,
 /// with relative filesystem targets anchored to the turn's typed workspace
 /// (or the daemon cwd when the turn has none).
-pub(super) fn infer_structural_completion_contract_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn infer_structural_completion_contract_anchored(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&std::path::Path>,
@@ -783,12 +805,12 @@ fn remove_scoped_negative_mutation_phrases(lower: &str) -> String {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct CompletionProgress {
+pub struct CompletionProgress {
     /// Stable namespace for every node in this task's completion graph.
     /// Runtime-created graphs never use a process-global "current" request
     /// node, so evidence from another task cannot become executable merely
     /// because its local obligation label happens to match.
-    pub(in crate::agent) task_scope: String,
+    pub task_scope: String,
     pub observation_count: usize,
     /// Mutation-capable invocations that crossed the adapter's pre-I/O
     /// contract boundary. Unlike `mutation_count`, this records attempts even
@@ -855,21 +877,21 @@ pub(super) struct CompletionProgress {
     /// Per-turn proof graph. Legacy/default-constructed progress values keep
     /// using counters; runtime construction initializes this graph and makes
     /// typed receipt evidence authoritative for completion.
-    pub(in crate::agent) proof_graph: ExecutionGraph,
-    pub(in crate::agent) proof_graph_initialized: bool,
-    pub(in crate::agent) mutation_obligation_ids: Vec<String>,
-    pub(in crate::agent) verification_obligation_id: Option<String>,
+    pub proof_graph: ExecutionGraph,
+    pub proof_graph_initialized: bool,
+    pub mutation_obligation_ids: Vec<String>,
+    pub verification_obligation_id: Option<String>,
     /// One proof-graph obligation per `CompletionContract::evidence_requirements`
     /// entry, preserving index alignment for receipt matching.
-    pub(in crate::agent) evidence_obligation_ids: Vec<String>,
+    pub evidence_obligation_ids: Vec<String>,
     /// Distinct task-local receipts accumulated for each evidence obligation.
     /// The graph edge is installed only after the predicate's typed minimum
     /// cardinality is reached.
-    pub(in crate::agent) evidence_receipt_ids: Vec<Vec<String>>,
+    pub evidence_receipt_ids: Vec<Vec<String>>,
 }
 
 impl CompletionProgress {
-    pub(super) fn new(contract: &CompletionContract, task_id: &str) -> Self {
+    pub fn new(contract: &CompletionContract, task_id: &str) -> Self {
         let mut progress = Self {
             task_scope: format!("task:{task_id}"),
             verification_pending: contract.requires_observation,
@@ -1016,7 +1038,7 @@ impl CompletionProgress {
         }
     }
 
-    pub(super) fn record_mutation_attempt(&mut self, outcome: ToolOutcomeStatus) {
+    pub fn record_mutation_attempt(&mut self, outcome: ToolOutcomeStatus) {
         if outcome == ToolOutcomeStatus::Blocked {
             return;
         }
@@ -1032,7 +1054,7 @@ impl CompletionProgress {
     }
 
     #[cfg(test)]
-    pub(super) fn mark_mutation(
+    pub fn mark_mutation(
         &mut self,
         contract: &CompletionContract,
         semantics: &ToolCallSemantics,
@@ -1041,7 +1063,7 @@ impl CompletionProgress {
         self.mark_mutation_receipt(contract, semantics, &evidence_id);
     }
 
-    pub(super) fn mark_mutation_receipt(
+    pub fn mark_mutation_receipt(
         &mut self,
         contract: &CompletionContract,
         semantics: &ToolCallSemantics,
@@ -1106,8 +1128,8 @@ impl CompletionProgress {
                             .filter_map(|(index, requirement)| {
                                 matches!(
                                     requirement.temporal_scope,
-                                    crate::traits::EvidenceTemporalScope::Current
-                                        | crate::traits::EvidenceTemporalScope::Both
+                                    aidaemon_events::traits::EvidenceTemporalScope::Current
+                                        | aidaemon_events::traits::EvidenceTemporalScope::Both
                                 )
                                 .then(|| self.evidence_obligation_ids.get(index).cloned())
                                 .flatten()
@@ -1125,7 +1147,7 @@ impl CompletionProgress {
     }
 
     #[cfg(test)]
-    pub(super) fn mark_observation(&mut self, contract: &CompletionContract, matched_target: bool) {
+    pub fn mark_observation(&mut self, contract: &CompletionContract, matched_target: bool) {
         let evidence_id = self.next_evidence_id("synthetic-verification");
         let matched_requirements = if matched_target {
             (0..contract.evidence_requirements.len()).collect::<Vec<_>>()
@@ -1140,7 +1162,7 @@ impl CompletionProgress {
         );
     }
 
-    pub(super) fn mark_observation_receipt(
+    pub fn mark_observation_receipt(
         &mut self,
         contract: &CompletionContract,
         matched_requirement_indices: &[usize],
@@ -1199,7 +1221,7 @@ impl CompletionProgress {
         }
     }
 
-    pub(super) fn mark_verification_attempt(&mut self) {
+    pub fn mark_verification_attempt(&mut self) {
         if self.verification_pending {
             self.verification_attempt_count = self.verification_attempt_count.saturating_add(1);
         }
@@ -1232,7 +1254,7 @@ impl CompletionProgress {
         }
     }
 
-    pub(in crate::agent) fn completion_obligations_for_receipt(
+    pub fn completion_obligations_for_receipt(
         &self,
         tool_call_id: &str,
     ) -> Vec<String> {
@@ -1266,11 +1288,11 @@ fn mutation_effect_obligations() -> [(&'static str, ToolMutationEffects); 11] {
     ]
 }
 
-pub(super) static HTTP_URL_RE: Lazy<Regex> =
+pub static HTTP_URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
 
 fn extract_verification_filesystem_targets(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     targets: &mut Vec<VerificationTarget>,
     max_targets: usize,
@@ -1301,7 +1323,7 @@ fn extract_verification_filesystem_targets(
 #[cfg(test)]
 fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<VerificationTarget> {
     extract_verification_targets_anchored(
-        &*crate::execution::active_execution_backend(),
+        &*aidaemon_tools::testing::active_execution_backend(),
         text,
         alias_roots,
         None,
@@ -1309,7 +1331,7 @@ fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<Verif
 }
 
 fn extract_verification_targets_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&std::path::Path>,
@@ -1376,7 +1398,7 @@ struct CompletionSignals {
 }
 
 #[cfg(test)]
-pub(super) fn looks_like_question_request(lower_text: &str) -> bool {
+pub fn looks_like_question_request(lower_text: &str) -> bool {
     lower_text.ends_with('?')
         || [
             "what ", "when ", "where ", "why ", "who ", "how ", "is ", "are ", "do ", "does ",
@@ -1928,7 +1950,7 @@ fn prior_request_segment(text: &str) -> Option<&str> {
 /// the child was never asked to perform — and stamp a fully successful step
 /// `partial`. Reverification survives only when the mission itself asks for
 /// it.
-pub(super) fn scope_contract_for_delegated_executor(
+pub fn scope_contract_for_delegated_executor(
     mut contract: CompletionContract,
 ) -> CompletionContract {
     if !contract.explicit_verification_requested {
@@ -2104,7 +2126,18 @@ fn infer_required_mutation_effects(
 }
 
 #[cfg(test)]
-pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
+pub fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
+    infer_completion_contract_with_content_mode(text, alias_roots, ConnectedContentMode::None)
+}
+
+/// [`infer_completion_contract`] for a request whose connected-content mode
+/// is already known (the daemon's test-only classifier sets it).
+#[cfg(test)]
+pub fn infer_completion_contract_with_content_mode(
+    text: &str,
+    alias_roots: &[String],
+    connected_content_mode: ConnectedContentMode,
+) -> CompletionContract {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return CompletionContract::default();
@@ -2131,8 +2164,6 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
 
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&mutation_signal_text, &verification_targets);
-    let connected_content_mode =
-        super::intent_routing::classify_connected_content_mode(contract_request);
     let mut task_kind = infer_completion_task_kind(&signals);
     // "Run X and provide the output" is an observation delivered as text —
     // the bare run verb must not make it a Change (observed live: successful
@@ -2223,10 +2254,10 @@ mod tests {
         persisted.requires_observation = true;
         persisted.evidence_requirements = vec![RequestEvidenceRequirement {
             summary: "Establish a canonical historical cause from personal memory".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
-            purpose: crate::traits::EvidencePurpose::CausalExplanation,
-            minimum_authority: crate::traits::EvidenceAuthority::Canonical,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+            acceptable_scopes: vec![aidaemon_events::traits::ToolSemanticScope::UserMemory],
+            purpose: aidaemon_events::traits::EvidencePurpose::CausalExplanation,
+            minimum_authority: aidaemon_events::traits::EvidenceAuthority::Canonical,
+            temporal_scope: aidaemon_events::traits::EvidenceTemporalScope::Historical,
             required_content_markers: Vec::new(),
             receipt: None,
             target: None,
@@ -2640,20 +2671,20 @@ mod tests {
     fn inherited_evidence_keeps_stable_source_identity_across_reorder_and_hydration() {
         let child_only = RequestEvidenceRequirement {
             summary: "Observe child state".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-            purpose: crate::traits::EvidencePurpose::CurrentState,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            acceptable_scopes: vec![aidaemon_events::traits::ToolSemanticScope::HostLocal],
+            purpose: aidaemon_events::traits::EvidencePurpose::CurrentState,
+            minimum_authority: aidaemon_events::traits::EvidenceAuthority::Direct,
+            temporal_scope: aidaemon_events::traits::EvidenceTemporalScope::Current,
             required_content_markers: Vec::new(),
             receipt: None,
             target: None,
         };
         let parent = RequestEvidenceRequirement {
             summary: "Observe parent command output".to_string(),
-            acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-            purpose: crate::traits::EvidencePurpose::Content,
-            minimum_authority: crate::traits::EvidenceAuthority::Direct,
-            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            acceptable_scopes: vec![aidaemon_events::traits::ToolSemanticScope::HostLocal],
+            purpose: aidaemon_events::traits::EvidencePurpose::Content,
+            minimum_authority: aidaemon_events::traits::EvidenceAuthority::Direct,
+            temporal_scope: aidaemon_events::traits::EvidenceTemporalScope::Current,
             required_content_markers: Vec::new(),
             receipt: None,
             target: None,
@@ -2697,15 +2728,15 @@ mod tests {
         let antecedent = CompletionContract {
             scope_task_id: Some("task-prior".to_string()),
             forbids_tool_use: true,
-            forbidden_tool_scopes: vec![crate::traits::ToolSemanticScope::UserMemory],
+            forbidden_tool_scopes: vec![aidaemon_events::traits::ToolSemanticScope::UserMemory],
             required_response_fields: vec!["old_field".to_string()],
             requires_observation: true,
             evidence_requirements: vec![RequestEvidenceRequirement {
                 summary: "Satisfied prior evidence".to_string(),
-                acceptable_scopes: vec![crate::traits::ToolSemanticScope::HostLocal],
-                purpose: crate::traits::EvidencePurpose::Outcome,
-                minimum_authority: crate::traits::EvidenceAuthority::Direct,
-                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                acceptable_scopes: vec![aidaemon_events::traits::ToolSemanticScope::HostLocal],
+                purpose: aidaemon_events::traits::EvidencePurpose::Outcome,
+                minimum_authority: aidaemon_events::traits::EvidenceAuthority::Direct,
+                temporal_scope: aidaemon_events::traits::EvidenceTemporalScope::Current,
                 required_content_markers: vec!["old_field".to_string()],
                 receipt: None,
                 target: None,
@@ -2721,7 +2752,7 @@ mod tests {
         assert!(inherited.forbids_tool_use);
         assert!(inherited
             .forbidden_tool_scopes
-            .contains(&crate::traits::ToolSemanticScope::UserMemory));
+            .contains(&aidaemon_events::traits::ToolSemanticScope::UserMemory));
         assert_eq!(inherited.required_response_fields, ["current_field"]);
         assert!(inherited.evidence_requirements.is_empty());
         assert!(inherited.verification_targets.is_empty());
@@ -2909,10 +2940,14 @@ mod tests {
     }
     #[test]
     fn connected_content_draft_only_request_preserves_signal_derived_task_kind() {
-        let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
+        let contract = infer_completion_contract_with_content_mode(
+            "Help me write a tweet about our launch.",
+            &[],
+            ConnectedContentMode::DraftOnly,
+        );
         assert_eq!(
             contract.connected_content_mode,
-            super::super::intent_routing::ConnectedContentMode::DraftOnly
+            ConnectedContentMode::DraftOnly
         );
         assert!(
             !contract.expects_mutation,
@@ -2921,15 +2956,16 @@ mod tests {
     }
     #[test]
     fn connected_content_draft_then_deliver_request_keeps_delivery_contract() {
-        let contract = infer_completion_contract(
+        let contract = infer_completion_contract_with_content_mode(
             "Can you post a tweet about your new stuff and make it engaging so people want to comment?",
             &[],
+            ConnectedContentMode::DraftThenDeliver,
         );
         assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
         assert!(contract.expects_mutation);
         assert_eq!(
             contract.connected_content_mode,
-            super::super::intent_routing::ConnectedContentMode::DraftThenDeliver
+            ConnectedContentMode::DraftThenDeliver
         );
     }
 

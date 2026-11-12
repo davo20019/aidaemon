@@ -6,10 +6,14 @@
 
 pub mod closeout;
 pub mod completion_checks;
+pub mod completion_contract;
+pub mod dialogue_state;
 pub mod execution_state;
+pub mod followup;
 pub mod inquiry;
 pub mod loop_utils;
 pub mod post_task;
+pub mod project_scope;
 pub mod reply_checks;
 pub mod sliding_window;
 pub mod system_directives;

@@ -501,33 +501,6 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
 }
 
 #[cfg(test)]
-fn text_contains_any_phrase_as_words(text: &str, phrases: &[&str]) -> bool {
-    phrases
-        .iter()
-        .any(|phrase| contains_keyword_as_words(text, phrase))
-}
-
-#[cfg(test)]
-pub(in crate::agent) fn text_has_explicit_project_scope_cues(text: &str) -> bool {
-    text_contains_any_phrase_as_words(
-        text,
-        &[
-            "project",
-            "repo",
-            "repository",
-            "workspace",
-            "directory",
-            "folder",
-            "codebase",
-            "code base",
-            "work in",
-            "inside",
-            "under",
-        ],
-    )
-}
-
-#[cfg(test)]
 pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text: &str) -> bool {
     if user_text_references_filesystem_path(user_text) {
         return true;

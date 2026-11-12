@@ -22,7 +22,6 @@ pub use events::{
     UserMessageData,
 };
 pub(crate) mod execution;
-pub(crate) use aidaemon_events::execution_graph;
 mod execution_policy;
 use aidaemon_work::goal_tokens;
 pub mod harness_eval;

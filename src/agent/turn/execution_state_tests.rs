@@ -114,7 +114,7 @@ fn api_read_requests_use_standard_budget_for_multi_step_lookups() {
 fn connected_content_authoring_requests_stay_in_knowledge_lane() {
     let mut turn_context = TurnContext::default();
     turn_context.completion_contract.connected_content_mode =
-        crate::agent::intent_routing::ConnectedContentMode::DraftThenDeliver;
+        crate::agent::completion_contract::ConnectedContentMode::DraftThenDeliver;
     turn_context.completion_contract.task_kind = CompletionTaskKind::Deliver;
     turn_context.completion_contract.expects_mutation = true;
     let (tier, route_kind, _) = select_initial_execution_budget(
