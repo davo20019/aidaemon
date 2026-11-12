@@ -169,6 +169,10 @@ impl CommandHost for DaemonCommandHost {
             when: aidaemon_work::schedule::owner_time(&at),
         })
     }
+
+    fn owner_time(&self, at: DateTime<Utc>) -> Option<String> {
+        Some(aidaemon_work::schedule::owner_time(&at))
+    }
 }
 
 fn chat_mode(mode: SessionMode) -> ChatMode {
