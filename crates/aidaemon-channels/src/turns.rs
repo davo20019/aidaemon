@@ -879,6 +879,12 @@ pub fn status_line(update: &StatusUpdate) -> String {
             label,
             progress: step,
         } => progress(format!("🤖 {label}: {step}")),
+        StatusUpdate::HelperStarted { label } => {
+            progress(crate::live_status::helper_started_line(label))
+        }
+        StatusUpdate::StepHandedOff { name, to_helper } => progress(
+            crate::live_status::step_handed_off_line(name, *to_helper),
+        ),
     }
 }
 

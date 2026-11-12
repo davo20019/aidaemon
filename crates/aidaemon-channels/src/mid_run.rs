@@ -101,6 +101,17 @@ impl LiveWork {
                 progress.plan = Some(text.clone());
                 None
             }
+            StatusUpdate::HelperStarted { label } => {
+                if !progress.helpers.iter().any(|h| h.label == *label) {
+                    progress.helpers.push(Helper {
+                        label: label.clone(),
+                        progress: "starting".to_string(),
+                        at: now,
+                        started: now,
+                    });
+                }
+                None
+            }
             StatusUpdate::SubAgentProgress {
                 label,
                 progress: line,

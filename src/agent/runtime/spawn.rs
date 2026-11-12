@@ -3047,6 +3047,21 @@ impl Agent {
             .clone()
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| mission.to_string());
+        // Listed by `/status` and `/tasks` in the chat it reports to from the
+        // moment it is created, waited on or in the background: its setup
+        // (the specialist's tools, its route, its event) is the child's own
+        // time, and a status read during it must not say no helper runs
+        // (live 2026-11-12). Dropped however this call ends.
+        let listed = effective_approval_session_id.as_deref().map(|chat| {
+            self.running_children
+                .enter(chat, &card_name, task, &child_session)
+        });
+        // Each helper gets its own start line on the chat's card.
+        if let Some(tx) = status_tx.as_ref() {
+            let _ = tx.try_send(StatusUpdate::HelperStarted {
+                label: child_status_label(&card_name),
+            });
+        }
         // Emit SubAgentSpawn event
         {
             let emitter =
@@ -3154,12 +3169,6 @@ impl Agent {
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
         let _on_roster = roster_entry;
-        // Listed by `/status` and `/tasks` in the chat it reports to while it
-        // runs, waited on or in the background.
-        let listed = effective_approval_session_id.as_deref().map(|chat| {
-            self.running_children
-                .enter(chat, &card_name, task, &child_session)
-        });
         let owner_stop = listed.as_ref().map(RunningChildEntry::stopped);
         let owner_stopped = async {
             match owner_stop.as_ref() {

@@ -935,7 +935,20 @@ impl Agent {
                         crate::agent::tool_execution::summarize_completed_tool_result(&output)
                     }
                 });
-                Some(StatusUpdate::ToolComplete { name, summary })
+                // A step that handed its work to a helper or a background
+                // job has not finished: its line says the work goes on
+                // (typed from the outcome, never from its text).
+                let handed_off = metadata.as_ref().is_some_and(|metadata| {
+                    metadata.background_handoff || metadata.background_started
+                });
+                Some(if handed_off {
+                    StatusUpdate::StepHandedOff {
+                        name,
+                        to_helper: facts.spawns_child_agents,
+                    }
+                } else {
+                    StatusUpdate::ToolComplete { name, summary }
+                })
             };
             if let Some(update) = update {
                 let _ = status_tx.try_send(update);

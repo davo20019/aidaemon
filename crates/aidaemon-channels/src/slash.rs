@@ -311,15 +311,21 @@ fn cancel_hint(running: &crate::stop::WorkList) -> &'static str {
 }
 
 /// `/tasks`: everything running for the chat (its turn, sub-agents and
-/// background commands), numbered for `/cancel`, and its failed turns.
+/// background commands), numbered for `/cancel`, and its failed turns. The
+/// reply is a snapshot that stays in the chat, so it says when it was taken
+/// (`as_of`, the owner's clock) and never reads as live later.
 pub fn render_tasks(
     running: &crate::stop::WorkList,
     failed: &[crate::tasks::TaskEntry],
     now: DateTime<Utc>,
+    as_of: Option<&str>,
 ) -> String {
+    let stamp = as_of.map(|at| format!("As of {at}:\n"));
+    let stamp = stamp.as_deref().unwrap_or("");
     if running.entries.is_empty() && failed.is_empty() {
-        return "Nothing is running in this chat right now. Use /work to see durable work items."
-            .to_string();
+        return format!(
+            "{stamp}Nothing is running in this chat right now. Use /work to see durable work items."
+        );
     }
     let mut sections = Vec::new();
     if running.entries.is_empty() {
@@ -347,14 +353,14 @@ pub fn render_tasks(
         sections.push(format!("Recently failed:\n{}", lines.join("\n")));
     }
     sections.push("Use /work for durable work items.".to_string());
-    sections.join("\n\n")
+    format!("{stamp}{}", sections.join("\n\n"))
 }
 
 /// `/status`: the chat's mode, what is running and what is scheduled next.
 pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
     let mode = mode_line(view.mode, now);
     let mut lines = vec![match &view.now {
-        Some(local) => format!("It's {local}. {mode}"),
+        Some(local) => format!("As of {local}: {mode}"),
         None => mode,
     }];
     if view.running.entries.is_empty() {
@@ -379,6 +385,16 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         None => "Next scheduled: nothing.".to_string(),
     });
     lines.join("\n")
+}
+
+/// What a `/clear` or `/wipe` stopped, as one list: the chat's cancelled
+/// turns (named as `/tasks` names them) before its sub-agents and commands,
+/// so no separate count can disagree with the list (live 2026-11-12: "(1
+/// running task cancelled.)" over two stopped sub-agents).
+fn stopped_with_turns(turns: usize, work: Vec<String>) -> Vec<String> {
+    let mut stopped = vec![crate::stop::TURN_LABEL.to_string(); turns];
+    stopped.extend(work);
+    stopped
 }
 
 /// The end of a `/clear` or `/wipe` reply: what else was cancelled, then
@@ -788,7 +804,8 @@ impl SharedCommands {
             .into_iter()
             .filter(|entry| matches!(entry.status, TaskStatus::Failed(_)))
             .collect::<Vec<_>>();
-        render_tasks(&running, &failed, Utc::now())
+        let now = Utc::now();
+        render_tasks(&running, &failed, now, self.host.owner_time(now).as_deref())
     }
 
     /// `/cancel`: everything running when it comes from one request (else
@@ -837,13 +854,6 @@ impl SharedCommands {
         match self.agent.clear_session_context(session_id).await {
             Ok(_) => {
                 let mut cancellations = Vec::new();
-                if !cancelled_tasks.is_empty() {
-                    cancellations.push(format!(
-                        "{} running task{}",
-                        cancelled_tasks.len(),
-                        if cancelled_tasks.len() == 1 { "" } else { "s" }
-                    ));
-                }
                 if !cancelled_goals.is_empty() {
                     cancellations.push(format!(
                         "{} background goal{}",
@@ -851,7 +861,8 @@ impl SharedCommands {
                         if cancelled_goals.len() == 1 { "" } else { "s" }
                     ));
                 }
-                let suffix = clear_suffix(&cancellations, &stopped_work);
+                let stopped = stopped_with_turns(cancelled_tasks.len(), stopped_work);
+                let suffix = clear_suffix(&cancellations, &stopped);
                 format!(
                     "Context cleared. Starting fresh – your history is kept; use /wipe to \
                      delete this chat's history.{suffix}"
@@ -873,15 +884,8 @@ impl SharedCommands {
         // Destructive: erases this session's active database artifacts.
         match self.agent.clear_session(session_id).await {
             Ok(_) => {
-                let mut cancellations = Vec::new();
-                if !cancelled.is_empty() {
-                    cancellations.push(format!(
-                        "{} running task{}",
-                        cancelled.len(),
-                        if cancelled.len() == 1 { "" } else { "s" }
-                    ));
-                }
-                let suffix = clear_suffix(&cancellations, &stopped_work);
+                let stopped = stopped_with_turns(cancelled.len(), stopped_work);
+                let suffix = clear_suffix(&[], &stopped);
                 format!(
                     "Conversation erased from the active database (events, exact-search index, \
                      summaries, episodes, and raw memory spans). Facts already saved to memory \
@@ -1109,7 +1113,7 @@ mod help_and_status_tests {
                 "req-1",
             ),
         ]);
-        let tasks = render_tasks(&running, &[], now);
+        let tasks = render_tasks(&running, &[], now, None);
         assert!(
             tasks.starts_with("Running in this chat:\n#7 Working on your message (40s so far)"),
             "{tasks}"
@@ -1126,10 +1130,57 @@ mod help_and_status_tests {
             tasks.contains("Send /cancel to stop all of it, or /cancel <number> for one."),
             "{tasks}"
         );
-        let quiet = render_tasks(&crate::stop::WorkList::default(), &[], now);
+        let quiet = render_tasks(&crate::stop::WorkList::default(), &[], now, None);
         assert!(
             quiet.starts_with("Nothing is running in this chat right now."),
             "{quiet}"
+        );
+    }
+
+    /// A `/tasks` reply stays in the chat after the work it lists has moved
+    /// on, so it says when it was read (live 2026-11-12: an old "#1 Working
+    /// on your message" reply looked current).
+    #[test]
+    fn tasks_says_when_it_was_read() {
+        let now = Utc::now();
+        let running = crate::stop::WorkList::for_tests(vec![(
+            1,
+            crate::stop::TURN_LABEL,
+            now - chrono::Duration::seconds(40),
+            "req-1",
+        )]);
+        let tasks = render_tasks(&running, &[], now, Some("5:44 PM ET"));
+        assert!(
+            tasks.starts_with(
+                "As of 5:44 PM ET:\nRunning in this chat:\n#1 Working on your message"
+            ),
+            "{tasks}"
+        );
+        let quiet = render_tasks(
+            &crate::stop::WorkList::default(),
+            &[],
+            now,
+            Some("5:44 PM ET"),
+        );
+        assert!(
+            quiet.starts_with("As of 5:44 PM ET:\nNothing is running"),
+            "{quiet}"
+        );
+    }
+
+    /// `/clear` names the turn it cancelled in the same list as the helpers
+    /// it stopped, with no separate count to disagree with that list.
+    #[test]
+    fn clear_lists_the_cancelled_turn_with_the_stopped_helpers() {
+        let stopped = stopped_with_turns(
+            1,
+            vec!["Sub-agent: Counter A".into(), "Sub-agent: Counter B".into()],
+        );
+        let suffix = clear_suffix(&[], &stopped);
+        assert!(!suffix.contains("cancelled"), "{suffix}");
+        assert_eq!(
+            suffix,
+            "\n\n⏹️ Stopped:\n• Working on your message\n• Sub-agent: Counter A\n• Sub-agent: Counter B"
         );
     }
 
@@ -1183,7 +1234,7 @@ mod help_and_status_tests {
         };
         let status = render_status(&busy, now);
         assert!(
-            status.starts_with("It's 2:05 PM ET. Mode: read-only (about 3h left)."),
+            status.starts_with("As of 2:05 PM ET: Mode: read-only (about 3h left)."),
             "{status}"
         );
         assert!(
