@@ -11,7 +11,8 @@
 
 use std::path::Path;
 
-use super::*;
+use aidaemon_events::traits::Message;
+
 
 #[cfg(test)]
 fn is_generic_non_project_token(token: &str) -> bool {
@@ -67,14 +68,14 @@ fn is_likely_filename(token: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(in crate::agent) fn token_looks_like_filesystem_path(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn token_looks_like_filesystem_path(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     token: &str,
 ) -> bool {
     // A shape hint for classifying a message, not a resolution of the user's
     // project: the process cwd is acceptable evidence of shape here.
     let cwd = std::env::current_dir().ok();
-    crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+    aidaemon_tools::fs_utils::resolve_structural_filesystem_reference_from(
         backend,
         token,
         &[],
@@ -84,12 +85,12 @@ pub(in crate::agent) fn token_looks_like_filesystem_path(
 }
 
 fn token_looks_like_project_scope_path(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     token: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) -> bool {
-    crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+    aidaemon_tools::fs_utils::resolve_structural_filesystem_reference_from(
         backend,
         token,
         alias_roots,
@@ -232,7 +233,7 @@ fn push_project_hint(hints: &mut Vec<String>, hint: String, max_hints: usize) {
 }
 
 #[cfg(test)]
-pub(super) fn extract_project_hints_from_text(
+pub fn extract_project_hints_from_text(
     text: &str,
     hints: &mut Vec<String>,
     max_hints: usize,
@@ -244,8 +245,8 @@ pub(super) fn extract_project_hints_from_text(
         }
         let uri_like = raw.contains("://");
         let path_like = uri_like
-            || crate::tools::fs_utils::resolve_structural_filesystem_reference(
-                &*crate::execution::active_execution_backend(),
+            || aidaemon_tools::fs_utils::resolve_structural_filesystem_reference(
+                &*aidaemon_tools::testing::active_execution_backend(),
                 raw,
                 &[],
             )
@@ -260,7 +261,7 @@ pub(super) fn extract_project_hints_from_text(
 }
 
 #[cfg(test)]
-pub(super) fn extract_project_hints_from_history(
+pub fn extract_project_hints_from_history(
     history: &[Message],
     current_user_text: &str,
     max_hints: usize,
@@ -294,12 +295,12 @@ pub(super) fn extract_project_hints_from_history(
 }
 
 #[cfg(test)]
-pub(super) fn normalize_project_scope_path_with_aliases(
+pub fn normalize_project_scope_path_with_aliases(
     raw_path: &str,
     alias_roots: &[String],
 ) -> Option<String> {
     normalize_project_scope_path_anchored(
-        &*crate::execution::active_execution_backend(),
+        &*aidaemon_tools::testing::active_execution_backend(),
         raw_path,
         alias_roots,
         None,
@@ -307,12 +308,12 @@ pub(super) fn normalize_project_scope_path_with_aliases(
 }
 
 fn normalize_project_scope_path_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     raw_path: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) -> Option<String> {
-    crate::tools::fs_utils::resolve_project_scope_reference_from(
+    aidaemon_tools::fs_utils::resolve_project_scope_reference_from(
         backend,
         raw_path,
         alias_roots,
@@ -321,15 +322,15 @@ fn normalize_project_scope_path_anchored(
     .map(|path| path.to_string_lossy().to_string())
 }
 
-pub(super) fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
+pub fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
     if scopes.len() >= max_scopes || scopes.iter().any(|existing| existing == &scope) {
         return;
     }
     scopes.push(scope);
 }
 
-pub(super) fn extract_project_scopes_from_text(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_project_scopes_from_text(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
@@ -342,8 +343,8 @@ pub(super) fn extract_project_scopes_from_text(
 /// from the text.  Contextual nickname matching (e.g. "modern" → modern-plants-site)
 /// is skipped.  Use this for the current user message to avoid false positives
 /// from common English words that happen to match project directory prefixes.
-pub(super) fn extract_explicit_path_scopes_from_text(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_explicit_path_scopes_from_text(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
@@ -354,8 +355,8 @@ pub(super) fn extract_explicit_path_scopes_from_text(
 
 /// [`extract_explicit_path_scopes_from_text`] with relative paths anchored to
 /// the turn's typed workspace instead of the daemon cwd.
-pub(super) fn extract_explicit_path_scopes_from_text_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_explicit_path_scopes_from_text_anchored(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
@@ -373,12 +374,12 @@ pub(super) fn extract_explicit_path_scopes_from_text_anchored(
 }
 
 #[cfg(test)]
-pub(super) fn extract_exact_filesystem_resources_from_text(
+pub fn extract_exact_filesystem_resources_from_text(
     text: &str,
     alias_roots: &[String],
 ) -> Vec<String> {
     extract_exact_filesystem_resources_from_text_anchored(
-        &*crate::execution::active_execution_backend(),
+        &*aidaemon_tools::testing::active_execution_backend(),
         text,
         alias_roots,
         None,
@@ -390,15 +391,15 @@ pub(super) fn extract_exact_filesystem_resources_from_text(
 /// broaden a resource to its workspace; permission grounding must not.
 /// Relative references are anchored to the turn's typed workspace (or the
 /// daemon cwd when the turn has none).
-pub(super) fn extract_exact_filesystem_resources_from_text_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_exact_filesystem_resources_from_text_anchored(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
     workspace_anchor: Option<&Path>,
 ) -> Vec<String> {
     let mut resources = Vec::new();
     for token in structural_filesystem_reference_tokens(text) {
-        let Some(path) = crate::tools::fs_utils::resolve_structural_filesystem_reference_from(
+        let Some(path) = aidaemon_tools::fs_utils::resolve_structural_filesystem_reference_from(
             backend,
             &token,
             alias_roots,
@@ -459,7 +460,7 @@ fn structural_filesystem_reference_tokens(text: &str) -> Vec<String> {
 }
 
 fn extract_project_scopes_from_text_inner(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     scopes: &mut Vec<String>,
     max_scopes: usize,
@@ -490,38 +491,38 @@ fn extract_project_scopes_from_text_inner(
 }
 
 fn scope_looks_like_project_root(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     scope: &str,
 ) -> bool {
-    if backend.kind() != crate::execution::BackendKind::Local {
-        let Ok(path) = crate::execution::normalize_path_lexically(backend, scope) else {
+    if backend.kind() != aidaemon_tools::BackendKind::Local {
+        let Ok(path) = aidaemon_tools::backend::normalize_path_lexically(backend, scope) else {
             return false;
         };
         return std::path::Path::new(path.as_str())
             .starts_with(std::path::Path::new(backend.workspace_root().as_str()));
     }
 
-    let Ok(path) = crate::tools::fs_utils::validate_path(backend, scope) else {
+    let Ok(path) = aidaemon_tools::fs_utils::validate_path(backend, scope) else {
         return false;
     };
     if !path.is_dir() {
         return false;
     }
-    crate::tools::fs_utils::find_nearest_project_root(&path).is_some_and(|root| root == path)
+    aidaemon_tools::fs_utils::find_nearest_project_root(&path).is_some_and(|root| root == path)
 }
 
 /// Drop scopes inside the attachment inbox. The notice for a received file
 /// names its saved path, so carried-over text would otherwise make daemon
 /// storage the task's project and confine the turn to it.
-pub(super) fn drop_inbox_scopes(scopes: &mut Vec<String>, inbox: Option<&Path>) {
+pub fn drop_inbox_scopes(scopes: &mut Vec<String>, inbox: Option<&Path>) {
     let Some(inbox) = inbox else {
         return;
     };
     scopes.retain(|scope| !Path::new(scope).starts_with(inbox));
 }
 
-pub(super) fn choose_primary_project_scope(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn choose_primary_project_scope(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     scopes: &[String],
 ) -> Option<String> {
     scopes
@@ -538,7 +539,7 @@ pub(super) fn choose_primary_project_scope(
 /// Without this, only the first scope is used, and writes to sibling
 /// directories are blocked by the scope guard (e.g. scope locks to
 /// `/blog/posts` but the user also asked to write `/blog/tweets.md`).
-pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
+pub fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
     if scopes.len() <= 1 {
         return scopes.first().cloned();
     }
@@ -595,12 +596,12 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
 /// one resolved from mission or request text, an attempt workspace) still
 /// steers where tools run but is never a trusted root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceBindingOrigin {
+pub enum WorkspaceBindingOrigin {
     Explicit,
     Inferred,
 }
 
-pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
+pub fn bound_workspace_from_goal_context(context: Option<&str>) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(context?).ok()?;
     typed_workspace_binding(value.get("project_scope")?.as_str())
 }
@@ -608,13 +609,13 @@ pub(crate) fn bound_workspace_from_goal_context(context: Option<&str>) -> Option
 /// Accept a runtime-supplied scope as a typed workspace binding only when it
 /// is an existing absolute directory. Anything else (a stale or relative
 /// spelling, a file) is not a binding and must not anchor or confine a turn.
-pub(crate) fn typed_workspace_binding(scope: Option<&str>) -> Option<String> {
+pub fn typed_workspace_binding(scope: Option<&str>) -> Option<String> {
     let scope = scope?.trim();
     let path = Path::new(scope);
     (path.is_absolute() && path.is_dir()).then(|| scope.to_string())
 }
 
-pub(super) fn resolve_primary_project_scope(
+pub fn resolve_primary_project_scope(
     extracted_primary_scope: Option<String>,
     inherited_project_scope: Option<&str>,
     allow_multi_project_scope: bool,
@@ -638,7 +639,7 @@ pub(super) fn resolve_primary_project_scope(
 }
 
 #[cfg(test)]
-pub(super) fn extract_project_scopes_from_history(
+pub fn extract_project_scopes_from_history(
     history: &[Message],
     current_user_text: &str,
     max_scopes: usize,
@@ -646,7 +647,7 @@ pub(super) fn extract_project_scopes_from_history(
     alias_roots: &[String],
 ) -> Vec<String> {
     extract_project_scopes_from_history_anchored(
-        &*crate::execution::active_execution_backend(),
+        &*aidaemon_tools::testing::active_execution_backend(),
         history,
         current_user_text,
         max_scopes,
@@ -659,8 +660,8 @@ pub(super) fn extract_project_scopes_from_history(
 /// Collect project scopes from the current request and (optionally) prior
 /// user turns, with relative paths anchored to the turn's typed workspace (or
 /// the daemon cwd when the turn has none).
-pub(super) fn extract_project_scopes_from_history_anchored(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_project_scopes_from_history_anchored(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     history: &[Message],
     current_user_text: &str,
     max_scopes: usize,
@@ -710,12 +711,12 @@ mod tests {
     use super::*;
 
     fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
-        super::choose_primary_project_scope(&*crate::execution::active_execution_backend(), scopes)
+        super::choose_primary_project_scope(&*aidaemon_tools::testing::active_execution_backend(), scopes)
     }
 
     fn token_looks_like_filesystem_path(token: &str) -> bool {
         super::token_looks_like_filesystem_path(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             token,
         )
     }
@@ -727,7 +728,7 @@ mod tests {
         alias_roots: &[String],
     ) {
         super::extract_project_scopes_from_text(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             text,
             scopes,
             max_scopes,
@@ -742,7 +743,7 @@ mod tests {
         alias_roots: &[String],
     ) {
         super::extract_explicit_path_scopes_from_text(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             text,
             scopes,
             max_scopes,
@@ -1323,10 +1324,10 @@ mod tests {
     }
     #[test]
     fn first_dir_component_exists_filters_correctly() {
-        assert!(crate::tools::fs_utils::first_dir_component_exists(
+        assert!(aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/tmp/test")
         ));
-        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+        assert!(!aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/api/notes")
         ));
     }

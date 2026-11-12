@@ -35,6 +35,7 @@ aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
 aidaemon-work = { version = "0.2.0", path = "../aidaemon-work" }
 anyhow = "1"
 async-trait = "0.1"
+dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 futures = "0.3"
 once_cell = "1"
@@ -55,5 +56,7 @@ uuid = { version = "1", features = ["v4"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

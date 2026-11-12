@@ -113,7 +113,7 @@ mod recall_guardrails {
 }
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
-use loop_utils::{extract_command_from_args, fixup_message_ordering, is_trigger_session};
+use loop_utils::{fixup_message_ordering, is_trigger_session};
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
@@ -137,8 +137,10 @@ mod closeout {
 mod completion_checks {
     pub(in crate::agent) use aidaemon_runtime::turn::completion_checks::*;
 }
-#[path = "runtime/completion_contract.rs"]
-mod completion_contract;
+/// Completion contracts live in `aidaemon-runtime`.
+mod completion_contract {
+    pub(in crate::agent) use aidaemon_runtime::turn::completion_contract::*;
+}
 pub(crate) mod conversation_compaction;
 #[path = "runtime/coordination.rs"]
 pub(crate) mod coordination;
@@ -148,10 +150,17 @@ mod core_prompt {
 }
 #[path = "runtime/deferred_retry.rs"]
 mod deferred_retry;
-#[path = "runtime/dialogue_state.rs"]
-mod dialogue_state;
-#[path = "runtime/followup.rs"]
-mod followup;
+/// Dialogue state lives in `aidaemon-runtime`.
+mod dialogue_state {
+    pub(in crate::agent) use aidaemon_runtime::turn::dialogue_state::*;
+}
+#[cfg(test)]
+#[path = "runtime/dialogue_state_tests.rs"]
+mod dialogue_state_tests;
+/// Follow-up classification lives in `aidaemon-runtime`.
+mod followup {
+    pub(in crate::agent) use aidaemon_runtime::turn::followup::*;
+}
 #[path = "runtime/graceful.rs"]
 mod graceful;
 #[path = "runtime/history.rs"]
@@ -165,8 +174,10 @@ mod notes;
 mod parent_delivery;
 #[path = "turn/post_turn.rs"]
 mod post_turn;
-#[path = "runtime/project_scope.rs"]
-mod project_scope;
+/// Project scopes live in `aidaemon-runtime`.
+mod project_scope {
+    pub(in crate::agent) use aidaemon_runtime::turn::project_scope::*;
+}
 #[path = "runtime/sdk_engine.rs"]
 pub(crate) mod sdk_engine;
 #[path = "runtime/sdk_provider.rs"]
@@ -187,8 +198,6 @@ pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
-pub(in crate::agent) use history::VerificationTarget;
-pub(in crate::agent) use history::VerificationTargetKind;
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
@@ -213,6 +222,7 @@ mod prefix_fingerprint {
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
+mod turn_host;
 /// Tool-result summaries live in `aidaemon-runtime`.
 mod sliding_window {
     pub(in crate::agent) use aidaemon_runtime::turn::sliding_window::*;
@@ -281,8 +291,7 @@ pub(in crate::agent) use agent_helpers::{
 pub use agent_helpers::{send_status, touch_heartbeat};
 #[cfg(test)]
 pub(in crate::agent) use agent_helpers::{
-    text_has_explicit_project_scope_cues, user_explicitly_requests_local_file_inspection,
-    user_text_references_filesystem_path,
+    user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
 };
 
 /// Phase 0 per-session window-boundary memory: `session_id` →

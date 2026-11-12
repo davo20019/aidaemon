@@ -2,14 +2,19 @@
 //!
 //! This module was split out of `run.rs` to keep that file under the size
 //! budget. All items are moved verbatim — no logic changes. Visibility is
-//! `pub(super)` so `run.rs` can call them via `super::run_helpers::*`.
+//! public so the daemon's dispatcher calls them.
 
-use crate::agent::*;
-use crate::traits::{
+use serde_json::Value;
+
+use super::completion_contract::{
+    CompletionContract, CompletionProgress, VerificationTarget, VerificationTargetKind,
+};
+use super::loop_utils::extract_command_from_args;
+use aidaemon_events::traits::{
     RequestEvidenceRequirement, RequestVerificationTargetKind, ToolCallSemantics, ToolTargetHint,
     ToolTargetHintKind,
 };
-use crate::utils::{truncate_str, truncate_with_note};
+use aidaemon_tools::text::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
 const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
@@ -27,12 +32,12 @@ const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
 /// with a typed sandbox denial if it genuinely needed the wider root. Write
 /// roots are never attenuated; an unauthorized write stays a violation.
 /// Returns the stripped roots (empty when nothing changed).
-pub(in crate::agent) fn attenuate_unauthorized_read_roots(
+pub fn attenuate_unauthorized_read_roots(
     arguments: &mut Value,
-    task: Option<&crate::traits::ToolCallAccessManifest>,
+    task: Option<&aidaemon_events::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
-    paths: &crate::tools::DaemonPaths,
+    paths: &aidaemon_tools::path_class::DaemonPaths,
 ) -> Vec<String> {
     let Some(object) = arguments.as_object_mut() else {
         return Vec::new();
@@ -52,7 +57,7 @@ pub(in crate::agent) fn attenuate_unauthorized_read_roots(
         let Some(hint) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, value) else {
             continue;
         };
-        let probe = crate::traits::ToolCallAccessManifest {
+        let probe = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: execution_cwd.map(str::to_string),
             read_targets: vec![hint],
             write_targets: Vec::new(),
@@ -79,7 +84,7 @@ pub(in crate::agent) fn attenuate_unauthorized_read_roots(
     stripped
 }
 
-pub(in crate::agent) fn blocked_for_untrusted_external_reference_message(
+pub fn blocked_for_untrusted_external_reference_message(
     tool_name: &str,
     active_skills: &[String],
 ) -> String {
@@ -103,7 +108,7 @@ Use API/auth tools directly, or ask explicitly for local file or repository insp
 /// cwd selects process location and is never implicit data authority.
 /// Outcome of checking a call's access manifest against task authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::agent) enum ScopeCheck {
+pub enum ScopeCheck {
     /// The call must not run: protected host data, a credential store, or an
     /// undeclared write outside the task boundary.
     Rejected(String),
@@ -112,12 +117,12 @@ pub(in crate::agent) enum ScopeCheck {
     /// project). The tool must obtain that authority before running.
     Escalatable {
         reason: String,
-        escalation: crate::traits::ScopeEscalation,
+        escalation: aidaemon_events::traits::ScopeEscalation,
     },
 }
 
 impl ScopeCheck {
-    pub(super) fn reason(&self) -> &str {
+    pub fn reason(&self) -> &str {
         match self {
             ScopeCheck::Rejected(reason) | ScopeCheck::Escalatable { reason, .. } => reason,
         }
@@ -129,9 +134,9 @@ impl ScopeCheck {
 /// ladder that renders the exact capability being requested.
 /// Whether a call names a path the guessed scope still protects: credential
 /// stores and the like stay refused outside it, as they always were.
-pub(in crate::agent) fn names_sensitive_path(
-    manifest: &crate::traits::ToolCallAccessManifest,
-    paths: &crate::tools::DaemonPaths,
+pub fn names_sensitive_path(
+    manifest: &aidaemon_events::traits::ToolCallAccessManifest,
+    paths: &aidaemon_tools::path_class::DaemonPaths,
 ) -> bool {
     manifest
         .read_targets
@@ -140,17 +145,17 @@ pub(in crate::agent) fn names_sensitive_path(
         .any(|target| paths.is_sensitive(std::path::Path::new(&target.value)))
 }
 
-pub(in crate::agent) fn tool_supports_scope_escalation(tool_name: &str) -> bool {
+pub fn tool_supports_scope_escalation(tool_name: &str) -> bool {
     tool_name == "terminal"
 }
 
-pub(super) fn access_manifest_scope_violation(
+pub fn access_manifest_scope_violation(
     tool_name: &str,
-    call: &crate::traits::ToolCallAccessManifest,
-    task: Option<&crate::traits::ToolCallAccessManifest>,
+    call: &aidaemon_events::traits::ToolCallAccessManifest,
+    task: Option<&aidaemon_events::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
-    paths: &crate::tools::DaemonPaths,
+    paths: &aidaemon_tools::path_class::DaemonPaths,
 ) -> Option<String> {
     access_manifest_scope_check(tool_name, call, task, fallback_scopes, execution_cwd, paths)
         .map(|check| check.reason().to_string())
@@ -161,7 +166,7 @@ pub(super) fn access_manifest_scope_violation(
 /// physically), and the rest is resolved lexically (`.` dropped, `..` pops).
 /// A relative path is only resolved lexically; callers anchor relative
 /// targets to the execution cwd first.
-pub(in crate::agent) fn normalize_scope_path(raw: &str) -> std::path::PathBuf {
+pub fn normalize_scope_path(raw: &str) -> std::path::PathBuf {
     use std::path::{Component, Path, PathBuf};
     let path = Path::new(raw);
     let components: Vec<Component<'_>> = path.components().collect();
@@ -192,13 +197,13 @@ pub(in crate::agent) fn normalize_scope_path(raw: &str) -> std::path::PathBuf {
     resolved
 }
 
-pub(in crate::agent) fn access_manifest_scope_check(
+pub fn access_manifest_scope_check(
     tool_name: &str,
-    call: &crate::traits::ToolCallAccessManifest,
-    task: Option<&crate::traits::ToolCallAccessManifest>,
+    call: &aidaemon_events::traits::ToolCallAccessManifest,
+    task: Option<&aidaemon_events::traits::ToolCallAccessManifest>,
     fallback_scopes: &[String],
     execution_cwd: Option<&str>,
-    paths: &crate::tools::DaemonPaths,
+    paths: &aidaemon_tools::path_class::DaemonPaths,
 ) -> Option<ScopeCheck> {
     // Tools resolve relative targets against the execution cwd, so the
     // capability check must compare the same absolute path a directory grant
@@ -272,9 +277,9 @@ pub(in crate::agent) fn access_manifest_scope_check(
             matches!(
                 target.kind,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
-            ) && (crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+            ) && (aidaemon_tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            )) || crate::tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
+            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
                 &target.value,
             ))) && !covered_by(target, &call.adapter_read_targets)
         })
@@ -287,9 +292,9 @@ pub(in crate::agent) fn access_manifest_scope_check(
             matches!(
                 target.kind,
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
-            ) && (crate::tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
+            ) && (aidaemon_tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            )) || crate::tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
+            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
                 &target.value,
             )))
         })
@@ -388,7 +393,7 @@ pub(in crate::agent) fn access_manifest_scope_check(
     {
         return Some(ScopeCheck::Escalatable {
             reason,
-            escalation: crate::traits::ScopeEscalation {
+            escalation: aidaemon_events::traits::ScopeEscalation {
                 read_paths: invalid_reads,
                 write_paths: invalid_writes,
             },
@@ -399,11 +404,11 @@ pub(in crate::agent) fn access_manifest_scope_check(
 
 /// The reply for a turn a tool handed to the background without completion
 /// notifications: the tool's own first line.
-pub(in crate::agent) fn build_background_detach_ack(
+pub fn build_background_detach_ack(
     result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> String {
-    let first_line = crate::traits::first_primary_message_line(result_text, &[])
+    let first_line = aidaemon_events::traits::first_primary_message_line(result_text, &[])
         .unwrap_or_else(|| "The task is running in the background.".to_string());
     // Use structured tool metadata rather than inferring notification semantics
     // from rendered tool output text.
@@ -418,7 +423,7 @@ pub(in crate::agent) fn build_background_detach_ack(
     }
 }
 
-pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
+pub fn is_trivial_success_excerpt(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
     lower.is_empty()
         || lower == "ok"
@@ -429,14 +434,14 @@ pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
         || lower == "request completed successfully"
 }
 
-pub(in crate::agent) fn summarize_completed_tool_result(result_text: &str) -> String {
-    let summary = crate::traits::first_primary_message_line(result_text, &[])
+pub fn summarize_completed_tool_result(result_text: &str) -> String {
+    let summary = aidaemon_events::traits::first_primary_message_line(result_text, &[])
         .filter(|line| !line.trim().is_empty())
         .unwrap_or_else(|| "Completed".to_string());
     truncate_str(summary.trim(), TOOL_COMPLETE_SUMMARY_MAX_CHARS)
 }
 
-pub(super) fn has_nonzero_exit_code(text: &str) -> bool {
+pub fn has_nonzero_exit_code(text: &str) -> bool {
     // Detect "[exit code: N]" where N != 0.
     if let Some(pos) = text.to_ascii_lowercase().find("[exit code:") {
         let after = &text[pos + 11..];
@@ -451,11 +456,11 @@ pub(super) fn has_nonzero_exit_code(text: &str) -> bool {
     false
 }
 
-pub(in crate::agent) fn build_external_action_completion_ack(result_text: &str) -> String {
-    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+pub fn build_external_action_completion_ack(result_text: &str) -> String {
+    let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
     let filtered: String = primary
         .lines()
-        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
+        .filter(|l| !crate::message_content::is_internal_scaffolding_line(l))
         .collect::<Vec<_>>()
         .join("\n");
     let excerpt = filtered.trim();
@@ -482,13 +487,13 @@ pub(in crate::agent) fn build_external_action_completion_ack(result_text: &str) 
 /// raw data dump (observed live: 500 chars of clinical-trials JSON). Keep the
 /// excerpt only when it reads like a short prose result; otherwise replace it
 /// with an honest offer to summarize on request.
-pub(crate) fn user_facing_external_action_ack(ack: &str) -> String {
+pub fn user_facing_external_action_ack(ack: &str) -> String {
     const MARKER: &str = "\n\nLatest result:\n";
     let Some((status, excerpt)) = ack.split_once(MARKER) else {
         return ack.to_string();
     };
     let excerpt = excerpt.trim();
-    let short_prose = crate::agent::response_analysis::is_short_prose_excerpt(excerpt);
+    let short_prose = super::reply_checks::is_short_prose_excerpt(excerpt);
     if short_prose {
         return ack.to_string();
     }
@@ -498,8 +503,8 @@ pub(crate) fn user_facing_external_action_ack(ack: &str) -> String {
     )
 }
 
-pub(in crate::agent) fn should_build_external_action_ack(result_text: &str) -> bool {
-    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+pub fn should_build_external_action_ack(result_text: &str) -> bool {
+    let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
     let lower = primary.trim_start().to_ascii_lowercase();
     !lower.starts_with("request blocked:")
         && !lower.starts_with("blocked:")
@@ -508,7 +513,7 @@ pub(in crate::agent) fn should_build_external_action_ack(result_text: &str) -> b
         && !lower.starts_with("failed to ")
 }
 
-pub(in crate::agent) fn tool_result_contains_verifiable_evidence(
+pub fn tool_result_contains_verifiable_evidence(
     semantics: &ToolCallSemantics,
     result_text: &str,
 ) -> bool {
@@ -516,7 +521,7 @@ pub(in crate::agent) fn tool_result_contains_verifiable_evidence(
         return false;
     }
 
-    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
     let primary = primary.trim();
     !primary.is_empty()
         && !matches!(
@@ -530,10 +535,10 @@ pub(in crate::agent) fn tool_result_contains_verifiable_evidence(
 /// for intentionally negative observations such as a command exiting 1 with
 /// empty stdout/stderr: absence of stream bytes must not erase the exit
 /// receipt, while generic prose alone still cannot manufacture evidence.
-pub(in crate::agent) fn tool_result_or_metadata_contains_verifiable_evidence(
+pub fn tool_result_or_metadata_contains_verifiable_evidence(
     semantics: &ToolCallSemantics,
     result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> bool {
     tool_result_contains_verifiable_evidence(semantics, result_text)
         || (semantics.can_verify_with_result_content()
@@ -546,11 +551,11 @@ pub(in crate::agent) fn tool_result_or_metadata_contains_verifiable_evidence(
 /// Complete adapter-supplied result metadata with the exact semantics compiled
 /// for the dispatched call. Adapters own domain outcomes; the central runtime
 /// owns evidence routing, so neither side may accidentally erase the other.
-pub(in crate::agent) fn complete_tool_result_semantics(
+pub fn complete_tool_result_semantics(
     tool_name: &str,
     arguments: &str,
     registered_call_semantics: &ToolCallSemantics,
-    metadata: &mut crate::traits::ToolCallMetadata,
+    metadata: &mut aidaemon_events::traits::ToolCallMetadata,
 ) {
     if !metadata.invocation_stage.reached_dispatch() {
         // Rejection receipts describe the validation/policy boundary only.
@@ -564,19 +569,19 @@ pub(in crate::agent) fn complete_tool_result_semantics(
         .merge_missing_from(registered_call_semantics.clone());
     if metadata.semantics.evidence.is_empty() {
         metadata.semantics.evidence =
-            crate::agent::inquiry::evidence_capabilities_for_tool_call(tool_name, arguments);
+            crate::turn::inquiry::evidence_capabilities_for_tool_call(tool_name, arguments);
     }
     if metadata.semantics.evidence.is_empty() && metadata.semantics.observes_state() {
         metadata.semantics.evidence =
-            crate::agent::inquiry::evidence_capabilities_from_target_hints(
+            crate::turn::inquiry::evidence_capabilities_from_target_hints(
                 &metadata.semantics.target_hints,
             );
     }
     if metadata.semantics.observes_state()
         && !metadata.semantics.evidence.is_empty()
-        && metadata.semantics.verification_mode == crate::traits::ToolVerificationMode::None
+        && metadata.semantics.verification_mode == aidaemon_events::traits::ToolVerificationMode::None
     {
-        metadata.semantics.verification_mode = crate::traits::ToolVerificationMode::ResultContent;
+        metadata.semantics.verification_mode = aidaemon_events::traits::ToolVerificationMode::ResultContent;
     }
 }
 
@@ -614,7 +619,7 @@ fn normalized_url_value(value: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-pub(super) fn tool_target_hint_matches_contract_target(
+pub fn tool_target_hint_matches_contract_target(
     target_hint: &ToolTargetHint,
     contract_target: &VerificationTarget,
 ) -> bool {
@@ -658,7 +663,7 @@ pub(super) fn tool_target_hint_matches_contract_target(
     }
 }
 
-pub(super) fn verification_target_matches_haystack(
+pub fn verification_target_matches_haystack(
     target: &VerificationTarget,
     haystack: &str,
 ) -> bool {
@@ -712,12 +717,12 @@ pub(super) fn verification_target_matches_haystack(
     false
 }
 
-pub(in crate::agent) fn observation_matches_completion_contract(
+pub fn observation_matches_completion_contract(
     contract: &CompletionContract,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
     _result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> bool {
     if contract.verification_targets.is_empty() {
         return true;
@@ -770,7 +775,7 @@ fn requirement_target_matches(
     requirement: &RequestEvidenceRequirement,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> bool {
     let Some(target) = requirement.target.as_ref() else {
         return true;
@@ -813,7 +818,7 @@ fn requirement_target_matches(
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(in crate::agent) struct ReceiptPredicateEvaluation {
+pub struct ReceiptPredicateEvaluation {
     pub has_predicate: bool,
     pub tool_compatible: bool,
     pub exit_compatible: bool,
@@ -833,7 +838,7 @@ impl ReceiptPredicateEvaluation {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(in crate::agent) struct EvidenceRequirementEvaluation {
+pub struct EvidenceRequirementEvaluation {
     pub requirement_index: usize,
     pub matched: bool,
     pub exact_invocation: bool,
@@ -847,7 +852,7 @@ fn evaluate_receipt_predicate(
     requirement: &RequestEvidenceRequirement,
     requested_tool_name: &str,
     _result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> ReceiptPredicateEvaluation {
     let Some(receipt) = requirement.receipt.as_ref() else {
         return ReceiptPredicateEvaluation {
@@ -894,13 +899,13 @@ fn evaluate_receipt_predicate(
 /// Evaluate every lifecycle obligation against one typed receipt. The result
 /// is both the authoritative match input and causal telemetry: consumers no
 /// longer have to infer why a receipt failed from a generic validation loop.
-pub(in crate::agent) fn evaluate_evidence_requirements(
+pub fn evaluate_evidence_requirements(
     contract: &CompletionContract,
     requested_tool_name: &str,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
     result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> Vec<EvidenceRequirementEvaluation> {
     let read_selection_compatible = metadata
         .read_file
@@ -912,10 +917,10 @@ pub(in crate::agent) fn evaluate_evidence_requirements(
         .enumerate()
         .map(|(requirement_index, requirement)| {
             let exact_invocation =
-                crate::agent::inquiry::requirement_is_exact_invocation(requirement);
+                crate::turn::inquiry::requirement_is_exact_invocation(requirement);
             let capability_compatible = exact_invocation
                 || semantics.evidence.iter().any(|capability| {
-                    crate::agent::inquiry::capability_supports_requirement(capability, requirement)
+                    crate::turn::inquiry::capability_supports_requirement(capability, requirement)
                 });
             let receipt =
                 evaluate_receipt_predicate(requirement, requested_tool_name, result_text, metadata);
@@ -940,13 +945,13 @@ pub(in crate::agent) fn evaluate_evidence_requirements(
 /// Return the exact machine-checkable evidence obligations supported by one
 /// observation receipt. Free-form subject words never decide task completion;
 /// only typed capabilities, receipt fields, and structural target identity do.
-pub(in crate::agent) fn matching_evidence_requirement_indices(
+pub fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
     requested_tool_name: &str,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
     result_text: &str,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> Vec<usize> {
     evaluate_evidence_requirements(
         contract,
@@ -961,13 +966,13 @@ pub(in crate::agent) fn matching_evidence_requirement_indices(
     .collect()
 }
 
-pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
+pub fn evidence_requirement_accepts_nonstandard_outcome(
     requirement: &RequestEvidenceRequirement,
-    metadata: &crate::traits::ToolCallMetadata,
+    metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> bool {
     requirement.receipt.as_ref().is_some_and(|receipt| {
         metadata.outcome_status.is_some_and(|actual| {
-            actual != crate::traits::ToolOutcomeStatus::Succeeded
+            actual != aidaemon_events::traits::ToolOutcomeStatus::Succeeded
                 && receipt.outcome_matches(
                     actual,
                     metadata.invocation_stage,
@@ -981,13 +986,13 @@ pub(in crate::agent) fn evidence_requirement_accepts_nonstandard_outcome(
 
 /// Compatibility shim for persisted schema-v7 marker state. Content markers
 /// are advisory and cannot close a lifecycle obligation.
-pub(in crate::agent) fn accumulate_evidence_requirement_marker_matches(
+pub fn accumulate_evidence_requirement_marker_matches(
     _contract: &CompletionContract,
     _progress: &mut CompletionProgress,
     _semantics: &ToolCallSemantics,
     _raw_arguments: &str,
     _result_text: &str,
-    _metadata: &crate::traits::ToolCallMetadata,
+    _metadata: &aidaemon_events::traits::ToolCallMetadata,
 ) -> Vec<usize> {
     Vec::new()
 }
@@ -998,9 +1003,9 @@ pub(in crate::agent) fn accumulate_evidence_requirement_marker_matches(
 /// enough to turn a partial/tail read into evidence for a bounded range.
 fn read_receipt_covers_requested_selection(
     raw_arguments: &str,
-    read: &crate::traits::ReadFileResultMetadata,
+    read: &aidaemon_events::traits::ReadFileResultMetadata,
 ) -> bool {
-    use crate::traits::ReadFileSelectionMetadata;
+    use aidaemon_events::traits::ReadFileSelectionMetadata;
 
     if read.truncated || !read_receipt_has_complete_content(read) {
         return false;
@@ -1075,7 +1080,7 @@ fn read_receipt_covers_requested_selection(
     }
 }
 
-fn read_receipt_has_complete_content(read: &crate::traits::ReadFileResultMetadata) -> bool {
+fn read_receipt_has_complete_content(read: &aidaemon_events::traits::ReadFileResultMetadata) -> bool {
     if read.total_lines == 0 {
         return read.selected_lines.is_empty()
             && read.returned_start_line.is_none()
@@ -1093,27 +1098,27 @@ fn read_receipt_has_complete_content(read: &crate::traits::ReadFileResultMetadat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::ToolVerificationMode;
+    use aidaemon_events::traits::ToolVerificationMode;
 
     #[test]
     fn adapter_outcome_metadata_retains_registered_observation_semantics() {
         let arguments = r#"{"action":"search","query":"synthetic pets"}"#;
-        let registered = crate::traits::semantics_for_exact_read_actions(
+        let registered = aidaemon_events::traits::semantics_for_exact_read_actions(
             arguments,
             &["search"],
-            crate::traits::ToolMutationEffects::NONE,
+            aidaemon_events::traits::ToolMutationEffects::NONE,
         );
-        let mut metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
-            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-            ..crate::traits::ToolCallMetadata::default()
+        let mut metadata = aidaemon_events::traits::ToolCallMetadata {
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         complete_tool_result_semantics("manage_memories", arguments, &registered, &mut metadata);
 
         assert!(metadata.semantics.observes_state());
         assert!(metadata.semantics.evidence.iter().any(|capability| {
-            capability.scope == crate::traits::ToolSemanticScope::UserMemory
+            capability.scope == aidaemon_events::traits::ToolSemanticScope::UserMemory
         }));
         assert!(tool_result_or_metadata_contains_verifiable_evidence(
             &metadata.semantics,
@@ -1126,11 +1131,11 @@ mod tests {
     fn structured_negative_process_outcome_is_evidence_without_stream_bytes() {
         let semantics = ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent);
-        let metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
             semantics: semantics.clone(),
-            ..crate::traits::ToolCallMetadata::default()
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert!(tool_result_or_metadata_contains_verifiable_evidence(
@@ -1140,7 +1145,7 @@ mod tests {
 
     #[test]
     fn typed_process_outcome_is_not_vetoed_by_reply_format_markers() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             RequestReceiptPredicate, ToolOutcomeStatus, ToolSemanticScope,
         };
@@ -1170,12 +1175,12 @@ mod tests {
         let raw_arguments = r#"{"command":"/usr/bin/false","working_dir":"/tmp"}"#;
         let registered = ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent);
-        let mut metadata = crate::traits::ToolCallMetadata {
-            receipt_kind: crate::traits::ToolReceiptKind::Process,
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+        let mut metadata = aidaemon_events::traits::ToolCallMetadata {
+            receipt_kind: aidaemon_events::traits::ToolReceiptKind::Process,
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
             exit_code: Some(1),
-            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-            ..crate::traits::ToolCallMetadata::default()
+            invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
         complete_tool_result_semantics("terminal", raw_arguments, &registered, &mut metadata);
 
@@ -1224,7 +1229,7 @@ mod tests {
 
     #[test]
     fn command_identity_and_output_presence_are_typed_receipt_fields() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             RequestReceiptPredicate, ToolOutcomeStatus, ToolSemanticScope,
         };
@@ -1252,23 +1257,23 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation().with_evidence(vec![
-            crate::traits::ToolEvidenceCapability::new(
+            aidaemon_events::traits::ToolEvidenceCapability::new(
                 ToolSemanticScope::HostLocal,
                 &[EvidencePurpose::CurrentState],
                 EvidenceAuthority::Direct,
                 EvidenceTemporalScope::Current,
             ),
         ]);
-        let metadata = crate::traits::ToolCallMetadata {
-            receipt_kind: crate::traits::ToolReceiptKind::Process,
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            receipt_kind: aidaemon_events::traits::ToolReceiptKind::Process,
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
-            result_provenance: Some(crate::traits::ToolResultProvenance {
+            result_provenance: Some(aidaemon_events::traits::ToolResultProvenance {
                 authoritative_chars: 35,
-                ..crate::traits::ToolResultProvenance::default()
+                ..aidaemon_events::traits::ToolResultProvenance::default()
             }),
             semantics: semantics.clone(),
-            ..crate::traits::ToolCallMetadata::default()
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert_eq!(
@@ -1286,7 +1291,7 @@ mod tests {
 
     #[test]
     fn process_only_predicate_fields_do_not_reject_nonprocess_receipts() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             RequestReceiptPredicate, ToolOutcomeStatus, ToolReceiptKind, ToolSemanticScope,
         };
@@ -1314,22 +1319,22 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation().with_evidence(vec![
-            crate::traits::ToolEvidenceCapability::new(
+            aidaemon_events::traits::ToolEvidenceCapability::new(
                 ToolSemanticScope::GoalState,
                 &[EvidencePurpose::CurrentState],
                 EvidenceAuthority::Canonical,
                 EvidenceTemporalScope::Current,
             ),
         ]);
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             receipt_kind: ToolReceiptKind::Generic,
             outcome_status: Some(ToolOutcomeStatus::Succeeded),
-            result_provenance: Some(crate::traits::ToolResultProvenance {
+            result_provenance: Some(aidaemon_events::traits::ToolResultProvenance {
                 authoritative_chars: 42,
-                ..crate::traits::ToolResultProvenance::default()
+                ..aidaemon_events::traits::ToolResultProvenance::default()
             }),
             semantics: semantics.clone(),
-            ..crate::traits::ToolCallMetadata::default()
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert_eq!(
@@ -1347,7 +1352,7 @@ mod tests {
 
     #[test]
     fn typed_receipt_matching_is_independent_of_result_prose() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             ToolSemanticScope,
         };
@@ -1380,7 +1385,7 @@ mod tests {
         };
 
         let external = ToolCallSemantics::observation().with_evidence(
-            crate::agent::inquiry::evidence_capabilities_for_tool_call(
+            crate::turn::inquiry::evidence_capabilities_for_tool_call(
                 "http_request",
                 r#"{"method":"GET","url":"https://example.test/feed"}"#,
             ),
@@ -1392,9 +1397,9 @@ mod tests {
                 &external,
                 "{}",
                 "synthetic state_key current state",
-                &crate::traits::ToolCallMetadata {
-                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-                    ..crate::traits::ToolCallMetadata::default()
+                &aidaemon_events::traits::ToolCallMetadata {
+                    invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+                    ..aidaemon_events::traits::ToolCallMetadata::default()
                 },
             ),
             [0]
@@ -1406,9 +1411,9 @@ mod tests {
                 &external,
                 "{}",
                 "synthetic response without the requested field",
-                &crate::traits::ToolCallMetadata {
-                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-                    ..crate::traits::ToolCallMetadata::default()
+                &aidaemon_events::traits::ToolCallMetadata {
+                    invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+                    ..aidaemon_events::traits::ToolCallMetadata::default()
                 },
             ),
             [0],
@@ -1416,7 +1421,7 @@ mod tests {
         );
 
         let trace = ToolCallSemantics::observation().with_evidence(
-            crate::agent::inquiry::evidence_capabilities_for_tool_call(
+            crate::turn::inquiry::evidence_capabilities_for_tool_call(
                 "goal_trace",
                 r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
             ),
@@ -1428,9 +1433,9 @@ mod tests {
                 &trace,
                 "{}",
                 "synthetic attribution record",
-                &crate::traits::ToolCallMetadata {
-                    invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-                    ..crate::traits::ToolCallMetadata::default()
+                &aidaemon_events::traits::ToolCallMetadata {
+                    invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+                    ..aidaemon_events::traits::ToolCallMetadata::default()
                 },
             ),
             [1]
@@ -1439,7 +1444,7 @@ mod tests {
 
     #[test]
     fn typed_evidence_scope_closes_without_matching_response_prose() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             ToolSemanticScope,
         };
@@ -1461,16 +1466,16 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation().with_evidence(vec![
-            crate::traits::ToolEvidenceCapability {
+            aidaemon_events::traits::ToolEvidenceCapability {
                 scope: ToolSemanticScope::GoalState,
                 purposes: vec![EvidencePurpose::Content],
                 authority: EvidenceAuthority::Canonical,
                 temporal_scope: EvidenceTemporalScope::Both,
             },
         ]);
-        let metadata = crate::traits::ToolCallMetadata {
-            invocation_stage: crate::traits::ToolInvocationStage::Dispatched,
-            ..crate::traits::ToolCallMetadata::default()
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert_eq!(
@@ -1487,13 +1492,13 @@ mod tests {
     }
 
     fn read_receipt(
-        selection: crate::traits::ReadFileSelectionMetadata,
+        selection: aidaemon_events::traits::ReadFileSelectionMetadata,
         start: usize,
         end: usize,
         total: usize,
         truncated: bool,
-    ) -> crate::traits::ReadFileResultMetadata {
-        crate::traits::ReadFileResultMetadata {
+    ) -> aidaemon_events::traits::ReadFileResultMetadata {
+        aidaemon_events::traits::ReadFileResultMetadata {
             display_path: "/tmp/synthetic.toml".to_string(),
             canonical_path: "/tmp/synthetic.toml".to_string(),
             selection,
@@ -1521,11 +1526,11 @@ mod tests {
         };
         let arguments = r#"{"path":"synthetic.toml","start_line":1,"end_line":12}"#;
         let semantics = ToolCallSemantics::observation()
-            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent)
+            .with_verification_mode(aidaemon_events::traits::ToolVerificationMode::ResultContent)
             .with_target_hint(ToolTargetHintKind::Path, "synthetic.toml");
-        let metadata = crate::traits::ToolCallMetadata {
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
             read_file: Some(read_receipt(
-                crate::traits::ReadFileSelectionMetadata::BoundedRange {
+                aidaemon_events::traits::ReadFileSelectionMetadata::BoundedRange {
                     start_line: 1,
                     end_line: 12,
                 },
@@ -1534,7 +1539,7 @@ mod tests {
                 40,
                 false,
             )),
-            ..crate::traits::ToolCallMetadata::default()
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert!(observation_matches_completion_contract(
@@ -1548,7 +1553,7 @@ mod tests {
 
     #[test]
     fn rejected_invocation_can_prove_its_typed_outcome_without_proving_content() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             RequestReceiptPredicate, ToolSemanticScope,
         };
@@ -1572,13 +1577,13 @@ mod tests {
         };
         let arguments = r#"{"path":"synthetic.toml","start_line":1,"end_line":12,"tail_lines":1}"#;
         let semantics = ToolCallSemantics::observation().with_evidence(
-            crate::agent::inquiry::evidence_capabilities_for_tool_call("read_file", arguments),
+            crate::turn::inquiry::evidence_capabilities_for_tool_call("read_file", arguments),
         );
-        let metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Blocked),
             contract_rejected: true,
-            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeIo,
-            ..crate::traits::ToolCallMetadata::default()
+            invocation_stage: aidaemon_events::traits::ToolInvocationStage::RejectedBeforeIo,
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert_eq!(
@@ -1596,7 +1601,7 @@ mod tests {
 
     #[test]
     fn rejected_invocation_cannot_close_a_generic_evidence_requirement() {
-        use crate::traits::{
+        use aidaemon_events::traits::{
             EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
             ToolSemanticScope,
         };
@@ -1615,19 +1620,19 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation().with_evidence(vec![
-            crate::traits::ToolEvidenceCapability::new(
+            aidaemon_events::traits::ToolEvidenceCapability::new(
                 ToolSemanticScope::HostLocal,
                 &[EvidencePurpose::CurrentState],
                 EvidenceAuthority::Direct,
                 EvidenceTemporalScope::Current,
             ),
         ]);
-        let metadata = crate::traits::ToolCallMetadata {
-            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+        let metadata = aidaemon_events::traits::ToolCallMetadata {
+            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Blocked),
             contract_rejected: true,
-            invocation_stage: crate::traits::ToolInvocationStage::RejectedBeforeIo,
+            invocation_stage: aidaemon_events::traits::ToolInvocationStage::RejectedBeforeIo,
             semantics: semantics.clone(),
-            ..crate::traits::ToolCallMetadata::default()
+            ..aidaemon_events::traits::ToolCallMetadata::default()
         };
 
         assert!(matching_evidence_requirement_indices(
@@ -1643,7 +1648,7 @@ mod tests {
 
     #[test]
     fn read_receipt_must_cover_the_exact_requested_range() {
-        use crate::traits::ReadFileSelectionMetadata;
+        use aidaemon_events::traits::ReadFileSelectionMetadata;
 
         let bounded = read_receipt(
             ReadFileSelectionMetadata::BoundedRange {
@@ -1707,7 +1712,7 @@ mod tests {
         // reply on a post-action provider failure.
         let result_text = format!(
             "Deployed 3 services successfully.\n{}",
-            crate::utils::truncation_notice(4000, 4265)
+            aidaemon_tools::text::truncation_notice(4000, 4265)
         );
         let ack = build_external_action_completion_ack(&result_text);
         assert!(ack.contains("Deployed 3 services successfully."));
@@ -1745,7 +1750,7 @@ mod tests {
     #[test]
     fn result_content_verification_requires_semantics_opt_in() {
         let verifyable = ToolCallSemantics::observation()
-            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+            .with_verification_mode(aidaemon_events::traits::ToolVerificationMode::ResultContent);
         let non_verifyable = ToolCallSemantics::observation();
         assert!(tool_result_contains_verifiable_evidence(
             &verifyable,
@@ -1768,14 +1773,14 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation()
-            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent)
+            .with_verification_mode(aidaemon_events::traits::ToolVerificationMode::ResultContent)
             .with_target_hint(ToolTargetHintKind::Url, "https://blog.aidaemon.ai");
         assert!(observation_matches_completion_contract(
             &contract,
             &semantics,
             "{}",
             "Latest post title: Scheduled reflection",
-            &crate::traits::ToolCallMetadata::default(),
+            &aidaemon_events::traits::ToolCallMetadata::default(),
         ));
     }
 
@@ -1819,7 +1824,7 @@ mod tests {
             ..CompletionContract::default()
         };
         let semantics = ToolCallSemantics::observation()
-            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+            .with_verification_mode(aidaemon_events::traits::ToolVerificationMode::ResultContent);
         let arguments = serde_json::json!({
             "action": "run",
             "command": "find \"$HOME/projects\" -mindepth 1 -maxdepth 1 -type d | wc -l"
@@ -1831,7 +1836,7 @@ mod tests {
             &semantics,
             &arguments,
             "213",
-            &crate::traits::ToolCallMetadata::default(),
+            &aidaemon_events::traits::ToolCallMetadata::default(),
         ));
     }
 
@@ -1858,7 +1863,7 @@ mod tests {
     #[test]
     fn mixed_access_manifest_checks_read_and_write_grants_independently() {
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![
                 hint(ToolTargetHintKind::ProjectScope, "/tmp"),
@@ -1867,7 +1872,7 @@ mod tests {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/synthetic-result.txt")],
             adapter_read_targets: Vec::new(),
         };
-        let valid = crate::traits::ToolCallAccessManifest {
+        let valid = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![
                 hint(ToolTargetHintKind::ProjectScope, "/tmp"),
@@ -1882,11 +1887,11 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
 
-        let invalid = crate::traits::ToolCallAccessManifest {
+        let invalid = aidaemon_events::traits::ToolCallAccessManifest {
             write_targets: vec![hint(ToolTargetHintKind::Path, "/workspace/project")],
             ..valid
         };
@@ -1896,79 +1901,22 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default(),
+            &aidaemon_tools::path_class::DaemonPaths::default(),
         )
         .expect("write must be rejected");
         assert!(violation.contains("/workspace/project"));
     }
 
-    /// Live 2026-11-11: a sub-agent confined to its project took a browser
-    /// screenshot (saved in the daemon inbox) and `send_file` was refused as
-    /// an "unauthorized write" of that screenshot. Sending a file reads it;
-    /// the inbox is the adapter's own; a file elsewhere stays out of scope.
-    #[test]
-    fn a_confined_child_can_send_its_own_screenshot_but_nothing_else() {
-        use crate::traits::ToolSemantics as _;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let inbox = tmp.path().join("files/inbox");
-        let project = tmp.path().join("projects/acme-site");
-        let elsewhere = tmp.path().join("private");
-        for dir in [&inbox, &project, &elsewhere] {
-            std::fs::create_dir_all(dir).expect("dir");
-        }
-        let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
-        let tool = crate::tools::SendFileTool::new(
-            crate::execution::active_execution_backend(),
-            media_tx,
-            &[tmp.path().to_string_lossy().to_string()],
-            &inbox.to_string_lossy(),
-        );
-        let task = crate::traits::ToolCallAccessManifest {
-            read_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                project.to_string_lossy(),
-            )
-            .unwrap()],
-            write_targets: vec![ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                project.to_string_lossy(),
-            )
-            .unwrap()],
-            ..Default::default()
-        };
-        let check = |path: &std::path::Path| {
-            let args = serde_json::json!({ "file_path": path.to_string_lossy() }).to_string();
-            let mut manifest = tool.call_access_manifest(&args);
-            assert!(manifest.write_targets.is_empty(), "sending writes nothing");
-            manifest.adapter_read_targets = tool
-                .adapter_owned_access_manifest(&args)
-                .adapter_read_targets;
-            access_manifest_scope_violation(
-                "send_file",
-                &manifest,
-                Some(&task),
-                &[],
-                None,
-                &crate::tools::DaemonPaths::default(),
-            )
-        };
-        assert_eq!(check(&inbox.join("5a947c87_screenshot.png")), None);
-        assert_eq!(check(&project.join("homepage.png")), None);
-        let refused = check(&elsewhere.join("notes.txt")).expect("outside the scope");
-        assert!(refused.contains("unauthorized reads"), "{refused}");
-        assert!(check(&inbox.join("../private/notes.txt")).is_some());
-    }
-
     #[test]
     fn adapter_runtime_reads_are_not_task_data_authority() {
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/tmp")],
             write_targets: Vec::new(),
             adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
         };
-        let call = crate::traits::ToolCallAccessManifest {
+        let call = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![hint(ToolTargetHintKind::Path, "/usr/bin/env")],
             write_targets: Vec::new(),
@@ -1981,13 +1929,13 @@ mod tests {
                 Some(&task),
                 &[],
                 None,
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             )
             .is_none(),
             "adapter-owned runtime reads must be independently grantable"
         );
 
-        let undeclared = crate::traits::ToolCallAccessManifest {
+        let undeclared = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
             ..call
         };
@@ -1997,7 +1945,7 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
@@ -2005,9 +1953,9 @@ mod tests {
     #[test]
     fn semantic_task_grant_cannot_widen_into_protected_host_data() {
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/etc/hosts")],
-            ..crate::traits::ToolCallAccessManifest::default()
+            ..aidaemon_events::traits::ToolCallAccessManifest::default()
         };
         let call = task.clone();
         let violation = access_manifest_scope_violation(
@@ -2016,14 +1964,14 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default(),
+            &aidaemon_tools::path_class::DaemonPaths::default(),
         )
         .expect("host data remains protected independently of task assessment");
         assert!(violation.contains("protected host-data capability violation"));
 
-        let adapter_only = crate::traits::ToolCallAccessManifest {
+        let adapter_only = aidaemon_events::traits::ToolCallAccessManifest {
             adapter_read_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/usr")],
-            ..crate::traits::ToolCallAccessManifest::default()
+            ..aidaemon_events::traits::ToolCallAccessManifest::default()
         };
         assert!(
             access_manifest_scope_violation(
@@ -2032,7 +1980,7 @@ mod tests {
                 None,
                 &[],
                 None,
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             )
             .is_none(),
             "adapter runtime capability is not task data"
@@ -2042,13 +1990,13 @@ mod tests {
     #[test]
     fn directory_write_grant_covers_future_descendants_for_write_and_read_back() {
         let hint = |kind, value| ToolTargetHint::new(kind, value).expect("target");
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/input.txt")],
             write_targets: vec![hint(ToolTargetHintKind::ProjectScope, "/tmp/output-root")],
             adapter_read_targets: Vec::new(),
         };
-        let call = crate::traits::ToolCallAccessManifest {
+        let call = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/input.txt")],
             write_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/output-root/.keep")],
@@ -2060,11 +2008,11 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
 
-        let read_escape = crate::traits::ToolCallAccessManifest {
+        let read_escape = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, "/tmp/elsewhere/secret")],
             ..call
         };
@@ -2074,20 +2022,20 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
 
     #[test]
     fn execution_cwd_is_neither_an_implicit_read_nor_write_grant() {
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        let call = crate::traits::ToolCallAccessManifest {
+        let call = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![
                 ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp").expect("cwd"),
@@ -2101,20 +2049,20 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
 
     #[test]
     fn execution_cwd_is_strategy_and_does_not_restrict_data_capabilities() {
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp/expected".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        let call = crate::traits::ToolCallAccessManifest {
+        let call = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp/different".to_string()),
             read_targets: Vec::new(),
             write_targets: Vec::new(),
@@ -2126,14 +2074,14 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
     }
 
     #[test]
     fn absent_access_boundary_does_not_invent_a_global_denial() {
-        let call = crate::traits::ToolCallAccessManifest {
+        let call = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![
                 ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/input.txt").expect("read"),
@@ -2150,7 +2098,7 @@ mod tests {
             None,
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
     }
@@ -2158,7 +2106,7 @@ mod tests {
     #[test]
     fn relative_targets_resolve_against_execution_cwd_before_capability_check() {
         let workspace = "/tmp/synthetic-workspace";
-        let call = |value: &str| crate::traits::ToolCallAccessManifest {
+        let call = |value: &str| aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some(workspace.to_string()),
             read_targets: vec![ToolTargetHint::new(ToolTargetHintKind::Path, value).expect("read")],
             write_targets: Vec::new(),
@@ -2172,7 +2120,7 @@ mod tests {
             None,
             &scopes,
             Some(workspace),
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
         assert!(access_manifest_scope_violation(
@@ -2181,7 +2129,7 @@ mod tests {
             None,
             &scopes,
             Some(workspace),
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
         // Escapes still resolve outside and are rejected.
@@ -2191,7 +2139,7 @@ mod tests {
             None,
             &scopes,
             Some(workspace),
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
         // Without a cwd a relative target cannot be proven inside any grant.
@@ -2201,14 +2149,14 @@ mod tests {
             None,
             &scopes,
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
 
     #[test]
     fn directory_write_grant_authorizes_reading_the_same_directory() {
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: Vec::new(),
             write_targets: vec![ToolTargetHint::new(
@@ -2218,7 +2166,7 @@ mod tests {
             .expect("write")],
             adapter_read_targets: Vec::new(),
         };
-        let read_back = crate::traits::ToolCallAccessManifest {
+        let read_back = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: vec![ToolTargetHint::new(
                 ToolTargetHintKind::Path,
@@ -2234,11 +2182,11 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
         // Explicit read grants do not remove the write-implies-read-back grant.
-        let explicit_reads = crate::traits::ToolCallAccessManifest {
+        let explicit_reads = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![ToolTargetHint::new(
                 ToolTargetHintKind::Path,
                 "/tmp/synthetic-input.txt",
@@ -2252,17 +2200,17 @@ mod tests {
             Some(&explicit_reads),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
         // The implication is one-way: a read grant never authorizes a write.
-        let read_only_task = crate::traits::ToolCallAccessManifest {
+        let read_only_task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: task.write_targets.clone(),
             write_targets: Vec::new(),
             adapter_read_targets: Vec::new(),
         };
-        let write_attempt = crate::traits::ToolCallAccessManifest {
+        let write_attempt = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: Vec::new(),
             write_targets: read_back.read_targets.clone(),
@@ -2274,16 +2222,16 @@ mod tests {
             Some(&read_only_task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
 
     #[test]
     fn explicit_read_grants_still_cover_paths_the_task_may_write() {
-        use crate::agent::tool_execution::{access_manifest_scope_check, ScopeCheck};
+        use super::{access_manifest_scope_check, ScopeCheck};
         let hint = |kind, value: &str| ToolTargetHint::new(kind, value).expect("target");
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(
                 ToolTargetHintKind::Path,
                 "/tmp/aidaemon-test/data/prices.csv",
@@ -2294,7 +2242,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let call = |path: &str| crate::traits::ToolCallAccessManifest {
+        let call = |path: &str| aidaemon_events::traits::ToolCallAccessManifest {
             read_targets: vec![hint(ToolTargetHintKind::Path, path)],
             ..Default::default()
         };
@@ -2304,7 +2252,7 @@ mod tests {
             Some(&task),
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_none());
         assert!(matches!(
@@ -2314,7 +2262,7 @@ mod tests {
                 Some(&task),
                 &[],
                 None,
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             ),
             Some(ScopeCheck::Rejected(_))
         ));
@@ -2322,7 +2270,7 @@ mod tests {
 
     #[test]
     fn unauthorized_declared_read_roots_are_stripped_not_fatal() {
-        let task = crate::traits::ToolCallAccessManifest {
+        let task = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: Some("/tmp".to_string()),
             read_targets: vec![ToolTargetHint::new(
                 ToolTargetHintKind::Path,
@@ -2348,7 +2296,7 @@ mod tests {
             Some(&task),
             &[],
             Some("/tmp"),
-            &crate::tools::DaemonPaths::default(),
+            &aidaemon_tools::path_class::DaemonPaths::default(),
         );
         // The write root is itself readable (write implies read-back), so only
         // the broader `/tmp` root is stripped.
@@ -2369,7 +2317,7 @@ mod tests {
         );
 
         // An authorized root is kept.
-        let scoped = crate::traits::ToolCallAccessManifest {
+        let scoped = aidaemon_events::traits::ToolCallAccessManifest {
             execution_cwd: None,
             read_targets: vec![ToolTargetHint::new(
                 ToolTargetHintKind::ProjectScope,
@@ -2385,7 +2333,7 @@ mod tests {
             Some(&scoped),
             &[],
             None,
-            &crate::tools::DaemonPaths::default(),
+            &aidaemon_tools::path_class::DaemonPaths::default(),
         );
         assert_eq!(stripped, vec!["/etc".to_string()]);
         assert_eq!(
@@ -2400,18 +2348,18 @@ mod tests {
             None,
             &[],
             None,
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_empty());
     }
 
     #[test]
     fn builds_deterministic_background_ack_from_tool_result() {
-        let with_notify = crate::traits::ToolCallMetadata {
+        let with_notify = aidaemon_events::traits::ToolCallMetadata {
             completion_notifications_enabled: true,
             ..Default::default()
         };
-        let without_notify = crate::traits::ToolCallMetadata::default();
+        let without_notify = aidaemon_events::traits::ToolCallMetadata::default();
 
         // With notifications enabled — should promise automatic delivery.
         let ack = build_background_detach_ack(
@@ -2432,11 +2380,11 @@ mod tests {
 
     #[test]
     fn background_ack_uses_structured_notification_metadata_not_text() {
-        let with_notify = crate::traits::ToolCallMetadata {
+        let with_notify = aidaemon_events::traits::ToolCallMetadata {
             completion_notifications_enabled: true,
             ..Default::default()
         };
-        let without_notify = crate::traits::ToolCallMetadata::default();
+        let without_notify = aidaemon_events::traits::ToolCallMetadata::default();
 
         let ack = build_background_detach_ack(
             "Command still running after 30s. Moved to background (pid=123).",
@@ -2467,7 +2415,7 @@ mod tests {
 #[cfg(test)]
 mod scope_escalation_tests {
     use super::*;
-    use crate::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+    use aidaemon_events::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
 
     fn task_scope(root: &str) -> ToolCallAccessManifest {
         let hint = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, root).unwrap();
@@ -2502,7 +2450,7 @@ mod scope_escalation_tests {
             Some(&task),
             &[],
             Some(root),
-            &crate::tools::DaemonPaths::default(),
+            &aidaemon_tools::path_class::DaemonPaths::default(),
         ) {
             Some(ScopeCheck::Escalatable { escalation, reason }) => {
                 assert_eq!(
@@ -2522,7 +2470,7 @@ mod scope_escalation_tests {
             Some(&task),
             &[],
             Some(root),
-            &crate::tools::DaemonPaths::default()
+            &aidaemon_tools::path_class::DaemonPaths::default()
         )
         .is_some());
     }
@@ -2555,7 +2503,7 @@ mod scope_escalation_tests {
                         Some(&task),
                         &[],
                         Some(&root),
-                        &crate::tools::DaemonPaths::default()
+                        &aidaemon_tools::path_class::DaemonPaths::default()
                     ),
                     Some(ScopeCheck::Escalatable { .. })
                 ),
@@ -2577,7 +2525,7 @@ mod scope_escalation_tests {
                 Some(&task),
                 &[],
                 Some(&root),
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             ),
             None
         );
@@ -2603,7 +2551,7 @@ mod scope_escalation_tests {
                         Some(&task),
                         &[],
                         Some(&root),
-                        &crate::tools::DaemonPaths::default()
+                        &aidaemon_tools::path_class::DaemonPaths::default()
                     ),
                     Some(ScopeCheck::Escalatable { .. })
                 ),
@@ -2631,7 +2579,7 @@ mod scope_escalation_tests {
                         Some(&task),
                         &[],
                         Some(root),
-                        &crate::tools::DaemonPaths::default()
+                        &aidaemon_tools::path_class::DaemonPaths::default()
                     ),
                     Some(ScopeCheck::Rejected(_))
                 ),
@@ -2652,7 +2600,7 @@ mod scope_escalation_tests {
                 Some(&task),
                 &[],
                 Some(root),
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             ),
             Some(ScopeCheck::Rejected(_))
         ));
@@ -2670,7 +2618,7 @@ mod scope_escalation_tests {
                 Some(&task),
                 &[],
                 Some(root),
-                &crate::tools::DaemonPaths::default()
+                &aidaemon_tools::path_class::DaemonPaths::default()
             ),
             Some(ScopeCheck::Rejected(_))
         ));

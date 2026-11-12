@@ -9,19 +9,21 @@ use super::completion_contract::looks_like_question_request;
 #[cfg(test)]
 use super::completion_contract::HTTP_URL_RE;
 use super::project_scope::extract_project_scopes_from_text;
+use aidaemon_events::traits::Message;
+#[cfg(test)]
+use aidaemon_tools::text::contains_keyword_as_words;
 #[cfg(test)]
 use super::project_scope::token_looks_like_filesystem_path;
-use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FollowupMode {
+pub enum FollowupMode {
     NewTask,
     Followup,
     ClarificationAnswer,
 }
 
 impl FollowupMode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             FollowupMode::NewTask => "new_task",
             FollowupMode::Followup => "followup",
@@ -31,7 +33,7 @@ impl FollowupMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum TurnContextReason {
+pub enum TurnContextReason {
     DefaultNewTask,
     InternalContinuation,
     #[cfg(test)]
@@ -45,7 +47,7 @@ pub(super) enum TurnContextReason {
 }
 
 impl TurnContextReason {
-    pub(super) fn as_code(&self) -> &'static str {
+    pub fn as_code(&self) -> &'static str {
         match self {
             TurnContextReason::DefaultNewTask => "default_new_task",
             TurnContextReason::InternalContinuation => "internal_continuation",
@@ -68,7 +70,7 @@ impl TurnContextReason {
 /// questions is how "Can you try one more time?" lost an outstanding PDF
 /// delivery obligation in the live incident.
 #[cfg(test)]
-pub(super) fn looks_like_retry_followup(text: &str) -> bool {
+pub fn looks_like_retry_followup(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 120 {
         return false;
@@ -90,7 +92,7 @@ pub(super) fn looks_like_retry_followup(text: &str) -> bool {
         )
 }
 
-pub(super) fn find_previous_turns(
+pub fn find_previous_turns(
     history: &[Message],
     current_user_text: &str,
 ) -> (Option<String>, Option<String>) {
@@ -130,7 +132,7 @@ pub(super) fn find_previous_turns(
 }
 
 #[cfg(test)]
-pub(super) fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
+pub fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
     // Question punctuation is the language feature here. Do not maintain a
     // phrase vocabulary whose omissions can silently lose the open-question
     // lifecycle; only a final model-authored question opens this provisional
@@ -139,7 +141,7 @@ pub(super) fn assistant_message_looks_like_clarifying_question(message: &str) ->
 }
 
 #[cfg(test)]
-pub(super) fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
+pub fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
     lower_text.starts_with("new task")
         || lower_text.starts_with("different task")
         || lower_text.starts_with("instead ")
@@ -201,7 +203,7 @@ fn has_strong_followup_indicators(lower_text: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
+pub fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
     if !looks_like_question_request(lower_text) || lower_text.chars().count() > 160 {
         return false;
     }
@@ -289,7 +291,7 @@ pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -
 /// "You didn't respond my question", "answer my question", "you ignored my request".
 /// These are meta-commentary about the prior interaction and must keep context.
 #[cfg(test)]
-pub(super) fn looks_like_unanswered_request_reference(lower: &str) -> bool {
+pub fn looks_like_unanswered_request_reference(lower: &str) -> bool {
     if lower.chars().count() > 120 {
         return false;
     }
@@ -372,7 +374,7 @@ fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(super) fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
+pub fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
     let word_count = lower_text.split_whitespace().count();
     if word_count < 8 {
         return false;
@@ -500,8 +502,50 @@ fn payload_has_self_contained_detail(text: &str) -> bool {
     meaningful_tokens >= 3
 }
 
+/// Whether a token of the text resolves to a filesystem reference.
 #[cfg(test)]
-pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
+fn user_text_references_filesystem_path(user_text: &str) -> bool {
+    user_text.split_whitespace().any(|raw| {
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                    )
+            })
+            .trim_end_matches(['.', '!', '?']);
+        !token.is_empty()
+            && aidaemon_tools::fs_utils::resolve_structural_filesystem_reference(
+                &*aidaemon_tools::testing::active_execution_backend(),
+                token,
+                &[],
+            )
+            .is_some()
+    })
+}
+
+#[cfg(test)]
+fn text_has_explicit_project_scope_cues(text: &str) -> bool {
+    [
+        "project",
+        "repo",
+        "repository",
+        "workspace",
+        "directory",
+        "folder",
+        "codebase",
+        "code base",
+        "work in",
+        "inside",
+        "under",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(text, phrase))
+}
+
+#[cfg(test)]
+pub fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.split_whitespace().count() < 6 {
         return false;
@@ -520,8 +564,8 @@ pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_te
 
     let has_structured_target = looks_like_short_command_request(trimmed)
         || HTTP_URL_RE.is_match(trimmed)
-        || super::user_text_references_filesystem_path(trimmed)
-        || super::text_has_explicit_project_scope_cues(lower_text)
+        || user_text_references_filesystem_path(trimmed)
+        || text_has_explicit_project_scope_cues(lower_text)
         || lower_text.contains(".json")
         || lower_text.contains(".toml")
         || lower_text.contains(".yaml")
@@ -535,7 +579,7 @@ pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_te
 }
 
 #[cfg(test)]
-pub(super) fn looks_like_short_command_request(current: &str) -> bool {
+pub fn looks_like_short_command_request(current: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.ends_with('?') {
         return false;
@@ -618,7 +662,7 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
         let token = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
         !token.is_empty()
             && (token_looks_like_filesystem_path(
-                &*crate::execution::active_execution_backend(),
+                &*aidaemon_tools::testing::active_execution_backend(),
                 token,
             ) || token.starts_with('-')
                 || token.chars().any(|c| c.is_ascii_digit()))
@@ -644,7 +688,7 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
 /// "Send me my Microsoft resume" is a new request even when the assistant just
 /// asked a clarifying question; "Post it." / "send that one" answer it.
 #[cfg(test)]
-pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower: &str) -> bool {
+pub fn looks_like_self_contained_imperative_request(trimmed: &str, lower: &str) -> bool {
     if trimmed.split_whitespace().count() < 2 {
         return false;
     }
@@ -667,13 +711,13 @@ pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower:
 }
 
 #[cfg(test)]
-pub(super) fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
+pub fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
     phrases
         .iter()
         .any(|phrase| contains_keyword_as_words(text, phrase))
 }
 
-pub(super) fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
+pub fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return (String::new(), false);
@@ -691,7 +735,7 @@ pub(super) fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
 }
 
 #[cfg(test)]
-pub(super) fn classify_followup_mode(
+pub fn classify_followup_mode(
     current: &str,
     prev_assistant: Option<&str>,
 ) -> (FollowupMode, Vec<TurnContextReason>) {
@@ -807,8 +851,8 @@ pub(super) fn classify_followup_mode(
     (FollowupMode::NewTask, reasons)
 }
 
-pub(super) fn has_project_scope_divergence_with_aliases(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn has_project_scope_divergence_with_aliases(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     prev_user_text: &str,
     current: &str,
     alias_roots: &[String],
@@ -849,7 +893,7 @@ mod tests {
         alias_roots: &[String],
     ) -> bool {
         super::has_project_scope_divergence_with_aliases(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             prev_user_text,
             current,
             alias_roots,

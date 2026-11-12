@@ -25,6 +25,7 @@
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod engine;
+pub mod host;
 pub mod llm;
 pub mod markers;
 pub mod message_content;

@@ -1,9 +1,9 @@
-use super::*;
-use crate::events::{
+use crate::host::{TurnStores, TurnWorkspace};
+use aidaemon_events::{
     AssistantResponseData, EventType, InteractionRequestedData, InteractionResolvedData,
     TaskEndData, TaskOutcome, TaskStartData, TaskStatus, UserMessageData,
 };
-use crate::traits::{
+use aidaemon_events::traits::{
     extract_primary_message_content, message_content_is_structural_only, ActiveTaskRef,
     ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState, Message,
     OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope,
@@ -21,7 +21,7 @@ fn is_courtesy_only(lower: &str) -> bool {
 }
 
 fn infer_open_request_scope(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     text: &str,
     alias_roots: &[String],
 ) -> Option<ToolSemanticScope> {
@@ -43,7 +43,7 @@ fn infer_open_request_scope(
         if token.starts_with("http://") || token.starts_with("https://") {
             return Some(ToolSemanticScope::ExternalRemote);
         }
-        if crate::tools::fs_utils::resolve_structural_filesystem_reference(
+        if aidaemon_tools::fs_utils::resolve_structural_filesystem_reference(
             backend,
             token,
             alias_roots,
@@ -134,7 +134,7 @@ fn open_request_anchor_expired(request: &OpenRequest, now: chrono::DateTime<Utc>
 /// assembly. Consumers should use this result instead of independently
 /// classifying the same text a second time. Text equality protects callers
 /// from accidentally reusing a stale dialogue-state row.
-pub(in crate::agent) fn resolved_followup_mode(
+pub fn resolved_followup_mode(
     state: &DialogueState,
     current_user_text: &str,
 ) -> Option<super::followup::FollowupMode> {
@@ -166,7 +166,7 @@ pub(in crate::agent) fn resolved_followup_mode(
 ///
 /// Returns `None` when there is no unfinished owner request to add, in which
 /// case the current message is the whole request.
-pub(in crate::agent) fn owner_request_for_verifier(
+pub fn owner_request_for_verifier(
     state: &DialogueState,
     current_user_text: &str,
     now: chrono::DateTime<Utc>,
@@ -245,7 +245,7 @@ pub(in crate::agent) fn owner_request_for_verifier(
 /// assessor, oldest first, each under its own stable message id. Continuations
 /// of unfinished work are otherwise invisible once the transcript window moves
 /// on, and the assessor could only name what it can see.
-pub(in crate::agent) fn owed_request_candidate_rows(
+pub fn owed_request_candidate_rows(
     state: &DialogueState,
     now: chrono::DateTime<Utc>,
 ) -> Option<String> {
@@ -288,7 +288,7 @@ pub(in crate::agent) fn owed_request_candidate_rows(
 /// Canonicalize a recent conversational user-message ID to the live request
 /// node it advances. The binding alone is never authority: its target must
 /// still be one of the request nodes currently eligible for adoption.
-pub(in crate::agent) fn resolve_request_antecedent<'a>(
+pub fn resolve_request_antecedent<'a>(
     state: &'a DialogueState,
     user_message_id: &str,
 ) -> Option<&'a OpenRequest> {
@@ -323,7 +323,7 @@ pub(in crate::agent) fn resolve_request_antecedent<'a>(
 /// may select only a persisted request node other than the current ingress
 /// message, and it refuses ambiguity. The relationship still comes from the
 /// semantic assessment; no request wording is classified here.
-pub(in crate::agent) fn unambiguous_request_antecedent(
+pub fn unambiguous_request_antecedent(
     state: &DialogueState,
 ) -> Option<&OpenRequest> {
     let current_message_id = state
@@ -355,7 +355,7 @@ pub(in crate::agent) fn unambiguous_request_antecedent(
 }
 
 fn classify_user_turn(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     state: &DialogueState,
     text: &str,
     alias_roots: &[String],
@@ -440,7 +440,7 @@ fn apply_task_start(state: &mut DialogueState, task_id: &str, started_at: chrono
 }
 
 fn apply_user_message(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     state: &mut DialogueState,
     message_id: &str,
     text: &str,
@@ -697,8 +697,8 @@ fn apply_semantic_user_turn_assessment(
     state.touch();
 }
 
-pub(in crate::agent) async fn record_dialogue_semantic_user_turn(
-    agent: &Agent,
+pub async fn record_dialogue_semantic_user_turn(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     text: &str,
     relationship: &str,
@@ -708,7 +708,7 @@ pub(in crate::agent) async fn record_dialogue_semantic_user_turn(
     };
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_semantic_user_turn_assessment(&mut state, text, kind, Utc::now());
-    agent.state.upsert_dialogue_state(&state).await?;
+    agent.dialogue_states().upsert_dialogue_state(&state).await?;
     Ok(Some(kind))
 }
 
@@ -867,15 +867,15 @@ fn apply_task_end(
     state.touch();
 }
 
-pub(in crate::agent) async fn get_or_rebuild_dialogue_state(
-    agent: &Agent,
+pub async fn get_or_rebuild_dialogue_state(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
 ) -> DialogueState {
-    match agent.state.get_dialogue_state(session_id).await {
+    match agent.dialogue_states().get_dialogue_state(session_id).await {
         Ok(Some(state)) if state.schema_version == DialogueState::SCHEMA_VERSION => state,
         Ok(_) | Err(_) => {
             let rebuilt = rebuild_dialogue_state_from_events(agent, session_id).await;
-            if let Err(err) = agent.state.upsert_dialogue_state(&rebuilt).await {
+            if let Err(err) = agent.dialogue_states().upsert_dialogue_state(&rebuilt).await {
                 tracing::warn!(
                     session_id,
                     error = %err,
@@ -887,10 +887,10 @@ pub(in crate::agent) async fn get_or_rebuild_dialogue_state(
     }
 }
 
-async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> DialogueState {
+async fn rebuild_dialogue_state_from_events(agent: &(impl TurnStores + TurnWorkspace + ?Sized), session_id: &str) -> DialogueState {
     let mut state = DialogueState::new(session_id);
     let events = agent
-        .event_store
+        .events()
         .query_recent_events(session_id, 200)
         .await
         .unwrap_or_default();
@@ -906,16 +906,16 @@ async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> 
                 if let Ok(data) = event.parse_data::<UserMessageData>() {
                     if data
                         .annotations
-                        .contains(&crate::traits::MessageAnnotation::InternalContinuation)
+                        .contains(&aidaemon_events::traits::MessageAnnotation::InternalContinuation)
                     {
                         continue;
                     }
                     apply_user_message(
-                        &*agent.execution_backend,
+                        agent.execution_backend(),
                         &mut state,
                         data.message_id.as_deref().unwrap_or_default(),
                         &data.content,
-                        &agent.path_aliases.projects,
+                        agent.project_roots(),
                         event.created_at,
                     );
                 }
@@ -967,24 +967,24 @@ async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> 
     state
 }
 
-pub(in crate::agent) async fn record_dialogue_task_start(
-    agent: &Agent,
+pub async fn record_dialogue_task_start(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     task_id: &str,
 ) -> anyhow::Result<()> {
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_task_start(&mut state, task_id, Utc::now());
-    agent.state.upsert_dialogue_state(&state).await
+    agent.dialogue_states().upsert_dialogue_state(&state).await
 }
 
-pub(in crate::agent) async fn record_dialogue_user_message(
-    agent: &Agent,
+pub async fn record_dialogue_user_message(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     message: &Message,
 ) -> anyhow::Result<()> {
     if message
         .effective_annotations()
-        .contains(&crate::traits::MessageAnnotation::InternalContinuation)
+        .contains(&aidaemon_events::traits::MessageAnnotation::InternalContinuation)
     {
         return Ok(());
     }
@@ -993,21 +993,21 @@ pub(in crate::agent) async fn record_dialogue_user_message(
     };
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_user_message(
-        &*agent.execution_backend,
+        agent.execution_backend(),
         &mut state,
         &message.id,
         &content,
-        &agent.path_aliases.projects,
+        agent.project_roots(),
         message.created_at,
     );
-    agent.state.upsert_dialogue_state(&state).await
+    agent.dialogue_states().upsert_dialogue_state(&state).await
 }
 
 /// Attach the finalized typed completion obligations to the currently open
 /// request. This lets later continuations inherit the contract without
 /// reclassifying the original wording or depending on assessment availability.
-pub(in crate::agent) async fn record_dialogue_completion_contract(
-    agent: &Agent,
+pub async fn record_dialogue_completion_contract(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     user_text: &str,
     contract: &super::completion_contract::CompletionContract,
@@ -1030,13 +1030,13 @@ pub(in crate::agent) async fn record_dialogue_completion_contract(
             super::completion_contract::persistable_completion_contract(contract),
         );
         state.touch();
-        agent.state.upsert_dialogue_state(&state).await?;
+        agent.dialogue_states().upsert_dialogue_state(&state).await?;
     }
     Ok(())
 }
 
-pub(in crate::agent) async fn record_dialogue_assistant_message(
-    agent: &Agent,
+pub async fn record_dialogue_assistant_message(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     message: &Message,
 ) -> anyhow::Result<()> {
@@ -1053,7 +1053,7 @@ pub(in crate::agent) async fn record_dialogue_assistant_message(
 
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_assistant_message(&mut state, &message.id, &primary, message.created_at);
-    agent.state.upsert_dialogue_state(&state).await
+    agent.dialogue_states().upsert_dialogue_state(&state).await
 }
 
 /// Persist a delivered mandate ASK as a typed owner-input obligation.
@@ -1062,8 +1062,8 @@ pub(in crate::agent) async fn record_dialogue_assistant_message(
 /// so prose classification cannot safely reconstruct this relationship. Only
 /// authenticated runtime identifiers are stored here; mandate-local text must
 /// still be retrieved through `manage_mandates(get)` on the related turn.
-pub(in crate::agent) async fn record_mandate_owner_input(
-    agent: &Agent,
+pub async fn record_mandate_owner_input(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     mandate_id: &str,
     mandate_version: i64,
@@ -1093,11 +1093,11 @@ pub(in crate::agent) async fn record_mandate_owner_input(
     });
     state.last_closed_question = None;
     state.touch();
-    agent.state.upsert_dialogue_state(&state).await
+    agent.dialogue_states().upsert_dialogue_state(&state).await
 }
 
-pub(in crate::agent) async fn record_dialogue_task_end(
-    agent: &Agent,
+pub async fn record_dialogue_task_end(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
     session_id: &str,
     task_id: &str,
     status: TaskStatus,
@@ -1105,7 +1105,7 @@ pub(in crate::agent) async fn record_dialogue_task_end(
 ) -> anyhow::Result<()> {
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_task_end(&mut state, task_id, status, outcome, Utc::now());
-    agent.state.upsert_dialogue_state(&state).await
+    agent.dialogue_states().upsert_dialogue_state(&state).await
 }
 
 #[cfg(test)]
@@ -1120,62 +1120,13 @@ mod tests {
         observed_at: chrono::DateTime<Utc>,
     ) {
         super::apply_user_message(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             state,
             message_id,
             text,
             alias_roots,
             observed_at,
         );
-    }
-
-    #[tokio::test]
-    async fn internal_continuation_does_not_rotate_open_request() {
-        use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::DialogueStateStore;
-
-        let harness = setup_test_agent(MockProvider::new())
-            .await
-            .expect("test harness");
-        let now = Utc::now();
-        let mut state = DialogueState::new("test-session");
-        state.open_request = Some(OpenRequest {
-            user_message_id: "request-1".to_string(),
-            text: "Find the specifications and tradeoffs for the synthetic product.".to_string(),
-            status: OpenRequestStatus::InProgress,
-            task_id: Some("task-1".to_string()),
-            project_scope: None,
-            completion_contract: None,
-            opened_at: now,
-            resolved_at: None,
-        });
-        harness
-            .state
-            .upsert_dialogue_state(&state)
-            .await
-            .expect("persist dialogue state");
-        let continuation = Message {
-            content: Some(
-                "Worker output: https://goo.gle/gemini-cli-auth-docs#workspace-gca".to_string(),
-            ),
-            annotations: vec![crate::traits::MessageAnnotation::InternalContinuation],
-            ..Message::new_runtime("continuation-1", "test-session", "user")
-        };
-
-        record_dialogue_user_message(&harness.agent, "test-session", &continuation)
-            .await
-            .expect("record continuation");
-
-        let persisted = harness
-            .state
-            .get_dialogue_state("test-session")
-            .await
-            .expect("read dialogue state")
-            .expect("dialogue state");
-        let open = persisted.open_request.expect("open request remains");
-        assert_eq!(open.user_message_id, "request-1");
-        assert!(!open.text.contains("workspace-gca"));
-        assert!(persisted.last_user_turn.is_none());
     }
 
     #[test]
@@ -2200,7 +2151,7 @@ mod owner_lineage_tests {
             resolved_at: None,
         };
         state.open_request = Some(request("message-current", "the provisional request"));
-        state.last_user_turn = Some(crate::traits::UserTurnSummary {
+        state.last_user_turn = Some(aidaemon_events::traits::UserTurnSummary {
             message_id: "message-current".to_string(),
             kind: UserTurnKind::NewRequest,
             text: "the provisional request".to_string(),

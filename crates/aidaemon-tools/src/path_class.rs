@@ -159,6 +159,52 @@ fn has_secret_name_shape(path: &Path) -> bool {
     })
 }
 
+/// How the daemon classifies paths: the SDK's patterns, its own config and
+/// env files (fixed at startup), and any env file its environment names.
+///
+/// The default protects no daemon files; only tests use it.
+#[derive(Debug, Clone, Default)]
+pub struct DaemonPaths {
+    classifier: std::sync::Arc<PathClassifier>,
+}
+
+impl DaemonPaths {
+    /// `protected` holds the daemon's own config and env files. They change
+    /// only through `manage_config`, never through the file tools.
+    pub fn new(protected: Vec<PathBuf>) -> Self {
+        Self {
+            classifier: std::sync::Arc::new(PathClassifier::new(protected)),
+        }
+    }
+
+    /// True for files that hold secrets (keys, credentials, env files, the
+    /// daemon's own config). Used by `read_file`.
+    pub fn is_secret(&self, path: &Path) -> bool {
+        self.classifier.is_secret(path) || is_configured_env_file(path)
+    }
+
+    /// Like [`DaemonPaths::is_secret`] but without the `.env.*` / `*.key`
+    /// name-shape rules, so a template file is judged by where it lives alone.
+    pub fn is_secret_ignoring_name_shape(&self, path: &Path) -> bool {
+        self.classifier.is_secret_ignoring_name_shape(path) || is_configured_env_file(path)
+    }
+
+    /// True for paths the file tools must not write.
+    pub fn is_sensitive(&self, path: &Path) -> bool {
+        self.classifier.is_sensitive(path) || is_configured_env_file(path)
+    }
+}
+
+/// Env files named by the daemon's own environment variables
+/// (`AIDAEMON_ENV_FILE`, `AIDAEMON_RUNTIME_ENV_FILE`), wherever they live.
+fn is_configured_env_file(path: &Path) -> bool {
+    ["AIDAEMON_ENV_FILE", "AIDAEMON_RUNTIME_ENV_FILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter(|value| !value.is_empty())
+        .any(|value| same_file(Path::new(&value), path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

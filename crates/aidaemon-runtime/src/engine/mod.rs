@@ -16,6 +16,7 @@ pub mod outcome;
 pub mod provider;
 pub mod recovery;
 pub mod stop;
+pub mod tool_calls;
 
 /// Host tools enforce their own timeouts (terminal backgrounding, CLI
 /// agents); this only stops a wedged call from holding the turn forever.

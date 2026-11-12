@@ -9,29 +9,8 @@ pub(super) enum ConnectedApiIntent {
     WriteAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ConnectedContentMode {
-    #[default]
-    None,
-    #[cfg(test)]
-    DraftOnly,
-    #[cfg(test)]
-    DeliverOnly,
-    #[cfg(test)]
-    DraftThenDeliver,
-}
-
-impl ConnectedContentMode {
-    #[cfg(test)]
-    pub(super) fn is_authoring_only(self) -> bool {
-        matches!(self, Self::DraftOnly)
-    }
-
-    #[cfg(test)]
-    pub(super) fn expects_live_delivery(self) -> bool {
-        matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
-    }
-}
+#[cfg(test)]
+use super::completion_contract::ConnectedContentMode;
 
 pub(crate) use aidaemon_tools::text::contains_keyword_as_words;
 
