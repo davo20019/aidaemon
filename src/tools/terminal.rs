@@ -5052,6 +5052,7 @@ impl TerminalTool {
             task_id,
             tool_call_id,
             detach,
+            background,
             network,
             confined,
             status_tx,
@@ -5171,8 +5172,9 @@ impl TerminalTool {
         });
 
         // Wait up to initial_timeout for the reader (and thus the process) to
-        // finish. A detached launch waits only for the startup grace.
-        let foreground_wait = if detach {
+        // finish. A detached or background launch waits only for the startup
+        // grace.
+        let foreground_wait = if detach || background {
             self.initial_timeout.min(DETACH_STARTUP_GRACE)
         } else {
             self.initial_timeout
@@ -6858,6 +6860,7 @@ impl TerminalTool {
                         task_id: exec_ctx.task_id.as_deref(),
                         tool_call_id: exec_ctx.tool_call_id.as_deref(),
                         detach: args.detach,
+                        background: args.background,
                         network: args.network,
                         confined: run_is_confined(self.confinement),
                         status_tx,
@@ -6924,6 +6927,10 @@ struct TerminalRunRequest<'a> {
     task_id: Option<&'a str>,
     tool_call_id: Option<&'a str>,
     detach: bool,
+    /// Finite work the model put in the background: it waits only for the
+    /// startup check, then hands off like any job that outlived the
+    /// foreground wait.
+    background: bool,
     /// Outbound network granted for this run.
     network: bool,
     /// Sandbox this run (false = host execution).
@@ -7029,8 +7036,13 @@ struct TerminalArgs {
     /// If true, allow a timed-out command to outlive task boundaries.
     /// Default false: timed-out background commands are task-owned and auto-cleaned
     /// when the task ends.
-    #[serde(default, alias = "background")]
+    #[serde(default)]
     detach: bool,
+    /// Run finite work in the background: after the startup check the
+    /// command is a task job that reports back when it ends, and the run
+    /// hands off to it. Not a long-lived service (that is `detach`).
+    #[serde(default)]
+    background: bool,
     /// Outbound network for this confined run. Off by default; requesting it
     /// is a capability escalation that needs user approval or a persisted
     /// capability grant for the command.
@@ -7748,7 +7760,11 @@ impl Tool for TerminalTool {
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "Launch-and-return for a long-lived process: after a ~1.5s startup check the command is handed to background tracking (background_started=true, detached=true, pid returned) and survives task end until explicitly killed. A command that exits within the startup check is reported synchronously with its exit code."
+                        "description": "Launch-and-return for a long-lived process that never ends by itself (server, tunnel, watcher): after a ~1.5s startup check the command is handed to background tracking (background_started=true, detached=true, pid returned) and survives task end until explicitly killed. A command that exits within the startup check is reported synchronously with its exit code. For finite work use background instead."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run finite work (a build, a count, a long script) in the background: after a ~1.5s startup check this turn ends and the result is sent to the user when the command finishes. Do not wait for it, poll it or start another command to watch it. A command that exits within the startup check is reported synchronously."
                     },
                     "pid": {
                         "type": "integer",
@@ -10904,6 +10920,68 @@ mod tests {
         assert!(outcome.metadata.timed_out);
         assert!(!outcome.metadata.detached);
         assert!(outcome.metadata.completion_notifications_enabled);
+    }
+
+    /// A finite job the model asks to run in the background (`background`)
+    /// returns after the startup check as a task job that reports back and
+    /// hands the run off, not as a detached service the run keeps watching
+    /// (live 2026-11-12: a count run with `detach` kept the run going and
+    /// the model started a `sleep 42` job to wait for it).
+    #[tokio::test]
+    async fn background_run_hands_off_at_launch_without_detaching() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+
+        let started = Instant::now();
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 20; echo counted","background":true}"#,
+                None,
+                crate::testing::call_facts("sess_background_job"),
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(outcome.metadata.background_started);
+        assert!(!outcome.metadata.detached);
+        assert!(outcome.metadata.completion_notifications_enabled);
+        assert!(outcome.metadata.background_handoff);
+        assert!(outcome.finish.is_some());
+        let _ = tool
+            .call_with_execution_context(
+                &format!(
+                    r#"{{"action":"kill","pid":{}}}"#,
+                    outcome
+                        .output
+                        .split("pid=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .unwrap()
+                ),
+                None,
+                crate::testing::call_facts("sess_background_job"),
+            )
+            .await;
     }
 
     /// A service that logs its URL on stderr (cloudflared does) must show it

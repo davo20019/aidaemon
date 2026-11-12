@@ -1136,6 +1136,13 @@ impl Agent {
         // the turn, so they run whatever the memory plugin.
         let owned_memory_tools = memory.owned_daemon_tools;
         let mut memory_hooks: Vec<Arc<dyn sdk::Hook>> = Vec::new();
+        // A turn opted out of learning stores nothing, through any memory
+        // tool either.
+        memory_hooks.push(Arc::new(
+            crate::agent::memory_plugin::PrivateTurnGuard::new(
+                memory_turn.learning_consent.clone(),
+            ),
+        ));
         if !memory_turn.mandate {
             memory_hooks.push(Arc::new(
                 crate::agent::memory_plugin::DaemonMemoryWriter::new(

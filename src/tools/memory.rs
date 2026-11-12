@@ -85,7 +85,7 @@ fn is_deletion_marker(value: &str) -> bool {
 /// True when this exact call would delete at least one fact. Mirrors the
 /// entry selection in `call`: a non-empty `facts` batch wins, otherwise the
 /// single key/value pair.
-fn call_deletes_facts(arguments: &str) -> bool {
+pub(crate) fn call_deletes_facts(arguments: &str) -> bool {
     let Ok(args) = serde_json::from_str::<RememberArgs>(arguments) else {
         return false;
     };

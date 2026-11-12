@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::events::{ExecutorExpectationItem, ExecutorExpectationsDeclaredData};
-use crate::plans::{ChecklistItem, PlanStore, StepStatus};
+use crate::plans::{ChecklistItem, PlanStatus, PlanStore, StepStatus};
 use crate::traits::{
     RequestObservationTarget, RequestVerificationTargetKind, StableObservationSubject, Tool,
     ToolArgumentContractViolation, ToolCallContext, ToolCallSemantics, ToolCapabilities,
@@ -415,8 +415,10 @@ impl Tool for TrackRequirementsTool {
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
-         Mark items 'completed' as you finish them, or 'deferred' if you will not do one: the run \
-         may then end, but a deferred or removed item is reported as not done, never as done. \
+         Mark items 'completed' as you finish them, 'failed' if you tried one and did not get what \
+         it asks for (the thing was not found, the step did not work), or 'deferred' if you will \
+         not do one: the run may then end, but a failed, deferred or removed item is reported as \
+         not done, never as done. \
          If the user adds, changes or cancels work while you are working, pass the revised list \
          before continuing. \
          Before your final answer, pass the list once more with outcome: done, partial, or blocked; \
@@ -456,7 +458,7 @@ impl Tool for TrackRequirementsTool {
                                 },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "deferred"]
+                                    "enum": ["pending", "in_progress", "completed", "failed", "deferred"]
                                 },
                                 "note": {
                                     "type": "string"
@@ -652,7 +654,7 @@ impl TrackRequirementsTool {
             return Ok("track_requirements: no items provided.".to_string());
         }
 
-        let plan = match self
+        let mut plan = match self
             .plan_store
             .upsert_checklist_graph(
                 &session_id,
@@ -669,6 +671,25 @@ impl TrackRequirementsTool {
                 return Ok("Checklist noted (not persisted).".to_string());
             }
         };
+
+        // The executor's verdict caps the card: a partial or blocked request
+        // never reads as done, however its items are ticked. Receipts can
+        // still downgrade a claimed done; nothing here upgrades.
+        let claimed_short = v
+            .get("outcome")
+            .and_then(Value::as_str)
+            .and_then(crate::events::ExecutorClaimedOutcome::from_protocol_name)
+            .is_some_and(|outcome| outcome != crate::events::ExecutorClaimedOutcome::Done);
+        if claimed_short && plan.status == PlanStatus::Completed {
+            plan.status = PlanStatus::PartiallyCompleted;
+            if let Err(e) = self
+                .plan_store
+                .set_status(&plan.id, PlanStatus::PartiallyCompleted)
+                .await
+            {
+                tracing::warn!(error = %e, "track_requirements: failed to record the partial verdict");
+            }
+        }
 
         // The rendered checklist is returned to the agent loop, which surfaces it
         // to the user via the single live status surface (StatusUpdate::Checklist).
@@ -866,6 +887,56 @@ mod tests {
             }
         }]);
         assert!(parse_expectation_targets(Some(&raw)).is_err());
+    }
+
+    /// The card's header follows the honest outcome (live 2026-11-12: step 3
+    /// found no price, yet the card read "Done · 3 of 3 steps"). An item
+    /// tried and not achieved is not done, and a partial or blocked verdict
+    /// never reads as done.
+    #[tokio::test]
+    async fn checklist_header_follows_unmet_items_and_the_claimed_outcome() {
+        let (tool, _plan_store) = test_tool().await;
+        let failed_item = json!({
+            "items": [
+                {"text": "Say the date", "status": "completed"},
+                {"text": "Multiply the numbers", "status": "completed"},
+                {"text": "Find the synthetic quote", "status": "failed"}
+            ],
+            "outcome": "done"
+        })
+        .to_string();
+        tool.validate_arguments(&failed_item).unwrap();
+        let statuses = &tool.schema()["parameters"]["properties"]["items"]["items"]["properties"]
+            ["status"]["enum"];
+        assert!(statuses.as_array().unwrap().contains(&json!("failed")));
+        let out = tool
+            .call_with(&failed_item, crate::testing::call_facts("sess-failed"))
+            .await
+            .unwrap();
+        assert!(!out.contains("Done ·"), "{out}");
+        assert!(out.contains("2 of 3 done"), "{out}");
+
+        let partial = json!({
+            "items": [
+                {"text": "Say the date", "status": "completed"},
+                {"text": "Find the synthetic quote", "status": "completed"}
+            ],
+            "outcome": "partial"
+        })
+        .to_string();
+        let out = tool
+            .call_with(&partial, crate::testing::call_facts("sess-partial"))
+            .await
+            .unwrap();
+        assert!(!out.contains("Done ·"), "{out}");
+        assert!(out.contains("Stopped short · 2 of 2 done"), "{out}");
+
+        let done = partial.replace("partial", "done");
+        let out = tool
+            .call_with(&done, crate::testing::call_facts("sess-done"))
+            .await
+            .unwrap();
+        assert!(out.contains("✅ Done · 2 of 2 steps"), "{out}");
     }
 
     #[tokio::test]
