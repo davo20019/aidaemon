@@ -377,6 +377,9 @@ pub struct Agent {
     /// This child's progress clock: its model and tool calls and kernel
     /// events keep it from being stopped as idle (`subagents.timeout_secs`).
     child_progress: Option<crate::tools::ProgressClock>,
+    /// The sub-agents running now, by the chat they report to; shared with
+    /// every child so `/status` and `/tasks` see the whole tree.
+    running_children: Arc<spawn::RunningChildren>,
     /// SDK kernel settings for this agent's turns; inherited by spawned children.
     sdk_engine: Arc<sdk_engine::SdkEngineSettings>,
     /// The kernel's durable run store: every SDK run journals its events and

@@ -998,26 +998,50 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
         .unwrap();
     let agent = Arc::new(harness.agent);
     let begun = std::time::Instant::now();
-    let run = agent
-        .spawn_child_with_outcome(
-            "synthetic mission",
-            "synthetic task",
-            None,
-            ChannelContext::private("test"),
-            UserRole::Owner,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(crate::runtime_ports::ChildTimeLimit {
-                limit: std::time::Duration::from_millis(1_500),
-            }),
-            None,
-        )
+    let running = agent.clone();
+    let run = tokio::spawn(async move {
+        running
+            .spawn_child_with_outcome(
+                "Install a synthetic site\nwith every step",
+                "synthetic task",
+                None,
+                ChannelContext::private("test"),
+                UserRole::Owner,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("telegram:synthetic-chat"),
+                None,
+                Some(crate::runtime_ports::ChildTimeLimit {
+                    limit: std::time::Duration::from_millis(1_500),
+                }),
+                None,
+            )
+            .await
+    });
+    // While it runs, the chat's `/status` and `/tasks` list it by its title.
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let children = aidaemon_channels::ports::ChannelAgentRuntime::running_children(
+                agent.as_ref(),
+                "telegram:synthetic-chat",
+            )
+            .await;
+            if !children.is_empty() {
+                break children;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the running child is listed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].label, "Install a synthetic site");
+    let run = run
         .await
+        .unwrap()
         .expect("a progressing child runs to its end");
     assert!(
         begun.elapsed() > std::time::Duration::from_secs(4),
@@ -1025,6 +1049,15 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
         begun.elapsed()
     );
     assert!(run.response.contains("synthetic install finished"), "{}", run.response);
+    assert!(
+        aidaemon_channels::ports::ChannelAgentRuntime::running_children(
+            agent.as_ref(),
+            "telegram:synthetic-chat"
+        )
+        .await
+        .is_empty(),
+        "a finished child is no longer listed"
+    );
 }
 
 /// A child charges the tree it belongs to, so a request's budget covers all

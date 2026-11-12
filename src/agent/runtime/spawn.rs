@@ -109,6 +109,65 @@ fn resolve_child_outcome(
     }
 }
 
+/// The sub-agents running now, each under the chat it reports to (its
+/// approval route): `/status` and `/tasks` list them by their title.
+#[derive(Default)]
+pub(crate) struct RunningChildren {
+    next: std::sync::atomic::AtomicU64,
+    entries: std::sync::Mutex<Vec<(u64, String, aidaemon_channels::ports::RunningChild)>>,
+}
+
+/// One running child's place in [`RunningChildren`], removed when dropped
+/// however the child ends.
+pub(crate) struct RunningChildEntry {
+    registry: Arc<RunningChildren>,
+    id: u64,
+}
+
+impl RunningChildren {
+    pub(crate) fn enter(self: &Arc<Self>, session_id: &str, mission: &str) -> RunningChildEntry {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                id,
+                session_id.to_string(),
+                aidaemon_channels::ports::RunningChild {
+                    label: child_status_label(mission),
+                    started_at: chrono::Utc::now(),
+                },
+            ));
+        RunningChildEntry {
+            registry: self.clone(),
+            id,
+        }
+    }
+
+    pub(crate) fn for_session(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_channels::ports::RunningChild> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, session, _)| session == session_id)
+            .map(|(_, _, child)| child.clone())
+            .collect()
+    }
+}
+
+impl Drop for RunningChildEntry {
+    fn drop(&mut self) {
+        self.registry
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _, _)| *id != self.id);
+    }
+}
+
 /// A child that ended with a refused write it never made did not do that
 /// work, whatever its own run concluded.
 fn settle_coordinated_outcome(outcome: TaskOutcome, unlanded_write: bool) -> TaskOutcome {
@@ -1823,6 +1882,7 @@ impl Agent {
             .push(inherited_authority.clone());
         child.inherited_authority = Some(inherited_authority);
         child.child_progress = child_progress;
+        child.running_children = self.running_children.clone();
         child.sdk_engine = self.sdk_engine.clone();
         child.run_store = self.run_store.clone();
         child.owner_approvals = self.owner_approvals.clone();
@@ -2801,8 +2861,8 @@ impl Agent {
         // only after `idle_limit` with no model or tool call running and no
         // kernel event (Decision 1). Owner waits never count.
         let idle_limit = time_limit.map(|requested| requested.limit);
-        let progress = idle_limit
-            .map(|_| crate::tools::ProgressClock::starting_now(owner_wait.clone()));
+        let progress =
+            idle_limit.map(|_| crate::tools::ProgressClock::starting_now(owner_wait.clone()));
         let read_only_tools: std::collections::HashSet<String> = scoped_tools
             .iter()
             .filter(|tool| tool.capabilities().read_only)
@@ -2826,7 +2886,7 @@ impl Agent {
                 root_tools,
                 add_spawn_tool,
                 effective_project_scope,
-                effective_approval_session_id,
+                effective_approval_session_id.clone(),
                 max_iterations_override,
                 timeout_secs_override,
                 parent_authority,
@@ -2877,6 +2937,11 @@ impl Agent {
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
         let _on_roster = roster_entry;
+        // Listed by `/status` and `/tasks` in the chat it reports to while it
+        // runs, waited on or in the background.
+        let _listed = effective_approval_session_id
+            .as_deref()
+            .map(|chat| self.running_children.enter(chat, mission));
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
