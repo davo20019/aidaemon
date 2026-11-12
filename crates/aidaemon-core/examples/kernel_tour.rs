@@ -2,7 +2,7 @@
 //! read-only tools run in parallel, a destructive tool pauses for approval,
 //! the paused state survives a JSON round trip, and the run resumes.
 //!
-//! cargo run -p aidaemon-core --example quickstart --features testing
+//! cargo run -p aidaemon-core --example kernel_tour --features testing
 
 use std::sync::Arc;
 

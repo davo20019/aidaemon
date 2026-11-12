@@ -12,7 +12,8 @@
 //! answer is acceptable and finish with a typed [`RunOutcome`].
 //!
 //! See `DESIGN.md` next to this crate for the reasoning behind each choice,
-//! and `examples/quickstart.rs` for a runnable example.
+//! `examples/kernel_tour.rs` for a runnable tour of the kernel, and
+//! `aidaemon-sdk`'s `examples/quickstart.rs` for the shortest working agent.
 
 mod agent;
 mod approval;

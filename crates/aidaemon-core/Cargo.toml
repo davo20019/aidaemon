@@ -29,5 +29,5 @@ aidaemon-core = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [[example]]
-name = "quickstart"
+name = "kernel_tour"
 required-features = ["testing"]

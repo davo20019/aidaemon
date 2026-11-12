@@ -77,3 +77,11 @@ required-features = ["macros", "testing"]
 [[test]]
 name = "structured_output"
 required-features = ["testing"]
+
+[[test]]
+name = "preset"
+required-features = ["macros", "testing", "tools", "sqlite"]
+
+[[example]]
+name = "quickstart"
+required-features = ["macros", "testing"]
