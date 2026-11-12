@@ -12,6 +12,9 @@ documentation = "https://docs.rs/aidaemon-agents"
 readme = "README.md"
 keywords = ["agent", "subagent", "llm", "delegation", "async"]
 categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]

@@ -12,6 +12,9 @@ documentation = "https://docs.rs/aidaemon-channels"
 readme = "README.md"
 keywords = ["agent", "chat", "channel", "llm", "async"]
 categories = ["asynchronous", "network-programming"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [features]

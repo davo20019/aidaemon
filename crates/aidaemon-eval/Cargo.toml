@@ -12,6 +12,9 @@ documentation = "https://docs.rs/aidaemon-eval"
 readme = "README.md"
 keywords = ["agent", "eval", "llm", "testing", "scenarios"]
 categories = ["development-tools::testing", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [features]
