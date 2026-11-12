@@ -292,7 +292,9 @@ pub enum RunTerminalDecision {
     SucceededByEvidence,
     /// Every open obligation was refused by a typed authority boundary before
     /// dispatch (nothing dispatched). The request could not be carried out
-    /// and the run is complete at that boundary; the reply narrates it.
+    /// and the run is complete at that boundary; the reply narrates it. The
+    /// work did not happen, so this is final but not a success: the task
+    /// ends `Partial` and the phase is `TaskKernelPhase::Partial`.
     ClosedByPolicyDenial,
     /// At least one exact bounded invocation is exhausted without proof.
     Failed,
@@ -2317,9 +2319,11 @@ impl RunAggregate {
             return TaskKernelPhase::ResponsePrepared;
         }
         match self.terminal_decision() {
-            RunTerminalDecision::Succeeded
-            | RunTerminalDecision::SucceededByEvidence
-            | RunTerminalDecision::ClosedByPolicyDenial => TaskKernelPhase::WorkSucceeded,
+            RunTerminalDecision::Succeeded | RunTerminalDecision::SucceededByEvidence => {
+                TaskKernelPhase::WorkSucceeded
+            }
+            // The requested work was refused, so it did not happen.
+            RunTerminalDecision::ClosedByPolicyDenial => TaskKernelPhase::Partial,
             RunTerminalDecision::Failed => TaskKernelPhase::Failed,
             RunTerminalDecision::Pending => TaskKernelPhase::WorkPending,
             RunTerminalDecision::Unspecified if self.started => TaskKernelPhase::Running,
@@ -3897,7 +3901,7 @@ mod tests {
             aggregate.terminal_decision(),
             RunTerminalDecision::ClosedByPolicyDenial
         );
-        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::WorkSucceeded);
+        assert_eq!(aggregate.lifecycle_phase(), TaskKernelPhase::Partial);
 
         // A refusal of an unrelated capability does not bind: the obligation
         // stays reachable and the run stays pending.

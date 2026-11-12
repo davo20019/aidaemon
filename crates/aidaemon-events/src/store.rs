@@ -2820,9 +2820,10 @@ impl EventStore {
             (
                 _,
                 super::RunTerminalDecision::Succeeded
-                | super::RunTerminalDecision::SucceededByEvidence
-                | super::RunTerminalDecision::ClosedByPolicyDenial,
+                | super::RunTerminalDecision::SucceededByEvidence,
             ) => crate::TaskOutcome::Succeeded,
+            // Refused by policy: the work did not happen; final, not failed.
+            (_, super::RunTerminalDecision::ClosedByPolicyDenial) => crate::TaskOutcome::Partial,
             (_, super::RunTerminalDecision::Failed) => crate::TaskOutcome::Failed,
             (TaskStatus::Completed, super::RunTerminalDecision::Unspecified) => {
                 crate::TaskOutcome::Succeeded

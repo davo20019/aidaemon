@@ -1227,7 +1227,7 @@ pub struct TaskEndData {
     pub harness_eval: Option<HarnessEvalSnapshot>,
 }
 
-/// What a successful task end is grounded in.
+/// What a closed task end is grounded in.
 ///
 /// `Contract` means every compiled obligation was credited by the durable
 /// reducer. `Evidence` means the compiled contract could not credit the work
@@ -1241,7 +1241,8 @@ pub enum TaskProofBasis {
     Evidence,
     /// Every open obligation was refused by a typed authority boundary before
     /// dispatch and the reply narrates that boundary. Nothing the request
-    /// asked for could be reached; the run is complete at that boundary.
+    /// asked for could be reached; the run is complete at that boundary, and
+    /// it ends `Partial` (the work did not happen), never `Succeeded`.
     PolicyDenial,
 }
 

@@ -1861,3 +1861,6 @@ mod finish_tests;
 #[cfg(test)]
 #[path = "sdk_engine/hook_port_tests.rs"]
 mod hook_port_tests;
+#[cfg(test)]
+#[path = "sdk_engine/status_tests.rs"]
+mod status_tests;

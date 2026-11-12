@@ -1373,9 +1373,15 @@ fn task_end_decision_and_outcome(
         (
             _,
             crate::events::RunTerminalDecision::Succeeded
-            | crate::events::RunTerminalDecision::SucceededByEvidence
-            | crate::events::RunTerminalDecision::ClosedByPolicyDenial,
+            | crate::events::RunTerminalDecision::SucceededByEvidence,
         ) => crate::events::TaskOutcome::Succeeded,
+        // Policy refused everything the request asked for: the work did not
+        // happen. The run is final at that boundary (partial, never failed,
+        // so nothing retries a denial), and the request stays open for the
+        // owner's follow-up.
+        (_, crate::events::RunTerminalDecision::ClosedByPolicyDenial) => {
+            crate::events::TaskOutcome::Partial
+        }
         (_, crate::events::RunTerminalDecision::Failed) => crate::events::TaskOutcome::Failed,
         (TaskStatus::Failed, _) => crate::events::TaskOutcome::Failed,
         // The contract's work is still owed and nothing ran at all: there
@@ -1651,7 +1657,7 @@ mod tests {
             decision,
             crate::events::RunTerminalDecision::ClosedByPolicyDenial
         );
-        assert_eq!(outcome, crate::events::TaskOutcome::Succeeded);
+        assert_eq!(outcome, crate::events::TaskOutcome::Partial);
     }
 
     #[test]

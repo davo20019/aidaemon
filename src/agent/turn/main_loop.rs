@@ -1275,7 +1275,6 @@ impl Agent {
                     run_aggregate.terminal_decision(),
                     crate::events::RunTerminalDecision::Succeeded
                         | crate::events::RunTerminalDecision::SucceededByEvidence
-                        | crate::events::RunTerminalDecision::ClosedByPolicyDenial
                 )
             } else {
                 result.receipt.as_ref().is_some_and(|receipt| {
