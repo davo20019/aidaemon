@@ -164,7 +164,12 @@ Tools get their dependencies through constructors: store traits from
 `aidaemon_tools::services` (facts, episodes, people, settings, OAuth) and
 an `ExecutionBackend`, the workspace a tool's commands and files live in
 (local, Docker, SSH). A `Sandbox` is narrower: the runner that confines
-one command inside that workspace.
+one command inside that workspace. The default `shell` picks one with
+`select_sandbox` (bubblewrap on Linux, seatbelt on macOS, else uncontained
+with a one-time warning; `AIDAEMON_SHELL_SANDBOX` overrides it). A new
+`Sandbox` should confine writes to `workspace_root`, honour `allow_network`
+and `deny_read`, and report `is_contained` truthfully: the shell's tool
+description is built from it.
 
 ## Effects, safeguards and owner approvals
 

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The SDK's shell is sandboxed by default on Linux too.** `aidaemon_tools::default_tools` (and `Shell::sandboxed`) run commands in bubblewrap on Linux, as they use seatbelt on macOS: the workspace is writable, the rest of the filesystem read-only, `/tmp` private, the network off unless allowed. Without a working `bwrap` the shell runs on the host and logs a one-time warning instead of pretending. Override with `default_tools_with_sandbox` or `AIDAEMON_SHELL_SANDBOX=auto|bubblewrap|seatbelt|local`; `Shell::deny_read` hides host paths from the contained backends. The bubblewrap backend's confinement tests now run for real on Linux CI. The daemon's `terminal` tool is unchanged (`[terminal] confinement = "host"` by default on every platform).
+
 - **A snapshot of the database before each upgrade.** The first time a new aidaemon version starts on an existing database, it writes a consistent, compacted copy (`VACUUM INTO`, encrypted with the same key) to `backups/` next to the database before any migration runs, and keeps the newest two (`[state] upgrade_backups`, `0` turns it off). Upgrading still needs no manual step: every schema change in this release is applied by the startup migrations.
 
 - **SQLite upkeep.** The query planner's statistics are refreshed after startup migrations and every six hours (`PRAGMA optimize`, bounded per index); a database that was never analyzed gets them on its first start. SDK users get the same through `aidaemon_store_sqlite::maintenance::{optimize, snapshot}`, and `SqliteStore::open` now applies the daemon's cache, mmap and temp-store settings and optimizes at open.

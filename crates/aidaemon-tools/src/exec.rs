@@ -62,6 +62,11 @@ pub struct SandboxCommand {
     pub max_output_bytes: usize,
     /// Whether the command may use the network (sandboxes only).
     pub allow_network: bool,
+    /// Host paths the command must not read (contained sandboxes only;
+    /// [`LocalSandbox`] cannot enforce it). Paths that do not exist are
+    /// skipped. Under bubblewrap a denied directory appears empty and a
+    /// denied file reads as empty; under seatbelt reading either fails.
+    pub deny_read: Vec<PathBuf>,
     /// Cancelled when the run is cancelled; the command is killed.
     pub cancel: CancellationToken,
 }
@@ -78,6 +83,7 @@ impl SandboxCommand {
             timeout: Duration::from_secs(60),
             max_output_bytes: 20_000,
             allow_network: false,
+            deny_read: Vec::new(),
             cancel: CancellationToken::new(),
         }
     }
@@ -297,6 +303,15 @@ impl BubblewrapSandbox {
         .collect();
         // After the tmpfs so a workspace under /tmp stays visible.
         args.extend(["--bind".into(), ws.clone(), ws]);
+        // After the workspace so a denied path inside it is hidden too.
+        for path in existing_canonical(&cmd.deny_read) {
+            let path = path.display().to_string();
+            if Path::new(&path).is_dir() {
+                args.extend(["--tmpfs".into(), path]);
+            } else {
+                args.extend(["--ro-bind".into(), "/dev/null".into(), path]);
+            }
+        }
         args.push("--unshare-pid".into());
         if !cmd.allow_network {
             args.push("--unshare-net".into());
@@ -325,16 +340,25 @@ impl Sandbox for BubblewrapSandbox {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         cfg!(target_os = "linux")
             && *AVAILABLE.get_or_init(|| {
-                // Probe a real sandbox: bwrap may be installed while user
-                // namespaces are disabled.
+                // Probe a real sandbox with the same mounts and namespaces
+                // `run` uses: bwrap may be installed while user namespaces
+                // are disabled (or restricted by AppArmor).
                 probe(
                     &self.program,
                     &[
                         "--ro-bind",
                         "/",
                         "/",
+                        "--dev",
+                        "/dev",
+                        "--proc",
+                        "/proc",
+                        "--tmpfs",
+                        "/tmp",
+                        "--unshare-pid",
                         "--unshare-net",
                         "--die-with-parent",
+                        "--new-session",
                         "true",
                     ],
                 )
@@ -363,6 +387,16 @@ impl Sandbox for BubblewrapSandbox {
 #[derive(Debug, Clone, Default)]
 pub struct SeatbeltSandbox;
 
+/// The canonical form of each path that exists (sandboxes match real paths:
+/// `/tmp` is `/private/tmp` on macOS, and bwrap cannot mount over a missing
+/// path on a read-only root).
+fn existing_canonical(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
+}
+
 fn sbpl_string(path: &Path) -> String {
     let raw = path.display().to_string();
     format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
@@ -383,6 +417,12 @@ impl SeatbeltSandbox {
         ));
         if !cmd.allow_network {
             profile.push_str("(deny network*)\n");
+        }
+        for path in existing_canonical(&cmd.deny_read) {
+            profile.push_str(&format!(
+                "(deny file-read* file-write* (subpath {}))\n",
+                sbpl_string(&path)
+            ));
         }
         profile
     }
@@ -539,19 +579,139 @@ impl Sandbox for DockerSandbox {
     }
 }
 
-/// The most contained backend available here: bubblewrap on Linux,
-/// seatbelt on macOS, otherwise [`LocalSandbox`] (uncontained). Docker is
-/// never picked automatically because it needs an image choice.
+/// The backends the default shell can choose between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    /// [`BubblewrapSandbox`] (Linux).
+    Bubblewrap,
+    /// [`SeatbeltSandbox`] (macOS).
+    Seatbelt,
+    /// [`LocalSandbox`]: no containment.
+    Local,
+}
+
+impl SandboxKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bubblewrap => "bubblewrap",
+            Self::Seatbelt => "seatbelt",
+            Self::Local => "local",
+        }
+    }
+
+    /// A new backend of this kind.
+    pub fn backend(self) -> Arc<dyn Sandbox> {
+        match self {
+            Self::Bubblewrap => Arc::new(BubblewrapSandbox::new()),
+            Self::Seatbelt => Arc::new(SeatbeltSandbox::new()),
+            Self::Local => Arc::new(LocalSandbox),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bubblewrap" | "bwrap" => Ok(Self::Bubblewrap),
+            "seatbelt" | "sandbox-exec" => Ok(Self::Seatbelt),
+            "local" | "host" | "none" => Ok(Self::Local),
+            other => Err(format!(
+                "unknown sandbox `{other}` (expected auto, bubblewrap, seatbelt or local)"
+            )),
+        }
+    }
+}
+
+/// Environment variable that overrides the default shell's backend:
+/// `auto` (or unset), `bubblewrap`, `seatbelt`, or `local` (no containment).
+pub const SANDBOX_ENV: &str = "AIDAEMON_SHELL_SANDBOX";
+
+/// The result of [`select_sandbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxSelection {
+    pub kind: SandboxKind,
+    /// No contained backend was available, so commands run uncontained.
+    /// Never set for an explicit choice.
+    pub fell_back: bool,
+}
+
+/// Pick a backend. An explicit `preference` always wins (an unavailable one
+/// then fails each command with [`ExecError::Unavailable`] rather than
+/// running uncontained). Otherwise the first available of bubblewrap and
+/// seatbelt, else [`SandboxKind::Local`] with `fell_back` set. `available`
+/// is the probe, injectable for tests.
+pub fn select_sandbox(
+    preference: Option<SandboxKind>,
+    available: impl Fn(SandboxKind) -> bool,
+) -> SandboxSelection {
+    if let Some(kind) = preference {
+        return SandboxSelection {
+            kind,
+            fell_back: false,
+        };
+    }
+    for kind in [SandboxKind::Bubblewrap, SandboxKind::Seatbelt] {
+        if available(kind) {
+            return SandboxSelection {
+                kind,
+                fell_back: false,
+            };
+        }
+    }
+    SandboxSelection {
+        kind: SandboxKind::Local,
+        fell_back: true,
+    }
+}
+
+/// Read [`SANDBOX_ENV`]: `Ok(None)` for unset, empty or `auto`.
+pub fn sandbox_preference_from_env() -> std::result::Result<Option<SandboxKind>, String> {
+    match std::env::var(SANDBOX_ENV) {
+        Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("auto") => {
+            Ok(None)
+        }
+        Ok(value) => value.parse().map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn is_kind_available(kind: SandboxKind) -> bool {
+    match kind {
+        SandboxKind::Bubblewrap => BubblewrapSandbox::new().is_available(),
+        SandboxKind::Seatbelt => SeatbeltSandbox::new().is_available(),
+        SandboxKind::Local => LocalSandbox.is_available(),
+    }
+}
+
+/// The default shell's backend: the one named by [`SANDBOX_ENV`], else the
+/// most contained one available here (bubblewrap on Linux, seatbelt on
+/// macOS), else [`LocalSandbox`] (uncontained) with a one-time warning.
+/// Docker is never picked automatically because it needs an image choice.
 pub fn best_available_sandbox() -> Arc<dyn Sandbox> {
-    let bwrap = BubblewrapSandbox::new();
-    if bwrap.is_available() {
-        return Arc::new(bwrap);
+    static WARN_ENV: std::sync::Once = std::sync::Once::new();
+    static WARN_FALLBACK: std::sync::Once = std::sync::Once::new();
+    let preference = sandbox_preference_from_env().unwrap_or_else(|err| {
+        WARN_ENV.call_once(|| tracing::warn!("{SANDBOX_ENV}: {err}; choosing automatically"));
+        None
+    });
+    let selection = select_sandbox(preference, is_kind_available);
+    if selection.fell_back {
+        WARN_FALLBACK.call_once(|| {
+            tracing::warn!(
+                "no OS sandbox is available ({}); the shell tool runs commands \
+                 uncontained on the host. Install bubblewrap on Linux, or set \
+                 {SANDBOX_ENV}=local to choose this explicitly.",
+                if cfg!(target_os = "linux") {
+                    "bwrap is missing or user namespaces are disabled"
+                } else {
+                    "no supported sandbox on this platform"
+                }
+            )
+        });
     }
-    let seatbelt = SeatbeltSandbox::new();
-    if seatbelt.is_available() {
-        return Arc::new(seatbelt);
-    }
-    Arc::new(LocalSandbox)
+    selection.kind.backend()
 }
 
 #[cfg(test)]
@@ -584,6 +744,129 @@ mod tests {
         assert!(!BubblewrapSandbox::new()
             .args(&open)
             .contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn bubblewrap_args_hide_denied_paths_after_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        std::fs::create_dir(root.join("secrets")).unwrap();
+        std::fs::write(root.join("token"), "t").unwrap();
+        let mut s = SandboxCommand::new("true", &root);
+        s.deny_read = vec![
+            root.join("secrets"),
+            root.join("token"),
+            root.join("missing"),
+        ];
+        let joined = BubblewrapSandbox::new().args(&s).join(" ");
+        let ws_bind = format!("--bind {0} {0}", root.display());
+        let dir = format!("--tmpfs {}", root.join("secrets").display());
+        let file = format!("--ro-bind /dev/null {}", root.join("token").display());
+        let at = |needle: &str| {
+            joined
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {joined}"))
+        };
+        assert!(at(&ws_bind) < at(&dir) && at(&ws_bind) < at(&file));
+        assert!(!joined.contains("missing"), "{joined}");
+    }
+
+    #[test]
+    fn seatbelt_profile_denies_reads_of_denied_paths() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let mut s = SandboxCommand::new("true", &root);
+        s.deny_read = vec![root.clone(), root.join("missing")];
+        let profile = SeatbeltSandbox::new().profile(&s);
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read* file-write* (subpath {}))",
+                sbpl_string(&root)
+            )),
+            "{profile}"
+        );
+        assert!(!profile.contains("missing"));
+    }
+
+    #[test]
+    fn explicit_choice_wins_even_when_unavailable() {
+        for kind in [
+            SandboxKind::Bubblewrap,
+            SandboxKind::Seatbelt,
+            SandboxKind::Local,
+        ] {
+            let chosen = select_sandbox(Some(kind), |_| false);
+            assert_eq!(chosen.kind, kind);
+            assert!(!chosen.fell_back);
+        }
+    }
+
+    #[test]
+    fn automatic_choice_prefers_contained_backends() {
+        let only = |k: SandboxKind| move |c: SandboxKind| c == k;
+        let bwrap = select_sandbox(None, only(SandboxKind::Bubblewrap));
+        assert_eq!(bwrap.kind, SandboxKind::Bubblewrap);
+        assert!(!bwrap.fell_back);
+        let seatbelt = select_sandbox(None, only(SandboxKind::Seatbelt));
+        assert_eq!(seatbelt.kind, SandboxKind::Seatbelt);
+        assert!(!seatbelt.fell_back);
+        assert_eq!(select_sandbox(None, |_| true).kind, SandboxKind::Bubblewrap);
+        // No OS sandbox: uncontained, and flagged so the caller warns.
+        let none = select_sandbox(None, |_| false);
+        assert_eq!(none.kind, SandboxKind::Local);
+        assert!(none.fell_back);
+        let local_only = select_sandbox(None, only(SandboxKind::Local));
+        assert_eq!(local_only.kind, SandboxKind::Local);
+        assert!(local_only.fell_back);
+    }
+
+    #[test]
+    fn sandbox_kind_parses_names_and_builds_backends() {
+        assert_eq!("bwrap".parse(), Ok(SandboxKind::Bubblewrap));
+        assert_eq!(" Bubblewrap ".parse(), Ok(SandboxKind::Bubblewrap));
+        assert_eq!("seatbelt".parse(), Ok(SandboxKind::Seatbelt));
+        assert_eq!("none".parse(), Ok(SandboxKind::Local));
+        assert_eq!("host".parse(), Ok(SandboxKind::Local));
+        assert!("docker".parse::<SandboxKind>().is_err());
+        for kind in [
+            SandboxKind::Bubblewrap,
+            SandboxKind::Seatbelt,
+            SandboxKind::Local,
+        ] {
+            assert_eq!(kind.backend().name(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn the_platform_default_matches_the_probe() {
+        if std::env::var_os(SANDBOX_ENV).is_some() {
+            println!("skipping: {SANDBOX_ENV} is set");
+            return;
+        }
+        let expected = select_sandbox(None, is_kind_available).kind;
+        assert_eq!(best_available_sandbox().name(), expected.as_str());
+        if cfg!(target_os = "macos") && SeatbeltSandbox::new().is_available() {
+            assert_eq!(expected, SandboxKind::Seatbelt);
+        }
+    }
+
+    #[tokio::test]
+    async fn seatbelt_blocks_reads_of_denied_paths() {
+        let backend = SeatbeltSandbox::new();
+        if !backend.is_available() {
+            println!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(secrets.path().join("key"), "synthetic-secret").unwrap();
+        let mut s = SandboxCommand::new(format!("cat {}/key", secrets.path().display()), &root);
+        s.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        s.deny_read = vec![secrets.path().to_path_buf()];
+        let out = backend.run(&s).await.unwrap();
+        assert_ne!(out.exit_code, Some(0), "{}", out.output);
+        assert!(!out.output.contains("synthetic-secret"), "{}", out.output);
     }
 
     #[test]
