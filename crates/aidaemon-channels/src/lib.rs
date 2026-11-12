@@ -18,6 +18,7 @@ pub mod approval_conformance;
 pub mod approval_render;
 mod approvals;
 pub mod attachments;
+pub mod bot;
 pub mod channel;
 pub mod commands;
 #[cfg(feature = "conformance")]

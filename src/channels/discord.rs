@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::commands::{shared_commands, CommandCategory, CommandDef};
-use super::formatting::{build_help_text, sanitize_filename, split_message};
 use super::prompts::Prompts;
 use super::turns::{repeat_while_working, Turn, TurnRunner, TurnSurface};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
@@ -27,6 +26,9 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{ChannelCapabilities, HubChannel};
 use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMessage};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+use aidaemon_channels::slash::build_help_text;
+use aidaemon_channels::split_message;
+use aidaemon_events::attachments::sanitize_filename;
 
 /// Longest Discord message: the adapter's limit.
 const MAX_MESSAGE_LEN: usize = aidaemon_channel_discord::MAX_MESSAGE_LEN;
@@ -379,7 +381,7 @@ impl DiscordChannel {
             return;
         }
 
-        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+        let user_role = aidaemon_channels::bot::determine_role(&self.owner_user_ids, user_id);
         let text = if user_role == UserRole::Owner {
             super::attachments::build_inbound_text(&message.text, &attachments)
         } else {
@@ -521,7 +523,7 @@ impl DiscordChannel {
             return "Unauthorized.".to_string();
         }
         let session_id = self.session_for(user_id, guild, channel_id);
-        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+        let user_role = aidaemon_channels::bot::determine_role(&self.owner_user_ids, user_id);
         self.dispatch_command(text, &session_id, user_id, user_role)
             .await
     }

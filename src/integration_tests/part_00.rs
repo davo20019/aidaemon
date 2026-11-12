@@ -1388,7 +1388,7 @@ fn simulate_telegram_auth(
     user_id: u64,
 ) -> Option<UserRole> {
     // Step 1: auth check (mirrors telegram.rs handle_message)
-    use crate::channels::telegram::{check_auth, determine_role, AuthResult};
+    use aidaemon_channel_telegram::bot::{check_auth, determine_role, AuthResult};
     let auth = if allowed_user_ids.is_empty() {
         check_auth(allowed_user_ids, user_id)
     } else if allowed_user_ids.contains(&user_id) {

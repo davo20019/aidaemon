@@ -5,7 +5,7 @@ pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]
 mod discord;
-mod formatting;
+#[cfg(test)]
 pub(crate) use aidaemon_channels::live_status;
 #[cfg(test)]
 pub(crate) mod mock_api;
@@ -34,7 +34,7 @@ pub(crate) use presentation::{
 };
 #[cfg(feature = "slack")]
 pub use slack::{spawn_slack_channel, SlackChannel};
-pub use telegram::TelegramChannel;
+pub(crate) use telegram::{new_telegram_bot, TelegramBot};
 
 /// Shared application services/configuration consumed by every chat transport.
 /// Transport constructors take this named bundle plus protocol-specific values,
@@ -53,6 +53,20 @@ pub(crate) struct ChannelRuntimeDeps {
 }
 
 impl ChannelRuntimeDeps {
+    /// What a bot in an adapter crate runs on.
+    pub(crate) fn bot_deps(&self) -> aidaemon_channels::bot::BotDeps {
+        aidaemon_channels::bot::BotDeps {
+            agent: self.agent.clone(),
+            session_map: self.session_map.clone(),
+            sessions: self.state.clone(),
+            task_registry: self.task_registry.clone(),
+            files_enabled: self.files_enabled,
+            inbox_dir: self.inbox_dir.clone(),
+            max_file_size_mb: self.max_file_size_mb,
+            watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+        }
+    }
+
     /// What the shared turn runner needs from these.
     pub(crate) fn turn_deps(&self) -> turns::TurnDeps {
         turns::TurnDeps {

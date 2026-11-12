@@ -74,22 +74,32 @@ async fn start_mock() -> (Arc<MockApi>, String) {
 async fn channel(
     base: &str,
     provider: MockProvider,
-) -> (Arc<TelegramChannel>, crate::testing::TestHarness) {
+) -> (Arc<TelegramBot>, crate::testing::TestHarness) {
+    let (channel, harness, _config_path) = channel_with_config(base, provider).await;
+    (channel, harness)
+}
+
+/// A bot on the mock, and the path of its (not yet written) config file.
+async fn channel_with_config(
+    base: &str,
+    provider: MockProvider,
+) -> (Arc<TelegramBot>, crate::testing::TestHarness, PathBuf) {
     let mut harness = setup_test_agent(provider).await.unwrap();
     let agent: Arc<dyn DaemonAgentRuntime> = Arc::new(std::mem::replace(
         &mut harness.agent,
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));
     let inbox = tempfile::tempdir().unwrap().keep();
+    let config_path = inbox.join("config.toml");
     let channel = Arc::new(
-        TelegramChannel::new(
+        new_telegram_bot(
             TOKEN,
             vec![OWNER],
             TelegramWebhookConfig::default(),
             vec![OWNER],
             ChannelRuntimeDeps {
                 agent,
-                config_path: inbox.join("config.toml"),
+                config_path: config_path.clone(),
                 session_map: Arc::default(),
                 task_registry: Arc::new(TaskRegistry::new(50)),
                 files_enabled: false,
@@ -103,7 +113,7 @@ async fn channel(
         )
         .with_api_url(base),
     );
-    (channel, harness)
+    (channel, harness, config_path)
 }
 
 impl MockApi {
@@ -316,10 +326,10 @@ async fn key_checking_provider() -> String {
 async fn setkey_channel(
     base: &str,
     provider_base: &str,
-) -> (Arc<TelegramChannel>, crate::testing::TestHarness) {
-    let (channel, harness) = channel(base, MockProvider::new()).await;
+) -> (Arc<TelegramBot>, crate::testing::TestHarness, PathBuf) {
+    let (channel, harness, config_path) = channel_with_config(base, MockProvider::new()).await;
     std::fs::write(
-        &channel.config_path,
+        &config_path,
         format!(
             "[provider]\nkind = \"openai_chatgpt\"\napi_key = \"\"\n\n\
              # Claude\n[[provider.fallbacks]]\nkind = \"anthropic\"\n\
@@ -327,7 +337,7 @@ async fn setkey_channel(
         ),
     )
     .unwrap();
-    (channel, harness)
+    (channel, harness, config_path)
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -336,7 +346,7 @@ async fn a_good_key_is_saved_and_never_reaches_the_agent() {
     let _keychain = crate::testing::KeychainIsolation::acquire();
     let (mock, base) = start_mock().await;
     let provider_base = key_checking_provider().await;
-    let (channel, harness) = setkey_channel(&base, &provider_base).await;
+    let (channel, harness, config_path) = setkey_channel(&base, &provider_base).await;
     mock.updates.lock().unwrap().extend([
         text_update(1, 10, "/setkey"),
         button_update(2, "setkey:f0"),
@@ -365,7 +375,7 @@ async fn a_good_key_is_saved_and_never_reaches_the_agent() {
     assert!(!done.to_string().contains("synthetic-good-key"), "{done}");
     running.abort();
 
-    let saved = std::fs::read_to_string(&channel.config_path).unwrap();
+    let saved = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved.contains("api_key = \"keychain\""), "{saved}");
     assert!(saved.contains("# Claude"), "{saved}");
     assert_eq!(
@@ -386,8 +396,8 @@ async fn a_rejected_key_changes_nothing() {
     let _keychain = crate::testing::KeychainIsolation::acquire();
     let (mock, base) = start_mock().await;
     let provider_base = key_checking_provider().await;
-    let (channel, _harness) = setkey_channel(&base, &provider_base).await;
-    let before = std::fs::read_to_string(&channel.config_path).unwrap();
+    let (channel, _harness, config_path) = setkey_channel(&base, &provider_base).await;
+    let before = std::fs::read_to_string(&config_path).unwrap();
     mock.updates.lock().unwrap().extend([
         button_update(1, "setkey:f0"),
         text_update(2, 11, "synthetic-bad-key"),
@@ -402,9 +412,6 @@ async fn a_rejected_key_changes_nothing() {
     })
     .await;
     running.abort();
-    assert_eq!(
-        std::fs::read_to_string(&channel.config_path).unwrap(),
-        before
-    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
     assert!(crate::config::resolve_from_keychain("provider_fallback_0_api_key").is_err());
 }

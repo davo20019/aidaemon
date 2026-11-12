@@ -101,3 +101,23 @@ pub fn sanitize_filename(name: &str) -> String {
         sanitized[..boundary].to_string()
     }
 }
+
+#[cfg(test)]
+mod sanitize_filename_tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename() {
+        assert_eq!(sanitize_filename("test.txt"), "test.txt");
+        assert_eq!(sanitize_filename("path/to/file.txt"), "pathtofile.txt");
+        assert_eq!(sanitize_filename("a\0b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_filename_long() {
+        let long = "a".repeat(250) + ".txt";
+        let result = sanitize_filename(&long);
+        assert!(result.len() <= 200);
+        assert!(result.ends_with(".txt"));
+    }
+}

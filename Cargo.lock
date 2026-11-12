@@ -191,9 +191,13 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
  "axum",
  "chrono",
+ "proptest",
  "rand 0.10.3",
  "reqwest 0.13.5",
  "serde",
@@ -202,6 +206,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

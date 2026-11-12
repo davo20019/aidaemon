@@ -20,9 +20,24 @@ publish = false
 [features]
 ## Receive updates on an HTTPS webhook instead of long polling.
 webhook = ["dep:axum", "dep:rand", "tokio/net"]
+## The bot an application runs (`bot::TelegramBot`): access, sessions,
+## commands, files and the live status card on the shared turn runner.
+bot = [
+    "webhook",
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:uuid",
+]
 
 [dependencies]
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 rand = { version = "0.10", optional = true }
 async-trait = "0.1"
@@ -36,6 +51,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+proptest = "1"
 aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 axum = "0.8"
