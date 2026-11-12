@@ -654,6 +654,8 @@ pub(in crate::agent) struct TurnScope<'a> {
     progress: std::sync::Mutex<crate::agent::completion_contract::CompletionProgress>,
     /// Shared with the memory writer, which learns from it at run end.
     learning: Arc<std::sync::Mutex<crate::agent::post_task::LearningContext>>,
+    /// The turn's learning consent, handed to the sub-agents it spawns.
+    learning_consent: aidaemon_policies::TurnLearning,
     /// The model-visible output of the latest tool call, for paste checks.
     latest_tool_output: std::sync::Mutex<Option<String>>,
     /// The one reply retry has been spent.
@@ -1544,6 +1546,7 @@ impl Agent {
             turn_id: &turn_id,
             contract: &contract,
             learning: learning.clone(),
+            learning_consent: memory_turn.learning_consent.clone(),
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: text_only_next_call.clone(),

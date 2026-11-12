@@ -954,6 +954,7 @@ async fn a_mandate_workers_egress_is_judged_against_the_confirmed_mandate() {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            learning: None,
             spawn_family: None,
             child_declaration: None,
             parent_run: None,

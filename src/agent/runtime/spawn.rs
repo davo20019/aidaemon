@@ -2464,6 +2464,8 @@ impl Agent {
             // Inside a chain the child shares the chain's live declines; a
             // root dispatch starts a family of its own.
             shared_declines: inherited.and_then(|inherited| inherited.shared_declines.clone()),
+            // A child of a turn opted out of learning is opted out too.
+            learning: inherited.and_then(|inherited| inherited.learning.clone()),
             spawn_family: inherited.and_then(|inherited| inherited.spawn_family.clone()),
             child_declaration: None,
             parent_run: inherited.and_then(|inherited| inherited.parent_run),

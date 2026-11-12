@@ -1192,10 +1192,14 @@ pub(in crate::agent) async fn run_bootstrap(
     // "Don't remember this" is settled before the turn's memory policy is
     // recorded, so the turn's one policy event already says so: background
     // intake never sees a private turn as allowed, and a turn suppressed for
-    // another reason still carries the opt-out history search excludes.
-    // `/private` sent before this message opts it out; only a message the
-    // user wrote consumes it.
-    let learning = aidaemon_policies::TurnLearning::default();
+    // another reason still carries the opt-out history search excludes. A
+    // sub-agent shares its parent turn's learning. `/private` sent before
+    // this message opts it out; only a message the user wrote consumes it.
+    let learning = agent
+        .inherited_authority
+        .as_ref()
+        .and_then(|parent| parent.learning.clone())
+        .unwrap_or_default();
     if !ctx.internal_continuation
         && agent.depth == 0
         && agent.mandate_execution.is_none()

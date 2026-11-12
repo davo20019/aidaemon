@@ -998,6 +998,7 @@ async fn test_child_tokens_count_against_the_requests_tree() {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            learning: None,
             spawn_family: Some(family.clone()),
             child_declaration: None,
             parent_run: None,
