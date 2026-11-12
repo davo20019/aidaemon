@@ -439,7 +439,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, f)| (i, fake_cosine(q.query, f)))
                 .collect();
-            let related = rank_related(&neighbors, &scores, None, &cfg);
+            let related = rank_related(&neighbors, &scores, None, None, &cfg);
             assert!(related.len() <= cfg.related_max);
             for hit in report.hits.iter().chain(&related) {
                 assert!(

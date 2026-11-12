@@ -933,13 +933,22 @@ impl ManageMemoriesTool {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
+                // "Relevant" only when a relevance floor judged the pool;
+                // otherwise every candidate would be called relevant.
+                let counts = if report.floor_applied {
+                    format!(
+                        "{} shown, {} relevant of {} considered",
+                        report.hits.len(),
+                        report.passed_floor,
+                        report.considered
+                    )
+                } else {
+                    format!("{} shown of {} considered", report.hits.len(), report.considered)
+                };
                 let mut output = format!(
-                    "══ Stored facts matching '{}' ({} shown, {} relevant of {} considered) ══\n\
+                    "══ Stored facts matching '{}' ({}) ══\n\
                      IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
-                    query,
-                    report.hits.len(),
-                    report.passed_floor,
-                    report.considered
+                    query, counts
                 );
                 for hit in &report.hits {
                     let f = &hit.fact;
@@ -982,7 +991,7 @@ impl ManageMemoriesTool {
                         marker
                     ));
                 }
-                if report.passed_floor > report.hits.len() {
+                if report.floor_applied && report.passed_floor > report.hits.len() {
                     output.push_str(&format!(
                         "({} more relevant; raise limit to see them.)\n",
                         report.passed_floor - report.hits.len()
@@ -2561,7 +2570,11 @@ mod tests {
             .call(&json!({"action": "search", "query": "zephyr"}).to_string())
             .await
             .unwrap();
-        assert!(out.contains("(3 shown, 3 relevant of"), "{out}");
+        assert!(out.contains("(3 shown of"), "{out}");
+        assert!(
+            !out.contains("relevant of"),
+            "no floor, no relevance claim: {out}"
+        );
         assert!(!out.contains("of 30 matches"), "{out}");
         assert!(!out.contains("more relevant"), "{out}");
     }

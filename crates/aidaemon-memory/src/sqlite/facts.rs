@@ -545,29 +545,49 @@ impl SqliteMemory {
 impl SqliteMemory {
     /// Every fact an explicit search ranks, loaded once: canonical
     /// projections, then active rows, minus owner rows a projection already
-    /// covers.
-    async fn explicit_search_facts(&self) -> anyhow::Result<Vec<Fact>> {
-        let mut facts = self.canonical_personal_facts().await.unwrap_or_default();
-        let canonical_owner_keys: std::collections::HashSet<String> = facts
+    /// covers. The map sends each such projection to the raw row it
+    /// replaced, whose vector stands in for it: projections have no vector
+    /// of their own, and without one they would be reachable by keyword only.
+    async fn explicit_search_facts(
+        &self,
+    ) -> anyhow::Result<(Vec<Fact>, std::collections::HashMap<i64, i64>)> {
+        let mut facts = self.canonical_personal_facts().await?;
+        let projection_by_key: std::collections::HashMap<String, i64> = facts
             .iter()
             .filter(|fact| fact.category == "user")
-            .map(|fact| canonical_personal_key(&fact.key))
+            .map(|fact| (canonical_personal_key(&fact.key), fact.id))
             .collect();
-        facts.extend(
-            self.get_all_facts_with_provenance()
-                .await?
-                .into_iter()
-                .filter(|fact| {
-                    fact.category != "user"
-                        || !canonical_owner_keys.contains(&canonical_personal_key(&fact.key))
-                }),
-        );
-        Ok(facts)
+        // The newest covered row stands in.
+        let mut newest: std::collections::HashMap<i64, (i64, DateTime<Utc>)> =
+            std::collections::HashMap::new();
+        for fact in self.get_all_facts_with_provenance().await? {
+            let covering = (fact.category == "user")
+                .then(|| projection_by_key.get(&canonical_personal_key(&fact.key)))
+                .flatten();
+            match covering {
+                Some(projection) => {
+                    let slot = newest
+                        .entry(*projection)
+                        .or_insert((fact.id, fact.updated_at));
+                    if fact.updated_at > slot.1 {
+                        *slot = (fact.id, fact.updated_at);
+                    }
+                }
+                None => facts.push(fact),
+            }
+        }
+        let stand_ins = newest.into_iter().map(|(p, (id, _))| (p, id)).collect();
+        Ok((facts, stand_ins))
     }
 
     /// Cosine of the query against every fact with a current vector, by
     /// position in `facts`. Empty when the query cannot be embedded.
-    async fn explicit_search_cosine(&self, query: &str, facts: &[Fact]) -> Vec<(usize, f32)> {
+    async fn explicit_search_cosine(
+        &self,
+        query: &str,
+        facts: &[Fact],
+        stand_ins: &std::collections::HashMap<i64, i64>,
+    ) -> Vec<(usize, f32)> {
         let query_vec = match self.embedding_service.embed(query.to_string()).await {
             Ok(vector) => vector,
             Err(error) => {
@@ -575,14 +595,15 @@ impl SqliteMemory {
                 return Vec::new();
             }
         };
+        let vector_id = |fact: &Fact| stand_ins.get(&fact.id).copied().unwrap_or(fact.id);
         let indexed = self
-            .fact_embedding_scores(&query_vec, facts.len())
+            .fact_embedding_scores(&query_vec, facts.len() + stand_ins.len())
             .await
             .unwrap_or_default();
         let fallback = self
             .unindexed_fact_scores(
                 &query_vec,
-                facts.iter().map(|f| f.id).filter(|id| *id > 0),
+                facts.iter().map(vector_id).filter(|id| *id > 0),
                 &indexed,
             )
             .await;
@@ -590,9 +611,10 @@ impl SqliteMemory {
             .iter()
             .enumerate()
             .filter_map(|(i, fact)| {
+                let id = vector_id(fact);
                 indexed
-                    .get(&fact.id)
-                    .or_else(|| fallback.get(&fact.id))
+                    .get(&id)
+                    .or_else(|| fallback.get(&id))
                     .map(|score| (i, *score))
             })
             .collect()
@@ -618,7 +640,7 @@ impl SqliteMemory {
         }
     }
 
-    fn rerank_floor(&self) -> Option<f32> {
+    fn rerank_floor(&self) -> Option<crate::search::RelevanceFloor> {
         self.embedding_service
             .reranker
             .as_ref()
@@ -641,7 +663,7 @@ impl FactStore for SqliteMemory {
             return Ok(search::FactSearchReport::default());
         }
         let started = std::time::Instant::now();
-        let facts = self.explicit_search_facts().await?;
+        let (facts, stand_ins) = self.explicit_search_facts().await?;
         let load_ms = started.elapsed().as_millis() as u64;
 
         let stage = std::time::Instant::now();
@@ -649,7 +671,7 @@ impl FactStore for SqliteMemory {
         let lexical_ms = stage.elapsed().as_millis() as u64;
 
         let stage = std::time::Instant::now();
-        let cosine = self.explicit_search_cosine(query, &facts).await;
+        let cosine = self.explicit_search_cosine(query, &facts, &stand_ins).await;
         let embed_ms = stage.elapsed().as_millis() as u64;
 
         let stage = std::time::Instant::now();
@@ -712,14 +734,23 @@ impl FactStore for SqliteMemory {
                 .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
                 .collect();
             let related = match self.explicit_search_rerank(query, docs).await {
-                Some(scores) => search::rank_related(&neighbors, &scores, floor, config),
+                Some(scores) => search::rank_related(
+                    &neighbors,
+                    &scores,
+                    floor,
+                    report.hits.first().map(|hit| hit.score),
+                    config,
+                ),
                 None => {
                     let scores: Vec<(usize, f32)> = neighbors
                         .iter()
                         .enumerate()
                         .map(|(i, f)| (i, prior(f)))
                         .collect();
-                    search::rank_related(&neighbors, &scores, None, config)
+                    // No floor: a relationship cluster (a parent of the
+                    // person searched) shares no words with the query, so a
+                    // cosine cutoff would drop exactly the designed case.
+                    search::rank_related(&neighbors, &scores, None, None, config)
                 }
             };
             report.related = related;
@@ -1050,72 +1081,78 @@ impl FactStore for SqliteMemory {
         // full fact embeddings (which include value), because dedup should detect
         // that two keys refer to the same concept regardless of their values.
         if existing.is_none() {
-            let new_key_text = build_dedup_key_text(category_clean, key_clean);
-            if let Ok(new_vec) = self.embedding_service.embed(new_key_text).await {
-                let category_facts = sqlx::query(
-                    "SELECT id, key, value FROM facts
-                     WHERE category = ? AND superseded_at IS NULL",
-                )
-                .bind(category_clean)
-                .fetch_all(&self.pool)
-                .await?;
+            let category_facts = sqlx::query(
+                "SELECT id, key, value FROM facts
+                 WHERE category = ? AND superseded_at IS NULL",
+            )
+            .bind(category_clean)
+            .fetch_all(&self.pool)
+            .await?;
 
-                let new_tokens: std::collections::HashSet<&str> =
-                    canonical_key.split('_').filter(|t| !t.is_empty()).collect();
+            let new_tokens: std::collections::HashSet<&str> =
+                canonical_key.split('_').filter(|t| !t.is_empty()).collect();
 
-                let mut best_match: Option<(i64, String, String, f32)> = None;
-                for row in &category_facts {
-                    let existing_key: String = row.get("key");
-                    let existing_canonical = canonicalize_fact_key(&existing_key);
-
-                    // Guard against false semantic matches for keys that are
-                    // structurally similar but intentionally distinct.
-                    //
-                    // If keys share SOME tokens, have the same token count, but
-                    // differ in at least one token, they're variants of the same
-                    // base concept (e.g., "dog_name_old" vs "dog_name_new") — skip.
-                    //
-                    // But allow through:
-                    // - Keys that are a subset/superset (modifier pattern):
-                    //   "editor" vs "preferred_editor" — different count, proceed.
-                    // - Keys that are just reordered (same tokens, same count):
-                    //   "company_previous" vs "previous_company" — all shared, proceed.
-                    // - Keys with zero overlap: completely different concepts.
+            // Guard against false semantic matches for keys that are
+            // structurally similar but intentionally distinct.
+            //
+            // If keys share SOME tokens, have the same token count, but
+            // differ in at least one token, they're variants of the same
+            // base concept (e.g., "dog_name_old" vs "dog_name_new") — skip.
+            //
+            // But allow through:
+            // - Keys that are a subset/superset (modifier pattern):
+            //   "editor" vs "preferred_editor" — different count, proceed.
+            // - Keys that are just reordered (same tokens, same count):
+            //   "company_previous" vs "previous_company" — all shared, proceed.
+            // - Keys with zero overlap: completely different concepts.
+            let comparable: Vec<&sqlx::sqlite::SqliteRow> = category_facts
+                .iter()
+                .filter(|row| {
+                    let existing_canonical = canonicalize_fact_key(&row.get::<String, _>("key"));
                     let existing_tokens: std::collections::HashSet<&str> = existing_canonical
                         .split('_')
                         .filter(|t| !t.is_empty())
                         .collect();
-                    if keys_name_distinct_concepts(&new_tokens, &existing_tokens) {
-                        continue;
-                    }
+                    !keys_name_distinct_concepts(&new_tokens, &existing_tokens)
+                })
+                .collect();
 
-                    let existing_key_text = build_dedup_key_text(category_clean, &existing_key);
-                    if let Ok(existing_vec) = self.embedding_service.embed(existing_key_text).await
-                    {
-                        let sim = cosine_similarity(&new_vec, &existing_vec);
-                        if sim > 0.85 {
-                            let score = best_match.as_ref().map(|m| m.3).unwrap_or(0.0);
-                            if sim > score {
-                                best_match = Some((
-                                    row.get("id"),
-                                    existing_key.clone(),
-                                    row.get::<String, _>("value"),
-                                    sim,
-                                ));
-                            }
+            // One embedder call for the new key and every comparable key: a
+            // call per row costs a model hop each and made one write into a
+            // large category take seconds.
+            if !comparable.is_empty() {
+                let mut texts = Vec::with_capacity(comparable.len() + 1);
+                texts.push(build_dedup_key_text(category_clean, key_clean));
+                texts.extend(
+                    comparable.iter().map(|row| {
+                        build_dedup_key_text(category_clean, &row.get::<String, _>("key"))
+                    }),
+                );
+                if let Ok(vectors) = self.embedding_service.embed_many(texts).await {
+                    let new_vec = &vectors[0];
+                    let mut best_match: Option<(i64, String, String, f32)> = None;
+                    for (row, existing_vec) in comparable.iter().zip(&vectors[1..]) {
+                        let sim = cosine_similarity(new_vec, existing_vec);
+                        if sim > 0.85 && sim > best_match.as_ref().map_or(0.0, |m| m.3) {
+                            best_match = Some((
+                                row.get("id"),
+                                row.get::<String, _>("key"),
+                                row.get::<String, _>("value"),
+                                sim,
+                            ));
                         }
                     }
-                }
 
-                if let Some((id, matched_key, matched_value, sim)) = best_match {
-                    tracing::info!(
-                        category = category_clean,
-                        new_key = key_clean,
-                        matched_key = matched_key.as_str(),
-                        similarity = sim,
-                        "Semantic dedup: matched existing fact by embedding similarity"
-                    );
-                    existing = Some((id, matched_key, matched_value));
+                    if let Some((id, matched_key, matched_value, sim)) = best_match {
+                        tracing::info!(
+                            category = category_clean,
+                            new_key = key_clean,
+                            matched_key = matched_key.as_str(),
+                            similarity = sim,
+                            "Semantic dedup: matched existing fact by embedding similarity"
+                        );
+                        existing = Some((id, matched_key, matched_value));
+                    }
                 }
             }
         }

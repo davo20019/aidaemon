@@ -165,8 +165,8 @@ impl Reranker for FailingReranker {
         anyhow::bail!("synthetic reranker outage")
     }
 
-    fn relevance_floor(&self) -> Option<f32> {
-        Some(0.5)
+    fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
+        Some(crate::search::RelevanceFloor::uniform(0.5))
     }
 }
 
@@ -206,8 +206,8 @@ impl Reranker for OverlapReranker {
         Ok(scored)
     }
 
-    fn relevance_floor(&self) -> Option<f32> {
-        Some(1.0)
+    fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
+        Some(crate::search::RelevanceFloor::uniform(1.0))
     }
 }
 
@@ -285,6 +285,24 @@ async fn search_facts_collapses_canonical_duplicate() {
         .filter(|h| h.fact.value == "1990-04-12")
         .count();
     assert_eq!(dates, 1, "{:?}", values(&report));
+    // The projection replaced the raw row, so it must also carry that row's
+    // vector: otherwise a projected owner fact is reachable by keyword only.
+    let hit = report
+        .hits
+        .iter()
+        .find(|h| h.fact.value == "1990-04-12")
+        .unwrap();
+    assert!(hit.fact.id < 0, "the projection is the row shown");
+    let report = memory
+        .search_facts("date of birth", 10, &FactSearchConfig::default())
+        .await
+        .unwrap();
+    let hit = report
+        .hits
+        .iter()
+        .find(|h| h.fact.value == "1990-04-12")
+        .unwrap();
+    assert_eq!(hit.kind, crate::search::MatchKind::Both);
 }
 
 struct BareStore;

@@ -96,7 +96,7 @@ pub trait Reranker: Send + Sync {
     /// specific to the model: cross-encoders emit logits or probabilities
     /// with different ranges, so only the implementation can say. `None`
     /// disables the floor, and the search pool caps are the only gate.
-    fn relevance_floor(&self) -> Option<f32> {
+    fn relevance_floor(&self) -> Option<crate::search::RelevanceFloor> {
         None
     }
 }
@@ -120,6 +120,22 @@ impl StoreModels {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))
+    }
+
+    /// One embedder call for many texts: one model hop instead of one per
+    /// text.
+    async fn embed_many(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected = texts.len();
+        let vectors = self.embedder.embed(&texts).await?;
+        anyhow::ensure!(
+            vectors.len() == expected,
+            "embedder returned {} vectors for {expected} texts",
+            vectors.len()
+        );
+        Ok(vectors)
     }
 
     async fn rerank(

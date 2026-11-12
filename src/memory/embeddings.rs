@@ -182,6 +182,22 @@ impl aidaemon_memory::sqlite::Reranker for EmbeddingService {
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         EmbeddingService::rerank(self, query, documents).await
     }
+
+    /// Calibrated for `RERANKER_MODEL` (raw logits) by the ignored
+    /// `reranker_floor_calibration` test in `aidaemon-memory` on keyword-list
+    /// queries like the ones the model sends: a single bar of -2.25 dropped
+    /// 7 relevant facts; these bars drop 3 with about the same noise and
+    /// return nothing for questions no fact answers. The related gap comes
+    /// from live searches, where relevant related facts (a parent link, a
+    /// sibling) sat within 2 of the top hit and irrelevant ones 2.9 or more
+    /// below it.
+    fn relevance_floor(&self) -> Option<aidaemon_memory::search::RelevanceFloor> {
+        Some(aidaemon_memory::search::RelevanceFloor {
+            lexical: -3.0,
+            semantic: -2.25,
+            related_gap: Some(2.5),
+        })
+    }
 }
 
 #[cfg(test)]

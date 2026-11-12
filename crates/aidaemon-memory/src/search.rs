@@ -31,6 +31,25 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Most facts pinned by containing the whole query phrase. A phrase that
+/// many facts mention would otherwise pin them all past the floor and send
+/// them all to the reranker. Exact-key pins are not capped.
+const MAX_PHRASE_PINS: usize = 5;
+
+/// Every lowercased alphanumeric word, in order: the unit a phrase match
+/// compares, so `port 80` never matches inside `report 8080`.
+fn word_sequence(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether `phrase` occurs in `words` as consecutive whole words.
+fn contains_word_run(words: &[String], phrase: &[String]) -> bool {
+    !phrase.is_empty() && words.windows(phrase.len()).any(|window| window == phrase)
+}
+
 /// Lowercase, with `_`, `-` and runs of whitespace folded to one space.
 fn fold_phrase(text: &str) -> String {
     text.to_lowercase()
@@ -44,7 +63,8 @@ struct IndexedFact {
     key_tokens: HashSet<String>,
     other_tokens: HashSet<String>,
     folded_key: String,
-    folded_value: String,
+    key_words: Vec<String>,
+    value_words: Vec<String>,
     updated_at: chrono::DateTime<chrono::Utc>,
     id: i64,
 }
@@ -82,7 +102,8 @@ impl LexicalIndex {
                     key_tokens,
                     other_tokens,
                     folded_key: fold_phrase(&fact.key),
-                    folded_value: fold_phrase(&fact.value),
+                    key_words: word_sequence(&fact.key),
+                    value_words: word_sequence(&fact.value),
                     updated_at: fact.updated_at,
                     id: fact.id,
                 }
@@ -114,9 +135,10 @@ impl LexicalIndex {
             })
             .collect();
         let phrase = fold_phrase(query);
-        let multi_word = phrase.split(' ').count() >= 2;
+        let phrase_words = word_sequence(query);
+        let multi_word = phrase_words.len() >= 2;
 
-        let mut hits: Vec<LexicalHit> = self
+        let mut matches: Vec<(LexicalHit, bool)> = self
             .facts
             .iter()
             .enumerate()
@@ -133,18 +155,41 @@ impl LexicalIndex {
                         }
                     })
                     .sum();
-                // The one substring match allowed: the whole multi-word query.
-                let pinned = !phrase.is_empty()
-                    && (fact.folded_key == phrase
-                        || multi_word
-                            && (fact.folded_key.contains(&phrase)
-                                || fact.folded_value.contains(&phrase)));
-                (score > 0.0 || pinned).then_some(LexicalHit {
-                    index,
-                    score,
-                    pinned,
-                })
+                let exact_key = !phrase.is_empty() && fact.folded_key == phrase;
+                // The whole multi-word query as consecutive words.
+                let phrase_pin = !exact_key
+                    && multi_word
+                    && (contains_word_run(&fact.key_words, &phrase_words)
+                        || contains_word_run(&fact.value_words, &phrase_words));
+                (score > 0.0 || exact_key || phrase_pin).then_some((
+                    LexicalHit {
+                        index,
+                        score,
+                        pinned: exact_key || phrase_pin,
+                    },
+                    exact_key,
+                ))
             })
+            .collect();
+        // Keep the best phrase pins; the rest compete on score like any hit.
+        matches.sort_by(|(a, _), (b, _)| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| self.tie_order(a.index, b.index))
+        });
+        let mut phrase_pins = 0usize;
+        for (hit, exact_key) in &mut matches {
+            if hit.pinned && !*exact_key {
+                phrase_pins += 1;
+                if phrase_pins > MAX_PHRASE_PINS {
+                    hit.pinned = false;
+                }
+            }
+        }
+        let mut hits: Vec<LexicalHit> = matches
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .filter(|hit| hit.pinned || hit.score > 0.0)
             .collect();
         hits.sort_by(|a, b| {
             b.pinned
@@ -192,6 +237,41 @@ impl Default for FactSearchConfig {
     }
 }
 
+/// The reranker's relevance bar, in its own score scale (cross-encoders emit
+/// logits or probabilities with model-specific ranges, so only the reranker
+/// can say).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelevanceFloor {
+    /// Lowest score kept for a candidate the lexical scorer also nominated.
+    /// Cross-encoders score keyword-list queries low even for the right
+    /// fact, so independent lexical evidence earns a lower bar.
+    pub lexical: f32,
+    /// Lowest score kept for a candidate only the embedding nominated.
+    pub semantic: f32,
+    /// A related fact must also score within this much of the top hit:
+    /// related context is extra, so it must be close to what was asked.
+    pub related_gap: Option<f32>,
+}
+
+impl RelevanceFloor {
+    /// One bar for every candidate and no related gap.
+    pub fn uniform(floor: f32) -> Self {
+        Self {
+            lexical: floor,
+            semantic: floor,
+            related_gap: None,
+        }
+    }
+
+    fn for_candidate(&self, candidate: &Candidate) -> f32 {
+        if candidate.lexical_rank.is_some() || candidate.pinned {
+            self.lexical
+        } else {
+            self.semantic
+        }
+    }
+}
+
 /// Why a fact is in the results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchKind {
@@ -222,6 +302,9 @@ pub struct FactSearchReport {
     /// Candidates that cleared the relevance floor (`>= hits.len()`).
     pub passed_floor: usize,
     pub reranked: bool,
+    /// A relevance floor judged the candidates. Without one, `passed_floor`
+    /// counts every candidate and says nothing about relevance.
+    pub floor_applied: bool,
 }
 
 /// One pooled candidate. Ranks start at 1.
@@ -336,7 +419,7 @@ pub fn rank(
     facts: &[Fact],
     candidates: &[Candidate],
     rerank: Option<&[(usize, f32)]>,
-    floor: Option<f32>,
+    floor: Option<RelevanceFloor>,
     limit: usize,
     cfg: &FactSearchConfig,
 ) -> FactSearchReport {
@@ -350,7 +433,7 @@ pub fn rank(
                 Some(scores) => {
                     let score = scores.get(&position).copied();
                     let clears = match (score, floor) {
-                        (Some(score), Some(floor)) => score >= floor,
+                        (Some(score), Some(floor)) => score >= floor.for_candidate(candidate),
                         (Some(_), None) => true,
                         (None, _) => false,
                     };
@@ -395,26 +478,39 @@ pub fn rank(
         considered: candidates.len(),
         passed_floor,
         reranked: rerank.is_some(),
+        floor_applied: rerank.is_some() && floor.is_some(),
     }
 }
 
 /// Rank expansion-eligible facts with the same scores as the main hits and
 /// cap them at `cfg.related_max`. `scores` holds `(position in neighbors,
-/// score)`; a neighbor with no score is left out, as is one below `floor`.
+/// score)`; a neighbor with no score is left out, as is one below the
+/// floor's lexical bar or, with a `related_gap`, more than that gap below
+/// `top_hit` (the best main hit's score). Neighbors are nominated by typed
+/// structure (a shared namespace, a relationship link), independent
+/// evidence like a lexical match, so they get the lexical bar.
 /// Ties break by `recall_count`, then lowest id: recall frequency is never a
 /// relevance signal, only a tie breaker.
 pub fn rank_related(
     neighbors: &[&Fact],
     scores: &[(usize, f32)],
-    floor: Option<f32>,
+    floor: Option<RelevanceFloor>,
+    top_hit: Option<f32>,
     cfg: &FactSearchConfig,
 ) -> Vec<SearchHit> {
+    let bar = floor.map(|floor| {
+        let gap_bar = floor
+            .related_gap
+            .zip(top_hit)
+            .map_or(f32::NEG_INFINITY, |(gap, top)| top - gap);
+        floor.lexical.max(gap_bar)
+    });
     let mut seen = HashSet::new();
     let mut scored: Vec<(&Fact, f32)> = scores
         .iter()
         .filter(|(position, _)| seen.insert(*position))
         .filter_map(|(position, score)| neighbors.get(*position).map(|f| (*f, *score)))
-        .filter(|(_, score)| floor.is_none_or(|floor| *score >= floor))
+        .filter(|(_, score)| bar.is_none_or(|bar| *score >= bar))
         .collect();
     scored.sort_by(|(a, a_score), (b, b_score)| {
         b_score
@@ -566,7 +662,14 @@ mod tests {
         let rerank: Vec<(usize, f32)> = (0..50)
             .map(|p| (p, if p % 12 == 0 && p > 0 { 0.8 } else { -2.0 }))
             .collect();
-        let report = rank(&facts, &pool, Some(&rerank), Some(0.0), 10, &cfg);
+        let report = rank(
+            &facts,
+            &pool,
+            Some(&rerank),
+            Some(RelevanceFloor::uniform(0.0)),
+            10,
+            &cfg,
+        );
         assert_eq!(report.hits.len(), 4);
         assert_eq!(report.passed_floor, 4);
         assert_eq!(report.considered, 50);
@@ -579,7 +682,14 @@ mod tests {
         let lex = vec![lexical(3, true), lexical(0, false), lexical(1, false)];
         let pool = candidates(&facts, &lex, &[], &cfg);
         let rerank = vec![(0, -5.0), (1, 0.9), (2, 0.7)];
-        let report = rank(&facts, &pool, Some(&rerank), Some(0.0), 10, &cfg);
+        let report = rank(
+            &facts,
+            &pool,
+            Some(&rerank),
+            Some(RelevanceFloor::uniform(0.0)),
+            10,
+            &cfg,
+        );
         assert_eq!(hit_ids(&report), vec![4, 1, 2]);
         assert_eq!(report.hits[0].kind, MatchKind::Exact);
     }
@@ -593,7 +703,14 @@ mod tests {
         let lex = vec![lexical(0, false), lexical(1, false)];
         let cosine = vec![(1, 0.9), (2, 0.8)];
         let pool = candidates(&facts, &lex, &cosine, &cfg);
-        let report = rank(&facts, &pool, None, Some(10.0), 10, &cfg);
+        let report = rank(
+            &facts,
+            &pool,
+            None,
+            Some(RelevanceFloor::uniform(10.0)),
+            10,
+            &cfg,
+        );
         assert_eq!(hit_ids(&report), vec![2, 1, 3]);
         assert_eq!(report.hits[0].kind, MatchKind::Both);
         assert!(!report.reranked);
@@ -644,7 +761,13 @@ mod tests {
             .enumerate()
             .map(|(p, f)| (p, if f.id == fx::FATHER_NAME { 0.4 } else { -1.0 }))
             .collect();
-        let related = rank_related(&neighbors, &scores, Some(0.0), &cfg);
+        let related = rank_related(
+            &neighbors,
+            &scores,
+            Some(RelevanceFloor::uniform(0.0)),
+            None,
+            &cfg,
+        );
         let ids: Vec<i64> = related.iter().map(|h| h.fact.id).collect();
         assert_eq!(ids, vec![fx::FATHER_NAME]);
     }
@@ -655,7 +778,13 @@ mod tests {
         let cfg = FactSearchConfig::default();
         let neighbors: Vec<&Fact> = facts.iter().collect();
         let scores: Vec<(usize, f32)> = (0..30).map(|p| (p, 0.5 + p as f32 / 100.0)).collect();
-        let related = rank_related(&neighbors, &scores, Some(0.0), &cfg);
+        let related = rank_related(
+            &neighbors,
+            &scores,
+            Some(RelevanceFloor::uniform(0.0)),
+            None,
+            &cfg,
+        );
         assert_eq!(related.len(), 5);
         assert_eq!(related[0].fact.id, 30, "best score first");
     }
@@ -669,6 +798,7 @@ mod tests {
             &neighbors,
             &[(0, 0.5), (1, 0.5)],
             None,
+            None,
             &FactSearchConfig::default(),
         );
         assert_eq!(related[0].fact.id, 2);
@@ -680,5 +810,108 @@ mod tests {
         let hits = LexicalIndex::build(&facts).score("report");
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].pinned);
+    }
+
+    #[test]
+    fn lexical_evidence_earns_the_lower_bar() {
+        let facts = corpus();
+        let cfg = FactSearchConfig::default();
+        let pool = vec![
+            Candidate {
+                index: 0,
+                lexical_rank: Some(1),
+                semantic_rank: None,
+                pinned: false,
+            },
+            Candidate {
+                index: 1,
+                lexical_rank: None,
+                semantic_rank: Some(1),
+                pinned: false,
+            },
+        ];
+        let floor = RelevanceFloor {
+            lexical: -3.0,
+            semantic: -2.0,
+            related_gap: None,
+        };
+        // Both score -2.5: only the lexically nominated one clears its bar.
+        let report = rank(
+            &facts,
+            &pool,
+            Some(&[(0, -2.5), (1, -2.5)]),
+            Some(floor),
+            10,
+            &cfg,
+        );
+        let ids: Vec<i64> = report.hits.iter().map(|h| h.fact.id).collect();
+        assert_eq!(ids, vec![facts[0].id]);
+        assert_eq!(report.passed_floor, 1);
+    }
+
+    #[test]
+    fn related_must_stay_close_to_the_top_hit() {
+        let facts = corpus();
+        let neighbors: Vec<&Fact> = facts.iter().take(3).collect();
+        let floor = RelevanceFloor {
+            lexical: -3.0,
+            semantic: -3.0,
+            related_gap: Some(2.0),
+        };
+        // Top hit 1.0: the bar is max(-3.0, 1.0 - 2.0) = -1.0.
+        let related = rank_related(
+            &neighbors,
+            &[(0, -0.5), (1, -1.5), (2, -2.9)],
+            Some(floor),
+            Some(1.0),
+            &FactSearchConfig::default(),
+        );
+        let ids: Vec<i64> = related.iter().map(|h| h.fact.id).collect();
+        assert_eq!(ids, vec![neighbors[0].id]);
+        // Without a top hit only the absolute bar applies.
+        let related = rank_related(
+            &neighbors,
+            &[(0, -0.5), (1, -1.5), (2, -2.9)],
+            Some(floor),
+            None,
+            &FactSearchConfig::default(),
+        );
+        assert_eq!(related.len(), 3);
+    }
+
+    #[test]
+    fn phrase_pin_matches_whole_words_only() {
+        let facts = vec![
+            fx::fact(1, "notes", "schedule", "report 8080 daily", 0),
+            fx::fact(2, "project", "web_port", "port 80 is open", 0),
+        ];
+        let hits = LexicalIndex::build(&facts).score("port 80");
+        let pinned: Vec<usize> = hits.iter().filter(|h| h.pinned).map(|h| h.index).collect();
+        assert_eq!(pinned, vec![1]);
+        assert!(
+            hits.iter().all(|h| h.index != 0),
+            "`report 8080` shares no word with `port 80`"
+        );
+    }
+
+    #[test]
+    fn phrase_pins_are_capped_but_exact_keys_are_not() {
+        let mut facts: Vec<Fact> = (0..40)
+            .map(|i| {
+                fx::fact(
+                    i,
+                    "notes",
+                    &format!("note_{i}"),
+                    "a new blog post went out",
+                    0,
+                )
+            })
+            .collect();
+        facts.push(fx::fact(100, "project", "blog_post", "weekly", 0));
+        let hits = LexicalIndex::build(&facts).score("blog post");
+        let pinned: Vec<&LexicalHit> = hits.iter().filter(|h| h.pinned).collect();
+        assert_eq!(pinned.len(), MAX_PHRASE_PINS + 1);
+        assert!(pinned.iter().any(|h| facts[h.index].id == 100));
+        assert_eq!(hits.len(), 41, "unpinned phrase matches still score");
     }
 }
