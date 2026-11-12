@@ -1372,6 +1372,38 @@ async fn declined_terminal_call_reasks_undeterminable_retry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A declined script that moves with `cd` and then copies into a directory
+/// binds the copy by its effect: the same copy reworded (no delete, other
+/// filler, `&&`) is refused as declined without a second card, and nothing
+/// is copied.
+#[tokio::test]
+async fn declined_script_reworded_around_cd_is_refused_by_effect() {
+    let root = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(root.join("tmp-site")).unwrap();
+    std::fs::write(root.join("tmp-site").join("composer.json"), "{}").unwrap();
+    let dir = root.display().to_string();
+    let (harness, approver, _pool) = terminal_harness(
+        vec![
+            terminal_run(&format!(
+                "cd {dir}\ncp -R tmp-site/. ./\nrm -rf tmp-site\nls -a"
+            )),
+            terminal_run(&format!("cd {dir} && cp -R tmp-site/. ./ ; ls -a")),
+            MockProvider::text_response("The owner declined the copy."),
+        ],
+        vec![Some(crate::types::ApprovalResponse::Deny)],
+        no_assessor(&[]),
+    )
+    .await;
+    run_owner_turn(&harness, ChannelContext::private("telegram")).await;
+
+    assert_eq!(approver.card_count(), 1, "the reworded copy gets no new card");
+    let results = tool_results(&harness).await;
+    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(!root.join("composer.json").exists());
+    assert!(root.join("tmp-site").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The same under Sandbox confinement, where an opaque script is neither
 /// egress nor destructive: after a declined delete, an allowlisted script
 /// that could do the same delete is asked about, not run.
