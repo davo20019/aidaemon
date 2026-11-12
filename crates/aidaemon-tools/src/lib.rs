@@ -46,6 +46,8 @@ pub mod backend;
 pub mod background_deliverable;
 pub mod backoff;
 mod checklist;
+#[cfg(feature = "checkpoints")]
+pub mod checkpoints;
 pub mod command_effects;
 pub mod command_risk;
 pub mod consequential;

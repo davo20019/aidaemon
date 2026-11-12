@@ -1,0 +1,24 @@
+{
+  "description": "List recent local workspace checkpoints. This is read-only. Checkpoint content is held in an external shadow-Git store, not in the user's repository.",
+  "name": "list_checkpoints",
+  "schema": {
+    "description": "List recent local workspace checkpoints. This is read-only. Checkpoint content is held in an external shadow-Git store, not in the user's repository.",
+    "name": "list_checkpoints",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Maximum checkpoints to return (default: 20)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "root": {
+          "description": "Optional substring filter for the project root",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

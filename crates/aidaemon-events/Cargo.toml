@@ -24,7 +24,7 @@ testing = []
 
 [dependencies]
 aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", features = ["checkpoints"] }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

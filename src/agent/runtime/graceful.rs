@@ -208,7 +208,7 @@ impl Agent {
                 );
             }
         }
-        if let Some(manager) = crate::checkpoints::active_manager() {
+        if let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
             if let Err(error) = manager.finalize_task(task_id, session_id).await {
                 warn!(
                     task_id,

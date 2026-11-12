@@ -641,7 +641,7 @@ pub async fn build_base_tools(
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
 ) -> anyhow::Result<BaseToolsBundle> {
-    let checkpoint_manager = crate::checkpoints::install_manager(
+    let checkpoint_manager = aidaemon_tools::checkpoints::install_manager(
         &config.checkpoints,
         pool.clone(),
         event_store.clone(),

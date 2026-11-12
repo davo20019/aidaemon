@@ -6784,7 +6784,7 @@ impl TerminalTool {
 
                 // The checkpoint belongs after every command-safety and
                 // user-approval gate, but immediately before process spawn.
-                if let Some(manager) = crate::checkpoints::active_manager() {
+                if let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
                     let access_manifest = terminal_access_manifest(arguments);
                     manager
                         .begin_for_access_manifest("terminal", &access_manifest, exec_ctx)

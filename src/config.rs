@@ -943,76 +943,7 @@ fn default_agent_name() -> String {
 
 pub use aidaemon_tools::execution::ExecutionConfig;
 
-/// Local shadow-Git workspace checkpoints created before the first filesystem
-/// mutation in an agent turn.
-#[derive(Debug, Deserialize, Clone)]
-pub struct CheckpointConfig {
-    /// Opt in to local workspace checkpoints. Disabled by default while the
-    /// feature is in beta.
-    #[serde(default)]
-    pub enabled: bool,
-    /// External checkpoint store. Defaults to the platform data directory.
-    #[serde(default)]
-    pub storage_dir: Option<String>,
-    #[serde(default = "default_checkpoint_retention_days")]
-    pub retention_days: u64,
-    #[serde(default = "default_checkpoint_max_per_root")]
-    pub max_per_root: u32,
-    #[serde(default = "default_checkpoint_max_store_bytes")]
-    pub max_store_bytes: u64,
-    #[serde(default = "default_checkpoint_max_root_bytes")]
-    pub max_root_bytes: u64,
-    #[serde(default = "default_checkpoint_max_file_bytes")]
-    pub max_file_bytes: u64,
-    #[serde(default = "default_checkpoint_max_paths")]
-    pub max_paths: usize,
-    #[serde(default = "default_checkpoint_snapshot_timeout_secs")]
-    pub snapshot_timeout_secs: u64,
-}
-
-impl Default for CheckpointConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            storage_dir: None,
-            retention_days: default_checkpoint_retention_days(),
-            max_per_root: default_checkpoint_max_per_root(),
-            max_store_bytes: default_checkpoint_max_store_bytes(),
-            max_root_bytes: default_checkpoint_max_root_bytes(),
-            max_file_bytes: default_checkpoint_max_file_bytes(),
-            max_paths: default_checkpoint_max_paths(),
-            snapshot_timeout_secs: default_checkpoint_snapshot_timeout_secs(),
-        }
-    }
-}
-
-fn default_checkpoint_retention_days() -> u64 {
-    14
-}
-
-fn default_checkpoint_max_per_root() -> u32 {
-    30
-}
-
-fn default_checkpoint_max_store_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
-}
-
-fn default_checkpoint_max_root_bytes() -> u64 {
-    500 * 1024 * 1024
-}
-
-fn default_checkpoint_max_file_bytes() -> u64 {
-    10 * 1024 * 1024
-}
-
-fn default_checkpoint_max_paths() -> usize {
-    50_000
-}
-
-fn default_checkpoint_snapshot_timeout_secs() -> u64 {
-    10
-}
+pub use aidaemon_tools::checkpoints::CheckpointConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct ProviderConfig {

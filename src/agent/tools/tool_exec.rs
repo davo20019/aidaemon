@@ -892,7 +892,7 @@ impl Agent {
             && self.exec_dispatch_facts(name, ctx).checkpoints_writes;
         if let Some(grant) = active_workspace_grant {
             if checkpoints_writes {
-                if let Some(manager) = crate::checkpoints::active_manager() {
+                if let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
                     manager
                         .begin_for_tool(name, &enriched_args, &call_facts)
                         .await?;
@@ -932,7 +932,7 @@ impl Agent {
                 };
                 let prepared_args = &prepared.canonical_arguments;
                 if checkpoints_writes {
-                    if let Some(manager) = crate::checkpoints::active_manager() {
+                    if let Some(manager) = aidaemon_tools::checkpoints::active_manager() {
                         manager
                             .begin_for_access_manifest(name, &prepared.access_manifest, &call_facts)
                             .await?;
@@ -956,7 +956,7 @@ impl Agent {
                     outcome.metadata.background_started || outcome.metadata.detached
                 }) {
                     if let (Some(manager), Some(task_id)) =
-                        (crate::checkpoints::active_manager(), task_id)
+                        (aidaemon_tools::checkpoints::active_manager(), task_id)
                     {
                         manager
                             .mark_task_unsafe(

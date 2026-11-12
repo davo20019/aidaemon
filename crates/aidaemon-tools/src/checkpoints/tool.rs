@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
+use crate::semantics::{ToolCallSemantics, ToolCapabilities, ToolRole};
+use crate::OutcomeTool as Tool;
 
 /// Read-only owner tool for inspecting external workspace checkpoints.
 pub struct ListCheckpointsTool;
@@ -42,8 +43,8 @@ impl Tool for ListCheckpointsTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
             let limit = args
@@ -52,17 +53,17 @@ impl Tool for ListCheckpointsTool {
                 .unwrap_or(20)
                 .clamp(1, 100) as usize;
             let root = args.get("root").and_then(Value::as_str);
-            Ok(match crate::checkpoints::active_manager() {
+            Ok(match super::active_manager() {
                 Some(manager) => manager.list_text(limit, root).await,
                 None => "Filesystem checkpoints are disabled.".to_string(),
             })
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(crate::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for ListCheckpointsTool {
+impl crate::semantics::ToolSemantics for ListCheckpointsTool {
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
     }

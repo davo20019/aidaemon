@@ -375,7 +375,7 @@ impl CommandContext {
         if user_role != UserRole::Owner {
             return "Only the owner can inspect filesystem checkpoints.".to_string();
         }
-        match crate::checkpoints::active_manager() {
+        match aidaemon_tools::checkpoints::active_manager() {
             Some(manager) => manager.list_text(30, None).await,
             None => "Filesystem checkpoints are disabled.".to_string(),
         }
@@ -385,7 +385,7 @@ impl CommandContext {
         if user_role != UserRole::Owner {
             return "Only the owner can roll back filesystem checkpoints.".to_string();
         }
-        let Some(manager) = crate::checkpoints::active_manager() else {
+        let Some(manager) = aidaemon_tools::checkpoints::active_manager() else {
             return "Filesystem checkpoints are disabled.".to_string();
         };
         let mut parts = args.split_whitespace();

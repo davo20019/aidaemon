@@ -84,3 +84,8 @@ fn dev_tool_schema_goldens() {
     check_golden(&crate::tools::CheckEnvironmentTool::new(backend()));
     check_golden(&crate::tools::ServiceStatusTool::new(backend()));
 }
+
+#[test]
+fn list_checkpoints_schema_golden() {
+    check_golden(&crate::tools::ListCheckpointsTool);
+}
