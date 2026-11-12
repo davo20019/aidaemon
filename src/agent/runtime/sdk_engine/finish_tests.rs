@@ -710,3 +710,179 @@ async fn timed_out_send_is_not_sent_again() {
         1
     );
 }
+
+/// A tool holding one job its task's end would stop (nothing reports its
+/// result) for `hold` from the first time the run asks about it.
+struct UnreportedJob {
+    hold: std::time::Duration,
+    asked_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for UnreportedJob {
+    fn name(&self) -> &str {
+        "synthetic_job_holder"
+    }
+
+    fn description(&self) -> &str {
+        "Holds a synthetic job"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "synthetic_job_holder",
+            "description": "Holds a synthetic job",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "ok".to_string(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for UnreportedJob {
+    async fn jobs_ended_by_task_end(&self, _task_id: &str) -> usize {
+        let mut asked = self.asked_at.lock().unwrap();
+        let first = *asked.get_or_insert_with(std::time::Instant::now);
+        usize::from(first.elapsed() < self.hold)
+    }
+}
+
+/// A run that answers while a job it started is still running, with
+/// nothing to report the job's result, is held until the job ends and then
+/// asked to answer from its result: the "still running" answer never ships
+/// (live 2026-11-12: a counting sub-agent answered "at 15 of 300", its end
+/// killed the count, and the chat was told it finished).
+#[tokio::test]
+async fn an_answer_while_an_unreported_job_runs_waits_for_the_job() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("At about 15 of 300; it is still running."),
+        MockProvider::text_response("Counted to 300. Done."),
+    ]);
+    let hold = std::time::Duration::from_millis(700);
+    let tool = UnreportedJob {
+        hold,
+        asked_at: std::sync::Mutex::new(None),
+    };
+    let harness = root(provider, vec![Arc::new(tool)]).await;
+    let started = std::time::Instant::now();
+    let reply = ask(&harness, "finish-unreported-job", "Count to 300 slowly").await;
+
+    assert_eq!(reply, "Counted to 300. Done.");
+    assert!(started.elapsed() >= hold);
+    assert_eq!(harness.provider.call_count().await, 2);
+    let calls = harness.provider.call_log.lock().await;
+    let second = serde_json::to_string(&calls[1].messages).unwrap();
+    assert!(
+        second.contains("finishing would have stopped it"),
+        "the run is told why it was held"
+    );
+}
+
+/// A tool with one background command running for a chat until stopped.
+struct ChatJob {
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Tool for ChatJob {
+    fn name(&self) -> &str {
+        "synthetic_jobs"
+    }
+
+    fn description(&self) -> &str {
+        "Runs a synthetic background command"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "synthetic_jobs",
+            "description": "Runs a synthetic background command",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "ok".to_string(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ToolSemantics for ChatJob {
+    async fn background_jobs(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_tools::semantics::BackgroundJob> {
+        if session_id != "chat-with-a-job" || self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Vec::new();
+        }
+        vec![aidaemon_tools::semantics::BackgroundJob {
+            key: "17".to_string(),
+            title: "Background command: count to 300".to_string(),
+            started_at: chrono::Utc::now(),
+            task_id: Some("turn-a".to_string()),
+        }]
+    }
+
+    async fn stop_background_job(&self, key: &str) -> bool {
+        assert_eq!(key, "17");
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+}
+
+/// The chat's running work lists a background command a tool runs for it,
+/// under its request, and stopping it goes to that tool and reads it back.
+#[tokio::test]
+async fn the_chat_work_lists_a_tools_background_command_and_stops_it() {
+    use aidaemon_channels::ports::ChatWorkKind;
+    let harness = root(
+        MockProvider::new(),
+        vec![Arc::new(ChatJob {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        })],
+    )
+    .await;
+    let view = harness.agent.chat_work("chat-with-a-job").await;
+    assert_eq!(view.current_request, None);
+    assert_eq!(view.items.len(), 1);
+    let job = &view.items[0];
+    assert_eq!(job.kind, ChatWorkKind::BackgroundJob);
+    assert_eq!(job.title, "Background command: count to 300");
+    assert_eq!(job.request.as_deref(), Some("turn-a"));
+    assert!(harness
+        .agent
+        .chat_work("another-chat")
+        .await
+        .items
+        .is_empty());
+
+    assert!(
+        harness
+            .agent
+            .stop_chat_work("chat-with-a-job", &job.key)
+            .await
+    );
+    assert!(harness
+        .agent
+        .chat_work("chat-with-a-job")
+        .await
+        .items
+        .is_empty());
+}

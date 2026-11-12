@@ -712,6 +712,10 @@ impl Agent {
         let user_text = user_text.as_str();
         let model = engine.model_override.clone().unwrap_or(model);
         touch_heartbeat(&heartbeat);
+        // The chat's running turn, so the sub-agents it starts are listed
+        // (and stopped) as part of this request.
+        let _running_request =
+            (self.depth == 0).then(|| self.running_children.begin_request(session_id, &task_id));
         let cwd = turn_cwd(&*self.execution_backend);
         // Trusted only by explicit grant, never by inference from the
         // request: `project_scope` and `known_project_dir` steer where tools
@@ -1338,6 +1342,7 @@ impl Agent {
             combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
             gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
+            unreported_jobs_wait_spent: AtomicBool::new(false),
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             context_overflowed: AtomicBool::new(false),

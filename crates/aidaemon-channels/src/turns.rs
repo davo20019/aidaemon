@@ -31,6 +31,7 @@ use crate::ports::{
     AgentResponseEnvelope, ChannelAgentRuntime, InboundMessageRequest, InboundMessageTiming,
     MidRunIntent, MidRunReading, RunningWork,
 };
+use crate::stop::StopRequest;
 use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 
 /// Least time between two ordinary status messages.
@@ -235,7 +236,9 @@ impl TurnRunner {
     /// a running turn, or a new turn (and then every turn queued behind it).
     pub async fn submit(&self, surface: Arc<dyn TurnSurface>, turn: Turn) {
         if is_cancel_word(&turn.text) {
-            let reply = self.cancel(&turn.session_id, turn.user_role).await;
+            let reply = self
+                .cancel(&turn.session_id, turn.user_role, StopRequest::Bare)
+                .await;
             let _ = surface.say(&reply).await;
             return;
         }
@@ -243,15 +246,39 @@ impl TurnRunner {
         let registry = &self.deps.task_registry;
         let session_id = turn.session_id.clone();
         let dedup_key = turn.dedup_key.as_deref();
+        if !registry.has_running_task(&session_id).await {
+            if let Some(request) = self.read_between_runs(&turn).await {
+                if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                    let reply = self.cancel(&session_id, turn.user_role, request).await;
+                    let _ = surface.say(&reply).await;
+                }
+                return;
+            }
+        }
         if registry.has_running_task(&session_id).await {
             let mut steerable = true;
             // The agent was asked to read it but gave no reading (its model
             // call failed): the owner still sees where the work stands.
             let mut unread = false;
             match self.read_mid_run(&turn).await {
+                Some(
+                    reading @ MidRunReading {
+                        intent: MidRunIntent::StopsWork,
+                        ..
+                    },
+                ) => {
+                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        let reply = self
+                            .cancel(&session_id, turn.user_role, stop_request(&reading))
+                            .await;
+                        let _ = surface.say(&reply).await;
+                    }
+                    return;
+                }
                 Some(MidRunReading {
                     intent: MidRunIntent::AboutRunningWork,
                     answer,
+                    ..
                 }) => {
                     // Answered now; the run goes on undisturbed.
                     if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
@@ -348,6 +375,19 @@ impl TurnRunner {
 
     /// The session's running work as its typed state shows it.
     async fn running_work(&self, session_id: &str) -> RunningWork {
+        let listed = crate::stop::running_work(
+            &self.deps.task_registry,
+            self.deps.agent.as_ref(),
+            session_id,
+        )
+        .await;
+        let mut work = self.running_turn(session_id).await;
+        work.running = listed.items(chrono::Utc::now());
+        work
+    }
+
+    /// The session's running turn as its live state shows it.
+    async fn running_turn(&self, session_id: &str) -> RunningWork {
         let running = self
             .deps
             .task_registry
@@ -400,20 +440,60 @@ impl TurnRunner {
         reading
     }
 
-    /// The reply to a cancel word.
-    async fn cancel(&self, session_id: &str, role: UserRole) -> String {
+    /// The reply to a cancel word, or to a message read as a stop request:
+    /// the same stop as `/cancel`, read back before it is reported.
+    async fn cancel(&self, session_id: &str, role: UserRole, request: StopRequest) -> String {
         if role != UserRole::Owner {
             return "Only the owner can cancel running work in this session.".to_string();
         }
-        let registry = &self.deps.task_registry;
-        let cancelled = registry.cancel_running_for_session(session_id).await;
-        let queued_work_preserved = registry.queue_len(session_id).await;
-        let cancelled_goals = self
-            .deps
-            .agent
-            .cancel_active_finite_work_for_session(session_id)
-            .await;
-        cancel_reply(&cancelled, queued_work_preserved, &cancelled_goals)
+        crate::stop::stop(
+            &self.deps.task_registry,
+            self.deps.agent.as_ref(),
+            session_id,
+            request,
+        )
+        .await
+    }
+
+    /// Read a message sent while the chat has sub-agents or background
+    /// commands running but no turn: a stop request stops them (the same
+    /// stop as `/cancel`); anything else runs as a turn. `None` when it is
+    /// not a stop request or nothing runs.
+    async fn read_between_runs(&self, turn: &Turn) -> Option<StopRequest> {
+        if turn.user_role != UserRole::Owner
+            || !turn.attachments.is_empty()
+            || turn.text.trim().is_empty()
+        {
+            return None;
+        }
+        let list = crate::stop::running_work(
+            &self.deps.task_registry,
+            self.deps.agent.as_ref(),
+            &turn.session_id,
+        )
+        .await;
+        if list.entries.is_empty() {
+            return None;
+        }
+        let work = RunningWork {
+            running: list.items(chrono::Utc::now()),
+            ..RunningWork::default()
+        };
+        let reading = tokio::time::timeout(
+            MID_RUN_READ_LIMIT,
+            self.deps
+                .agent
+                .read_mid_run_message(&turn.session_id, &turn.text, &work),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        info!(
+            session_id = %turn.session_id,
+            intent = ?reading.intent,
+            "Read a message sent while background work runs"
+        );
+        (reading.intent == MidRunIntent::StopsWork).then(|| stop_request(&reading))
     }
 
     /// Run `turn` and then each turn queued behind it.
@@ -655,35 +735,12 @@ pub fn is_cancel_word(text: &str) -> bool {
     )
 }
 
-fn cancel_reply(
-    cancelled: &[(u64, String)],
-    queued_work_preserved: usize,
-    cancelled_goals: &[String],
-) -> String {
-    if let Some((_, description)) = cancelled.first() {
-        let mut reply = format!("⏹️ Cancelled: {description}");
-        if queued_work_preserved > 0 {
-            reply.push_str(&format!(
-                " ({queued_work_preserved} queued request(s) will continue in order)"
-            ));
-        }
-        if !cancelled_goals.is_empty() {
-            reply.push_str(&format!(" (+{} more cancelled)", cancelled_goals.len()));
-        }
-        return reply;
-    }
-    match cancelled_goals {
-        [] => "No running task to cancel.".to_string(),
-        [goal] => format!("⏹️ Cancelled: {goal}"),
-        goals => format!(
-            "⏹️ Cancelled {} items:\n{}",
-            goals.len(),
-            goals
-                .iter()
-                .map(|goal| format!("- {goal}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
+/// The stop a reading names: its items, or what bare `/cancel` stops.
+fn stop_request(reading: &MidRunReading) -> StopRequest {
+    if reading.stop.is_empty() {
+        StopRequest::Bare
+    } else {
+        StopRequest::Numbers(reading.stop.clone())
     }
 }
 
@@ -909,6 +966,8 @@ mod tests {
     struct ScriptedAgent {
         release: tokio::sync::Notify,
         reading: std::sync::Mutex<Option<MidRunReading>>,
+        /// The chat's sub-agents and background commands; a stop removes one.
+        work: std::sync::Mutex<Vec<crate::ports::ChatWork>>,
     }
 
     #[async_trait]
@@ -946,6 +1005,17 @@ mod tests {
             _work: &RunningWork,
         ) -> Option<MidRunReading> {
             self.reading.lock().unwrap().clone()
+        }
+        async fn chat_work(&self, _session_id: &str) -> crate::ports::ChatWorkView {
+            crate::ports::ChatWorkView {
+                current_request: None,
+                items: self.work.lock().unwrap().clone(),
+            }
+        }
+        async fn stop_chat_work(&self, _session_id: &str, key: &str) -> bool {
+            let mut work = self.work.lock().unwrap();
+            work.retain(|item| item.key != key);
+            true
         }
         async fn terminalize_supervised_task(
             &self,
@@ -1019,6 +1089,7 @@ mod tests {
         let agent = Arc::new(ScriptedAgent {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(Vec::new()),
         });
         let registry = Arc::new(TaskRegistry::new(10));
         let runner = TurnRunner::new(TurnDeps {
@@ -1056,6 +1127,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
             answer: None,
+            stop: Vec::new(),
         }));
         runner
             .submit(surface.clone(), owner_turn("How is it going so far?", "m2"))
@@ -1073,6 +1145,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
             answer: Some("The screenshots are not ready yet; they come when it finishes.".into()),
+            stop: Vec::new(),
         }));
         runner
             .submit(
@@ -1090,6 +1163,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::Unrelated,
             answer: None,
+            stop: Vec::new(),
         }));
         runner
             .submit(
@@ -1116,6 +1190,7 @@ mod tests {
                 Some(MidRunReading {
                     intent: MidRunIntent::ChangesWork,
                     answer: None,
+                    stop: Vec::new(),
                 }),
                 "m5",
             ),
@@ -1158,16 +1233,133 @@ mod tests {
         assert!(!is_cancel_word("don't stop"));
     }
 
-    #[test]
-    fn cancel_reply_names_what_stopped() {
-        assert_eq!(cancel_reply(&[], 0, &[]), "No running task to cancel.");
+    /// Two background commands started by one request: a bare stop word
+    /// stops both and names each, read back as gone; with nothing left it
+    /// says so. A stop request read in plain words between runs takes the
+    /// same path.
+    #[tokio::test]
+    async fn a_bare_stop_stops_every_job_of_one_request_and_names_them() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(two_counting_jobs()),
+        });
+        let registry = Arc::new(TaskRegistry::new(10));
+        let runner = TurnRunner::new(TurnDeps {
+            agent: agent.clone(),
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: registry.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        let surface = Arc::new(Said::default());
+        runner
+            .submit(surface.clone(), owner_turn("stop", "s1"))
+            .await;
+        let reply = surface.0.lock().unwrap().last().cloned().unwrap();
         assert_eq!(
-            cancel_reply(&[(1, "deploy".into())], 2, &["blog".into()]),
-            "⏹️ Cancelled: deploy (2 queued request(s) will continue in order) (+1 more cancelled)"
+            reply,
+            "⏹️ Stopped:\n• Sub-agent: Counting agent A\n• Background command: count to 300"
         );
+        assert!(agent.work.lock().unwrap().is_empty());
+        runner
+            .submit(surface.clone(), owner_turn("stop", "s2"))
+            .await;
         assert_eq!(
-            cancel_reply(&[], 0, &["a".into(), "b".into()]),
-            "⏹️ Cancelled 2 items:\n- a\n- b"
+            surface.0.lock().unwrap().last().cloned().unwrap(),
+            "Nothing is running in this chat right now."
         );
+
+        // "Stop both counting agents now", read as a stop request: no turn
+        // starts, and the same read-back stop runs.
+        *agent.work.lock().unwrap() = two_counting_jobs();
+        *agent.reading.lock().unwrap() = Some(MidRunReading {
+            intent: MidRunIntent::StopsWork,
+            answer: None,
+            stop: Vec::new(),
+        });
+        runner
+            .submit(
+                surface.clone(),
+                owner_turn("Stop both counting agents now.", "s3"),
+            )
+            .await;
+        assert!(!registry.has_running_task("test:mid-run").await);
+        let reply = surface.0.lock().unwrap().last().cloned().unwrap();
+        assert!(reply.contains("• Sub-agent: Counting agent A"), "{reply}");
+        assert!(
+            reply.contains("• Background command: count to 300"),
+            "{reply}"
+        );
+        assert!(agent.work.lock().unwrap().is_empty());
+    }
+
+    /// Work from two requests: a bare stop lists it to pick from and stops
+    /// nothing; a number stops just that one.
+    #[tokio::test]
+    async fn a_bare_stop_over_two_requests_asks_which() {
+        let mut work = two_counting_jobs();
+        work[1].request = Some("req-2".into());
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(work),
+        });
+        let registry = TaskRegistry::new(10);
+        let reply =
+            crate::stop::stop(&registry, agent.as_ref(), "test:mid-run", StopRequest::Bare).await;
+        assert!(
+            reply.starts_with("Work from more than one request is running:"),
+            "{reply}"
+        );
+        assert!(reply.contains("/cancel all"), "{reply}");
+        assert_eq!(agent.work.lock().unwrap().len(), 2);
+        let list = crate::stop::running_work(&registry, agent.as_ref(), "test:mid-run").await;
+        let job = list.entries[1].number;
+        let reply = crate::stop::stop(
+            &registry,
+            agent.as_ref(),
+            "test:mid-run",
+            StopRequest::Numbers(vec![job]),
+        )
+        .await;
+        assert_eq!(reply, "⏹️ Stopped:\n• Background command: count to 300");
+        assert_eq!(agent.work.lock().unwrap().len(), 1);
+    }
+
+    /// `/clear` and `/wipe` stop the chat's sub-agents and background
+    /// commands through the same read-back stop.
+    #[tokio::test]
+    async fn clearing_stops_every_sub_agent_and_command() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(two_counting_jobs()),
+        });
+        let registry = TaskRegistry::new(10);
+        let stopped =
+            crate::stop::stop_background_work(&registry, agent.as_ref(), "test:mid-run").await;
+        assert_eq!(stopped, 2);
+        assert!(agent.work.lock().unwrap().is_empty());
+    }
+
+    fn two_counting_jobs() -> Vec<crate::ports::ChatWork> {
+        let now = chrono::Utc::now();
+        vec![
+            crate::ports::ChatWork {
+                key: "agent:1".into(),
+                kind: crate::ports::ChatWorkKind::SubAgent,
+                title: "Sub-agent: Counting agent A".into(),
+                started_at: now - chrono::Duration::seconds(60),
+                request: Some("req-1".into()),
+            },
+            crate::ports::ChatWork {
+                key: "job:0:4242".into(),
+                kind: crate::ports::ChatWorkKind::BackgroundJob,
+                title: "Background command: count to 300".into(),
+                started_at: now - chrono::Duration::seconds(50),
+                request: Some("req-1".into()),
+            },
+        ]
     }
 }

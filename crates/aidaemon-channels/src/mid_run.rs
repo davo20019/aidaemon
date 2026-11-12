@@ -289,6 +289,7 @@ mod tests {
                 since: Duration::from_secs(5),
                 running_for: Duration::from_secs(130),
             }],
+            ..RunningWork::default()
         };
         let reply = running_work_reply(&work);
         assert!(reply.starts_with("Still working on \"Set up two demo sites\" (5m 30s so far)."));

@@ -1128,7 +1128,88 @@ impl Agent {
         cancelled
     }
 
-    async fn cancel_session_finite_goals(&self, session_id: &str) -> Vec<String> {
+    /// Everything running for the chat besides its turns, from typed
+    /// state: its sub-agents (the running-children registry) and its
+    /// background commands (each tool's process table).
+    pub(crate) async fn chat_work(
+        &self,
+        session_id: &str,
+    ) -> aidaemon_channels::ports::ChatWorkView {
+        use aidaemon_channels::ports::{ChatWork, ChatWorkKind, ChatWorkView};
+        let mut items: Vec<ChatWork> = self
+            .running_children
+            .listed(session_id)
+            .into_iter()
+            .map(|child| ChatWork {
+                key: child.key,
+                kind: ChatWorkKind::SubAgent,
+                title: format!("Sub-agent: {}", child.child.label),
+                started_at: child.child.started_at,
+                request: child.request,
+            })
+            .collect();
+        for (index, tool) in self.tools.iter().enumerate() {
+            for job in tool.background_jobs(session_id).await {
+                items.push(ChatWork {
+                    key: format!("job:{index}:{}", job.key),
+                    kind: ChatWorkKind::BackgroundJob,
+                    title: job.title,
+                    started_at: job.started_at,
+                    request: job.task_id,
+                });
+            }
+        }
+        items.sort_by_key(|item| item.started_at);
+        ChatWorkView {
+            current_request: self.running_children.current_request(session_id),
+            items,
+        }
+    }
+
+    /// Stop the chat's work `key` and read it back: a sub-agent is stopped
+    /// with the commands it left running, and counts as stopped once it is
+    /// no longer listed and none of those commands runs; a command once its
+    /// process is gone.
+    pub(crate) async fn stop_chat_work(&self, session_id: &str, key: &str) -> bool {
+        const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+        if let Some(job) = key.strip_prefix("job:") {
+            let Some((index, job_key)) = job.split_once(':') else {
+                return false;
+            };
+            let Some(tool) = index.parse::<usize>().ok().and_then(|i| self.tools.get(i)) else {
+                return false;
+            };
+            if !tool
+                .background_jobs(session_id)
+                .await
+                .iter()
+                .any(|listed| listed.key == job_key)
+            {
+                // Not running for this chat (it ended, or it is not its).
+                return true;
+            }
+            return tool.stop_background_job(job_key).await;
+        }
+        let Some(child_session) = self.running_children.stop(key) else {
+            return true;
+        };
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        while self.running_children.is_listed(key) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(POLL).await;
+        }
+        // A stopped child's run is dropped before its own end could stop
+        // the commands it started: stop them here.
+        let mut jobs_stopped = true;
+        for tool in &self.tools {
+            for job in tool.background_jobs(&child_session).await {
+                jobs_stopped &= tool.stop_background_job(&job.key).await;
+            }
+        }
+        !self.running_children.is_listed(key) && jobs_stopped
+    }
+
+    pub(crate) async fn cancel_session_finite_goals(&self, session_id: &str) -> Vec<String> {
         let goals = self
             .state
             .get_goals_for_session(session_id)

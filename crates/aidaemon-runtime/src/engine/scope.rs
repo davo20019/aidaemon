@@ -164,6 +164,9 @@ pub struct TurnScope<'a> {
     pub mandate_commit_retries: std::sync::atomic::AtomicU32,
     /// Verify-before-claim demands for an unverified GUI coordinate click.
     pub gui_verify_demands: std::sync::atomic::AtomicU32,
+    /// A stop held for the run's unreported jobs waited its longest once:
+    /// the next stop is not held again.
+    pub unreported_jobs_wait_spent: std::sync::atomic::AtomicBool,
     /// The one 80% budget warning (task or scheduled run) was given.
     pub budget_warning_sent: AtomicBool,
     /// Timed-out model calls retried in this run.

@@ -45,6 +45,7 @@ pub mod runner;
 pub mod session;
 pub mod slash;
 pub mod split;
+pub mod stop;
 pub mod tasks;
 pub mod turns;
 

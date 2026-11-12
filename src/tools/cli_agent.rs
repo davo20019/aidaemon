@@ -4490,6 +4490,58 @@ impl CliAgentTool {
 
 #[async_trait]
 impl crate::traits::ToolSemantics for CliAgentTool {
+    async fn background_jobs(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_tools::semantics::BackgroundJob> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now();
+        let mut jobs: Vec<aidaemon_tools::semantics::BackgroundJob> = self
+            .running
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, agent)| {
+                agent.session_id == session_id && !agent.finished.load(Ordering::Acquire)
+            })
+            .map(
+                |(task_id, agent)| aidaemon_tools::semantics::BackgroundJob {
+                    key: task_id.clone(),
+                    title: format!(
+                        "Coding agent ({}): {}",
+                        agent.tool_name,
+                        truncate_str(agent.prompt_summary.trim(), 80)
+                    ),
+                    started_at: now
+                        - chrono::Duration::from_std(agent.started_at.elapsed())
+                            .unwrap_or_default(),
+                    task_id: agent.delegated_task_id.clone(),
+                },
+            )
+            .collect();
+        jobs.sort_by_key(|job| job.started_at);
+        jobs
+    }
+
+    async fn stop_background_job(&self, key: &str) -> bool {
+        let finished = match self.running.lock().await.get(key) {
+            Some(agent) => agent.finished.clone(),
+            None => return true,
+        };
+        if let Err(error) = self.handle_cancel(key).await {
+            warn!(task_id = key, %error, "Could not stop a background CLI agent for the owner");
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        finished.load(Ordering::Acquire)
+    }
+
     fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
         crate::traits::ToolDispatchFacts {
             task_lead_delegation: true,
@@ -7654,6 +7706,37 @@ mod tests {
         assert!(outcome.metadata.completion_notifications_enabled);
 
         tool.handle_cancel_all("session-background").await.unwrap();
+    }
+
+    /// A background CLI run is listed for its chat's running work, under
+    /// the turn that started it, and stopping it reads the process back as
+    /// ended.
+    #[tokio::test]
+    async fn a_background_cli_run_is_listed_for_its_chat_and_stops() {
+        use crate::traits::ToolSemantics as _;
+        let (tool, _db) = setup_bash_tool().await;
+        let facts = ToolCallContext {
+            task_id: Some("turn-cli".to_string()),
+            ..crate::testing::call_facts("session-cli-jobs")
+        };
+        tool.outcome_with_facts(
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 30","async_mode":true}"#,
+            None,
+            false,
+            &facts,
+        )
+        .await
+        .unwrap();
+        let jobs = tool.background_jobs("session-cli-jobs").await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert!(
+            jobs[0].title.starts_with("Coding agent (bash-agent): "),
+            "{jobs:?}"
+        );
+        assert_eq!(jobs[0].task_id.as_deref(), Some("turn-cli"));
+        assert!(tool.background_jobs("another-session").await.is_empty());
+        assert!(tool.stop_background_job(&jobs[0].key).await);
+        assert!(tool.background_jobs("session-cli-jobs").await.is_empty());
     }
 
     #[tokio::test]
