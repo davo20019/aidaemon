@@ -61,6 +61,29 @@ const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// still reported synchronously with its exit code, then it is handed to
 /// background tracking with a typed `process_state` receipt.
 const DETACH_STARTUP_GRACE: Duration = Duration::from_millis(1500);
+/// How long a sub-agent's own foreground command keeps its call. Nothing
+/// else reads the result of a sub-agent's command (its session has no
+/// reader), so moving it to the background only hands the run a job to
+/// wait on, poll or kill (live 2026-11-12: a counting helper's single loop
+/// went to the background at 30 s and the helper killed it at 56 of 60).
+/// Kept under the tool watchdog's default (300 s); past it the command
+/// goes to the background and the run's stop is held until it ends.
+const SUB_AGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(240);
+
+/// How long a run waits for its command before moving it to the background:
+/// a detached or background launch only for the startup grace; a sub-agent's
+/// command (`notifications_reach` false: nothing else reports its result) up
+/// to [`SUB_AGENT_FOREGROUND_WAIT`], one call for one long job; anything else
+/// the configured initial wait.
+fn foreground_wait(initial: Duration, backgrounded: bool, notifications_reach: bool) -> Duration {
+    if backgrounded {
+        initial.min(DETACH_STARTUP_GRACE)
+    } else if !notifications_reach {
+        initial.max(SUB_AGENT_FOREGROUND_WAIT)
+    } else {
+        initial
+    }
+}
 /// Per-stream tail of startup output returned with a background launch.
 const PARTIAL_OUTPUT_TAIL_BYTES: usize = 1500;
 
@@ -5395,11 +5418,11 @@ impl TerminalTool {
         // Wait up to initial_timeout for the reader (and thus the process) to
         // finish. A detached or background launch waits only for the startup
         // grace.
-        let foreground_wait = if detach || background {
-            self.initial_timeout.min(DETACH_STARTUP_GRACE)
-        } else {
-            self.initial_timeout
-        };
+        let foreground_wait = foreground_wait(
+            self.initial_timeout,
+            detach || background,
+            notifications_reach,
+        );
         let poll_finished = async {
             loop {
                 if reader_handle.is_finished() {
@@ -11511,6 +11534,22 @@ mod tests {
                 crate::testing::call_facts("sess_background_job"),
             )
             .await;
+    }
+
+    /// A sub-agent's long command keeps its call: one loop printing a count
+    /// is one call that finishes, never a background job the sub-agent then
+    /// waits on or kills; a chat's command and any explicit background
+    /// launch keep their own waits.
+    #[test]
+    fn a_sub_agents_command_keeps_its_call() {
+        let initial = Duration::from_secs(30);
+        assert_eq!(
+            foreground_wait(initial, false, false),
+            SUB_AGENT_FOREGROUND_WAIT
+        );
+        assert!(SUB_AGENT_FOREGROUND_WAIT >= Duration::from_secs(120));
+        assert_eq!(foreground_wait(initial, false, true), initial);
+        assert_eq!(foreground_wait(initial, true, false), DETACH_STARTUP_GRACE);
     }
 
     /// A sub-agent's job that outlives the foreground wait does not end the
