@@ -34,6 +34,12 @@ pub struct FileSystemResolver {
     skill_dirs: RwLock<HashMap<String, PathBuf>>,
 }
 
+impl Default for FileSystemResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystemResolver {
     pub fn new() -> Self {
         Self {

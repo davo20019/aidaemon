@@ -36,6 +36,7 @@ impl ProbeType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // infallible: unknown names map to a default
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "http" | "https" => ProbeType::Http,
@@ -67,6 +68,7 @@ impl ProbeStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // infallible: unknown names map to a default
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "healthy" | "ok" | "up" => ProbeStatus::Healthy,
@@ -213,7 +215,7 @@ impl ProbeResult {
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
         let body = body.into();
         // Truncate to ~1KB
-        self.response_body = Some(crate::utils::truncate_str(&body, 1024));
+        self.response_body = Some(aidaemon_tools::text::truncate_str(&body, 1024));
         self
     }
 }

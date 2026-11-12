@@ -7,12 +7,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
 
-use crate::cron_utils::{compute_next_run, parse_schedule};
-use crate::health::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
-use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+use super::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
+use crate::schedule::{compute_next_run, parse_schedule};
+use aidaemon_tools::semantics::{
+    semantics_for_exact_read_actions, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
+use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct HealthProbeTool {
     store: Arc<HealthProbeStore>,
@@ -144,8 +144,8 @@ impl Tool for HealthProbeTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: HealthProbeArgs = serde_json::from_str(arguments)?;
 
@@ -164,11 +164,11 @@ impl Tool for HealthProbeTool {
             }
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for HealthProbeTool {
+impl aidaemon_tools::semantics::ToolSemantics for HealthProbeTool {
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
         semantics_for_exact_read_actions(
             arguments,

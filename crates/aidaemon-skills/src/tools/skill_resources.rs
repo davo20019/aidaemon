@@ -4,8 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::skills::{self, ResourceResolver};
-use crate::traits::{Tool, ToolCapabilities};
+use crate::{self as skills, ResourceResolver};
+use aidaemon_tools::semantics::ToolCapabilities;
+use aidaemon_tools::OutcomeTool as Tool;
 
 pub struct SkillResourcesTool {
     skills_dir: PathBuf,
@@ -58,8 +59,8 @@ impl Tool for SkillResourcesTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
         let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
@@ -121,17 +122,17 @@ impl Tool for SkillResourcesTool {
             )),
         }
     }.await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for SkillResourcesTool {
+impl aidaemon_tools::semantics::ToolSemantics for SkillResourcesTool {
     /// A skill's bundled files are its author's; a skill's declared source
     /// is a field of the skill's own file, so it cannot vouch for itself.
     fn output_trust(
         &self,
         _arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
+        _roots: &aidaemon_tools::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::SourceTrust {
         aidaemon_core::SourceTrust::Untrusted
     }
@@ -150,9 +151,9 @@ impl crate::traits::ToolSemantics for SkillResourcesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::resources::ResourceEntry;
-    use crate::skills::Skill;
-    use crate::traits::ToolCalls as _;
+    use crate::resources::ResourceEntry;
+    use crate::Skill;
+    use aidaemon_tools::testing::ToolCalls as _;
 
     fn make_skill_with_resources(name: &str, resources: Vec<ResourceEntry>) -> Skill {
         Skill {
@@ -276,7 +277,7 @@ mod tests {
         );
 
         // Intentionally do NOT pre-register the directory in resolver.
-        let resolver = Arc::new(crate::skills::FileSystemResolver::new());
+        let resolver = Arc::new(crate::FileSystemResolver::new());
         let tool = SkillResourcesTool::new(dir.path().to_path_buf(), resolver);
         let result = tool
             .call(

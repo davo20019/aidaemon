@@ -4,6 +4,7 @@
 //! `aidaemon_memory::sqlite` do, and owns the `events` table contract.
 
 pub mod attachments;
+pub mod checkpoint_audit;
 pub mod context;
 pub mod conversation;
 pub mod conversation_turn;

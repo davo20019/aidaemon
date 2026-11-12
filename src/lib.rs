@@ -4,7 +4,6 @@ mod agent;
 mod agent_handoff;
 mod backoff;
 mod channels;
-mod checkpoints;
 mod cli_agent_flags;
 mod config;
 mod context_budget;
@@ -14,7 +13,7 @@ use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
-mod duration_format;
+use aidaemon_tools::duration_format;
 #[allow(dead_code)]
 mod events;
 mod otel_export;
@@ -68,7 +67,6 @@ mod tasks;
 #[cfg(feature = "terminal-bridge")]
 mod terminal_bridge;
 mod terminal_lite;
-mod token_alerts;
 mod tools;
 #[cfg(feature = "computer_use")]
 pub use config::ComputerUseConfig;
@@ -80,7 +78,6 @@ mod types;
 mod updater;
 pub mod utils;
 mod wizard;
-mod workspaces;
 
 #[cfg(test)]
 mod contract_shape_tests;

@@ -20,6 +20,10 @@ publish = false
 [features]
 # Helpers for calling tools directly from tests.
 testing = []
+# Local workspace checkpoints (shadow-Git snapshots with their SQLite tables).
+checkpoints = ["dep:sqlx"]
+# The persistent Docker container execution backend.
+docker = []
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
@@ -45,6 +49,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 shell-words = "1.1"
 shellexpand = "3"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 thiserror = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

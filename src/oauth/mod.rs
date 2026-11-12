@@ -223,7 +223,7 @@ struct ResolvedPendingFlow {
 }
 
 /// Shared HTTP auth profiles map type.
-pub type SharedHttpProfiles = Arc<RwLock<HashMap<String, HttpAuthProfile>>>;
+pub use aidaemon_tools::http_request::SharedHttpProfiles;
 
 /// The OAuth gateway manages OAuth flows and stores tokens.
 #[derive(Clone)]

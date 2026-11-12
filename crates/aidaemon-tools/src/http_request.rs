@@ -161,6 +161,9 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Maximum timeout in seconds.
 const MAX_TIMEOUT_SECS: u64 = 120;
 
+/// Shared HTTP auth profiles, by name.
+pub type SharedHttpProfiles = Arc<RwLock<HashMap<String, HttpAuthProfile>>>;
+
 pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
     oauth_gateway: Arc<RwLock<Option<Arc<dyn OAuthTokens>>>>,

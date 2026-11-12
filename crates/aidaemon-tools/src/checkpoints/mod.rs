@@ -27,11 +27,117 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::CheckpointConfig;
-use crate::events::{Event, EventStore, EventType};
-use crate::execution::{BackendKind, SharedExecutionBackend};
-use crate::tools::fs_utils;
-use crate::traits::{ToolCallAccessManifest, ToolCallContext, ToolTargetHint, ToolTargetHintKind};
+use crate::backend::{BackendKind, SharedExecutionBackend};
+use crate::fs_utils;
+use crate::semantics::{
+    ToolCallAccessManifest, ToolCallContext, ToolTargetHint, ToolTargetHintKind,
+};
+
+mod schema;
+mod tool;
+
+pub use schema::migrate;
+pub use tool::ListCheckpointsTool;
+
+/// Where a checkpoint's lifecycle is recorded: the host's audit log.
+#[async_trait::async_trait]
+pub trait CheckpointAudit: Send + Sync {
+    /// Record `event` for `session_id`; a failure is logged, never fatal.
+    async fn record(
+        &self,
+        session_id: &str,
+        event: CheckpointEvent,
+        data: Value,
+    ) -> anyhow::Result<()>;
+}
+
+/// The checkpoint lifecycle events a host records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointEvent {
+    /// A pre-mutation workspace checkpoint was created.
+    Created,
+    /// A checkpoint's post-task tree was captured.
+    Finalized,
+    /// Checkpointing was skipped or failed before a mutation.
+    Skipped,
+    /// A confirmed rollback started.
+    RollbackStarted,
+    /// A rollback completed, possibly with preserved conflicts.
+    RollbackCompleted,
+    /// A rollback failed before completion.
+    RollbackFailed,
+}
+
+/// Local shadow-Git workspace checkpoints created before the first filesystem
+/// mutation in an agent turn.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CheckpointConfig {
+    /// Opt in to local workspace checkpoints. Disabled by default while the
+    /// feature is in beta.
+    #[serde(default)]
+    pub enabled: bool,
+    /// External checkpoint store. Defaults to the platform data directory.
+    #[serde(default)]
+    pub storage_dir: Option<String>,
+    #[serde(default = "default_checkpoint_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_checkpoint_max_per_root")]
+    pub max_per_root: u32,
+    #[serde(default = "default_checkpoint_max_store_bytes")]
+    pub max_store_bytes: u64,
+    #[serde(default = "default_checkpoint_max_root_bytes")]
+    pub max_root_bytes: u64,
+    #[serde(default = "default_checkpoint_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_checkpoint_max_paths")]
+    pub max_paths: usize,
+    #[serde(default = "default_checkpoint_snapshot_timeout_secs")]
+    pub snapshot_timeout_secs: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            storage_dir: None,
+            retention_days: default_checkpoint_retention_days(),
+            max_per_root: default_checkpoint_max_per_root(),
+            max_store_bytes: default_checkpoint_max_store_bytes(),
+            max_root_bytes: default_checkpoint_max_root_bytes(),
+            max_file_bytes: default_checkpoint_max_file_bytes(),
+            max_paths: default_checkpoint_max_paths(),
+            snapshot_timeout_secs: default_checkpoint_snapshot_timeout_secs(),
+        }
+    }
+}
+
+fn default_checkpoint_retention_days() -> u64 {
+    14
+}
+
+fn default_checkpoint_max_per_root() -> u32 {
+    30
+}
+
+fn default_checkpoint_max_store_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_checkpoint_max_root_bytes() -> u64 {
+    500 * 1024 * 1024
+}
+
+fn default_checkpoint_max_file_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_checkpoint_max_paths() -> usize {
+    50_000
+}
+
+fn default_checkpoint_snapshot_timeout_secs() -> u64 {
+    10
+}
 
 static ACTIVE_MANAGER: Lazy<RwLock<Option<Arc<CheckpointManager>>>> =
     Lazy::new(|| RwLock::new(None));
@@ -41,7 +147,7 @@ const OPEN: &str = "open";
 const UNSAFE: &str = "unsafe";
 const ROLLBACK_CONFIRMATION_MINUTES: i64 = 5;
 
-pub(crate) fn active_manager() -> Option<Arc<CheckpointManager>> {
+pub fn active_manager() -> Option<Arc<CheckpointManager>> {
     ACTIVE_MANAGER
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -50,10 +156,10 @@ pub(crate) fn active_manager() -> Option<Arc<CheckpointManager>> {
 
 /// Install the process-wide manager after the immutable execution backend is
 /// selected. Remote backends are deliberately unsupported in the beta.
-pub(crate) async fn install_manager(
+pub async fn install_manager(
     config: &CheckpointConfig,
     pool: SqlitePool,
-    event_store: Arc<EventStore>,
+    audit: Arc<dyn CheckpointAudit>,
     backend: SharedExecutionBackend,
 ) -> anyhow::Result<Option<Arc<CheckpointManager>>> {
     if !config.enabled {
@@ -71,8 +177,7 @@ pub(crate) async fn install_manager(
         return Ok(Some(existing));
     }
 
-    let manager =
-        Arc::new(CheckpointManager::new(config.clone(), pool, event_store, backend).await?);
+    let manager = Arc::new(CheckpointManager::new(config.clone(), pool, audit, backend).await?);
     manager.reconcile_interrupted_state().await?;
     manager.prune_retention().await?;
 
@@ -157,7 +262,7 @@ struct Confirmation {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RollbackPreview {
+pub struct RollbackPreview {
     pub checkpoint_id: String,
     pub root: PathBuf,
     pub writes: usize,
@@ -169,7 +274,7 @@ pub(crate) struct RollbackPreview {
 }
 
 impl RollbackPreview {
-    pub(crate) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let samples = if self.samples.is_empty() {
             String::new()
         } else {
@@ -192,7 +297,7 @@ impl RollbackPreview {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RollbackResult {
+pub struct RollbackResult {
     checkpoint_id: String,
     safety_checkpoint_id: String,
     applied: usize,
@@ -200,7 +305,7 @@ pub(crate) struct RollbackResult {
 }
 
 impl RollbackResult {
-    pub(crate) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let conflict_text = if self.conflicts.is_empty() {
             String::new()
         } else {
@@ -225,10 +330,10 @@ impl RollbackResult {
     }
 }
 
-pub(crate) struct CheckpointManager {
+pub struct CheckpointManager {
     config: CheckpointConfig,
     pool: SqlitePool,
-    event_store: Arc<EventStore>,
+    audit: Arc<dyn CheckpointAudit>,
     backend: SharedExecutionBackend,
     store_root: PathBuf,
     git_binary: PathBuf,
@@ -242,7 +347,7 @@ impl CheckpointManager {
     async fn new(
         config: CheckpointConfig,
         pool: SqlitePool,
-        event_store: Arc<EventStore>,
+        audit: Arc<dyn CheckpointAudit>,
         backend: SharedExecutionBackend,
     ) -> anyhow::Result<Self> {
         validate_config(&config)?;
@@ -276,7 +381,7 @@ impl CheckpointManager {
         Ok(Self {
             config,
             pool,
-            event_store,
+            audit,
             backend,
             store_root,
             git_binary,
@@ -287,7 +392,7 @@ impl CheckpointManager {
         })
     }
 
-    pub(crate) async fn begin_for_tool(
+    pub async fn begin_for_tool(
         &self,
         tool: &str,
         arguments: &str,
@@ -301,7 +406,7 @@ impl CheckpointManager {
     /// Shell source is intentionally absent: only typed write targets can
     /// authorize and scope a filesystem snapshot. The session, task and turn
     /// it is recorded under are the dispatcher's `facts` about the call.
-    pub(crate) async fn begin_for_access_manifest(
+    pub async fn begin_for_access_manifest(
         &self,
         tool: &str,
         manifest: &ToolCallAccessManifest,
@@ -328,7 +433,7 @@ impl CheckpointManager {
             Err(error) => {
                 self.emit(
                     &session_id,
-                    EventType::CheckpointSkipped,
+                    CheckpointEvent::Skipped,
                     json!({
                         "task_id": task_id,
                         "turn_id": turn_id,
@@ -377,7 +482,7 @@ impl CheckpointManager {
             Err(error) => {
                 self.emit(
                     &session_id,
-                    EventType::CheckpointSkipped,
+                    CheckpointEvent::Skipped,
                     json!({
                         "checkpoint_id": id,
                         "task_id": task_id,
@@ -423,7 +528,7 @@ impl CheckpointManager {
         self.leases.lock().await.insert(id.clone(), guard);
         self.emit(
             &session_id,
-            EventType::CheckpointCreated,
+            CheckpointEvent::Created,
             json!({
                 "checkpoint_id": id,
                 "task_id": task_id,
@@ -440,7 +545,7 @@ impl CheckpointManager {
         Ok(Some(id))
     }
 
-    pub(crate) async fn mark_task_unsafe(&self, task_id: &str, reason: &str) {
+    pub async fn mark_task_unsafe(&self, task_id: &str, reason: &str) {
         if let Err(error) = sqlx::query(
             "UPDATE filesystem_checkpoints
              SET unsafe_reason = COALESCE(unsafe_reason, ?)
@@ -456,11 +561,7 @@ impl CheckpointManager {
         }
     }
 
-    pub(crate) async fn finalize_task(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn finalize_task(&self, task_id: &str, session_id: &str) -> anyhow::Result<()> {
         let rows = sqlx::query(
             "SELECT id, root_path, store_path, unsafe_reason, turn_id
              FROM filesystem_checkpoints WHERE task_id = ? AND state = ?",
@@ -501,7 +602,7 @@ impl CheckpointManager {
                     .await?;
                     self.emit(
                         session_id,
-                        EventType::CheckpointFinalized,
+                        CheckpointEvent::Finalized,
                         json!({
                             "checkpoint_id": id,
                             "task_id": task_id,
@@ -529,7 +630,7 @@ impl CheckpointManager {
                     .await?;
                     self.emit(
                         session_id,
-                        EventType::CheckpointSkipped,
+                        CheckpointEvent::Skipped,
                         json!({
                             "checkpoint_id": id,
                             "task_id": task_id,
@@ -546,7 +647,7 @@ impl CheckpointManager {
         self.prune_retention().await
     }
 
-    pub(crate) async fn list_text(&self, limit: usize, root_filter: Option<&str>) -> String {
+    pub async fn list_text(&self, limit: usize, root_filter: Option<&str>) -> String {
         match self.list_records(limit.clamp(1, 100)).await {
             Ok(records) => {
                 let records = records
@@ -596,7 +697,7 @@ impl CheckpointManager {
         }
     }
 
-    pub(crate) async fn prepare_rollback(
+    pub async fn prepare_rollback(
         &self,
         session_id: &str,
         selector: Option<&str>,
@@ -683,7 +784,7 @@ impl CheckpointManager {
         })
     }
 
-    pub(crate) async fn apply_rollback(
+    pub async fn apply_rollback(
         &self,
         session_id: &str,
         token: &str,
@@ -740,7 +841,7 @@ impl CheckpointManager {
         .await?;
         self.emit(
             session_id,
-            EventType::RollbackStarted,
+            CheckpointEvent::RollbackStarted,
             json!({
                 "checkpoint_id": plan.checkpoint_id,
                 "restore_run_id": run_id,
@@ -794,7 +895,7 @@ impl CheckpointManager {
                     .await?;
                     self.emit(
                         session_id,
-                        EventType::RollbackFailed,
+                        CheckpointEvent::RollbackFailed,
                         json!({
                             "checkpoint_id": plan.checkpoint_id,
                             "restore_run_id": run_id,
@@ -833,7 +934,7 @@ impl CheckpointManager {
             .await?;
             self.emit(
                 session_id,
-                EventType::RollbackFailed,
+                CheckpointEvent::RollbackFailed,
                 json!({
                     "checkpoint_id": plan.checkpoint_id,
                     "restore_run_id": run_id,
@@ -861,7 +962,7 @@ impl CheckpointManager {
         .await?;
         self.emit(
             session_id,
-            EventType::RollbackCompleted,
+            CheckpointEvent::RollbackCompleted,
             json!({
                 "checkpoint_id": plan.checkpoint_id,
                 "restore_run_id": run_id,
@@ -1119,7 +1220,7 @@ impl CheckpointManager {
         .await?;
         self.emit(
             session_id,
-            EventType::CheckpointCreated,
+            CheckpointEvent::Created,
             json!({
                 "checkpoint_id": id,
                 "name": "rollback_safety",
@@ -1161,7 +1262,7 @@ impl CheckpointManager {
         .await?;
         self.emit(
             session_id,
-            EventType::CheckpointFinalized,
+            CheckpointEvent::Finalized,
             json!({
                 "checkpoint_id": id,
                 "name": "rollback_safety",
@@ -1232,12 +1333,8 @@ impl CheckpointManager {
             .ok_or_else(|| anyhow::anyhow!("no matching rollback-ready checkpoint found"))
     }
 
-    async fn emit(&self, session_id: &str, event_type: EventType, data: Value) {
-        if let Err(error) = self
-            .event_store
-            .append(Event::new(session_id, event_type, data))
-            .await
-        {
+    async fn emit(&self, session_id: &str, event: CheckpointEvent, data: Value) {
+        if let Err(error) = self.audit.record(session_id, event, data).await {
             warn!(error = %error, "Failed to append checkpoint audit event");
         }
     }
@@ -1286,7 +1383,7 @@ impl CheckpointManager {
             .await?;
             self.emit(
                 &session_id,
-                EventType::CheckpointFinalized,
+                CheckpointEvent::Finalized,
                 json!({
                     "checkpoint_id": id,
                     "task_id": task_id,
@@ -2239,7 +2336,34 @@ fn directory_size(path: &Path) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventStoreForTests as _;
+
+    /// Records the lifecycle events a manager reports.
+    #[derive(Default)]
+    struct RecordingAudit(std::sync::Mutex<Vec<CheckpointEvent>>);
+
+    impl RecordingAudit {
+        fn count(&self, events: &[CheckpointEvent]) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| events.contains(event))
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointAudit for RecordingAudit {
+        async fn record(
+            &self,
+            _session_id: &str,
+            event: CheckpointEvent,
+            _data: Value,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn shell_source_has_no_checkpoint_authority() {
@@ -2262,8 +2386,9 @@ mod tests {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let event_store = Arc::new(EventStore::new(pool.clone()).await.unwrap());
-        let execution_config = crate::config::ExecutionConfig {
+        migrate(&pool).await.unwrap();
+        let audit = Arc::new(RecordingAudit::default());
+        let execution_config = crate::execution::ExecutionConfig {
             workspace_root: Some(workspace_container.path().to_string_lossy().into_owned()),
             allow_outside_workspace: Some(false),
             ..Default::default()
@@ -2280,7 +2405,7 @@ mod tests {
                 ..CheckpointConfig::default()
             },
             pool,
-            event_store,
+            audit,
             backend,
         )
         .await
@@ -2311,8 +2436,9 @@ mod tests {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let event_store = Arc::new(EventStore::new(pool.clone()).await.unwrap());
-        let execution_config = crate::config::ExecutionConfig {
+        migrate(&pool).await.unwrap();
+        let audit = Arc::new(RecordingAudit::default());
+        let execution_config = crate::execution::ExecutionConfig {
             workspace_root: Some(workspace_container.path().to_string_lossy().into_owned()),
             allow_outside_workspace: Some(false),
             ..Default::default()
@@ -2329,7 +2455,7 @@ mod tests {
                 ..CheckpointConfig::default()
             },
             pool,
-            event_store,
+            audit,
             backend,
         )
         .await
@@ -2376,8 +2502,9 @@ mod tests {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let event_store = Arc::new(EventStore::new(pool.clone()).await.unwrap());
-        let execution_config = crate::config::ExecutionConfig {
+        migrate(&pool).await.unwrap();
+        let audit = Arc::new(RecordingAudit::default());
+        let execution_config = crate::execution::ExecutionConfig {
             workspace_root: Some(workspace_container.path().to_string_lossy().into_owned()),
             allow_outside_workspace: Some(false),
             ..Default::default()
@@ -2394,7 +2521,7 @@ mod tests {
                 ..CheckpointConfig::default()
             },
             pool.clone(),
-            event_store,
+            audit,
             backend,
         )
         .await
@@ -2437,8 +2564,9 @@ mod tests {
         let workspace_container = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let event_store = Arc::new(EventStore::new(pool.clone()).await.unwrap());
-        let execution_config = crate::config::ExecutionConfig {
+        migrate(&pool).await.unwrap();
+        let audit = Arc::new(RecordingAudit::default());
+        let execution_config = crate::execution::ExecutionConfig {
             workspace_root: Some(workspace_container.path().to_string_lossy().into_owned()),
             allow_outside_workspace: Some(false),
             ..Default::default()
@@ -2455,7 +2583,7 @@ mod tests {
                 ..CheckpointConfig::default()
             },
             pool,
-            event_store,
+            audit,
             backend,
         )
         .await
@@ -2626,7 +2754,8 @@ mod tests {
 
         let store = tempfile::tempdir().unwrap();
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let event_store = Arc::new(EventStore::new(pool.clone()).await.unwrap());
+        migrate(&pool).await.unwrap();
+        let audit = Arc::new(RecordingAudit::default());
         let config = CheckpointConfig {
             enabled: true,
             storage_dir: Some(store.path().to_string_lossy().into_owned()),
@@ -2635,8 +2764,8 @@ mod tests {
         let manager = CheckpointManager::new(
             config,
             pool.clone(),
-            event_store,
-            crate::execution::active_execution_backend(),
+            audit.clone(),
+            crate::testing::active_execution_backend(),
         )
         .await
         .unwrap();
@@ -2675,14 +2804,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<String, _>("state"), READY);
         assert!(!row.get::<String, _>("post_tree").is_empty());
-        let audit_count = sqlx::query(
-            "SELECT COUNT(*) AS count FROM events
-             WHERE event_type IN ('checkpoint_created', 'checkpoint_finalized')",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get::<i64, _>("count");
+        let audit_count = audit.count(&[CheckpointEvent::Created, CheckpointEvent::Finalized]);
         assert_eq!(audit_count, 2);
 
         let preview = manager
@@ -2708,14 +2830,10 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read_to_string(&source).unwrap(), "after");
         assert!(!workspace.path().join(".git").exists());
-        let rollback_events = sqlx::query(
-            "SELECT COUNT(*) AS count FROM events
-             WHERE event_type IN ('rollback_started', 'rollback_completed')",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get::<i64, _>("count");
+        let rollback_events = audit.count(&[
+            CheckpointEvent::RollbackStarted,
+            CheckpointEvent::RollbackCompleted,
+        ]);
         assert_eq!(rollback_events, 4);
 
         let second_args = json!({

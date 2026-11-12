@@ -356,7 +356,7 @@ pub(crate) async fn init_heartbeat_coordinator(
 
         // Skill promotion (every 12 hours)
         if let Some(sd) = skills_dir {
-            let promoter = Arc::new(crate::skills::promotion::SkillPromoter::new(
+            let promoter = Arc::new(crate::skills::promotion::promoter(
                 state.clone(),
                 side_calls.clone(),
                 sd,

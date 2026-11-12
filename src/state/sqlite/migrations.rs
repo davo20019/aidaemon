@@ -559,18 +559,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .await?;
 
     // Token alert detector dedupe/cooldown state.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS token_alert_state (
-            scope_type TEXT NOT NULL,
-            scope_id TEXT NOT NULL,
-            last_alert_at TEXT NOT NULL,
-            last_metric_tokens INTEGER NOT NULL DEFAULT 0,
-            last_metric_calls INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (scope_type, scope_id)
-        )",
-    )
-    .execute(pool)
-    .await?;
+    aidaemon_work::token_alerts::migrate(pool).await?;
 
     // Conversation summaries for context window management
     sqlx::query(
