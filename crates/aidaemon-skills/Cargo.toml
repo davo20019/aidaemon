@@ -27,7 +27,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 htmd = "0.5"
 llm_readability = "0.0"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "deflate", "brotli", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
