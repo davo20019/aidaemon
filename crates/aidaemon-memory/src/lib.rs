@@ -86,6 +86,7 @@ mod learning;
 mod memory;
 pub mod neighborhood;
 pub mod people_intelligence;
+pub mod policy;
 pub mod profile;
 pub mod progressive;
 mod recall;
