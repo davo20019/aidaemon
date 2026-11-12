@@ -1036,15 +1036,14 @@ mod tests {
         assert!(request
             .warnings
             .iter()
-            .any(|warning| warning == "Expiration: 1 hour after activation"));
+            .any(|warning| warning == "Ends: 1 hour after you approve"));
         assert!(request.warnings.iter().all(|warning| {
             !warning.contains("http_request")
                 && !warning.contains("auth_profile:")
                 && !warning.contains("api.x.com")
         }));
         assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Timing normalized")
-                && warning.contains("expires_at value was ignored")
+            warning.starts_with("Timing note:") && warning.contains("the end date was ignored")
         }));
         let result = tool.call_with(args, approved_owner_facts()).await.unwrap();
         assert!(result.contains("Activated mandate"));
@@ -1362,8 +1361,9 @@ mod tests {
                 && warning.contains("handles routine decisions")
         }));
         assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Policy reference: Version 2")
-                && warning.contains("rules and limits summarized here")
+            warning.starts_with("Policy reference:")
+                && warning.contains("policy version 2")
+                && warning.contains("rules and limits shown here")
         }));
         assert!(request.warnings.iter().any(|warning| {
             warning
@@ -1489,11 +1489,8 @@ mod tests {
             panic!("create asks the owner");
         };
         let rendered = request.warnings.join("\n");
-        assert!(
-            rendered.contains("Review interval: Every 1 hour."),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("may vary from"), "{rendered}");
+        assert!(rendered.contains("How often: Every hour"), "{rendered}");
+        assert!(!rendered.contains("between"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1540,15 +1537,16 @@ mod tests {
             panic!("create asks the owner");
         };
         for expected in [
-            "Objective:",
+            "What:",
+            "How often:",
+            "Can do:",
+            "Tells you when:",
+            "Ends:",
             "Constraints:",
             "Success criteria:",
             "Stop conditions:",
             "Guidance:",
             "Access summary:",
-            "Mutation limits:",
-            "Review interval:",
-            "Expiration:",
             "Review depth:",
             "Policy reference:",
         ] {

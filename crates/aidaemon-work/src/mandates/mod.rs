@@ -1,3 +1,4 @@
+pub mod card;
 pub mod history;
 pub mod policy;
 
