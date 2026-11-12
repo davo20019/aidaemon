@@ -802,6 +802,7 @@ impl NotificationEntry {
             | "token_alert"
             | "mandate_action"
             | "mandate_ask"
+            | "mandate_alert"
             | "mandate_ask_timeout"
             | "mandate_stopped"
             | "mandate_review_failed"
@@ -849,7 +850,11 @@ impl NotificationEntry {
     pub fn interrupts_quiet_hours(&self) -> bool {
         matches!(
             self.notification_type.as_str(),
-            "mandate_ask" | "mandate_reconciliation_required" | "escalation" | "node_monitor_alert"
+            "mandate_ask"
+                | "mandate_alert"
+                | "mandate_reconciliation_required"
+                | "escalation"
+                | "node_monitor_alert"
         )
     }
 

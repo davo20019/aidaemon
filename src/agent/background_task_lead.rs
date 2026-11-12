@@ -1009,7 +1009,17 @@ async fn finalize_mandate_review(
         MandateRunFinalizationResult::NonActionSatisfied { outcome, counts } => match outcome {
             MandateDecisionOutcome::Wait => {
                 keep_mandate_controller_open(state, &mandate, goal).await;
-                None
+                // A WAIT carrying its granted owner alert was committed with
+                // an alert notice; hand it on for prompt delivery.
+                let alert = state
+                    .get_mandate_decision_for_run(goal_run_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|decision| decision.owner_alert);
+                alert.map(|alert| {
+                    notice(MandateRunNotificationKind::Alert, counts).with_owner_alert(Some(&alert))
+                })
             }
             MandateDecisionOutcome::Ask => {
                 let question = state

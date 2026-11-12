@@ -4719,6 +4719,11 @@ impl TurnSurface for TelegramSurface {
         })
     }
 
+    /// The live card's closing checklist decides whether it stays.
+    fn status_settles_before_reply(&self) -> bool {
+        self.live.is_some()
+    }
+
     async fn deliver(&self, envelope: &AgentResponseEnvelope, reply: &str) -> Delivered {
         let background_handoff =
             envelope.disposition == crate::events::AssistantResponseDisposition::BackgroundHandoff;
@@ -5229,98 +5234,140 @@ async fn run_status_consumer(
     use crate::channels::live_status::SurfaceSink;
     let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
     let min_interval = Duration::from_secs(3);
-    while let Some(update) = rx.recv().await {
-        if is_indicator_only_status(&update) {
-            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
-            continue;
+    while let Some(first) = rx.recv().await {
+        // Whatever piled up while the last edit was on its way: only the
+        // newest card state matters, so a slow surface catches up in one
+        // edit instead of replaying (and the sender, which never waits,
+        // finds room for the closing checklist).
+        let mut backlog = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            backlog.push(next);
         }
-        let is_immediate = update.requires_immediate_delivery();
-        let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
-        // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
-        if !is_dm && !is_budget_ext {
-            continue;
-        }
-        // BudgetExtended and explicit user actions are must-deliver: send as
-        // their own message (never folded into the live surface).
-        if is_immediate {
-            let text = match &update {
-                StatusUpdate::BudgetExtended {
-                    old_budget,
-                    new_budget,
-                    extension,
-                    max_extensions,
-                } => format!(
-                    "💰 Auto-extended token budget {old_budget} → {new_budget} \
+        for update in coalesce_status_backlog(backlog) {
+            if is_indicator_only_status(&update) {
+                let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                continue;
+            }
+            let is_immediate = update.requires_immediate_delivery();
+            let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+            // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
+            if !is_dm && !is_budget_ext {
+                continue;
+            }
+            // BudgetExtended and explicit user actions are must-deliver: send as
+            // their own message (never folded into the live surface).
+            if is_immediate {
+                let text = match &update {
+                    StatusUpdate::BudgetExtended {
+                        old_budget,
+                        new_budget,
+                        extension,
+                        max_extensions,
+                    } => format!(
+                        "💰 Auto-extended token budget {old_budget} → {new_budget} \
                      ({extension}/{max_extensions}) — continuing."
-                ),
-                StatusUpdate::UserActionRequired { message } => message.clone(),
-                _ => String::new(),
-            };
-            if !text.is_empty() {
-                let _ = bot.send_message(chat_id, text).await;
-            }
-            continue;
-        }
-        // Ordinary progress → single live surface, gated by min_interval.
-        // Exception: the plan checklist is the highest-value content and edits in
-        // place, so it must never be dropped by the throttle. It typically arrives
-        // within a second of the track_requirements ToolStart (well inside
-        // min_interval), which previously discarded it and the plan never showed.
-        let now = tokio::time::Instant::now();
-        let is_checklist = matches!(&update, StatusUpdate::Checklist { .. });
-        if !is_checklist && now.duration_since(last_sent) < min_interval {
-            continue;
-        }
-        let sink_ref: &dyn SurfaceSink = sink.as_ref();
-        // Single-writer invariant: exactly one consumer task touches `owner` per
-        // turn and turns are sequential (the previous task is aborted before the
-        // next is spawned), so holding the lock across the network send below is
-        // safe — there is never a second writer to contend with.
-        match &update {
-            StatusUpdate::Checklist { text } => {
-                owner
-                    .lock()
-                    .await
-                    .set_checklist(sink_ref, text.clone())
-                    .await;
-            }
-            StatusUpdate::ToolStart { name, summary } => {
-                let line = if summary.is_empty() {
-                    format!("{name}…")
-                } else {
-                    format!("{name}: {summary}…")
+                    ),
+                    StatusUpdate::UserActionRequired { message } => message.clone(),
+                    _ => String::new(),
                 };
-                owner.lock().await.set_activity(sink_ref, line).await;
+                if !text.is_empty() {
+                    let _ = bot.send_message(chat_id, text).await;
+                }
+                continue;
             }
-            StatusUpdate::ToolComplete { name, .. } => {
-                owner
-                    .lock()
-                    .await
-                    .set_activity(sink_ref, format!("{name}…"))
-                    .await;
+            // Ordinary progress → single live surface, gated by min_interval.
+            // Exception: the plan checklist is the highest-value content and edits in
+            // place, so it must never be dropped by the throttle. It typically arrives
+            // within a second of the track_requirements ToolStart (well inside
+            // min_interval), which previously discarded it and the plan never showed.
+            let now = tokio::time::Instant::now();
+            let is_checklist = matches!(&update, StatusUpdate::Checklist { .. });
+            if !is_checklist && now.duration_since(last_sent) < min_interval {
+                continue;
             }
-            StatusUpdate::PlanStepStart { description, .. }
-            | StatusUpdate::PlanStepComplete { description, .. } => {
-                owner
-                    .lock()
-                    .await
-                    .set_activity(sink_ref, description.clone())
-                    .await;
+            let sink_ref: &dyn SurfaceSink = sink.as_ref();
+            // Single-writer invariant: exactly one consumer task touches `owner` per
+            // turn and turns are sequential (the previous task is aborted before the
+            // next is spawned), so holding the lock across the network send below is
+            // safe — there is never a second writer to contend with.
+            match &update {
+                StatusUpdate::Checklist { text } => {
+                    owner
+                        .lock()
+                        .await
+                        .set_checklist(sink_ref, text.clone())
+                        .await;
+                }
+                StatusUpdate::ToolStart { name, summary } => {
+                    let line = if summary.is_empty() {
+                        format!("{name}…")
+                    } else {
+                        format!("{name}: {summary}…")
+                    };
+                    owner.lock().await.set_activity(sink_ref, line).await;
+                }
+                StatusUpdate::ToolComplete { name, .. } => {
+                    owner
+                        .lock()
+                        .await
+                        .set_activity(sink_ref, format!("{name}…"))
+                        .await;
+                }
+                StatusUpdate::PlanStepStart { description, .. }
+                | StatusUpdate::PlanStepComplete { description, .. } => {
+                    owner
+                        .lock()
+                        .await
+                        .set_activity(sink_ref, description.clone())
+                        .await;
+                }
+                StatusUpdate::SubAgentProgress { label, progress } => {
+                    owner
+                        .lock()
+                        .await
+                        .set_activity(sink_ref, format!("🤖 {label}: {progress}"))
+                        .await;
+                }
+                _ => {
+                    continue; // other Plan*/Thinking variants: no separate message
+                }
             }
-            StatusUpdate::SubAgentProgress { label, progress } => {
-                owner
-                    .lock()
-                    .await
-                    .set_activity(sink_ref, format!("🤖 {label}: {progress}"))
-                    .await;
-            }
-            _ => {
-                continue; // other Plan*/Thinking variants: no separate message
-            }
+            last_sent = tokio::time::Instant::now();
+            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
         }
-        last_sent = tokio::time::Instant::now();
-        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
     }
+}
+
+/// Keep what a backlog of status updates still needs shown: every
+/// must-deliver message in order, the newest checklist and the newest
+/// progress line. Older card states would only be overwritten, and one
+/// typing indicator covers any number of `Thinking` beats.
+fn coalesce_status_backlog(backlog: Vec<StatusUpdate>) -> Vec<StatusUpdate> {
+    let is_checklist = |update: &StatusUpdate| matches!(update, StatusUpdate::Checklist { .. });
+    let is_progress = |update: &StatusUpdate| {
+        !update.requires_immediate_delivery()
+            && !is_indicator_only_status(update)
+            && !is_checklist(update)
+    };
+    let last_checklist = backlog.iter().rposition(is_checklist);
+    let last_progress = backlog.iter().rposition(is_progress);
+    let last_thinking = backlog.iter().rposition(is_indicator_only_status);
+    backlog
+        .into_iter()
+        .enumerate()
+        .filter(|(index, update)| {
+            if is_checklist(update) {
+                Some(*index) == last_checklist
+            } else if is_progress(update) {
+                Some(*index) == last_progress
+            } else if is_indicator_only_status(update) {
+                Some(*index) == last_thinking
+            } else {
+                true
+            }
+        })
+        .map(|(_, update)| update)
+        .collect()
 }
 
 /// Legacy (pre-LiveStatus) status consumer used only when the `ChannelHub` is
@@ -5520,6 +5567,49 @@ mod sdk_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_backlog_keeps_the_newest_card_and_every_must_deliver() {
+        let checklist = |text: &str| StatusUpdate::Checklist {
+            text: text.to_string(),
+        };
+        let tool = |name: &str| StatusUpdate::ToolStart {
+            name: name.to_string(),
+            summary: String::new(),
+        };
+        let action = StatusUpdate::UserActionRequired {
+            message: "Open the synthetic link".to_string(),
+        };
+        let kept = coalesce_status_backlog(vec![
+            StatusUpdate::Thinking(1),
+            checklist("step 1"),
+            tool("reading"),
+            action.clone(),
+            StatusUpdate::Thinking(2),
+            checklist("done"),
+            tool("writing"),
+        ]);
+        let shown: Vec<String> = kept
+            .iter()
+            .map(|update| match update {
+                StatusUpdate::Checklist { text } => format!("checklist:{text}"),
+                StatusUpdate::ToolStart { name, .. } => format!("tool:{name}"),
+                StatusUpdate::UserActionRequired { message } => format!("action:{message}"),
+                StatusUpdate::Thinking(n) => format!("thinking:{n}"),
+                _ => "other".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                "action:Open the synthetic link",
+                "thinking:2",
+                "checklist:done",
+                "tool:writing"
+            ]
+        );
+        assert_eq!(coalesce_status_backlog(vec![checklist("only")]).len(), 1);
+    }
 
     #[test]
     fn terminal_bot_sync_response_accepts_success_json() {

@@ -27,6 +27,9 @@ use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// Least time between two ordinary status messages.
 const STATUS_INTERVAL: Duration = Duration::from_secs(3);
+/// Most time a finished turn waits for its status display to catch up
+/// before the reply is sent.
+const STATUS_DRAIN: Duration = Duration::from_secs(3);
 const CANCELLED: &str = "Task cancelled";
 const INACTIVITY_PREFIX: &str = "Task auto-cancelled due to inactivity";
 
@@ -102,6 +105,14 @@ pub(crate) trait TurnSurface: Send + Sync + 'static {
         _private: bool,
     ) -> Result<JoinHandle<()>, mpsc::Receiver<StatusUpdate>> {
         Err(updates)
+    }
+
+    /// Whether this surface's status is one card that the reply settles
+    /// (its closing state decides whether the card stays). Such a surface
+    /// gets a finished turn's last updates before the reply; plain status
+    /// messages do not, since a late one would only repeat the reply.
+    fn status_settles_before_reply(&self) -> bool {
+        false
     }
 
     /// Deliver the agent's reply (already prepared for chat).
@@ -252,7 +263,8 @@ impl TurnRunner {
             // Each turn gets the whole limit; a message queued behind a long
             // turn does not inherit what that turn used.
             let owner_wait = crate::tools::OwnerWaitClock::default();
-            let description: String = text.chars().take(80).collect();
+            // Shown in "current task (…)" notices and cancel replies.
+            let description = super::presentation::word_preview(&text, 80);
             let (task_id, cancel) = registry.register(&session_id, &description).await;
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
             registry.set_heartbeat(task_id, heartbeat.clone()).await;
@@ -295,7 +307,20 @@ impl TurnRunner {
                 },
             };
             working.cancel();
-            // A background job may still hold a status sender; don't wait on it.
+            // The run is over, so its status sender is gone and the surface
+            // finishes showing what it sent: the closing checklist must reach
+            // the card before the reply, or the card stays on "Working" above
+            // a reply. A background job may still hold a sender, so the wait
+            // is bounded and a handoff, whose job keeps running, skips it.
+            let mut status_task = status_task;
+            let run_finished = matches!(
+                &result,
+                Ok(envelope) if envelope.disposition
+                    != crate::events::AssistantResponseDisposition::BackgroundHandoff
+            );
+            if run_finished && surface.status_settles_before_reply() {
+                let _ = tokio::time::timeout(STATUS_DRAIN, &mut status_task).await;
+            }
             status_task.abort();
 
             // The task stays running while the reply is sent, so a message
@@ -389,15 +414,10 @@ impl TurnRunner {
             // Let the finished turn's messages commit first.
             tokio::time::sleep(Duration::from_millis(100)).await;
             let queued = surface.before_queued(queued).await;
-            let preview: String = queued.text.chars().take(50).collect();
+            let preview = super::presentation::word_preview(&queued.text, 50);
             info!(session_id, "Processing queued message: {}", preview);
-            let ellipsis = if queued.text.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
             let _ = surface
-                .say(&format!("▶️ Processing queued: \"{preview}{ellipsis}\""))
+                .say(&format!("▶️ Processing queued: \"{preview}\""))
                 .await;
             text = queued.text;
             role = queued.user_role;
@@ -710,6 +730,100 @@ mod tests {
         };
         assert_eq!(status(&finite).await, "cancelled");
         assert_ne!(status(&recurring).await, "cancelled");
+    }
+
+    /// A surface whose status display is slow, as a loaded Telegram edit is:
+    /// each update shows a while after it arrives.
+    #[derive(Default)]
+    struct SlowStatus {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TurnSurface for SlowStatus {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+            self.log.lock().unwrap().push(format!("say:{text}"));
+            Ok(vec!["1".to_string()])
+        }
+        fn show_working(&self, _: CancellationToken, _: Arc<AtomicU64>, _: u64) {}
+        fn status_settles_before_reply(&self) -> bool {
+            true
+        }
+        fn show_status(
+            &self,
+            mut updates: mpsc::Receiver<StatusUpdate>,
+            _private: bool,
+        ) -> Result<JoinHandle<()>, mpsc::Receiver<StatusUpdate>> {
+            let log = self.log.clone();
+            Ok(tokio::spawn(async move {
+                while let Some(update) = updates.recv().await {
+                    log.lock().unwrap().push("status-received".to_string());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    log.lock()
+                        .unwrap()
+                        .push(format!("status-shown:{}", status_line(&update)));
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn status_sent_before_the_reply_is_shown_before_the_reply() {
+        let tool = Arc::new(crate::testing::MockTool::new(
+            "lookup_widget",
+            "Look up a synthetic widget",
+            "widget-7 is blue",
+        ));
+        let provider = MockProvider::with_responses(vec![
+            MockProvider::tool_call_response("lookup_widget", "{}"),
+            MockProvider::text_response("Widget-7 is blue."),
+        ]);
+        let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+            provider,
+            vec![tool as Arc<dyn crate::traits::Tool>],
+            None,
+        )
+        .await
+        .unwrap();
+        let inbox = tempfile::tempdir().unwrap().keep();
+        let runner = TurnRunner::new(ChannelRuntimeDeps {
+            agent: Arc::new(harness.agent),
+            config_path: inbox.join("config.toml"),
+            session_map: Arc::default(),
+            task_registry: Arc::new(crate::tasks::TaskRegistry::new(50)),
+            files_enabled: false,
+            inbox_dir: inbox,
+            max_file_size_mb: 10,
+            state: harness.state.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        let surface = Arc::new(SlowStatus::default());
+        runner
+            .clone()
+            .run(surface.clone(), turn("What colour is widget-7?", "m1"))
+            .await;
+
+        let log = surface.log.lock().unwrap().clone();
+        let reply = log
+            .iter()
+            .position(|entry| entry.starts_with("say:") && entry.contains("blue"))
+            .unwrap_or_else(|| panic!("no reply in {log:#?}"));
+        let received = log[..reply]
+            .iter()
+            .filter(|entry| *entry == "status-received")
+            .count();
+        let shown = log[..reply]
+            .iter()
+            .filter(|entry| entry.starts_with("status-shown:"))
+            .count();
+        assert!(received > 0, "the turn sent no status: {log:#?}");
+        assert_eq!(
+            shown, received,
+            "every status sent during the turn must show before the reply: {log:#?}"
+        );
     }
 
     #[test]
