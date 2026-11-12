@@ -98,7 +98,7 @@ jobs:
           cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
-          -p aidaemon-events -p aidaemon-work
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord
           --all-targets --all-features -- -D warnings
@@ -197,7 +197,7 @@ jobs:
           cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
-          -p aidaemon-events -p aidaemon-work
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord --all-features
 

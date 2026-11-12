@@ -359,6 +359,7 @@ enforce them.
 | `aidaemon-memory` | Long-term memory ported from the daemon: facts with supersession, episodes, hybrid recall, decay. Store, embedder and scorer are traits, so every part is replaceable |
 | `aidaemon-channels` | The `Channel` contract and `ChannelRunner`: access control, one session per conversation, queueing, streamed status edits, approvals as buttons with `/approve` fallback, `/stop` `/new` `/status` |
 | `aidaemon-channel-telegram` / `-slack` / `-discord` | Built-in adapters talking to each platform's API directly (Bot API, Socket Mode, Gateway) |
+| `aidaemon-decisions` | Decision backends (experimental): closed questions answered with a confidence and where it came from, from any `Provider` or Google's Decisions API |
 | `aidaemon-sdk` | One dependency re-exporting all of them behind features |
 
 ### Extending the SDK

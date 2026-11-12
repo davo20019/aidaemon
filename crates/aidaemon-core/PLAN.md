@@ -16,7 +16,7 @@ Keep it current: when a step finishes, tick it, add the commit, and move the
 | Branch | `ccr-695cf12a-023uky` (carries the earlier `ccr-986102ee-12nt48` work) |
 | Crates | `aidaemon-core` plus 16 SDK crates under `crates/aidaemon-*` (see `DESIGN.md`, "The SDK crates"), all `publish = false` |
 | Tests | passing across the crates CI covers (incl. conformance kits); clippy and fmt clean |
-| CI | Lint and tests for 16 of the 17 crates run in `ci.yml`, on Linux and macOS. `aidaemon-decisions` (experimental) is not in either `-p` list |
+| CI | Lint and tests for all 17 crates run in `ci.yml`, on Linux and macOS |
 | PR | #14 (draft). #13 was closed without merging |
 | Research | Harness Field Guide: https://claude.ai/artifact/Fm5Ax7oX2vzmACjtb7iPxF |
 
@@ -68,8 +68,8 @@ Gate: decision 7.
       first).
 - [ ] 8.7 item 7: learning opt-out.
 - [ ] Delete the task wall-clock timeout setting (decision 1).
-- [ ] Add `aidaemon-decisions` to CI and `DESIGN.md` (decision 6).
-- [ ] Commit the background-handoff work in the tree.
+- [x] Add `aidaemon-decisions` to CI and `DESIGN.md` (decision 6).
+- [x] Commit the background-handoff work in the tree (`e0bf437`).
 - [ ] Whole-branch review.
 - [ ] Live N-of-M on goals and mandates.
 
