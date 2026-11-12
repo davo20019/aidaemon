@@ -127,7 +127,7 @@ async fn private_opts_out_the_next_message_and_recall_still_works() {
         )
         .await
         .unwrap();
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
 
@@ -201,7 +201,7 @@ async fn a_replacing_memory_system_is_told_the_turn_is_opted_out() {
         .await
         .unwrap();
     // `/private` before the message: opted out from the start.
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness
@@ -244,7 +244,7 @@ async fn remember_after(private: bool) -> TestHarness {
     .await
     .unwrap();
     if private {
-        set_next_message_private(harness.state.as_ref(), SESSION, true)
+        set_next_message_private(harness.state.as_ref(), SESSION, None, true)
             .await
             .unwrap();
     }
@@ -352,7 +352,7 @@ async fn an_opted_out_turn_cannot_store_through_a_memory_systems_tool() {
         .set_memory_plugin(Arc::new(SystemMemory::new(Arc::new(ToolMemory(
             calls.clone(),
         )))));
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness
@@ -378,7 +378,7 @@ async fn after_clear_a_private_turn_reaches_no_prompt_or_history_search() {
     ]))
     .await
     .unwrap();
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness

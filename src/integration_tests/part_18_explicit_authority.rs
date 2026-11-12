@@ -374,7 +374,7 @@ async fn readonly_blocks_writes_then_full_restores() {
     };
 
     let reply = commands
-        .dispatch("/readonly", "", session, UserRole::Owner)
+        .dispatch("/readonly", "", session, None, UserRole::Owner)
         .await
         .unwrap();
     assert!(
@@ -460,7 +460,7 @@ async fn readonly_blocks_writes_then_full_restores() {
 
     assert_eq!(
         commands
-            .dispatch("/mode", "full", session, UserRole::Owner)
+            .dispatch("/mode", "full", session, None, UserRole::Owner)
             .await
             .as_deref(),
         Some("Back to full access from your next message.")
@@ -628,7 +628,7 @@ async fn readonly_parent_child_cannot_write() {
         config_path: std::path::PathBuf::new(),
     };
     commands
-        .dispatch("/readonly", "", session, UserRole::Owner)
+        .dispatch("/readonly", "", session, None, UserRole::Owner)
         .await
         .unwrap();
 

@@ -388,7 +388,9 @@ impl DiscordChannel {
         let session_id = self.session_for(user_id, guild, &message.conversation.id);
 
         if super::commands::is_slash_command(&text) {
-            let reply = self.dispatch_command(&text, &session_id, user_role).await;
+            let reply = self
+                .dispatch_command(&text, &session_id, user_id, user_role)
+                .await;
             let _ = outlet.say_all(&reply).await;
             return;
         }
@@ -520,19 +522,31 @@ impl DiscordChannel {
         }
         let session_id = self.session_for(user_id, guild, channel_id);
         let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
-        self.dispatch_command(text, &session_id, user_role).await
+        self.dispatch_command(text, &session_id, user_id, user_role)
+            .await
     }
 
     /// Dispatch a command string to the appropriate handler and return the reply text.
-    async fn dispatch_command(&self, text: &str, session_id: &str, user_role: UserRole) -> String {
+    async fn dispatch_command(
+        &self,
+        text: &str,
+        session_id: &str,
+        user_id: u64,
+        user_role: UserRole,
+    ) -> String {
         let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
+        // The same sender id the turn's channel context carries.
+        let sender_id = format!("discord:{user_id}");
         let ctx = super::commands::CommandContext {
             agent: Arc::clone(&self.deps.agent),
             state: Arc::clone(&self.deps.state),
             task_registry: Arc::clone(&self.deps.task_registry),
             config_path: self.deps.config_path.clone(),
         };
-        if let Some(reply) = ctx.dispatch(cmd, arg.trim(), session_id, user_role).await {
+        if let Some(reply) = ctx
+            .dispatch(cmd, arg.trim(), session_id, Some(&sender_id), user_role)
+            .await
+        {
             return reply;
         }
         match cmd {

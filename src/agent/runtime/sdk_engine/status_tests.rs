@@ -143,7 +143,7 @@ async fn run_closed_by_policy_denial_is_not_a_success() {
         config_path: std::path::PathBuf::new(),
     };
     commands
-        .dispatch("/readonly", "", session, UserRole::Owner)
+        .dispatch("/readonly", "", session, None, UserRole::Owner)
         .await
         .unwrap();
     agent

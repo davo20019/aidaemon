@@ -115,29 +115,41 @@ impl aidaemon_policies::OptOutRecorder for TurnOptOut {
     }
 }
 
-fn private_key(session_id: &str) -> String {
-    format!("learning_opt_out:{session_id}")
+/// A `/private` request belongs to the sender who made it: in a shared chat
+/// another person's message neither consumes nor cancels it. A sender the
+/// channel cannot identify keys by the session alone.
+fn private_key(session_id: &str, sender_id: Option<&str>) -> String {
+    match sender_id {
+        Some(sender) => format!("learning_opt_out:{session_id}:{sender}"),
+        None => format!("learning_opt_out:{session_id}"),
+    }
 }
 
-/// `/private`: opt the chat's next message out of learning (`on`), or cancel.
+/// `/private`: opt the sender's next message in this chat out of learning
+/// (`on`), or cancel the sender's own request.
 pub(crate) async fn set_next_message_private(
     state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
+    sender_id: Option<&str>,
     on: bool,
 ) -> anyhow::Result<()> {
     state
-        .set_setting(&private_key(session_id), if on { "next" } else { "" })
+        .set_setting(
+            &private_key(session_id, sender_id),
+            if on { "next" } else { "" },
+        )
         .await
 }
 
-/// Whether `/private` opted this message out, consuming the request. A read
-/// error opts the message out: a request not to remember must not be lost to
-/// a storage fault.
+/// Whether the sender's `/private` opted this message out, consuming the
+/// request. A read error opts the message out: a request not to remember
+/// must not be lost to a storage fault.
 pub(crate) async fn take_next_message_private(
     state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
+    sender_id: Option<&str>,
 ) -> bool {
-    let key = private_key(session_id);
+    let key = private_key(session_id, sender_id);
     match state.get_setting(&key).await {
         Ok(Some(value)) if !value.is_empty() => {
             if let Err(error) = state.set_setting(&key, "").await {

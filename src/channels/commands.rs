@@ -205,6 +205,7 @@ impl CommandContext {
         cmd: &str,
         args: &str,
         session_id: &str,
+        sender_id: Option<&str>,
         user_role: UserRole,
     ) -> Option<String> {
         match cmd {
@@ -221,16 +222,23 @@ impl CommandContext {
             "/context" => Some(self.handle_context(session_id, user_role).await),
             "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
             "/readonly" => Some(self.handle_readonly(session_id, user_role).await),
-            "/private" => Some(self.handle_private(args, session_id).await),
+            "/private" => Some(self.handle_private(args, session_id, sender_id).await),
             "/mode" => Some(self.handle_mode(args, session_id, user_role).await),
             "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
         }
     }
 
-    /// `/private [off]`: the chat's next message is not remembered or learned
-    /// from (it only narrows memory, so anyone may ask). `off` cancels.
-    async fn handle_private(&self, args: &str, session_id: &str) -> String {
+    /// `/private [off]`: the sender's next message in this chat is not
+    /// remembered or learned from (it only narrows memory, so anyone may ask).
+    /// `off` cancels. Both are the sender's own: in a shared chat nobody else
+    /// consumes or cancels them.
+    async fn handle_private(
+        &self,
+        args: &str,
+        session_id: &str,
+        sender_id: Option<&str>,
+    ) -> String {
         let on = match args.trim().to_ascii_lowercase().as_str() {
             "" => true,
             "off" => false,
@@ -239,6 +247,7 @@ impl CommandContext {
         match crate::agent::memory_plugin::set_next_message_private(
             self.state.as_ref(),
             session_id,
+            sender_id,
             on,
         )
         .await
@@ -1149,24 +1158,58 @@ mod mode_command_tests {
             config_path: PathBuf::new(),
         };
         let session = "telegram:synthetic-user-1";
-        assert!(!take_next_message_private(state.as_ref(), session).await);
+        assert!(!take_next_message_private(state.as_ref(), session, None).await);
         let reply = ctx
-            .dispatch("/private", "", session, UserRole::Guest)
+            .dispatch("/private", "", session, None, UserRole::Guest)
             .await
             .unwrap();
         assert!(reply.contains("won't be remembered"), "{reply}");
-        assert!(take_next_message_private(state.as_ref(), session).await);
-        assert!(!take_next_message_private(state.as_ref(), session).await);
+        assert!(take_next_message_private(state.as_ref(), session, None).await);
+        assert!(!take_next_message_private(state.as_ref(), session, None).await);
 
-        ctx.dispatch("/private", "", session, UserRole::Owner).await;
-        ctx.dispatch("/private", "off", session, UserRole::Owner)
+        ctx.dispatch("/private", "", session, None, UserRole::Owner)
             .await;
-        assert!(!take_next_message_private(state.as_ref(), session).await);
+        ctx.dispatch("/private", "off", session, None, UserRole::Owner)
+            .await;
+        assert!(!take_next_message_private(state.as_ref(), session, None).await);
         assert!(ctx
-            .dispatch("/private", "bogus", session, UserRole::Owner)
+            .dispatch("/private", "bogus", session, None, UserRole::Owner)
             .await
             .unwrap()
             .starts_with("Usage"));
+    }
+
+    /// In a shared chat `/private` belongs to the person who sent it: only
+    /// their next message consumes it, and nobody else can cancel it.
+    #[tokio::test]
+    async fn private_belongs_to_its_sender_in_a_shared_chat() {
+        use crate::agent::memory_plugin::take_next_message_private;
+
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state = Arc::clone(&harness.state);
+        let ctx = CommandContext {
+            agent: Arc::new(harness.agent),
+            state: state.clone(),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            config_path: PathBuf::new(),
+        };
+        let session = "slack:C-synthetic-shared";
+        let alice = Some("slack:U-synthetic-alice");
+        let bob = Some("slack:U-synthetic-bob");
+
+        ctx.dispatch("/private", "", session, alice, UserRole::Guest)
+            .await
+            .unwrap();
+        // Bob's message does not consume Alice's request...
+        assert!(!take_next_message_private(state.as_ref(), session, bob).await);
+        // ...and Bob cannot cancel it.
+        ctx.dispatch("/private", "off", session, bob, UserRole::Guest)
+            .await
+            .unwrap();
+        assert!(take_next_message_private(state.as_ref(), session, alice).await);
+        assert!(!take_next_message_private(state.as_ref(), session, alice).await);
     }
 
     #[tokio::test]
@@ -1189,7 +1232,9 @@ mod mode_command_tests {
                 ("/mode", "unrestricted"),
             ] {
                 assert_eq!(
-                    ctx.dispatch(cmd, args, session, role).await.as_deref(),
+                    ctx.dispatch(cmd, args, session, None, role)
+                        .await
+                        .as_deref(),
                     Some("Only the owner can change the mode.")
                 );
             }
@@ -1203,7 +1248,7 @@ mod mode_command_tests {
         );
 
         let reply = ctx
-            .dispatch("/readonly", "", session, UserRole::Owner)
+            .dispatch("/readonly", "", session, None, UserRole::Owner)
             .await
             .unwrap();
         assert_eq!(
@@ -1211,32 +1256,32 @@ mod mode_command_tests {
             "Read-only for this chat for the next 4 hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."
         );
         let shown = ctx
-            .dispatch("/mode", "", session, UserRole::Owner)
+            .dispatch("/mode", "", session, None, UserRole::Owner)
             .await
             .unwrap();
         assert!(shown.starts_with("Mode: read-only (about "), "{shown}");
         assert!(shown.ends_with(" left)."), "{shown}");
         assert_no_clock_time(&shown);
         assert_eq!(
-            ctx.dispatch("/mode", "bogus", session, UserRole::Owner)
+            ctx.dispatch("/mode", "bogus", session, None, UserRole::Owner)
                 .await
                 .as_deref(),
             Some("Usage: /mode [full|unrestricted|readonly]")
         );
         assert_eq!(
-            ctx.dispatch("/mode", "full", session, UserRole::Owner)
+            ctx.dispatch("/mode", "full", session, None, UserRole::Owner)
                 .await
                 .as_deref(),
             Some("Back to full access from your next message.")
         );
         assert_eq!(
-            ctx.dispatch("/mode", "", session, UserRole::Owner)
+            ctx.dispatch("/mode", "", session, None, UserRole::Owner)
                 .await
                 .as_deref(),
             Some("Mode: full.")
         );
         let unrestricted = ctx
-            .dispatch("/mode", "unrestricted", session, UserRole::Owner)
+            .dispatch("/mode", "unrestricted", session, None, UserRole::Owner)
             .await
             .unwrap();
         assert_eq!(
@@ -1244,7 +1289,7 @@ mod mode_command_tests {
             "Unrestricted for this chat for the next 4 hours, starting with your next message."
         );
         let shown = ctx
-            .dispatch("/mode", "", session, UserRole::Owner)
+            .dispatch("/mode", "", session, None, UserRole::Owner)
             .await
             .unwrap();
         assert!(shown.starts_with("Mode: unrestricted (about "), "{shown}");

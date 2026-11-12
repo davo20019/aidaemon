@@ -1224,7 +1224,12 @@ pub(in crate::agent) async fn run_bootstrap(
     if !ctx.internal_continuation
         && agent.depth == 0
         && agent.mandate_execution.is_none()
-        && crate::agent::memory_plugin::take_next_message_private(&*agent.state, session_id).await
+        && crate::agent::memory_plugin::take_next_message_private(
+            &*agent.state,
+            session_id,
+            channel_ctx.sender_id.as_deref(),
+        )
+        .await
     {
         learning.opt_out();
         if memory_pipeline_allowed {
