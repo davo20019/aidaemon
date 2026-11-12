@@ -87,15 +87,10 @@ fn looks_like_named_person_relational_query(lower: &str) -> bool {
 
     // "where does X live / work" — relational even without possessive.
     let relational_verbs = ["live", "lives", "work", "works"];
-    if contains_keyword_as_words(lower, "where")
+    contains_keyword_as_words(lower, "where")
         && relational_verbs
             .iter()
             .any(|v| contains_keyword_as_words(lower, v))
-    {
-        return true;
-    }
-
-    false
 }
 
 /// True when the text is a specific personal relational query (e.g.,
