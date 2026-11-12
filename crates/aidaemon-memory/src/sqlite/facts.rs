@@ -1672,7 +1672,7 @@ impl FactStore for SqliteMemory {
             }
         }
 
-        if let Err(error) = self.sync_fact_memory_category(category_clean).await {
+        if let Err(error) = self.sync_fact_memory_written_at(category_clean, &now).await {
             tracing::warn!(%error, category = category_clean, "Deferred fact memory projection");
         }
         Ok(())

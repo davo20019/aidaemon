@@ -392,7 +392,11 @@ async fn fact_dedup_embeds_each_stored_key_once() {
         }
     };
     for i in 0..30 {
-        put(format!("orion_setting_{}", ["alpha", "beta", "gamma"][i % 3].repeat(i + 1))).await;
+        put(format!(
+            "orion_setting_{}",
+            ["alpha", "beta", "gamma"][i % 3].repeat(i + 1)
+        ))
+        .await;
     }
     let count = || embedder.texts.load(std::sync::atomic::Ordering::SeqCst);
     let before = count();

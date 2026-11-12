@@ -628,8 +628,33 @@ impl SqliteMemory {
             .bind(category)
             .fetch_all(&self.pool)
             .await?;
+        self.sync_fact_memory_rows(category, &ids).await
+    }
+
+    /// Project the facts one write changed: the rows of `category` whose
+    /// `updated_at` or `superseded_at` is that write's timestamp. Every row
+    /// a fact upsert touches carries its timestamp, and re-projecting the
+    /// whole category on each write took seconds in a large one.
+    pub(crate) async fn sync_fact_memory_written_at(
+        &self,
+        category: &str,
+        written_at: &str,
+    ) -> anyhow::Result<()> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM facts
+             WHERE category = ? AND (updated_at = ? OR superseded_at = ?)",
+        )
+        .bind(category)
+        .bind(written_at)
+        .bind(written_at)
+        .fetch_all(&self.pool)
+        .await?;
+        self.sync_fact_memory_rows(category, &ids).await
+    }
+
+    async fn sync_fact_memory_rows(&self, category: &str, ids: &[i64]) -> anyhow::Result<()> {
         for id in ids {
-            self.project_fact_memory(id).await?;
+            self.project_fact_memory(*id).await?;
         }
         sqlx::query(
             "UPDATE memory_claims AS old
