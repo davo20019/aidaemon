@@ -1469,6 +1469,28 @@ fn typed_checklist_steps_keep_their_state() {
     assert_eq!(plan.steps[0].status, crate::plans::StepStatus::InProgress);
 }
 
+/// A step a launched job is doing stays running in the background when the
+/// run ends; one marked for the background that no launch took is not done.
+#[test]
+fn background_steps_keep_running_only_with_a_job() {
+    use crate::plans::StepStatus;
+    let mut plan = crate::plans::TaskPlan::new(
+        "telegram:synthetic",
+        "synthetic request",
+        "synthetic plan",
+        vec![
+            "Run the setup".to_string(),
+            "Run the other setup".to_string(),
+        ],
+        "test",
+    );
+    plan.link_background_job(&[0], "job-a");
+    plan.steps[1].status = StepStatus::Background;
+    assert!(reconcile_plan_projection(&mut plan));
+    assert_eq!(plan.steps[0].status, StepStatus::Background);
+    assert_eq!(plan.steps[1].status, StepStatus::Deferred);
+}
+
 #[test]
 fn task_budget_warns_once_at_eighty_percent() {
     assert!(!task_budget_warning_due(79, 100, false));

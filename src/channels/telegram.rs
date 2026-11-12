@@ -4793,7 +4793,13 @@ impl TurnSurface for TelegramSurface {
         if ended != TurnEnd::Delivered {
             live.clear(false).await;
         }
-        live.owner.lock().await.reset();
+        let mut owner = live.owner.lock().await;
+        // A card that stays in the chat can still change after the turn: a
+        // background job settles the steps it was handed.
+        if let (Some(hub), Some(id)) = (&self.hub, owner.checklist_message_id()) {
+            hub.register_checklist_surface(&self.session_id, &id).await;
+        }
+        owner.reset();
     }
 }
 

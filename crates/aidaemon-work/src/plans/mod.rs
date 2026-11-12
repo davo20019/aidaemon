@@ -79,6 +79,7 @@ impl TaskPlan {
                 requires_observation: false,
                 expected_targets: Vec::new(),
                 evidence_receipt_ids: Vec::new(),
+                background_jobs: Vec::new(),
                 status: if index == 0 {
                     StepStatus::InProgress
                 } else {
@@ -230,7 +231,7 @@ impl TaskPlan {
             }
             let state = match step.status {
                 StepStatus::Pending => ExecutionNodeState::Pending,
-                StepStatus::InProgress => ExecutionNodeState::Running,
+                StepStatus::InProgress | StepStatus::Background => ExecutionNodeState::Running,
                 StepStatus::Completed | StepStatus::Skipped | StepStatus::Deferred => {
                     ExecutionNodeState::Satisfied
                 }
@@ -332,6 +333,79 @@ impl TaskPlan {
             .collect()
     }
 
+    /// Whether a background job is still working on any step.
+    pub fn has_background_steps(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.status == StepStatus::Background)
+    }
+
+    /// Hand the steps at `indices` to the background job `job_id`. A step
+    /// already settled (completed, failed, skipped) is left alone. Returns
+    /// whether any step changed.
+    pub fn link_background_job(&mut self, indices: &[usize], job_id: &str) -> bool {
+        let mut changed = false;
+        for &index in indices {
+            let Some(step) = self.steps.get_mut(index) else {
+                continue;
+            };
+            if matches!(
+                step.status,
+                StepStatus::Completed | StepStatus::Failed | StepStatus::Skipped
+            ) {
+                continue;
+            }
+            step.status = StepStatus::Background;
+            step.started_at.get_or_insert_with(Utc::now);
+            step.completed_at = None;
+            if !step.background_jobs.iter().any(|job| job == job_id) {
+                step.background_jobs.push(job_id.to_string());
+            }
+            changed = true;
+        }
+        if changed {
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    /// Record the end of background job `job_id`: a step it served is
+    /// completed once every job on it succeeded, and failed as soon as one
+    /// did not. The plan resolves once nothing is left to run. Returns
+    /// whether any step changed.
+    pub fn settle_background_job(&mut self, job_id: &str, succeeded: bool) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+        for step in &mut self.steps {
+            if step.status != StepStatus::Background
+                || !step.background_jobs.iter().any(|job| job == job_id)
+            {
+                continue;
+            }
+            changed = true;
+            if succeeded {
+                step.background_jobs.retain(|job| job != job_id);
+                if step.background_jobs.is_empty() {
+                    step.status = StepStatus::Completed;
+                    step.completed_at = Some(now);
+                }
+            } else {
+                step.background_jobs.clear();
+                step.status = StepStatus::Failed;
+                step.completed_at = Some(now);
+            }
+        }
+        if changed {
+            if self.is_finished() {
+                self.status = self.resolved_status();
+            } else {
+                self.sync_active_step();
+            }
+            self.updated_at = now;
+        }
+        changed
+    }
+
     /// Compact, channel-friendly checklist for the live status card.
     ///
     /// One header line carries the state and the count; the steps follow, a
@@ -352,9 +426,18 @@ impl TaskPlan {
                 (PlanStatus::Paused, _) => "⏸️",
                 _ => "⏳",
             };
+            if step.status == StepStatus::Background {
+                return format!("{mark} {} (running in the background)", step.description);
+            }
             return format!("{mark} {}", step.description);
         }
+        let in_background = self.has_background_steps();
         let header = match self.status {
+            // Work handed to a job that reports back is still being done:
+            // never "stopped short" while it runs.
+            _ if in_background => {
+                format!("⏳ Continuing in the background · {done} of {total} done")
+            }
             PlanStatus::Planning => "🧭 Planning…".to_string(),
             PlanStatus::InProgress => {
                 let position = self.current_step.saturating_add(1).min(total);
@@ -375,6 +458,9 @@ impl TaskPlan {
             let line = match step.status {
                 StepStatus::Completed => format!("✅ {}", step.description),
                 StepStatus::InProgress => format!("▶️ {}", step.description),
+                StepStatus::Background => {
+                    format!("⏳ {} (running in the background)", step.description)
+                }
                 // `deferred` is the model's typed "set aside": the owner
                 // reads what it means for them.
                 StepStatus::Deferred => format!("⏭️ {} (not done)", step.description),
@@ -387,7 +473,7 @@ impl TaskPlan {
             out.push_str("\n\n");
             out.push_str(&line);
         }
-        if self.status == PlanStatus::PartiallyCompleted {
+        if self.status == PlanStatus::PartiallyCompleted && !in_background {
             out.push_str("\n\nThe reply below says what was left undone and why.");
         }
         out
@@ -401,6 +487,7 @@ impl TaskPlan {
                 StepStatus::Completed => "✅",
                 StepStatus::Deferred => "⏭️ (not done)",
                 StepStatus::Failed => "⚠️ (failed)",
+                StepStatus::Background => "⏳ (running in the background)",
                 _ => "☐ (not done)",
             };
             out.push_str(&format!("{} {}\n", mark, step.description));
@@ -429,6 +516,7 @@ impl TaskPlan {
                 StepStatus::Failed => "[!]",
                 StepStatus::Skipped => "[-]",
                 StepStatus::Deferred => "[~]",
+                StepStatus::Background => "[bg]",
                 StepStatus::Pending => "[ ]",
             };
             let mut line = format!("  {} {}. {}", marker, step.index + 1, step.description);
@@ -482,6 +570,12 @@ pub struct PlanStep {
     /// Tool-call receipt IDs that proved this step.
     #[serde(default)]
     pub evidence_receipt_ids: Vec<String>,
+
+    /// Background jobs (their launch ids) still working on this step. Set at
+    /// launch from the launch's typed `checklist_items`; each job's end
+    /// settles the step ([`TaskPlan::settle_background_job`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_jobs: Vec<String>,
 
     /// Step status
     pub status: StepStatus,
@@ -603,6 +697,9 @@ pub enum StepStatus {
     Skipped,
     /// Explicitly abandoned by the model (counts as resolved, not unchecked).
     Deferred,
+    /// Handed to a background job that reports back: still being worked on,
+    /// outside this run. Only the job's end moves it to completed or failed.
+    Background,
 }
 
 impl StepStatus {
@@ -847,6 +944,75 @@ mod tests {
         assert_eq!(checklist, "✅ Done · 2 of 2 steps\n\n✅ first\n\n✅ second");
         assert!(is_completed_checklist(&checklist));
         assert!(!checklist.contains("Finalizing"));
+    }
+
+    /// Steps handed to background jobs read as still being done: the card
+    /// never says "stopped short" or "not done" while they run, whatever
+    /// verdict the run itself recorded.
+    #[test]
+    fn handed_off_steps_render_as_running_in_the_background() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec![
+                "inspect".into(),
+                "first setup".into(),
+                "second setup".into(),
+                "report both".into(),
+            ],
+            "track_requirements",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        assert!(plan.link_background_job(&[1, 3], "job-a"));
+        assert!(plan.link_background_job(&[2, 3], "job-b"));
+        // The run itself ends partial: work continues elsewhere.
+        plan.status = PlanStatus::PartiallyCompleted;
+
+        let card = plan.render_compact_checklist();
+        assert_eq!(
+            card,
+            "⏳ Continuing in the background · 1 of 4 done\n\n✅ inspect\n\n\
+             ⏳ first setup (running in the background)\n\n\
+             ⏳ second setup (running in the background)\n\n\
+             ⏳ report both (running in the background)"
+        );
+        assert!(!is_completed_checklist(&card));
+
+        // One job done: its own step is done; the shared one waits for both.
+        assert!(plan.settle_background_job("job-a", true));
+        assert_eq!(plan.steps[1].status, StepStatus::Completed);
+        assert_eq!(plan.steps[3].status, StepStatus::Background);
+        assert!(plan
+            .render_compact_checklist()
+            .starts_with("⏳ Continuing in the background · 2 of 4 done"));
+
+        // The other fails: its step and the shared one failed, never done.
+        assert!(plan.settle_background_job("job-b", false));
+        assert_eq!(plan.steps[2].status, StepStatus::Failed);
+        assert_eq!(plan.steps[3].status, StepStatus::Failed);
+        assert_eq!(plan.status, PlanStatus::Failed);
+        assert!(plan
+            .render_compact_checklist()
+            .starts_with("❌ Stopped · 2 of 4 done"));
+        // A job nothing waits on changes nothing.
+        assert!(!plan.settle_background_job("job-c", true));
+    }
+
+    #[test]
+    fn background_steps_that_all_finish_complete_the_plan() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["first".into(), "second".into()],
+            "track_requirements",
+        );
+        plan.link_background_job(&[0, 1], "job-a");
+        plan.status = PlanStatus::PartiallyCompleted;
+        assert!(plan.settle_background_job("job-a", true));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        assert!(is_completed_checklist(&plan.render_compact_checklist()));
     }
 
     #[test]

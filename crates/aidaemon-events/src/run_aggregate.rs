@@ -701,7 +701,12 @@ impl RunAggregate {
         for item in &declared.items {
             let id = format!("task:{}/obligation:checklist:{}", self.task_id, item.index);
             // `failed`: tried and not achieved. Not demanded again, never done.
-            let deferred = matches!(item.status.as_str(), "deferred" | "skipped" | "failed");
+            // `background`: handed to a job that reports back; this run can
+            // neither demand nor prove it, so it is not done here.
+            let deferred = matches!(
+                item.status.as_str(),
+                "deferred" | "skipped" | "failed" | "background"
+            );
             let has_effect = !item.mutation_effects.is_empty();
             let declared_observation_targets = if item.observation_targets.is_empty() {
                 item.targets

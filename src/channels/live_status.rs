@@ -133,6 +133,14 @@ impl LiveStatus {
         }
     }
 
+    /// The message showing this turn's plan card, when one is on screen and
+    /// still editable. Read before `reset()`, so work that outlives the turn
+    /// (a background job settling its steps) can update the card.
+    pub fn checklist_message_id(&self) -> Option<String> {
+        self.checklist.as_ref()?;
+        self.surface_message_id()
+    }
+
     pub fn reset(&mut self) {
         self.message_id = None;
         self.checklist = None;
@@ -336,6 +344,29 @@ mod tests {
             0,
             "a card with unfinished steps stays as the record of what was left"
         );
+    }
+
+    /// A card left in the chat can still be edited after the turn (a
+    /// background job settling its steps); an activity line or a dropped
+    /// card leaves nothing to edit.
+    #[tokio::test]
+    async fn kept_card_stays_editable_after_the_turn() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, "working".into()).await;
+        assert_eq!(s.checklist_message_id(), None);
+        s.set_checklist(
+            &sink,
+            "⏳ Continuing in the background · 0 of 1 done".into(),
+        )
+        .await;
+        s.clear(&sink, true).await;
+        assert_eq!(s.checklist_message_id().as_deref(), Some("m1"));
+
+        let mut done = LiveStatus::new();
+        done.set_checklist(&sink, "✅ Remember X".into()).await;
+        done.clear(&sink, true).await;
+        assert_eq!(done.checklist_message_id(), None);
     }
 
     #[tokio::test]

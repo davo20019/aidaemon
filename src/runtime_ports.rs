@@ -388,6 +388,13 @@ pub(crate) trait OutboundRouter: Send + Sync {
     async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+    /// The plan card a turn left in the session's chat, if the channel keeps
+    /// one; the default suits routers without plan cards.
+    async fn checklist_surface(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+    /// Record a plan card sent outside a turn (see [`Self::checklist_surface`]).
+    async fn register_checklist_surface(&self, _session_id: &str, _message_id: &str) {}
     async fn request_inline_approval(
         &self,
         session_id: &str,

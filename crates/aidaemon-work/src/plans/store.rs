@@ -148,6 +148,7 @@ impl PlanStore {
                 requires_observation: item.requires_observation,
                 expected_targets: item.expected_targets.clone(),
                 evidence_receipt_ids: Vec::new(),
+                background_jobs: Vec::new(),
                 status: item.status,
                 tool_call_ids: Vec::new(),
                 result_summary: None,
@@ -189,6 +190,24 @@ impl PlanStore {
             .unwrap_or(0);
 
         if let Some(mut existing) = self.get_incomplete_for_session(session_id).await? {
+            // A step a background job is still doing stays with that job:
+            // a checklist update cannot finish or drop work it did not do.
+            // Only the job's end settles it.
+            let mut steps = steps;
+            for step in &mut steps {
+                let Some(previous) = existing.steps.get(step.index) else {
+                    continue;
+                };
+                if previous.status == StepStatus::Background
+                    && !previous.background_jobs.is_empty()
+                    && previous.description == step.description
+                {
+                    step.status = StepStatus::Background;
+                    step.background_jobs = previous.background_jobs.clone();
+                    step.started_at = previous.started_at;
+                    step.completed_at = None;
+                }
+            }
             existing.steps = steps;
             existing.current_step = current_step;
             existing.updated_at = now;
@@ -215,6 +234,50 @@ impl PlanStore {
             self.create(&plan).await?;
             Ok(plan)
         }
+    }
+
+    /// Hand steps of the session's checklist for `task_id` to the background
+    /// job `job_id` ([`TaskPlan::link_background_job`]). Returns the updated
+    /// plan, or `None` when there is no such checklist or nothing changed.
+    pub async fn link_background_job(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        indices: &[usize],
+        job_id: &str,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let Some(mut plan) = self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
+        else {
+            return Ok(None);
+        };
+        if !plan.link_background_job(indices, job_id) {
+            return Ok(None);
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// Record the end of background job `job_id` on the session's checklist
+    /// that handed it work ([`TaskPlan::settle_background_job`]). Returns the
+    /// updated plan, or `None` when no checklist step waited on that job.
+    pub async fn settle_background_job(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        succeeded: bool,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        for mut plan in self.get_recent_for_session(session_id, 5).await? {
+            if plan.settle_background_job(job_id, succeeded) {
+                self.update(&plan).await?;
+                return Ok(Some(plan));
+            }
+        }
+        Ok(None)
     }
 
     /// Update just the status of a plan.
@@ -833,5 +896,53 @@ mod tests {
         let retrieved = store.get(&plan.id).await.unwrap().unwrap();
         assert_eq!(retrieved.checkpoint["image_tag"], "v1.2.3");
         assert_eq!(retrieved.checkpoint["commit_sha"], "abc123");
+    }
+
+    /// A checklist update cannot settle a step a background job is doing:
+    /// it stays with the job until the job ends.
+    #[tokio::test]
+    async fn checklist_update_keeps_steps_a_background_job_is_doing() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        let items = |status: StepStatus| {
+            vec![
+                ("inspect".to_string(), StepStatus::Completed),
+                ("set up".to_string(), status),
+            ]
+        };
+        store
+            .upsert_checklist(
+                "s",
+                Some("t"),
+                "track_requirements",
+                &items(StepStatus::Pending),
+            )
+            .await
+            .unwrap();
+        store
+            .link_background_job("s", Some("t"), &[1], "job-a")
+            .await
+            .unwrap()
+            .expect("linked");
+
+        let plan = store
+            .upsert_checklist(
+                "s",
+                Some("t"),
+                "track_requirements",
+                &items(StepStatus::Deferred),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.steps[1].status, StepStatus::Background);
+        assert_eq!(plan.steps[1].background_jobs, vec!["job-a".to_string()]);
+
+        let plan = store
+            .settle_background_job("s", "job-a", true)
+            .await
+            .unwrap()
+            .expect("settled");
+        assert_eq!(plan.steps[1].status, StepStatus::Completed);
+        assert_eq!(plan.status, PlanStatus::Completed);
     }
 }
