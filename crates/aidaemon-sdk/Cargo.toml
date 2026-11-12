@@ -9,10 +9,12 @@ homepage = "https://aidaemon.ai/"
 publish = false
 
 [features]
-default = ["providers", "tools", "policies", "agents", "sqlite"]
+default = ["providers", "tools", "policies", "agents", "sqlite", "macros"]
+macros = ["dep:aidaemon-macros"]
 providers = ["dep:aidaemon-providers"]
 tools = ["dep:aidaemon-tools"]
 policies = ["dep:aidaemon-policies"]
+otel = ["policies", "aidaemon-policies/otel"]
 agents = ["dep:aidaemon-agents"]
 sqlite = ["dep:aidaemon-store-sqlite"]
 mcp = ["dep:aidaemon-mcp"]
@@ -26,10 +28,16 @@ telegram = ["channels", "dep:aidaemon-channel-telegram"]
 slack = ["channels", "dep:aidaemon-channel-slack"]
 discord = ["channels", "dep:aidaemon-channel-discord"]
 testing = ["aidaemon-core/testing", "aidaemon-channels?/testing"]
-full = ["providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord"]
+full = ["macros", "providers", "tools", "policies", "agents", "sqlite", "mcp", "eval", "testing", "memory", "events", "work", "telegram", "slack", "discord", "otel"]
 
 [dependencies]
 aidaemon-core = { path = "../aidaemon-core" }
+aidaemon-macros = { path = "../aidaemon-macros", optional = true }
+async-trait = "0.1"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
 aidaemon-providers = { path = "../aidaemon-providers", optional = true }
 aidaemon-tools = { path = "../aidaemon-tools", optional = true }
 aidaemon-policies = { path = "../aidaemon-policies", optional = true }
@@ -46,6 +54,10 @@ aidaemon-channel-slack = { path = "../aidaemon-channel-slack", optional = true }
 aidaemon-channel-discord = { path = "../aidaemon-channel-discord", optional = true }
 
 [dev-dependencies]
+axum = "0.8"
+futures = "0.3"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
+async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tempfile = "3"
@@ -61,3 +73,51 @@ required-features = ["providers", "tools", "policies", "sqlite"]
 [[example]]
 name = "support_triage"
 required-features = ["providers", "policies"]
+
+[[test]]
+name = "tool_macro"
+required-features = ["macros", "testing"]
+
+[[test]]
+name = "structured_output"
+required-features = ["testing"]
+
+[[test]]
+name = "preset"
+required-features = ["macros", "testing", "tools", "sqlite"]
+
+[[example]]
+name = "quickstart"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "custom_tool"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "approvals"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "resume_after_crash"
+required-features = ["macros", "testing", "sqlite"]
+
+[[example]]
+name = "sub_agent"
+required-features = ["macros", "testing", "agents"]
+
+[[example]]
+name = "memory_swap"
+required-features = ["testing", "memory"]
+
+[[example]]
+name = "channel_bot"
+required-features = ["macros", "testing", "channels"]
+
+[[example]]
+name = "sse_server"
+required-features = ["macros", "testing"]
+
+[[example]]
+name = "otel_traces"
+required-features = ["macros", "testing", "otel"]

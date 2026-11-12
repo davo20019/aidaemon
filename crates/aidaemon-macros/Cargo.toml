@@ -1,0 +1,17 @@
+[package]
+name = "aidaemon-macros"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "The #[tool] attribute macro for aidaemon agents; use it through aidaemon-sdk (experimental)"
+repository = "https://github.com/davo20019/aidaemon"
+homepage = "https://aidaemon.ai/"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

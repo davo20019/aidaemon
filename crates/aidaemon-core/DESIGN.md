@@ -361,6 +361,7 @@ enforce them.
 | `aidaemon-channel-telegram` / `-slack` / `-discord` | Built-in adapters talking to each platform's API directly (Bot API, Socket Mode, Gateway) |
 | `aidaemon-decisions` | Decision backends (experimental): closed questions answered with a confidence and where it came from, from any `Provider` or Google's Decisions API |
 | `aidaemon-sdk` | One dependency re-exporting all of them behind features |
+| `aidaemon-macros` | `#[tool]`: a tool from a plain function, its schema derived with `schemars`; used through `aidaemon-sdk` |
 
 ### Extending the SDK
 

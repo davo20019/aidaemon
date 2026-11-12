@@ -66,6 +66,8 @@ impl std::fmt::Display for UserRole {
 
 impl UserRole {
     /// Only explicit owner traffic is allowed to update durable owner memory.
+    /// The daemon's memory policy, not part of the stable API.
+    #[doc(hidden)]
     pub fn can_persist_owner_memory(self) -> bool {
         matches!(self, Self::Owner)
     }

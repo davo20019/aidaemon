@@ -97,7 +97,7 @@ jobs:
         run: >-
           cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
-          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord
@@ -196,10 +196,25 @@ jobs:
         run: >-
           cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
-          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-memory
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord --all-features
+
+      # Each example runs against the scripted provider when no API key is
+      # set (CI sets none), and against a live model when one is.
+      - name: SDK examples (scripted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANTHROPIC_API_KEY OPENAI_API_KEY
+          for example in quickstart custom_tool approvals resume_after_crash sub_agent \
+              memory_swap channel_bot sse_server otel_traces; do
+            echo "::group::$example"
+            cargo run -q -p aidaemon-sdk --all-features --example "$example"
+            echo "::endgroup::"
+          done
+          cargo run -q -p aidaemon-core --features testing --example kernel_tour
 
   build-check:
     name: Build check (release)

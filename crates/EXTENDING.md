@@ -101,7 +101,12 @@ Rules every channel follows:
   `RateLimited`, 5xx → `Transient`, 401/403 → `Auth`). Retries belong in
   the `Retry` wrapper, not in your provider.
 - **Tool**: `spec` (JSON schema with `additionalProperties: false`) and
-  `call`. Declare honest `annotations` (read-only tools run in parallel;
+  `call`. Or write a plain function with `#[tool]` (`aidaemon_sdk::tool`,
+  crate `aidaemon-macros`): the schema is derived from its parameters with
+  `schemars`, doc comments become descriptions, and annotations, trust,
+  effects and access are explicit macro arguments (no preset is
+  `ToolAnnotations::DESTRUCTIVE`, as for a hand-written tool). Macro-made
+  tools pass the `Tool` conformance kit (`crates/aidaemon-sdk/tests/tool_macro.rs`). Declare honest `annotations` (read-only tools run in parallel;
   unannotated tools are treated as destructive; set `egress` on a call
   that sends owner data off the machine, and declare the host it contacts
   as an `Egress` effect, which is how a network read is covered), an `access` manifest

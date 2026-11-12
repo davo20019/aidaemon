@@ -33,6 +33,7 @@ members = [
     "crates/aidaemon-channel-slack",
     "crates/aidaemon-channel-discord",
     "crates/aidaemon-sdk",
+    "crates/aidaemon-macros",
 ]
 resolver = "2"
 
