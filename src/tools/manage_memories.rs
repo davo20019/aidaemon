@@ -36,7 +36,6 @@ struct ScheduledGoalPlan {
     fire_policy: String,
     reminder: Option<String>,
     next_run: String,
-    tz_label: String,
     /// The exact arguments the owner approves (the approval subject).
     subject: String,
 }
@@ -65,7 +64,6 @@ impl ScheduledGoalPlan {
             warnings: vec![
                 format!("{} schedule(s)", self.parsed.len()),
                 format!("Next: {}", self.next_run),
-                format!("System timezone: {}", self.tz_label),
             ],
         }
     }
@@ -244,12 +242,11 @@ impl ManageMemoriesTool {
             .filter(|message| !message.is_empty())
             .map(str::to_string);
 
-        let tz_label = crate::cron_utils::system_timezone_display();
         let next_run = parsed
             .iter()
             .map(|p| p.next_local)
             .min_by_key(|dt| dt.timestamp())
-            .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+            .map(|dt| crate::cron_utils::owner_time(&dt))
             .unwrap_or_else(|| "n/a".to_string());
         let subject = json!({
             "action": "create_scheduled_goal",
@@ -267,7 +264,6 @@ impl ManageMemoriesTool {
             fire_policy,
             reminder,
             next_run,
-            tz_label,
             subject,
         }))
     }
@@ -438,11 +434,7 @@ impl ManageMemoriesTool {
     fn format_local(ts: &str) -> String {
         chrono::DateTime::parse_from_rfc3339(ts)
             .ok()
-            .map(|dt| {
-                dt.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M %Z")
-                    .to_string()
-            })
+            .map(|dt| crate::cron_utils::owner_time(&dt))
             .unwrap_or_else(|| ts.to_string())
     }
 }
@@ -844,7 +836,6 @@ impl ManageMemoriesTool {
                     fire_policy,
                     reminder,
                     next_run,
-                    tz_label,
                     subject: _,
                 } = plan;
 
@@ -889,19 +880,17 @@ impl ManageMemoriesTool {
                 // confirmation step.
                 if let Some(message) = reminder {
                     return Ok(format!(
-                        "Reminder set: \"{}\". {} schedule(s). Next: {}. System timezone: {}.",
+                        "Reminder set: \"{}\". {} schedule(s). Next: {}.",
                         message,
                         parsed.len(),
-                        next_run,
-                        tz_label
+                        next_run
                     ));
                 }
                 Ok(format!(
-                    "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
+                    "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}.",
                     goal.id,
                     parsed.len(),
-                    next_run,
-                    tz_label
+                    next_run
                 ))
             }
             "activate_scheduled" => {
@@ -1143,7 +1132,7 @@ impl ManageMemoriesTool {
                         .iter()
                         .filter_map(|s| chrono::DateTime::parse_from_rfc3339(&s.next_run_at).ok())
                         .min_by_key(|dt| dt.timestamp())
-                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
+                        .map(|dt| crate::cron_utils::owner_time(&dt))
                         .unwrap_or_else(|| "n/a".to_string());
                     output.push_str(&format!(
                         "- **{}** {} (type: {}, status: {}, schedules: {}, next: {})\n",
@@ -1233,7 +1222,7 @@ impl ManageMemoriesTool {
                     "Added schedule {} to goal {} (next: {}).",
                     schedule.id,
                     goal.id,
-                    next_local.format("%Y-%m-%d %H:%M %Z")
+                    crate::cron_utils::owner_time(&next_local)
                 ))
             }
             "cancel_scheduled" => {
@@ -1732,7 +1721,7 @@ impl ManageMemoriesTool {
                     .iter()
                     .filter_map(|s| chrono::DateTime::parse_from_rfc3339(&s.next_run_at).ok())
                     .min_by_key(|dt| dt.timestamp())
-                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
+                    .map(|dt| crate::cron_utils::owner_time(&dt))
                     .unwrap_or_else(|| "n/a".to_string());
 
                 let tasks = self.state.get_tasks_for_goal(&goal.id).await?;

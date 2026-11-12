@@ -73,7 +73,13 @@ mod tests {
         assert_eq!(status.runs_failed, 0);
 
         let line = render_objective_status_line(&status);
-        assert!(line.contains("schedule active (next 2026-09-01T10:00:00+00:00)"));
+        // The owner reads the time in their own zone and format.
+        let shown = crate::cron_utils::owner_time_rfc3339("2026-09-01T10:00:00+00:00").unwrap();
+        assert!(
+            line.contains(&format!("schedule active (next {shown})")),
+            "{line}"
+        );
+        assert!(!line.contains("2026-09-01T10:00:00"), "{line}");
         assert!(line.contains("last run completed"));
         assert!(line.contains("Published and verified the daily post."));
         assert!(line.contains("run history 1 completed / 0 failed"));

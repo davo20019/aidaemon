@@ -426,10 +426,10 @@ impl ObjectiveWake {
         match self {
             Self::GoalSchedule {
                 next_run_at: Some(next),
-            } => format!("schedule active (next {next})"),
+            } => format!("schedule active (next {})", shown_time(next)),
             Self::GoalSchedule { next_run_at: None } => "schedule paused".to_string(),
             Self::MandateClock { next_review_at } => {
-                format!("mandate clock (next review {next_review_at})")
+                format!("mandate clock (next review {})", shown_time(next_review_at))
             }
             Self::MandateHalted {
                 reason: Some(reason),
@@ -673,4 +673,10 @@ pub fn render_objective_status_line(status: &ObjectiveStatus) -> String {
         ),
     }
     line
+}
+
+/// A stored time as the owner reads it ("2:39 PM ET"); unreadable values
+/// as stored.
+fn shown_time(value: &str) -> String {
+    crate::schedule::owner_time_rfc3339(value).unwrap_or_else(|| value.to_string())
 }

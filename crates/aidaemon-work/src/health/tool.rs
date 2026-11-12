@@ -288,7 +288,7 @@ impl HealthProbeTool {
             schedule,
             cron_expr,
             probe.consecutive_failures_alert,
-            next_run.format("%Y-%m-%d %H:%M:%S UTC")
+            crate::schedule::owner_time(&next_run)
         ))
     }
 
@@ -319,7 +319,7 @@ impl HealthProbeTool {
 
             let last_check = latest
                 .as_ref()
-                .map(|r| r.checked_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                .map(|r| crate::schedule::owner_time(&r.checked_at))
                 .unwrap_or_else(|| "never".to_string());
 
             output.push_str(&format!(
@@ -339,7 +339,7 @@ impl HealthProbeTool {
                 probe.schedule,
                 probe.source,
                 last_check,
-                probe.next_run_at.format("%Y-%m-%d %H:%M UTC")
+                crate::schedule::owner_time(&probe.next_run_at)
             ));
         }
 
@@ -405,7 +405,7 @@ impl HealthProbeTool {
             Ok(format!(
                 "Resumed health probe {}. Next run: {}",
                 id,
-                next_run.format("%Y-%m-%d %H:%M:%S UTC")
+                crate::schedule::owner_time(&next_run)
             ))
         } else {
             Ok(format!("No health probe found with ID '{}'", id))
@@ -494,7 +494,7 @@ impl HealthProbeTool {
 
         let last_check = latest
             .as_ref()
-            .map(|r| r.checked_at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .map(|r| crate::schedule::owner_time(&r.checked_at))
             .unwrap_or_else(|| "never".to_string());
 
         let last_latency = latest
