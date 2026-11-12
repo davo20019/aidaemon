@@ -69,7 +69,7 @@ impl FirmwareRelease {
                 && manifest.sha256 == manifest.sha256.to_ascii_lowercase(),
             "firmware manifest SHA-256 is invalid"
         );
-        let actual_digest = format!("{:x}", Sha256::digest(&image));
+        let actual_digest = hex::encode(Sha256::digest(&image));
         anyhow::ensure!(
             actual_digest == manifest.sha256,
             "firmware image digest does not match its manifest"
@@ -119,10 +119,10 @@ impl FirmwareRelease {
         use base64::Engine;
         use p256::ecdsa::signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::Generate;
 
-        let key = SigningKey::random(&mut rand::thread_rng());
-        let public_key =
-            URL_SAFE_NO_PAD.encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
+        let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(true).as_bytes());
         let mut manifest = FirmwareReleaseManifest {
             schema: FIRMWARE_RELEASE_SCHEMA.to_string(),
             release_id: "release_test_0001".to_string(),
@@ -130,7 +130,7 @@ impl FirmwareRelease {
             board: K10_BOARD_ID.to_string(),
             sequence,
             size_bytes: image.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(image)),
+            sha256: hex::encode(Sha256::digest(image)),
             signature_der: String::new(),
         };
         let signature: Signature = key.sign(&manifest.canonical_bytes());
@@ -146,11 +146,11 @@ mod tests {
     use base64::Engine;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::Generate;
 
     fn signed_release(image: &[u8]) -> (FirmwareReleaseManifest, String) {
-        let key = SigningKey::random(&mut rand::thread_rng());
-        let public_key =
-            URL_SAFE_NO_PAD.encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let key = SigningKey::generate_from_rng(&mut rand::rng());
+        let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(true).as_bytes());
         let mut manifest = FirmwareReleaseManifest {
             schema: FIRMWARE_RELEASE_SCHEMA.to_string(),
             release_id: "release_test_0001".to_string(),
@@ -158,7 +158,7 @@ mod tests {
             board: K10_BOARD_ID.to_string(),
             sequence: 1,
             size_bytes: image.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(image)),
+            sha256: hex::encode(Sha256::digest(image)),
             signature_der: String::new(),
         };
         let signature: Signature = key.sign(&manifest.canonical_bytes());

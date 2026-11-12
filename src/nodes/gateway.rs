@@ -541,7 +541,7 @@ async fn upload_media(
             "upload size does not match declaration",
         ));
     }
-    let digest = format!("{:x}", Sha256::digest(&body));
+    let digest = hex::encode(Sha256::digest(&body));
     if digest != upload.expected_sha256 {
         return Err(GatewayError::bad_request(
             "upload digest does not match declaration",
@@ -683,7 +683,7 @@ async fn download_firmware(
         .firmware_image(&context, &release_id)
         .await
         .map_err(GatewayError::forbidden)?;
-    let digest = format!("{:x}", Sha256::digest(image.as_ref()));
+    let digest = hex::encode(Sha256::digest(image.as_ref()));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
@@ -1102,7 +1102,7 @@ mod tests {
             .resolve_audio_announcement_target(Some("Test Companion"))
             .await
             .unwrap();
-        let digest = format!("{:x}", Sha256::digest(audio_bytes));
+        let digest = hex::encode(Sha256::digest(audio_bytes));
         let queued = store
             .queue_audio_announcement(
                 &target,

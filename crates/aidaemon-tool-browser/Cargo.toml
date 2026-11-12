@@ -32,6 +32,7 @@ chromium = [
     "dep:reqwest",
     "dep:serde_json",
     "dep:sha2",
+    "dep:hex",
     "dep:shellexpand",
     "dep:tokio",
     "dep:tracing",
@@ -50,7 +51,8 @@ futures = { version = "0.3", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
+hex = { version = "0.4", optional = true }
 shellexpand = { version = "3", optional = true }
 tokio = { version = "1", features = ["sync", "macros", "rt", "time", "fs"], optional = true }
 tracing = { version = "0.1", optional = true }

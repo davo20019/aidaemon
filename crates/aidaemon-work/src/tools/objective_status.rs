@@ -76,8 +76,8 @@ pub fn objective_resource_id(goal_id: &str) -> String {
     // output must not expose internal database UUIDs. A full digest keeps the
     // mapping deterministic without relying on display prose or row order.
     format!(
-        "{OBJECTIVE_MEMBER_NAMESPACE}sha256:{:x}",
-        Sha256::digest(goal_id.as_bytes())
+        "{OBJECTIVE_MEMBER_NAMESPACE}sha256:{}",
+        hex::encode(Sha256::digest(goal_id.as_bytes()))
     )
 }
 

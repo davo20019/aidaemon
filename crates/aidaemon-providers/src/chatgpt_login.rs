@@ -470,11 +470,11 @@ pub struct PkceChallenge {
 
 impl PkceChallenge {
     pub fn generate() -> Self {
-        use rand::Rng;
+        use rand::RngExt;
         use sha2::Digest;
 
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(sha2::Sha256::digest(verifier.as_bytes()));

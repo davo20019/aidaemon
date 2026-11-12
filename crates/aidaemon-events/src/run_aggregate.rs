@@ -513,7 +513,7 @@ impl RunAggregate {
     fn install_contract(&mut self, compiled: TaskContractCompiledData) {
         let fingerprint = serde_json::to_vec(&compiled).ok().map(|bytes| {
             let digest = Sha256::digest(bytes);
-            format!("{digest:x}")
+            hex::encode(digest)
         });
         if self.contract_present {
             if self.contract_fingerprint != fingerprint {

@@ -838,7 +838,7 @@ impl HttpRequestTool {
         content_type: Option<&str>,
     ) -> anyhow::Result<String> {
         use base64::Engine;
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
 
         let api_key = profile
             .api_key
@@ -859,11 +859,11 @@ impl HttpRequestTool {
 
         // Generate nonce and timestamp
         let nonce: String = {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
+            use rand::RngExt;
+            let mut rng = rand::rng();
             (0..32)
                 .map(|_| {
-                    let idx = rng.gen_range(0..36);
+                    let idx = rng.random_range(0..36);
                     if idx < 10 {
                         (b'0' + idx) as char
                     } else {
@@ -1098,7 +1098,12 @@ impl HttpRequestTool {
         let canonical_url = parsed.as_ref().and_then(Self::canonical_url_from_args);
         let target_digest = canonical_url
             .as_ref()
-            .map(|url| format!("sha256:{:x}", Sha256::digest(url.as_str().as_bytes())))
+            .map(|url| {
+                format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(url.as_str().as_bytes()))
+                )
+            })
             .unwrap_or_else(|| "unavailable".to_string());
         let auth_profile = parsed
             .as_ref()
@@ -1264,8 +1269,8 @@ impl HttpRequestTool {
             }
         }
         ready.credential_generation = Some(format!(
-            "sha256:{:x}",
-            Sha256::digest(generation_material.as_bytes())
+            "sha256:{}",
+            hex::encode(Sha256::digest(generation_material.as_bytes()))
         ));
         ready.refresh_result = Some(refresh_result.to_string());
         ready

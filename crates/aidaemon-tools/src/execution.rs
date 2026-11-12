@@ -790,7 +790,7 @@ impl SshBackend {
         let home = identity_lines.next().unwrap_or_default().trim().to_string();
         let remote_fingerprint = identity_lines.next().unwrap_or("unknown").trim();
         anyhow::ensure!(!home.is_empty(), "SSH host returned an empty HOME");
-        let fingerprint_hash = format!("{:x}", Sha256::digest(remote_fingerprint.as_bytes()));
+        let fingerprint_hash = hex::encode(Sha256::digest(remote_fingerprint.as_bytes()));
 
         let workspace = workspace_override.unwrap_or(&config.workspace_root);
         let workspace = if workspace == "~" {

@@ -747,7 +747,10 @@ pub fn mutation_audit_scope(
                     accounts.push(target.value.clone());
                     target.value
                 } else {
-                    format!("sha256:{:x}", Sha256::digest(target.value.as_bytes()))
+                    format!(
+                        "sha256:{}",
+                        hex::encode(Sha256::digest(target.value.as_bytes()))
+                    )
                 }
             }
             _ => return Err(MandateAuthorityDenial::TargetNotAllowed),
@@ -994,7 +997,7 @@ fn action_digest(
         hash_field(&mut hasher, b"target_kind", target.kind.as_bytes());
         hash_field(&mut hasher, b"target_value", target.value.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {

@@ -3772,20 +3772,17 @@ impl<S: WorkDatabase> MandateStore for S {
         target.set_query(None);
         target.set_fragment(None);
         let target_url = target.to_string();
-        let signal_digest = format!(
-            "{:x}",
-            Sha256::digest(
-                format!(
-                    "aidaemon.mandate.wake.v1\0{}\0{}\0{}\0{}\0{}",
-                    signal.kind.as_str(),
-                    signal.source,
-                    signal.target_url,
-                    signal.account_id.as_deref().unwrap_or(""),
-                    signal.dedupe_key
-                )
-                .as_bytes()
+        let signal_digest = hex::encode(Sha256::digest(
+            format!(
+                "aidaemon.mandate.wake.v1\0{}\0{}\0{}\0{}\0{}",
+                signal.kind.as_str(),
+                signal.source,
+                signal.target_url,
+                signal.account_id.as_deref().unwrap_or(""),
+                signal.dedupe_key
             )
-        );
+            .as_bytes(),
+        ));
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut awakened = Vec::new();
         let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;

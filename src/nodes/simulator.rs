@@ -2,6 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate;
 use sha2::{Digest, Sha256};
 
 use super::auth;
@@ -19,7 +20,7 @@ pub struct SimulatorIdentity {
 impl SimulatorIdentity {
     pub fn generate() -> Self {
         Self {
-            signing_key: SigningKey::random(&mut rand::thread_rng()),
+            signing_key: SigningKey::generate_from_rng(&mut rand::rng()),
             credential_id: None,
             node_id: None,
             node_session_id: None,
@@ -30,7 +31,7 @@ impl SimulatorIdentity {
         URL_SAFE_NO_PAD.encode(
             self.signing_key
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes(),
         )
     }
@@ -331,13 +332,9 @@ impl NodeSimulator {
             .error_for_status()?
             .json()
             .await?;
-        let replacement = SigningKey::random(&mut rand::thread_rng());
-        let new_public_key_sec1 = URL_SAFE_NO_PAD.encode(
-            replacement
-                .verifying_key()
-                .to_encoded_point(true)
-                .as_bytes(),
-        );
+        let replacement = SigningKey::generate_from_rng(&mut rand::rng());
+        let new_public_key_sec1 =
+            URL_SAFE_NO_PAD.encode(replacement.verifying_key().to_sec1_point(true).as_bytes());
         let session_id = self
             .identity
             .node_session_id
@@ -440,7 +437,7 @@ impl NodeSimulator {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("simulator has no active session"))?;
         let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let sha256 = hex::encode(Sha256::digest(bytes));
         let request = if content_type == "audio/wav" {
             CreateTurnRequest::Audio {
                 request_id,

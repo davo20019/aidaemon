@@ -4,7 +4,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
@@ -471,7 +473,7 @@ fn persist_key_to_env_file(env_path: &Path, key: &str) -> anyhow::Result<()> {
 #[cfg(feature = "encryption")]
 fn generate_encryption_key_hex() -> String {
     let mut key_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut key_bytes);
     bytes_to_hex(&key_bytes)
 }
 

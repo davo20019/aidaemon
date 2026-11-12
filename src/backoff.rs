@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 pub(crate) use aidaemon_tools::backoff::exponential_backoff;
 
@@ -15,7 +15,7 @@ pub(crate) fn jittered_delay(base: Duration, jitter_fraction: f64) -> Duration {
         return base;
     }
 
-    let jitter_millis = rand::thread_rng().gen_range(0..=max_jitter_millis);
+    let jitter_millis = rand::rng().random_range(0..=max_jitter_millis);
     base.saturating_add(Duration::from_millis(jitter_millis))
 }
 

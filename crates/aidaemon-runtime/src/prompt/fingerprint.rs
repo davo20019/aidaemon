@@ -79,7 +79,7 @@ pub fn hash_canonical(value: &Value) -> String {
     write_canonical(value, &mut canonical);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Serialize `value` into a deterministic string form with all object keys

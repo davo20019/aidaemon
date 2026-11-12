@@ -546,7 +546,7 @@ impl ManageMandatesTool {
         let snapshot = MandateStrategySnapshot {
             skill_name: skill.name.clone(),
             snapshot_version: MandateStrategySnapshot::SCHEMA_VERSION,
-            content_sha256: format!("{:x}", Sha256::digest(canonical.as_bytes())),
+            content_sha256: hex::encode(Sha256::digest(canonical.as_bytes())),
             description: skill.description.trim().to_string(),
             body,
             source: skill.source.clone(),

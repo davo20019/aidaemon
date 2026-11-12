@@ -27,7 +27,7 @@ pub fn sha256_file(path: &Path) -> Option<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 pub fn tool_artifact_attachment(
@@ -71,7 +71,7 @@ pub fn save_tool_observation_image(
         size_bytes: bytes.len() as u64,
         provenance: AttachmentProvenance::ToolObservation,
         source_tool: Some(source_tool.to_string()),
-        sha256: Some(format!("{:x}", Sha256::digest(bytes))),
+        sha256: Some(hex::encode(Sha256::digest(bytes))),
     })
 }
 

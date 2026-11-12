@@ -42,7 +42,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strum = { version = "0.28", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
+hex = "0.4"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "process", "net", "io-util", "macros"] }
 tokio-util = "0.7"

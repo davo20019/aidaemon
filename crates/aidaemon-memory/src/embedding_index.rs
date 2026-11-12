@@ -330,7 +330,7 @@ impl EmbeddingIndex for SqliteEmbeddingIndex {
 }
 
 pub fn content_hash(content: &str) -> String {
-    format!("{:x}", Sha256::digest(content.as_bytes()))
+    hex::encode(Sha256::digest(content.as_bytes()))
 }
 
 #[cfg(test)]
