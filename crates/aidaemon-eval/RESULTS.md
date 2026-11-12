@@ -1,5 +1,32 @@
 # Live results
 
+## 2026-11-12 (night): `ContextWindow` redesigned for a stable prefix
+
+`ContextWindow` now elides in coarse steps: old tool results become stubs
+up to a cut, and the cut moves only when a request would pass the budget,
+then far enough to bring it to half the budget, so the next requests grow
+on an unchanged prefix (the prompt cache keeps hitting). A stub names the
+tool, its arguments, the output size and its first and last lines. The
+budget counts the tool definitions too, and when the recent turns alone
+pass it, that request also elides recent results and drops the oldest
+units, so no request goes over. Default `keep_recent_turns` is now 1.
+
+`context_trail` (10k window via `context_cap:10000`), `claude-haiku-5-5`,
+N = 5:
+
+| Config | Pass | tokens/run | turns/run | Before the redesign |
+|---|---:|---:|---:|---|
+| plain kernel | 0/5 | 16077 | 7 (overflow) | 0/5, 10408 |
+| `ContextWindow::new(8_000)` | **5/5** | **31573** | 11.0 | 3/5, 141048, 12.6 turns |
+| `ContextWindow::new(8_000).keep_recent_turns(2)` | 5/5 | 57229 | 12.4 | 3/5, 121189, 11.8 turns |
+
+No overflow in any run, and 11 turns is the minimum (ten reads and the
+answer): the model followed the trail from the stubs' last lines instead
+of re-reading. Tokens per run fell 4.5x against the old hook (2x the plain
+kernel, which stops at file 6). Two protected turns mean smaller, more
+frequent steps, so the prefix breaks more often; one is the better default.
+Spend: about 0.5M billable tokens, well under $1.
+
 ## 2026-11-12 (later): a scenario aimed at each unmeasured policy
 
 - Model `claude-haiku-5-5`, N = 5 per cell. Eight new scenarios
