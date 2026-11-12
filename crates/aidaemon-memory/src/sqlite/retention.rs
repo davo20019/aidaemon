@@ -85,7 +85,7 @@ impl MemoryRetention {
         }
         // One transaction, a set-based delete per batch of ids. A claim
         // filed since the scan keeps its span.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut deleted = 0;
         for ids in dropped.chunks(500) {
             let placeholders = vec!["?"; ids.len()].join(", ");
