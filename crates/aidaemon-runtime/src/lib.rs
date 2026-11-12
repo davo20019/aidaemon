@@ -10,10 +10,15 @@
 //!   ([`llm::decide`]).
 //! - [`chat_bridge`]: calling an SDK provider with chat-completions JSON,
 //!   and the classified provider errors recovery decisions read.
+//! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
+//!   and the prefix fingerprints.
+//! - [`message_content`]: chat content helpers.
 //! - [`context_budget`]: token estimates and context-window budgets.
 //! - [`settings`]: what the runtime takes from its host's configuration.
 
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod llm;
+pub mod message_content;
+pub mod prompt;
 pub mod settings;

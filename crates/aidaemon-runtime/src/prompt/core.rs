@@ -5,8 +5,8 @@
 //! enforced upstream and asserted in Tasks 6 and 8. No timestamps, map
 //! iteration, or env-dependent formatting.
 
-use crate::agent::prefix_fingerprint::hash_canonical;
-use crate::types::ChannelVisibility;
+use super::fingerprint::hash_canonical;
+use aidaemon_core::ChannelVisibility;
 use serde_json::json;
 
 /// Session-static inputs to the core (cacheable) prompt prefix. Each field maps
@@ -15,7 +15,7 @@ use serde_json::json;
 /// deliberately excluded so the core hash is stable across ordinary query
 /// changes within a session.
 #[derive(Clone, Debug)]
-pub(crate) struct CoreInputs {
+pub struct CoreInputs {
     /// Both `base_template` and `persona` are sourced from the same configured
     /// system prompt today (both equal `self.system_prompt`). They are kept as
     /// separate hash components to allow future divergence — `base_template` may
@@ -45,7 +45,7 @@ pub(crate) struct CoreInputs {
 /// fixed order. Component attribution lets a later task name exactly which input
 /// changed when the core invalidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ComponentHashes {
+pub struct ComponentHashes {
     /// (component name, hash) pairs in a fixed, declaration order.
     entries: [(&'static str, String); Self::COMPONENT_COUNT],
 }
@@ -56,7 +56,7 @@ impl ComponentHashes {
     /// Aggregate hash = hash of the concatenated component hashes (in fixed
     /// order). Adding a field forces a new component entry, so attribution can
     /// never be silently bypassed.
-    pub(crate) fn aggregate(&self) -> String {
+    pub fn aggregate(&self) -> String {
         let concatenated: Vec<serde_json::Value> = self
             .entries
             .iter()
@@ -66,7 +66,7 @@ impl ComponentHashes {
     }
 
     /// Names of components whose hash differs from `other`, in fixed order.
-    pub(crate) fn diff(&self, other: &ComponentHashes) -> Vec<&'static str> {
+    pub fn diff(&self, other: &ComponentHashes) -> Vec<&'static str> {
         self.entries
             .iter()
             .zip(other.entries.iter())
@@ -79,7 +79,7 @@ impl CoreInputs {
     /// Hash each component independently. Unordered collections (tool roster,
     /// skills catalog) are sorted by name BEFORE hashing so ordering differences
     /// do not change the hash.
-    pub(crate) fn component_hashes(&self) -> ComponentHashes {
+    pub fn component_hashes(&self) -> ComponentHashes {
         let mut tool_roster = self.tool_roster.clone();
         tool_roster.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
@@ -104,7 +104,7 @@ impl CoreInputs {
     /// Aggregate hash over all component hashes. Used in tests only; the
     /// production cache path calls `component_hashes().aggregate()` directly.
     #[allow(dead_code)]
-    pub(crate) fn aggregate_hash(&self) -> String {
+    pub fn aggregate_hash(&self) -> String {
         self.component_hashes().aggregate()
     }
 }
@@ -114,7 +114,7 @@ impl CoreInputs {
 /// reused VERBATIM with no re-render; on a MISS the entry is replaced and the
 /// changed component(s) are named via [`ComponentHashes::diff`].
 #[derive(Clone, Debug)]
-pub(crate) struct CachedCore {
+pub struct CachedCore {
     pub aggregate: String,
     pub components: ComponentHashes,
     pub bytes: String,
@@ -126,7 +126,7 @@ pub(crate) struct CachedCore {
 /// has one or more named components; for the very first task of a session (no
 /// prior entry) `changed == ["initial"]`. `updated_entry` is `None` on a HIT
 /// (existing entry is already correct) and `Some` on every MISS.
-pub(crate) struct CoreCacheDecision {
+pub struct CoreCacheDecision {
     /// Rendered (or reused) core bytes to feed into the prompt.
     pub bytes: String,
     /// The (possibly new) cache entry to store under the session id. `None` only
@@ -154,10 +154,7 @@ const INITIAL_COMPONENT: &str = "initial";
 /// - MISS (changed): `prev` present but aggregate differs → render, name changed
 ///   components via `prev.components.diff(&new)`, return a fresh entry.
 /// - MISS (initial): no `prev` → render, `changed = [INITIAL_COMPONENT]`.
-pub(crate) fn core_cache_decision(
-    prev: Option<&CachedCore>,
-    inputs: &CoreInputs,
-) -> CoreCacheDecision {
+pub fn core_cache_decision(prev: Option<&CachedCore>, inputs: &CoreInputs) -> CoreCacheDecision {
     let new_components = inputs.component_hashes();
     let new_aggregate = new_components.aggregate();
 
@@ -248,7 +245,7 @@ fn render_specialists_block(entries: &[(String, String)]) -> String {
 /// sections are still emitted by their existing inline sites this task), so the
 /// rendered core equals the legacy `base_prompt` byte-for-byte. The golden tests
 /// drive the full layout with all sections populated.
-pub(crate) fn render_core_prompt(inputs: &CoreInputs) -> String {
+pub fn render_core_prompt(inputs: &CoreInputs) -> String {
     let mut specialists = inputs.specialists.clone();
     specialists.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let specialists_block = render_specialists_block(&specialists);
@@ -313,9 +310,9 @@ pub(crate) fn render_core_prompt(inputs: &CoreInputs) -> String {
 /// | `channel_rules` | channel/privacy rule set for the session's visibility class |
 /// | `persona` | persona/identity config (== `base_template` source) |
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_core_inputs(
-    user_role: crate::types::UserRole,
-    channel_ctx: &crate::types::ChannelContext,
+pub fn assemble_core_inputs(
+    user_role: aidaemon_tools::semantics::UserRole,
+    channel_ctx: &aidaemon_channels::context::ChannelContext,
     persona: String,
     tool_roster: Vec<(String, String)>,
     skills_catalog: Vec<(String, String, bool)>,
@@ -331,7 +328,7 @@ pub(crate) fn assemble_core_inputs(
     };
     // Non-owners have no tools unless this exact context carries an active
     // workspace grant (matches `session_static_tool_roster`).
-    let tool_roster = if user_role != crate::types::UserRole::Owner
+    let tool_roster = if user_role != aidaemon_tools::semantics::UserRole::Owner
         && channel_ctx.active_workspace_grant(user_role).is_none()
     {
         Vec::new()
@@ -348,8 +345,8 @@ pub(crate) fn assemble_core_inputs(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_core_inputs() -> CoreInputs {
+#[cfg(any(test, feature = "testing"))]
+pub fn test_core_inputs() -> CoreInputs {
     CoreInputs {
         base_template: "T".into(),
         tool_roster: vec![("b".into(), "{}".into()), ("a".into(), "{}".into())],
@@ -366,7 +363,7 @@ pub(crate) fn test_core_inputs() -> CoreInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+    use crate::prompt::fingerprint::TASK_CONTEXT_TAIL_MARKER;
 
     #[test]
     fn core_prompt_renders_identically_for_identical_inputs() {
@@ -522,7 +519,8 @@ mod tests {
     ///   assembly+decision boundary: identical CoreInputs → HIT.
     #[test]
     fn core_cache_decision_query_independent() {
-        use crate::types::{ChannelContext, UserRole};
+        use aidaemon_channels::context::ChannelContext;
+        use aidaemon_tools::semantics::UserRole;
 
         // Private DM context; user_text never reaches assembly, so a different
         // query cannot perturb the assembled inputs.

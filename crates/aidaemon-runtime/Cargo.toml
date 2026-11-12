@@ -23,6 +23,7 @@ publish = false
 testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
 
 [dependencies]
+aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels" }
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }
 aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
@@ -36,6 +37,7 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

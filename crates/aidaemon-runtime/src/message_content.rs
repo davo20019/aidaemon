@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 /// Extract plain text from OpenAI-style string or multimodal content.
-pub(crate) fn content_value_as_text(content: &Value) -> Option<String> {
+pub fn content_value_as_text(content: &Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text.clone()),
         Value::Array(blocks) => {
@@ -24,6 +24,11 @@ pub(crate) fn content_value_as_text(content: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether a rendered user message matches the current turn's user text.
+pub fn user_message_content_matches(content: &Value, user_text: &str) -> bool {
+    content_value_as_text(content).is_some_and(|text| text == user_text)
 }
 
 #[cfg(test)]

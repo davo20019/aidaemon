@@ -131,8 +131,10 @@ mod completion_contract;
 pub(crate) mod conversation_compaction;
 #[path = "runtime/coordination.rs"]
 pub(crate) mod coordination;
-#[path = "runtime/core_prompt.rs"]
-mod core_prompt;
+/// The cacheable core prompt lives in `aidaemon-runtime`.
+mod core_prompt {
+    pub(crate) use aidaemon_runtime::prompt::core::*;
+}
 #[path = "runtime/deferred_retry.rs"]
 mod deferred_retry;
 #[path = "runtime/dialogue_state.rs"]
@@ -191,8 +193,10 @@ mod mandate_run;
 mod message_build;
 #[path = "runtime/models.rs"]
 mod models;
-#[path = "turn/prefix_fingerprint.rs"]
-mod prefix_fingerprint;
+/// Prefix fingerprints live in `aidaemon-runtime`.
+mod prefix_fingerprint {
+    pub(crate) use aidaemon_runtime::prompt::fingerprint::*;
+}
 #[path = "runtime/resume.rs"]
 mod resume;
 mod runtime_ports;
