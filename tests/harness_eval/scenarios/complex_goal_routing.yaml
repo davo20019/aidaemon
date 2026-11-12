@@ -14,6 +14,9 @@ script:
   # No-tool reply: the ledger demands the open checklist once while no receipt
   # lands, then the run stops with its declared work still open.
   - text: "No work was executed. I cannot report a refactor, tests, or deployment as completed."
+  # The demand ended unmet, so the reply to it gets one tool-less rewrite
+  # addressed to the user (cfc84b8a).
+  - text: "I have not refactored, tested or deployed the auth module yet; nothing was changed or deployed."
 expect:
   ext:
     llm_calls_min: 3
