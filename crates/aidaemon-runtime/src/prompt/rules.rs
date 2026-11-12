@@ -610,12 +610,30 @@ pub fn render_environment_section(kind: BackendKind, home: &str) -> String {
         BackendKind::Local => format!(", {}", std::env::consts::OS),
         _ => String::new(),
     };
+    let userland = match kind {
+        BackendKind::Local => userland_note(std::env::consts::OS),
+        _ => "",
+    };
     format!(
         "[Environment]\nCommands and file tools run on the {}{os} backend. Home directory: {home}. \
          `~` means this directory and the tools expand it themselves; never guess a home \
-         directory or a user name in a path.",
+         directory or a user name in a path.{userland} A command that prints nothing may have \
+         failed: keep its errors (no `2>/dev/null`) when you rely on its output, and never \
+         report an empty result as \"empty\" without seeing the command succeed.",
         kind.as_str()
     )
+}
+
+/// What the host's command-line tools are, when they differ from the GNU
+/// tools models tend to assume.
+fn userland_note(os: &str) -> &'static str {
+    match os {
+        "macos" | "freebsd" | "openbsd" | "netbsd" => {
+            " Its command-line tools are the BSD versions: GNU-only options (such as \
+             `ls --time-style`) fail."
+        }
+        _ => "",
+    }
 }
 
 /// The mandate task lead's protocol rules. The measured objective
@@ -638,4 +656,18 @@ quiet uses the default cadence, active accelerates it, urgent uses the owner-con
         );
     }
     rules
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn a_bsd_host_names_its_tools_and_every_host_warns_about_silent_failures() {
+        assert!(userland_note("macos").contains("BSD"));
+        assert_eq!(userland_note("linux"), "");
+        let section = render_environment_section(BackendKind::Ssh, "/home/synthetic-user");
+        assert!(!section.contains("BSD"));
+        assert!(section.contains("may have failed"));
+    }
 }
