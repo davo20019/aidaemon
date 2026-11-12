@@ -466,17 +466,48 @@ fn batch_tasks(arguments: &str) -> anyhow::Result<Option<Vec<Value>>> {
     Ok(Some(merged))
 }
 
-/// When a child ran, in UTC, so a parent can see which of its children
-/// overlapped.
+/// When a child ran and how long it took, measured by the daemon: its start
+/// and finish in this machine's local time (the owner's clock, as `date`
+/// shows it) and the elapsed time between them. A parent sees which of its
+/// children overlapped, and a duration it reports is this measurement, not
+/// times the child wrote in its own reply.
 fn run_window(
     started: chrono::DateTime<chrono::Utc>,
     finished: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    let secs = (finished - started).num_seconds().max(0);
+    let elapsed = (finished - started).max(chrono::Duration::zero());
+    let local = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&chrono::Local);
     format!(
-        "Sub-agent ran {}\u{2013}{} UTC ({secs}s).",
-        started.format("%H:%M:%S"),
-        finished.format("%H:%M:%S")
+        "Sub-agent ran {}\u{2013}{} (local time, UTC{}), {} ({}s) measured by the daemon. \
+         Report this when saying how long it took; times in the sub-agent's own reply are \
+         its estimates.",
+        local(started).format("%H:%M:%S"),
+        local(finished).format("%H:%M:%S"),
+        local(started).format("%:z"),
+        aidaemon_tools::duration_format::compact_chrono_duration(
+            elapsed,
+            aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+        ),
+        elapsed.num_seconds()
+    )
+}
+
+/// A background child's measured run for the chat: how long it took and
+/// when, in this machine's local time.
+fn background_timing(
+    started: chrono::DateTime<chrono::Utc>,
+    finished: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let elapsed = (finished - started).max(chrono::Duration::zero());
+    let local = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&chrono::Local);
+    format!(
+        "Took {} ({}\u{2013}{}).",
+        aidaemon_tools::duration_format::compact_chrono_duration(
+            elapsed,
+            aidaemon_tools::duration_format::ZeroUnitStyle::Trim,
+        ),
+        local(started).format("%-I:%M:%S %p"),
+        local(finished).format("%-I:%M:%S %p")
     )
 }
 
@@ -1056,21 +1087,32 @@ impl Tool for SpawnAgentTool {
         let cancel_token = agent.background_cancel_token(&background_id).await;
         let plan_store = self.plan_store.get().cloned();
         // The steps this child does now wait on it (typed: the launch names
-        // them). The card shows them running in the background.
-        if let (Some(plans), Some(plan_session), false) = (
-            plan_store.as_ref(),
-            approval_session_id.as_deref(),
-            args.checklist_items.is_empty(),
-        ) {
-            match plans
-                .link_background_job(
-                    plan_session,
-                    facts.task_id.as_deref(),
-                    &args.checklist_items,
-                    &background_id,
-                )
-                .await
-            {
+        // them). The card shows them running in the background. A launch
+        // that names none still leaves the turn's open steps waiting on it
+        // (without crediting them to it): the card never says "stopped
+        // short" for work that is still running.
+        if let (Some(plans), Some(plan_session)) =
+            (plan_store.as_ref(), approval_session_id.as_deref())
+        {
+            let linked = if args.checklist_items.is_empty() {
+                plans
+                    .wait_on_background_jobs(
+                        plan_session,
+                        facts.task_id.as_deref(),
+                        std::slice::from_ref(&background_id),
+                    )
+                    .await
+            } else {
+                plans
+                    .link_background_job(
+                        plan_session,
+                        facts.task_id.as_deref(),
+                        &args.checklist_items,
+                        &background_id,
+                    )
+                    .await
+            };
+            match linked {
                 Ok(Some(plan)) => {
                     if let Some(tx) = status_tx.as_ref() {
                         let _ = tx.try_send(StatusUpdate::Checklist {
@@ -1100,6 +1142,7 @@ impl Tool for SpawnAgentTool {
             // cleanup below, and the parent session still hears it failed.
             let finished = std::panic::AssertUnwindSafe(async {
                 let started_at = std::time::Instant::now();
+                let started_utc = chrono::Utc::now();
                 let mut progress_interval =
                     tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
                 progress_interval.tick().await; // consume immediate tick
@@ -1249,7 +1292,8 @@ impl Tool for SpawnAgentTool {
                                 None => (
                                     "failed",
                                     format!(
-                                        "\u{23f1} Ran out of time in the background: {}\n\n{}",
+                                        "\u{23f1} Stopped in the background after it made no \
+                                         progress: {}\n\n{}",
                                         mission,
                                         timed_out.render()
                                     ),
@@ -1258,6 +1302,12 @@ impl Tool for SpawnAgentTool {
                         }
                     },
                 };
+                // How long it took, measured here: the owner and the parent
+                // read this, not times the child wrote.
+                let message = format!(
+                    "{message}\n\n{}",
+                    background_timing(started_utc, chrono::Utc::now())
+                );
                 delivery.deliver(notification_type, &message, trust).await;
                 settle_background_steps(
                     plan_store.as_ref(),
@@ -2412,6 +2462,7 @@ mod child_runtime_tests {
             assert!(outcome.output.contains(mission), "{}", outcome.output);
         }
         assert_eq!(outcome.output.matches("Sub-agent ran ").count(), 3);
+        assert_eq!(outcome.output.matches("measured by the daemon").count(), 3);
         assert_eq!(
             outcome.metadata.outcome_status,
             Some(crate::traits::ToolOutcomeStatus::Succeeded)
@@ -3010,6 +3061,40 @@ mod child_runtime_tests {
         let entry = wait_for_notification(&store).await;
         assert!(entry.message.contains("cancelled"), "{}", entry.message);
         assert!(!entry.message.contains("never delivered"));
+    }
+
+    /// A child's result carries its measured run: start and finish on this
+    /// machine's clock and the elapsed time, foreground and background.
+    #[test]
+    fn a_childs_result_carries_its_measured_elapsed_time() {
+        let started = chrono::Utc::now();
+        let finished = started + chrono::Duration::seconds(86);
+        let window = run_window(started, finished);
+        assert!(
+            window.contains("1m 26s (86s) measured by the daemon"),
+            "{window}"
+        );
+        let local = started.with_timezone(&chrono::Local);
+        assert!(
+            window.contains(&local.format("%H:%M:%S").to_string()),
+            "{window}"
+        );
+        let timing = background_timing(started, finished);
+        assert!(timing.starts_with("Took 1m 26s ("), "{timing}");
+    }
+
+    #[tokio::test]
+    async fn a_background_childs_result_says_how_long_it_took() {
+        let child = ScriptedChild::new("synthetic report", Duration::from_millis(50));
+        let store = notification_store().await;
+        let state: Arc<dyn StateStore> = store.clone();
+        let tool = tool_for(&child).with_state(state);
+        let args = json!({"mission": "Report", "task": "t", "background": true}).to_string();
+        tool.call_with_execution_context(&args, None, facts())
+            .await
+            .unwrap();
+        let entry = wait_for_notification(&store).await;
+        assert!(entry.message.contains("\n\nTook "), "{}", entry.message);
     }
 
     #[tokio::test]

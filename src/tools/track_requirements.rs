@@ -177,6 +177,9 @@ impl StableSubjectVocabulary {
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
     vocabulary: StableSubjectVocabulary,
+    /// Where running background sub-agents are recorded: a checklist written
+    /// while some run waits on them instead of reading as stopped short.
+    state: Option<Arc<dyn crate::traits::StateStore>>,
 }
 
 impl TrackRequirementsTool {
@@ -184,7 +187,14 @@ impl TrackRequirementsTool {
         Self {
             plan_store,
             vocabulary: StableSubjectVocabulary::default(),
+            state: None,
         }
+    }
+
+    /// Read the session's running background sub-agents from `state`.
+    pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
+        self.state = Some(state);
+        self
     }
 
     /// Bind checklist resource-ID targets against the subjects these tools
@@ -696,6 +706,24 @@ impl TrackRequirementsTool {
             }
         }
 
+        // Background sub-agents of this chat still running: the steps left
+        // open wait on them (typed: their running records), so the card says
+        // the work continues in the background, not that it stopped short.
+        if let Some(state) = self.state.as_ref() {
+            let running: Vec<String> = state
+                .background_spawns_for_session(&session_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|spawn| spawn.id)
+                .collect();
+            if plan.wait_on_background_jobs(&running) {
+                if let Err(e) = self.plan_store.update(&plan).await {
+                    tracing::warn!(error = %e, "track_requirements: failed to record waiting steps");
+                }
+            }
+        }
+
         // A turn that cannot make changes did what it was allowed to: steps
         // it left undone were held back, not failed, and the card says so.
         if facts.mutation_forbidden
@@ -960,6 +988,62 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("✅ Done · 2 of 2 steps"), "{out}");
+    }
+
+    /// Steps left open while the chat's background sub-agents run read as
+    /// continuing in the background, never "stopped short", even when no
+    /// launch named them (typed: the running records, not the wording).
+    #[tokio::test]
+    async fn open_steps_wait_on_running_background_sub_agents() {
+        let (tool, _plan_store) = test_tool().await;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state: Arc<dyn crate::traits::StateStore> = Arc::new(
+            crate::state::SqliteStateStore::new(
+                &db_file.path().display().to_string(),
+                100,
+                None,
+                Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        state
+            .record_background_spawn(&crate::traits::BackgroundSpawn {
+                id: "background_spawn:synthetic".to_string(),
+                session_id: "sess-bg".to_string(),
+                mission: "Install a synthetic site".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        let tool = tool.with_state(state);
+        let args = json!({
+            "items": [
+                {"text": "Check the tools", "status": "completed"},
+                {"text": "Install the synthetic site", "status": "deferred"}
+            ],
+            "outcome": "partial"
+        })
+        .to_string();
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-bg"))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("Continuing in the background · 1 of 2 done"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Stopped short") && !out.contains("not done"),
+            "{out}"
+        );
+
+        // Another chat with nothing running keeps its own verdict.
+        let out = tool
+            .call_with(&args, crate::testing::call_facts("sess-quiet"))
+            .await
+            .unwrap();
+        assert!(out.contains("Stopped short"), "{out}");
     }
 
     /// A step with nothing to do is finished, not failed: the card reads

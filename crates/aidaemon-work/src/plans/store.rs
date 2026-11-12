@@ -149,6 +149,7 @@ impl PlanStore {
                 expected_targets: item.expected_targets.clone(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
+                waits_on_jobs: false,
                 not_done: None,
                 status: item.status,
                 tool_call_ids: Vec::new(),
@@ -205,6 +206,7 @@ impl PlanStore {
                 {
                     step.status = StepStatus::Background;
                     step.background_jobs = previous.background_jobs.clone();
+                    step.waits_on_jobs = previous.waits_on_jobs;
                     step.started_at = previous.started_at;
                     step.completed_at = None;
                 }
@@ -257,6 +259,31 @@ impl PlanStore {
             return Ok(None);
         };
         if !plan.link_background_job(indices, job_id) {
+            return Ok(None);
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// The session's checklist for `task_id` waits on background jobs
+    /// `job_ids` ([`TaskPlan::wait_on_background_jobs`]). Returns the updated
+    /// plan, or `None` when there is no such checklist or nothing changed.
+    pub async fn wait_on_background_jobs(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        job_ids: &[String],
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let Some(mut plan) = self
+            .get_recent_for_session(session_id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|plan| task_id.is_none() || plan.task_id.as_deref() == task_id)
+        else {
+            return Ok(None);
+        };
+        if !plan.wait_on_background_jobs(job_ids) {
             return Ok(None);
         }
         self.update(&plan).await?;
