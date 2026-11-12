@@ -34,7 +34,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -761,6 +761,13 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// notifications on: the daemon will deliver its result later, so the
     /// reply is a background handoff, not the terminal answer.
     background_handoff: AtomicBool,
+    /// Background jobs this run launched with completion notifications on
+    /// (not detached services) whose end it has not observed: each typed
+    /// launch receipt adds one, each typed settle receipt (the job's result
+    /// read back, or the job cancelled) takes one away. While any is open, a
+    /// stop is a handoff: the job's result reaches the session through its
+    /// notifier, so the run must not close the request on its own.
+    open_background_jobs: AtomicUsize,
 }
 
 impl Agent {
@@ -1568,6 +1575,7 @@ impl Agent {
                 crate::agent::completion_contract::CompletionProgress::new(&contract, &task_id),
             ),
             background_handoff: AtomicBool::new(false),
+            open_background_jobs: AtomicUsize::new(0),
             emitter: &emitter,
             prefix,
             prefix_len,

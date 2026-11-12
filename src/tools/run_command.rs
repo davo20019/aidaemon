@@ -285,7 +285,7 @@ impl RunCommandTool {
         // Reject shell operators
         if aidaemon_policies::contains_shell_operator(trimmed) {
             return Ok(routing_rejection(
-                "Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands.".to_string(),
+                format!("Shell operators (;, |, &&, ||, $(), etc.) are not allowed in run_command. Use 'terminal' for complex commands. {NOT_RUN_ROUTE}"),
                 "terminal",
             ));
         }
@@ -298,7 +298,7 @@ impl RunCommandTool {
             }
             return Ok(routing_rejection(
                 format!(
-                    "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command.\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
+                    "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command. {NOT_RUN_ROUTE}\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
                     preview, SAFE_NPM_PREFIX_HINT
                 ),
                 "terminal",
@@ -443,6 +443,13 @@ impl RunCommandTool {
         })
     }
 }
+
+/// Every routing rejection says what it is: nothing ran and nothing refused
+/// the command itself, only this tool's shape. A model that read "not in the
+/// safe command list" as "this command is blocked" told the owner their
+/// request was impossible instead of retrying in `terminal` (live 2026-11-11).
+const NOT_RUN_ROUTE: &str = "Nothing ran, and the command itself is not blocked: run it with \
+     `terminal`, which can run it (asking the owner first when it needs approval).";
 
 /// A pre-dispatch rejection that routes the model to a different tool. It
 /// never ran a command, so it is typed as a blocked, rejected-before-dispatch

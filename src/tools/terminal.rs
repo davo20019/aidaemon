@@ -51,7 +51,11 @@ const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 /// The raw command/worker result is always delivered when this budget expires,
 /// so a slow model or a wedged continuation can never strand the user's final
 /// answer or monopolize the global re-engagement serializer indefinitely.
-const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Ten minutes, not two: a continuation often finishes real work the job left
+/// (start the site, install it, take the screenshot), and two minutes cut one
+/// off mid-install (live 2026-11-11). It stays well under the 30-minute task
+/// timeout.
+const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// `detach=true` is a launch-and-return contract: the process is given this
 /// brief startup window so an immediate failure (bad binary, usage error) is
 /// still reported synchronously with its exit code, then it is handed to

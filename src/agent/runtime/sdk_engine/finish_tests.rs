@@ -389,6 +389,66 @@ async fn background_handoff_with_more_declared_work_lets_the_model_continue() {
     assert_eq!(harness.provider.call_count().await, 3);
 }
 
+/// A notifying job still running when the model stops makes the stop a
+/// handoff: its notifier owns the result, so the model's own verdict on the
+/// unfinished work does not ship, whatever it says (live 2026-11-11: "I
+/// couldn't create it" while the job went on to build it).
+#[tokio::test]
+async fn stop_with_a_notifying_job_still_running_ships_the_handoff() {
+    let checklist = r#"{"items":[
+        {"text":"Start the job","status":"in_progress"},
+        {"text":"Send the screenshot","status":"pending"}
+    ]}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::tool_call_response("synthetic_launcher", "{}"),
+        MockProvider::text_response("I couldn't do it: the job failed."),
+        MockProvider::text_response("UNREACHED second answer"),
+    ]);
+    let harness = root(provider, vec![Arc::new(launcher(true))]).await;
+    let text = "Build the site, then send a screenshot";
+    let reply = ask(&harness, "finish-stop-running", text).await;
+
+    assert_eq!(
+        reply,
+        crate::agent::post_task::build_friendly_background_handoff(text)
+    );
+    assert_eq!(harness.provider.call_count().await, 3);
+    let end = task_end(&harness, "finish-stop-running").await;
+    assert_eq!(end.status, TaskStatus::Completed);
+    assert_eq!(end.effective_outcome(), TaskOutcome::Partial);
+}
+
+/// Once a receipt shows the job ended (its result read back), the run owns
+/// the answer again and the model's reply ships.
+#[tokio::test]
+async fn stop_after_the_job_settled_ships_the_models_answer() {
+    let checklist = r#"{"items":[
+        {"text":"Start the job","status":"in_progress"},
+        {"text":"Report the result","status":"pending"}
+    ]}"#;
+    let settle = MockTool::new(
+        "synthetic_check",
+        "Reads a synthetic job's result",
+        "Synthetic job 7 finished: built.",
+    )
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+        background_settled: true,
+        ..ToolCallMetadata::default()
+    });
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", checklist),
+        MockProvider::tool_call_response("synthetic_launcher", "{}"),
+        MockProvider::tool_call_response("synthetic_check", "{}"),
+        MockProvider::text_response("Job 7 finished and the site is built."),
+    ]);
+    let harness = root(provider, vec![Arc::new(launcher(true)), Arc::new(settle)]).await;
+    let reply = ask(&harness, "finish-stop-settled", "Build the site and report").await;
+
+    assert_eq!(reply, "Job 7 finished and the site is built.");
+}
+
 /// The job as the only open item is a plain handoff: nothing is left to do
 /// inline, so the run ends on the tool's finish.
 #[tokio::test]

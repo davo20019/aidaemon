@@ -88,6 +88,20 @@ const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_secs(120);
 
+/// How long `action="check"` waits for a running task to finish before it
+/// reports "still running". A check that answers at once invites a model to
+/// poll in a tight loop, each poll re-billing the whole context (live
+/// 2026-11-11: ten checks in 36 s, ~685k input tokens, while Codex worked for
+/// six minutes). Waiting turns each check into a long poll that returns the
+/// moment the task ends.
+#[cfg(test)]
+const CHECK_WAIT: Duration = Duration::from_millis(300);
+#[cfg(not(test))]
+const CHECK_WAIT: Duration = Duration::from_secs(60);
+
+/// How often a waiting check looks at the task's finished flag.
+const CHECK_POLL: Duration = Duration::from_millis(250);
+
 /// Loop detection: window size for tracking recent lines
 const LOOP_DETECTION_WINDOW: usize = 100;
 
@@ -109,11 +123,20 @@ tokio::task_local! {
     /// running), so the outcome is typed from what the call did, never
     /// guessed from its text (a finished agent's output can say anything).
     static LEFT_IN_BACKGROUND: std::cell::Cell<bool>;
+    /// Set by a call that observed a background task's end (a check that
+    /// returned its finished result, or a cancel), so the run knows the job
+    /// it launched is no longer running.
+    static BACKGROUND_SETTLED: std::cell::Cell<bool>;
 }
 
 /// Record that this call left its work running in the background.
 fn mark_left_in_background() {
     let _ = LEFT_IN_BACKGROUND.try_with(|flag| flag.set(true));
+}
+
+/// Record that this call observed a background task's end.
+fn mark_background_settled() {
+    let _ = BACKGROUND_SETTLED.try_with(|flag| flag.set(true));
 }
 
 fn format_background_progress(
@@ -3602,11 +3625,13 @@ impl CliAgentTool {
 
     /// Check on a background CLI agent task.
     async fn handle_check(&self, task_id: &str, session_id: &str) -> anyhow::Result<String> {
+        self.wait_for_finish(task_id, CHECK_WAIT).await;
         let running = self.running.lock().await;
 
         let Some(agent) = running.get(task_id) else {
             drop(running);
             if let Some(done) = self.completed.lock().await.get(task_id).cloned() {
+                mark_background_settled();
                 return Ok(done.result);
             }
 
@@ -3621,6 +3646,9 @@ impl CliAgentTool {
                     .output_summary
                     .as_deref()
                     .unwrap_or("No persisted output was recorded.");
+                if invocation.completed_at.is_some() {
+                    mark_background_settled();
+                }
                 return Ok(format!(
                     "CLI agent '{}' {}. Recovered durable result for task_id={task_id}.\n\nResult:\n{}",
                     invocation.agent_name,
@@ -3671,6 +3699,7 @@ impl CliAgentTool {
             if session_candidates.len() == 1 {
                 let (recovered_id, status, result) = &session_candidates[0];
                 if let Some(result) = result {
+                    mark_background_settled();
                     return Ok(format!(
                         "Requested task_id '{task_id}' was not found. Recovered the only recent CLI task for this session instead (task_id={recovered_id}, {status}).\n\n{result}"
                     ));
@@ -3706,6 +3735,7 @@ impl CliAgentTool {
         let is_running = !agent.finished.load(Ordering::Acquire);
 
         if !is_running {
+            mark_background_settled();
             Ok(Self::build_finished_result(&self.backend, agent).await)
         } else {
             mark_left_in_background();
@@ -3720,6 +3750,20 @@ impl CliAgentTool {
                 display_output.len(),
                 truncate_with_note(&display_output, 5000)
             ))
+        }
+    }
+
+    /// Wait up to `wait` for a running task to finish, without holding the
+    /// task table's lock (the stream task and other calls need it). Returns at
+    /// once for a task that is unknown or already finished.
+    async fn wait_for_finish(&self, task_id: &str, wait: Duration) {
+        let finished = match self.running.lock().await.get(task_id) {
+            Some(agent) => agent.finished.clone(),
+            None => return,
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        while !finished.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(CHECK_POLL).await;
         }
     }
 
@@ -3744,6 +3788,7 @@ impl CliAgentTool {
 
         // Try to kill the process
         kill_process(&self.backend, &agent.process_handle).await;
+        mark_background_settled();
 
         if let Some(ref delegated_task_id) = agent.delegated_task_id {
             Self::persist_delegated_cli_result_with_state(
@@ -3794,6 +3839,7 @@ impl CliAgentTool {
                 self.release_working_dir_claim(dir, &task_id);
             }
             kill_process(&self.backend, &agent.process_handle).await;
+            mark_background_settled();
             if let Some(ref delegated_task_id) = agent.delegated_task_id {
                 Self::persist_delegated_cli_result_with_state(
                     self.state.clone(),
@@ -4770,26 +4816,30 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background) = LEFT_IN_BACKGROUND
-            .scope(std::cell::Cell::new(false), async {
-                let output = self
-                    .call_with_status_under_contract(
-                        arguments,
-                        status_tx,
-                        read_only_run,
-                        enforce_native_access,
-                        facts,
-                    )
-                    .await?;
-                anyhow::Ok((output, LEFT_IN_BACKGROUND.with(std::cell::Cell::get)))
-            })
+        let (output, left_in_background, settled) = BACKGROUND_SETTLED
+            .scope(
+                std::cell::Cell::new(false),
+                LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                    let output = self
+                        .call_with_status_under_contract(
+                            arguments,
+                            status_tx,
+                            read_only_run,
+                            enforce_native_access,
+                            facts,
+                        )
+                        .await?;
+                    anyhow::Ok((
+                        output,
+                        LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                        BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                    ))
+                }),
+            )
             .await?;
-        Ok(cli_agent_outcome(
-            &action,
-            output,
-            read_only_run,
-            left_in_background,
-        ))
+        let mut outcome = cli_agent_outcome(&action, output, read_only_run, left_in_background);
+        outcome.metadata.background_settled = settled && !left_in_background;
+        Ok(outcome)
     }
 
     async fn call_with_status_under_contract(
@@ -7499,6 +7549,94 @@ mod tests {
             Some(ToolOutcomeStatus::Backgrounded)
         );
         assert!(started.metadata.background_started);
+    }
+
+    fn started_task_id(output: &str) -> String {
+        output
+            .split("task_id=")
+            .nth(1)
+            .unwrap()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A check waits for a task about to finish and returns its result, typed
+    /// as settling the launch; a check of a task that outlasts the wait stays
+    /// a nonterminal background observation that settles nothing.
+    #[tokio::test]
+    async fn check_waits_for_the_task_and_types_its_end() {
+        let (tool, _db) = setup_bash_tool().await;
+        let facts = crate::testing::call_facts("session-check-wait");
+        let started = tool
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 0.1; echo waited-result","async_mode":true}"#,
+                None,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        assert!(started.metadata.background_started);
+        assert!(!started.metadata.background_settled);
+        let task_id = started_task_id(&started.output);
+
+        let check = tool
+            .outcome_with_facts(
+                &format!(r#"{{"action":"check","task_id":"{task_id}"}}"#),
+                None,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        assert!(check.output.contains("waited-result"), "{}", check.output);
+        assert!(check.metadata.background_settled, "{}", check.output);
+        assert!(!check.metadata.background_started);
+
+        let slow = tool
+            .outcome_with_facts(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5; echo never","async_mode":true}"#,
+                None,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        let slow_id = started_task_id(&slow.output);
+        let waited = Instant::now();
+        let running = tool
+            .outcome_with_facts(
+                &format!(r#"{{"action":"check","task_id":"{slow_id}"}}"#),
+                None,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            waited.elapsed() >= CHECK_WAIT,
+            "check returned before its wait"
+        );
+        assert!(
+            running.output.contains("still running"),
+            "{}",
+            running.output
+        );
+        assert!(!running.metadata.background_settled);
+        assert!(!running.metadata.completion_notifications_enabled);
+
+        let cancel = tool
+            .outcome_with_facts(
+                &format!(r#"{{"action":"cancel","task_id":"{slow_id}"}}"#),
+                None,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        assert!(cancel.metadata.background_settled, "{}", cancel.output);
     }
 
     #[tokio::test]

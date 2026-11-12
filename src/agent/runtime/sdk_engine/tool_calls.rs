@@ -1292,6 +1292,24 @@ impl Agent {
                 // model reports it. Work a tool handed to the background ends
                 // the run on the tool's finish.
                 let mut handed_off = false;
+                // Track the jobs this run left running whose result the
+                // daemon will deliver: a notifying, non-detached launch opens
+                // one; a receipt that observed a job's end closes one.
+                if outcome.metadata.background_started
+                    && outcome.metadata.completion_notifications_enabled
+                    && !outcome.metadata.detached
+                    && outcome.metadata.outcome_status
+                        != Some(crate::traits::ToolOutcomeStatus::FailedPermanent)
+                {
+                    scope.open_background_jobs.fetch_add(1, Ordering::Relaxed);
+                }
+                if outcome.metadata.background_settled {
+                    let _ = scope.open_background_jobs.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |open| open.checked_sub(1),
+                    );
+                }
                 if outcome.metadata.background_started || outcome.metadata.background_handoff {
                     // A call the tool itself typed as a permanent failure hands
                     // nothing off, whatever it started: the run goes on.

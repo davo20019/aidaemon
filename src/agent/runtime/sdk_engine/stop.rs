@@ -155,6 +155,10 @@ pub(super) fn closeout_visible_tools<'a>(
 impl Agent {
     pub(super) async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
         let mut decision = self.sdk_mandate_commit_check(scope).await;
+        if decision == sdk::StopDecision::Accept && self.sdk_background_handoff(scope).await {
+            let _ = check.reply.send(decision);
+            return;
+        }
         if decision == sdk::StopDecision::Accept {
             decision = self
                 .sdk_closeout(scope, check.completed_results, check.failed_without_success)
@@ -177,6 +181,39 @@ impl Agent {
             decision = self.sdk_reply_check(scope, &check.final_text).await;
         }
         let _ = check.reply.send(decision);
+    }
+
+    /// A stop while a job this run launched is still running is a handoff,
+    /// decided from the run's typed launch and settle receipts, never from
+    /// the reply: the job's notifier owns its result and re-engages the
+    /// session when it ends, so the run demands no more work, runs no reply
+    /// checks, and ships the handoff reply instead of the model's verdict on
+    /// work that has not finished (live 2026-11-11: a run polled a running
+    /// Codex job, gave up, and reported the task as failed while Codex went
+    /// on to build it).
+    pub(super) async fn sdk_background_handoff(&self, scope: &TurnScope<'_>) -> bool {
+        if scope.open_background_jobs.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        scope.background_handoff.store(true, Ordering::Relaxed);
+        scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+        scope.verdict.record_handoff_reply(
+            crate::agent::post_task::build_friendly_background_handoff(scope.user_text),
+        );
+        self.emit_decision_point(
+            scope.emitter,
+            scope.task_id,
+            scope.model_calls.load(Ordering::Relaxed) as usize,
+            crate::events::DecisionType::PostExecutionValidation,
+            "Stop with a background job still running: handed off".to_string(),
+            serde_json::json!({
+                "condition": "background_job_running_at_stop",
+                "open_jobs": scope.open_background_jobs.load(Ordering::Relaxed),
+                "engine": "sdk",
+            }),
+        )
+        .await;
+        true
     }
 
     /// A GUI success claim must not ship while the task's last coordinate

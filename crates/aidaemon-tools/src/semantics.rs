@@ -1442,6 +1442,12 @@ pub struct ToolCallMetadata {
     /// `background_started` it says nothing about the receipt's status.
     #[serde(default)]
     pub background_handoff: bool,
+    /// The call observed the end of a background job a launch left running
+    /// (a check that returned its finished result, or a cancel). The run
+    /// pairs it with `background_started` launches to know whether work it
+    /// handed off is still running when the model wants to stop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_settled: bool,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,

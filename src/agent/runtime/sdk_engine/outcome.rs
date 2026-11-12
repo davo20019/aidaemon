@@ -181,6 +181,11 @@ pub(crate) struct TurnVerdict {
     /// more work. If the model then replies with nothing, this ships instead
     /// of a generic activity summary.
     interrupted_answer: std::sync::Mutex<Option<String>>,
+    /// The handoff reply for a run that stopped while a job it launched was
+    /// still running: that job's notifier delivers the result, so the run
+    /// tells the user the work continues instead of shipping the model's own
+    /// verdict on unfinished work.
+    handoff_reply: std::sync::Mutex<Option<String>>,
 }
 
 impl TurnVerdict {
@@ -189,6 +194,12 @@ impl TurnVerdict {
     pub(super) fn record_budget_stop(&self, reply: String, outcome: TaskOutcome) {
         if let Ok(mut stop) = self.budget_stop.lock() {
             *stop = Some((reply, outcome));
+        }
+    }
+
+    pub(super) fn record_handoff_reply(&self, reply: String) {
+        if let Ok(mut handoff) = self.handoff_reply.lock() {
+            *handoff = Some(reply);
         }
     }
 
@@ -209,7 +220,22 @@ impl TurnVerdict {
         visibility: crate::types::ChannelVisibility,
     ) -> (String, TaskStatus, TaskOutcome) {
         let (reply, status, task_outcome) = self.resolve(outcome);
-        let reply = if matches!(outcome.status, sdk::RunStatus::Completed) {
+        let handoff = self
+            .handoff_reply
+            .lock()
+            .ok()
+            .and_then(|reply| reply.clone());
+        // A handed-off run stopped with its work still running: partial work,
+        // whatever the kernel's completed status would otherwise credit.
+        let handed_off = matches!(outcome.status, sdk::RunStatus::Completed) && handoff.is_some();
+        let task_outcome = if handed_off && task_outcome == TaskOutcome::Succeeded {
+            TaskOutcome::Partial
+        } else {
+            task_outcome
+        };
+        let reply = if let (true, Some(handoff)) = (handed_off, handoff) {
+            handoff
+        } else if matches!(outcome.status, sdk::RunStatus::Completed) {
             let note = self.response_note.lock().ok().and_then(|note| note.clone());
             let interrupted = self
                 .interrupted_answer
