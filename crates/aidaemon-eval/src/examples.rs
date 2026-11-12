@@ -153,6 +153,7 @@ pub struct ExampleFactory {
     live: Option<Arc<dyn Provider>>,
     model: Option<String>,
     hooks: Option<HookSet>,
+    guidance: Option<String>,
 }
 
 impl ExampleFactory {
@@ -171,6 +172,13 @@ impl ExampleFactory {
     /// only a scripted provider accepts).
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Append this text to every scenario's instructions (for prompt
+    /// on/off comparisons).
+    pub fn with_guidance(mut self, guidance: impl Into<String>) -> Self {
+        self.guidance = Some(guidance.into());
         self
     }
 
@@ -208,7 +216,18 @@ impl AgentFactory for ExampleFactory {
         for hook in self.hooks.iter().flat_map(|hooks| hooks(scenario)) {
             builder = builder.hook_arc(hook);
         }
-        Ok(scenario.configure(builder).build()?)
+        let builder = scenario.configure(builder);
+        Ok(match &self.guidance {
+            Some(guidance) => {
+                let instructions = match &scenario.instructions {
+                    Some(own) => format!("{own}\n\n{guidance}"),
+                    None => guidance.clone(),
+                };
+                builder.instructions(instructions)
+            }
+            None => builder,
+        }
+        .build()?)
     }
 
     /// The live provider; a scenario tagged `context_cap:<tokens>` gets it
@@ -362,6 +381,49 @@ where
     ))
 }
 
+/// The `shell` kit's `run_command`, over a shared "OrbStack is running" flag.
+fn orbstack_shell(running: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn Tool> {
+    fn_tool(
+        "run_command",
+        "Run a shell command on the owner's laptop (the owner allows this)",
+        &["command"],
+        ToolAnnotations::WRITE,
+        move |args| {
+            let command = arg(&args, "command");
+            let words: Vec<&str> = command
+                .split(|c: char| c.is_whitespace() || c == ';' || c == '&')
+                .filter(|w| !w.is_empty())
+                .collect();
+            let has = |w: &str| words.iter().any(|x| x.eq_ignore_ascii_case(w));
+            if (has("orb") && has("start")) || (has("open") && has("OrbStack")) {
+                running.store(true, Ordering::SeqCst);
+            }
+            let up = running.load(Ordering::SeqCst);
+            let project = words
+                .iter()
+                .find_map(|w| w.strip_prefix("--project-name="))
+                .unwrap_or("school");
+            let output = if has("ddev") && !up {
+                ToolOutput::error(
+                    "exit 1: Docker error: failed to connect to the docker API at \
+                     unix:///Users/owner/.orbstack/run/docker.sock; check if the \
+                     path is correct and if the daemon is running",
+                )
+            } else if has("ddev") {
+                ToolOutput::text(format!(
+                    "Successfully started {project}\nYour project can be reached at \
+                     https://{project}.ddev.site"
+                ))
+            } else if has("orb") && has("status") {
+                ToolOutput::text(if up { "Running" } else { "Stopped" })
+            } else {
+                ToolOutput::text("exit 0")
+            };
+            async move { Ok(output) }
+        },
+    )
+}
+
 /// Extra synthetic tools for a scenario tagged `kit:<name>`. Each call of
 /// the factory builds them anew, so a tool's state (a counter, a first
 /// failure) belongs to one run.
@@ -383,6 +445,18 @@ where
 /// - `cleanup`: `list_dir` (read-only, `path`), a nearly full disk.
 /// - `logs`: `read_log` (read-only, `path`): a trail of [`TRAIL_PARTS`]
 ///   files, each naming the next, the last holding [`TRAIL_CODE`].
+/// - `service`: `build_site` (write, `project`) fails with a Docker
+///   connection error until `start_service` (write, `service`) has run;
+///   `service_status` (read-only, `service`) reports the container engine
+///   stopped, then running.
+/// - `shell`: `run_command` (write, `command`), a scripted shell on the
+///   owner's laptop: `ddev` commands fail with the same Docker error until
+///   a command starts OrbStack (`orb start`, `open -a OrbStack`); `ddev`
+///   then answers with the project's URL (`school` unless `--project-name=` says otherwise), `orb status` with the engine's
+///   state, anything else with no output.
+/// - `delegate`: that `run_command` and a `spawn_agent` (write, `mission`)
+///   whose sub-agent reports the Docker error as incomplete work until
+///   OrbStack runs, then the site's URL.
 pub fn kit_tools(kit: &str) -> Result<Vec<Arc<dyn Tool>>, FactoryError> {
     Ok(match kit {
         "deploy" => {
@@ -558,6 +632,98 @@ pub fn kit_tools(kit: &str) -> Result<Vec<Arc<dyn Tool>>, FactoryError> {
                 })
             },
         )],
+        "service" => {
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (status, start, build) = (running.clone(), running.clone(), running);
+            vec![
+                fn_tool(
+                    "service_status",
+                    "Status of a local service or app on this machine",
+                    &["service"],
+                    ToolAnnotations::READ_ONLY,
+                    move |args| {
+                        let up = status.load(Ordering::SeqCst);
+                        async move {
+                            Ok(ToolOutput::text(format!(
+                                "{}: {}",
+                                arg(&args, "service"),
+                                if up { "running" } else { "stopped" }
+                            )))
+                        }
+                    },
+                ),
+                fn_tool(
+                    "start_service",
+                    "Start a local service or app on this machine (the owner allows this)",
+                    &["service"],
+                    ToolAnnotations::WRITE,
+                    move |args| {
+                        start.store(true, Ordering::SeqCst);
+                        async move {
+                            Ok(ToolOutput::text(format!(
+                                "{} started",
+                                arg(&args, "service")
+                            )))
+                        }
+                    },
+                ),
+                fn_tool(
+                    "build_site",
+                    "Create and start a local DDEV site for a project",
+                    &["project"],
+                    ToolAnnotations::WRITE,
+                    move |args| {
+                        let up = build.load(Ordering::SeqCst);
+                        async move {
+                            Ok(if up {
+                                ToolOutput::text(format!(
+                                    "{} is running at https://{}.ddev.site",
+                                    arg(&args, "project"),
+                                    arg(&args, "project")
+                                ))
+                            } else {
+                                ToolOutput::error(
+                                    "Docker error: failed to connect to the docker API at \
+                                     unix:///Users/owner/.orbstack/run/docker.sock; check if the \
+                                     path is correct and if the daemon is running",
+                                )
+                            })
+                        }
+                    },
+                ),
+            ]
+        }
+        "shell" => vec![orbstack_shell(Arc::default())],
+        "delegate" => {
+            let running: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+            let child = running.clone();
+            vec![
+                orbstack_shell(running),
+                fn_tool(
+                    "spawn_agent",
+                    "Delegate a task to a sub-agent and get its report",
+                    &["mission"],
+                    ToolAnnotations::WRITE,
+                    move |_args| {
+                        let output = if child.load(Ordering::SeqCst) {
+                            ToolOutput::text(
+                                "Sub-agent complete: the Drupal site is up; its homepage is \
+                                 https://school.ddev.site",
+                            )
+                        } else {
+                            ToolOutput::text(
+                                "Sub-agent incomplete\n\nddev start failed: Docker error: \
+                                 failed to connect to the docker API at \
+                                 unix:///Users/owner/.orbstack/run/docker.sock; check if the \
+                                 path is correct and if the daemon is running. The site was \
+                                 configured in ~/projects/school but not started.",
+                            )
+                        };
+                        async move { Ok(output) }
+                    },
+                ),
+            ]
+        }
         other => return Err(format!("unknown tool kit `{other}`").into()),
     })
 }

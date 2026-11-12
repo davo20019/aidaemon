@@ -9,7 +9,9 @@
 //! ```
 //! Configs: `baseline` (default), `streak_guard`,
 //! `untrusted_output`, `redactor`, `context_window`, `context_window_8k`,
-//! `context_window_8k_recent2`, `egress_guard`, `scope_guard`, `approval`, `all`. Each writes
+//! `context_window_8k_recent2`, `egress_guard`, `scope_guard`, `approval`, `all`,
+//! and `obstacle_guidance` (no hook: [`aidaemon_policies::OBSTACLE_GUIDANCE`]
+//! appended to each scenario's instructions). Each writes
 //! `<out_dir>/<config>.json` and prints its report, plus a comparison against
 //! `<out_dir>/baseline.json` when present. Every agent also has the
 //! scenarios' own `DenyDestructive` fixture hook (unless a scenario is
@@ -41,6 +43,7 @@ const CONFIGS: &[&str] = &[
     "scope_guard",
     "approval",
     "all",
+    "obstacle_guidance",
 ];
 
 fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
@@ -67,6 +70,8 @@ fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
             PathBuf::from("/workspace/app"),
         ]))],
         "approval" => vec![Arc::new(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))],
+        // A prompt change, not a hook: the factory appends the guidance.
+        "obstacle_guidance" => vec![],
         // Registration order as `aidaemon-policies` documents it.
         "all" => ["scope_guard", "egress_guard", "streak_guard", "redactor"]
             .into_iter()
@@ -111,9 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for config in configs {
         let name = config.clone();
         let _ = policy(&name); // reject unknown names before spending anything
-        let factory = ExampleFactory::with_live_provider(provider.clone())
+        let guidance = config == "obstacle_guidance";
+        let mut factory = ExampleFactory::with_live_provider(provider.clone())
             .model(model.clone())
             .with_hooks(move |_| policy(&name));
+        if guidance {
+            factory = factory.with_guidance(aidaemon_policies::OBSTACLE_GUIDANCE);
+        }
         let report = suite.run_subject(&ExampleSubject::new(&factory), n).await;
         println!("## {config} ({model}, N={n})\n\n{}", report.to_markdown());
         std::fs::write(out.join(format!("{config}.json")), report.to_json())?;
