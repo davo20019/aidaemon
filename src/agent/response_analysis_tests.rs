@@ -102,18 +102,27 @@ fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
         "How many projects are at ~/projects?"
     ));
     assert!(user_text_references_filesystem_path(
-        "src/agent/main_loop.rs"
-    ));
-    assert!(user_text_references_filesystem_path("Cargo.toml"));
-    assert!(user_text_references_filesystem_path(
         r"C:\\Users\\alice\\file.txt"
     ));
+}
+
+/// Since cf00042c a relative reference resolves only against a workspace the
+/// run was given (or a configured project root), never the daemon's own cwd:
+/// with neither, `src/...` or a bare file name names no filesystem target.
+#[test]
+fn test_user_text_references_filesystem_path_needs_a_workspace_for_relative_paths() {
+    for text in ["src/agent/runtime/llm.rs", "Cargo.toml"] {
+        assert!(
+            !user_text_references_filesystem_path(text),
+            "relative reference resolved without a workspace: {text}"
+        );
+    }
 }
 
 #[test]
 fn test_user_explicitly_requests_local_file_inspection_detects_explicit_requests() {
     assert!(user_explicitly_requests_local_file_inspection(
-        "Inspect Cargo.toml and read src/main.rs"
+        "Inspect /tmp/synthetic-project/Cargo.toml and read /tmp/synthetic-project/src/main.rs"
     ));
     assert!(user_explicitly_requests_local_file_inspection(
         "Search the repo for OAuth callback code"
