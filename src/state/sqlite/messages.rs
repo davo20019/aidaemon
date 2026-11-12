@@ -90,7 +90,10 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 );
             }
         }
-        let mut tx = self.pool.begin().await?;
+        // Read-then-write under WAL: take the write lock up front, or a
+        // concurrent commit between the read and the write fails the lock
+        // upgrade at once with SQLITE_BUSY, ignoring busy_timeout.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT id, data FROM events WHERE session_id = ?1 AND event_type = 'user_message' AND turn_id = ?2 ORDER BY id LIMIT 1",
         )
