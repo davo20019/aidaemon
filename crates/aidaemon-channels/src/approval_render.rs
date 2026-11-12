@@ -207,6 +207,36 @@ fn readable_policy(value: &str) -> String {
     value.replace(" | ", "\n")
 }
 
+/// A mandate's confirmation card: its five essentials one line each, then
+/// everything else under one "Details" heading, so the owner reads what they
+/// approve at a glance and the full policy is still there.
+fn mandate_card_body(
+    subject: &str,
+    summary: &str,
+    waiting_copy: &str,
+    card: &aidaemon_core::mandate_card::MandateConfirmationCard,
+) -> String {
+    use aidaemon_core::mandate_card::Essential;
+    let mut body = format!("{subject}\n{summary}\n");
+    let summary_normalized = normalized_goal_text(summary);
+    for (essential, text) in card.essentials() {
+        // The summary already names what it does.
+        if essential == Essential::What && summary_normalized.contains(&normalized_goal_text(text))
+        {
+            continue;
+        }
+        body.push_str(&format!("\n{}: {text}", essential.label()));
+    }
+    body.push_str(&format!("\n\n{waiting_copy}"));
+    if !card.details.is_empty() {
+        body.push_str("\n\nDetails");
+        for detail in &card.details {
+            body.push_str(&format!("\n• {}", readable_policy(detail.trim())));
+        }
+    }
+    body
+}
+
 /// Build lossless plain-text pages for a goal-confirmation prompt.
 ///
 /// Mandate confirmations can contain complete authority scopes and policy text,
@@ -240,14 +270,21 @@ pub fn build_goal_confirmation_pages(
             "Nothing starts until you approve this exact policy.",
         ),
     };
-    let mut body = format!("{subject}\n{summary}\n\n{waiting_copy}");
-    for detail in details {
-        let (heading, value) = goal_detail_section(detail);
-        if heading == "🎯 Objective" && normalized_goal_text(value) == summary_normalized {
-            continue;
+    let body = match aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(details) {
+        Some(card) => mandate_card_body(subject, summary, waiting_copy, &card),
+        None => {
+            let mut body = format!("{subject}\n{summary}\n\n{waiting_copy}");
+            for detail in details {
+                let (heading, value) = goal_detail_section(detail);
+                if heading == "🎯 Objective" && normalized_goal_text(value) == summary_normalized
+                {
+                    continue;
+                }
+                body.push_str(&format!("\n\n{heading}\n{}", readable_policy(value)));
+            }
+            body
         }
-        body.push_str(&format!("\n\n{heading}\n{}", readable_policy(value)));
-    }
+    };
 
     let chunks = split_message(&body, PAGE_BODY_BYTES);
     let page_count = chunks.len();
@@ -367,6 +404,46 @@ mod tests {
         assert!(rendered.contains("🛡️ Rules it must follow\n1. Verify identity.\n2. Never retry"));
         assert!(rendered.contains("⏱️ Ends"));
         assert!(rendered.contains("Nothing starts until you approve this goal."));
+    }
+
+    #[test]
+    fn a_mandate_card_shows_five_essentials_and_one_details_section() {
+        let card = aidaemon_core::mandate_card::MandateConfirmationCard {
+            what: "Every hour, check the synthetic status page".to_string(),
+            how_often: "Every hour".to_string(),
+            can_do: "Read only – makes no changes".to_string(),
+            tells_you_when: "it finds something you asked to hear about".to_string(),
+            ends: "Only when you stop it".to_string(),
+            details: vec![
+                "Owner checkpoints: It asks you before using a new account.".to_string(),
+                "Policy reference: Your approval covers only these rules (policy version 2)."
+                    .to_string(),
+                "Timing note: It uses the length you gave.".to_string(),
+            ],
+        };
+        let pages = build_goal_confirmation_pages(
+            "Delegate mandate \"Status\": Every hour, check the synthetic status page",
+            &card.into_lines(),
+            GoalConfirmationStyle::Standard,
+        );
+        let rendered = pages.join("\n");
+        assert_eq!(
+            rendered.matches("check the synthetic status page").count(),
+            1
+        );
+        for line in [
+            "\nHow often: Every hour",
+            "\nCan do: Read only – makes no changes",
+            "\nTells you when: it finds something you asked to hear about",
+            "\nEnds: Only when you stop it",
+        ] {
+            assert!(rendered.contains(line), "{line}: {rendered}");
+        }
+        assert_eq!(rendered.matches("\nDetails\n").count(), 1, "{rendered}");
+        assert!(rendered.contains("• Timing note: It uses the length you gave."));
+        assert!(!rendered.contains("Additional detail"), "{rendered}");
+        let essentials_end = rendered.find("Ends:").unwrap();
+        assert!(essentials_end < rendered.find("Details").unwrap());
     }
 
     #[test]

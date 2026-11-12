@@ -24,6 +24,7 @@ mod event;
 mod failover;
 mod hook;
 mod limits;
+pub mod mandate_card;
 mod message;
 mod outcome;
 mod provider;
