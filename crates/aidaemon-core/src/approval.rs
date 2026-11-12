@@ -16,6 +16,14 @@ pub const OWNER_DECLINED: &str = "[OWNER DECLINED]";
 /// [`crate::Safeguard::Egress`] hook) gives when it refuses a call.
 pub const EGRESS_BLOCKED: &str = "[EGRESS BLOCKED]";
 
+/// Prefix of the reason the [`crate::AuthorityHook`] gives when a call is
+/// outside what the run may do.
+pub const AUTHORITY_BLOCKED: &str = "[AUTHORITY BLOCKED]";
+
+/// Prefix of the refusal a rejected egress call returns to the model after
+/// the run read untrusted content.
+pub const UNTRUSTED_BLOCKED: &str = "[UNTRUSTED BLOCKED]";
+
 /// What kind of thing a call does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

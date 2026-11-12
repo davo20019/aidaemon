@@ -493,7 +493,7 @@ pub fn verdict_resolution(tool: &str, verdict: &VerifierVerdict) -> sdk::Resolut
 }
 
 /// Prefix of the refusal a rejected egress call returns to the model.
-pub const UNTRUSTED_BLOCKED: &str = "[UNTRUSTED BLOCKED]";
+pub const UNTRUSTED_BLOCKED: &str = aidaemon_core::UNTRUSTED_BLOCKED;
 
 #[cfg(test)]
 mod tests {

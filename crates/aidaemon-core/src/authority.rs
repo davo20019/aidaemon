@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::approval::AUTHORITY_BLOCKED;
 use crate::hook::{Hook, HookContext, ToolDecision};
 use crate::message::ToolCall;
 use crate::safeguard::Safeguard;
@@ -93,6 +94,9 @@ pub struct AuthorityHook {
     authority: Authority,
     ceiling: Option<Arc<dyn AuthorityCeiling>>,
     delegated: bool,
+    /// How the person in charge can lift this hook's own limit, added to
+    /// its refusals (see [`Self::with_limit_note`]).
+    limit_note: Option<String>,
 }
 
 impl AuthorityHook {
@@ -101,7 +105,16 @@ impl AuthorityHook {
             authority,
             ceiling: None,
             delegated: false,
+            limit_note: None,
         }
+    }
+
+    /// Add `note` to every refusal this hook's own authority makes: what
+    /// set the limit and how it can be lifted, so the run tells the person
+    /// that instead of asking them to do the work by hand.
+    pub fn with_limit_note(mut self, note: impl Into<String>) -> Self {
+        self.limit_note = Some(note.into());
+        self
     }
 
     /// This run's authority was set by the agent that started it (a
@@ -137,6 +150,12 @@ impl std::fmt::Debug for AuthorityHook {
 #[async_trait]
 pub trait AuthorityCeiling: Send + Sync {
     async fn ceiling(&self) -> Option<Authority>;
+
+    /// What set the ceiling and how it can be lifted, added to a refusal
+    /// the ceiling (and not the run's own authority) made.
+    fn limit_note(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[async_trait]
@@ -159,7 +178,7 @@ impl Hook for AuthorityHook {
             if let Err(reason) = self.authority.permits(&call.name, tool.annotations) {
                 return ToolDecision::Deny {
                     reason: format!(
-                        "[AUTHORITY BLOCKED] `{}` is outside the access this sub-agent was \
+                        "{AUTHORITY_BLOCKED} `{}` is outside the access this sub-agent was \
                          given ({reason}). Use a permitted tool or report the limitation: the \
                          agent that started this one chose that access, and only it can start \
                          a sub-agent with more (never more than its own).",
@@ -175,13 +194,25 @@ impl Hook for AuthorityHook {
         let judged = narrowed.as_ref().unwrap_or(&self.authority);
         match judged.permits(&call.name, tool.annotations) {
             Ok(()) => ToolDecision::Allow,
-            Err(reason) => ToolDecision::Deny {
-                reason: format!(
-                    "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
+            Err(reason) => {
+                // Whose limit refused it: the run's own authority, or only
+                // the ceiling narrowing it now.
+                let note = if self.authority.permits(&call.name, tool.annotations).is_ok() {
+                    self.ceiling.as_ref().and_then(|c| c.limit_note())
+                } else {
+                    self.limit_note.as_deref()
+                };
+                let mut reason = format!(
+                    "{AUTHORITY_BLOCKED} `{}` is outside what this session allows ({reason}). \
                      Use a permitted tool or report the limitation.",
                     call.name
-                ),
-            },
+                );
+                if let Some(note) = note {
+                    reason.push(' ');
+                    reason.push_str(note);
+                }
+                ToolDecision::Deny { reason }
+            }
         }
     }
 }
@@ -429,6 +460,54 @@ mod tests {
             session.contains("this session allows (read-only)"),
             "{session}"
         );
+    }
+
+    struct NotedCeiling;
+    #[async_trait]
+    impl AuthorityCeiling for NotedCeiling {
+        async fn ceiling(&self) -> Option<Authority> {
+            Some(Authority::read_only())
+        }
+        fn limit_note(&self) -> Option<&str> {
+            Some("ceiling-note")
+        }
+    }
+
+    /// A refusal carries the note of whichever limit made it: the run's own
+    /// authority, or the ceiling narrowing a run that could otherwise write.
+    #[tokio::test]
+    async fn a_refusal_says_how_its_own_limit_is_lifted() {
+        let run = |hook: AuthorityHook| async move {
+            let agent = Agent::builder("a")
+                .model("m")
+                .provider(ScriptedProvider::new([
+                    tool_calls([call("c1", "write_file", json!({}))]),
+                    text("done"),
+                ]))
+                .tool(writer_tool())
+                .hook(hook)
+                .attest(Safeguard::Scope)
+                .attest(Safeguard::Approval)
+                .attest(Safeguard::Egress)
+                .attest(Safeguard::UntrustedOutput)
+                .build()
+                .unwrap();
+            let out = agent.run("s", "go").await.unwrap();
+            assert_eq!(out.receipts()[0].status, ReceiptStatus::Denied);
+            out.receipts()[0].reason.clone().unwrap_or_default()
+        };
+        let own = run(AuthorityHook::new(Authority::read_only())
+            .with_limit_note("own-note")
+            .with_ceiling(std::sync::Arc::new(NotedCeiling)))
+        .await;
+        assert!(own.ends_with(" own-note"), "{own}");
+        let ceiling = run(AuthorityHook::new(Authority::full())
+            .with_limit_note("own-note")
+            .with_ceiling(std::sync::Arc::new(NotedCeiling)))
+        .await;
+        assert!(ceiling.ends_with(" ceiling-note"), "{ceiling}");
+        let plain = run(AuthorityHook::new(Authority::read_only())).await;
+        assert!(plain.ends_with("report the limitation."), "{plain}");
     }
 
     struct Mixed;

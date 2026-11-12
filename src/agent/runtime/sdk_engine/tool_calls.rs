@@ -1168,8 +1168,9 @@ impl Agent {
             Err((
                 format!(
                     "[AUTHORITY BLOCKED] `{}` is outside what this session allows ({reason}). \
-                     Use a permitted tool or report the limitation.",
-                    request.name
+                     Use a permitted tool or report the limitation. {}",
+                    request.name,
+                    crate::agent::authority::READ_ONLY_MODE_NOTE
                 ),
                 "session_mode_ceiling",
             ))

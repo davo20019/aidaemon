@@ -167,6 +167,27 @@ impl aidaemon_core::AuthorityCeiling for SessionModeCeiling {
             _ => None,
         }
     }
+
+    fn limit_note(&self) -> Option<&str> {
+        Some(READ_ONLY_MODE_NOTE)
+    }
+}
+
+/// What a refusal by the owner's read-only chat mode tells the model: the
+/// owner set the limit and lifts it with a command, so the model says what
+/// is blocked and how to allow it instead of handing the owner commands to
+/// run by hand.
+pub const READ_ONLY_MODE_NOTE: &str = "The owner put this chat in read-only mode. Do not ask \
+     the owner to run commands or make the change by hand. Tell them in plain words what you \
+     could not do and that sending /mode full lets you do it.";
+
+/// The note for a refusal by `resolved`'s own authority, when what limits it
+/// is something the owner can lift: an owner's turn is read-only only
+/// because of the chat's mode.
+pub fn own_limit_note(resolved: &ResolvedAuthority) -> Option<&'static str> {
+    (resolved.owner_level.is_some()
+        && resolved.authority.level == aidaemon_core::AccessLevel::ReadOnly)
+        .then_some(READ_ONLY_MODE_NOTE)
 }
 
 /// The explicit facts authority is resolved from.
@@ -743,6 +764,25 @@ mod tests {
             access,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
         }
+    }
+
+    #[test]
+    fn only_an_owner_s_read_only_mode_says_how_to_lift_it() {
+        let resolve = |user_role, session_mode| {
+            resolve_authority(&AuthorityFacts {
+                user_role,
+                owner_default: OwnerLevel::Full,
+                session_mode,
+                workspace_grant: None,
+                bound_workspace: None,
+            })
+        };
+        let note = own_limit_note(&resolve(UserRole::Owner, Some(SessionMode::ReadOnly)));
+        assert_eq!(note, Some(READ_ONLY_MODE_NOTE));
+        assert!(READ_ONLY_MODE_NOTE.contains("/mode full"));
+        assert_eq!(own_limit_note(&resolve(UserRole::Owner, None)), None);
+        assert_eq!(own_limit_note(&resolve(UserRole::Guest, None)), None);
+        assert_eq!(own_limit_note(&resolve(UserRole::Public, None)), None);
     }
 
     #[test]

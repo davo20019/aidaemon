@@ -761,6 +761,10 @@ impl Agent {
         ));
         let mut authority_hook =
             sdk::AuthorityHook::new(authority.authority.clone()).with_ceiling(ceiling.clone());
+        // A refusal by a limit the owner can lift says how to lift it.
+        if let Some(note) = crate::agent::authority::own_limit_note(&authority) {
+            authority_hook = authority_hook.with_limit_note(note);
+        }
         // A child's authority is what its parent gave it: a refusal says so.
         if self.inherited_authority.is_some() {
             authority_hook = authority_hook.delegated();
