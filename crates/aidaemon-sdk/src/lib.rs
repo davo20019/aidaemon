@@ -21,6 +21,7 @@
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
 //! | [`testing`] | `testing` | Scripted provider for tests |
 //! | [`tool`] | `macros` (default) | `#[tool]`: a tool from a plain function, schema derived |
+//! | [`structured`] | always | Typed output: a model call or an agent's final answer as your type, one repair retry |
 //!
 //! ```no_run
 //! # #[cfg(all(feature = "providers", feature = "tools", feature = "policies"))]
@@ -59,6 +60,7 @@
 pub use aidaemon_core::*;
 
 pub mod schema;
+pub mod structured;
 
 #[doc(hidden)]
 #[path = "macro_support.rs"]
