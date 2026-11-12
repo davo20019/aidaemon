@@ -2537,4 +2537,112 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    /// The live "every hour check a page and tell me only if it is down"
+    /// request: a draft whose check settings are out of range names the
+    /// setting and its allowed range (not "timing or experiment settings
+    /// are invalid"), and the same request drafted as a plain watch with an
+    /// hourly interval is ready and shows the five-line card on create.
+    #[tokio::test]
+    async fn an_hourly_down_check_drafts_and_creates_with_the_five_line_card() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let tool = ManageMandatesTool::new(state.clone());
+        let request = json!({
+            "action": "draft",
+            "name": "qa-ux-card",
+            "autonomy_mode": "bounded",
+            "objective": "Check https://example.com/index.html every hour and alert the owner only if the page is down.",
+            "constraints": ["Only read the one page", "Send a message only when the page is down"],
+            "success_criteria": ["The owner is alerted promptly if the page is down"],
+            "operation_scopes": [{
+                "tool": "web_fetch",
+                "operation": "GET",
+                "kind": "observation",
+                "target_prefixes": ["https://example.com/index.html"],
+                "allowed_query_params": [],
+                "mutation_effects": []
+            }],
+            "owner_alerts": true
+        });
+
+        // The shape the model sent live: an objective control whose stall
+        // limit is above its range.
+        let mut with_control = request.clone();
+        with_control["objective_control"] = json!({
+            "schema_version": 1,
+            "metric_name": "page_up",
+            "unit": "boolean",
+            "baseline_micros": 0,
+            "target_micros": 1_000_000,
+            "direction": "at_least",
+            "measurement_source": "https://example.com/index.html",
+            "measurement_cadence_secs": 3600,
+            "experiment_cohort": "qa-ux-card",
+            "experiment_window_secs": 86400,
+            "minimum_effect_micros": 1_000_000,
+            "max_stagnant_measurements": 24,
+            "run_failure_budget": 3,
+            "baseline_observed_at": "2026-01-31T09:00:00Z"
+        });
+        let drafted: Value = serde_json::from_str(
+            &tool
+                .call_with(&with_control.to_string(), owner_facts())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(drafted["ready_to_confirm"], json!(false));
+        assert_eq!(
+            drafted["validation_status"],
+            json!("max_stagnant_measurements is 24; allowed: 1 to 20")
+        );
+
+        // The plain watch: how often it runs is the review interval.
+        let mut watch = request.clone();
+        watch["default_review_minutes"] = json!(60);
+        watch["min_review_minutes"] = json!(60);
+        watch["max_review_minutes"] = json!(60);
+        let drafted: Value = serde_json::from_str(
+            &tool
+                .call_with(&watch.to_string(), owner_facts())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(drafted["ready_to_confirm"], json!(true), "{drafted}");
+        assert_eq!(drafted["owner_confirms_on_card"], json!(true));
+        assert_eq!(drafted["validation_status"], json!("ready"));
+        assert_eq!(drafted["proposal"]["name"], json!("qa-ux-card"));
+
+        let mut create = watch.clone();
+        create["action"] = json!("create");
+        let crate::traits::OwnerApprovalNeed::Ask(card) =
+            tool.owner_approval(&create, &owner_facts()).await
+        else {
+            panic!("create asks the owner");
+        };
+        let essentials: Vec<&str> = card.warnings.iter().take(5).map(String::as_str).collect();
+        assert_eq!(
+            essentials,
+            [
+                "What: Check https://example.com/index.html every hour and alert the owner only if the page is down.",
+                "How often: Every hour",
+                "Can do: Read only – makes no changes",
+                "Tells you when: it finds something you asked to hear about, it needs your input, or it hits a problem",
+                "Ends: Only when you stop it",
+            ]
+        );
+        let result = tool
+            .call_with(&create.to_string(), approved_owner_facts())
+            .await
+            .unwrap();
+        assert!(result.contains("Activated mandate"), "{result}");
+        let mandates = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap();
+        assert_eq!(mandates.len(), 1);
+        assert_eq!(mandates[0].name.as_deref(), Some("qa-ux-card"));
+    }
 }

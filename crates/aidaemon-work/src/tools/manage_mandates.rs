@@ -701,7 +701,8 @@ impl ManageMandatesTool {
         )?;
         anyhow::ensure!(
             min_review_secs <= default_review_secs && default_review_secs <= max_review_secs,
-            "review bounds must satisfy min <= default <= max"
+            "{}",
+            review_bounds_error(min_review_secs, default_review_secs, max_review_secs)
         );
         let timing = activation_timing(args)?;
         let default_effort = if autonomy_mode.is_autopilot() {
@@ -955,7 +956,8 @@ impl ManageMandatesTool {
         )?;
         anyhow::ensure!(
             min_review_secs <= default_review_secs && default_review_secs <= max_review_secs,
-            "review bounds must satisfy min <= default <= max"
+            "{}",
+            review_bounds_error(min_review_secs, default_review_secs, max_review_secs)
         );
 
         let timing = activation_timing(args)?;
@@ -2042,7 +2044,12 @@ impl ManageMandatesTool {
         anyhow::ensure!(
             mandate.min_review_secs <= mandate.default_review_secs
                 && mandate.default_review_secs <= mandate.max_review_secs,
-            "review bounds must satisfy min <= default <= max"
+            "{}",
+            review_bounds_error(
+                mandate.min_review_secs,
+                mandate.default_review_secs,
+                mandate.max_review_secs
+            )
         );
         if let Some(expires_at) = args.expires_at.as_ref() {
             let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
@@ -2742,7 +2749,9 @@ const PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
 const REVIEW_EFFORTS: &[&str] = &["efficient", "balanced", "thorough"];
 const GET_SECTIONS: &[&str] = &["summary", "policy", "history"];
 const OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION: &str =
-    "Autopilot control loop. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.";
+    "Autopilot only: a number the mandate works to move to a target. Omit it for a mandate that checks or watches something; how often that runs is default_review_minutes. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.";
+const DEFAULT_REVIEW_FIELD_DESCRIPTION: &str =
+    "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.";
 const FIXED_DEADLINE_DESCRIPTION: &str =
     "RFC3339 fixed deadline. Supported by both create and update.";
 const OWNER_ALERTS_DESCRIPTION: &str =
@@ -2835,7 +2844,7 @@ impl Tool for ManageMandatesTool {
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
                     "owner_alerts": described(json!({"type":"boolean"}), OWNER_ALERTS_DESCRIPTION), "owner_alert": described(bounded_text(MAX_QUESTION_TEXT), OWNER_ALERT_DESCRIPTION),
                     "constraints": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), CONSTRAINT_FIELD_DESCRIPTION), "success_criteria": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), SUCCESS_FIELD_DESCRIPTION), "stop_conditions": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), STOP_FIELD_DESCRIPTION),
-                    "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": integer_min(1),
+                    "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": described(integer_min(1), DEFAULT_REVIEW_FIELD_DESCRIPTION),
                     "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
                     "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
@@ -3339,6 +3348,24 @@ fn validate_policy_text(
         "constraints, success_criteria, and stop_conditions exceed their combined 8 KiB bound"
     );
     Ok(())
+}
+
+/// Which review setting is out of order, with the allowed range.
+fn review_bounds_error(min_secs: i64, default_secs: i64, max_secs: i64) -> String {
+    if min_secs > max_secs {
+        format!(
+            "min_review_minutes ({}) must not be more than max_review_minutes ({})",
+            min_secs / 60,
+            max_secs / 60
+        )
+    } else {
+        format!(
+            "default_review_minutes is {}; allowed: min_review_minutes ({}) to max_review_minutes ({})",
+            default_secs / 60,
+            min_secs / 60,
+            max_secs / 60
+        )
+    }
 }
 
 fn minutes_to_secs(value: Option<i64>, default_secs: i64, field: &str) -> anyhow::Result<i64> {
