@@ -1039,6 +1039,9 @@ pub struct TerminalTool {
     /// by pid: `check` and `kill` output carries it; an unknown pid is
     /// untrusted. Daemon-held; the model can only name a pid.
     launch_trust: Arc<std::sync::Mutex<HashMap<u32, aidaemon_core::SourceTrust>>>,
+    /// Background processes whose output is a local `ddev` project's own
+    /// report (see `command_effects::reports_ddev_sites`), by pid.
+    site_report_pids: Arc<std::sync::Mutex<HashSet<u32>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
@@ -3613,6 +3616,7 @@ impl TerminalTool {
             task_processes: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             launch_trust: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            site_report_pids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
@@ -5659,6 +5663,12 @@ impl TerminalTool {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(pid, launch_trust);
+                if crate::tools::command_effects::reports_ddev_sites(command) {
+                    self.site_report_pids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(pid);
+                }
                 self.running.lock().await.insert(pid, proc);
                 self.insert_indexes_for_process(
                     pid,
@@ -8210,6 +8220,27 @@ impl crate::traits::ToolSemantics for TerminalTool {
         }
     }
 
+    fn output_reports_local_sites(&self, arguments: &str) -> bool {
+        let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+            return false;
+        };
+        match TerminalAction::parse(&args.action) {
+            // A background process's output: the shape judged at launch.
+            TerminalAction::Check | TerminalAction::Kill => args.pid.is_some_and(|pid| {
+                self.site_report_pids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&pid)
+            }),
+            TerminalAction::Run | TerminalAction::Unrecognized => args
+                .command
+                .as_deref()
+                .or(args.script.as_deref())
+                .is_some_and(crate::tools::command_effects::reports_ddev_sites),
+            TerminalAction::TrustAll => false,
+        }
+    }
+
     fn call_access_manifest(&self, arguments: &str) -> crate::traits::ToolCallAccessManifest {
         terminal_access_manifest(arguments)
     }
@@ -10428,6 +10459,30 @@ mod tests {
                      ddev wp option get siteurl";
         assert!(!ann(check).egress, "{check}");
         assert!(ann("ddev wp plugin install akismet").egress);
+    }
+
+    /// A `ddev` project report run in the sandbox needs the network
+    /// capability, so its output is untrusted; it is still typed as the
+    /// project's own report of its sites, and a background report keeps
+    /// that for its `check`.
+    #[tokio::test]
+    async fn a_ddev_report_is_typed_as_a_local_site_report() {
+        let (_, sandboxed) = host_and_sandboxed_terminals().await;
+        let run = |command: &str| {
+            serde_json::json!({"action":"run","command":command,"network":true}).to_string()
+        };
+        let report = run("cd /tmp/synthetic-site && ddev start 2>&1; ddev describe | head -30");
+        assert!(sandboxed.output_reports_local_sites(&report));
+        assert!(!sandboxed.output_reports_local_sites(&run("ddev drush uli")));
+        assert!(!sandboxed.output_reports_local_sites(&run("cat site-url.txt")));
+        sandboxed
+            .site_report_pids
+            .lock()
+            .unwrap()
+            .insert(4242);
+        let check = |pid: u32| serde_json::json!({"action":"check","pid":pid}).to_string();
+        assert!(sandboxed.output_reports_local_sites(&check(4242)));
+        assert!(!sandboxed.output_reports_local_sites(&check(4243)));
     }
 
     /// A request to a site on this computer is local work, like a local
