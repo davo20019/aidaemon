@@ -5049,6 +5049,7 @@ impl TerminalTool {
             write_roots,
             notify_session_id,
             notify_goal_id,
+            notifications_reach,
             task_id,
             tool_call_id,
             detach,
@@ -5505,7 +5506,14 @@ impl TerminalTool {
                 // effect or the mutation is never credited anywhere.
                 let completion_semantics_for_notify =
                     background_process_semantics(&command_semantics);
-                if state_for_notify.is_some() || hub_for_notify.is_some() {
+                if !notifications_reach {
+                    info!(
+                        pid,
+                        session_id = notify_session_id,
+                        "Terminal background notifier not started: a sub-agent's session has no reader"
+                    );
+                    notify_on_completion.store(false, Ordering::Relaxed);
+                } else if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
                     let command_for_notify = command.to_string();
@@ -6881,6 +6889,7 @@ impl TerminalTool {
                         write_roots: &declared_write_roots,
                         notify_session_id: &notify_session_id,
                         notify_goal_id: exec_ctx.goal_id.as_deref(),
+                        notifications_reach: notifications_reach(exec_ctx, &notify_session_id),
                         task_id: exec_ctx.task_id.as_deref(),
                         tool_call_id: exec_ctx.tool_call_id.as_deref(),
                         detach: args.detach,
@@ -6939,6 +6948,16 @@ impl TerminalTool {
     }
 }
 
+/// Whether a background job's completion notification reaches a reader: the
+/// call runs in the session the owner talks in, or the notification is
+/// routed to the goal's origin session. A sub-agent's own session (its grants
+/// are its parent chat's) has neither.
+fn notifications_reach(exec_ctx: &ToolCallContext, notify_session_id: &str) -> bool {
+    let delegated =
+        !exec_ctx.grant_session.is_empty() && exec_ctx.grant_session != exec_ctx.session_id;
+    !delegated || notify_session_id != exec_ctx.session_id
+}
+
 struct TerminalRunRequest<'a> {
     command: &'a str,
     script_via_stdin: bool,
@@ -6948,6 +6967,13 @@ struct TerminalRunRequest<'a> {
     write_roots: &'a [String],
     notify_session_id: &'a str,
     notify_goal_id: Option<&'a str>,
+    /// A completion notification for `notify_session_id` reaches someone
+    /// waiting on it. A sub-agent's own session has no channel and its
+    /// parent waits for the run's reply, not for the session: a job it
+    /// moved to the background must not end its run (live 2026-11-12: two
+    /// DDEV children ended as "still on it, I'll send the result" and the
+    /// result went to a session nobody reads).
+    notifications_reach: bool,
     task_id: Option<&'a str>,
     tool_call_id: Option<&'a str>,
     detach: bool,
@@ -11006,6 +11032,87 @@ mod tests {
                 crate::testing::call_facts("sess_background_job"),
             )
             .await;
+    }
+
+    /// A sub-agent's job that outlives the foreground wait does not end the
+    /// sub-agent's run: its session has no reader, so the notifier would
+    /// deliver nowhere while the parent got "still on it" as the child's
+    /// answer (live 2026-11-12). The run keeps going and reads the result.
+    #[tokio::test]
+    async fn sub_agent_background_run_keeps_the_run() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+
+        let child = ToolCallContext {
+            grant_session: "telegram:synthetic-chat".to_string(),
+            ..crate::testing::call_facts("specialist:executor:synthetic-child")
+        };
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 20; echo built","background":true}"#,
+                None,
+                child.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.background_started);
+        assert!(!outcome.metadata.completion_notifications_enabled);
+        assert!(!outcome.metadata.background_handoff);
+        assert!(outcome.finish.is_none());
+        assert!(outcome.output.contains("action=\"check\""));
+        let pid = outcome
+            .output
+            .split("pid=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .unwrap()
+            .to_string();
+        let _ = tool
+            .call_with_execution_context(
+                &format!(r#"{{"action":"kill","pid":{pid}}}"#),
+                None,
+                child,
+            )
+            .await;
+    }
+
+    #[test]
+    fn notifications_reach_the_chat_or_a_goal_session_only() {
+        let chat = crate::testing::call_facts("telegram:synthetic-chat");
+        assert!(notifications_reach(&chat, "telegram:synthetic-chat"));
+        let child = ToolCallContext {
+            grant_session: "telegram:synthetic-chat".to_string(),
+            ..crate::testing::call_facts("specialist:executor:synthetic-child")
+        };
+        assert!(!notifications_reach(
+            &child,
+            "specialist:executor:synthetic-child"
+        ));
+        // A child working for a goal notifies the goal's origin session.
+        assert!(notifications_reach(
+            &child,
+            "telegram:synthetic-goal-origin"
+        ));
     }
 
     /// A background job hands the run off only when something will report
