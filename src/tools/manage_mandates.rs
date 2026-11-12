@@ -1091,6 +1091,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mandate_keeps_the_owner_given_name_and_is_found_by_it() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let tool = ManageMandatesTool::new(state.clone());
+        let create = |name: &str| {
+            json!({
+                "action": "create",
+                "name": name,
+                // The objective does not repeat the name: the name is its own
+                // typed field, never parsed from text.
+                "objective": "Hourly availability checks for the synthetic status page",
+                "duration_minutes": 60,
+                "default_review_minutes": 60,
+                "min_review_minutes": 60,
+                "max_review_minutes": 60,
+                "operation_scopes": [{
+                    "tool": "http_request",
+                    "operation": "GET",
+                    "kind": "observation",
+                    "target_prefixes": ["https://status.example.test/health"],
+                    "mutation_effects": []
+                }],
+                "success_criteria": ["The owner hears about every outage of the status page"]
+            })
+            .to_string()
+        };
+
+        let mut draft: Value = serde_json::from_str(&create("synthetic-watch-2")).unwrap();
+        draft["action"] = json!("draft");
+        let drafted: Value = serde_json::from_str(
+            &tool
+                .call_with(&draft.to_string(), approved_owner_facts())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(drafted["proposal"]["name"], json!("synthetic-watch-2"));
+
+        let crate::traits::OwnerApprovalNeed::Ask(card) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&create("synthetic-watch-2")).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        assert!(
+            card.summary.contains("\"synthetic-watch-2\""),
+            "{}",
+            card.summary
+        );
+
+        let created = tool
+            .call_with(&create("synthetic-watch-2"), approved_owner_facts())
+            .await
+            .unwrap();
+        assert!(created.contains("\"synthetic-watch-2\""), "{created}");
+        let stored = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name.as_deref(), Some("synthetic-watch-2"));
+
+        // Listed under its name.
+        let listed = tool
+            .call_with(
+                &json!({"action": "list"}).to_string(),
+                approved_owner_facts(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&format!("{} \"synthetic-watch-2\"", stored[0].id)),
+            "{listed}"
+        );
+
+        // A second live mandate cannot take the same name.
+        let error = tool
+            .call_with(&create("Synthetic-Watch-2"), approved_owner_facts())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already named"), "{error}");
+
+        // Found and cancelled by the name alone.
+        let summary: Value = serde_json::from_str(
+            &tool
+                .call_with(
+                    &json!({"action": "get", "name": "SYNTHETIC-WATCH-2"}).to_string(),
+                    approved_owner_facts(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["mandate"]["id"], json!(stored[0].id));
+        assert_eq!(summary["mandate"]["name"], json!("synthetic-watch-2"));
+        tool.call_with(
+            &json!({"action": "cancel", "name": "synthetic-watch-2"}).to_string(),
+            approved_owner_facts(),
+        )
+        .await
+        .unwrap();
+        let after = state.get_mandate(&stored[0].id).await.unwrap().unwrap();
+        assert_eq!(after.status, crate::traits::MandateStatus::Cancelled);
+
+        // An unknown name selects nothing.
+        let missing = tool
+            .call_with(
+                &json!({"action": "cancel", "name": "synthetic-watch-9"}).to_string(),
+                approved_owner_facts(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("no mandate named"),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_mandate_that_should_tell_the_owner_carries_and_shows_the_alert_grant() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let state = harness.state.clone();

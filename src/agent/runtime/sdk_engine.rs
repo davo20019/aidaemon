@@ -766,6 +766,9 @@ pub(in crate::agent) struct TurnScope<'a> {
     /// Directives and mid-turn user messages, with the run position they
     /// arrived at.
     placed_directives: std::sync::Mutex<Vec<(usize, Value)>>,
+    /// Mid-turn messages taken into the run, and whether a model call
+    /// answered each; unanswered ones are re-queued at run end.
+    absorbed_steering: std::sync::Mutex<Vec<model_call::AbsorbedSteering>>,
     /// The run's summarized older rounds, once it outgrew the context.
     compaction: std::sync::Mutex<Option<compaction::RunCompaction>>,
     /// Set when a call moved work to the background with completion
@@ -1573,6 +1576,7 @@ impl Agent {
             instruction_tracker: instruction_tracker.map(tokio::sync::Mutex::new),
             extra_system: std::sync::Mutex::new(Vec::new()),
             placed_directives: std::sync::Mutex::new(Vec::new()),
+            absorbed_steering: std::sync::Mutex::new(Vec::new()),
             compaction: std::sync::Mutex::new(None),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
@@ -1719,6 +1723,7 @@ impl Agent {
             }
         };
         end_if_dropped.disarm();
+        self.sdk_return_unanswered_steering(&scope).await;
         // The run is over: record the notices still queued and finish every
         // ledger write before the task end is computed and appended.
         while let Ok(notice) = refusals_rx.try_recv() {

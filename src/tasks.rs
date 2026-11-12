@@ -484,6 +484,22 @@ impl TaskRegistry {
         taken
     }
 
+    /// Put messages a running turn took (`take_steering_messages`) but
+    /// never answered back at the front of the session's queue, in their
+    /// original order, so the channel runs them as their own turn once the
+    /// current one ends. The turn calls this before it returns, so the
+    /// channel's `finalize_and_drain` still finds them.
+    pub async fn return_steering_messages(&self, session_id: &str, messages: Vec<QueuedMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+        for message in messages.into_iter().rev() {
+            queue.push_front(message);
+        }
+    }
+
     /// Atomically check for a running task and queue the message behind it.
     ///
     /// Closes the race where a session task finishes between the caller's
@@ -687,6 +703,32 @@ mod tests {
             .await
             .is_empty());
         assert_eq!(registry.queue_len(session).await, 1);
+    }
+
+    #[tokio::test]
+    async fn returned_steering_messages_run_first_in_their_order() {
+        let registry = TaskRegistry::new(10);
+        let session = "steer-returned";
+        let ctx = queued("x").channel_ctx.clone();
+        registry.queue_message(session, queued("first"), None).await;
+        registry
+            .queue_message(session, queued("second"), None)
+            .await;
+        let taken = registry
+            .take_steering_messages(session, UserRole::Public, &ctx)
+            .await;
+        assert_eq!(taken.len(), 2);
+        registry
+            .queue_message(session, queued("arrived later"), None)
+            .await;
+
+        registry.return_steering_messages(session, taken).await;
+
+        let mut order = Vec::new();
+        while let Some(message) = registry.pop_queued_message(session).await {
+            order.push(message.text);
+        }
+        assert_eq!(order, ["first", "second", "arrived later"]);
     }
 
     #[tokio::test]

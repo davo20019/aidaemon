@@ -375,7 +375,9 @@ impl TaskPlan {
             let line = match step.status {
                 StepStatus::Completed => format!("✅ {}", step.description),
                 StepStatus::InProgress => format!("▶️ {}", step.description),
-                StepStatus::Deferred => format!("⏭️ {} (deferred)", step.description),
+                // `deferred` is the model's typed "set aside": the owner
+                // reads what it means for them.
+                StepStatus::Deferred => format!("⏭️ {} (not done)", step.description),
                 StepStatus::Failed => format!("⚠️ {} (needs attention)", step.description),
                 StepStatus::Skipped => format!("➖ {} (skipped)", step.description),
                 StepStatus::Pending => format!("○ {}", step.description),
@@ -397,7 +399,7 @@ impl TaskPlan {
         for step in &self.steps {
             let mark = match step.status {
                 StepStatus::Completed => "✅",
-                StepStatus::Deferred => "⏭️ (deferred)",
+                StepStatus::Deferred => "⏭️ (not done)",
                 StepStatus::Failed => "⚠️ (failed)",
                 _ => "☐ (not done)",
             };
@@ -864,7 +866,11 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::PartiallyCompleted);
         let checklist = plan.render_compact_checklist();
         assert!(checklist.starts_with("⚠️ Stopped short · 0 of 2 done"));
-        assert!(checklist.contains("⏭️ first action (deferred)"));
+        assert!(checklist.contains("⏭️ first action (not done)"));
+        assert!(
+            !checklist.contains("deferred"),
+            "no internal status word: {checklist}"
+        );
         assert!(!is_completed_checklist(&checklist));
         assert!(checklist.contains("what was left undone and why"));
         // The footer speaks to the user; it is not an instruction to the model.

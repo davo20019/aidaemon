@@ -429,9 +429,10 @@ pub(crate) fn word_preview(text: &str, max_chars: usize) -> String {
 }
 
 /// The reply to a message that arrives while a task runs in its session.
-/// Without attachments the running task takes it in at its next step when
-/// it is from the same sender (`TaskRegistry::take_steering_messages`);
-/// otherwise it runs as its own turn once the current one ends.
+/// Without attachments the running task takes it in at its next step that
+/// can act on it (one offering tools) when it is from the same sender
+/// (`TaskRegistry::take_steering_messages`); otherwise, or when no model
+/// call answered it, it runs as its own turn once the current one ends.
 pub(crate) fn queued_message_notice(
     text: &str,
     current_task: &str,

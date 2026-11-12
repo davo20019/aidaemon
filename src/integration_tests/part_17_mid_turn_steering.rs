@@ -367,3 +367,181 @@ async fn test_sdk_messages_sent_before_the_first_call_add_to_the_request() {
     drop(log);
     assert_eq!(registry.queue_len(session).await, 0);
 }
+
+/// A tool that queues `message` for `session` a little after it returns, so
+/// the message arrives while the run's next model call is already out.
+struct QueueAfterCall {
+    registry: Arc<crate::tasks::TaskRegistry>,
+    session: String,
+    message: crate::tasks::QueuedMessage,
+    after: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for QueueAfterCall {
+    fn name(&self) -> &str {
+        "slow_step"
+    }
+
+    fn description(&self) -> &str {
+        "A step that takes a while"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "slow_step",
+            "description": "A step that takes a while",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _args: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let registry = self.registry.clone();
+        let session = self.session.clone();
+        let message = self.message.clone();
+        let after = self.after;
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            registry.queue_message(&session, message, None).await;
+        });
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "step done".to_string(),
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for QueueAfterCall {}
+
+/// A message that arrives while the run's last call is out, before a reply
+/// retry that offers no tools, is not taken into that retry (which could not
+/// act on it): it stays queued, so the channel runs it as its own turn.
+#[tokio::test]
+async fn test_sdk_mid_turn_message_is_not_taken_into_a_text_only_retry() {
+    let session = "tg_mid_turn_text_only";
+    let channel_ctx = ChannelContext::private("telegram");
+    let registry = Arc::new(crate::tasks::TaskRegistry::new(10));
+    let steer = "In 3 minutes, remind me to stretch (synthetic check two).";
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(QueueAfterCall {
+        registry: registry.clone(),
+        session: session.to_string(),
+        message: crate::tasks::QueuedMessage::new(
+            steer,
+            UserRole::Owner,
+            channel_ctx.clone(),
+            Vec::new(),
+        ),
+        after: std::time::Duration::from_millis(200),
+    });
+    // The call after the step is out when the message arrives and answers
+    // empty; after real work the retry is text only.
+    let provider = MockProvider::with_delayed_responses(
+        vec![
+            MockProvider::tool_call_response("slow_step", "{}"),
+            MockProvider::text_response(""),
+            MockProvider::text_response("Step done."),
+        ],
+        vec![
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1500),
+        ],
+    );
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    harness.agent.set_task_registry(registry.clone());
+
+    harness
+        .agent
+        .handle_message(
+            session,
+            "Run the step",
+            None,
+            UserRole::Owner,
+            channel_ctx,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let log = harness.provider.call_log.lock().await;
+    let text_only = log
+        .iter()
+        .filter(|call| call.options.tool_choice == crate::traits::ToolChoiceMode::None)
+        .count();
+    assert!(text_only > 0, "the reply retry ran text only");
+    assert!(
+        log.iter().all(|call| call
+            .messages
+            .iter()
+            .all(|m| !m["content"].as_str().unwrap_or("").contains(steer))),
+        "no call took the message"
+    );
+    drop(log);
+    let queued = registry
+        .pop_queued_message(session)
+        .await
+        .expect("the message waits for its own turn");
+    assert_eq!(queued.text, steer);
+}
+
+/// A message taken into a call that then failed, ending the run, was never
+/// answered: it goes back to the queue for its own turn.
+#[tokio::test]
+async fn test_sdk_unanswered_mid_turn_message_is_queued_again() {
+    let session = "tg_mid_turn_unanswered";
+    let channel_ctx = ChannelContext::private("telegram");
+    let registry = Arc::new(crate::tasks::TaskRegistry::new(10));
+    let steer = "Also send me the message: synthetic check three.";
+    let tool: Arc<dyn crate::traits::Tool> = Arc::new(QueueOnCall {
+        registry: registry.clone(),
+        session: session.to_string(),
+        message: crate::tasks::QueuedMessage::new(
+            steer,
+            UserRole::Owner,
+            channel_ctx.clone(),
+            Vec::new(),
+        ),
+    });
+    // Every call after the step fails.
+    let provider = MockProvider::with_responses(vec![MockProvider::tool_call_response(
+        "slow_step",
+        "{}",
+    )])
+    .with_strict_responses();
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    harness.agent.set_task_registry(registry.clone());
+
+    let _ = harness
+        .agent
+        .handle_message(
+            session,
+            "Run the step",
+            None,
+            UserRole::Owner,
+            channel_ctx,
+            None,
+        )
+        .await;
+
+    let log = harness.provider.call_log.lock().await;
+    assert!(
+        log.iter().skip(1).any(|call| call
+            .messages
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or("").contains(steer))),
+        "the failed call carried the message"
+    );
+    drop(log);
+    let queued = registry
+        .pop_queued_message(session)
+        .await
+        .expect("the unanswered message is queued again");
+    assert_eq!(queued.text, steer);
+    assert_eq!(registry.queue_len(session).await, 0);
+}
