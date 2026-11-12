@@ -912,7 +912,17 @@ async fn test_heartbeat_telemetry_tracks_failures_and_recovery() {
     let host = coordinator.into_host();
     let waker = host.waker();
     let host = tokio::spawn(host.run(shutdown.clone()));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for each run rather than a fixed delay: under load the host can
+    // take longer than a fixed sleep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && !telemetry
+            .snapshots()
+            .iter()
+            .any(|j| j.name == "test_job" && j.consecutive_failures == 1)
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let first = telemetry.snapshots();
     let first_job = first
@@ -924,7 +934,15 @@ async fn test_heartbeat_telemetry_tracks_failures_and_recovery() {
     assert!(first_job.last_run_at.is_some());
 
     waker.wake();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && !telemetry
+            .snapshots()
+            .iter()
+            .any(|j| j.name == "test_job" && j.last_success_at.is_some())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     shutdown.cancel();
     host.await.unwrap();
 
