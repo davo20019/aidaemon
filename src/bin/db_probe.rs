@@ -1545,7 +1545,11 @@ async fn record_fixture_from_session(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml::to_string(&scenario)?;
+    // One-line strings stay on one line, as serde_yaml wrote them.
+    let yaml = serde_saphyr::to_string_with_options(
+        &scenario,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )?;
     std::fs::write(&output_path, format!("{RECORDED_SCENARIO_HEADER}{yaml}"))?;
     println!("Recorded draft scenario -> {}", output_path.display());
     println!("Check it against the trace before moving it into the suite.");

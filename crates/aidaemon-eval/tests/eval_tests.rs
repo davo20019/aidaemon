@@ -621,7 +621,7 @@ fn finished_runs_have_their_own_status() {
         tool: "file_report".into(),
     };
     assert_eq!(aidaemon_eval::status_name(&status), "finished");
-    let expected: ExpectedStatus = serde_yaml::from_str("finished").unwrap();
+    let expected: ExpectedStatus = serde_saphyr::from_str("finished").unwrap();
     assert_eq!(expected, ExpectedStatus::Finished);
     assert_eq!(expected.as_str(), aidaemon_eval::status_name(&status));
 }
@@ -629,7 +629,7 @@ fn finished_runs_have_their_own_status() {
 /// `completed` says the run stopped; `succeeded` says its objective was met.
 #[test]
 fn succeeded_is_checked_separately_from_completed() {
-    let expect = |yaml: &str| -> aidaemon_eval::Expect { serde_yaml::from_str(yaml).unwrap() };
+    let expect = |yaml: &str| -> aidaemon_eval::Expect { serde_saphyr::from_str(yaml).unwrap() };
     let mut outcome = aidaemon_core::RunOutcome {
         status: aidaemon_core::RunStatus::Completed,
         final_text: Some("done".into()),

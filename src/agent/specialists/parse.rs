@@ -25,7 +25,7 @@ struct RawFrontmatter {
     #[serde(default)]
     memory_scope: Option<String>,
     #[serde(flatten)]
-    extra: std::collections::BTreeMap<String, serde_yaml::Value>,
+    extra: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 pub fn parse_specialist(
@@ -33,7 +33,12 @@ pub fn parse_specialist(
     content: &str,
 ) -> anyhow::Result<SpecialistDef> {
     let (frontmatter_str, body) = split_frontmatter(content)?;
-    let raw: RawFrontmatter = serde_yaml::from_str(&frontmatter_str)
+    let options = serde_saphyr::options! {
+        strict_booleans: true,
+        leading_zero_numbers_as_strings: true,
+        underscored_numbers_as_strings: true,
+    };
+    let raw: RawFrontmatter = serde_saphyr::from_str_with_options(&frontmatter_str, options)
         .map_err(|e| anyhow::anyhow!("invalid frontmatter YAML: {}", e))?;
 
     let declared_kind = SpecialistKind::from_str(&raw.kind)
