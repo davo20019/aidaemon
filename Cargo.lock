@@ -424,6 +424,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-decisions",
  "aidaemon-events",
+ "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-tools",

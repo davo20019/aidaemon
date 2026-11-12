@@ -12,13 +12,18 @@
 //!   and the classified provider errors recovery decisions read.
 //! - [`prompt`]: the system prompt's cacheable core, its fixed rule blocks
 //!   and the prefix fingerprints.
+//! - [`policy`]: execution policies, turn signals, recall guardrails and
+//!   model trust tiers.
 //! - [`message_content`]: chat content helpers.
 //! - [`context_budget`]: token estimates and context-window budgets.
+//! - [`turn`]: system directives, tool-result notices and task outcomes.
 //! - [`settings`]: what the runtime takes from its host's configuration.
 
 pub mod chat_bridge;
 pub mod context_budget;
 pub mod llm;
 pub mod message_content;
+pub mod policy;
 pub mod prompt;
 pub mod settings;
+pub mod turn;

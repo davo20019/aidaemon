@@ -1,19 +1,19 @@
 #[cfg(test)]
 use serde_json::Value;
 
-use super::intent_routing::contains_keyword_as_words;
 #[cfg(test)]
 use aidaemon_memory::render::{
     build_critical_facts_prompt_block, extract_critical_fact_summary, CriticalFactSummary,
 };
+use aidaemon_tools::text::contains_keyword_as_words;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CriticalFactQuery {
+pub enum CriticalFactQuery {
     OwnerName,
     AssistantName,
 }
 
-pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
+pub fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
     let lower = user_text
         .trim()
         .trim_end_matches(['?', '!', '.'])
@@ -61,7 +61,7 @@ pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFact
 }
 
 #[cfg(test)]
-pub(super) fn deterministic_reply_for_critical_query(
+pub fn deterministic_reply_for_critical_query(
     query: CriticalFactQuery,
     summary: &CriticalFactSummary,
 ) -> String {
@@ -79,7 +79,7 @@ pub(super) fn deterministic_reply_for_critical_query(
     }
 }
 
-pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
+pub fn text_relates_to_critical_identity(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
@@ -110,12 +110,12 @@ pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
 
 /// Execution tools blocked when delegation mode is active.
 /// Keep spawn_agent available for task-lead orchestration.
-pub(super) fn is_delegation_blocked_tool(name: &str) -> bool {
+pub fn is_delegation_blocked_tool(name: &str) -> bool {
     matches!(name, "terminal" | "browser" | "run_command")
 }
 
 #[cfg(test)]
-pub(super) fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
+pub fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
     defs.iter()
         .filter_map(|def| {
             let name = def
@@ -134,8 +134,7 @@ pub(super) fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::Fact;
-    use crate::types::FactPrivacy;
+    use aidaemon_memory::records::{Fact, FactPrivacy};
     use chrono::Utc;
     use serde_json::json;
 

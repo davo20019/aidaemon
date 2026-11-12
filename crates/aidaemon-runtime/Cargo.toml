@@ -47,5 +47,6 @@ tracing = "0.1"
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
+aidaemon-memory = { path = "../aidaemon-memory" }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

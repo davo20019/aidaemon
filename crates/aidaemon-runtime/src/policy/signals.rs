@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 
-use super::contains_keyword_as_words;
-use crate::execution_policy::{score_risk_from_capabilities, PolicyBundle};
-use crate::traits::ToolCapabilities;
+use super::execution::{score_risk_from_capabilities, PolicyBundle};
+use aidaemon_tools::semantics::ToolCapabilities;
+use aidaemon_tools::text::contains_keyword_as_words;
 
 #[allow(dead_code)] // Kept for potential future response/fallback handling.
-pub(super) fn first_question_line(text: &str) -> Option<String> {
+pub fn first_question_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
         .find(|line| line.contains('?'))
         .map(|s| s.to_string())
 }
 
-pub(super) fn build_policy_bundle(
+pub fn build_policy_bundle(
     _user_text: &str,
     available_capabilities: &HashMap<String, ToolCapabilities>,
     prior_immediate_failure: bool,
@@ -28,7 +28,7 @@ pub(super) fn build_policy_bundle(
     PolicyBundle::from_scores(risk_score, uncertainty_score, confidence)
 }
 
-pub(super) fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str, bool)> {
+pub fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str, bool)> {
     let lower = text.trim().to_ascii_lowercase();
     // Feedback learning must not reinterpret a substantive new request just
     // because it contains a courtesy word (for example, "thanks to X, deploy
@@ -71,7 +71,7 @@ pub(super) fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str
 /// Returns true if the message is a trivial acknowledgment, greeting, or
 /// single imperative command that should never be routed as Complex.
 #[allow(dead_code)] // Kept for potential future guardrail handling.
-pub(super) fn is_trivial_message(lower: &str) -> bool {
+pub fn is_trivial_message(lower: &str) -> bool {
     let trivial_prefixes = [
         "ok",
         "okay",
@@ -117,8 +117,7 @@ pub(super) fn is_trivial_message(lower: &str) -> bool {
 /// Returns true for short corrective follow-ups (not new requests), e.g.
 /// "you did send me the pdf". This is a deterministic guardrail when the
 /// first-pass intent gate over-predicts `needs_tools=true`.
-#[cfg(test)]
-pub(super) fn is_short_user_correction(text: &str) -> bool {
+pub fn is_short_user_correction(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() || lower.contains('?') {
         return false;
@@ -198,7 +197,7 @@ pub(super) fn is_short_user_correction(text: &str) -> bool {
 /// Returns true if the message is a list of immediate tool operations that can
 /// be completed in a single agent session. These should be Simple, not Complex.
 #[allow(dead_code)] // Kept for potential future guardrail handling.
-pub(super) fn is_sequential_tool_request(lower: &str) -> bool {
+pub fn is_sequential_tool_request(lower: &str) -> bool {
     // Check for numbered list patterns (1), 2), 3) or 1. 2. 3.)
     let has_numbered_steps = lower.contains("1)") || lower.contains("1.");
     if !has_numbered_steps {
@@ -234,5 +233,5 @@ pub(super) fn is_sequential_tool_request(lower: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "policy_signal_tests.rs"]
+#[path = "signal_tests.rs"]
 mod policy_signal_tests;

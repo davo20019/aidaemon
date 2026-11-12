@@ -71,14 +71,17 @@ mod intent_routing;
 #[path = "intent/relational_prefilter.rs"]
 #[cfg(test)]
 pub mod relational_prefilter;
+#[allow(unused_imports)]
 use intent_routing::contains_keyword_as_words;
 #[cfg(test)]
 use intent_routing::infer_intent_gate;
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
 #[allow(unused_imports)]
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
-#[path = "policy/policy_signals.rs"]
-mod policy_signals;
+/// Policy signals live in `aidaemon-runtime`.
+mod policy_signals {
+    pub(super) use aidaemon_runtime::policy::signals::*;
+}
 #[cfg(test)]
 use policy_signals::is_short_user_correction;
 use policy_signals::{build_policy_bundle, detect_explicit_outcome_signal};
@@ -100,8 +103,10 @@ pub(in crate::agent) use execution_state::{
 };
 #[path = "turn/loop_utils.rs"]
 mod loop_utils;
-#[path = "policy/recall_guardrails.rs"]
-mod recall_guardrails;
+/// Recall guardrails live in `aidaemon-runtime`.
+mod recall_guardrails {
+    pub(super) use aidaemon_runtime::policy::recall_guardrails::*;
+}
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
 use loop_utils::{
@@ -109,8 +114,10 @@ use loop_utils::{
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
-#[path = "runtime/task_outcome.rs"]
-mod task_outcome;
+/// Task outcomes live in `aidaemon-runtime`.
+mod task_outcome {
+    pub use aidaemon_runtime::turn::task_outcome::*;
+}
 use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]
@@ -205,8 +212,10 @@ mod sliding_window;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 pub(crate) mod stt;
-#[path = "turn/system_directives.rs"]
-mod system_directives;
+/// System directives live in `aidaemon-runtime`.
+mod system_directives {
+    pub(in crate::agent) use aidaemon_runtime::turn::system_directives::*;
+}
 #[path = "runtime/system_prompt.rs"]
 mod system_prompt;
 #[path = "tools/tool_defs.rs"]
@@ -215,8 +224,10 @@ mod tool_defs;
 mod tool_exec;
 #[path = "turn/tool_execution/mod.rs"]
 mod tool_execution;
-#[path = "turn/tool_result_notices.rs"]
-mod tool_result_notices;
+/// Tool-result notices live in `aidaemon-runtime`.
+mod tool_result_notices {
+    pub(in crate::agent) use aidaemon_runtime::turn::tool_result_notices::*;
+}
 #[path = "turn/turn_eviction.rs"]
 pub(crate) mod turn_eviction;
 #[path = "turn/turn_render.rs"]
