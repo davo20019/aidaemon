@@ -47,6 +47,7 @@ members = [
     "crates/aidaemon-skills",
     "crates/aidaemon-secrets",
     "crates/aidaemon-nodes",
+    "crates/aidaemon-terminal-bridge",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
     "crates/aidaemon-channel-slack",
@@ -68,7 +69,6 @@ path = "src/bin/computer_use_probe.rs"
 required-features = ["computer_use-macos"]
 
 [dependencies]
-aidaemon-node-protocol = { version = "0.1.0", path = "crates/node-protocol" }
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "query", "form", "blocking", "gzip", "deflate", "brotli", "stream"] }
@@ -102,7 +102,6 @@ regex = "1"
 # vs. a truly-stalled process. Default features disabled — we only need the
 # `system` component (processes), not disks/networks/components.
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
-tokio-tungstenite = { version = "0.30", features = ["native-tls"], optional = true }
 self_update = { version = "1.3", features = ["reqwest", "rustls", "github", "archive-tar", "compression-tar-gz"], default-features = false }
 semver = "1"
 hmac = "0.13"
@@ -111,10 +110,6 @@ hex = "0.4"
 base64 = "0.23"
 rand = "0.10"
 serialport = { version = "4.10", default-features = false }
-hkdf = { version = "0.13", optional = true }
-p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
-aes-gcm = { version = "0.11", optional = true }
-portable-pty = { version = "0.9", optional = true }
 
 # The agent kernel (workspace crate).
 aidaemon-core = { version = "=0.2.0", path = "crates/aidaemon-core" }
@@ -130,6 +125,8 @@ aidaemon-skills = { version = "=0.2.0", path = "crates/aidaemon-skills" }
 aidaemon-secrets = { version = "=0.2.0", path = "crates/aidaemon-secrets" }
 # Nodes: hardware companions, their Gateway, store and tools.
 aidaemon-nodes = { version = "=0.2.0", path = "crates/aidaemon-nodes" }
+# The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).
+aidaemon-terminal-bridge = { version = "=0.2.0", path = "crates/aidaemon-terminal-bridge", optional = true }
 aidaemon-tool-browser = { version = "=0.2.0", path = "crates/aidaemon-tool-browser" }
 aidaemon-providers = { version = "=0.2.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
 # The MCP transport; the daemon keeps its registry and result rendering.
@@ -162,12 +159,7 @@ browser = ["aidaemon-tool-browser/chromium"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
 execution-docker = ["aidaemon-tools/docker"]
-terminal-bridge = [
-    "dep:tokio-tungstenite",
-    "dep:hkdf",
-    "dep:aes-gcm",
-    "dep:portable-pty",
-]
+terminal-bridge = ["dep:aidaemon-terminal-bridge"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 computer_use = []
 # Export runs to an OTLP backend when `[telemetry]` names one.

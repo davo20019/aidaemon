@@ -70,7 +70,6 @@ dependencies = [
 name = "aidaemon"
 version = "0.12.9"
 dependencies = [
- "aes-gcm",
  "aidaemon-agents",
  "aidaemon-channel-discord",
  "aidaemon-channel-slack",
@@ -82,7 +81,6 @@ dependencies = [
  "aidaemon-events",
  "aidaemon-mcp",
  "aidaemon-memory",
- "aidaemon-node-protocol",
  "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
@@ -90,6 +88,7 @@ dependencies = [
  "aidaemon-secrets",
  "aidaemon-skills",
  "aidaemon-store-sqlite",
+ "aidaemon-terminal-bridge",
  "aidaemon-tool-browser",
  "aidaemon-tools",
  "aidaemon-work",
@@ -108,13 +107,10 @@ dependencies = [
  "fastembed",
  "futures",
  "hex",
- "hkdf",
  "hmac",
  "libc",
  "libsqlite3-sys",
  "opentelemetry_sdk",
- "p256",
- "portable-pty",
  "proptest",
  "rand 0.10.3",
  "regex",
@@ -135,7 +131,6 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "toml",
  "toml_edit",
@@ -566,6 +561,38 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "aidaemon-terminal-bridge"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm",
+ "aidaemon-secrets",
+ "aidaemon-tools",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "dirs 7.0.0",
+ "futures",
+ "hkdf",
+ "hmac",
+ "libc",
+ "p256",
+ "portable-pty",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "shell-words",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

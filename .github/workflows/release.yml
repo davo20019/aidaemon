@@ -344,6 +344,7 @@ jobs:
             aidaemon-tool-browser
             aidaemon-memory
             aidaemon-skills
+            aidaemon-terminal-bridge
             aidaemon-work
             aidaemon-nodes
             aidaemon-runtime
