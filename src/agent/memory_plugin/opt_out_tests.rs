@@ -222,3 +222,145 @@ async fn a_replacing_memory_system_is_told_the_turn_is_opted_out() {
         "offered under any memory system"
     );
 }
+
+/// Whether any later model request carries the private-turn refusal.
+async fn model_was_told_private(harness: &TestHarness) -> bool {
+    let log = harness.provider.call_log.lock().await;
+    log.iter().skip(1).any(|call| {
+        serde_json::to_string(&call.messages)
+            .unwrap()
+            .contains(super::opt_out::PRIVATE_TURN_STORE_REFUSAL)
+    })
+}
+
+async fn remember_after(private: bool) -> TestHarness {
+    let harness = crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "remember_fact",
+            r#"{"category":"personal","key":"test_lizard_name","value":"Quibbit-9"}"#,
+        ),
+        MockProvider::text_response("This message is private, so I won't store it."),
+    ]))
+    .await
+    .unwrap();
+    if private {
+        set_next_message_private(harness.state.as_ref(), SESSION, true)
+            .await
+            .unwrap();
+    }
+    harness
+        .agent
+        .handle_inbound_message(request("My synthetic lizard is named Quibbit-9."))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    harness
+}
+
+async fn lizard_facts(harness: &TestHarness) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM facts WHERE value LIKE '%Quibbit-9%'")
+        .fetch_one(&harness.state.pool())
+        .await
+        .unwrap()
+}
+
+/// `/private` covers the explicit memory tools too (live 2026-11-12: the
+/// model stored the fact with `remember_fact` and recalled it after
+/// `/clear`). The kernel refuses the store with a reason the model relays.
+#[tokio::test]
+async fn an_opted_out_turn_cannot_store_through_a_memory_tool() {
+    let normal = remember_after(false).await;
+    assert_eq!(lizard_facts(&normal).await, 1, "a normal turn stores");
+    assert!(!model_was_told_private(&normal).await);
+
+    let private = remember_after(true).await;
+    assert_eq!(lizard_facts(&private).await, 0, "the private turn stored");
+    assert!(model_was_told_private(&private).await);
+}
+
+/// A memory system's tool, counting its calls.
+struct CountingMemoryTool {
+    name: &'static str,
+    read_only: bool,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl aidaemon_core::Tool for CountingMemoryTool {
+    fn spec(&self) -> aidaemon_core::ToolSpec {
+        aidaemon_core::ToolSpec {
+            name: self.name.into(),
+            description: "Synthetic memory tool".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn annotations(&self) -> aidaemon_core::ToolAnnotations {
+        if self.read_only {
+            aidaemon_core::ToolAnnotations::READ_ONLY
+        } else {
+            aidaemon_core::ToolAnnotations::WRITE
+        }
+    }
+
+    async fn call(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &aidaemon_core::ToolContext,
+    ) -> aidaemon_core::ToolResult {
+        self.calls.lock().unwrap().push(self.name);
+        Ok(aidaemon_core::ToolOutput::text("ok"))
+    }
+}
+
+/// A memory system that offers one store and one recall tool.
+struct ToolMemory(Arc<Mutex<Vec<&'static str>>>);
+
+#[async_trait]
+impl MemorySystem for ToolMemory {
+    async fn turn(&self, _turn: &MemoryTurn) -> MemoryParts {
+        MemoryParts {
+            hooks: Vec::new(),
+            tools: vec![
+                Arc::new(CountingMemoryTool {
+                    name: "synthetic_memory_store",
+                    read_only: false,
+                    calls: self.0.clone(),
+                }),
+                Arc::new(CountingMemoryTool {
+                    name: "synthetic_memory_recall",
+                    read_only: true,
+                    calls: self.0.clone(),
+                }),
+            ],
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_opted_out_turn_cannot_store_through_a_memory_systems_tool() {
+    let mut harness = crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_memory_recall", "{}"),
+        MockProvider::tool_call_response("synthetic_memory_store", "{}"),
+        MockProvider::text_response("This message is private, so I won't store it."),
+    ]))
+    .await
+    .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    harness
+        .agent
+        .set_memory_plugin(Arc::new(SystemMemory::new(Arc::new(ToolMemory(
+            calls.clone(),
+        )))));
+    set_next_message_private(harness.state.as_ref(), SESSION, true)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request("Remember my synthetic code word."))
+        .await
+        .unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), ["synthetic_memory_recall"]);
+    assert!(model_was_told_private(&harness).await);
+}

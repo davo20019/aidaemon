@@ -49,6 +49,49 @@ pub(crate) async fn mark_turn_opted_out(
     Ok(())
 }
 
+/// What the model is told when an opted-out turn tries to store something.
+pub(crate) const PRIVATE_TURN_STORE_REFUSAL: &str = "[PRIVATE] This message is private, so \
+nothing from it is stored in memory. Do not try another way to store it; tell the user plainly \
+that you won't remember it.";
+
+/// Refuses memory stores on a turn opted out of learning, for the daemon's
+/// memory tools and a replacing memory system's alike: a call is judged by
+/// its tool's [`MemoryToolFacts`](super::tool_facts::MemoryToolFacts)
+/// (`stores`), never by its name. Reads still run. The opt-out is read at
+/// call time, so a `skip_learning` earlier in the turn covers later calls.
+pub(crate) struct PrivateTurnGuard {
+    learning: TurnLearning,
+}
+
+impl PrivateTurnGuard {
+    pub(crate) fn new(learning: TurnLearning) -> Self {
+        Self { learning }
+    }
+}
+
+#[async_trait]
+impl sdk::Hook for PrivateTurnGuard {
+    async fn before_tool(
+        &self,
+        _ctx: &sdk::HookContext<'_>,
+        call: &sdk::ToolCall,
+        _tool: &sdk::ToolInfo,
+    ) -> sdk::ToolDecision {
+        if self.learning.allowed() {
+            return sdk::ToolDecision::Allow;
+        }
+        let stores = super::tool_facts::memory_tool_facts(&call.name)
+            .is_some_and(|facts| (facts.stores)(&call.arguments.to_string()));
+        if stores {
+            sdk::ToolDecision::Deny {
+                reason: PRIVATE_TURN_STORE_REFUSAL.to_string(),
+            }
+        } else {
+            sdk::ToolDecision::Allow
+        }
+    }
+}
+
 /// The model's way to opt the current turn out of learning.
 pub(crate) struct SkipLearningTool {
     learning: TurnLearning,

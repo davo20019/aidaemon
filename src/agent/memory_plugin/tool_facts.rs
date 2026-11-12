@@ -36,6 +36,10 @@ pub(in crate::agent) struct MemoryToolFacts {
     pub representative_calls: &'static [&'static str],
     /// A successful read whose text must not be mistaken for a failure.
     pub output_is_report: Option<fn(&str, Option<&str>) -> bool>,
+    /// A call with these arguments stores something new in memory (not a
+    /// read, a deletion, a visibility change or requested work such as a
+    /// goal): what a turn opted out of learning may not do.
+    pub stores: fn(&str) -> bool,
 }
 
 static FACTS: LazyLock<RwLock<HashMap<String, Arc<MemoryToolFacts>>>> =
@@ -97,6 +101,8 @@ fn memory_system_tool_facts(read_only: bool) -> MemoryToolFacts {
         evidence_modeled: true,
         representative_calls: &["{}"],
         output_is_report: None,
+        // All such a system declares is whether a tool only reads.
+        stores: if read_only { |_| false } else { |_| true },
     }
 }
 
@@ -108,17 +114,19 @@ const DAEMON_TOOLS: &[&str] = &[
 ];
 
 fn daemon_tool_facts() -> HashMap<String, Arc<MemoryToolFacts>> {
-    let write_only = |scope: Option<ToolSemanticScope>, low_signal_result, summary_from_action| {
-        MemoryToolFacts {
-            scope,
-            low_signal_result,
-            summary_from_action,
-            keep_result_excerpt: false,
-            evidence: Box::new(|_| Vec::new()),
-            evidence_modeled: false,
-            representative_calls: &["{}"],
-            output_is_report: None,
-        }
+    let write_only = |scope: Option<ToolSemanticScope>,
+                      low_signal_result,
+                      summary_from_action,
+                      stores: fn(&str) -> bool| MemoryToolFacts {
+        scope,
+        low_signal_result,
+        summary_from_action,
+        keep_result_excerpt: false,
+        evidence: Box::new(|_| Vec::new()),
+        evidence_modeled: false,
+        representative_calls: &["{}"],
+        output_is_report: None,
+        stores,
     };
     let manage_memories = MemoryToolFacts {
         scope: Some(UserMemory),
@@ -134,6 +142,9 @@ fn daemon_tool_facts() -> HashMap<String, Arc<MemoryToolFacts>> {
             r#"{"action":"diagnose_scheduled"}"#,
         ],
         output_is_report: Some(manage_memories_output_is_report),
+        // Its writes forget, repair or re-scope stored facts, or start work
+        // the user asked for (goals, schedules); none stores the turn.
+        stores: |_| false,
     };
     let manage_people = MemoryToolFacts {
         scope: None,
@@ -151,10 +162,25 @@ fn daemon_tool_facts() -> HashMap<String, Arc<MemoryToolFacts>> {
         evidence_modeled: true,
         representative_calls: &["{}"],
         output_is_report: None,
+        stores: |arguments| {
+            matches!(
+                action_from_arguments(arguments).as_deref(),
+                Some("add" | "update" | "add_fact" | "link" | "confirm" | "reconnect")
+            )
+        },
     };
     [
-        ("remember_fact", write_only(Some(UserMemory), true, true)),
-        ("share_memory", write_only(Some(UserMemory), false, false)),
+        (
+            "remember_fact",
+            write_only(Some(UserMemory), true, true, |arguments| {
+                !crate::tools::memory::call_deletes_facts(arguments)
+            }),
+        ),
+        // Widens who may see a fact already stored.
+        (
+            "share_memory",
+            write_only(Some(UserMemory), false, false, |_| false),
+        ),
         ("manage_memories", manage_memories),
         ("manage_people", manage_people),
     ]
