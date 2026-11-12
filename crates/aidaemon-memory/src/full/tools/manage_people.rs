@@ -6,25 +6,27 @@ use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{
-    semantics_for_exact_read_actions, Person, PersonFact, StateStore, Tool, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects,
+use aidaemon_tools::semantics::{
+    semantics_for_exact_read_actions, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
 };
+use aidaemon_tools::services::SettingsStore;
+use aidaemon_tools::OutcomeTool as Tool;
 
+use crate::records::{Person, PersonFact};
+
+/// The people store's tool. People intelligence is on while the host's
+/// `people_enabled` setting is `"true"`; `enable`/`disable` set it.
 pub struct ManagePeopleTool {
-    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
-    settings: Arc<dyn crate::traits::SettingsStore>,
+    store: Arc<dyn crate::stores::MemoryStores>,
+    settings: Arc<dyn SettingsStore>,
 }
 
 impl ManagePeopleTool {
     pub fn new(
-        state: Arc<dyn StateStore>,
-        store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+        settings: Arc<dyn SettingsStore>,
+        store: Arc<dyn crate::stores::MemoryStores>,
     ) -> Self {
-        Self {
-            store,
-            settings: state,
-        }
+        Self { store, settings }
     }
 }
 
@@ -118,8 +120,8 @@ impl Tool for ManagePeopleTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
@@ -157,13 +159,13 @@ impl Tool for ManagePeopleTool {
             other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
         }
     }.await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for ManagePeopleTool {
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
             always_offered: true,
             status_from_arguments: true,
             ..Default::default()
@@ -887,11 +889,8 @@ impl ManagePeopleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::traits::store_prelude::*;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
+    use crate::full::tools::test_support::{memory, Settings, ToolCalls as _};
+    use aidaemon_tools::semantics::ToolSemantics;
 
     #[test]
     fn schema_fits_payload_budget() {
@@ -930,20 +929,12 @@ mod tests {
     }
 
     async fn setup_tool() -> ManagePeopleTool {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let db_path = db_file.path().to_str().unwrap().to_string();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(&db_path, 100, None, embedding_service)
-                .await
-                .unwrap(),
-        );
-        state.set_setting("people_enabled", "true").await.unwrap();
-        std::mem::forget(db_file);
-        {
-            let store = state.memory_stores();
-            ManagePeopleTool::new(state as Arc<dyn StateStore>, store)
-        }
+        let settings = Arc::new(Settings::default());
+        settings
+            .set_setting("people_enabled", "true")
+            .await
+            .unwrap();
+        ManagePeopleTool::new(settings, memory().await)
     }
 
     #[tokio::test]

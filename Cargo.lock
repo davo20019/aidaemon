@@ -333,6 +333,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-memory",
  "aidaemon-policies",
+ "aidaemon-tools",
  "anyhow",
  "async-trait",
  "chrono",

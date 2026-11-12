@@ -10,16 +10,14 @@ use crate::traits::{
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolMutationEffects, ToolOutcomeStatus,
 };
-use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
+use crate::types::{ChannelVisibility, UserRole};
 
-fn compact_provenance_excerpt(text: &str) -> String {
-    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    crate::utils::truncate_str(&single_line, 180)
-}
-
+/// `manage_memories` as the daemon offers it: the memory actions of
+/// [`aidaemon_memory::full::tools::ManageMemoriesTool`] and the goal
+/// actions, which are the daemon's work, as one tool with one schema.
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
-    store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
+    memory: aidaemon_memory::full::tools::ManageMemoriesTool,
 }
 
 /// One parsed schedule of a `create_scheduled_goal` call.
@@ -78,7 +76,10 @@ impl ManageMemoriesTool {
         state: Arc<dyn StateStore>,
         store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     ) -> Self {
-        Self { state, store }
+        Self {
+            state,
+            memory: aidaemon_memory::full::tools::ManageMemoriesTool::new(store),
+        }
     }
 
     /// Validate a `create_scheduled_goal` call with the dispatcher's facts
@@ -447,6 +448,9 @@ impl ManageMemoriesTool {
 }
 
 #[derive(Deserialize)]
+// Every field is parsed, so a malformed call fails here whatever its
+// action; the memory actions' fields are read by the memory tool.
+#[allow(dead_code)]
 struct ManageArgs {
     action: String,
     limit: Option<usize>,
@@ -540,16 +544,6 @@ fn memory_action_effects(arguments: &str) -> ToolMutationEffects {
             | "trigger_now",
         ) => ToolMutationEffects::SCHEDULED_WORK,
         _ => ToolMutationEffects::NONE,
-    }
-}
-
-fn canonical_personal_display_key(key: &str) -> String {
-    match key.trim().to_ascii_lowercase().as_str() {
-        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
-        "current_residence" | "home" | "location" => "residence".to_string(),
-        "place_of_birth" => "birthplace".to_string(),
-        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
-        other => other.to_string(),
     }
 }
 
@@ -713,382 +707,10 @@ impl ManageMemoriesTool {
         facts: &ToolCallContext,
     ) -> anyhow::Result<String> {
         let args: ManageArgs = serde_json::from_str(arguments)?;
-        let trusted_session = facts.trusted_session;
 
         match args.action.as_str() {
-            "health" => {
-                let report = self.store.memory_health_report().await?;
-                Ok(serde_json::to_string_pretty(&report)?)
-            }
-            "repair" => {
-                let report = self.store.repair_memory_projections().await?;
-                Ok(serde_json::to_string_pretty(&report)?)
-            }
-            "list" => {
-                let mut facts = self.store.get_canonical_memory_facts().await?;
-                let canonical_owner_keys: std::collections::HashSet<String> = facts
-                    .iter()
-                    .filter(|fact| fact.category == "user")
-                    .map(|fact| canonical_personal_display_key(&fact.key))
-                    .collect();
-                facts.extend(
-                    self.store
-                        .get_all_facts_with_provenance()
-                        .await?
-                        .into_iter()
-                        .filter(|fact| {
-                            fact.category != "user"
-                                || !canonical_owner_keys
-                                    .contains(&canonical_personal_display_key(&fact.key))
-                        }),
-                );
-                if facts.is_empty() {
-                    return Ok("No memories stored.".to_string());
-                }
-
-                let filtered = if let Some(ref cat) = args.category {
-                    facts.into_iter().filter(|f| f.category == *cat).collect::<Vec<_>>()
-                } else {
-                    facts
-                };
-
-                let limit = args.limit.unwrap_or(100).clamp(1, 200);
-                let total = filtered.len();
-                let shown = filtered.into_iter().take(limit).collect::<Vec<_>>();
-
-                let mut output = format!(
-                    "**Stored Memories** (showing {} of {} facts)\n\n",
-                    shown.len(),
-                    total
-                );
-                let mut current_cat = String::new();
-                for f in &shown {
-                    if f.category != current_cat {
-                        current_cat = f.category.clone();
-                        output.push_str(&format!("### {}\n", current_cat));
-                    }
-                    let privacy_label = f.privacy.to_string();
-                    let channel_label = f.channel_id.as_deref().unwrap_or("global");
-                    let age = chrono::Utc::now().signed_duration_since(f.updated_at);
-                    let age_str = if age.num_days() > 0 {
-                        format!("{}d ago", age.num_days())
-                    } else if age.num_hours() > 0 {
-                        format!("{}h ago", age.num_hours())
-                    } else {
-                        "just now".to_string()
-                    };
-                    output.push_str(&format!(
-                        "- **{}**: {} (privacy: {}, from: {}, updated: {})\n",
-                        f.key, f.value, privacy_label, channel_label, age_str
-                    ));
-                }
-                if total > shown.len() {
-                    output.push_str(&format!(
-                        "\n(Results truncated to {}. Provide a higher `limit` to see more.)",
-                        shown.len()
-                    ));
-                }
-                Ok(output)
-            }
-            "forget" => {
-                let key_raw = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
-                let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
-
-                // Reject empty / whitespace-only / too-short keys. A blank key would
-                // make partial key matching true for every
-                // fact, wiping the store. A single character is also too broad to be
-                // a safe substring match across all facts.
-                let key = key_raw.trim();
-                if key.is_empty() {
-                    anyhow::bail!("'key' must not be empty or whitespace for forget action");
-                }
-                if key.chars().count() < 2 {
-                    anyhow::bail!(
-                        "'key' must be at least 2 characters for forget action (got {:?}); use manage_memories(action='list') to see exact keys",
-                        key
-                    );
-                }
-
-                // Canonicalize the requested key for fuzzy matching
-                let canon = |k: &str| -> String {
-                    let mut out = String::with_capacity(k.len());
-                    let mut last_sep = false;
-                    for ch in k.trim().chars() {
-                        if ch.is_ascii_alphanumeric() {
-                            out.push(ch.to_ascii_lowercase());
-                            last_sep = false;
-                        } else if !last_sep {
-                            out.push('_');
-                            last_sep = true;
-                        }
-                    }
-                    out.trim_matches('_').to_string()
-                };
-
-                let key_canonical = canon(key);
-
-                // Within the explicitly-requested category an exact or canonical
-                // key match is authoritative. Only when none exists may a partial
-                // key select facts, and then only as whole `_`-separated key
-                // segments ("color" -> "favorite_color"). A fact key contained
-                // in the requested key is never a match: forgetting
-                // `qa_pet_name` used to also delete the owner's `name` fact.
-                let exact_in_category = |f: &crate::traits::Fact| -> bool {
-                    f.superseded_at.is_none()
-                        && (f.key == key || canon(&f.key) == key_canonical)
-                };
-                let key_segments: Vec<&str> = key_canonical.split('_').collect();
-                let partial_in_category = |f: &crate::traits::Fact| -> bool {
-                    if f.superseded_at.is_some() || key_canonical.is_empty() {
-                        return false;
-                    }
-                    let fk_canon = canon(&f.key);
-                    let fact_segments: Vec<&str> = fk_canon.split('_').collect();
-                    fact_segments
-                        .windows(key_segments.len())
-                        .any(|window| window == key_segments.as_slice())
-                };
-
-                // Across OTHER categories (the "duplicate sweep") only accept exact
-                // or canonical matches. Substring matching outside the requested
-                // category is too broad and can delete unrelated facts.
-                let matches_key_cross_category = |f: &crate::traits::Fact| -> bool {
-                    if f.superseded_at.is_some() {
-                        return false;
-                    }
-                    f.key == key || canon(&f.key) == key_canonical
-                };
-
-                let mut to_delete: Vec<(i64, String, String)> = Vec::new();
-                let mut seen_ids = std::collections::HashSet::new();
-
-                let facts = self.store.get_facts(Some(category)).await?;
-                let has_exact = facts.iter().any(&exact_in_category);
-                for f in &facts {
-                    let selected = if has_exact {
-                        exact_in_category(f)
-                    } else {
-                        partial_in_category(f)
-                    };
-                    if selected && seen_ids.insert(f.id) {
-                        to_delete.push((f.id, f.category.clone(), f.key.clone()));
-                    }
-                }
-
-                // Also check OTHER categories for exact/canonical duplicates only.
-                let all_facts = self.store.get_facts(None).await?;
-                for f in &all_facts {
-                    if f.category == category {
-                        continue;
-                    }
-                    if matches_key_cross_category(f) && seen_ids.insert(f.id) {
-                        to_delete.push((f.id, f.category.clone(), f.key.clone()));
-                    }
-                }
-
-                if to_delete.is_empty() {
-                    Ok(format!("No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.", key))
-                } else {
-                    let mut forgotten = Vec::new();
-                    for (id, cat, k) in &to_delete {
-                        self.store.delete_fact(*id).await?;
-                        forgotten.push(format!("[{}] {}", cat, k));
-                    }
-                    Ok(format!("Forgotten {} fact(s): {}", forgotten.len(), forgotten.join(", ")))
-                }
-            }
-            "set_privacy" => {
-                let key = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for set_privacy action"))?;
-                let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for set_privacy action"))?;
-                let privacy_str = args.privacy.as_deref().ok_or_else(|| anyhow::anyhow!("'privacy' is required for set_privacy action"))?;
-                let privacy = FactPrivacy::from_str_lossy(privacy_str);
-
-                let facts = self.store.get_facts(Some(category)).await?;
-                let fact = facts.iter().find(|f| f.key == key && f.superseded_at.is_none());
-
-                match fact {
-                    Some(f) => {
-                        self.store.update_fact_privacy(f.id, privacy).await?;
-                        Ok(format!("Updated privacy: [{}] {} → {}", category, key, privacy))
-                    }
-                    None => Ok(format!("No active fact found: [{}] {}", category, key)),
-                }
-            }
-            "search" => {
-                let query = args.query.as_deref().unwrap_or("");
-                if query.is_empty() {
-                    return Ok("Please provide a search query.".to_string());
-                }
-
-                let limit = args.limit.unwrap_or(10).clamp(1, 200);
-                let report = self
-                    .store
-                    .search_facts(
-                        query,
-                        limit,
-                        &aidaemon_memory::search::FactSearchConfig::default(),
-                    )
-                    .await?;
-                if report.hits.is_empty() {
-                    return Ok(format!("No memories matching '{}'.", query));
-                }
-
-                // "Relevant" only when a relevance floor judged the pool;
-                // otherwise every candidate would be called relevant.
-                let counts = if report.floor_applied {
-                    format!(
-                        "{} shown, {} relevant of {} considered",
-                        report.hits.len(),
-                        report.passed_floor,
-                        report.considered
-                    )
-                } else {
-                    format!("{} shown of {} considered", report.hits.len(), report.considered)
-                };
-                let mut output = format!(
-                    "══ Stored facts matching '{}' ({}) ══\n\
-                     IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
-                    query, counts
-                );
-                for hit in &report.hits {
-                    let f = &hit.fact;
-                    let privacy_label = f.privacy.to_string();
-                    let channel_label = f.channel_id.as_deref().unwrap_or("global");
-                    let marker = if hit.kind == aidaemon_memory::search::MatchKind::Semantic {
-                        " (semantic match)"
-                    } else {
-                        ""
-                    };
-                    // Surface WHEN the fact was learned so the model can answer
-                    // temporal questions ("when did I tell you X?") directly from
-                    // search results instead of reaching for the wrong tool.
-                    let learned_ts = f.first_seen_at.unwrap_or(f.created_at).to_rfc3339();
-                    let learned = Self::format_age(&learned_ts);
-                    let evidence = f
-                        .source_excerpt
-                        .as_deref()
-                        .map(compact_provenance_excerpt)
-                        .filter(|excerpt| !excerpt.is_empty())
-                        .map(|excerpt| {
-                            format!(
-                                "; evidence: {}",
-                                serde_json::to_string(&excerpt)
-                                    .unwrap_or_else(|_| "\"[unavailable]\"".to_string())
-                            )
-                        })
-                        .unwrap_or_default();
-                    output.push_str(&format!(
-                        "• [{}] {} → \"{}\" (fact_id: {}, source: {}, privacy: {}, from: {}, learned: {}{}){}\n",
-                        f.category,
-                        f.key,
-                        f.value,
-                        f.id,
-                        f.source,
-                        privacy_label,
-                        channel_label,
-                        learned,
-                        evidence,
-                        marker
-                    ));
-                }
-                if report.floor_applied && report.passed_floor > report.hits.len() {
-                    output.push_str(&format!(
-                        "({} more relevant; raise limit to see them.)\n",
-                        report.passed_floor - report.hits.len()
-                    ));
-                }
-                if !report.related.is_empty() {
-                    output.push_str("\n── Related context (connected facts) ──\n");
-                    for hit in &report.related {
-                        output.push_str(&format!(
-                            "• [{}] {} → \"{}\"\n",
-                            hit.fact.category, hit.fact.key, hit.fact.value
-                        ));
-                    }
-                }
-
-                Ok(output)
-            }
-            "search_episodes" => {
-                // Active recall over episodic memory (past-conversation summaries).
-                // Facts answer "what is X"; episodes answer "what did we discuss /
-                // do, and when". With a query → semantic search; without one →
-                // most-recent conversations (browse). This tool is owner-only (the
-                // session tool roster is empty for non-owners), with explicit
-                // channel/session scoping for non-private origins.
-                let query = args.query.as_deref().unwrap_or("").trim();
-                let limit = args.limit.unwrap_or(8).clamp(1, 50);
-                let visibility = facts
-                    .channel_visibility
-                    .unwrap_or(ChannelVisibility::Internal);
-                let episodes = match visibility {
-                    ChannelVisibility::Private => {
-                        self.store.get_relevant_episodes(query, limit).await?
-                    }
-                    ChannelVisibility::PrivateGroup | ChannelVisibility::Public => {
-                        self.store
-                            .get_relevant_episodes_for_channel(
-                                query,
-                                limit,
-                                facts.channel_id.as_deref(),
-                            )
-                            .await?
-                    }
-                    ChannelVisibility::PublicExternal => {
-                        return Ok(
-                            "Past-conversation recall is disabled in public-external channels."
-                                .to_string(),
-                        );
-                    }
-                    ChannelVisibility::Internal if trusted_session => {
-                        self.store.get_relevant_episodes(query, limit).await?
-                    }
-                    ChannelVisibility::Internal => {
-                        let session_id = facts.session().unwrap_or("");
-                        self.store
-                            .get_relevant_episodes_for_session(query, limit, session_id)
-                            .await?
-                    }
-                };
-                let recalled: Vec<i64> = episodes.iter().map(|episode| episode.id).collect();
-                let _ = self.store.record_memory_recall(&[], &recalled).await;
-                if episodes.is_empty() {
-                    return Ok(if query.is_empty() {
-                        "No past conversations recorded yet.".to_string()
-                    } else {
-                        format!("No past conversations found matching '{}'.", query)
-                    });
-                }
-
-                let header = if query.is_empty() {
-                    format!(
-                        "══ Generated episode summaries: recent conversations ({}) ══\n\n",
-                        episodes.len()
-                    )
-                } else {
-                    format!(
-                        "══ Generated episode summaries matching '{}' ({}) ══\n\n",
-                        query,
-                        episodes.len()
-                    )
-                };
-                let mut output = header;
-                for e in &episodes {
-                    let when = Self::format_age(&e.created_at.to_rfc3339());
-                    output.push_str(&format!("• [{}] {}", when, e.summary.trim()));
-                    if let Some(topics) = e.topics.as_ref().filter(|t| !t.is_empty()) {
-                        output.push_str(&format!(" (topics: {})", topics.join(", ")));
-                    }
-                    if let Some(outcome) = e.outcome.as_deref().filter(|o| !o.is_empty()) {
-                        output.push_str(&format!(" [outcome: {}]", outcome));
-                    }
-                    output.push('\n');
-                }
-                output.push_str(
-                    "\nThese are semantic, generated summaries. Use search_history for exact \
-                     retained user/assistant wording, anchored context, and message paging.\n",
-                );
-                Ok(output)
+            action if aidaemon_memory::full::tools::MEMORY_ACTIONS.contains(&action) => {
+                self.memory.run(arguments, facts).await
             }
             "list_goals" => {
                 let limit = args.limit.unwrap_or(50).clamp(1, 200) as i64;
@@ -2278,6 +1900,7 @@ mod tests {
     use crate::traits::ToolCalls as _;
     use crate::traits::ToolSemantics;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
+    use crate::types::FactPrivacy;
 
     #[test]
     fn schema_fits_payload_budget() {
@@ -2512,16 +2135,6 @@ mod tests {
             out.contains("Related context"),
             "output should have a neighborhood header; got:\n{out}"
         );
-    }
-
-    #[test]
-    fn provenance_excerpt_is_single_line_utf8_safe_and_bounded() {
-        let input = format!("User said:\n\t{}", "🦀".repeat(250));
-        let compact = compact_provenance_excerpt(&input);
-        assert!(!compact.contains('\n'));
-        assert!(!compact.contains('\t'));
-        assert!(compact.chars().count() <= 180);
-        assert!(compact.ends_with("..."));
     }
 
     #[tokio::test]

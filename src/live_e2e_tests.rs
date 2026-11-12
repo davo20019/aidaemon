@@ -25,7 +25,7 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::state::SqliteStateStore;
 use crate::testing::TestChannel;
 use crate::tools::command_risk::PermissionMode;
-use crate::tools::memory::RememberFactTool;
+use crate::tools::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::HubChannel;
 use crate::types::{ChannelContext, UserRole};

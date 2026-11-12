@@ -74,6 +74,7 @@ pub use memory::{
     PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate, PersonalMemoryWrite,
     PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
+#[allow(unused_imports)]
 pub use people::{Person, PersonFact};
 pub use tools::NothingSentError;
 #[cfg(test)]

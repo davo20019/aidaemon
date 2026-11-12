@@ -8,39 +8,17 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::agent::inquiry::{action_from_arguments, capability};
 use crate::traits::{
-    EvidenceAuthority::{Advisory, Canonical},
+    EvidenceAuthority::Canonical,
     EvidencePurpose::{
         Attribution, CausalExplanation, Content, CurrentState, HistoricalRecord, Outcome,
     },
-    EvidenceTemporalScope::{Both, Current, Historical},
+    EvidenceTemporalScope::{Both, Current},
     ToolEvidenceCapability,
-    ToolSemanticScope::{self, GoalState, UserMemory},
+    ToolSemanticScope::{GoalState, UserMemory},
 };
 
-type Evidence = Box<dyn Fn(&str) -> Vec<ToolEvidenceCapability> + Send + Sync>;
-
 /// How the turn treats one memory tool's calls and results.
-pub(in crate::agent) struct MemoryToolFacts {
-    pub scope: Option<ToolSemanticScope>,
-    /// The result says little worth carrying into a checkpoint.
-    pub low_signal_result: bool,
-    /// Older calls are summarized by their `action` argument.
-    pub summary_from_action: bool,
-    /// An older result stays as an excerpt, because it may be the evidence
-    /// behind an answer.
-    pub keep_result_excerpt: bool,
-    /// What a call with these arguments can prove.
-    pub evidence: Evidence,
-    /// `evidence` is complete enough to rule this tool out for an inquiry.
-    pub evidence_modeled: bool,
-    pub representative_calls: &'static [&'static str],
-    /// A successful read whose text must not be mistaken for a failure.
-    pub output_is_report: Option<fn(&str, Option<&str>) -> bool>,
-    /// A call with these arguments stores something new in memory (not a
-    /// read, a deletion, a visibility change or requested work such as a
-    /// goal): what a turn opted out of learning may not do.
-    pub stores: fn(&str) -> bool,
-}
+pub(in crate::agent) use aidaemon_memory::full::tools::MemoryToolFacts;
 
 static FACTS: LazyLock<RwLock<HashMap<String, Arc<MemoryToolFacts>>>> =
     LazyLock::new(|| RwLock::new(daemon_tool_facts()));
@@ -113,80 +91,36 @@ const DAEMON_TOOLS: &[&str] = &[
     "manage_people",
 ];
 
+/// The full memory system's tool facts, with `manage_memories` as the
+/// daemon offers it: memory and goal actions in one tool.
 fn daemon_tool_facts() -> HashMap<String, Arc<MemoryToolFacts>> {
-    let write_only = |scope: Option<ToolSemanticScope>,
-                      low_signal_result,
-                      summary_from_action,
-                      stores: fn(&str) -> bool| MemoryToolFacts {
-        scope,
-        low_signal_result,
-        summary_from_action,
-        keep_result_excerpt: false,
-        evidence: Box::new(|_| Vec::new()),
-        evidence_modeled: false,
-        representative_calls: &["{}"],
-        output_is_report: None,
-        stores,
-    };
-    let manage_memories = MemoryToolFacts {
-        scope: Some(UserMemory),
-        low_signal_result: true,
-        summary_from_action: true,
-        keep_result_excerpt: true,
-        evidence: Box::new(manage_memories_evidence),
-        evidence_modeled: true,
-        representative_calls: &[
-            r#"{"action":"search"}"#,
-            r#"{"action":"search_episodes"}"#,
-            r#"{"action":"list_goals"}"#,
-            r#"{"action":"diagnose_scheduled"}"#,
-        ],
-        output_is_report: Some(manage_memories_output_is_report),
-        // Its writes forget, repair or re-scope stored facts, or start work
-        // the user asked for (goals, schedules); none stores the turn.
-        stores: |_| false,
-    };
-    let manage_people = MemoryToolFacts {
-        scope: None,
-        low_signal_result: true,
-        summary_from_action: false,
-        keep_result_excerpt: false,
-        evidence: Box::new(|_| {
-            vec![capability(
-                UserMemory,
-                &[CurrentState, HistoricalRecord, Content, Attribution],
-                Canonical,
-                Both,
-            )]
+    let mut facts: HashMap<String, Arc<MemoryToolFacts>> =
+        aidaemon_memory::full::tools::tool_facts()
+            .into_iter()
+            .map(|(name, facts)| (name, Arc::new(facts)))
+            .collect();
+    facts.insert(
+        "manage_memories".to_string(),
+        Arc::new(MemoryToolFacts {
+            scope: Some(UserMemory),
+            low_signal_result: true,
+            summary_from_action: true,
+            keep_result_excerpt: true,
+            evidence: Box::new(manage_memories_evidence),
+            evidence_modeled: true,
+            representative_calls: &[
+                r#"{"action":"search"}"#,
+                r#"{"action":"search_episodes"}"#,
+                r#"{"action":"list_goals"}"#,
+                r#"{"action":"diagnose_scheduled"}"#,
+            ],
+            output_is_report: Some(manage_memories_output_is_report),
+            // Its writes forget, repair or re-scope stored facts, or start work
+            // the user asked for (goals, schedules); none stores the turn.
+            stores: |_| false,
         }),
-        evidence_modeled: true,
-        representative_calls: &["{}"],
-        output_is_report: None,
-        stores: |arguments| {
-            matches!(
-                action_from_arguments(arguments).as_deref(),
-                Some("add" | "update" | "add_fact" | "link" | "confirm" | "reconnect")
-            )
-        },
-    };
-    [
-        (
-            "remember_fact",
-            write_only(Some(UserMemory), true, true, |arguments| {
-                !crate::tools::memory::call_deletes_facts(arguments)
-            }),
-        ),
-        // Widens who may see a fact already stored.
-        (
-            "share_memory",
-            write_only(Some(UserMemory), false, false, |_| false),
-        ),
-        ("manage_memories", manage_memories),
-        ("manage_people", manage_people),
-    ]
-    .into_iter()
-    .map(|(name, facts)| (name.to_string(), Arc::new(facts)))
-    .collect()
+    );
+    facts
 }
 
 fn manage_memories_evidence(arguments: &str) -> Vec<ToolEvidenceCapability> {
@@ -209,25 +143,8 @@ fn manage_memories_evidence(arguments: &str) -> Vec<ToolEvidenceCapability> {
             Canonical,
             Both,
         )],
-        Some("search_episodes") => vec![capability(
-            UserMemory,
-            &[HistoricalRecord, Content, Attribution],
-            Advisory,
-            Historical,
-        )],
-        Some("list" | "search") | None => vec![capability(
-            UserMemory,
-            &[CurrentState, HistoricalRecord, Content, Attribution],
-            // This operation reads the canonical persisted memory ledger.
-            // The stored claim may itself be user-supplied, but whether it
-            // exists (or does not exist) is an authoritative store fact.
-            // A current lookup can return claims about either current or
-            // historical subjects; the receipt separately timestamps the
-            // lookup itself.
-            Canonical,
-            Both,
-        )],
-        _ => Vec::new(),
+        // The memory actions, as the full memory system states them.
+        _ => aidaemon_memory::full::tools::manage_memories_evidence(arguments),
     }
 }
 
