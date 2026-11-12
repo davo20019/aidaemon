@@ -72,7 +72,10 @@ background tasks`.
 - `src/agent/`: runtime. `turn/` (bootstrap, tool offering, closeout) hands
   each turn to the SDK engine in `runtime/sdk_engine/`.
 - `src/tools/`: LLM-callable and deterministic local tools.
-- `src/traits.rs` re-exports traits defined under `src/traits/`.
+- `src/traits.rs` and `src/types.rs` re-export the contract types and store
+  traits, which live in the crates that own them; `src/traits/state_store.rs`
+  keeps only what the app assembles itself (`StateStore`, `MandateToolStore`,
+  `SkillsStore`, `HealthCheckStore`).
 - `src/state/sqlite/`: SQLite persistence by domain. Goals, mandates, tasks,
   work coordination and notifications: `crates/aidaemon-work`. Memory:
   `aidaemon_memory::sqlite`. Events and run aggregate:
@@ -109,7 +112,7 @@ The core interfaces are re-exported from `src/traits.rs`:
   implementations.
 - `ModelProvider`: LLM backend abstraction.
 - Goal, memory, people, dynamic config, dialogue, and trigger-event traits/types
-  are split into focused files under `src/traits/`.
+  are defined in their crates and re-exported by focused files under `src/traits/`.
 
 When calling store-trait methods on concrete types, import:
 

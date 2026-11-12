@@ -350,14 +350,14 @@ enforce them.
 |---|---|
 | `aidaemon-core` | The kernel described above |
 | `aidaemon-providers` | OpenAI-compatible and Anthropic providers, streaming, prompt caching |
-| `aidaemon-tools` | Workspace-confined file tools, glob/grep, shell over sandbox backends, web fetch, checklist + gate |
+| `aidaemon-tools` | Workspace-confined file tools, glob/grep, shell over sandbox backends, web fetch, checklist + gate; the tool semantics and approval vocabulary (`RiskLevel`, `PermissionMode`, `AgentRole`), live progress (`status::StatusUpdate`) and the settings, OAuth and CLI-agent store traits |
 | `aidaemon-store-sqlite` | `RunStore` on SQLite, versioned migrations, recovery queries |
-| `aidaemon-mcp` | stdio MCP client exposing server tools as `Tool`s |
-| `aidaemon-agents` | Agents as tools, child budgets, depth limits |
+| `aidaemon-mcp` | stdio MCP client exposing server tools as `Tool`s; the runtime registry contract (`registry::DynamicMcpServerStore`) |
+| `aidaemon-agents` | Agents as tools, child budgets, depth limits; specialist profiles (`specialist::SpecialistKind`) |
 | `aidaemon-policies` | The daemon's policies as hooks (see table above) |
 | `aidaemon-eval` | YAML scenarios, trajectory assertions, N-of-M reports |
-| `aidaemon-memory` | Long-term memory ported from the daemon: facts with supersession, episodes, hybrid recall, decay. Store, embedder and scorer are traits, so every part is replaceable |
-| `aidaemon-channels` | The `Channel` contract and `ChannelRunner`: access control, one session per conversation, queueing, streamed status edits, approvals as buttons with `/approve` fallback, `/stop` `/new` `/status` |
+| `aidaemon-memory` | Long-term memory ported from the daemon: facts with supersession, episodes, hybrid recall, decay. Store, embedder and scorer are traits, so every part is replaceable; the skill-draft store (`skills::SkillStore`) |
+| `aidaemon-channels` | The `Channel` contract and `ChannelRunner`: access control, one session per conversation, queueing, streamed status edits, approvals as buttons with `/approve` fallback, `/stop` `/new` `/status`. Internal modules `context` (`ChannelContext`, workspace grants) and `hub` (the daemon's `HubChannel` surface, bot and session-routing stores) until 9.5 |
 | `aidaemon-channel-telegram` / `-slack` / `-discord` | Built-in adapters talking to each platform's API directly (Bot API, Socket Mode, Gateway) |
 | `aidaemon-decisions` | Decision backends (experimental): closed questions answered with a confidence and where it came from, from any `Provider` or Google's Decisions API |
 | `aidaemon-sdk` | One dependency re-exporting all of them behind features |
