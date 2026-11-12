@@ -29,7 +29,10 @@ http = ["dep:reqwest"]
 
 [dependencies]
 aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
+aidaemon-tools = { version = "0.1.0", path = "../aidaemon-tools" }
+anyhow = "1"
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, optional = true }
@@ -41,6 +44,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 
 [dev-dependencies]
+toml = "0.8"
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-channels = { path = ".", features = ["testing", "conformance", "http"] }
 reqwest = { version = "0.12", default-features = false }

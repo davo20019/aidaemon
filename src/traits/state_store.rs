@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+pub use aidaemon_channels::hub::{DynamicBotStore, SessionChannelStore};
 pub use aidaemon_events::provider::TokenUsageStore;
 pub use aidaemon_events::stores::{
     ConversationSummaryStore, DialogueStateStore, MessageStore, PromptSnapshotStore,
@@ -81,54 +82,6 @@ pub trait SkillStore: Send + Sync {
         _procedure_name: &str,
     ) -> anyhow::Result<bool> {
         Ok(false)
-    }
-}
-
-/// Dynamic bots (runtime-managed) persistence.
-#[async_trait]
-pub trait DynamicBotStore: Send + Sync {
-    /// Store a dynamically added bot configuration.
-    async fn add_dynamic_bot(&self, _bot: &super::DynamicBot) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Get all dynamically added bots.
-    async fn get_dynamic_bots(&self) -> anyhow::Result<Vec<super::DynamicBot>> {
-        Ok(vec![])
-    }
-
-    /// Update the allowed_user_ids for a dynamic bot identified by its token.
-    #[allow(dead_code)]
-    async fn update_dynamic_bot_allowed_users(
-        &self,
-        _bot_token: &str,
-        _allowed_user_ids: &[String],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Delete a dynamic bot by ID.
-    #[allow(dead_code)]
-    async fn delete_dynamic_bot(&self, _id: i64) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// Session → channel mapping persistence.
-#[async_trait]
-pub trait SessionChannelStore: Send + Sync {
-    /// Persist a session_id → channel_name mapping so it survives restarts.
-    async fn save_session_channel(
-        &self,
-        _session_id: &str,
-        _channel_name: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Load all persisted session → channel mappings (for populating session_map on startup).
-    async fn load_session_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
-        Ok(vec![])
     }
 }
 

@@ -221,8 +221,11 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -230,6 +233,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
 ]
 

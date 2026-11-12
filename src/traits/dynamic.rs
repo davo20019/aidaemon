@@ -38,17 +38,6 @@ fn default_empty_json() -> String {
     "[]".to_string()
 }
 
-/// A dynamically added bot configuration (stored in database).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicBot {
-    pub id: i64,
-    pub channel_type: String, // "telegram", "discord", "slack"
-    pub bot_token: String,
-    pub app_token: Option<String>,     // Only for Slack
-    pub allowed_user_ids: Vec<String>, // Stored as JSON
-    pub extra_config: String,          // JSON for channel-specific settings
-    pub created_at: String,
-}
-
+pub use aidaemon_channels::hub::DynamicBot;
 pub use aidaemon_mcp::registry::DynamicMcpServer;
 pub use aidaemon_tools::services::{CliAgentInvocation, DynamicCliAgent};

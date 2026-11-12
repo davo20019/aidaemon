@@ -20,8 +20,10 @@ pub mod channel;
 pub mod commands;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod context;
 #[cfg(feature = "http")]
 pub mod download;
+pub mod hub;
 mod inbound_files;
 pub mod latex;
 pub mod names;
