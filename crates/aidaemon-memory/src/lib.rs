@@ -80,6 +80,7 @@ pub mod embedding_index;
 pub mod episodes;
 mod error;
 mod extract;
+pub mod full;
 pub mod history;
 mod learning;
 mod memory;

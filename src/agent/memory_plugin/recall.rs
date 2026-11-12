@@ -1,431 +1,128 @@
-//! [`DaemonRecall`]: the daemon's SQLite memory, rendered as one system note
-//! by `MemoryInjection`.
+//! [`DaemonRecall`]: the full memory system's recall
+//! (`aidaemon_memory::full::FullRecall`) for one daemon turn, with the
+//! daemon's goals, settings, recall filter and decision points as its host.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use aidaemon_memory::full::{FullRecall, RecallDecision, RecallHost, RecallTurn};
 use async_trait::async_trait;
-use serde_json::json;
-use tracing::{info, warn};
 
 use super::{DaemonMemoryInner, MemoryTurn};
-use crate::agent::recall_guardrails::{
-    build_critical_facts_prompt_block, extract_critical_fact_summary,
-};
 use crate::events::{DecisionType, DiagnosticSeverity};
-use crate::skills::{self, MemoryContext};
-use crate::types::{ChannelVisibility, UserRole};
+use crate::types::UserRole;
 
-/// Identity/profile categories pinned as critical facts in owner DMs.
-const IDENTITY_CATEGORIES: &[&str] = &[
-    "identity",
-    "personal",
-    "profile",
-    "user",
-    "assistant",
-    "bot",
-    "relationship",
-    "preference",
-    "family",
-];
+/// The daemon's recall: [`FullRecall`] over the daemon store.
+pub(crate) struct DaemonRecall;
 
-/// A recall read that fails soft: the section renders empty, and the error is
-/// logged so a broken store does not look like an empty memory.
-fn or_logged<T: Default, E: std::fmt::Display>(result: Result<T, E>, section: &str) -> T {
-    result.unwrap_or_else(|error| {
-        warn!(section, %error, "memory recall read failed; section left empty");
-        T::default()
-    })
+impl DaemonRecall {
+    #[allow(clippy::new_ret_no_self)]
+    pub(crate) fn new(memory: Arc<DaemonMemoryInner>, turn: MemoryTurn) -> FullRecall {
+        let recall_turn = recall_turn(&turn);
+        let host = Arc::new(DaemonRecallHost {
+            state: memory.state.clone(),
+            side_calls: memory.side_calls.clone(),
+            record_decision_points: memory.record_decision_points,
+            turn,
+        });
+        FullRecall::new(memory.recall.clone(), host, recall_turn)
+    }
 }
 
-/// Recall over the daemon store for one turn. It already knows the channel,
-/// role and memory policy, so the `Recall` contract's session and query are
-/// enough.
-pub(crate) struct DaemonRecall {
-    memory: Arc<DaemonMemoryInner>,
+/// What recall knows about a daemon turn.
+pub(crate) fn recall_turn(turn: &MemoryTurn) -> RecallTurn {
+    let owner = turn.user_role == UserRole::Owner;
+    RecallTurn {
+        session_id: turn.session_id.clone(),
+        task_id: turn.task_id.clone(),
+        user_text: turn.user_text.clone(),
+        owner,
+        personal: owner && turn.channel_ctx.should_inject_personal_memory(),
+        visibility: turn.channel_ctx.visibility,
+        channel_id: turn.channel_ctx.channel_id.clone(),
+        sender_id: turn.channel_ctx.sender_id.clone(),
+        allowed: turn.memory_pipeline_allowed,
+        depth: turn.depth,
+    }
+}
+
+/// The daemon's end of recall for one turn.
+struct DaemonRecallHost {
+    state: Arc<dyn crate::traits::StateStore>,
+    side_calls: crate::llm_runtime::gateway::SideCallGateway,
+    record_decision_points: bool,
     turn: MemoryTurn,
 }
 
-impl DaemonRecall {
-    pub(crate) fn new(memory: Arc<DaemonMemoryInner>, turn: MemoryTurn) -> Self {
-        Self { memory, turn }
+#[async_trait]
+impl RecallHost for DaemonRecallHost {
+    async fn active_goals(&self) -> anyhow::Result<Vec<aidaemon_memory::render::RecallGoal>> {
+        Ok(self
+            .state
+            .get_active_personal_goals(20)
+            .await?
+            .into_iter()
+            .map(|goal| aidaemon_memory::render::RecallGoal {
+                id: goal.id,
+                description: goal.description,
+                status: goal.status,
+            })
+            .collect())
     }
 
-    /// Starts the recall filter over `facts`, when the decision layer runs
-    /// it. Resolves to the ids of facts to drop: only a calibrated answer
-    /// with P(relevant) below 0.15 drops one, and facts in identity
-    /// categories are never asked about, so they are always kept. In shadow
-    /// mode, or on any failure, nothing is dropped.
-    fn spawn_fact_filter(
-        &self,
-        facts: &[aidaemon_memory::records::Fact],
-    ) -> Option<tokio::task::JoinHandle<Option<std::collections::HashSet<i64>>>> {
+    async fn people_enabled(&self) -> anyhow::Result<bool> {
+        Ok(self.state.get_setting("people_enabled").await?.as_deref() == Some("true"))
+    }
+
+    fn relevance_enabled(&self) -> bool {
         use crate::llm_runtime::decisions::Decision;
-        let side_calls = self.memory.side_calls.clone();
-        if side_calls.decision_mode(Decision::RecallFilter) == crate::config::DecisionMode::Off {
-            return None;
-        }
-        let mut request = aidaemon_decisions::DecisionRequest::new(format!(
-            "User message:\n{}",
-            crate::utils::truncate_str(&self.turn.user_text, 3000)
-        ));
-        let mut asked = std::collections::BTreeMap::new();
-        for fact in facts
-            .iter()
-            .filter(|fact| !IDENTITY_CATEGORIES.contains(&fact.category.as_str()))
-        {
-            let key = format!("f{}", asked.len());
-            request.insert(
-                key.clone(),
-                aidaemon_decisions::Question::yes_no(format!(
-                    "Would this remembered fact help answer or carry out the user's message? Fact: [{}] {}: {}",
-                    fact.category,
-                    fact.key,
-                    crate::utils::truncate_str(&fact.value, 300)
-                )),
-            );
-            asked.insert(key, fact.id);
-        }
-        if asked.is_empty() {
-            return None;
-        }
-        let session = self.turn.session_id.clone();
-        let task = self.turn.task_id.clone();
-        Some(tokio::spawn(async move {
-            let outcome = side_calls
-                .decide(
-                    Decision::RecallFilter,
-                    request,
-                    crate::llm_runtime::decide::DecisionContext::turn(&session, &task),
-                )
-                .await;
-            Some(
-                asked
-                    .iter()
-                    .filter(|(key, _)| {
-                        outcome
-                            .acted(key)
-                            .and_then(aidaemon_decisions::Answer::p_yes)
-                            .is_some_and(|p| p < 0.5)
-                    })
-                    .map(|(_, id)| *id)
-                    .collect(),
-            )
-        }))
+        self.side_calls.decision_mode(Decision::RecallFilter) != crate::config::DecisionMode::Off
     }
 
-    /// The daemon memory block: critical facts, core profile, then the
-    /// query-ranked memory sections. Channel, role and policy scoping are
-    /// applied here.
-    async fn render_block(&self) -> String {
-        let memory = &self.memory;
-        let turn = &self.turn;
-        let state = &memory.state;
-        let store = &memory.store;
-        let channel_ctx = &turn.channel_ctx;
-        let user_role = turn.user_role;
-        let allowed = turn.memory_pipeline_allowed;
-        // Memory retrieval is current-request-scoped.
-        let query = turn.user_text.as_str();
-        let inject_personal =
-            user_role == UserRole::Owner && channel_ctx.should_inject_personal_memory();
-
-        // Facts: always channel-scoped semantic retrieval, so unrelated facts
-        // never bleed into prompts for unrelated queries.
-        let facts = if !allowed {
-            vec![]
-        } else {
-            or_logged(
-                store
-                    .get_relevant_facts_for_channel(
-                        query,
-                        memory.max_facts,
-                        channel_ctx.channel_id.as_deref(),
-                        channel_ctx.visibility,
-                        user_role == UserRole::Owner,
-                    )
-                    .await,
-                "facts",
-            )
-        };
-
-        // The optional recall filter (decision layer) asks which of these
-        // facts matter to the message. It runs beside the lookups below and
-        // is awaited where the facts are rendered.
-        let fact_filter = self.spawn_fact_filter(&facts);
-
-        // Critical facts (identity/profile): bounded identity categories only,
-        // owner DMs (delegated agents included).
-        let mut critical_fact_summary = if allowed && inject_personal {
-            let mut identity_facts = Vec::new();
-            for category in IDENTITY_CATEGORIES {
-                identity_facts.append(&mut or_logged(
-                    store.get_facts(Some(category)).await,
-                    "critical_facts",
-                ));
-            }
-            extract_critical_fact_summary(&identity_facts)
-        } else {
-            Default::default()
-        };
-        if let Some(configured_name) = memory.assistant_name.clone() {
-            critical_fact_summary.assistant_name = Some(configured_name);
-        }
-
-        // Episodes: channel-scoped for non-DM channels.
-        let episodes = if !allowed {
-            vec![]
-        } else if inject_personal {
-            or_logged(store.get_relevant_episodes(query, 3).await, "episodes")
-        } else {
-            match channel_ctx.visibility {
-                ChannelVisibility::PublicExternal => vec![],
-                _ => or_logged(
-                    store
-                        .get_relevant_episodes_for_channel(
-                            query,
-                            3,
-                            channel_ctx.channel_id.as_deref(),
-                        )
-                        .await,
-                    "episodes",
-                ),
-            }
-        };
-
-        // Personal goals/profile remain DM-only. Operational failure patterns
-        // are safe more broadly: they encode agent-side recovery guidance, not
-        // user-private preferences.
-        let goals = if allowed && inject_personal {
-            or_logged(state.get_active_personal_goals(20).await, "goals")
-                .into_iter()
-                .map(|goal| skills::RecallGoal {
-                    id: goal.id,
-                    description: goal.description,
-                    status: goal.status,
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-        let patterns =
-            if !allowed || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
-                vec![]
-            } else if inject_personal {
-                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
-            } else {
-                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
-                    .into_iter()
-                    .filter(|pattern| pattern.pattern_type == "failure")
-                    .collect()
-            };
-        // Procedures and error solutions are operational: always load, except
-        // on PublicExternal where everything is restricted.
-        let (procedures, error_solutions) =
-            if !allowed || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
-                (vec![], vec![])
-            } else {
-                (
-                    or_logged(store.get_relevant_procedures(query, 5).await, "procedures"),
-                    or_logged(
-                        store.get_relevant_error_solutions(query, 5).await,
-                        "error_solutions",
-                    ),
-                )
-            };
-        let profile = if allowed && inject_personal {
-            or_logged(store.get_user_profile().await, "profile")
-        } else {
-            None
-        };
-
-        // People context: resolve the current speaker (only when enabled).
-        let people_enabled = allowed
-            && or_logged(state.get_setting("people_enabled").await, "people_enabled").as_deref()
-                == Some("true");
-        let (people, current_person, current_person_facts) = if !people_enabled {
-            (vec![], None, vec![])
-        } else if inject_personal {
-            // In owner DMs the people list only selects the privacy rules; the
-            // owner's own profile arrives through the core profile.
-            (
-                or_logged(store.get_all_people().await, "people"),
-                None,
-                vec![],
-            )
-        } else if let Some(ref sender_id) = channel_ctx.sender_id {
-            match store.get_person_by_platform_id(sender_id).await {
-                Ok(Some(person)) => {
-                    if let Err(error) = store.touch_person_interaction(person.id).await {
-                        warn!(%error, "failed to record person interaction");
-                    }
-                    let facts = or_logged(
-                        store.get_person_facts(person.id, None).await,
-                        "person_facts",
-                    );
-                    (vec![], Some(person), facts)
-                }
-                Ok(None) => (vec![], None, vec![]),
-                Err(error) => {
-                    warn!(%error, "memory recall read failed; section left empty");
-                    (vec![], None, vec![])
-                }
-            }
-        } else {
-            (vec![], None, vec![])
-        };
-
-        // Core profile: owner DMs at the top level, with a per-session stable
-        // entity selection.
-        let core_profile = if allowed && inject_personal && turn.depth == 0 {
-            let cached_ids = memory
-                .core_profile_ids
-                .read()
-                .await
-                .get(&turn.session_id)
-                .cloned();
-            let (profile_str, new_ids, digest) = or_logged(
-                aidaemon_memory::profile::build_core_profile(
-                    store.as_ref(),
-                    cached_ids,
-                    people_enabled,
-                )
-                .await,
-                "core_profile",
-            );
-            if let Some(ids) = new_ids {
-                memory
-                    .core_profile_ids
-                    .write()
-                    .await
-                    .insert(turn.session_id.clone(), ids);
-            }
-            // The selection digest (id + content hash per entity) makes a
-            // profile change self-explaining across turns.
-            if !digest.is_empty() {
-                self.decision_point(
-                    DecisionType::CoreProfileSelection,
-                    format!("Core profile selection: {} entities", digest.len()),
-                    json!({
-                        "code": "core_profile_digest",
-                        "count": digest.len(),
-                        "entities": digest
-                            .iter()
-                            .map(|(id, h)| json!({ "id": id, "h": h }))
-                            .collect::<Vec<_>>(),
-                    }),
-                )
-                .await;
-            }
-            profile_str
-        } else {
-            String::new()
-        };
-
-        let facts = match fact_filter {
-            Some(filter) => match filter.await {
-                Ok(Some(drop)) if !drop.is_empty() => {
-                    let before = facts.len();
-                    let kept: Vec<_> = facts
-                        .into_iter()
-                        .filter(|fact| !drop.contains(&fact.id))
-                        .collect();
-                    info!(
-                        dropped = before - kept.len(),
-                        kept = kept.len(),
-                        "Recall filter dropped facts irrelevant to the message"
-                    );
-                    kept
-                }
-                _ => facts,
-            },
-            None => facts,
-        };
-
-        let memory_context = MemoryContext {
-            facts: &facts,
-            episodes: &episodes,
-            goals: &goals,
-            patterns: &patterns,
-            procedures: &procedures,
-            error_solutions: &error_solutions,
-            profile: profile.as_ref(),
-            people: &people,
-            current_person: current_person.as_ref(),
-            current_person_facts: &current_person_facts,
-        };
-        let report = skills::render_memory_section(&memory_context, memory.max_facts);
-        if let Err(error) = store
-            .record_memory_recall(&report.rendered_fact_ids, &report.rendered_episode_ids)
-            .await
-        {
-            tracing::debug!(%error, "Failed to record rendered memory recall");
-        }
-        self.decision_point(
-            DecisionType::MemoryRetrieval,
-            format!(
-                "Memory fetched/rendered: facts={}/{} episodes={}/{} procedures={}/{}",
-                facts.len(),
-                report.rendered_fact_ids.len(),
-                episodes.len(),
-                report.rendered_episode_ids.len(),
-                procedures.len(),
-                report.rendered_procedure_ids.len()
-            ),
-            json!({
-                "policy": if allowed { "allowed" } else { "suppressed" },
-                "pipeline_suppressed": !allowed,
-                "fetched": {
-                    "facts": facts.len(),
-                    "episodes": episodes.len(),
-                    "goals": goals.len(),
-                    "patterns": patterns.len(),
-                    "procedures": procedures.len(),
-                    "error_solutions": error_solutions.len(),
-                    "people": people.len(),
-                    "current_person_facts": current_person_facts.len()
-                },
-                "rendered": {
-                    "fact_ids": report.rendered_fact_ids,
-                    "episode_ids": report.rendered_episode_ids,
-                    "goal_ids": report.rendered_goal_ids,
-                    "procedure_ids": report.rendered_procedure_ids,
-                    "error_solution_ids": report.rendered_error_solution_ids,
-                    "pattern_ids": report.rendered_pattern_ids
-                }
-            }),
-        )
-        .await;
-        info!(
-            session_id = %turn.session_id,
-            facts = facts.len(),
-            episodes = episodes.len(),
-            goals = goals.len(),
-            patterns = patterns.len(),
-            procedures = procedures.len(),
-            "Memory context loaded"
-        );
-
-        let mut block =
-            build_critical_facts_prompt_block(&critical_fact_summary).unwrap_or_default();
-        if !core_profile.is_empty() {
-            if !block.is_empty() {
-                block.push_str("\n\n");
-            }
-            block.push_str(&core_profile);
-        }
-        block.push_str(&report.prompt);
-        block.trim_start().to_string()
-    }
-
-    async fn decision_point(
+    async fn relevance(
         &self,
-        decision_type: DecisionType,
+        turn: &RecallTurn,
+        message: String,
+        questions: Vec<(String, String)>,
+    ) -> HashMap<String, f32> {
+        use crate::llm_runtime::decisions::Decision;
+        let mut request = aidaemon_decisions::DecisionRequest::new(message);
+        let keys: Vec<String> = questions.iter().map(|(key, _)| key.clone()).collect();
+        for (key, question) in questions {
+            request.insert(key, aidaemon_decisions::Question::yes_no(question));
+        }
+        let outcome = self
+            .side_calls
+            .decide(
+                Decision::RecallFilter,
+                request,
+                crate::llm_runtime::decide::DecisionContext::turn(&turn.session_id, &turn.task_id),
+            )
+            .await;
+        keys.into_iter()
+            .filter_map(|key| {
+                let p = outcome
+                    .acted(&key)
+                    .and_then(aidaemon_decisions::Answer::p_yes)?;
+                Some((key, p))
+            })
+            .collect()
+    }
+
+    async fn decision(
+        &self,
+        _turn: &RecallTurn,
+        kind: RecallDecision,
         summary: String,
         metadata: serde_json::Value,
     ) {
-        if !self.memory.record_decision_points {
+        if !self.record_decision_points {
             return;
         }
+        let decision_type = match kind {
+            RecallDecision::CoreProfileSelection => DecisionType::CoreProfileSelection,
+            RecallDecision::MemoryRetrieval => DecisionType::MemoryRetrieval,
+        };
         crate::agent::graceful::emit_decision_point_event(
             &self.turn.emitter,
             &self.turn.task_id,
@@ -436,38 +133,6 @@ impl DaemonRecall {
             metadata,
         )
         .await;
-    }
-}
-
-#[async_trait]
-impl aidaemon_policies::Recall for DaemonRecall {
-    /// Channel-scoped fact lines, for generic callers.
-    async fn recall(&self, _session_id: &str, query: &str, limit: usize) -> Vec<String> {
-        if !self.turn.memory_pipeline_allowed {
-            return Vec::new();
-        }
-        let channel_ctx = &self.turn.channel_ctx;
-        let facts = self
-            .memory
-            .store
-            .get_relevant_facts_for_channel(
-                query,
-                limit,
-                channel_ctx.channel_id.as_deref(),
-                channel_ctx.visibility,
-                self.turn.user_role == UserRole::Owner,
-            )
-            .await;
-        or_logged(facts, "facts")
-            .into_iter()
-            .map(|fact| format!("[{}] {}: {}", fact.category, fact.key, fact.value))
-            .collect()
-    }
-
-    /// The full daemon memory block with its section headings.
-    async fn render(&self, _session_id: &str, _query: &str, _limit: usize) -> Option<String> {
-        let block = self.render_block().await;
-        (!block.trim().is_empty()).then_some(block)
     }
 }
 

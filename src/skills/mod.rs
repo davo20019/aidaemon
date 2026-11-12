@@ -774,9 +774,7 @@ pub fn build_system_prompt(
     prompt
 }
 
-pub use aidaemon_memory::render::{
-    render_memory_section, MemoryContext, MemoryPromptReport, RecallGoal,
-};
+pub use aidaemon_memory::render::{render_memory_section, MemoryContext, MemoryPromptReport};
 
 /// Build the complete system prompt with all memory components.
 ///

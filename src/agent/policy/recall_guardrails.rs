@@ -3,9 +3,8 @@ use serde_json::Value;
 
 use super::intent_routing::contains_keyword_as_words;
 #[cfg(test)]
-use aidaemon_memory::render::CriticalFactSummary;
-pub(super) use aidaemon_memory::render::{
-    build_critical_facts_prompt_block, extract_critical_fact_summary,
+use aidaemon_memory::render::{
+    build_critical_facts_prompt_block, extract_critical_fact_summary, CriticalFactSummary,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

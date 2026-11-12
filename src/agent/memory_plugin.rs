@@ -10,7 +10,6 @@
 //! and the system decides how to remember. `aidaemon-memory` is the
 //! built-in system; [`DaemonMemory`] is the daemon's own store.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aidaemon_core as sdk;
@@ -331,13 +330,9 @@ pub(crate) struct DaemonMemoryInner {
     /// Runs the conversation summarizer's model calls.
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     context_window_config: crate::config::ContextWindowConfig,
-    max_facts: usize,
     record_decision_points: bool,
-    /// The configured assistant name (pinned among the critical facts).
-    assistant_name: Option<String>,
-    /// Per session, the entities the core profile selected last, so the
-    /// selection stays stable across turns.
-    core_profile_ids: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// The full memory system's recall over `store`.
+    recall: Arc<aidaemon_memory::full::RecallSource>,
 }
 
 impl DaemonMemory {
@@ -355,18 +350,22 @@ impl DaemonMemory {
     ) -> Self {
         Self {
             inner: Arc::new(DaemonMemoryInner {
+                recall: Arc::new(aidaemon_memory::full::RecallSource::new(
+                    store.clone(),
+                    aidaemon_memory::full::RecallSettings {
+                        max_facts,
+                        assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
+                            system_prompt,
+                        ),
+                    },
+                )),
                 state,
                 store,
                 event_store,
                 llm_runtime,
                 side_calls,
                 context_window_config,
-                max_facts,
                 record_decision_points,
-                assistant_name: super::system_prompt::infer_assistant_name_from_prompt(
-                    system_prompt,
-                ),
-                core_profile_ids: tokio::sync::RwLock::new(HashMap::new()),
             }),
         }
     }
