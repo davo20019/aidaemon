@@ -1,8 +1,9 @@
 //! View-only context compaction as a `before_model` hook.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
-use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Role};
+use aidaemon_core::{Hook, HookContext, Message, ModelRequest, Role, ToolCall};
 use async_trait::async_trait;
 
 /// Rough token estimate: characters / 4, counting content, tool-call names
@@ -23,20 +24,56 @@ fn message_chars(m: &Message) -> usize {
             .sum::<usize>()
 }
 
-/// Keeps each request under a token budget without touching stored state.
+/// Characters the request spends outside its messages: the tool
+/// definitions the provider sends with every call.
+fn tool_spec_chars(request: &ModelRequest) -> usize {
+    request
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.chars().count() + t.parameters.to_string().len())
+        .sum()
+}
+
+/// Longest arguments and quoted output line a stub carries.
+const STUB_ARGS_CHARS: usize = 200;
+const STUB_LINE_CHARS: usize = 120;
+
+/// Keeps each request under a token budget without touching stored state,
+/// and keeps the request's prefix stable so the provider's prompt cache
+/// keeps hitting.
 ///
-/// When the estimate exceeds the budget:
-/// 1. System messages, the first user message and the most recent
-///    `keep_recent_turns` turns (a turn is an assistant message plus its
-///    tool results, and any user message after it) stay intact.
-/// 2. Older tool results are replaced, oldest first, with
-///    `[tool result for <tool> elided: N chars]` until under budget.
-/// 3. If still over, the oldest unprotected units are dropped whole.
+/// The budget covers what the provider is sent: every message plus the
+/// tool definitions ([`ContextWindow::compact_request`]). Output tokens are
+/// not included; set the budget below the model's window by at least the
+/// output limit.
+///
+/// **Coarse, stable steps.** Old tool results are replaced by a short stub
+/// up to a *cut*, and units before a *drop* point are left out. Both move
+/// only when a request would pass the budget, and then far enough to bring
+/// it down to half the budget, so the following requests grow back on the
+/// same prefix until the budget is reached again. The two points are
+/// replayed from the transcript itself (every earlier model call saw a
+/// prefix of it), so the hook keeps no state and a resumed run computes
+/// the same view.
+///
+/// **Stubs say what was there.** An elided result becomes
+/// `[earlier tool result elided ...: <tool> <arguments> returned N chars
+/// (first line: "..."; last line: "...")...]`, so the model knows it
+/// already ran the call and where it led, and is told to call again only
+/// if it needs the exact content.
+///
+/// **Never over budget.** System messages, injected harness messages and
+/// the user's first message are never elided or dropped, and the most
+/// recent `keep_recent_turns` turns (default 1: the results the model has
+/// not seen yet) are kept whole by the
+/// stable steps. If the request still passes the budget (the recent turns
+/// alone are too big), this request alone also elides recent results,
+/// oldest first, and then drops the oldest units until it fits. It is sent
+/// over budget only if the never-touched part alone is.
 ///
 /// An assistant message with tool calls and its tool results form one unit:
 /// they are kept or dropped together, never split (providers reject a tool
-/// result without its call and vice versa). If the protected part alone is
-/// over budget, the request is sent as is.
+/// result without its call and vice versa).
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
     budget_tokens: usize,
@@ -47,116 +84,179 @@ impl ContextWindow {
     pub fn new(budget_tokens: usize) -> Self {
         Self {
             budget_tokens,
-            keep_recent_turns: 4,
+            keep_recent_turns: 1,
         }
     }
 
+    /// Turns the stable steps keep whole (a turn is an assistant message
+    /// plus its tool results, and any user message after it). More turns
+    /// mean smaller steps, so the prefix changes more often.
     pub fn keep_recent_turns(mut self, turns: usize) -> Self {
         self.keep_recent_turns = turns;
         self
     }
 
-    /// Compact `messages` in place. Returns true if anything changed.
+    /// Compact `messages` in place, counting messages only. Returns true if
+    /// anything changed.
     pub fn compact(&self, messages: &mut Vec<Message>) -> bool {
-        if estimate_tokens(messages) <= self.budget_tokens {
+        self.compact_with_overhead(messages, 0)
+    }
+
+    /// Compact a whole request: its messages, with its tool definitions
+    /// counted against the budget too. Returns true if anything changed.
+    pub fn compact_request(&self, request: &mut ModelRequest) -> bool {
+        let overhead = tool_spec_chars(request);
+        self.compact_with_overhead(&mut request.messages, overhead)
+    }
+
+    fn compact_with_overhead(&self, messages: &mut Vec<Message>, overhead_chars: usize) -> bool {
+        let budget = self.budget_tokens.saturating_mul(4);
+        let low_water = budget / 2;
+        let current = overhead_chars + messages.iter().map(message_chars).sum::<usize>();
+        // Every earlier request was a prefix of this one, so none of them
+        // passed the budget either: nothing was ever cut.
+        if current <= budget {
             return false;
         }
-        let units = units(messages);
-        let protected = self.protected_units(messages, &units);
 
-        // Tool name per call id, for placeholders.
-        let tool_names: HashMap<String, String> = messages
+        let units = units(messages);
+        let fixed = fixed_units(messages, &units);
+        let calls = calls_by_id(messages);
+        let full: Vec<usize> = units
             .iter()
-            .flat_map(|m| m.tool_calls.iter())
-            .map(|c| (c.id.clone(), c.name.clone()))
+            .map(|r| messages[r.clone()].iter().map(message_chars).sum())
+            .collect();
+        let stubbed: Vec<usize> = units
+            .iter()
+            .enumerate()
+            .map(|(u, r)| {
+                if fixed[u] {
+                    return full[u];
+                }
+                messages[r.clone()]
+                    .iter()
+                    .map(|m| match stub_for(m, &calls) {
+                        Some(stub) => {
+                            stub.chars().count() + message_chars(m) - m.content.chars().count()
+                        }
+                        None => message_chars(m),
+                    })
+                    .sum()
+            })
+            .collect();
+        let dropped: Vec<usize> = (0..units.len())
+            .map(|u| if fixed[u] { full[u] } else { 0 })
             .collect();
 
+        // Replay the stable steps at every point a model call was made: the
+        // end of each unit an assistant message follows, and now.
+        let assistant_units: Vec<usize> = (0..units.len())
+            .filter(|&u| messages[units[u].start].role == Role::Assistant)
+            .collect();
+        let (mut cut, mut drop) = (0usize, 0usize);
+        for p in 1..=units.len() {
+            if p < units.len() && messages[units[p].start].role != Role::Assistant {
+                continue;
+            }
+            let mut size = overhead_chars
+                + dropped[..drop].iter().sum::<usize>()
+                + stubbed[drop..cut].iter().sum::<usize>()
+                + full[cut..p].iter().sum::<usize>();
+            if size <= budget {
+                continue;
+            }
+            let boundary = self.protected_start(&assistant_units, p).max(cut);
+            while cut < boundary && size > low_water {
+                size -= full[cut] - stubbed[cut];
+                cut += 1;
+            }
+            while drop < cut && size > low_water {
+                size -= stubbed[drop] - dropped[drop];
+                drop += 1;
+            }
+        }
+
+        // Apply the stable view.
         let mut changed = false;
-        // Phase 1: elide old tool results, oldest first.
-        'elide: for (u, range) in units.iter().enumerate() {
-            if protected[u] {
+        let mut keep = vec![true; messages.len()];
+        for (u, range) in units.iter().enumerate().take(cut) {
+            if fixed[u] {
                 continue;
             }
             for i in range.clone() {
-                if estimate_tokens(messages) <= self.budget_tokens {
-                    break 'elide;
-                }
-                let m = &messages[i];
-                if m.role != Role::Tool {
-                    continue;
-                }
-                let tool = m
-                    .tool_call_id
-                    .as_ref()
-                    .and_then(|id| tool_names.get(id))
-                    .map_or("unknown", String::as_str);
-                let placeholder = format!(
-                    "[tool result for {tool} elided: {} chars]",
-                    m.content.chars().count()
-                );
-                if placeholder.len() < m.content.len() {
-                    messages[i].content = placeholder;
+                if u < drop {
+                    keep[i] = false;
                     changed = true;
+                } else {
+                    changed |= apply_stub(&mut messages[i], &calls);
                 }
             }
         }
+        let mut size = overhead_chars
+            + messages
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(m, _)| message_chars(m))
+                .sum::<usize>();
 
-        // Phase 2: drop oldest unprotected units whole.
-        if estimate_tokens(messages) > self.budget_tokens {
-            let mut keep = vec![true; messages.len()];
-            let mut total = estimate_tokens(messages) * 4;
-            for (u, range) in units.iter().enumerate() {
-                if total.div_ceil(4) <= self.budget_tokens {
+        // Still over: the recent turns alone pass the budget. For this
+        // request only, elide their results oldest first...
+        if size > budget {
+            'elide: for range in &units[cut..] {
+                for i in range.clone() {
+                    if size <= budget {
+                        break 'elide;
+                    }
+                    let before = message_chars(&messages[i]);
+                    if apply_stub(&mut messages[i], &calls) {
+                        size -= before - message_chars(&messages[i]);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // ...then drop the oldest units, never the newest one.
+        if size > budget {
+            for (u, range) in units.iter().enumerate().take(units.len() - 1) {
+                if size <= budget {
                     break;
                 }
-                if protected[u] {
+                if fixed[u] || !keep[range.start] {
                     continue;
                 }
                 for i in range.clone() {
                     keep[i] = false;
-                    total = total.saturating_sub(message_chars(&messages[i]));
+                    size -= message_chars(&messages[i]);
                 }
                 changed = true;
             }
-            let mut index = 0;
-            messages.retain(|_| {
-                let k = keep[index];
-                index += 1;
-                k
-            });
         }
+
+        let mut index = 0;
+        messages.retain(|_| {
+            let k = keep[index];
+            index += 1;
+            k
+        });
         changed
     }
 
-    fn protected_units(&self, messages: &[Message], units: &[std::ops::Range<usize>]) -> Vec<bool> {
-        let first_user = messages.iter().position(|m| m.role == Role::User);
-        // Start of the Nth most recent assistant unit.
-        let recent_start = units
-            .iter()
-            .filter(|r| messages[r.start].role == Role::Assistant)
-            .rev()
-            .take(self.keep_recent_turns)
-            .last()
-            .map_or(messages.len(), |r| r.start);
-        let recent_start = if self.keep_recent_turns == 0 {
-            messages.len()
-        } else {
-            recent_start
-        };
-        units
-            .iter()
-            .map(|r| {
-                r.start >= recent_start
-                    || messages[r.start].role == Role::System
-                    || first_user.is_some_and(|f| r.contains(&f))
-            })
-            .collect()
+    /// First unit of the `keep_recent_turns` most recent turns before `p`.
+    fn protected_start(&self, assistant_units: &[usize], p: usize) -> usize {
+        if self.keep_recent_turns == 0 {
+            return p;
+        }
+        let before = assistant_units.partition_point(|&u| u < p);
+        before
+            .checked_sub(self.keep_recent_turns)
+            .map_or(0, |i| assistant_units[i])
     }
 }
 
 /// Partition into atomic units: an assistant message with tool calls plus
 /// the tool results that follow it; every other message alone.
-fn units(messages: &[Message]) -> Vec<std::ops::Range<usize>> {
+fn units(messages: &[Message]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < messages.len() {
@@ -172,17 +272,100 @@ fn units(messages: &[Message]) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+/// Units never elided or dropped: system messages, messages the harness or
+/// a hook injected, and the user's first message.
+fn fixed_units(messages: &[Message], units: &[Range<usize>]) -> Vec<bool> {
+    let first_user = messages
+        .iter()
+        .position(|m| m.role == Role::User && !m.is_injected());
+    units
+        .iter()
+        .map(|r| {
+            let m = &messages[r.start];
+            m.role == Role::System
+                || (m.role == Role::User && m.is_injected())
+                || first_user.is_some_and(|f| r.contains(&f))
+        })
+        .collect()
+}
+
+fn calls_by_id(messages: &[Message]) -> HashMap<String, ToolCall> {
+    messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .map(|c| (c.id.clone(), c.clone()))
+        .collect()
+}
+
+/// The stub that replaces a tool result, or `None` when `m` is not a tool
+/// result (or already a stub, or the stub would not be shorter).
+fn stub_for(m: &Message, calls: &HashMap<String, ToolCall>) -> Option<String> {
+    if m.role != Role::Tool {
+        return None;
+    }
+    let (tool, args) = match m.tool_call_id.as_ref().and_then(|id| calls.get(id)) {
+        Some(c) => (
+            c.name.as_str(),
+            clip(&c.arguments.to_string(), STUB_ARGS_CHARS),
+        ),
+        None => ("unknown", String::new()),
+    };
+    let chars = m.content.chars().count();
+    let mut lines = m.content.lines().map(str::trim).filter(|l| !l.is_empty());
+    let seen = match (lines.next(), lines.next_back()) {
+        (Some(first), Some(last)) => {
+            format!(
+                " (first line: {}; last line: {})",
+                quote(first),
+                quote(last)
+            )
+        }
+        (Some(only), None) => format!(" (output: {})", quote(only)),
+        _ => String::new(),
+    };
+    let stub = format!(
+        "[earlier tool result elided to fit the context window: {tool} {args} returned \
+         {chars} chars{seen}. You read it in full when it ran; call the tool again only if \
+         you need its exact content.]"
+    );
+    (stub.chars().count() < chars).then_some(stub)
+}
+
+/// Replace a tool result with its stub. Returns true if it changed.
+fn apply_stub(m: &mut Message, calls: &HashMap<String, ToolCall>) -> bool {
+    match stub_for(m, calls) {
+        Some(stub) => {
+            m.content = stub;
+            m.images.clear();
+            true
+        }
+        None => false,
+    }
+}
+
+fn quote(line: &str) -> String {
+    format!("\"{}\"", clip(line, STUB_LINE_CHARS))
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push_str("...");
+    out
+}
+
 #[async_trait]
 impl Hook for ContextWindow {
     async fn before_model(&self, _ctx: &HookContext<'_>, request: &mut ModelRequest) {
-        self.compact(&mut request.messages);
+        self.compact_request(request);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::ToolCall;
     use serde_json::json;
 
     fn round(id: &str, result: &str) -> Vec<Message> {
@@ -195,15 +378,21 @@ mod tests {
         ]
     }
 
+    fn body(len: usize, next: &str) -> String {
+        format!("header line\n{}\nNext file: {next}\n", "x".repeat(len))
+    }
+
     fn transcript(rounds: usize, result_len: usize) -> Vec<Message> {
         let mut m = vec![
             Message::system("sys"),
             Message::user("Summarize the files for Alice Rivera"),
         ];
         for r in 0..rounds {
-            m.extend(round(&format!("c{r}"), &"x".repeat(result_len)));
+            m.extend(round(
+                &format!("c{r}"),
+                &body(result_len, &format!("f{}", r + 1)),
+            ));
         }
-        m.push(Message::assistant("almost done", vec![]));
         m
     }
 
@@ -233,6 +422,35 @@ mod tests {
         open.is_empty()
     }
 
+    fn view(window: &ContextWindow, m: &[Message]) -> Vec<Message> {
+        let mut v = m.to_vec();
+        window.compact(&mut v);
+        v
+    }
+
+    /// Number of turns whose view does not extend the previous turn's.
+    fn prefix_changes(window: &ContextWindow, turns: usize, result_len: usize) -> usize {
+        let mut previous: Option<Vec<Message>> = None;
+        let mut changes = 0;
+        for r in 1..=turns {
+            let v = view(window, &transcript(r, result_len));
+            assert!(
+                estimate_tokens(&v) <= window.budget_tokens,
+                "turn {r}: {}",
+                estimate_tokens(&v)
+            );
+            assert!(well_formed(&v));
+            assert_eq!(v[1].content, "Summarize the files for Alice Rivera");
+            if let Some(prev) = &previous {
+                if v.len() < prev.len() || v[..prev.len()] != prev[..] {
+                    changes += 1;
+                }
+            }
+            previous = Some(v);
+        }
+        changes
+    }
+
     #[test]
     fn under_budget_is_untouched() {
         let mut m = transcript(3, 100);
@@ -242,38 +460,79 @@ mod tests {
     }
 
     #[test]
-    fn old_tool_results_are_elided_first() {
+    fn old_results_become_stubs_that_say_what_they_were() {
         let mut m = transcript(10, 4_000);
-        let window = ContextWindow::new(6_000).keep_recent_turns(2);
+        let window = ContextWindow::new(6_000);
         assert!(window.compact(&mut m));
         assert!(estimate_tokens(&m) <= 6_000);
         assert_eq!(m.len(), transcript(10, 4_000).len(), "nothing dropped");
-        assert_eq!(
-            m[3].content,
-            "[tool result for read_file elided: 4000 chars]"
+        let stub = &m[3].content;
+        assert!(stub.starts_with("[earlier tool result elided"), "{stub}");
+        assert!(
+            stub.contains(r#"read_file {"path":"c0"} returned 4027 chars"#),
+            "{stub}"
         );
-        // The last two turns (round c9 and the final answer) are intact.
+        assert!(stub.contains(r#"first line: "header line""#), "{stub}");
+        assert!(stub.contains(r#"last line: "Next file: f1""#), "{stub}");
+        // The newest turn is intact.
         let n = m.len();
-        assert_eq!(m[n - 2].content.len(), 4_000);
+        assert!(m[n - 1].content.len() > 4_000);
         assert!(well_formed(&m));
     }
 
     #[test]
-    fn whole_units_are_dropped_when_eliding_is_not_enough() {
-        let mut m = Vec::new();
-        m.push(Message::system("sys"));
-        m.push(Message::user("first request"));
-        for r in 0..20 {
-            m.push(Message::user(format!("follow-up {r} {}", "y".repeat(400))));
-            m.extend(round(&format!("c{r}"), "short"));
+    fn the_prefix_changes_only_in_coarse_steps() {
+        // One ~1k-token read per turn under a 6k budget. Re-cutting every
+        // turn would change the prefix on ~35 of 40 turns.
+        let changes = prefix_changes(&ContextWindow::new(6_000), 40, 4_000);
+        assert!(changes > 0);
+        assert!(changes <= 40 / 3, "{changes} prefix changes in 40 turns");
+    }
+
+    #[test]
+    fn stubs_are_dropped_in_steps_too() {
+        // 200 turns: the stubs themselves outgrow the budget.
+        let changes = prefix_changes(&ContextWindow::new(1_500), 200, 1_000);
+        assert!(changes <= 200 / 3, "{changes} prefix changes in 200 turns");
+    }
+
+    #[test]
+    fn recent_turns_over_budget_are_cut_for_that_request() {
+        // One turn re-reads five big files at once: the protected tail
+        // alone is over budget.
+        let mut m = vec![Message::system("sys"), Message::user("go")];
+        let calls: Vec<ToolCall> = (0..5)
+            .map(|i| ToolCall::new(format!("c{i}"), "read_file", json!({"path": i})))
+            .collect();
+        m.push(Message::assistant("", calls));
+        for i in 0..5 {
+            m.push(Message::tool_result(format!("c{i}"), body(8_000, "z")));
         }
-        let window = ContextWindow::new(400).keep_recent_turns(2);
+        let window = ContextWindow::new(5_000);
         assert!(window.compact(&mut m));
-        assert!(estimate_tokens(&m) <= 400, "{}", estimate_tokens(&m));
-        assert_eq!(m[0].content, "sys");
-        assert_eq!(m[1].content, "first request");
+        assert!(estimate_tokens(&m) <= 5_000, "{}", estimate_tokens(&m));
         assert!(well_formed(&m));
-        assert_eq!(m.last().unwrap().tool_call_id.as_deref(), Some("c19"));
+        assert!(m[3].content.starts_with("[earlier tool result elided"));
+        assert!(m[7].content.len() > 8_000, "the newest result stays");
+    }
+
+    #[test]
+    fn tool_definitions_count_against_the_budget() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: transcript(4, 4_000),
+            tools: vec![aidaemon_core::ToolSpec {
+                name: "read_file".into(),
+                description: "d".repeat(8_000),
+                parameters: json!({}),
+            }],
+            tool_choice: Default::default(),
+            max_output_tokens: None,
+            options: Default::default(),
+        };
+        assert!(estimate_tokens(&request.messages) < 6_000);
+        assert!(ContextWindow::new(6_000).compact_request(&mut request));
+        assert!(estimate_tokens(&request.messages) + 2_000 <= 6_000);
     }
 
     #[test]

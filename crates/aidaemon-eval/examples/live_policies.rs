@@ -56,7 +56,7 @@ fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
         "context_window" => vec![Arc::new(ContextWindow::new(120_000))],
         // Below the 10k window `context_trail` gives the model.
         "context_window_8k" => vec![Arc::new(ContextWindow::new(8_000))],
-        // The same with two protected turns, so the protected tail fits.
+        // The same with two protected turns (smaller, more frequent steps).
         "context_window_8k_recent2" => {
             vec![Arc::new(ContextWindow::new(8_000).keep_recent_turns(2))]
         }

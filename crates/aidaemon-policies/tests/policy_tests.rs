@@ -284,36 +284,127 @@ async fn project_instructions_are_injected_per_request_not_stored() {
         .any(|m| m.content.contains("Run cargo fmt")));
 }
 
+/// A log reader whose files each end by naming the next one.
+struct Trail;
+
+#[async_trait]
+impl Tool for Trail {
+    fn spec(&self) -> ToolSpec {
+        spec("read_log", "read a log file", &["path"])
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::READ_ONLY
+    }
+    async fn call(&self, arguments: Value, _ctx: &ToolContext) -> ToolResult {
+        let n: usize = arguments["path"]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        Ok(ToolOutput::text(format!(
+            "log {n} start\n{}\nNext file: {}\n",
+            "heartbeat ok\n".repeat(150),
+            n + 1
+        )))
+    }
+}
+
+/// Estimated tokens of everything a request sends: messages and tools.
+fn request_tokens(request: &aidaemon_core::ModelRequest) -> usize {
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    aidaemon_policies::estimate_tokens(&request.messages) + tools.div_ceil(4)
+}
+
+fn read_log(id: &str, n: usize) -> aidaemon_core::ToolCall {
+    call(id, "read_log", json!({"path": n.to_string()}))
+}
+
 #[tokio::test]
 async fn context_window_compacts_requests_but_not_state() {
-    let big = "z".repeat(8_000);
-    let provider = Arc::new(ScriptedProvider::new([
-        tool_calls([call("c1", "read_file", json!({"path": "a"}))]),
-        tool_calls([call("c2", "read_file", json!({"path": "b"}))]),
-        tool_calls([call("c3", "read_file", json!({"path": "c"}))]),
-        text("done"),
-    ]));
+    let provider = Arc::new(ScriptedProvider::new(
+        (0..20)
+            .map(|n| tool_calls([read_log(&format!("c{n}"), n)]))
+            .chain([text("done")]),
+    ));
     let agent = agent(provider.clone())
-        .tool(read_file(&big))
-        .hook(ContextWindow::new(3_000).keep_recent_turns(1))
+        .tool(Trail)
+        .hook(ContextWindow::new(3_000))
         .build()
         .unwrap();
-    let out = agent.run("s", "go").await.unwrap();
+    let out = agent.run("s", "follow the trail").await.unwrap();
     assert!(out.is_completed());
-    let last = provider.requests().last().unwrap().clone();
-    assert!(aidaemon_policies::estimate_tokens(&last.messages) <= 3_000);
-    assert!(last
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 21);
+
+    // No request passes the budget, tool definitions included.
+    for (i, r) in requests.iter().enumerate() {
+        assert!(
+            request_tokens(r) <= 3_000,
+            "request {i}: {}",
+            request_tokens(r)
+        );
+    }
+
+    // Consecutive requests share their prefix except at a few coarse steps
+    // (re-cutting every turn would break it on ~17 of 20).
+    let changes = requests
+        .windows(2)
+        .filter(|w| !w[1].messages.starts_with(&w[0].messages))
+        .count();
+    assert!(changes > 0);
+    assert!(changes <= 20 / 3, "{changes} prefix changes in 20 turns");
+
+    // An elided result says what it was.
+    let last = requests.last().unwrap();
+    let stub = last
         .messages
         .iter()
-        .any(|m| m.content == "[tool result for read_file elided: 8000 chars]"));
+        .find(|m| m.role == Role::Tool && m.content.starts_with("[earlier tool result elided"))
+        .map(|m| m.content.clone())
+        .expect("a stub");
+    assert!(stub.contains("read_log {\"path\":"), "{stub}");
+    assert!(stub.contains(" chars (first line: \"log "), "{stub}");
+    assert!(stub.contains("last line: \"Next file: "), "{stub}");
+
     // Stored transcript keeps every full result.
     let full = out
         .state
         .messages
         .iter()
-        .filter(|m| m.role == Role::Tool && m.content.len() == 8_000)
+        .filter(|m| m.role == Role::Tool && m.content.starts_with("log "))
         .count();
-    assert_eq!(full, 3);
+    assert_eq!(full, 20);
+}
+
+#[tokio::test]
+async fn context_window_never_sends_a_request_over_budget() {
+    // The model re-reads four files at once: the recent turns alone pass
+    // the budget.
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([read_log("a", 0)]),
+        tool_calls([read_log("b", 1)]),
+        tool_calls((0..4).map(|n| read_log(&format!("r{n}"), n))),
+        tool_calls((4..8).map(|n| read_log(&format!("s{n}"), n))),
+        text("done"),
+    ]));
+    let agent = agent(provider.clone())
+        .tool(Trail)
+        .hook(ContextWindow::new(1_200))
+        .build()
+        .unwrap();
+    let out = agent.run("s", "follow the trail").await.unwrap();
+    assert!(out.is_completed());
+    for (i, r) in provider.requests().iter().enumerate() {
+        assert!(
+            request_tokens(r) <= 1_200,
+            "request {i}: {}",
+            request_tokens(r)
+        );
+    }
 }
 
 #[tokio::test]
