@@ -130,12 +130,31 @@ impl std::fmt::Display for ModelCallTimedOut {
 
 impl std::error::Error for ModelCallTimedOut {}
 
+/// A message the same sender sent while the run was going, taken into it
+/// (`sdk_take_steering`). It is answered once a model call that carried it,
+/// with tools offered, returned; one never answered goes back to the channel
+/// queue at run end (`sdk_return_unanswered_steering`).
+pub(in crate::agent) struct AbsorbedSteering {
+    message: crate::tasks::QueuedMessage,
+    answered: bool,
+}
+
 impl Agent {
     /// Make one model call for the SDK run through the daemon's provider
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply.
     pub(super) async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
         let reply = self.sdk_model_call(scope, &call.request).await;
+        if reply.is_ok() {
+            // Every message taken so far rode in this call (placed messages
+            // stay pinned in each later call): the model has answered it with
+            // its tools in reach.
+            if let Ok(mut absorbed) = scope.absorbed_steering.lock() {
+                for entry in absorbed.iter_mut() {
+                    entry.answered = true;
+                }
+            }
+        }
         let _ = call.reply.send(reply);
     }
 
@@ -245,7 +264,15 @@ impl Agent {
                 .lock()
                 .map(|mut queue| std::mem::take(&mut *queue))
                 .unwrap_or_default();
-            let steering = self.sdk_take_steering(scope).await;
+            // A call that offers no tools (a text-only reply retry) cannot
+            // act on a new message: it stays queued for its own turn.
+            let offers_tools =
+                !request.tools.is_empty() && request.tool_choice != sdk::ToolChoice::None;
+            let steering = if offers_tools {
+                self.sdk_take_steering(scope).await
+            } else {
+                Vec::new()
+            };
             let mut placed = scope
                 .placed_directives
                 .lock()
@@ -600,8 +627,46 @@ impl Agent {
                 "role": "user",
                 "content": format!("{header}\n{}", queued.text),
             }));
+            if let Ok(mut absorbed) = scope.absorbed_steering.lock() {
+                absorbed.push(AbsorbedSteering {
+                    message: queued,
+                    answered: false,
+                });
+            }
         }
         messages
+    }
+
+    /// At run end, hand every message taken mid-turn that no model call
+    /// answered (the call that carried it failed and the run ended) back to
+    /// the channel queue, so it runs as its own turn right after this one
+    /// instead of being dropped.
+    pub(super) async fn sdk_return_unanswered_steering(&self, scope: &TurnScope<'_>) {
+        let unanswered: Vec<crate::tasks::QueuedMessage> = scope
+            .absorbed_steering
+            .lock()
+            .map(|mut absorbed| {
+                std::mem::take(&mut *absorbed)
+                    .into_iter()
+                    .filter(|entry| !entry.answered)
+                    .map(|entry| entry.message)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if unanswered.is_empty() {
+            return;
+        }
+        let Some(registry) = self.task_registry.get() else {
+            return;
+        };
+        warn!(
+            task_id = scope.task_id,
+            count = unanswered.len(),
+            "SDK engine: a mid-turn message was never answered; queued for its own turn"
+        );
+        registry
+            .return_steering_messages(scope.session_id, unanswered)
+            .await;
     }
 
     /// Admit a mandate run's model call against its durable balance. Returns
