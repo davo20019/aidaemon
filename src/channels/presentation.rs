@@ -73,6 +73,7 @@ pub(crate) fn present_notification(notification_type: &str, message: &str) -> St
             "⚠️ **Automation update**"
         }
         "mandate_action" => "✅ **Automation update**",
+        "mandate_alert" => "🚨 **Automation alert**",
         "node_monitor_alert" => "🚨 **Node alert**",
         "node_monitor_recovery" => "✅ **Node recovered**",
         "node_monitor_ended" | "node_monitor_suspended" => "⏸️ **Node monitoring**",

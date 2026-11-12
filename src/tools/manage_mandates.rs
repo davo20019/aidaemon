@@ -324,7 +324,8 @@ impl ManageMandatesTool {
                 args.max_mutating_actions_per_cycle.unwrap_or(0),
                 args.max_mutating_actions_per_rolling_24h.unwrap_or(0),
                 args.min_seconds_between_mutations.unwrap_or(0),
-            ));
+            )
+            .with_owner_alerts(args.owner_alerts.unwrap_or(false)));
         }
         Ok(MandateAuthority {
             allow_observations: args.allow_observations.unwrap_or(true),
@@ -337,6 +338,7 @@ impl ManageMandatesTool {
                 .max_mutating_actions_per_rolling_24h
                 .unwrap_or(0),
             min_seconds_between_mutations: args.min_seconds_between_mutations.unwrap_or(0),
+            owner_alerts: args.owner_alerts.unwrap_or(false),
         })
     }
 
@@ -714,6 +716,7 @@ impl ManageMandatesTool {
                     "content_sha256": value.content_sha256,
                 })),
                 "objective_control": args.objective_control,
+                "owner_alerts": authority.owner_alerts,
                 "authority": authority,
                 "resource_policy": {
                     "review_effort": capacity.display_mode(),
@@ -1308,6 +1311,7 @@ impl ManageMandatesTool {
                         "max_mutations_per_cycle": mandate.authority.max_mutating_actions_per_cycle,
                         "max_mutations_per_rolling_24h": mandate.authority.max_mutating_actions_per_rolling_24h,
                         "minimum_seconds_between_mutations": mandate.authority.min_seconds_between_mutations,
+                        "owner_alerts": mandate.authority.owner_alerts,
                     },
                     "owner_input_contract": {
                         "answer_question_records_guidance_only": true,
@@ -1737,6 +1741,7 @@ impl ManageMandatesTool {
             || args.max_mutating_actions_per_cycle.is_some()
             || args.max_mutating_actions_per_rolling_24h.is_some()
             || args.min_seconds_between_mutations.is_some()
+            || args.owner_alerts.is_some()
             || args.constraints.is_some()
             || args.success_criteria.is_some()
             || args.stop_conditions.is_some()
@@ -1763,6 +1768,7 @@ impl ManageMandatesTool {
         mandate.autonomy_mode = Self::autonomy_mode_from_args(args, Some(mandate.autonomy_mode))?;
         let enabled_autopilot =
             !previous_autonomy_mode.is_autopilot() && mandate.autonomy_mode.is_autopilot();
+        let previous_owner_alerts = mandate.authority.owner_alerts;
         if args.allow_observations.is_some()
             || args.operation_scopes.is_some()
             || args.allowed_tools.is_some()
@@ -1821,9 +1827,11 @@ impl ManageMandatesTool {
                     min_seconds_between_mutations: args
                         .min_seconds_between_mutations
                         .unwrap_or(mandate.authority.min_seconds_between_mutations),
+                    owner_alerts: previous_owner_alerts,
                 };
             }
         }
+        mandate.authority.owner_alerts = args.owner_alerts.unwrap_or(previous_owner_alerts);
         if let Some(values) = args.constraints.as_deref() {
             mandate.constraints = clean_strings(Some(values));
         }
@@ -2123,6 +2131,18 @@ impl ManageMandatesTool {
                 "question is required when outcome is ask"
             );
         }
+        if let Some(alert) = args.owner_alert.as_deref() {
+            validate_bounded_text(alert, "owner_alert", MAX_QUESTION_TEXT)?;
+            anyhow::ensure!(
+                outcome == MandateDecisionOutcome::Wait,
+                "owner_alert is carried only by a WAIT"
+            );
+            anyhow::ensure!(
+                mandate.authority.owner_alerts,
+                "this mandate's confirmed policy does not include telling the owner what it finds; record WAIT without owner_alert, or ASK the owner to confirm a policy update that adds it"
+            );
+            decision.owner_alert = Some(alert.to_string());
+        }
         (decision.termination_kind, decision.termination_match) = normalized_termination_fields(
             outcome,
             args.termination_kind.as_deref(),
@@ -2340,6 +2360,7 @@ struct ManageMandatesArgs {
     max_mutating_actions_per_cycle: Option<u32>,
     max_mutating_actions_per_rolling_24h: Option<u32>,
     min_seconds_between_mutations: Option<u32>,
+    owner_alerts: Option<bool>,
     constraints: Option<Vec<String>>,
     success_criteria: Option<Vec<String>>,
     stop_conditions: Option<Vec<String>>,
@@ -2369,6 +2390,7 @@ struct ManageMandatesArgs {
     measurement_observed_at: Option<String>,
     attributed_intention_ids: Option<Vec<String>>,
     question: Option<String>,
+    owner_alert: Option<String>,
     termination_kind: Option<String>,
     termination_match: Option<String>,
     reconsider_minutes: Option<i64>,
@@ -2445,6 +2467,7 @@ impl ManageMandatesArgs {
         trim_optional(&mut self.rationale);
         trim_optional(&mut self.measurement_observed_at);
         trim_optional(&mut self.question);
+        trim_optional(&mut self.owner_alert);
         trim_optional(&mut self.termination_kind);
         trim_optional(&mut self.termination_match);
         trim_optional(&mut self.intention);
@@ -2567,6 +2590,10 @@ const OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION: &str =
     "Autopilot control loop. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.";
 const FIXED_DEADLINE_DESCRIPTION: &str =
     "RFC3339 fixed deadline. Supported by both create and update.";
+const OWNER_ALERTS_DESCRIPTION: &str =
+    "create/update: true when the owner asked to be told what the mandate finds (e.g. tell me when it is down). Lets a review's WAIT carry owner_alert; grants no tool, target or effect.";
+const OWNER_ALERT_DESCRIPTION: &str =
+    "WAIT only, when the policy grants owner_alerts: the one finding the owner asked to hear about, in a sentence.";
 const STOP_ONLY_DESCRIPTION: &str = "STOP only; omit for ACT, WAIT, and ASK.";
 const VALUE_CRITERION_DESCRIPTION: &str =
     "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.";
@@ -2651,6 +2678,7 @@ impl Tool for ManageMandatesTool {
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
+                    "owner_alerts": described(json!({"type":"boolean"}), OWNER_ALERTS_DESCRIPTION), "owner_alert": described(bounded_text(MAX_QUESTION_TEXT), OWNER_ALERT_DESCRIPTION),
                     "constraints": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), CONSTRAINT_FIELD_DESCRIPTION), "success_criteria": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), SUCCESS_FIELD_DESCRIPTION), "stop_conditions": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), STOP_FIELD_DESCRIPTION),
                     "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": integer_min(1),
                     "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
@@ -3485,6 +3513,9 @@ fn display_access_summary(authority: &MandateAuthority) -> String {
             "Account: Only account {} through the {service}",
             account_ids.into_iter().collect::<Vec<_>>().join(", ")
         ));
+    }
+    if authority.owner_alerts {
+        lines.push("Tell you: what it finds that you asked to hear about".to_string());
     }
     lines.push("Everything else remains blocked".to_string());
     lines.join("\n")
@@ -4776,6 +4807,98 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mandate_that_should_tell_the_owner_carries_and_shows_the_alert_grant() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let tool = ManageMandatesTool::new(state.clone());
+        let create = |owner_alerts: bool| {
+            json!({
+                "action": "create",
+                "objective": "Check the synthetic status page hourly and tell me when it is down",
+                "duration_minutes": 60,
+                "default_review_minutes": 60,
+                "min_review_minutes": 60,
+                "max_review_minutes": 60,
+                "operation_scopes": [{
+                    "tool": "http_request",
+                    "operation": "GET",
+                    "kind": "observation",
+                    "target_prefixes": ["https://status.example.test/health"],
+                    "mutation_effects": []
+                }],
+                "owner_alerts": owner_alerts,
+                "success_criteria": ["The owner hears about every outage of the status page"]
+            })
+            .to_string()
+        };
+
+        // The draft shows the typed grant the model chose.
+        let mut draft: Value = serde_json::from_str(&create(true)).unwrap();
+        draft["action"] = json!("draft");
+        let drafted: Value = serde_json::from_str(
+            &tool
+                .call_with(&draft.to_string(), approved_owner_facts())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(drafted["proposal"]["owner_alerts"], json!(true));
+
+        // The owner's card says the automation will tell them what it finds.
+        let crate::traits::OwnerApprovalNeed::Ask(request) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&create(true)).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Tell you:")),
+            "{:#?}",
+            request.warnings
+        );
+        let crate::traits::OwnerApprovalNeed::Ask(silent) = tool
+            .owner_approval(
+                &serde_json::from_str::<Value>(&create(false)).unwrap(),
+                &owner_facts(),
+            )
+            .await
+        else {
+            panic!("create asks the owner");
+        };
+        assert!(!silent
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Tell you:")));
+
+        tool.call_with(&create(true), approved_owner_facts())
+            .await
+            .unwrap();
+        let mandates = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap();
+        assert_eq!(mandates.len(), 1);
+        assert!(mandates[0].authority.owner_alerts);
+        let summary: Value = serde_json::from_str(
+            &tool
+                .call_with(
+                    &json!({"action": "get", "mandate_id": mandates[0].id}).to_string(),
+                    approved_owner_facts(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["authority_summary"]["owner_alerts"], json!(true));
     }
 
     #[tokio::test]

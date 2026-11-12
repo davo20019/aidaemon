@@ -22,8 +22,8 @@ const MANDATE_COLUMNS: &str =
 
 const DECISION_COLUMNS: &str =
     "id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level, rationale, belief_snapshot, \
-     evidence_receipt_ids_json, question, termination_kind, termination_match, reconsider_at, \
-     action_attempts, created_at, updated_at";
+     evidence_receipt_ids_json, question, owner_alert, termination_kind, termination_match, \
+     reconsider_at, action_attempts, created_at, updated_at";
 
 const INTENTION_COLUMNS: &str =
     "id, mandate_id, decision_cycle_id, goal_run_id, description, rationale, \
@@ -119,6 +119,7 @@ fn decision_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateDec
             &row.get::<String, _>("evidence_receipt_ids_json"),
         )?,
         question: row.get("question"),
+        owner_alert: row.get("owner_alert"),
         termination_kind: row
             .get::<Option<String>, _>("termination_kind")
             .map(|value| {
@@ -3110,6 +3111,12 @@ impl<S: WorkDatabase> MandateStore for S {
                 "ASK requires a concrete question"
             );
         }
+        if let Some(alert) = decision.owner_alert.as_deref() {
+            anyhow::ensure!(
+                decision.outcome == MandateDecisionOutcome::Wait && !alert.trim().is_empty(),
+                "owner_alert is a non-empty finding carried by a WAIT"
+            );
+        }
         anyhow::ensure!(
             decision.outcome == MandateDecisionOutcome::Stop
                 || (decision.termination_kind.is_none() && decision.termination_match.is_none()),
@@ -3184,6 +3191,10 @@ impl<S: WorkDatabase> MandateStore for S {
         anyhow::ensure!(
             decision.mandate_version == mandate.version,
             "mandate version changed before the decision was committed"
+        );
+        anyhow::ensure!(
+            decision.owner_alert.is_none() || mandate.authority.owner_alerts,
+            "this mandate's confirmed policy does not include telling the owner what it finds; record WAIT without owner_alert, or ASK the owner to confirm a policy update that adds it"
         );
         validate_current_run_receipt_refs(
             &mut tx,
@@ -3392,9 +3403,10 @@ impl<S: WorkDatabase> MandateStore for S {
         sqlx::query(
             "INSERT INTO mandate_decision_cycles (
                 id, mandate_id, goal_run_id, mandate_version, outcome, origin, activity_level,
-                rationale, belief_snapshot, evidence_receipt_ids_json, question, termination_kind,
-                termination_match, reconsider_at, action_attempts, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rationale, belief_snapshot, evidence_receipt_ids_json, question, owner_alert,
+                termination_kind, termination_match, reconsider_at, action_attempts, created_at,
+                updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&decision.id)
         .bind(&decision.mandate_id)
@@ -3407,6 +3419,7 @@ impl<S: WorkDatabase> MandateStore for S {
         .bind(&decision.belief_snapshot)
         .bind(serde_json::to_string(&decision.evidence_receipt_ids)?)
         .bind(&decision.question)
+        .bind(&decision.owner_alert)
         .bind(
             decision
                 .termination_kind
@@ -5043,8 +5056,21 @@ impl<S: WorkDatabase> MandateStore for S {
                         reason: MandateFinalizationStaleReason::RunNotCurrent,
                     });
                 }
+                let owner_alert = if decision_outcome == MandateDecisionOutcome::Wait {
+                    sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT owner_alert FROM mandate_decision_cycles WHERE id = ?",
+                    )
+                    .bind(&decision_cycle_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten()
+                } else {
+                    None
+                };
                 if let Some(kind) = match decision_outcome {
-                    MandateDecisionOutcome::Wait => None,
+                    MandateDecisionOutcome::Wait => owner_alert
+                        .is_some()
+                        .then_some(crate::traits::MandateRunNotificationKind::Alert),
                     MandateDecisionOutcome::Ask => {
                         Some(crate::traits::MandateRunNotificationKind::Ask)
                     }
@@ -5074,7 +5100,8 @@ impl<S: WorkDatabase> MandateStore for S {
                         counts.clone(),
                         &request.finalized_at,
                     )
-                    .with_owner_question(question.as_deref());
+                    .with_owner_question(question.as_deref())
+                    .with_owner_alert(owner_alert.as_deref());
                     super::notifications::enqueue_mandate_run_notification_on_connection(
                         &mut tx, &notice,
                     )
@@ -8391,6 +8418,106 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
+    }
+
+    /// Drive one review to a finalized WAIT carrying `owner_alert`, as the
+    /// task lead would. Returns the commit error when the decision is refused.
+    async fn finalize_wait_with_alert(
+        store: &SqliteWorkStore,
+        goal: &Goal,
+        mandate: &Mandate,
+        alert: &str,
+    ) -> anyhow::Result<()> {
+        let run = claim_and_start_run(store, goal, mandate).await;
+        let root_attempt = store
+            .claim_task_with_lease(
+                run.root_task_id.as_deref().unwrap(),
+                "alert-root",
+                Some("profile-task-lead"),
+                7_200,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "the watched page answered 503",
+            mandate.version,
+        );
+        decision.owner_alert = Some(alert.to_string());
+        store
+            .record_mandate_decision(&decision, None, Some(&root_attempt.id))
+            .await?;
+        assert!(store
+            .patch_task_from_attempt(
+                &root_attempt.id,
+                &root_attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("WAIT recorded".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        store
+            .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                mandate_id: mandate.id.clone(),
+                expected_mandate_version: mandate.version,
+                goal_run_id: run.id.clone(),
+                finalized_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_granted_owner_alert_reaches_the_owner_and_the_mandate_keeps_running() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 0);
+        mandate.authority.owner_alerts = true;
+        finalize_wait_with_alert(
+            &store,
+            &goal,
+            &mandate,
+            "The watched page is down (HTTP 503).",
+        )
+        .await
+        .expect("a granted alert commits with its WAIT");
+        let message = sqlx::query_scalar::<_, String>(
+            "SELECT message FROM notification_queue
+             WHERE goal_id = ? AND notification_type = 'mandate_alert'",
+        )
+        .bind(&goal.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(
+            message.contains("The watched page is down (HTTP 503)."),
+            "{message}"
+        );
+        let after = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(after.status, MandateStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn an_owner_alert_without_the_grant_is_refused() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 0);
+        assert!(!mandate.authority.owner_alerts);
+        let refused =
+            finalize_wait_with_alert(&store, &goal, &mandate, "The watched page is down.").await;
+        assert!(refused.is_err(), "an alert needs the owner's grant");
+        let alerts = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_queue WHERE notification_type = 'mandate_alert'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(alerts, 0);
     }
 
     #[tokio::test]

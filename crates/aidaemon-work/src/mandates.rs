@@ -940,6 +940,13 @@ pub struct MandateAuthority {
     /// for this mandate. Observation cycles are deliberately unaffected.
     #[serde(default)]
     pub min_seconds_between_mutations: u32,
+    /// The owner asked to be told what the mandate finds ("tell me when it
+    /// is down"). It lets a WAIT carry one owner alert
+    /// ([`MandateDecisionCycle::owner_alert`]); it grants no tool, target or
+    /// effect. Absent in policies written before it existed, which keeps
+    /// their confirmed hashes unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_alerts: bool,
 }
 
 fn default_allow_observations() -> bool {
@@ -957,6 +964,7 @@ impl Default for MandateAuthority {
             max_mutating_actions_per_cycle: 0,
             max_mutating_actions_per_rolling_24h: 0,
             min_seconds_between_mutations: 0,
+            owner_alerts: false,
         }
     }
 }
@@ -1036,7 +1044,14 @@ impl MandateAuthority {
             max_mutating_actions_per_cycle,
             max_mutating_actions_per_rolling_24h,
             min_seconds_between_mutations,
+            owner_alerts: false,
         }
+    }
+
+    /// The same policy, with or without the owner-alert grant.
+    pub fn with_owner_alerts(mut self, owner_alerts: bool) -> Self {
+        self.owner_alerts = owner_alerts;
+        self
     }
 
     pub fn uses_operation_scopes(&self) -> bool {
@@ -1291,13 +1306,20 @@ fn validate_mandate_target_prefix(prefix: &str) -> Result<(), String> {
     if prefix.contains("://") {
         let url = reqwest::Url::parse(prefix)
             .map_err(|_| "URL target prefixes must be canonical URLs".to_string())?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-            || matches!(url.path(), "" | "/")
-        {
+        let well_formed = matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none();
+        // A target covers everything below it, so the site root would grant
+        // the whole site. Refuse it, and say how to name what is meant.
+        if well_formed && matches!(url.path(), "" | "/") {
+            let origin = url.origin().ascii_serialization();
+            return Err(format!(
+                "URL target {prefix} is the site root, which would cover the whole site. Name the exact page or path to check instead, as {origin}/<page> (for the front page, the page the site serves there, such as {origin}/index.html), and confirm that path with the owner."
+            ));
+        }
+        if !well_formed || matches!(url.path(), "" | "/") {
             return Err(
                 "URL target prefixes require an http(s) origin plus a non-root path and cannot contain userinfo or fragments"
                     .to_string(),
@@ -1481,6 +1503,11 @@ pub struct MandateDecisionCycle {
     #[serde(default)]
     pub evidence_receipt_ids: Vec<String>,
     pub question: Option<String>,
+    /// WAIT only, and only when the policy grants `owner_alerts`: one
+    /// finding the owner asked to be told about. Sent to the owner when the
+    /// review closes; the mandate keeps running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_alert: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_kind: Option<MandateTerminationKind>,
     /// Exact owner-authored success/stop entry matched by a STOP decision.
@@ -1534,6 +1561,7 @@ impl MandateDecisionCycle {
             belief_snapshot: None,
             evidence_receipt_ids: Vec::new(),
             question: None,
+            owner_alert: None,
             termination_kind: None,
             termination_match: None,
             reconsider_at: None,
@@ -2393,6 +2421,8 @@ pub enum MandateRunFinalizationResult {
 pub enum MandateRunNotificationKind {
     ActSatisfied,
     Ask,
+    /// A WAIT that carried the owner alert its policy grants.
+    Alert,
     Stopped,
     ReconciliationRequired {
         reason: MandateReconciliationReason,
@@ -2409,6 +2439,7 @@ impl MandateRunNotificationKind {
         match self {
             Self::ActSatisfied => "mandate_action",
             Self::Ask => "mandate_ask",
+            Self::Alert => "mandate_alert",
             Self::Stopped => "mandate_stopped",
             Self::ReconciliationRequired { .. }
             | Self::ExecutionLeaseLost
@@ -2432,6 +2463,10 @@ pub struct MandateRunNotification {
     /// answer from chat. Rendered through [`owner_question_excerpt`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_question: Option<String>,
+    /// The WAIT's owner alert, rendered through [`owner_question_excerpt`]
+    /// (the same bounding, quoted and attributed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_alert: Option<String>,
     /// The owner-confirmed objective, so the notice names the automation the
     /// owner recognizes instead of an opaque id. Rendered through
     /// [`mandate_owner_label`].
@@ -2518,6 +2553,7 @@ impl MandateRunNotification {
             counts,
             created_at: created_at.to_string(),
             owner_question: None,
+            owner_alert: None,
             objective: None,
         }
     }
@@ -2529,6 +2565,11 @@ impl MandateRunNotification {
 
     pub fn with_owner_question(mut self, question: Option<&str>) -> Self {
         self.owner_question = question.and_then(owner_question_excerpt);
+        self
+    }
+
+    pub fn with_owner_alert(mut self, alert: Option<&str>) -> Self {
+        self.owner_alert = alert.and_then(owner_question_excerpt);
         self
     }
 
@@ -2589,6 +2630,14 @@ impl MandateRunNotification {
                 ),
                 None => format!(
                     "{label} needs your input. Ask me what it wants to know. If you don't reply, it continues on its own within its current limits at its next review. {reference}"
+                ),
+            },
+            MandateRunNotificationKind::Alert => match self.owner_alert.as_deref() {
+                Some(alert) => format!(
+                    "{label} has something you asked to hear about. It reported: \"{alert}\"\n\nIt keeps running on its own; nothing new was allowed. {reference}"
+                ),
+                None => format!(
+                    "{label} has something you asked to hear about. Ask me what it found. It keeps running on its own. {reference}"
                 ),
             },
             MandateRunNotificationKind::Stopped => format!(
@@ -2667,6 +2716,24 @@ impl MandateRunNotification {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_site_root_target_is_refused_with_a_way_forward() {
+        let refused = super::validate_mandate_target_prefix("https://status.example.test/")
+            .expect_err("a root target would cover the whole site");
+        assert!(refused.contains("whole site"), "{refused}");
+        assert!(
+            refused.contains("https://status.example.test/<page>"),
+            "the refusal names how to scope it: {refused}"
+        );
+        assert!(super::validate_mandate_target_prefix("https://status.example.test").is_err());
+        assert!(
+            super::validate_mandate_target_prefix("https://status.example.test/health").is_ok()
+        );
+        let userinfo = super::validate_mandate_target_prefix("https://a:b@status.example.test/x")
+            .expect_err("userinfo is refused");
+        assert!(!userinfo.contains("whole site"), "{userinfo}");
+    }
     use super::*;
 
     #[test]

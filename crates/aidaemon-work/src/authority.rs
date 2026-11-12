@@ -1031,6 +1031,7 @@ mod tests {
             max_mutating_actions_per_cycle: 2,
             max_mutating_actions_per_rolling_24h: 8,
             min_seconds_between_mutations: 900,
+            owner_alerts: false,
         }
     }
 

@@ -1159,6 +1159,10 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
+    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN owner_alert TEXT")
+        .execute(pool)
+        .await;
+
     // Pre-release development databases may already contain the first mandate
     // draft. Keep startup migration idempotent while backfilling the durable
     // wake/lease and policy-version columns added before the first release.
