@@ -1166,8 +1166,10 @@ impl Agent {
                 builder = builder.tool_arc(tool);
             }
             // "Don't remember this" is the host's, so it is offered under any
-            // memory system, on a turn that would otherwise learn.
-            if !memory_turn.mandate
+            // memory system, on a turn that would otherwise learn. A turn
+            // offered no tools stays tool-free (`/private` still works there).
+            if !offered_tools.is_empty()
+                && !memory_turn.mandate
                 && memory_turn.memory_persistence_allowed
                 && !memory_turn.memory_isolated()
                 && memory_turn.learning_consent.allowed()
