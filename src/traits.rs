@@ -53,8 +53,7 @@ pub use aidaemon_work::mandates::{
     MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationKind,
     MandateOperationScope, MandateReconciliationReason, MandateReconciliationResolution,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategyRevision,
-    MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind,
+    MandateRunNotificationKind, MandateRunProofCounts, MandateStatus, MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind,
     MandateTerminationKind, MandateWakeSignal, MandateWakeSignalKind, ObjectiveMetricDirection,
     SAFE_FALLBACK_WAIT_RATIONALE,
 };

@@ -400,8 +400,13 @@ pub enum ObjectiveMetricDirection {
     AtMost,
 }
 
-/// Stable, integer-valued control policy for a measurable ongoing objective.
+/// A measured objective: a number the mandate works to move to a target.
 /// Values use caller-declared micro-units to avoid floating-point drift.
+///
+/// New mandates no longer set one; it is kept, read-only, for a mandate that
+/// was confirmed with one, so its reviews still record and read the metric.
+/// Settings older rows also carry (experiment cohort and window, minimum
+/// effect, stagnation and failure budgets) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MandateObjectiveControl {
     pub schema_version: u16,
@@ -413,24 +418,13 @@ pub struct MandateObjectiveControl {
     /// Exact analytics endpoint or stable metric-source resource identity.
     pub measurement_source: String,
     pub measurement_cadence_secs: i64,
-    /// Owner-confirmed experiment/cohort identity used to keep attributed
-    /// observations from silently mixing unrelated strategy populations.
-    pub experiment_cohort: String,
-    pub experiment_window_secs: i64,
-    pub minimum_effect_micros: i64,
-    pub max_stagnant_measurements: u16,
-    pub run_failure_budget: u16,
     pub baseline_observed_at: String,
 }
 
 impl MandateObjectiveControl {
     pub const SCHEMA_VERSION: u16 = 1;
-    /// Smallest meaningful effect: one thousandth of a unit.
-    pub const MIN_EFFECT_MICROS: i64 = 1_000;
 
-    /// Checks every setting. An error names the one setting that is wrong,
-    /// its value and the allowed range, so the model can fix that setting
-    /// and tell the owner plainly what was wrong.
+    /// Checks every setting. An error names the one setting that is wrong.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != Self::SCHEMA_VERSION {
             return Err(format!(
@@ -439,48 +433,12 @@ impl MandateObjectiveControl {
                 Self::SCHEMA_VERSION
             ));
         }
-        for (field, value, max) in [
-            ("metric_name", &self.metric_name, 128),
-            ("unit", &self.unit, 64),
-            ("experiment_cohort", &self.experiment_cohort, 128),
-        ] {
+        for (field, value, max) in [("metric_name", &self.metric_name, 128), ("unit", &self.unit, 64)] {
             if !canonical_text_within(value, max) {
                 return Err(format!(
                     "{field} must be plain text of 1 to {max} characters with no surrounding spaces"
                 ));
             }
-        }
-        let (target, baseline) = (self.target_micros, self.baseline_micros);
-        match self.direction {
-            ObjectiveMetricDirection::AtLeast if target <= baseline => {
-                return Err(format!(
-                    "with direction at_least, target_micros ({target}) must be greater than baseline_micros ({baseline})"
-                ));
-            }
-            ObjectiveMetricDirection::AtMost if target >= baseline => {
-                return Err(format!(
-                    "with direction at_most, target_micros ({target}) must be less than baseline_micros ({baseline})"
-                ));
-            }
-            _ => {}
-        }
-        // `*_micros` are millionths of one unit. A sub-milli-unit effect or a
-        // target closer to baseline than the minimum effect is a unit slip
-        // ("1 engagement" written as 1 micro), and it makes any single
-        // observation satisfy the objective and terminate the mandate.
-        if self.minimum_effect_micros < Self::MIN_EFFECT_MICROS {
-            return Err(format!(
-                "minimum_effect_micros is {}; it must be at least {} (values are millionths of a unit: 1 unit = 1000000)",
-                self.minimum_effect_micros,
-                Self::MIN_EFFECT_MICROS
-            ));
-        }
-        let gap = target.abs_diff(baseline);
-        if gap < self.minimum_effect_micros.unsigned_abs() {
-            return Err(format!(
-                "target_micros and baseline_micros differ by {gap}; they must differ by at least minimum_effect_micros ({})",
-                self.minimum_effect_micros
-            ));
         }
         let source_valid = reqwest::Url::parse(&self.measurement_source)
             .ok()
@@ -502,30 +460,10 @@ impl MandateObjectiveControl {
             );
         }
         const MAX_CADENCE_SECS: i64 = 30 * 24 * 60 * 60;
-        const MAX_WINDOW_SECS: i64 = 90 * 24 * 60 * 60;
         if !(60..=MAX_CADENCE_SECS).contains(&self.measurement_cadence_secs) {
             return Err(format!(
                 "measurement_cadence_secs is {}; allowed: 60 to {MAX_CADENCE_SECS} (1 minute to 30 days)",
                 self.measurement_cadence_secs
-            ));
-        }
-        if !(self.measurement_cadence_secs..=MAX_WINDOW_SECS).contains(&self.experiment_window_secs)
-        {
-            return Err(format!(
-                "experiment_window_secs is {}; allowed: measurement_cadence_secs ({}) to {MAX_WINDOW_SECS} (90 days)",
-                self.experiment_window_secs, self.measurement_cadence_secs
-            ));
-        }
-        if !(1..=20).contains(&self.max_stagnant_measurements) {
-            return Err(format!(
-                "max_stagnant_measurements is {}; allowed: 1 to 20",
-                self.max_stagnant_measurements
-            ));
-        }
-        if !(1..=10).contains(&self.run_failure_budget) {
-            return Err(format!(
-                "run_failure_budget is {}; allowed: 1 to 10",
-                self.run_failure_budget
             ));
         }
         if chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).is_err() {
@@ -561,8 +499,8 @@ impl MandateObjectiveControl {
     }
 }
 
-/// One immutable observation in the objective's control loop. Receipt IDs
-/// prove the measurement and attribution IDs link it to bounded experiments.
+/// One immutable observation of a measured objective. Receipt IDs prove the
+/// measurement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MandateObjectiveMeasurement {
     pub id: String,
@@ -572,8 +510,6 @@ pub struct MandateObjectiveMeasurement {
     pub value_micros: i64,
     pub confidence_bps: u16,
     pub evidence_receipt_ids: Vec<String>,
-    #[serde(default)]
-    pub attributed_intention_ids: Vec<String>,
     pub observed_at: String,
     pub created_at: String,
 }
@@ -596,15 +532,9 @@ impl MandateObjectiveMeasurement {
             value_micros,
             confidence_bps,
             evidence_receipt_ids,
-            attributed_intention_ids: Vec::new(),
             observed_at: observed_at.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         }
-    }
-
-    pub fn with_attributed_intention_ids(mut self, intention_ids: Vec<String>) -> Self {
-        self.attributed_intention_ids = intention_ids;
-        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -612,16 +542,11 @@ impl MandateObjectiveMeasurement {
             || self.confidence_bps > 10_000
             || self.evidence_receipt_ids.is_empty()
             || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
-            || self.attributed_intention_ids.len() > 16
             || chrono::DateTime::parse_from_rfc3339(&self.observed_at).is_err()
         {
             return Err("objective measurement metadata is invalid".to_string());
         }
-        for id in self
-            .evidence_receipt_ids
-            .iter()
-            .chain(&self.attributed_intention_ids)
-        {
+        for id in &self.evidence_receipt_ids {
             if !canonical_text_within(id, 256) {
                 return Err("objective measurement identifiers are invalid".to_string());
             }
@@ -686,7 +611,6 @@ impl MandateStrategySnapshot {
 pub enum MandateSuspensionKind {
     OwnerPaused,
     AwaitingAnswer,
-    ObjectiveControlRequired,
     ReconciliationRequired,
     ExecutionLeaseLost,
     ReviewFailed,
@@ -698,7 +622,6 @@ impl MandateSuspensionKind {
         match self {
             Self::OwnerPaused => "owner_paused",
             Self::AwaitingAnswer => "awaiting_answer",
-            Self::ObjectiveControlRequired => "objective_control_required",
             Self::ReconciliationRequired => "reconciliation_required",
             Self::ExecutionLeaseLost => "execution_lease_lost",
             Self::ReviewFailed => "review_failed",
@@ -1718,112 +1641,9 @@ impl MandateDecisionCycle {
     }
 }
 
-/// One typed, evidence-backed revision to the mandate's adaptive operating
-/// strategy. These revisions are advisory and may change tactics only; they
-/// are never owner authority and are ignored by the authorization gate.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum MandateStrategyRevisionKind {
-    Reinforce,
-    Explore,
-    Avoid,
-    Retire,
-}
-
-impl MandateStrategyRevisionKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Reinforce => "reinforce",
-            Self::Explore => "explore",
-            Self::Avoid => "avoid",
-            Self::Retire => "retire",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "reinforce" => Some(Self::Reinforce),
-            "explore" => Some(Self::Explore),
-            "avoid" => Some(Self::Avoid),
-            "retire" => Some(Self::Retire),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MandateStrategyRevision {
-    pub id: String,
-    pub mandate_id: String,
-    pub mandate_version: i64,
-    pub decision_cycle_id: String,
-    pub strategy_key: String,
-    pub kind: MandateStrategyRevisionKind,
-    pub guidance: String,
-    /// Confidence in basis points (0–10,000), avoiding floating-point drift.
-    pub confidence_bps: u16,
-    pub evidence_receipt_ids: Vec<String>,
-    pub created_at: String,
-}
-
-impl MandateStrategyRevision {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        mandate_id: &str,
-        mandate_version: i64,
-        decision_cycle_id: &str,
-        strategy_key: &str,
-        kind: MandateStrategyRevisionKind,
-        guidance: &str,
-        confidence_bps: u16,
-        evidence_receipt_ids: Vec<String>,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            mandate_id: mandate_id.to_string(),
-            mandate_version,
-            decision_cycle_id: decision_cycle_id.to_string(),
-            strategy_key: strategy_key.to_string(),
-            kind,
-            guidance: guidance.trim().to_string(),
-            confidence_bps,
-            evidence_receipt_ids,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        let valid_key = !self.strategy_key.is_empty()
-            && self.strategy_key.len() <= 64
-            && self.strategy_key.bytes().enumerate().all(|(index, byte)| {
-                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'_' | b'-' | b'.'))
-            });
-        if !canonical_text_within(&self.id, 256)
-            || !canonical_text_within(&self.mandate_id, 256)
-            || self.mandate_version <= 0
-            || !canonical_text_within(&self.decision_cycle_id, 256)
-            || !valid_key
-            || !canonical_text_within(&self.guidance, 750)
-            || self.confidence_bps > 10_000
-            || self.evidence_receipt_ids.is_empty()
-            || self.evidence_receipt_ids.len() > 8
-            || self
-                .evidence_receipt_ids
-                .iter()
-                .any(|value| !canonical_text_within(value, 256))
-        {
-            return Err("invalid bounded mandate strategy revision".to_string());
-        }
-        chrono::DateTime::parse_from_rfc3339(&self.created_at)
-            .map_err(|_| "strategy revision created_at must be RFC3339".to_string())?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct MandateOperatingUpdates {
     pub learning_note: Option<MandateLearningNote>,
-    pub strategy_revisions: Vec<MandateStrategyRevision>,
 }
 
 /// Content-free external signal that may accelerate a matching Autopilot
@@ -3441,23 +3261,19 @@ mod tests {
     }
 
     #[test]
-    fn objective_control_enforces_direction_cadence_and_target() {
-        let mut control = MandateObjectiveControl {
-            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
-            metric_name: "synthetic conversions".to_string(),
-            unit: "count".to_string(),
-            baseline_micros: 5_000_000,
-            target_micros: 8_000_000,
-            direction: ObjectiveMetricDirection::AtLeast,
-            measurement_source: "metric_source:synthetic-analytics".to_string(),
-            measurement_cadence_secs: 3_600,
-            experiment_cohort: "synthetic-cohort-a".to_string(),
-            experiment_window_secs: 86_400,
-            minimum_effect_micros: 500_000,
-            max_stagnant_measurements: 3,
-            run_failure_budget: 3,
-            baseline_observed_at: "2026-08-15T00:00:00Z".to_string(),
-        };
+    fn objective_control_reads_legacy_rows_and_enforces_cadence_and_target() {
+        // A row confirmed before the trim still carries experiment and
+        // stagnation settings; they are ignored, not refused.
+        let control: MandateObjectiveControl = serde_json::from_str(
+            r#"{"schema_version":1,"metric_name":"weekly_engagements","unit":"engagements",
+                "baseline_micros":5000000,"target_micros":8000000,"direction":"at_least",
+                "measurement_source":"metric_source:synthetic-analytics",
+                "measurement_cadence_secs":3600,"experiment_cohort":"synthetic-cohort-a",
+                "experiment_window_secs":86400,"minimum_effect_micros":500000,
+                "max_stagnant_measurements":3,"run_failure_budget":3,
+                "baseline_observed_at":"2026-08-15T00:00:00Z"}"#,
+        )
+        .unwrap();
         assert!(control.validate().is_ok());
         assert!(!control.target_reached(7_999_999));
         assert!(control.target_reached(8_000_000));
@@ -3478,54 +3294,18 @@ mod tests {
             Some("2026-08-15T01:00:00Z")
         );
 
-        control.target_micros = control.baseline_micros;
-        assert!(control.validate().is_err());
-        // "Reach 1 engagement" written as one micro-unit: a single signal
-        // would satisfy the objective and end the mandate.
-        let mut unit_slip = control.clone();
-        unit_slip.baseline_micros = 0;
-        unit_slip.target_micros = 1;
-        unit_slip.minimum_effect_micros = 1;
-        assert!(unit_slip.validate().is_err());
-        // A target inside the minimum effect is not a reachable improvement.
-        let mut too_close = control.clone();
-        too_close.target_micros = too_close.baseline_micros + 400_000;
-        assert!(too_close.validate().is_err());
-        control.target_micros = 8_000_000;
-        control.experiment_window_secs = control.measurement_cadence_secs - 1;
-        assert!(control.validate().is_err());
-
-        // Each refusal names the one setting that is wrong and its range,
-        // so it can be fixed and relayed plainly.
-        control.experiment_window_secs = 86_400;
-        let mut stalled = control.clone();
-        stalled.max_stagnant_measurements = 24;
-        assert_eq!(
-            stalled.validate().unwrap_err(),
-            "max_stagnant_measurements is 24; allowed: 1 to 20"
-        );
-        let mut window = control.clone();
-        window.experiment_window_secs = 60;
-        assert_eq!(
-            window.validate().unwrap_err(),
-            "experiment_window_secs is 60; allowed: measurement_cadence_secs (3600) to 7776000 (90 days)"
-        );
-        let mut budget = control.clone();
-        budget.run_failure_budget = 0;
-        assert!(budget
+        let mut cadence = control.clone();
+        cadence.measurement_cadence_secs = 59;
+        assert!(cadence
             .validate()
             .unwrap_err()
-            .starts_with("run_failure_budget is 0; allowed: 1 to 10"));
+            .starts_with("measurement_cadence_secs is 59"));
         let mut when = control.clone();
         when.baseline_observed_at = "yesterday".to_string();
         assert!(when
             .validate()
             .unwrap_err()
             .starts_with("baseline_observed_at is \"yesterday\""));
-        assert!(unit_slip
-            .validate()
-            .unwrap_err()
-            .starts_with("minimum_effect_micros is 1; it must be at least 1000"));
     }
 
     #[test]

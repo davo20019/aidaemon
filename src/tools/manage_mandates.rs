@@ -559,9 +559,6 @@ mod tests {
                     "reconsider_minutes": 180,
                     "learning_note": "",
                     "learning_evidence_receipt_ids": [],
-                    "strategy_key": "",
-                    "strategy_kind": "explore",
-                    "strategy_confidence_bps": 0,
                 })
                 .to_string(),
                 crate::traits::ToolCallContext {
@@ -589,11 +586,6 @@ mod tests {
         );
         assert!(state
             .list_mandate_learning_notes(&mandate.id, 10)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(state
-            .list_current_mandate_strategy(&mandate.id, 10)
             .await
             .unwrap()
             .is_empty());
@@ -665,11 +657,6 @@ mod tests {
                 direction: crate::traits::ObjectiveMetricDirection::AtLeast,
                 measurement_source: "metric_source:acme-notes".to_string(),
                 measurement_cadence_secs: 600,
-                experiment_cohort: "acme".to_string(),
-                experiment_window_secs: 3_600,
-                minimum_effect_micros: 1_000_000,
-                max_stagnant_measurements: 3,
-                run_failure_budget: 3,
                 baseline_observed_at: chrono::Utc::now().to_rfc3339(),
             });
         }
@@ -899,10 +886,7 @@ mod tests {
                         "action": "record_decision",
                         "outcome": "wait",
                         "rationale": "The feed has nothing new since the last note",
-                        "learning_note": "The Acme feed updates in the morning",
-                        "strategy_key": "acme_feed_timing",
-                        "strategy_kind": "explore",
-                        "strategy_confidence_bps": 6_000
+                        "learning_note": "The Acme feed updates in the morning"
                     }),
                 ),
                 lead_facts(&run),
@@ -919,15 +903,6 @@ mod tests {
         assert_eq!(
             notes[0].evidence_receipt_ids,
             vec!["call_read_acme_feed".to_string()]
-        );
-        assert_eq!(
-            run.state
-                .list_current_mandate_strategy(&run.mandate.id, 10)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "the strategy revision was kept"
         );
     }
 
@@ -1312,22 +1287,6 @@ mod tests {
                     "action":"create",
                     "objective":"Maintain the synthetic account without routine hand-holding",
                     "autonomy_mode":"autopilot",
-                    "objective_control": {
-                        "schema_version": 1,
-                        "metric_name": "synthetic useful interactions",
-                        "unit": "count",
-                        "baseline_micros": 10000000,
-                        "target_micros": 20000000,
-                        "direction": "at_least",
-                        "measurement_source": "metric_source:synthetic-analytics",
-                        "measurement_cadence_secs": 3600,
-                        "experiment_cohort": "synthetic-cohort-a",
-                        "experiment_window_secs": 86400,
-                        "minimum_effect_micros": 1000000,
-                        "max_stagnant_measurements": 3,
-                        "run_failure_budget": 3,
-                        "baseline_observed_at": "2026-08-15T00:00:00Z"
-                    },
                     "operation_scopes":[{
                         "tool":"http_request",
                         "operation":"POST",
@@ -2565,38 +2524,6 @@ mod tests {
             }],
             "owner_alerts": true
         });
-
-        // The shape the model sent live: an objective control whose stall
-        // limit is above its range.
-        let mut with_control = request.clone();
-        with_control["objective_control"] = json!({
-            "schema_version": 1,
-            "metric_name": "page_up",
-            "unit": "boolean",
-            "baseline_micros": 0,
-            "target_micros": 1_000_000,
-            "direction": "at_least",
-            "measurement_source": "https://example.com/index.html",
-            "measurement_cadence_secs": 3600,
-            "experiment_cohort": "qa-ux-card",
-            "experiment_window_secs": 86400,
-            "minimum_effect_micros": 1_000_000,
-            "max_stagnant_measurements": 24,
-            "run_failure_budget": 3,
-            "baseline_observed_at": "2026-01-31T09:00:00Z"
-        });
-        let drafted: Value = serde_json::from_str(
-            &tool
-                .call_with(&with_control.to_string(), owner_facts())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(drafted["ready_to_confirm"], json!(false));
-        assert_eq!(
-            drafted["validation_status"],
-            json!("max_stagnant_measurements is 24; allowed: 1 to 20")
-        );
 
         // The plain watch: how often it runs is the review interval.
         let mut watch = request.clone();

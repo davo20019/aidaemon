@@ -8,7 +8,7 @@ use crate::traits::{
     MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
     MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
-    MandateStatus, MandateStore, MandateStrategyRevision, MandateStrategyRevisionKind,
+    MandateStatus, MandateStore,
     MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
 };
 use sha2::{Digest, Sha256};
@@ -32,10 +32,6 @@ const INTENTION_COLUMNS: &str =
 const LEARNING_NOTE_COLUMNS: &str =
     "id, mandate_id, mandate_version, learned_in_decision_cycle_id, summary, \
      evidence_receipt_ids_json, created_at";
-
-const STRATEGY_REVISION_COLUMNS: &str =
-    "id, mandate_id, mandate_version, decision_cycle_id, strategy_key, kind, guidance, \
-     confidence_bps, evidence_receipt_ids_json, created_at";
 
 const MUTATION_ATTEMPT_COLUMNS: &str =
     "id, mandate_id, mandate_version, decision_cycle_id, goal_run_id, intention_id, \
@@ -149,9 +145,6 @@ fn objective_measurement_from_row(
         evidence_receipt_ids: serde_json::from_str(
             &row.get::<String, _>("evidence_receipt_ids_json"),
         )?,
-        attributed_intention_ids: serde_json::from_str(
-            &row.get::<String, _>("attributed_intention_ids_json"),
-        )?,
         observed_at: row.get("observed_at"),
         created_at: row.get("created_at"),
     })
@@ -186,28 +179,6 @@ fn learning_note_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Manda
         mandate_version: row.get("mandate_version"),
         learned_in_decision_cycle_id: row.get("learned_in_decision_cycle_id"),
         summary: row.get("summary"),
-        evidence_receipt_ids: serde_json::from_str(
-            &row.get::<String, _>("evidence_receipt_ids_json"),
-        )?,
-        created_at: row.get("created_at"),
-    })
-}
-
-fn strategy_revision_from_row(
-    row: &sqlx::sqlite::SqliteRow,
-) -> anyhow::Result<MandateStrategyRevision> {
-    let kind_raw: String = row.get("kind");
-    Ok(MandateStrategyRevision {
-        id: row.get("id"),
-        mandate_id: row.get("mandate_id"),
-        mandate_version: row.get("mandate_version"),
-        decision_cycle_id: row.get("decision_cycle_id"),
-        strategy_key: row.get("strategy_key"),
-        kind: MandateStrategyRevisionKind::parse(&kind_raw).ok_or_else(|| {
-            anyhow::anyhow!("invalid mandate strategy revision kind `{kind_raw}`")
-        })?,
-        guidance: row.get("guidance"),
-        confidence_bps: row.get::<i64, _>("confidence_bps").try_into()?,
         evidence_receipt_ids: serde_json::from_str(
             &row.get::<String, _>("evidence_receipt_ids_json"),
         )?,
@@ -286,10 +257,6 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
         "mandate owner principal is invalid"
     );
     mandate.authority.validate().map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
-        "autopilot mandates require a validated objective control"
-    );
     if let Some(control) = mandate.objective_control.as_ref() {
         anyhow::ensure!(
             control.measurement_cadence_secs >= mandate.min_review_secs
@@ -660,46 +627,6 @@ async fn mutation_quota_state_on_connection(
             .then(|| earliest.map(|value| value.to_rfc3339()))
             .flatten(),
     }))
-}
-
-/// Whether credible measurements stayed flat across the no-progress window.
-///
-/// `readings` are credible measurements, newest first, one per review run.
-/// Stagnation is measured in the owner's cadence, not in review runs: several
-/// reviews inside one measurement period (retries, owner-driven re-reviews)
-/// are one observation of the objective, so a reading counts only when it is
-/// close to a full cadence older than the last counted one. The small
-/// tolerance absorbs scheduler jitter between otherwise daily reviews.
-/// Which outcomes stagnation then refuses is decided in
-/// `mandates::admissibility`.
-fn objective_is_stagnant(
-    control: &crate::traits::MandateObjectiveControl,
-    readings: &[(i64, chrono::DateTime<chrono::Utc>)],
-) -> bool {
-    let window = usize::from(control.max_stagnant_measurements) + 1;
-    let min_spacing = chrono::Duration::seconds(control.measurement_cadence_secs.max(0) * 9 / 10);
-    let mut counted: Vec<(i64, chrono::DateTime<chrono::Utc>)> = Vec::with_capacity(window);
-    for &(value, observed_at) in readings {
-        if counted.len() == window {
-            break;
-        }
-        if counted
-            .last()
-            .is_none_or(|&(_, last)| last - observed_at >= min_spacing)
-        {
-            counted.push((value, observed_at));
-        }
-    }
-    if counted.len() < window {
-        return false;
-    }
-    let newest = counted[0].0;
-    let oldest = counted[counted.len() - 1].0;
-    let improvement = match control.direction {
-        crate::traits::ObjectiveMetricDirection::AtLeast => newest.saturating_sub(oldest),
-        crate::traits::ObjectiveMetricDirection::AtMost => oldest.saturating_sub(newest),
-    };
-    improvement < control.minimum_effect_micros
 }
 
 async fn insert_mandate_row(
@@ -1455,105 +1382,6 @@ async fn resume_unanswered_agent_questions(
     Ok(())
 }
 
-/// Quarantine active autopilot rows created before objective controls became a
-/// mandatory policy invariant. We cannot invent a baseline, target, metric
-/// source, or failure budget on the owner's behalf, so legacy rows fail closed
-/// into an explicit recovery state before any review can be leased.
-async fn quarantine_uncontrolled_autopilot_mandates(
-    connection: &mut sqlx::SqliteConnection,
-    now: &str,
-) -> anyhow::Result<()> {
-    let rows = sqlx::query(
-        "SELECT m.id, m.goal_id, m.version, g.session_id
-         FROM mandates m
-         JOIN goals g ON g.id = m.goal_id
-         WHERE m.status = 'active'
-           AND m.autonomy_mode = 'autopilot'
-           AND m.objective_control_json IS NULL",
-    )
-    .fetch_all(&mut *connection)
-    .await?;
-
-    for row in rows {
-        let mandate_id: String = row.get("id");
-        let goal_id: String = row.get("goal_id");
-        let version: i64 = row.get("version");
-        let session_id: String = row.get("session_id");
-        let unresolved_mutations = invalidate_open_mandate_runs(connection, &goal_id, now).await?;
-        let (kind, reason_code, message) = if unresolved_mutations > 0 {
-            (
-                MandateSuspensionKind::AuthorityRevokedWithUnresolvedMutation,
-                "legacy_autopilot_missing_objective_control_with_unresolved_mutation",
-                format!(
-                    "Autopilot mandate {} was paused because its legacy policy lacks objective control and an earlier mutation has no terminal receipt. Reconcile the external target first, then configure an owner-approved baseline, target, measurement source/cadence, experiment window, and failure budget before resuming.",
-                    mandate_id.chars().take(8).collect::<String>()
-                ),
-            )
-        } else {
-            (
-                MandateSuspensionKind::ObjectiveControlRequired,
-                "legacy_autopilot_missing_objective_control",
-                format!(
-                    "Autopilot mandate {} was paused because its legacy policy has no objective control. Configure an owner-approved baseline, target, measurement source/cadence, experiment window, and failure budget before resuming; no values were inferred automatically.",
-                    mandate_id.chars().take(8).collect::<String>()
-                ),
-            )
-        };
-        let suspension = MandateSuspension::new(kind, Some(reason_code.to_string()));
-        let transitioned = sqlx::query(
-            "UPDATE mandates
-             SET status = 'awaiting_input', suspension_json = ?,
-                 review_lease_token = NULL, review_lease_expires_at = NULL,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND goal_id = ? AND status = 'active'
-               AND autonomy_mode = 'autopilot'
-               AND objective_control_json IS NULL AND version = ?",
-        )
-        .bind(serde_json::to_string(&suspension)?)
-        .bind(now)
-        .bind(&mandate_id)
-        .bind(&goal_id)
-        .bind(version)
-        .execute(&mut *connection)
-        .await?;
-        if transitioned.rows_affected() != 1 {
-            continue;
-        }
-        update_controller_status(connection, &goal_id, MandateStatus::AwaitingInput, now).await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO notification_queue
-                (id, goal_id, session_id, notification_type, priority, message,
-                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
-             VALUES (?, ?, ?, 'mandate_objective_control_required', 'critical', ?, ?,
-                     NULL, 0, NULL, NULL, NULL)",
-        )
-        .bind(format!(
-            "mandate-objective-control-required:{}:{}",
-            mandate_id,
-            version + 1
-        ))
-        .bind(&goal_id)
-        .bind(&session_id)
-        .bind(message)
-        .bind(now)
-        .execute(&mut *connection)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Reconcile persisted authority invariants before any background dispatcher or
-/// management surface can observe legacy rows. Waiting until the next due
-/// lease leaves an unmeasurable autopilot mandate visibly `active` after a
-/// restart, even though no safe controller run can execute it.
-pub async fn enforce_mandate_invariants_on_startup(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-    quarantine_uncontrolled_autopilot_mandates(&mut transaction, &now).await?;
-    transaction.commit().await?;
-    Ok(())
-}
-
 #[async_trait]
 impl<S: WorkDatabase> MandateStore for S {
     async fn create_mandate_controller(
@@ -1760,133 +1588,6 @@ impl<S: WorkDatabase> MandateStore for S {
             != 0)
     }
 
-    async fn transfer_mandate_ownership(
-        &self,
-        mandate_id: &str,
-        expected_version: i64,
-        from_session_id: &str,
-        to_session_id: &str,
-    ) -> anyhow::Result<bool> {
-        for (label, value) in [
-            ("mandate id", mandate_id),
-            ("source session", from_session_id),
-            ("target session", to_session_id),
-        ] {
-            anyhow::ensure!(
-                !value.trim().is_empty()
-                    && value.trim() == value
-                    && value.len() <= 256
-                    && !value.chars().any(char::is_control),
-                "invalid ownership transfer {label}"
-            );
-        }
-        anyhow::ensure!(
-            from_session_id != to_session_id,
-            "ownership transfer target must differ from the source session"
-        );
-        anyhow::ensure!(expected_version > 0, "mandate version must be positive");
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query(
-            "SELECT m.goal_id, m.owner_principal_id
-             FROM mandates m
-             JOIN mandate_principal_sessions ps
-               ON ps.principal_id = m.owner_principal_id
-             WHERE m.id = ? AND m.version = ? AND ps.session_id = ?
-               AND m.status NOT IN ('completed', 'cancelled')",
-        )
-        .bind(mandate_id)
-        .bind(expected_version)
-        .bind(from_session_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
-        let goal_id: String = row.get("goal_id");
-        let principal_id: String = row.get("owner_principal_id");
-        let claimed_unresolved = invalidate_open_mandate_runs(&mut tx, &goal_id, &now).await?;
-        if claimed_unresolved > 0 {
-            tx.rollback().await?;
-            anyhow::bail!(
-                "ownership cannot move while a dispatched mutation awaits reconciliation"
-            );
-        }
-        sqlx::query(
-            "INSERT INTO mandate_principal_sessions
-                (principal_id, session_id, linked_at, linked_by_session)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(principal_id, session_id) DO NOTHING",
-        )
-        .bind(&principal_id)
-        .bind(to_session_id)
-        .bind(&now)
-        .bind(from_session_id)
-        .execute(&mut *tx)
-        .await?;
-        let updated = sqlx::query(
-            "UPDATE mandates
-             SET created_by_session = ?, version = version + 1,
-                 review_lease_token = NULL, review_lease_expires_at = NULL,
-                 updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(to_session_id)
-        .bind(&now)
-        .bind(mandate_id)
-        .bind(expected_version)
-        .execute(&mut *tx)
-        .await?;
-        anyhow::ensure!(
-            updated.rows_affected() == 1,
-            "mandate version changed during transfer"
-        );
-        sqlx::query("UPDATE goals SET session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(to_session_id)
-            .bind(&now)
-            .bind(&goal_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "INSERT INTO work_channel_links (goal_id, channel_session_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(goal_id, channel_session_id) DO UPDATE SET updated_at = excluded.updated_at",
-        )
-        .bind(&goal_id)
-        .bind(to_session_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE notification_queue SET session_id = ?
-             WHERE goal_id = ? AND delivered_at IS NULL",
-        )
-        .bind(to_session_id)
-        .bind(&goal_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO mandate_ownership_transfers
-                (id, mandate_id, principal_id, from_session_id, to_session_id,
-                 from_version, to_version, transferred_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(mandate_id)
-        .bind(&principal_id)
-        .bind(from_session_id)
-        .bind(to_session_id)
-        .bind(expected_version)
-        .bind(expected_version + 1)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
     async fn record_mandate_objective_measurement(
         &self,
         measurement: &MandateObjectiveMeasurement,
@@ -1931,27 +1632,11 @@ impl<S: WorkDatabase> MandateStore for S {
             &measurement.evidence_receipt_ids,
         )
         .await?;
-        for intention_id in &measurement.attributed_intention_ids {
-            let exists = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM intentions
-                 WHERE id = ? AND mandate_id = ? AND goal_run_id <> ? LIMIT 1",
-            )
-            .bind(intention_id)
-            .bind(&measurement.mandate_id)
-            .bind(&measurement.goal_run_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            anyhow::ensure!(
-                exists.is_some(),
-                "objective measurement attribution must reference a prior intention from the same mandate"
-            );
-        }
         sqlx::query(
             "INSERT INTO mandate_objective_measurements
                 (id, mandate_id, mandate_version, goal_run_id, value_micros,
-                 confidence_bps, evidence_receipt_ids_json, attributed_intention_ids_json,
-                 observed_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 confidence_bps, evidence_receipt_ids_json, observed_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&measurement.id)
         .bind(&measurement.mandate_id)
@@ -1960,9 +1645,6 @@ impl<S: WorkDatabase> MandateStore for S {
         .bind(measurement.value_micros)
         .bind(i64::from(measurement.confidence_bps))
         .bind(serde_json::to_string(&measurement.evidence_receipt_ids)?)
-        .bind(serde_json::to_string(
-            &measurement.attributed_intention_ids,
-        )?)
         .bind(&measurement.observed_at)
         .bind(&measurement.created_at)
         .execute(&mut *tx)
@@ -1978,8 +1660,7 @@ impl<S: WorkDatabase> MandateStore for S {
     ) -> anyhow::Result<Vec<MandateObjectiveMeasurement>> {
         let rows = sqlx::query(
             "SELECT id, mandate_id, mandate_version, goal_run_id, value_micros,
-                    confidence_bps, evidence_receipt_ids_json,
-                    attributed_intention_ids_json, observed_at, created_at
+                    confidence_bps, evidence_receipt_ids_json, observed_at, created_at
              FROM mandate_objective_measurements
              WHERE mandate_id = ?
              ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?",
@@ -2574,12 +2255,6 @@ impl<S: WorkDatabase> MandateStore for S {
         // ambiguous cycle: atomically pause it for owner reconciliation.
         reconcile_orphaned_mandate_runs(&mut tx, &now_string).await?;
 
-        // Older rows can predate the objective-control invariant enforced on
-        // every new/update path. Reconcile them at the authoritative lease
-        // boundary so a restart cannot silently keep an unmeasurable autopilot
-        // objective active.
-        quarantine_uncontrolled_autopilot_mandates(&mut tx, &now_string).await?;
-
         // An agent question is a request for owner judgment, not a safety
         // fence. Once its bounded reconsider time passes without an answer,
         // the mandate continues within its unchanged authority instead of
@@ -3044,10 +2719,6 @@ impl<S: WorkDatabase> MandateStore for S {
             .validate_content_bounds()
             .map_err(anyhow::Error::msg)?;
         if let Some(updates) = operating_updates {
-            anyhow::ensure!(
-                updates.strategy_revisions.len() <= 4,
-                "one decision may revise at most four adaptive strategy nodes"
-            );
             if let Some(note) = updates.learning_note.as_ref() {
                 note.validate().map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
@@ -3061,27 +2732,6 @@ impl<S: WorkDatabase> MandateStore for S {
                         .iter()
                         .all(|id| decision.evidence_receipt_ids.contains(id)),
                     "learning evidence must be a subset of current decision evidence"
-                );
-            }
-            let mut strategy_keys = std::collections::HashSet::new();
-            for revision in &updates.strategy_revisions {
-                revision.validate().map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(
-                    revision.mandate_id == decision.mandate_id
-                        && revision.mandate_version == decision.mandate_version
-                        && revision.decision_cycle_id == decision.id,
-                    "strategy revision does not belong to this decision"
-                );
-                anyhow::ensure!(
-                    strategy_keys.insert(revision.strategy_key.as_str()),
-                    "one decision cannot revise the same strategy key twice"
-                );
-                anyhow::ensure!(
-                    revision
-                        .evidence_receipt_ids
-                        .iter()
-                        .all(|id| decision.evidence_receipt_ids.contains(id)),
-                    "strategy evidence must be a subset of current decision evidence"
                 );
             }
         }
@@ -3206,8 +2856,8 @@ impl<S: WorkDatabase> MandateStore for S {
         .await?;
         // A runtime-authored fallback is a typed review-failure marker, not a
         // deliberation: it carries no evidence, no intention, and no
-        // authority, so the semantic gates below (measurement, stagnation)
-        // cannot apply to it. Structural gates (lease, version, one decision
+        // authority, so the semantic gates below (measurement) cannot apply
+        // to it. Structural gates (lease, version, one decision
         // per run) still apply.
         let runtime_fallback = decision.is_runtime_fallback();
         if runtime_fallback {
@@ -3232,14 +2882,12 @@ impl<S: WorkDatabase> MandateStore for S {
             };
             let admissible =
                 crate::admissibility::admissible_outcomes(&crate::admissibility::OutcomeState {
-                    stagnant: false,
                     quota_block: block,
-                    adapts_strategy: false,
                 });
             if !admissible.act {
                 if block == Some(MandateMutationQuotaBlockReason::MutationDisabled) {
                     anyhow::bail!(
-                        "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle (if the objective is stagnant, a WAIT must carry a strategy revision that explores, avoids, or retires a tactic)"
+                        "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle"
                     );
                 }
                 let earliest = quota
@@ -3272,9 +2920,9 @@ impl<S: WorkDatabase> MandateStore for S {
         } else {
             None
         };
-        // The measured control loop belongs to autopilot. A bounded
-        // mandate's objective control is advisory: recorded measurements are
-        // kept, but a decision never waits on one or on its stagnation window.
+        // The measured objective belongs to autopilot. A bounded mandate's
+        // objective control is advisory: recorded measurements are kept, but
+        // a decision never waits on one.
         let control_loop = mandate.autonomy_mode.is_autopilot();
         if control_loop
             && mandate.objective_control.is_some()
@@ -3288,56 +2936,6 @@ impl<S: WorkDatabase> MandateStore for S {
                 current_measurement.is_some(),
                 "controlled mandate decisions require a receipt-backed metric measurement from the current run"
             );
-        }
-        if control_loop && decision.outcome == MandateDecisionOutcome::Wait && !runtime_fallback {
-            if let Some(control) = mandate.objective_control.as_ref() {
-                // Only credible readings form the no-progress window. A
-                // zero-confidence reading means the metric could not be read
-                // (e.g. the source omitted the field), which is a measurement
-                // outage, not evidence that the objective stalled; counting
-                // it would force a healthy mandate out of WAIT into ASK/STOP.
-                let rows = sqlx::query_as::<_, (i64, String)>(
-                    "SELECT value_micros, observed_at FROM (
-                         SELECT value_micros, observed_at, id,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY goal_run_id
-                                    ORDER BY julianday(observed_at) DESC, id DESC
-                                ) AS run_rank
-                         FROM mandate_objective_measurements
-                         WHERE mandate_id = ? AND confidence_bps > 0
-                     )
-                     WHERE run_rank = 1
-                     ORDER BY julianday(observed_at) DESC, id DESC LIMIT 512",
-                )
-                .bind(&mandate.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let mut readings = Vec::with_capacity(rows.len());
-                for (value, observed_at) in rows {
-                    let observed_at = chrono::DateTime::parse_from_rfc3339(&observed_at)
-                        .map_err(|_| anyhow::anyhow!("invalid persisted measurement timestamp"))?
-                        .with_timezone(&chrono::Utc);
-                    readings.push((value, observed_at));
-                }
-                let quota =
-                    mutation_quota_state_on_connection(&mut tx, &mandate.id, &now_string).await?;
-                let admissible = crate::admissibility::admissible_outcomes(
-                    &crate::admissibility::OutcomeState {
-                        stagnant: objective_is_stagnant(control, &readings),
-                        quota_block: quota.and_then(|quota| quota.block_reason),
-                        adapts_strategy: operating_updates.is_some_and(|updates| {
-                            updates.strategy_revisions.iter().any(|revision| {
-                                revision.kind != MandateStrategyRevisionKind::Reinforce
-                            })
-                        }),
-                    },
-                );
-                anyhow::ensure!(
-                    admissible.wait,
-                    "objective_control_stagnant: a WAIT that does not change tactics is not permitted after the configured no-progress window. Admissible now: {}",
-                    admissible.describe()
-                );
-            }
         }
         if decision.outcome == MandateDecisionOutcome::Stop {
             let termination_kind = decision
@@ -3495,45 +3093,6 @@ impl<S: WorkDatabase> MandateStore for S {
                 .execute(&mut *tx)
                 .await?;
             }
-            for revision in &updates.strategy_revisions {
-                sqlx::query(
-                    "INSERT INTO mandate_strategy_revisions (
-                        id, mandate_id, mandate_version, decision_cycle_id, strategy_key,
-                        kind, guidance, confidence_bps, evidence_receipt_ids_json, created_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&revision.id)
-                .bind(&revision.mandate_id)
-                .bind(revision.mandate_version)
-                .bind(&revision.decision_cycle_id)
-                .bind(&revision.strategy_key)
-                .bind(revision.kind.as_str())
-                .bind(&revision.guidance)
-                .bind(i64::from(revision.confidence_bps))
-                .bind(serde_json::to_string(&revision.evidence_receipt_ids)?)
-                .bind(&revision.created_at)
-                .execute(&mut *tx)
-                .await?;
-            }
-            let active_strategy_nodes: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*)
-                 FROM mandate_strategy_revisions r
-                 WHERE r.mandate_id = ? AND r.kind != 'retire'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM mandate_strategy_revisions newer
-                       WHERE newer.mandate_id = r.mandate_id
-                         AND newer.strategy_key = r.strategy_key
-                         AND (julianday(newer.created_at) > julianday(r.created_at)
-                              OR (newer.created_at = r.created_at AND newer.id > r.id))
-                   )",
-            )
-            .bind(&decision.mandate_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            anyhow::ensure!(
-                active_strategy_nodes <= 16,
-                "adaptive strategy cannot exceed sixteen active nodes"
-            );
         }
 
         // The durable decision remains provisional until the root task itself
@@ -3736,32 +3295,6 @@ impl<S: WorkDatabase> MandateStore for S {
         rows.iter().map(learning_note_from_row).collect()
     }
 
-    async fn list_current_mandate_strategy(
-        &self,
-        mandate_id: &str,
-        limit: i64,
-    ) -> anyhow::Result<Vec<MandateStrategyRevision>> {
-        let query = format!(
-            "SELECT {STRATEGY_REVISION_COLUMNS}
-             FROM mandate_strategy_revisions r
-             WHERE r.mandate_id = ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM mandate_strategy_revisions newer
-                   WHERE newer.mandate_id = r.mandate_id
-                     AND newer.strategy_key = r.strategy_key
-                     AND (julianday(newer.created_at) > julianday(r.created_at)
-                          OR (newer.created_at = r.created_at AND newer.id > r.id))
-               )
-             ORDER BY julianday(r.created_at) DESC, r.id DESC LIMIT ?"
-        );
-        let rows = sqlx::query(&query)
-            .bind(mandate_id)
-            .bind(limit.clamp(1, 100))
-            .fetch_all(self.work_pool())
-            .await?;
-        rows.iter().map(strategy_revision_from_row).collect()
-    }
-
     async fn wake_mandates_for_signal(
         &self,
         signal: &MandateWakeSignal,
@@ -3866,8 +3399,7 @@ impl<S: WorkDatabase> MandateStore for S {
             serde_json::from_str::<serde_json::Value>(context)?;
         }
         match expected_kind {
-            MandateSuspensionKind::AwaitingAnswer
-            | MandateSuspensionKind::ObjectiveControlRequired => anyhow::ensure!(
+            MandateSuspensionKind::AwaitingAnswer => anyhow::ensure!(
                 reconciliation_resolution.is_none(),
                 "non-reconciliation suspensions cannot carry a reconciliation resolution"
             ),
@@ -3886,7 +3418,7 @@ impl<S: WorkDatabase> MandateStore for S {
         let now = chrono::Utc::now().to_rfc3339();
         let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query(
-            "SELECT goal_id, created_by_session, suspension_json, objective_control_json
+            "SELECT goal_id, created_by_session, suspension_json
              FROM mandates
              WHERE id = ? AND version = ? AND status = 'awaiting_input'
                AND confirmed_at IS NOT NULL",
@@ -3912,14 +3444,6 @@ impl<S: WorkDatabase> MandateStore for S {
             suspension.kind == expected_kind,
             "mandate suspension changed before it was resolved"
         );
-        if expected_kind == MandateSuspensionKind::ObjectiveControlRequired {
-            anyhow::ensure!(
-                current
-                    .get::<Option<String>, _>("objective_control_json")
-                    .is_some(),
-                "objective control must be configured before this mandate can resume"
-            );
-        }
         let goal_id: String = current.get("goal_id");
 
         if let Some(resolution) = reconciliation_resolution {
@@ -5213,113 +4737,29 @@ mod tests {
             direction: ObjectiveMetricDirection::AtLeast,
             measurement_source: "metric_source:synthetic-analytics".to_string(),
             measurement_cadence_secs: 3_600,
-            experiment_cohort: "synthetic-cohort-a".to_string(),
-            experiment_window_secs: 86_400,
-            minimum_effect_micros: 1_000_000,
-            max_stagnant_measurements: 3,
-            run_failure_budget: 3,
             baseline_observed_at: chrono::Utc::now().to_rfc3339(),
         }
     }
 
     #[tokio::test]
-    async fn startup_quarantines_legacy_autopilot_before_any_lease_claim() {
+    async fn autopilot_without_a_measured_objective_stays_active_and_due() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 0);
         mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
-        mandate.objective_control = Some(objective_control());
         store
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
 
-        // Reproduce a legacy active row without the now-mandatory controller.
-        sqlx::query("UPDATE mandates SET objective_control_json = NULL WHERE id = ?")
-            .bind(&mandate.id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
-
-        enforce_mandate_invariants_on_startup(&store.pool)
-            .await
-            .unwrap();
-
-        let quarantined = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(quarantined.status, MandateStatus::AwaitingInput);
-        assert!(quarantined.objective_control.is_none());
-        assert_eq!(
-            quarantined.suspension.as_ref().map(|value| value.kind),
-            Some(MandateSuspensionKind::ObjectiveControlRequired)
-        );
-        assert_eq!(
-            store.get_goal(&goal.id).await.unwrap().unwrap().status,
-            "paused"
-        );
-    }
-
-    #[tokio::test]
-    async fn due_claim_quarantines_legacy_autopilot_without_inventing_objective_control() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 0);
-        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
-        mandate.objective_control = Some(objective_control());
-        store
-            .create_mandate_controller(&goal, &mandate)
-            .await
-            .unwrap();
-
-        // Simulate a row created before objective_control became mandatory.
-        sqlx::query("UPDATE mandates SET objective_control_json = NULL WHERE id = ?")
-            .bind(&mandate.id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
-
-        assert!(store
+        let claimed = store
             .claim_due_mandates(10, "synthetic-heartbeat", 300)
             .await
-            .unwrap()
-            .is_empty());
-        let mut quarantined = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(quarantined.status, MandateStatus::AwaitingInput);
-        assert!(quarantined.objective_control.is_none());
-        assert_eq!(
-            quarantined.suspension.as_ref().map(|value| value.kind),
-            Some(MandateSuspensionKind::ObjectiveControlRequired)
-        );
-        assert_eq!(
-            store.get_goal(&goal.id).await.unwrap().unwrap().status,
-            "paused"
-        );
-        let notices = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM notification_queue
-             WHERE goal_id = ? AND notification_type = 'mandate_objective_control_required'",
-        )
-        .bind(&goal.id)
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-        assert_eq!(notices, 1);
-
-        quarantined.objective_control = Some(objective_control());
-        quarantined.version += 1;
-        store.update_mandate(&quarantined).await.unwrap();
-        assert!(store
-            .resolve_mandate_suspension(
-                &mandate.id,
-                quarantined.version,
-                MandateSuspensionKind::ObjectiveControlRequired,
-                None,
-                None,
-                "Owner configured the validated objective control required for autopilot.",
-                "owner-session",
-            )
-            .await
-            .unwrap());
-        let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(resumed.status, MandateStatus::Active);
-        assert!(resumed.objective_control.is_some());
-        assert!(resumed.suspension.is_none());
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(current.status, MandateStatus::Active);
+        assert!(current.objective_control.is_none());
+        assert!(current.suspension.is_none());
     }
 
     #[tokio::test]
@@ -5715,55 +5155,6 @@ mod tests {
             .is_mandate_session_authorized(&group_mandate.id, "beta_bot:-10012345")
             .await
             .unwrap());
-    }
-
-    #[tokio::test]
-    async fn ownership_transfer_preserves_principal_and_moves_runtime_route_atomically() {
-        let (store, _database) = test_store().await;
-        let (goal, mandate) = controller("telegram:synthetic-owner-a", 1);
-        store
-            .create_mandate_controller(&goal, &mandate)
-            .await
-            .unwrap();
-
-        assert!(store
-            .transfer_mandate_ownership(
-                &mandate.id,
-                mandate.version,
-                "telegram:synthetic-owner-a",
-                "telegram:synthetic-owner-b",
-            )
-            .await
-            .unwrap());
-        let moved = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(moved.owner_principal_id, mandate.owner_principal_id);
-        assert_eq!(moved.created_by_session, "telegram:synthetic-owner-b");
-        assert_eq!(moved.version, mandate.version + 1);
-        assert_eq!(
-            store.get_goal(&goal.id).await.unwrap().unwrap().session_id,
-            "telegram:synthetic-owner-b"
-        );
-        assert!(store
-            .is_mandate_session_authorized(&mandate.id, "telegram:synthetic-owner-b")
-            .await
-            .unwrap());
-        assert!(!store
-            .transfer_mandate_ownership(
-                &mandate.id,
-                mandate.version,
-                "telegram:synthetic-owner-a",
-                "telegram:synthetic-owner-c",
-            )
-            .await
-            .unwrap());
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM mandate_ownership_transfers WHERE mandate_id = ?",
-        )
-        .bind(&mandate.id)
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-        assert_eq!(audit_count, 1);
     }
 
     #[tokio::test]
@@ -7928,23 +7319,12 @@ mod tests {
             "Explicit verification is more reliable than inferred completion",
             vec!["observation-receipt-1".to_string()],
         );
-        let revision = MandateStrategyRevision::new(
-            &mandate.id,
-            mandate.version,
-            &decision.id,
-            "verify_before_completion",
-            MandateStrategyRevisionKind::Reinforce,
-            "Prefer explicit verification before declaring completion",
-            9_000,
-            vec!["observation-receipt-1".to_string()],
-        );
         store
             .record_mandate_decision_with_updates(
                 &decision,
                 None,
                 Some(&MandateOperatingUpdates {
                     learning_note: Some(note.clone()),
-                    strategy_revisions: vec![revision.clone()],
                 }),
                 Some(&root_attempt.id),
             )
@@ -7956,13 +7336,6 @@ mod tests {
                 .await
                 .unwrap(),
             vec![note]
-        );
-        assert_eq!(
-            store
-                .list_current_mandate_strategy(&mandate.id, 16)
-                .await
-                .unwrap(),
-            vec![revision]
         );
         assert_eq!(
             store
@@ -8154,44 +7527,18 @@ mod tests {
         .unwrap();
     }
 
+    /// Measurements are read, not judged: flat (or unreadable) readings
+    /// never refuse a WAIT; whether to change course is the reviewer's call.
     #[tokio::test]
-    async fn unreadable_measurements_do_not_count_toward_stagnation() {
+    async fn flat_measurements_never_refuse_a_wait() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 1);
-        mandate.objective_control = Some(objective_control());
-        let run = claim_and_start_run(&store, &goal, &mandate).await;
-        // Every prior review could not read the metric (confidence 0), which
-        // is a measurement outage, not evidence that the objective stalled.
-        for hours_ago in 2..=5 {
-            seed_prior_measurement(&store, &mandate, &run, 0, 0, hours_ago).await;
-        }
-        seed_measurement_on_run(&store, &mandate, &run.id, 0, 0, 0).await;
-
-        let wait = MandateDecisionCycle::new(
-            &mandate.id,
-            &run.id,
-            MandateDecisionOutcome::Wait,
-            "metric unavailable; observe again next cycle",
-            mandate.version,
-        );
-        store
-            .record_mandate_decision(&wait, None, None)
-            .await
-            .expect("an unreadable metric must not force the mandate out of WAIT");
-    }
-
-    #[tokio::test]
-    async fn credible_flat_measurements_still_reject_wait_as_stagnant() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 1);
-        // The measured control loop (gate, stagnation) is autopilot's.
         mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
         mandate.objective_control = Some(objective_control());
         let run = claim_and_start_run(&store, &goal, &mandate).await;
-        for hours_ago in 2..=4 {
+        for hours_ago in 2..=5 {
             seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
         }
-        // An unreadable reading in between must neither reset nor extend the window.
         seed_prior_measurement(&store, &mandate, &run, 0, 0, 1).await;
         seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
 
@@ -8202,103 +7549,10 @@ mod tests {
             "no change observed",
             mandate.version,
         );
-        let error = store
-            .record_mandate_decision(&wait, None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("objective_control_stagnant"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_period_reviews_are_one_stagnation_observation() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 1);
-        let mut control = objective_control();
-        control.measurement_cadence_secs = 86_400;
-        mandate.objective_control = Some(control);
-        mandate.max_review_secs = 86_400;
-        let run = claim_and_start_run(&store, &goal, &mandate).await;
-        // Several reviews inside one daily measurement period (retries, an
-        // owner-driven re-review) read the same flat metric. That is one
-        // observation of the objective, not a multi-day no-progress window.
-        for hours_ago in 1..=5 {
-            seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
-        }
-        seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
-
-        let wait = MandateDecisionCycle::new(
-            &mandate.id,
-            &run.id,
-            MandateDecisionOutcome::Wait,
-            "the newest intervention has not had a full period yet",
-            mandate.version,
-        );
         store
             .record_mandate_decision(&wait, None, None)
             .await
-            .expect("same-period readings must not exhaust the stagnation window");
-    }
-
-    fn flat_daily_readings(count: usize) -> Vec<(i64, chrono::DateTime<chrono::Utc>)> {
-        let now = chrono::Utc::now();
-        // Daily reviews drift by a few minutes; each is still its own period.
-        (0..count)
-            .map(|day| {
-                let age = chrono::Duration::hours(24 * day as i64)
-                    - chrono::Duration::minutes(5 * day as i64);
-                (10_000_000, now - age)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn flat_readings_across_full_periods_are_stagnant() {
-        let mut control = objective_control();
-        control.measurement_cadence_secs = 86_400;
-        let readings = flat_daily_readings(4);
-        assert!(objective_is_stagnant(&control, &readings));
-        assert!(!objective_is_stagnant(&control, &readings[..3]));
-    }
-
-    #[tokio::test]
-    async fn stagnant_passive_wait_refusal_names_admissible_outcomes() {
-        let (store, _database) = test_store().await;
-        let (goal, mut mandate) = controller("owner-session", 1);
-        // The measured control loop (gate, stagnation) is autopilot's.
-        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
-        mandate.objective_control = Some(objective_control());
-        // Mutation authority exists but the rolling window allows none now.
-        mandate.authority.max_mutating_actions_per_rolling_24h = 1;
-        let run = claim_and_start_run(&store, &goal, &mandate).await;
-        for hours_ago in 1..=4 {
-            seed_prior_measurement(&store, &mandate, &run, 10_000_000, 9_000, hours_ago).await;
-        }
-        seed_measurement_on_run(&store, &mandate, &run.id, 10_000_000, 9_000, 0).await;
-        let quota = store
-            .get_mandate_mutation_quota_state(&mandate.id, &chrono::Utc::now().to_rfc3339())
-            .await
-            .unwrap()
-            .unwrap();
-        // No reservation exists, so ACT is possible and a passive WAIT is
-        // refused with a message that names the admissible alternatives.
-        assert!(quota.available_now);
-        let wait = MandateDecisionCycle::new(
-            &mandate.id,
-            &run.id,
-            MandateDecisionOutcome::Wait,
-            "no change observed",
-            mandate.version,
-        );
-        let error = store
-            .record_mandate_decision(&wait, None, None)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("Admissible now: ACT"), "{error}");
-        assert!(error.contains("WAIT with a strategy revision"), "{error}");
+            .expect("a flat metric must not force the mandate out of WAIT");
     }
 
     #[tokio::test]

@@ -515,17 +515,9 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
 
         let scheduled_objective = goal_type == "continuous" && has_schedule;
         if scheduled_objective {
-            let failure_budget = sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(
-                    (SELECT json_extract(objective_control_json, '$.run_failure_budget')
-                     FROM mandates WHERE goal_id = ?),
-                    3
-                 )",
-            )
-            .bind(&goal_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .clamp(1, 10);
+            // Consecutive unproven failures a scheduled objective absorbs
+            // before it escalates.
+            let failure_budget: i64 = 3;
             // Live receipts carry the AGENT-LOOP task id, which exists
             // nowhere in the goals-table task graph. The typed edge from the
             // recovery task to its receipts is the task ATTEMPT: the worker

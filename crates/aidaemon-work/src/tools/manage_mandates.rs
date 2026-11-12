@@ -9,10 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::traits::UserRole;
 use crate::traits::{
     Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveControl,
+    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote,
     MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationScope,
-    MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
-    MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
+    MandateReconciliationResolution, MandateStatus, MandateStrategySnapshot, MandateSuspensionKind,
     MandateTerminationKind, MandateToolStore, ToolCallContext, ToolCallMetadata, ToolCallOperation,
     ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
     ToolRole,
@@ -53,8 +52,8 @@ const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
-/// Evidence a strategy revision may cite (`MandateStrategyRevision::validate`).
-const MAX_STRATEGY_EVIDENCE_RECEIPTS: usize = 8;
+/// Evidence a learning note may cite (`MandateLearningNote::validate`).
+const MAX_LEARNING_EVIDENCE_RECEIPTS: usize = 8;
 const EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Omit to cite this run's successful observations automatically. To cite specific ones, use the tool_call_id you issued (e.g. call_...) or the result_id in that result's receipt footer (e.g. sha256:...); receipts from other runs, failed calls, or invented IDs are rejected.";
 const LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION: &str = "Optional. Receipts backing learning_note; they must also back this decision. Omit to cite the decision's evidence.";
 const NAME_FIELD_DESCRIPTION: &str = "draft/create: the short name the owner gave the mandate, exactly as given; omit when none. Other actions: selects the mandate by that name when mandate_id is omitted.";
@@ -186,14 +185,6 @@ struct UpdatePlan {
     card: MandateCard,
 }
 
-/// A validated `transfer_owner`.
-struct TransferPlan {
-    mandate: Mandate,
-    owner: String,
-    target: String,
-    card: MandateCard,
-}
-
 impl ManageMandatesTool {
     pub fn new(state: Arc<dyn MandateToolStore>) -> Self {
         Self {
@@ -203,7 +194,7 @@ impl ManageMandatesTool {
         }
     }
 
-    /// A committing owner change (create, update, transfer_owner) runs only
+    /// A committing owner change (create, update) runs only
     /// after the owner confirmed it through the agent kernel.
     fn require_kernel_approval(args: &ManageMandatesArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -215,8 +206,8 @@ impl ManageMandatesTool {
         Ok(())
     }
 
-    /// The owner approval one call needs: creating, updating and
-    /// transferring a mandate are confirmed by the owner, whatever the
+    /// The owner approval one call needs: creating and updating a mandate
+    /// are confirmed by the owner, whatever the
     /// session, exactly where the call would commit them. Every other call
     /// (including one these actions answer without committing) needs none.
     pub async fn owner_approval(
@@ -236,10 +227,6 @@ impl ManageMandatesTool {
                 _ => return OwnerApprovalNeed::NotNeeded,
             },
             "update" => match self.update_plan(&args).await {
-                Ok(Ok(plan)) => plan.card,
-                _ => return OwnerApprovalNeed::NotNeeded,
-            },
-            "transfer_owner" => match self.transfer_plan(&args).await {
                 Ok(Ok(plan)) => plan.card,
                 _ => return OwnerApprovalNeed::NotNeeded,
             },
@@ -752,29 +739,17 @@ impl ManageMandatesTool {
         if success_criteria.is_empty() {
             missing.push("success_criteria");
         }
-        if autonomy_mode.is_autopilot() && args.objective_control.is_none() {
-            missing.push("objective_control");
-        }
-        let control_validation = args.objective_control.as_ref().and_then(|control| {
-            control.validate().err().or_else(|| {
-                crate::authority::measurement_source_is_authorized(&authority, control).err()
-            })
-        });
         let validation_error = authority
             .validate()
             .err()
             .or_else(|| unreachable_scope_targets(&authority.operation_scopes));
-        let ready_to_confirm =
-            missing.is_empty() && validation_error.is_none() && control_validation.is_none();
+        let ready_to_confirm = missing.is_empty() && validation_error.is_none();
         Ok(serde_json::to_string_pretty(&json!({
             "execution_mode": "ongoing_mandate",
             "writes_performed": false,
             "ready_to_confirm": ready_to_confirm,
             "required_inputs": missing,
-            "validation_status": validation_error
-                .as_deref()
-                .or(control_validation.as_deref())
-                .unwrap_or("ready"),
+            "validation_status": validation_error.as_deref().unwrap_or("ready"),
             "proposal": {
                 "name": name,
                 "objective": objective,
@@ -786,7 +761,6 @@ impl ManageMandatesTool {
                     "skill_name": value.skill_name,
                     "content_sha256": value.content_sha256,
                 })),
-                "objective_control": args.objective_control,
                 "owner_alerts": authority.owner_alerts,
                 "authority": authority,
                 "resource_policy": {
@@ -1010,14 +984,6 @@ impl ManageMandatesTool {
         mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
         mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
         mandate.strategy = self.approved_strategy_snapshot(args)?;
-        mandate.objective_control = args.objective_control.clone();
-        if let Some(control) = mandate.objective_control.as_ref() {
-            control.validate().map_err(anyhow::Error::msg)?;
-        }
-        anyhow::ensure!(
-            !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
-            "autopilot mandates require an explicit objective_control with baseline, target, measurement source/cadence, experiment window, and failure budget"
-        );
         mandate.review_effort = capacity.display_mode().to_string();
         validate_policy_text(
             &mandate.constraints,
@@ -1171,7 +1137,7 @@ impl ManageMandatesTool {
         // cannot stand in for an unrelated scheduled-only goal.
         //
         // Mandates are session-scoped by typed authority (`list_mandates`,
-        // `resolve_owned_mandate`, the `transfer` action). Scheduled goals have
+        // `resolve_owned_mandate`). Scheduled goals have
         // no such authority model: `goal.session_id` only records which owner
         // channel created the goal, and the owner reaches the daemon through
         // several sessions. Enumerating that collection through the shared
@@ -1382,10 +1348,6 @@ impl ManageMandatesTool {
                     .await?
                     .into_iter()
                     .next();
-                let adaptive_strategy = self
-                    .state
-                    .list_current_mandate_strategy(&mandate.id, 16)
-                    .await?;
                 let latest_goal_run = self
                     .state
                     .get_goal_runs(&mandate.goal_id)
@@ -1487,7 +1449,6 @@ impl ManageMandatesTool {
                     "latest_decision": latest_decision,
                     "latest_intention": latest_intention,
                     "latest_learning_note": latest_learning_note,
-                    "adaptive_operating_strategy": adaptive_strategy,
                     "latest_mutation_receipts": latest_mutation_receipts,
                     "more": {
                         "policy": "Call get again with section=policy for exact scopes and owner policy.",
@@ -1529,10 +1490,6 @@ impl ManageMandatesTool {
                     .state
                     .list_mandate_learning_notes(&mandate.id, limit)
                     .await?;
-                let adaptive_strategy = self
-                    .state
-                    .list_current_mandate_strategy(&mandate.id, 16)
-                    .await?;
                 let goal_runs = self
                     .state
                     .get_goal_runs(&mandate.goal_id)
@@ -1558,7 +1515,6 @@ impl ManageMandatesTool {
                     "recent_decisions": decisions,
                     "recent_intentions": intentions,
                     "recent_learning_notes": learning,
-                    "adaptive_operating_strategy": adaptive_strategy,
                     "recent_mutation_receipts": mutation_receipts,
                 })
             }
@@ -1685,21 +1641,6 @@ impl ManageMandatesTool {
                     );
                     None
                 }
-                MandateSuspensionKind::ObjectiveControlRequired => {
-                    anyhow::ensure!(
-                        action == "resume",
-                        "configure objective_control with update, then use resume"
-                    );
-                    anyhow::ensure!(
-                        mandate.objective_control.is_some(),
-                        "configure a validated objective_control before resuming this legacy autopilot mandate"
-                    );
-                    anyhow::ensure!(
-                        args.reconciliation_resolution.is_none(),
-                        "objective-control recovery does not accept a reconciliation resolution"
-                    );
-                    None
-                }
                 MandateSuspensionKind::OwnerPaused => {
                     anyhow::bail!("owner-paused mandates must use ordinary resume")
                 }
@@ -1722,9 +1663,7 @@ impl ManageMandatesTool {
                     })?)
                 }
             };
-            let guidance = guidance.unwrap_or(
-                "Owner configured the validated objective control required for autopilot.",
-            );
+            let guidance = guidance.unwrap_or("Owner resolved the mandate's suspension.");
             anyhow::ensure!(
                 self.state
                     .resolve_mandate_suspension(
@@ -1740,12 +1679,7 @@ impl ManageMandatesTool {
                 "mandate suspension changed before it could be resolved"
             );
             return Ok(
-                if expected_kind == MandateSuspensionKind::ObjectiveControlRequired {
-                    format!(
-                        "Mandate {} is active with its owner-configured objective control.",
-                        mandate.id
-                    )
-                } else if action == "answer_question" {
+                if action == "answer_question" {
                     format!(
                     "Mandate {} is active after recording bounded owner guidance. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change, and do not claim this answer authorized one.",
                     mandate.id
@@ -1798,80 +1732,6 @@ impl ManageMandatesTool {
         Ok(format!("Mandate {} is now {}.", mandate.id, current.status))
     }
 
-    /// Validate a `transfer_owner` exactly as it commits, without changing
-    /// anything. `Ok(Err(answer))`: the call answers without transferring.
-    async fn transfer_plan(
-        &self,
-        args: &ManageMandatesArgs,
-    ) -> anyhow::Result<Result<TransferPlan, String>> {
-        if !Self::is_private_owner_control(args) {
-            return Ok(Err(
-                "Mandates can only be transferred by the owner in a verified private channel."
-                    .to_string(),
-            ));
-        }
-        let owner = Self::owner_session(args)?;
-        let target = required_trimmed(args.target_session_id.as_deref(), "target_session_id")?;
-        anyhow::ensure!(
-            target != owner && target.len() <= 256 && !target.chars().any(char::is_control),
-            "target_session_id must be a different bounded session identity"
-        );
-        let known_target = self
-            .state
-            .load_session_channels()
-            .await?
-            .into_iter()
-            .any(|(session_id, _)| session_id == target);
-        anyhow::ensure!(
-            known_target,
-            "target_session_id is not a registered channel session; send a message from that session first"
-        );
-        let mandate = self.resolve_selected_mandate(args, owner).await?;
-        let card = MandateCard {
-            summary: format!("Transfer mandate {} to session {}", mandate.id, target),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
-                "The target session will be linked to this stable owner principal and become the primary route for the mandate, its schedules, pending notices, and future reviews. Open runs will be invalidated first.".to_string(),
-                "No session-name similarity is used as proof of ownership.".to_string(),
-            ],
-            autopilot: false,
-        };
-        Ok(Ok(TransferPlan {
-            mandate,
-            owner: owner.to_string(),
-            target: target.to_string(),
-            card,
-        }))
-    }
-
-    /// Transfer a mandate the owner confirmed moving through the agent
-    /// kernel.
-    async fn transfer_owner(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
-        let plan = match self.transfer_plan(args).await? {
-            Err(answer) => return Ok(answer),
-            Ok(plan) => plan,
-        };
-        Self::require_kernel_approval(args)?;
-        let TransferPlan {
-            mandate,
-            owner,
-            target,
-            card: _,
-        } = plan;
-        anyhow::ensure!(
-            self.state
-                .transfer_mandate_ownership(&mandate.id, mandate.version, &owner, &target)
-                .await?,
-            "mandate authority changed before ownership could transfer"
-        );
-        Ok(format!(
-            "Mandate {} now routes through {} under the same stable principal at policy version {}.",
-            mandate.id,
-            target,
-            mandate.version + 1
-        ))
-    }
-
     /// Validate an `update` exactly as it commits, without storing it.
     /// `Ok(Err(answer))`: the call answers without changing the mandate.
     async fn update_plan(
@@ -1909,8 +1769,7 @@ impl ManageMandatesTool {
             || args.budget_per_cycle.is_some()
             || args.budget_daily.is_some()
             || args.strategy_skill.is_some()
-            || args.clear_strategy.unwrap_or(false)
-            || args.objective_control.is_some();
+            || args.clear_strategy.unwrap_or(false);
         anyhow::ensure!(has_change, "update requires at least one changed field");
         anyhow::ensure!(
             !mandate.status.is_terminal(),
@@ -2006,14 +1865,6 @@ impl ManageMandatesTool {
         } else if args.strategy_skill.is_some() {
             mandate.strategy = self.approved_strategy_snapshot(args)?;
         }
-        if let Some(control) = args.objective_control.as_ref() {
-            control.validate().map_err(anyhow::Error::msg)?;
-            mandate.objective_control = Some(control.clone());
-        }
-        anyhow::ensure!(
-            !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
-            "autopilot mandates require an explicit objective_control"
-        );
         validate_policy_text(
             &mandate.constraints,
             &mandate.success_criteria,
@@ -2182,8 +2033,7 @@ impl ManageMandatesTool {
             args.measurement_confidence_bps.unwrap_or(10_000),
             receipts,
             &observed_at,
-        )
-        .with_attributed_intention_ids(clean_strings(args.attributed_intention_ids.as_deref()));
+        );
         self.state
             .record_mandate_objective_measurement(&measurement)
             .await?;
@@ -2397,20 +2247,19 @@ impl ManageMandatesTool {
         } else {
             None
         };
-        // Learning/strategy annotations are optional advisory metadata, never
+        // Learning notes are optional advisory metadata, never
         // the authority-bearing decision itself. Structured providers can
         // populate only part of an optional field family; do not let that
         // prevent a valid ACT/WAIT/ASK/STOP decision from being committed.
         // A note whose receipt ids are omitted cites the decision's own
         // evidence (learning evidence must be a subset of it, and the model
-        // may not see ids the runtime attached), capped at the strategy
-        // revision limit.
+        // may not see ids the runtime attached), capped at the note's limit.
         let cited_learning_evidence = clean_strings(args.learning_evidence_receipt_ids.as_deref());
         let learning_evidence = if cited_learning_evidence.is_empty() {
             decision
                 .evidence_receipt_ids
                 .iter()
-                .take(MAX_STRATEGY_EVIDENCE_RECEIPTS)
+                .take(MAX_LEARNING_EVIDENCE_RECEIPTS)
                 .cloned()
                 .collect()
         } else {
@@ -2432,28 +2281,7 @@ impl ManageMandatesTool {
                 evidence,
             )
         });
-        let strategy_fields_complete = strategy_update_fields_complete(
-            args.strategy_key.as_deref(),
-            args.strategy_kind.as_deref(),
-            args.strategy_confidence_bps,
-            learning_note.as_ref(),
-        );
-        let strategy_revisions = if strategy_fields_complete {
-            normalized_strategy_revisions(
-                &mandate,
-                &decision,
-                args.strategy_key.as_deref(),
-                args.strategy_kind.as_deref(),
-                args.strategy_confidence_bps,
-                learning_note.as_ref(),
-            )?
-        } else {
-            Vec::new()
-        };
-        let operating_updates = MandateOperatingUpdates {
-            learning_note,
-            strategy_revisions,
-        };
+        let operating_updates = MandateOperatingUpdates { learning_note };
         self.state
             .record_mandate_decision_with_updates(
                 &decision,
@@ -2511,7 +2339,6 @@ struct ManageMandatesArgs {
     name: Option<String>,
     objective: Option<String>,
     autonomy_mode: Option<String>,
-    objective_control: Option<MandateObjectiveControl>,
     source_goal_id: Option<String>,
     allow_observations: Option<bool>,
     operation_scopes: Option<Vec<MandateOperationScope>>,
@@ -2549,7 +2376,6 @@ struct ManageMandatesArgs {
     measurement_value_micros: Option<i64>,
     measurement_confidence_bps: Option<u16>,
     measurement_observed_at: Option<String>,
-    attributed_intention_ids: Option<Vec<String>>,
     question: Option<String>,
     owner_alert: Option<String>,
     termination_kind: Option<String>,
@@ -2562,12 +2388,8 @@ struct ManageMandatesArgs {
     invalidation_criteria: Option<String>,
     learning_note: Option<String>,
     learning_evidence_receipt_ids: Option<Vec<String>>,
-    strategy_key: Option<String>,
-    strategy_kind: Option<String>,
-    strategy_confidence_bps: Option<u16>,
     guidance: Option<String>,
     reconciliation_resolution: Option<String>,
-    target_session_id: Option<String>,
     /// The dispatcher's facts about this call ([`Self::bind_facts`]),
     /// never arguments.
     #[serde(skip)]
@@ -2638,11 +2460,8 @@ impl ManageMandatesArgs {
         trim_optional(&mut self.risk);
         trim_optional(&mut self.invalidation_criteria);
         trim_optional(&mut self.learning_note);
-        trim_optional(&mut self.strategy_key);
-        trim_optional(&mut self.strategy_kind);
         trim_optional(&mut self.guidance);
         trim_optional(&mut self.reconciliation_resolution);
-        trim_optional(&mut self.target_session_id);
 
         if self.action == "update" {
             // These are creation metadata, not authority. A monolithic tool
@@ -2692,7 +2511,6 @@ const MANAGE_MANDATE_ACTIONS: &[&str] = &[
     "list",
     "get",
     "update",
-    "transfer_owner",
     "pause",
     "resume",
     "answer_question",
@@ -2701,22 +2519,6 @@ const MANAGE_MANDATE_ACTIONS: &[&str] = &[
     "record_measurement",
     "record_decision",
     "list_intentions",
-];
-const OBJECTIVE_CONTROL_REQUIRED: &[&str] = &[
-    "schema_version",
-    "metric_name",
-    "unit",
-    "baseline_micros",
-    "target_micros",
-    "direction",
-    "measurement_source",
-    "measurement_cadence_secs",
-    "experiment_cohort",
-    "experiment_window_secs",
-    "minimum_effect_micros",
-    "max_stagnant_measurements",
-    "run_failure_budget",
-    "baseline_observed_at",
 ];
 const OPERATION_SCOPE_REQUIRED: &[&str] = &[
     "tool",
@@ -2733,7 +2535,6 @@ const TERMINATION_KINDS: &[&str] = &[
     "stop_condition_met",
     "safety_termination",
 ];
-const STRATEGY_KINDS: &[&str] = &["reinforce", "explore", "avoid", "retire"];
 const RECONCILIATION_RESOLUTIONS: &[&str] = &[
     "confirmed_effect_occurred",
     "confirmed_no_effect",
@@ -2743,13 +2544,10 @@ const HTTP_TOOLS: &[&str] = &["http_request", "web_fetch"];
 const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 const OPERATION_KINDS: &[&str] = &["observation", "mutation"];
 const MUTATION_EFFECTS: &[&str] = &["remote_mutation", "external_delivery"];
-const OBJECTIVE_DIRECTIONS: &[&str] = &["at_least", "at_most"];
 const AUTONOMY_MODES: &[&str] = &["bounded", "autopilot"];
 const PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
 const REVIEW_EFFORTS: &[&str] = &["efficient", "balanced", "thorough"];
 const GET_SECTIONS: &[&str] = &["summary", "policy", "history"];
-const OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION: &str =
-    "Autopilot only: a number the mandate works to move to a target. Omit it for a mandate that checks or watches something; how often that runs is default_review_minutes. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.";
 const DEFAULT_REVIEW_FIELD_DESCRIPTION: &str =
     "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.";
 const FIXED_DEADLINE_DESCRIPTION: &str =
@@ -2765,8 +2563,6 @@ const EXPECTED_BENEFIT_DESCRIPTION: &str = "ACT: benefit of acting now instead o
 const RISK_DESCRIPTION: &str = "ACT: expected cost or downside, or why none is material.";
 const INVALIDATION_DESCRIPTION: &str =
     "ACT: evidence making the intervention unsafe or not worthwhile.";
-const TRANSFER_SESSION_DESCRIPTION: &str =
-    "transfer_owner only; exact registered destination session";
 
 fn op_schema() -> Value {
     json!({
@@ -2783,31 +2579,6 @@ fn op_schema() -> Value {
             "required": OPERATION_SCOPE_REQUIRED,
             "additionalProperties": false
         }
-    })
-}
-
-fn objective_control_schema() -> Value {
-    json!({
-        "type": "object",
-        "description": OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION,
-        "properties": {
-            "schema_version": { "type": "integer", "enum": [1] },
-            "metric_name": bounded_text(128),
-            "unit": bounded_text(64),
-            "baseline_micros": { "type": "integer" },
-            "target_micros": { "type": "integer" },
-            "direction": text_enum(OBJECTIVE_DIRECTIONS),
-            "measurement_source": bounded_text(2048),
-            "measurement_cadence_secs": integer_range(60, 2592000),
-            "experiment_cohort": bounded_text(128),
-            "experiment_window_secs": integer_range(60, 7776000),
-            "minimum_effect_micros": integer_min(1),
-            "max_stagnant_measurements": integer_range(1, 20),
-            "run_failure_budget": integer_range(1, 10),
-            "baseline_observed_at": { "type": "string" }
-        },
-        "required": OBJECTIVE_CONTROL_REQUIRED,
-        "additionalProperties": false
     })
 }
 
@@ -2838,7 +2609,7 @@ impl Tool for ManageMandatesTool {
                 "type": "object",
                 "properties": {
                     "action": text_enum(MANAGE_MANDATE_ACTIONS),
-                    "mandate_id": bounded_text(256), "name": described(bounded_text(MAX_NAME_TEXT), NAME_FIELD_DESCRIPTION), "objective": bounded_text(MAX_OBJECTIVE_TEXT), "autonomy_mode": text_enum(AUTONOMY_MODES), "objective_control": objective_control_schema(), "source_goal_id": described(bounded_text(256), SOURCE_GOAL_FIELD_DESCRIPTION),
+                    "mandate_id": bounded_text(256), "name": described(bounded_text(MAX_NAME_TEXT), NAME_FIELD_DESCRIPTION), "objective": bounded_text(MAX_OBJECTIVE_TEXT), "autonomy_mode": text_enum(AUTONOMY_MODES), "source_goal_id": described(bounded_text(256), SOURCE_GOAL_FIELD_DESCRIPTION),
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
@@ -2849,12 +2620,11 @@ impl Tool for ManageMandatesTool {
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
                     "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
                     "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), EVIDENCE_RECEIPT_IDS_DESCRIPTION), "question": bounded_text(MAX_QUESTION_TEXT),
-                    "measurement_value_micros": { "type": "integer", "description": "Millionths of one unit (25 engagements = 25000000)." }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
+                    "measurement_value_micros": { "type": "integer", "description": "record_measurement only, for a mandate confirmed with a measured objective. Millionths of one unit (25 engagements = 25000000)." }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" },
                     "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
                     "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
-                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION), "strategy_key": bounded_text(64),
-                    "target_session_id": described(bounded_text(256), TRANSFER_SESSION_DESCRIPTION),
-                    "strategy_kind": text_enum(STRATEGY_KINDS), "strategy_confidence_bps": integer_range(0, 10000), "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
+                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": described(bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION),
+                    "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -2950,7 +2720,6 @@ impl ManageMandatesTool {
             "list" => self.list(&args).await,
             "get" => self.get(&args).await,
             "update" => self.update(&args).await,
-            "transfer_owner" => self.transfer_owner(&args).await,
             "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
                 self.transition(&args, &args.action).await
             }
@@ -2964,7 +2733,7 @@ impl ManageMandatesTool {
 
 #[async_trait]
 impl crate::traits::ToolSemantics for ManageMandatesTool {
-    /// Creating, updating and transferring a mandate are confirmed by the
+    /// Creating and updating a mandate are confirmed by the
     /// owner before they commit. The dispatcher runs the call only with that
     /// answer; a decline is recorded by the kernel and changes nothing.
     async fn owner_approval_request(
@@ -2980,7 +2749,7 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
 
     /// Reads (draft, list, get, list_intentions) have no effects. Every
     /// other action changes durable delegated policy or schedules work, so
-    /// it stays undeclared; a declined create, update or transfer is
+    /// it stays undeclared; a declined create or update is
     /// recorded by its approval subject, so the identical change is not put
     /// to the owner again.
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
@@ -3228,61 +2997,6 @@ fn normalized_learning_note(
 fn learning_note_fields_complete(learning_note: Option<&str>, evidence: Option<&[String]>) -> bool {
     learning_note.is_some_and(|value| !value.trim().is_empty())
         && evidence.is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))
-}
-
-fn strategy_update_fields_complete(
-    strategy_key: Option<&str>,
-    strategy_kind: Option<&str>,
-    strategy_confidence_bps: Option<u16>,
-    learning_note: Option<&MandateLearningNote>,
-) -> bool {
-    strategy_key.is_some_and(|value| !value.trim().is_empty())
-        && strategy_kind.is_some_and(|value| !value.trim().is_empty())
-        && strategy_confidence_bps.is_some()
-        && learning_note.is_some()
-}
-
-fn normalized_strategy_revisions(
-    mandate: &Mandate,
-    decision: &MandateDecisionCycle,
-    strategy_key: Option<&str>,
-    strategy_kind: Option<&str>,
-    strategy_confidence_bps: Option<u16>,
-    learning_note: Option<&MandateLearningNote>,
-) -> anyhow::Result<Vec<MandateStrategyRevision>> {
-    let Some(key) = bounded_optional_text(strategy_key, "strategy_key", 64)? else {
-        // Some structured-tool providers fill every optional field. The
-        // non-empty strategy key is the authoritative presence marker for an
-        // adaptive update, so enum/numeric defaults without a key are ignored.
-        return Ok(Vec::new());
-    };
-    let kind = strategy_kind
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(MandateStrategyRevisionKind::parse)
-        .ok_or_else(|| {
-            anyhow::anyhow!("strategy_kind must be reinforce, explore, avoid, or retire")
-        })?;
-    let confidence = strategy_confidence_bps.ok_or_else(|| {
-        anyhow::anyhow!(
-            "strategy_key, strategy_kind, strategy_confidence_bps, learning_note, and learning evidence must be supplied together"
-        )
-    })?;
-    let note = learning_note.ok_or_else(|| {
-        anyhow::anyhow!(
-            "strategy_key, strategy_kind, strategy_confidence_bps, learning_note, and learning evidence must be supplied together"
-        )
-    })?;
-    Ok(vec![MandateStrategyRevision::new(
-        &mandate.id,
-        mandate.version,
-        &decision.id,
-        &key,
-        kind,
-        &note.summary,
-        confidence,
-        note.evidence_receipt_ids.clone(),
-    )])
 }
 
 fn clean_strings(values: Option<&[String]>) -> Vec<String> {
@@ -3951,55 +3665,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_strategy_key_ignores_structured_provider_companion_defaults() {
-        let goal = crate::traits::Goal::new_continuous(
-            "Review a synthetic bounded source",
-            "owner-session",
-            None,
-            None,
-        );
-        let mandate = Mandate::new(
-            &goal.id,
-            None,
-            "Review a synthetic bounded source",
-            "owner-session",
-            MandateAuthority::default(),
-            60,
-            3_600,
-            300,
-        );
-        let decision = MandateDecisionCycle::new(
-            &mandate.id,
-            "synthetic-run",
-            MandateDecisionOutcome::Wait,
-            "Nothing worthwhile to do in this review.",
-            mandate.version,
-        );
-
-        let revisions = normalized_strategy_revisions(
-            &mandate,
-            &decision,
-            Some(""),
-            Some("explore"),
-            Some(0),
-            None,
-        )
-        .unwrap();
-
-        assert!(revisions.is_empty());
-    }
-
-    #[test]
-    fn partial_optional_learning_and_strategy_metadata_is_not_decision_blocking() {
+    fn partial_optional_learning_metadata_is_not_decision_blocking() {
         assert!(!learning_note_fields_complete(
             Some("possible learning"),
             None
-        ));
-        assert!(!strategy_update_fields_complete(
-            Some("source-selection"),
-            Some("reinforce"),
-            None,
-            None,
         ));
     }
 
