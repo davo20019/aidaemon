@@ -15,7 +15,9 @@
 
 #[cfg(feature = "conformance")]
 pub mod approval_conformance;
+pub mod approval_render;
 mod approvals;
+pub mod attachments;
 pub mod channel;
 pub mod commands;
 #[cfg(feature = "conformance")]
@@ -28,6 +30,10 @@ mod inbound_files;
 pub mod latex;
 pub mod names;
 pub mod policy;
+pub mod presentation;
+pub mod prompts;
+#[cfg(feature = "http")]
+pub mod rate_limit;
 mod render;
 pub mod router;
 pub mod runner;

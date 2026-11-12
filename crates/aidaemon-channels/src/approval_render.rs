@@ -3,9 +3,9 @@
 //! Pure helpers that build inline keyboards and message text for command-approval
 //! and scheduled-goal-confirmation prompts.
 
-use super::formatting::split_message;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::types::{ApprovalResponse, GoalConfirmationStyle};
+use crate::split::split_message;
+use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
+use aidaemon_tools::semantics::{ApprovalResponse, GoalConfirmationStyle};
 
 /// Truncate command display to fit Telegram's 4096 char limit.
 /// Reserve ~300 chars for header, warnings, buttons, and footer.
@@ -16,10 +16,7 @@ const MAX_CMD_DISPLAY: usize = 3600;
 /// - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
 /// - Cautious mode: All get [Once, Session, Deny]
 /// - YOLO mode: All get [Once, Always, Deny]
-pub(crate) fn approval_use_session_button(
-    permission_mode: PermissionMode,
-    risk_level: RiskLevel,
-) -> bool {
+pub fn approval_use_session_button(permission_mode: PermissionMode, risk_level: RiskLevel) -> bool {
     match permission_mode {
         PermissionMode::Cautious => true,
         PermissionMode::Default => risk_level >= RiskLevel::Critical,
@@ -28,7 +25,7 @@ pub(crate) fn approval_use_session_button(
 }
 
 /// User-facing risk header: icon, title, and one-line context.
-pub(super) fn risk_header(risk_level: RiskLevel) -> (&'static str, &'static str, &'static str) {
+pub fn risk_header(risk_level: RiskLevel) -> (&'static str, &'static str, &'static str) {
     match risk_level {
         RiskLevel::Safe => (
             "ℹ️",
@@ -54,7 +51,7 @@ pub(super) fn risk_header(risk_level: RiskLevel) -> (&'static str, &'static str,
 }
 
 /// Hint text explaining what the persistent-approval button does.
-pub(super) fn allow_button_hint(use_session_button: bool, one_time_only: bool) -> &'static str {
+pub fn allow_button_hint(use_session_button: bool, one_time_only: bool) -> &'static str {
     if one_time_only {
         "This approval applies only to this action; you will be asked again for another sensitive action."
     } else if use_session_button {
@@ -65,7 +62,7 @@ pub(super) fn allow_button_hint(use_session_button: bool, one_time_only: bool) -
 }
 
 /// Short status shown after the user taps an approval button.
-pub(super) fn response_status(response: &ApprovalResponse) -> (&'static str, &'static str) {
+pub fn response_status(response: &ApprovalResponse) -> (&'static str, &'static str) {
     match response {
         ApprovalResponse::AllowOnce => ("✅", "Allowed this once"),
         ApprovalResponse::AllowSession => ("✅", "Allowed for this session"),
@@ -75,7 +72,7 @@ pub(super) fn response_status(response: &ApprovalResponse) -> (&'static str, &'s
 }
 
 /// Optional follow-up detail after the status line.
-pub(super) fn response_status_detail(response: &ApprovalResponse) -> Option<&'static str> {
+pub fn response_status_detail(response: &ApprovalResponse) -> Option<&'static str> {
     match response {
         ApprovalResponse::AllowSession => Some("You'll be asked again after restart."),
         ApprovalResponse::AllowAlways => Some("You won't be asked again for this type of action."),
@@ -84,7 +81,7 @@ pub(super) fn response_status_detail(response: &ApprovalResponse) -> Option<&'st
 }
 
 /// Strip the pre-decision footer (button hint) from an approval prompt message.
-pub(super) fn strip_approval_footer(text: &str) -> String {
+pub fn strip_approval_footer(text: &str) -> String {
     let mut body = text.trim_end().to_string();
     for marker in [
         "\n\n\"Allow Session\"",
@@ -109,7 +106,7 @@ pub(super) fn strip_approval_footer(text: &str) -> String {
 }
 
 /// Build the message body shown after the user chooses Allow / Deny.
-pub(super) fn finalize_approval_message(original: &str, response: &ApprovalResponse) -> String {
+pub fn finalize_approval_message(original: &str, response: &ApprovalResponse) -> String {
     let body = strip_approval_footer(original);
     let (icon, status) = response_status(response);
     let mut text = format!("{body}\n\n{icon} {status}");
@@ -121,7 +118,7 @@ pub(super) fn finalize_approval_message(original: &str, response: &ApprovalRespo
 
 fn truncate_command(command: &str) -> String {
     if command.len() > MAX_CMD_DISPLAY {
-        let end = crate::utils::floor_char_boundary(command, MAX_CMD_DISPLAY);
+        let end = aidaemon_tools::text::floor_char_boundary(command, MAX_CMD_DISPLAY);
         format!(
             "{}...\n[truncated — {} chars total]",
             &command[..end],
@@ -133,7 +130,7 @@ fn truncate_command(command: &str) -> String {
 }
 
 /// Build the Markdown body for a command-approval prompt.
-pub(super) fn build_approval_message_markdown(
+pub fn build_approval_message_markdown(
     command: &str,
     risk_level: RiskLevel,
     warnings: &[String],
@@ -217,7 +214,7 @@ fn readable_policy(value: &str) -> String {
 /// headroom for page labels and the final confirmation instruction, and put the
 /// inline keyboard on the final page only. Plain text avoids splitting inside
 /// generated HTML entities while preserving every disclosed detail.
-pub(super) fn build_goal_confirmation_pages(
+pub fn build_goal_confirmation_pages(
     goal_description: &str,
     details: &[String],
     style: GoalConfirmationStyle,

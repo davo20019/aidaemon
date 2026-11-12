@@ -30,6 +30,7 @@ http = ["dep:reqwest"]
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -42,9 +43,11 @@ thiserror = "1"
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 toml = "0.8"
+tempfile = "3"
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-channels = { path = ".", features = ["testing", "conformance", "http"] }
 reqwest = { version = "0.12", default-features = false }

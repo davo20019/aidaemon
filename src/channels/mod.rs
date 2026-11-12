@@ -1,5 +1,5 @@
-pub(crate) mod approval_render;
-pub(crate) mod attachments;
+pub(crate) use aidaemon_channels::approval_render;
+pub(crate) use aidaemon_channels::attachments;
 pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]
@@ -9,9 +9,10 @@ mod hub;
 pub(crate) mod live_status;
 #[cfg(test)]
 pub(crate) mod mock_api;
-mod presentation;
-pub(crate) mod prompts;
-mod rate_limit;
+use aidaemon_channels::presentation;
+pub(crate) use aidaemon_channels::prompts;
+#[cfg(feature = "slack")]
+use aidaemon_channels::rate_limit;
 pub(crate) mod set_key;
 #[cfg(feature = "slack")]
 mod slack;

@@ -3,8 +3,8 @@
 //! Keep channel messages readable here instead of teaching every notification
 //! producer how to lay out a mobile-friendly card.
 
-use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
+use std::sync::LazyLock as Lazy;
 
 const MAX_INLINE_STEP_CHARS: usize = 180;
 const MAX_SCHEDULED_FAILURE_CHARS: usize = 900;
@@ -19,8 +19,8 @@ static TASK_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Prepare arbitrary agent-originated Markdown for a chat surface.
-pub(crate) fn prepare_chat_message(text: &str) -> String {
-    let cleaned = crate::tools::sanitize::strip_leaked_control_markers(text);
+pub fn prepare_chat_message(text: &str) -> String {
+    let cleaned = aidaemon_tools::sanitize::strip_leaked_control_markers(text);
     let mut lines = Vec::new();
     let mut previous_blank = false;
 
@@ -52,7 +52,7 @@ pub(crate) fn prepare_chat_message(text: &str) -> String {
 }
 
 /// Apply a consistent status card to queued notifications.
-pub(crate) fn present_notification(notification_type: &str, message: &str) -> String {
+pub fn present_notification(notification_type: &str, message: &str) -> String {
     let prepared = prepare_chat_message(message);
     if prepared.is_empty() || has_status_heading(&prepared) {
         return prepared;
@@ -95,7 +95,7 @@ pub(crate) fn present_notification(notification_type: &str, message: &str) -> St
 /// different job: state the outcome, link the deliverable, and make the schedule
 /// state obvious. Keeping that boundary here prevents raw execution transcripts
 /// from becoming the default Telegram experience.
-pub(crate) fn present_scheduled_run_notification(
+pub fn present_scheduled_run_notification(
     notification_type: &str,
     message: &str,
     recurring: bool,
@@ -408,7 +408,7 @@ mod tests {
 /// `text` cut to at most `max_chars` characters (the ellipsis included) at
 /// the last whole word, so a preview never ends mid-word. A single word
 /// longer than the limit is cut where it must be.
-pub(crate) fn word_preview(text: &str, max_chars: usize) -> String {
+pub fn word_preview(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -433,11 +433,7 @@ pub(crate) fn word_preview(text: &str, max_chars: usize) -> String {
 /// can act on it (one offering tools) when it is from the same sender
 /// (`TaskRegistry::take_steering_messages`); otherwise, or when no model
 /// call answered it, it runs as its own turn once the current one ends.
-pub(crate) fn queued_message_notice(
-    text: &str,
-    current_task: &str,
-    has_attachments: bool,
-) -> String {
+pub fn queued_message_notice(text: &str, current_task: &str, has_attachments: bool) -> String {
     let preview = word_preview(text, 50);
     if has_attachments {
         format!("📥 Got \"{preview}\". I'll handle it right after the current task: {current_task}")
