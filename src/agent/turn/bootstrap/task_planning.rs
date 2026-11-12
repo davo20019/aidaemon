@@ -119,6 +119,39 @@ pub(crate) fn compile_memory_pipeline_policy(
     )
 }
 
+/// The turn's one memory-policy event. A turn opted out of learning is
+/// recorded as suppressed with the opt-out's reason whatever the compiled
+/// policy says: the reason is what keeps the turn out of history search, so
+/// it must not depend on the turn's memory being allowed otherwise. Recall
+/// still follows the policy (opting out is about learning, not reading).
+pub(crate) fn memory_policy_compiled_data(
+    task_id: &str,
+    turn_id: &str,
+    policy: &MemoryPipelinePolicy,
+    learning_opted_out: bool,
+) -> crate::events::MemoryPolicyCompiledData {
+    let persistence_allowed = policy.allows_memory() && !learning_opted_out;
+    crate::events::MemoryPolicyCompiledData {
+        task_id: task_id.to_string(),
+        turn_id: Some(turn_id.to_string()),
+        // `access` excludes the turn from every automatic memory pipeline
+        // (`memory_suppressed_turn_ids`), so it tracks persistence, not
+        // recall.
+        access: if persistence_allowed {
+            crate::events::MemoryPipelineAccess::Allowed
+        } else {
+            crate::events::MemoryPipelineAccess::Suppressed
+        },
+        reason_code: if learning_opted_out {
+            crate::agent::memory_plugin::OPTED_OUT_REASON.to_string()
+        } else {
+            policy.reason_code().to_string()
+        },
+        retrieval_suppressed: !policy.allows_recall(),
+        persistence_suppressed: !persistence_allowed,
+    }
+}
+
 /// JSON-object mode is rejected by a number of OpenAI-compatible gateways
 /// unless the prompt contains a provider-specific lowercase marker.  The
 /// daemon's semantic producers should not depend on prompt spelling.  A
@@ -439,6 +472,31 @@ mod tests {
     use super::*;
     use crate::llm_runtime::gateway::test_support::*;
     use std::sync::Arc;
+
+    /// An opted-out turn's one policy event carries the opt-out's reason
+    /// whatever else suppressed its memory, so history search (which keys on
+    /// that reason) leaves it out; recall still follows the policy.
+    #[test]
+    fn an_opted_out_turn_records_the_opt_out_whatever_its_policy() {
+        use aidaemon_memory::policy::TurnAuthor;
+        let opted_out = crate::agent::memory_plugin::OPTED_OUT_REASON;
+        for (author, forbidden) in [
+            (TurnAuthor::Person, false),
+            (TurnAuthor::Person, true),
+            (TurnAuthor::Synthetic, false),
+        ] {
+            let policy = MemoryPipelinePolicy::compile(author, forbidden);
+            let data = memory_policy_compiled_data("task-1", "turn-1", &policy, true);
+            assert_eq!(data.reason_code, opted_out, "{policy:?}");
+            assert_eq!(data.access, crate::events::MemoryPipelineAccess::Suppressed);
+            assert!(data.persistence_suppressed);
+            assert_eq!(data.retrieval_suppressed, !policy.allows_recall());
+
+            let normal = memory_policy_compiled_data("task-1", "turn-1", &policy, false);
+            assert_eq!(normal.reason_code, policy.reason_code());
+            assert_eq!(normal.persistence_suppressed, !policy.allows_memory());
+        }
+    }
 
     #[test]
     fn conversational_turn_reaches_the_relationship_router() {

@@ -482,3 +482,40 @@ async fn a_failed_opt_out_mark_is_retried_until_recorded() {
         "a recorded mark is not repeated"
     );
 }
+
+/// Policy events of every turn so far: (access, reason).
+async fn policy_events(harness: &TestHarness) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT json_extract(data, '$.access'), json_extract(data, '$.reason_code')
+           FROM events WHERE event_type = 'memory_policy_compiled' ORDER BY id",
+    )
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap()
+}
+
+/// A `/private` turn records one policy event, already suppressed with the
+/// opt-out's reason: no window where background intake sees it as allowed.
+#[tokio::test]
+async fn a_private_turn_records_one_suppressed_policy_event() {
+    let harness = crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+        MockProvider::text_response("I won't keep that."),
+    ]))
+    .await
+    .unwrap();
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request("My synthetic code word is Zephyr-4."))
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_events(&harness).await,
+        [(
+            "suppressed".to_string(),
+            super::opt_out::OPTED_OUT_REASON.to_string()
+        )]
+    );
+}

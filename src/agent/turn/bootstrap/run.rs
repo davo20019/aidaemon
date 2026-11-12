@@ -1189,37 +1189,12 @@ pub(in crate::agent) async fn run_bootstrap(
         relationship_fallback.as_ref(),
     )
     .await?;
-    let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
-        &turn_context.completion_contract,
-        planner_skip_reason.is_none(),
-    );
-    // Persistence and recall are separate: a turn no person wrote may recall
-    // but never persist.
-    let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
-    let memory_recall_allowed = memory_pipeline_policy.allows_recall();
-    learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;
-    emitter
-        .emit(
-            EventType::MemoryPolicyCompiled,
-            crate::events::MemoryPolicyCompiledData {
-                task_id: task_id.clone(),
-                turn_id: Some(user_msg_id.clone()),
-                // `access` excludes the turn from every automatic memory
-                // pipeline (`memory_suppressed_turn_ids`), so it tracks
-                // persistence, not recall.
-                access: if memory_pipeline_allowed {
-                    crate::events::MemoryPipelineAccess::Allowed
-                } else {
-                    crate::events::MemoryPipelineAccess::Suppressed
-                },
-                reason_code: memory_pipeline_policy.reason_code().to_string(),
-                retrieval_suppressed: !memory_recall_allowed,
-                persistence_suppressed: !memory_pipeline_allowed,
-            },
-        )
-        .await?;
-    // "Don't remember this" sent as `/private` before this message. Only a
-    // message the user wrote consumes it.
+    // "Don't remember this" is settled before the turn's memory policy is
+    // recorded, so the turn's one policy event already says so: background
+    // intake never sees a private turn as allowed, and a turn suppressed for
+    // another reason still carries the opt-out history search excludes.
+    // `/private` sent before this message opts it out; only a message the
+    // user wrote consumes it.
     let learning = aidaemon_policies::TurnLearning::default();
     if !ctx.internal_continuation
         && agent.depth == 0
@@ -1232,11 +1207,27 @@ pub(in crate::agent) async fn run_bootstrap(
         .await
     {
         learning.opt_out();
-        if memory_pipeline_allowed {
-            crate::agent::memory_plugin::mark_turn_opted_out(&emitter, &task_id, &user_msg_id)
-                .await?;
-        }
     }
+    let memory_pipeline_policy = super::task_planning::compile_memory_pipeline_policy(
+        &turn_context.completion_contract,
+        planner_skip_reason.is_none(),
+    );
+    // Persistence and recall are separate: a turn no person wrote may recall
+    // but never persist.
+    let memory_pipeline_allowed = memory_pipeline_policy.allows_memory();
+    let memory_recall_allowed = memory_pipeline_policy.allows_recall();
+    learning_ctx.memory_persistence_allowed = memory_pipeline_allowed;
+    emitter
+        .emit(
+            EventType::MemoryPolicyCompiled,
+            super::task_planning::memory_policy_compiled_data(
+                &task_id,
+                &user_msg_id,
+                &memory_pipeline_policy,
+                !learning.allowed(),
+            ),
+        )
+        .await?;
     agent
         .emit_decision_point(
             &emitter,
