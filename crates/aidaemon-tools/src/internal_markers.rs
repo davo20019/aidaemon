@@ -10,7 +10,7 @@
 
 use std::sync::RwLock;
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use regex::Regex;
 
 use crate::sanitize::{ENDPOINT_LABEL, FILE_PATH_LABEL, REDACTED_MARKER, WINDOWS_PATH_LABEL};
