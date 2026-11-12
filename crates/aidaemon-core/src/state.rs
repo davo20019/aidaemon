@@ -65,18 +65,22 @@ pub struct Interruption {
 /// The unfinished tool batch of an interrupted turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pending {
+    #[doc(hidden)]
     pub calls: Vec<ToolCall>,
     /// Index of the interrupted call; earlier calls already have results.
+    #[doc(hidden)]
     pub next: usize,
     pub interruption: Interruption,
     /// Index of the hook that interrupted. An approval settles that hook
     /// only: hooks registered after it still judge the call on resume.
     #[serde(default)]
+    #[doc(hidden)]
     pub hook_index: Option<usize>,
     /// The hooks that were installed when the run paused. `hook_index` means
     /// nothing under a different chain, so an approval is judged again from
     /// the first hook when this does not match.
     #[serde(default)]
+    #[doc(hidden)]
     pub hook_chain: Vec<String>,
     /// The paused run of a child this call started, when the interrupted
     /// call is a tool that delegates ([`crate::Tool::suspends`]). The call at
@@ -140,8 +144,12 @@ pub struct RunState {
     pub elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Pending>,
+    /// Kernel bookkeeping for crash recovery (see `aidaemon-store-sqlite`'s
+    /// `in_flight_runs`), not part of the stable API.
+    #[doc(hidden)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight: Option<InFlight>,
+    #[doc(hidden)]
     #[serde(default)]
     pub nudges: u32,
     /// The run has seen untrusted content (a dispatched call whose result
@@ -171,10 +179,12 @@ pub struct RunState {
     pub unmet: Vec<String>,
     /// The first finish a call returned in the unfinished batch; the run
     /// ends with it once the batch ends (see [`crate::ToolOutput::finish`]).
+    #[doc(hidden)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finishing: Option<PendingFinish>,
     /// How far `on_limit` hooks raised this run's limits. A new run
     /// ([`RunState::with_user_message`]) starts with none.
+    #[doc(hidden)]
     #[serde(default)]
     pub limit_grants: LimitGrants,
     /// The run whose tool call started this one, if any.

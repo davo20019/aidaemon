@@ -60,7 +60,9 @@ pub use hook::{
     Hook, HookContext, HookFailure, HookPoint, LimitDecision, ModelDecision, ModelErrorDecision,
     StopDecision, StuckDecision, ToolDecision,
 };
-pub use limits::{LimitGrants, LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
+#[doc(hidden)]
+pub use limits::LimitGrants;
+pub use limits::{LimitKind, Limits, RunSnapshot, StopCondition, HARD_TURN_CAP};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{FinishOutcome, RunOutcome, RunStatus};
 pub use provider::{
@@ -74,9 +76,10 @@ pub use service::{
     FnService, Schedule, Service, ServiceContext, ServiceError, ServiceEvent, ServiceGate,
     ServiceHost, ServiceObserver, ServiceWaker,
 };
-pub use state::{
-    InFlight, Interruption, Pending, PendingFinish, RunId, RunState, RUN_STATE_SCHEMA,
-};
+/// Kernel bookkeeping types inside [`RunState`]; not part of the stable API.
+#[doc(hidden)]
+pub use state::{InFlight, PendingFinish};
+pub use state::{Interruption, Pending, RunId, RunState, RUN_STATE_SCHEMA};
 pub use store::{MemoryStore, RunStore, StoreError};
 pub use stuck::{StuckConfig, StuckSignal};
 pub use tool::{
