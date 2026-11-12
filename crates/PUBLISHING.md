@@ -1,91 +1,100 @@
-# Publishing the SDK (draft plan)
+# Publishing the SDK
 
-Status: **draft for the owner's decision**. Nothing has been published.
-Every SDK crate has `publish = false` until this plan is approved.
+Status: **decided** (PLAN.md, "Decisions (2026-11-11)", decisions 2 and 3).
+Nothing has been published. Every SDK crate keeps `publish = false` until the
+owner approves the first release; that flag is removed only then.
 
-Publishing to crates.io is public and permanent: a version can be yanked
-but never deleted, and a crate name cannot be released once taken. Each
-step below that publishes is the owner's call.
+Publishing to crates.io is public and permanent: a version can be yanked but
+never deleted, and a crate name cannot be released once taken.
+
+## Shape
+
+- The crates are published, not folded into the daemon: the daemon is built
+  on them, and `cargo publish` of the daemon needs every path dependency on
+  crates.io.
+- **One shared version** for every SDK crate (`crates/aidaemon-*`), set in
+  `[workspace.package]` of the root `Cargo.toml`, starting at `0.1.0` and
+  separate from the daemon's version. Crates use `version.workspace = true`.
+  Split the versions later only if outside users need it.
+- `aidaemon-node-protocol` and `aidaemon-node-sdk` are already published and
+  keep their own versions.
+- **The daemon pins them exactly** (`=0.1.x`, alongside `path`), so a daemon
+  release always builds against the crates it was tested with. Path
+  dependencies between SDK crates carry `version = "0.1.0"` so
+  `cargo package` works; dev-dependencies stay path-only.
+- MSRV: `rust-version = "1.88"` in `[workspace.package]`, the floor of the
+  SDK crates' dependency tree with all features (`image`, `ignore`); the CI
+  `msrv` job checks it.
 
 ## Names
 
-Checked on 2026-10-31 against the crates.io API:
-
-| Name | Status |
-|---|---|
-| `aidaemon` | taken (the existing daemon release) |
-| `aidaemon-node-sdk` | taken (existing) |
-| All 14 SDK crate names (`aidaemon-core`, `-sdk`, `-providers`, `-tools`, `-store-sqlite`, `-mcp`, `-agents`, `-policies`, `-eval`, `-memory`, `-channels`, `-channel-telegram`, `-channel-slack`, `-channel-discord`) | free |
-
-Names can be taken by anyone at any time; re-check right before the first
-release.
-
-Option to consider: publish placeholder 0.0.x versions early only to
-reserve the names. That is still a public, permanent action.
+Checked on 2026-10-31 against the crates.io API: `aidaemon` and
+`aidaemon-node-sdk` are ours already, and the 14 original SDK names
+(`aidaemon-core`, `-sdk`, `-providers`, `-tools`, `-store-sqlite`, `-mcp`,
+`-agents`, `-policies`, `-eval`, `-memory`, `-channels`, `-channel-telegram`,
+`-channel-slack`, `-channel-discord`) were free. `aidaemon-events`,
+`aidaemon-work` and `aidaemon-decisions` have not been checked. Names can be
+taken at any time: re-check all 17 right before the first release. No
+placeholder 0.0.x versions.
 
 ## Stability tiers
 
 | Tier | Crates | Promise |
 |---|---|---|
-| Stable contracts | `aidaemon-core`, `aidaemon-channels` (the `channel` module), the traits in `aidaemon-memory` | semver; breaking changes only in a new minor version while 0.x, with a migration note |
-| Implementations | providers, tools, store-sqlite, mcp, agents, policies, eval, memory implementations, channel runner and adapters | may change in any minor version while 0.x |
-| Bundle | `aidaemon-sdk` | re-exports; its version moves with the stable tier |
+| Public contract | `aidaemon-core`, `aidaemon-sdk`, the `channel` module of `aidaemon-channels`, the traits in `aidaemon-memory` | semver; breaking changes only in a new minor version while 0.x, with a migration note; checked by `cargo-semver-checks` in CI |
+| Implementation | providers, tools, store-sqlite, mcp, agents, policies, eval, channel adapters, the rest of channels and memory | no promise while 0.x; description says so |
+| Internal | `aidaemon-events`, `aidaemon-work`, `aidaemon-decisions` | published only because the daemon depends on them; description says "internal to aidaemon, no stability promise" |
 
-Third-party crates depend on the stable tier, so it should change rarely.
+## Before the first release (checklist)
 
-## Versioning
-
-- Start every SDK crate at `0.1.0`. Leave 1.0 for after the daemon itself
-  runs on the SDK (PLAN.md, Phase 7) and the contracts have held for a few
-  releases.
-- Version crates independently. `aidaemon-sdk` pins compatible minor
-  ranges of the others.
-- Add `cargo-semver-checks` to CI for the stable tier before the first
-  release, so accidental breaking changes fail the build.
-- Declare an MSRV (`rust-version`) in each crate and test it in CI.
-
-## Before the first release
-
-1. Fill in package metadata for every crate: `readme`, `keywords`,
-   `categories`, `documentation`, `rust-version`.
-2. Add a short `README.md` per crate (crates.io shows it).
-3. Check `cargo package --list -p <crate>` for each crate: no test
-   fixtures with secrets, no large files, nothing untracked.
-4. Make sure docs build: `cargo doc -p <crate> --no-deps --all-features`.
-5. Decide the order of the daemon migration (Phase 7) relative to the
-   first release. Publishing first lets outside users start, but the
-   contracts are less proven.
+- [x] `[workspace.package]`, per-crate `readme`, `keywords`, `categories`,
+      `documentation`, descriptions.
+- [x] A `README.md` per crate; `crates/CHANGELOG.md`.
+- [x] Getting-started guide source in `crates/sdk-guide/` (to be moved to the
+      docs.aidaemon.ai site, which is built outside this repository).
+- [x] CI: `cargo doc` per crate with `-D warnings`, MSRV, `cargo-semver-checks`.
+- [x] `cargo package --list` reviewed for every crate (see below).
+- [x] `release.yml` publishes the SDK crates in order, then the daemon.
+- [ ] Re-check the names are free; the owner approves; remove
+      `publish = false` from all SDK crates in one commit.
+- [ ] Settle Phase 9 steps 0 and 1 first (PLAN.md, Milestone 2), so the
+      contracts are proven by the daemon before they become permanent.
+- [ ] The outsider check from the published crates.
 
 ## Release order
 
-Crates must be published in dependency order:
+Dependency order, computed from the non-dev dependency edges:
 
 1. `aidaemon-core`
-2. `aidaemon-channels`, `aidaemon-providers`, `aidaemon-tools`,
-   `aidaemon-store-sqlite`, `aidaemon-mcp`, `aidaemon-agents`,
-   `aidaemon-policies`, `aidaemon-eval`
-3. `aidaemon-memory` (depends on policies), `aidaemon-events` (depends on
-   tools and policies), `aidaemon-channel-telegram`, `aidaemon-channel-slack`,
-   `aidaemon-channel-discord`
-4. `aidaemon-work` (depends on events)
+2. `aidaemon-agents`, `-channels`, `-decisions`, `-eval`, `-mcp`,
+   `-policies`, `-providers`, `-store-sqlite`, `-tools`
+3. `aidaemon-channel-discord`, `-channel-slack`, `-channel-telegram`,
+   `-events`, `-memory`
+4. `aidaemon-work`
 5. `aidaemon-sdk`
+6. `aidaemon` (the daemon)
+
+`release.yml` holds the same list (`SDK_CRATES`) with a comment on how to
+regenerate it.
 
 ## Automation
 
-The existing `.github/workflows/release.yml` already publishes the daemon
-with `cargo publish`. Extend it (or add a separate `sdk-release.yml`) to:
+`.github/workflows/release.yml` runs on the daemon's `v*` tag (no separate
+tag scheme). After the binaries and the GitHub release, the
+`publish-crates` job:
 
-- trigger on tags like `sdk-v0.1.0`,
-- run the SDK checks (fmt, clippy, tests, semver checks),
-- publish in the order above, skipping crates whose version is already on
-  crates.io,
-- create a GitHub release with the changelog section.
+1. publishes the node crates as before;
+2. stops with a notice while any SDK crate still has `publish = false`
+   (GitHub binaries and Homebrew are unaffected);
+3. otherwise checks that the daemon's exact pin matches the workspace
+   version, publishes each SDK crate in order, skipping versions already on
+   crates.io, waits for crates.io to report each, then publishes the daemon.
 
-Keep SDK and daemon tags separate so a daemon release never publishes SDK
-crates by accident.
+`ci.yml` has `sdk-docs`, `msrv` and `semver` jobs. `semver` skips a crate
+that is not on crates.io yet (no baseline) and starts checking on its own
+once 0.1.0 is out.
 
 ## Changelog
 
-Add a `crates/CHANGELOG.md` (Keep a Changelog format, like the root one)
-covering all SDK crates, with one section per release listing changes per
-crate.
+`crates/CHANGELOG.md` covers all SDK crates (Keep a Changelog), one section
+per shared release, listing changes per crate or tier.

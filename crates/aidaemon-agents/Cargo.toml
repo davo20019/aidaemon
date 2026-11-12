@@ -1,15 +1,24 @@
 [package]
 name = "aidaemon-agents"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: agents (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Agents as tools: let an aidaemon agent delegate to sub-agents; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-agents"
+readme = "README.md"
+keywords = ["agent", "subagent", "llm", "delegation", "async"]
+categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
-aidaemon-core = { path = "../aidaemon-core" }
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 serde_json = "1"
 

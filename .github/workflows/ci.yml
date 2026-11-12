@@ -122,6 +122,130 @@ jobs:
       - name: Diff aidaemon-core public API against the snapshot
         run: scripts/check-core-api.sh
 
+  # Docs must build without warnings for every SDK crate, one crate at a time
+  # (a workspace-wide `cargo doc` unifies features and hides per-crate breakage).
+  sdk-docs:
+    name: SDK docs (-D warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-docs-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-docs-v1-
+
+      - name: cargo doc per crate
+        run: |
+          set -euo pipefail
+          for crate in aidaemon-core aidaemon-providers aidaemon-tools \
+            aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies \
+            aidaemon-eval aidaemon-memory aidaemon-decisions aidaemon-events \
+            aidaemon-work aidaemon-channels aidaemon-channel-telegram \
+            aidaemon-channel-slack aidaemon-channel-discord aidaemon-macros aidaemon-sdk; do
+            echo "::group::cargo doc $crate"
+            cargo doc --no-deps --all-features -p "$crate"
+            echo "::endgroup::"
+          done
+
+  # The SDK crates declare `rust-version` in [workspace.package]. This job
+  # builds them on exactly that toolchain, read from the manifest so the two
+  # cannot drift. Library targets only: dev-dependencies may need newer Rust.
+  msrv:
+    name: MSRV (SDK crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read rust-version
+        id: msrv
+        run: |
+          v="$(sed -nE 's/^rust-version = "([0-9.]+)"/\1/p' Cargo.toml | head -1)"
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-msrv-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-v1-
+
+      - name: cargo check on the MSRV
+        run: >-
+          cargo check --locked --all-features
+          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-memory
+          -p aidaemon-decisions -p aidaemon-events -p aidaemon-work
+          -p aidaemon-channels -p aidaemon-channel-telegram
+          -p aidaemon-channel-slack -p aidaemon-channel-discord -p aidaemon-macros
+          -p aidaemon-sdk
+
+  # Semver check of the public-contract tier against the last published
+  # version on crates.io. Before the first publish there is no baseline, so a
+  # crate that is not on crates.io yet is skipped with a notice instead of
+  # failing; once 0.1.0 is out the check is live with no workflow change.
+  semver:
+    name: Semver (public contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Check each public-contract crate
+        run: |
+          set -euo pipefail
+          # aidaemon-channels and aidaemon-memory are in the tier by their
+          # `channel` module and traits; the check covers the whole crate.
+          for crate in aidaemon-core aidaemon-sdk aidaemon-channels aidaemon-memory; do
+            status="$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'aidaemon-ci (https://github.com/davo20019/aidaemon)' \
+              "https://crates.io/api/v1/crates/$crate")"
+            if [ "$status" = "404" ]; then
+              echo "::notice::$crate is not on crates.io yet; no semver baseline, skipping."
+              continue
+            elif [ "$status" != "200" ]; then
+              echo "::error::crates.io lookup for $crate returned HTTP $status"
+              exit 1
+            fi
+            cargo semver-checks check-release -p "$crate"
+          done
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

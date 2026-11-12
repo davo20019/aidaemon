@@ -1,11 +1,20 @@
 [package]
 name = "aidaemon-eval"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: eval (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Scenario-based eval kit for aidaemon agents; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-eval"
+readme = "README.md"
+keywords = ["agent", "eval", "llm", "testing", "scenarios"]
+categories = ["development-tools::testing", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [features]
@@ -14,7 +23,7 @@ publish = false
 examples = []
 
 [dependencies]
-aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-core = { version = "0.1.0", path = "../aidaemon-core", features = ["testing"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

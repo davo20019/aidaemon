@@ -1,11 +1,20 @@
 [package]
 name = "aidaemon-core"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "Experimental sketch of a small, hook-driven agent loop kernel for AIdaemon"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "The aidaemon agent kernel: a small, hook-driven agent loop with tools, providers, receipts and resumable state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-core"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "hooks", "kernel"]
+categories = ["asynchronous", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/", "PLAN.md", "plans/", "public-api.txt"]
 publish = false
 
 [features]

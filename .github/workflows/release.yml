@@ -204,6 +204,34 @@ jobs:
             exit 1
           fi
 
+      - name: Check the SDK crates are ready to publish
+        id: sdk_gate
+        run: |
+          set -euo pipefail
+
+          # Publishing is permanent and owner-approved: the SDK crates carry
+          # `publish = false` until the owner removes it. While any does, this
+          # workflow skips the SDK crates and the daemon (cargo would refuse
+          # them anyway) and still ships binaries and Homebrew.
+          ready=true
+          if grep -lE '^publish = false' crates/aidaemon-*/Cargo.toml | grep -q .; then
+            ready=false
+          fi
+
+          version="$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version"
+
+          if [ "$ready" = "true" ]; then
+            # The daemon must pin exactly the version being published.
+            if ! grep -qE "^aidaemon-core = \{ version = \"=${version}\"" Cargo.toml; then
+              echo "::error::The daemon's aidaemon-core pin does not match workspace version ${version}."
+              exit 1
+            fi
+          fi
+
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -273,6 +301,58 @@ jobs:
 
           publish_package "aidaemon-node-protocol" "$PROTOCOL_VERSION"
           publish_package "aidaemon-node-sdk" "$SDK_VERSION"
+
+          if [ "${{ steps.sdk_gate.outputs.ready }}" != "true" ]; then
+            echo "::notice::SDK crates still have publish = false; not publishing them or the daemon to crates.io. GitHub binaries and Homebrew are unaffected."
+            exit 0
+          fi
+
+          # Skip a version that is already on crates.io (a daemon release that
+          # does not change the SDK re-uses the published crates).
+          already_published() {
+            local code
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'aidaemon-release (https://github.com/davo20019/aidaemon)' \
+              "https://crates.io/api/v1/crates/$1/$2")"
+            [ "$code" = "200" ]
+          }
+
+          # SDK crates in dependency order (each after everything it depends on;
+          # dev-dependencies do not count). The shared version is
+          # [workspace.package] version. To regenerate after adding a crate or
+          # a dependency edge: topologically sort the `aidaemon-*` packages of
+          #   cargo metadata --format-version 1 --no-deps
+          # over their non-dev dependencies, and add the crate to the
+          # sdk-docs and msrv lists in ci.yml.
+          SDK_CRATES=(
+            aidaemon-macros
+            aidaemon-core
+            aidaemon-agents
+            aidaemon-channels
+            aidaemon-decisions
+            aidaemon-eval
+            aidaemon-mcp
+            aidaemon-policies
+            aidaemon-providers
+            aidaemon-store-sqlite
+            aidaemon-tools
+            aidaemon-channel-discord
+            aidaemon-channel-slack
+            aidaemon-channel-telegram
+            aidaemon-events
+            aidaemon-memory
+            aidaemon-work
+            aidaemon-sdk
+          )
+          WORKSPACE_VERSION="${{ steps.sdk_gate.outputs.version }}"
+          for crate in "${SDK_CRATES[@]}"; do
+            if already_published "$crate" "$WORKSPACE_VERSION"; then
+              echo "$crate $WORKSPACE_VERSION is already on crates.io; skipping."
+              continue
+            fi
+            publish_package "$crate" "$WORKSPACE_VERSION"
+          done
+
           publish_package "aidaemon" "${{ steps.release_meta.outputs.crate_version }}"
 
   update-homebrew:

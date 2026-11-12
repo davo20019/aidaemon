@@ -1,11 +1,20 @@
 [package]
 name = "aidaemon-channel-telegram"
-version = "0.0.1"
-edition = "2021"
-license = "MIT"
-description = "aidaemon SDK: telegram channel adapter (experimental)"
-repository = "https://github.com/davo20019/aidaemon"
-homepage = "https://aidaemon.ai/"
+description = "Telegram adapter for aidaemon channels; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-channel-telegram"
+readme = "README.md"
+keywords = ["telegram", "bot", "agent", "chat", "llm"]
+categories = ["asynchronous", "network-programming"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
 publish = false
 
 [features]
@@ -13,7 +22,7 @@ publish = false
 webhook = ["dep:axum", "dep:rand", "tokio/net"]
 
 [dependencies]
-aidaemon-channels = { path = "../aidaemon-channels", features = ["http"] }
+aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels", features = ["http"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 rand = { version = "0.8", optional = true }
 async-trait = "0.1"
