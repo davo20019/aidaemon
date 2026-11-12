@@ -6284,7 +6284,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert!(notification_message.contains("will retry automatically"));
+        assert!(notification_message.contains("will try again on its own"));
         let intention_status =
             sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
                 .bind(&intention.id)
@@ -6357,7 +6357,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notification.0, "mandate_review_failed");
-        assert!(notification.1.contains("(decision missing)"));
+        assert!(notification
+            .1
+            .contains("interrupted before it decided anything"));
         assert!(notification.1.contains("Nothing was done"));
         assert!(!notification.1.contains("check the account"));
     }

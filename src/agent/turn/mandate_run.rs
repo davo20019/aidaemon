@@ -160,13 +160,25 @@ fn mandate_input_token_reservation(estimated_input_tokens: u32) -> i64 {
         + MANDATE_INPUT_RESERVATION_FIXED_TOKENS
 }
 
+/// The most output one mandate model call may ask for, however much of the
+/// cycle's balance is left. The balance bounds what a call may spend; it is
+/// not a request size. Sent as the call's output cap, a whole cycle's balance
+/// (hundreds of thousands of tokens) exceeds every model's output limit, and
+/// the provider rejects the request before it runs. Every model the daemon
+/// talks to accepts this many.
+const MANDATE_MAX_OUTPUT_TOKENS_PER_CALL: u32 = 8_192;
+
 pub(in crate::agent) fn mandate_output_token_ceiling(
     remaining: i64,
     estimated_input_tokens: u32,
 ) -> Option<u32> {
     let available =
         remaining.saturating_sub(mandate_input_token_reservation(estimated_input_tokens));
-    (available > 0).then(|| u32::try_from(available).unwrap_or(u32::MAX))
+    (available > 0).then(|| {
+        u32::try_from(available)
+            .unwrap_or(u32::MAX)
+            .min(MANDATE_MAX_OUTPUT_TOKENS_PER_CALL)
+    })
 }
 
 pub(in crate::agent) async fn committed_non_action_mandate_summary(
@@ -369,5 +381,20 @@ mod tests {
         assert_eq!(mandate_output_token_ceiling(2_000, 1_000), Some(238));
         assert_eq!(mandate_output_token_ceiling(1_762, 1_000), None);
         assert_eq!(mandate_output_token_ceiling(1_700, 1_000), None);
+    }
+
+    /// A fresh cycle's balance bounds what a call may spend; it is never sent
+    /// as the call's output cap (a 250k cap was rejected by a model whose
+    /// output limit is 128k, and the review never ran).
+    #[test]
+    fn a_large_balance_never_becomes_an_oversized_output_cap() {
+        assert_eq!(
+            mandate_output_token_ceiling(250_000, 2_000),
+            Some(MANDATE_MAX_OUTPUT_TOKENS_PER_CALL)
+        );
+        assert_eq!(
+            mandate_output_token_ceiling(i64::MAX, 0),
+            Some(MANDATE_MAX_OUTPUT_TOKENS_PER_CALL)
+        );
     }
 }

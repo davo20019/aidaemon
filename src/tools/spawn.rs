@@ -774,7 +774,7 @@ impl Tool for SpawnAgentTool {
                     "access": {
                         "type": "string",
                         "enum": ["read_only", "write"],
-                        "description": "Optional: read_only stops the child changing anything. It can never exceed your own access."
+                        "description": "Optional: read_only lets the child only observe: every call that could change something is refused, including any command that runs a program or script (python, node, a build). Leave it out when the task runs code or changes files. It can never exceed your own access."
                     },
                     "scope": {
                         "type": "array",
@@ -2081,6 +2081,8 @@ mod child_runtime_tests {
         salvage_lookups: StdMutex<Vec<String>>,
         /// What each spawn declared about its child.
         declarations: StdMutex<Vec<crate::agent::authority::ChildDeclaration>>,
+        /// The authority each child was started with.
+        authorities: StdMutex<Vec<Option<aidaemon_core::Authority>>>,
     }
 
     impl ScriptedChild {
@@ -2097,6 +2099,7 @@ mod child_runtime_tests {
                 fails_in_setup: std::sync::atomic::AtomicBool::new(false),
                 declarations: StdMutex::new(Vec::new()),
                 salvage_lookups: StdMutex::new(Vec::new()),
+                authorities: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -2130,6 +2133,12 @@ mod child_runtime_tests {
                 anyhow::bail!("synthetic setup failure");
             }
             crate::agent::authority::mark_child_began();
+            self.authorities.lock().unwrap().push(
+                request
+                    .parent_authority
+                    .as_ref()
+                    .map(|parent| parent.authority.clone()),
+            );
             if let Some(declaration) = request
                 .parent_authority
                 .as_ref()
@@ -2871,6 +2880,89 @@ mod child_runtime_tests {
         })
         .await
         .expect("a notification arrives")
+    }
+
+    fn facts_with_authority(authority: aidaemon_core::Authority) -> ToolCallContext {
+        let mut call_facts = facts();
+        call_facts.user_role = Some(UserRole::Owner);
+        call_facts
+            .extensions
+            .insert(crate::agent::authority::InheritedAuthority {
+                authority,
+                owner_level: None,
+                task_access: None,
+                mode_session: None,
+                untrusted_context: false,
+                origin_request: None,
+                origin_trusted: true,
+                trusted_roots: Vec::new(),
+                declined: Vec::new(),
+                shared_declines: None,
+                learning: None,
+                spawn_family: None,
+                child_declaration: None,
+                parent_run: None,
+                known_resources: Default::default(),
+                lineage: Vec::new(),
+                parent_task: None,
+            });
+        call_facts
+    }
+
+    /// A child, background or not, starts with its parent turn's authority
+    /// and never more: a full-access parent's child may run a command that
+    /// changes things, a read-only parent's child may not, and a parent can
+    /// narrow its child further with `access`.
+    #[tokio::test]
+    async fn a_child_runs_with_its_parent_turns_authority_foreground_or_background() {
+        use aidaemon_core::{Authority, ToolAnnotations};
+        let command = ToolAnnotations::WRITE;
+        let cases = [
+            (Authority::full(), json!({}), true),
+            (Authority::read_only(), json!({}), false),
+            (Authority::full(), json!({"access": "read_only"}), false),
+        ];
+        for background in [false, true] {
+            for (parent, extra, allowed) in cases.clone() {
+                let child = ScriptedChild::new("done", Duration::ZERO);
+                let store = notification_store().await;
+                let state: Arc<dyn StateStore> = store.clone();
+                let tool = tool_for(&child).with_state(state);
+                let mut args = json!({
+                    "mission": "Run a command",
+                    "task": "Run one shell command.",
+                    "tools": ["terminal"],
+                    "background": background,
+                });
+                for (key, value) in extra.as_object().unwrap() {
+                    args[key] = value.clone();
+                }
+                tool.call_with_execution_context(
+                    &args.to_string(),
+                    None,
+                    facts_with_authority(parent.clone()),
+                )
+                .await
+                .unwrap();
+                let given = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Some(given) = child.authorities.lock().unwrap().first().cloned() {
+                            return given;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the child starts")
+                .expect("the child carries its parent's authority");
+                assert_eq!(
+                    given.permits("terminal", command).is_ok(),
+                    allowed,
+                    "background={background} parent={parent:?} extra={extra} given={given:?}"
+                );
+                assert_eq!(given.level, parent.level.min(given.level));
+            }
+        }
     }
 
     #[tokio::test]

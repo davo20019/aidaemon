@@ -501,6 +501,7 @@ pub fn aidaemon_core::Authority::permits(&self, &str, aidaemon_core::ToolAnnotat
 pub fn aidaemon_core::Authority::read_only() -> Self
 pub struct aidaemon_core::AuthorityHook
 impl aidaemon_core::AuthorityHook
+pub fn aidaemon_core::AuthorityHook::delegated(self) -> Self
 pub fn aidaemon_core::AuthorityHook::new(aidaemon_core::Authority) -> Self
 pub fn aidaemon_core::AuthorityHook::with_ceiling(self, alloc::sync::Arc<dyn aidaemon_core::AuthorityCeiling>) -> Self
 impl aidaemon_core::Hook for aidaemon_core::AuthorityHook
