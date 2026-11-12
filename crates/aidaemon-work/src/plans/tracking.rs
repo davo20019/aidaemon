@@ -103,7 +103,7 @@ impl StepTracker {
             plan_id = %plan.id,
             step = current_idx,
             tool = tool_name,
-            result = %crate::utils::truncate_str(result_summary, 120),
+            result = %aidaemon_events::text::truncate_str(result_summary, 120),
             "Recorded successful tool evidence without inferring plan completion"
         );
         Ok(Some((plan, false)))

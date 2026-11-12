@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 
 use crate::traits::{
     Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,
-    MandateMutationQuotaState, MandateObjectiveControl, MandateObjectiveMeasurement,
-    MandateStrategyRevisionKind, StateStore,
+    MandateMutationQuotaState, MandateObjectiveControl, MandateObjectiveMeasurement, MandateStore,
+    MandateStrategyRevisionKind,
 };
 
 const MAX_DECISIONS: i64 = 5;
@@ -33,8 +33,8 @@ struct HistoryRecord {
 /// policy. It is passed in (never re-read here) so the derived
 /// `next_measurement_due` cannot disagree with the immutable policy the
 /// worker was fenced with.
-pub(crate) async fn build_mandate_history_block(
-    state: &dyn StateStore,
+pub async fn build_mandate_history_block(
+    state: &(impl MandateStore + ?Sized),
     mandate_id: &str,
     as_of: &str,
     objective_control: Option<&MandateObjectiveControl>,

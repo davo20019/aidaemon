@@ -9,16 +9,17 @@
 
 pub mod detection;
 mod store;
+#[allow(dead_code)]
 mod tracking;
 
-pub use store::PlanStore;
+pub use store::{migrate_task_plans, PlanStore};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::traits::ToolMutationEffects;
-use crate::utils::truncate_str;
+use aidaemon_events::text::truncate_str;
 
 /// A persistent multi-step task plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +121,7 @@ impl TaskPlan {
 
     /// Keep the user-facing execution pointer aligned with checklist state.
     /// While work remains, exactly one pending step is promoted to in-progress.
-    pub(crate) fn sync_active_step(&mut self) {
+    pub fn sync_active_step(&mut self) {
         if let Some(index) = self
             .steps
             .iter()
@@ -214,8 +215,8 @@ impl TaskPlan {
             .collect())
     }
 
-    fn step_graph(&self) -> Result<crate::execution_graph::ExecutionGraph, String> {
-        use crate::execution_graph::{
+    fn step_graph(&self) -> Result<aidaemon_events::execution_graph::ExecutionGraph, String> {
+        use aidaemon_events::execution_graph::{
             ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
         };
 
@@ -559,6 +560,7 @@ impl PlanStatus {
         (*self).into()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }
@@ -606,6 +608,7 @@ impl StepStatus {
         (*self).into()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }

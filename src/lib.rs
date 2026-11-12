@@ -10,7 +10,7 @@ mod config;
 mod context_budget;
 mod conversation;
 mod core;
-mod cron_utils;
+use aidaemon_work::schedule as cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
@@ -25,26 +25,34 @@ pub use events::{
 pub(crate) mod execution;
 pub(crate) use aidaemon_events::execution_graph;
 mod execution_policy;
-mod goal_tokens;
+use aidaemon_work::goal_tokens;
 pub mod harness_eval;
 mod health;
 mod heartbeat;
 mod llm_markers;
 mod llm_runtime;
 mod logging;
-mod mandates;
+mod mandates {
+    //! The mandate policy lives in `aidaemon_work::mandates`.
+    #[allow(unused_imports)]
+    pub(crate) use aidaemon_work::mandates::{history, policy::*};
+    #[allow(unused_imports)]
+    pub use aidaemon_work::MANDATE_PROTOCOL_TOOLS;
+    #[allow(unused_imports)]
+    pub(crate) use aidaemon_work::{admissibility, authority};
+}
 mod mcp;
 mod memory;
 mod message_content;
 pub mod nodes;
 mod oauth;
-#[allow(dead_code)]
-mod plans;
+#[allow(unused_imports)]
+use aidaemon_work::plans;
 mod project_instructions;
 mod providers;
 mod queue_policy;
 mod queue_telemetry;
-mod reminders;
+use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;
 pub(crate) use aidaemon_events::session;

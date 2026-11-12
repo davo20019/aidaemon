@@ -1,12 +1,5 @@
 //! Owner-authorized autonomous mandate policy.
 
-pub(crate) mod history;
-
-#[allow(unused_imports)]
-pub use aidaemon_work::MANDATE_PROTOCOL_TOOLS;
-#[allow(unused_imports)]
-pub(crate) use aidaemon_work::{admissibility, authority};
-
 use serde_json::Value;
 
 use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
@@ -14,13 +7,13 @@ use crate::traits::{MandateAuthority, ToolCallEffect, ToolCallSemantics};
 /// Whether the tool named `tool_name` is on the list a mandate never
 /// delegates. Where the tool itself is at hand, use [`is_non_delegable`],
 /// which also covers tools that declare opaque execution (MCP servers).
-pub(crate) fn is_non_delegable_tool(tool_name: &str) -> bool {
+pub fn is_non_delegable_tool(tool_name: &str) -> bool {
     MandateAuthority::NON_DELEGABLE_TOOLS.contains(&tool_name)
 }
 
 /// Whether a mandate may never delegate `tool`: a listed tool, or one whose
 /// calls run inside an opaque process (`ToolDispatchFacts::opaque_execution`).
-pub(crate) fn is_non_delegable(tool: &dyn crate::traits::Tool) -> bool {
+pub fn is_non_delegable(tool: &dyn aidaemon_tools::OutcomeTool) -> bool {
     tool.dispatch_facts().opaque_execution || is_non_delegable_tool(tool.name())
 }
 
@@ -30,11 +23,11 @@ const VERIFIER_STRATEGY_CHARS: usize = 2_000;
 /// The owner's request for a mandate run, as the untrusted-call verifier reads
 /// it. Built only from the owner-confirmed policy row: the runtime's task text
 /// authorizes nothing, and late owner guidance never widens a mandate.
-pub(crate) fn verifier_request(mandate: &crate::traits::Mandate) -> String {
+pub fn verifier_request(mandate: &crate::traits::Mandate) -> String {
     let strategy = mandate.strategy.as_ref().map(|strategy| {
         serde_json::json!({
             "description": strategy.description,
-            "body": crate::utils::truncate_str(&strategy.body, VERIFIER_STRATEGY_CHARS),
+            "body": aidaemon_events::text::truncate_str(&strategy.body, VERIFIER_STRATEGY_CHARS),
         })
     });
     let statement = serde_json::json!({
@@ -60,7 +53,7 @@ pub(crate) fn verifier_request(mandate: &crate::traits::Mandate) -> String {
 /// mixed context. This is the sole controller-context field allowed into a
 /// mandate child prompt. Keep both entry count and aggregate prompt size
 /// bounded even if older data predates the write-side limits.
-pub(crate) fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> {
+pub fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> {
     const MAX_ENTRIES: usize = 10;
     const MAX_ENTRY_TEXT: usize = 1_024;
     const MAX_TOTAL_TEXT: usize = 8 * 1_024;
@@ -115,14 +108,14 @@ pub(crate) fn bounded_owner_guidance(goal_context: Option<&str>) -> Vec<String> 
 /// consumed by the call classifier, the tool's call semantics, and the
 /// role-gate invariant test: a deliberator-reserved action that is not listed
 /// here is unreachable inside a mandate run.
-pub(crate) const DELIBERATOR_PROTOCOL_ACTIONS: &[(&str, MandateCallClass)] = &[
+pub const DELIBERATOR_PROTOCOL_ACTIONS: &[(&str, MandateCallClass)] = &[
     ("record_decision", MandateCallClass::RecordDecision),
     ("record_measurement", MandateCallClass::RecordMeasurement),
 ];
 
 /// Kernel class for a deliberator-reserved `manage_mandates` action, or
 /// `None` when the action is not part of the deliberator protocol.
-pub(crate) fn deliberator_protocol_class(action: &str) -> Option<MandateCallClass> {
+pub fn deliberator_protocol_class(action: &str) -> Option<MandateCallClass> {
     DELIBERATOR_PROTOCOL_ACTIONS
         .iter()
         .find(|(name, _)| *name == action)
@@ -133,7 +126,7 @@ pub(crate) fn deliberator_protocol_class(action: &str) -> Option<MandateCallClas
 /// resolved goal. These are exact protocol names/actions, never language
 /// inference. Only governed mutations receive an action-budgeted grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MandateCallClass {
+pub enum MandateCallClass {
     /// Read-only controller protocol state, available without broad read
     /// authority (currently only the current run's task list).
     ProtocolObservation,
@@ -155,7 +148,7 @@ pub(crate) enum MandateCallClass {
     Deny,
 }
 
-pub(crate) fn classify_mandate_call(
+pub fn classify_mandate_call(
     tool_name: &str,
     arguments: &str,
     semantics: &ToolCallSemantics,
@@ -233,7 +226,7 @@ pub(crate) fn classify_mandate_call(
 /// visibility. The task lead may observe, commit the decision, and orchestrate
 /// exact children; only a non-root executor may consume a mutation grant. An
 /// executor has one control-plane escape hatch: reporting its own blocker.
-pub(crate) fn role_allows_mandate_call(
+pub fn role_allows_mandate_call(
     class: MandateCallClass,
     tool_name: &str,
     is_task_lead: bool,
@@ -258,7 +251,7 @@ pub(crate) fn role_allows_mandate_call(
 /// The next step a refused mandate call can actually take, by typed denial
 /// reason and role. One generic hint told an executor to record an ACT it
 /// cannot record, and told a run whose fence was gone to keep trying.
-pub(crate) fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'static str {
+pub fn mandate_denial_next_step(reason: &str, is_task_lead: bool) -> &'static str {
     match reason {
         "mandate_record_missing"
         | "mandate_inactive"

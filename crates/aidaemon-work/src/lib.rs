@@ -3,8 +3,12 @@
 
 pub mod admissibility;
 pub mod authority;
+pub mod goal_tokens;
 pub mod goals;
 pub mod mandates;
+pub mod plans;
+pub mod reminders;
+pub mod schedule;
 pub mod schema;
 pub mod sqlite;
 pub mod stores;

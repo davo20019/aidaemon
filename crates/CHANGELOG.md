@@ -31,6 +31,7 @@ stability promise.
 - New crate `aidaemon-tool-browser` (Phase 9.4): the daemon's `browser` tool behind the `chromium` feature, with `BrowserSettings` and `SessionIsolation` always available. Name, description and schema unchanged (daemon golden).
 - Phase 9.4: `aidaemon-tools` gains the daemon's `system_info`, `git_info`, `git_commit`, `project_inspect` and `service_status` tools (modules of the same names). Schemas unchanged (daemon goldens).
 - Phase 9.0: the daemon's shared contract types and store traits moved into the crates that own them: approval vocabulary, `status::StatusUpdate`, `TerminalConfinement`, `NothingSentError` and the CLI-agent store into `aidaemon-tools`; `specialist::SpecialistKind` into `aidaemon-agents`; the message, dialogue, summary and prompt-snapshot stores into `aidaemon-events::stores`; `triggers::TriggerEvent` and the work-only composite stores into `aidaemon-work`; `registry` into `aidaemon-mcp`; internal `context` and `hub` modules into `aidaemon-channels`; `skills` into `aidaemon-memory`. Serde shapes unchanged.
+- Phase 9.3: `aidaemon-work` holds the work domain's logic: `plans` (task plans, their store and the `task_plans` migration), `mandates::policy` and `mandates::history`, `reminders`, `schedule` (cron parsing and next-run times) and `goal_tokens` (goal cancellation and daily budget overrides). Tables unchanged.
 
 ## [0.1.0]: first release (not yet published)
 

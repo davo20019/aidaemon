@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use serde::{Deserialize, Serialize};
 
-use crate::traits::{Goal, ScheduledRunHealth, SettingsStore};
+use crate::traits::{Goal, ScheduledRunHealth};
+use aidaemon_tools::services::SettingsStore;
 
 const DAILY_BUDGET_OVERRIDE_PREFIX: &str = "goal_daily_budget_override:";
 
@@ -142,6 +143,12 @@ impl Drop for GoalRunGuard {
         if let Ok(mut runs) = self.registry.active_runs.lock() {
             runs.remove(&self.goal_id);
         }
+    }
+}
+
+impl Default for GoalTokenRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
