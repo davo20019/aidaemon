@@ -364,7 +364,12 @@ impl DaemonMemory {
 
 /// The daemon store's extraction, summarization and learning pipelines.
 impl MemoryWrites for DaemonMemoryInner {
-    fn extract_facts(&self, turn: &MemoryTurn, reply: &str) {
+    fn extract_facts(
+        &self,
+        turn: &MemoryTurn,
+        reply: &str,
+        run_started_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let snapshot = self.llm_runtime.snapshot();
         crate::memory::progressive::spawn_progressive_extraction(
             self.side_calls.clone(),
@@ -378,6 +383,7 @@ impl MemoryWrites for DaemonMemoryInner {
             turn.channel_ctx.channel_id.clone(),
             turn.channel_ctx.visibility,
             turn.user_role,
+            run_started_at,
         );
     }
 

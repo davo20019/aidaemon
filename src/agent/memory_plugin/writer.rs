@@ -13,7 +13,14 @@ use crate::events::TaskStatus;
 /// are testable without spawning extraction.
 pub(crate) trait MemoryWrites: Send + Sync {
     /// Progressive fact extraction from the user text and the final reply.
-    fn extract_facts(&self, turn: &MemoryTurn, reply: &str);
+    /// Facts the agent stored itself since `run_started_at` are not
+    /// extracted a second time.
+    fn extract_facts(
+        &self,
+        turn: &MemoryTurn,
+        reply: &str,
+        run_started_at: chrono::DateTime<chrono::Utc>,
+    );
     /// Incremental conversation summarization.
     fn summarize(&self, turn: &MemoryTurn);
     /// Post-task learning (procedures, expertise, failure patterns).
@@ -36,6 +43,10 @@ pub(crate) struct DaemonMemoryWriter {
     turn: MemoryTurn,
     settings: WriterSettings,
     writes: Arc<dyn MemoryWrites>,
+    /// When the run began: the writer is built as the run is assembled,
+    /// before any tool call, so every memory write the run makes is at or
+    /// after it.
+    run_started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl DaemonMemoryWriter {
@@ -48,6 +59,7 @@ impl DaemonMemoryWriter {
             turn,
             settings,
             writes,
+            run_started_at: chrono::Utc::now(),
         }
     }
 }
@@ -75,7 +87,7 @@ impl sdk::Hook for DaemonMemoryWriter {
             );
             if extract {
                 let reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
-                self.writes.extract_facts(turn, &reply);
+                self.writes.extract_facts(turn, &reply, self.run_started_at);
             }
             if summarize {
                 self.writes.summarize(turn);
@@ -106,6 +118,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Recorded {
         pub(crate) extracted: Vec<String>,
+        /// The run start each extraction was given.
+        pub(crate) extraction_windows: Vec<chrono::DateTime<chrono::Utc>>,
         pub(crate) summarized: usize,
         pub(crate) learned: Vec<LearningContext>,
     }
@@ -114,8 +128,15 @@ pub(crate) mod tests {
     pub(crate) struct RecordingWrites(pub(crate) Mutex<Recorded>);
 
     impl MemoryWrites for RecordingWrites {
-        fn extract_facts(&self, _turn: &MemoryTurn, reply: &str) {
-            self.0.lock().unwrap().extracted.push(reply.to_string());
+        fn extract_facts(
+            &self,
+            _turn: &MemoryTurn,
+            reply: &str,
+            run_started_at: chrono::DateTime<chrono::Utc>,
+        ) {
+            let mut recorded = self.0.lock().unwrap();
+            recorded.extracted.push(reply.to_string());
+            recorded.extraction_windows.push(run_started_at);
         }
         fn summarize(&self, _turn: &MemoryTurn) {
             self.0.lock().unwrap().summarized += 1;
@@ -187,6 +208,23 @@ pub(crate) mod tests {
         }
         agent.run_with_cancel("s", "go", token).await.unwrap();
         writes
+    }
+
+    #[tokio::test]
+    async fn extraction_window_opens_before_the_run_and_closes_after_it() {
+        let built_after = chrono::Utc::now();
+        let turn = turn(0, "telegram:synthetic-user-1").await;
+        let writes = run(
+            ScriptedProvider::new([text("first answer"), text("Saved: teal.")]),
+            turn,
+            false,
+        )
+        .await;
+        let ended_before = chrono::Utc::now();
+        let recorded = writes.0.lock().unwrap();
+        assert_eq!(recorded.extraction_windows.len(), 1);
+        let started = recorded.extraction_windows[0];
+        assert!(built_after <= started && started <= ended_before);
     }
 
     #[tokio::test]

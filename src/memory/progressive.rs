@@ -26,8 +26,9 @@ pub fn spawn_progressive_extraction(
     channel_id: Option<String>,
     visibility: crate::types::ChannelVisibility,
     user_role: UserRole,
+    run_started_at: chrono::DateTime<chrono::Utc>,
 ) {
-    use aidaemon_memory::progressive::{may_extract, Exchange};
+    use aidaemon_memory::progressive::{may_extract, owner_writes_during_run, Exchange};
     tokio::spawn(async move {
         if !may_extract(user_role, visibility) {
             return;
@@ -36,10 +37,14 @@ pub fn spawn_progressive_extraction(
             side_calls.provider(crate::llm_runtime::side_calls::SideCall::ProgressiveExtraction);
         // The side-call gateway picks the model; `fast_model` is not sent.
         let extractor = extractor(provider, &fast_model);
+        // What the agent itself stored during the run, so extraction does
+        // not store the same information a second time.
+        let already_stored = owner_writes_during_run(store.as_ref(), run_started_at).await;
         let exchange = Exchange {
             user_text: &user_text,
             assistant_reply: &assistant_response,
             channel_id: channel_id.as_deref(),
+            already_stored: &already_stored,
         };
         let facts = match extractor.propose(&exchange).await {
             Ok(facts) => facts,
