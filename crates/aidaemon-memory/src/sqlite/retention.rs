@@ -69,21 +69,39 @@ impl MemoryRetention {
         )
         .fetch_all(&self.pool)
         .await?;
-        let mut deleted = 0;
+        let mut dropped = Vec::new();
         for chunk in spans.chunks(500) {
             let sources: Vec<i64> = chunk.iter().map(|(_, source)| *source).collect();
             let kept = messages.retained(&sources).await?;
-            for (span_id, source) in chunk {
-                if kept.contains(source) {
-                    continue;
-                }
-                deleted += sqlx::query("DELETE FROM memory_spans WHERE id = ?")
-                    .bind(span_id)
-                    .execute(&self.pool)
-                    .await?
-                    .rows_affected();
-            }
+            dropped.extend(
+                chunk
+                    .iter()
+                    .filter(|(_, source)| !kept.contains(source))
+                    .map(|(span_id, _)| *span_id),
+            );
         }
+        if dropped.is_empty() {
+            return Ok(0);
+        }
+        // One transaction, a set-based delete per batch of ids. A claim
+        // filed since the scan keeps its span.
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = 0;
+        for ids in dropped.chunks(500) {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM memory_spans WHERE id IN ({placeholders})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
+                   )"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in ids {
+                query = query.bind(id);
+            }
+            deleted += query.execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
         Ok(deleted)
     }
 
@@ -338,5 +356,108 @@ impl MemoryRetention {
         .await?
         .rows_affected();
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A host log that keeps only the listed message ids.
+    struct Keeps(HashSet<i64>);
+
+    #[async_trait::async_trait]
+    impl MessageLog for Keeps {
+        async fn message_bounds(
+            &self,
+            _session_id: &str,
+            _start: chrono::DateTime<Utc>,
+            _end: chrono::DateTime<Utc>,
+        ) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+            Ok((None, None))
+        }
+
+        async fn retained(&self, ids: &[i64]) -> anyhow::Result<HashSet<i64>> {
+            Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| self.0.contains(id))
+                .collect())
+        }
+    }
+
+    async fn span(pool: &SqlitePool, source_event_id: i64) -> i64 {
+        sqlx::query(
+            "INSERT INTO memory_spans
+                (span_kind, source_event_id, content, content_hash, valid_from)
+             VALUES ('message', ?, 'synthetic', ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(source_event_id)
+        .bind(format!("hash-{source_event_id}"))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// Spans of dropped messages go, in batches over the 500-id limit;
+    /// spans of kept messages, and spans backing a claim, stay.
+    #[tokio::test]
+    async fn spans_of_dropped_messages_go_unless_kept_or_claimed() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::sqlite::migrate(&pool).await.unwrap();
+        let mut kept = HashSet::new();
+        let mut expected_left = Vec::new();
+        for event_id in 1..=1200 {
+            let span_id = span(&pool, event_id).await;
+            if event_id % 3 == 0 {
+                kept.insert(event_id);
+                expected_left.push(span_id);
+            }
+        }
+        let claimed = span(&pool, 5000).await;
+        sqlx::query(
+            "INSERT INTO memory_claims
+                (subject, predicate, object, claim_text, source_span_id, provenance, valid_from)
+             VALUES ('owner', 'likes', 'tea', 'owner likes tea', ?, 'test',
+                     '2026-01-01T00:00:00Z')",
+        )
+        .bind(claimed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        expected_left.push(claimed);
+
+        let retention = MemoryRetention::new(
+            pool.clone(),
+            MemoryRetentionPolicy {
+                superseded_facts_days: 0,
+                episodes_days: 0,
+                behavior_patterns_days: 0,
+                procedures_days: 0,
+                error_solutions_days: 0,
+            },
+        )
+        .with_message_log(Arc::new(Keeps(kept)));
+        assert_eq!(
+            retention.cleanup_spans_of_dropped_messages().await.unwrap(),
+            800
+        );
+        let mut left: Vec<i64> = sqlx::query_scalar("SELECT id FROM memory_spans")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        left.sort();
+        expected_left.sort();
+        assert_eq!(left, expected_left);
+        assert_eq!(
+            retention.cleanup_spans_of_dropped_messages().await.unwrap(),
+            0
+        );
     }
 }
