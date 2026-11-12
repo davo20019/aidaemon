@@ -18,7 +18,7 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [features]
-default = ["providers", "tools", "policies", "agents", "sqlite", "macros"]
+default = ["providers", "tools", "policies", "agents", "sqlite", "macros", "memory"]
 macros = ["dep:aidaemon-macros"]
 providers = ["dep:aidaemon-providers"]
 tools = ["dep:aidaemon-tools"]

@@ -4,6 +4,7 @@
 pub use aidaemon_channels::context::{ChannelContext, WorkspaceAccessLevel, WorkspaceGrant};
 pub use aidaemon_channels::hub::{MediaKind, MediaMessage};
 pub use aidaemon_core::ChannelVisibility;
+#[allow(unused_imports)]
 pub use aidaemon_memory::records::FactPrivacy;
 pub use aidaemon_tools::semantics::{
     ApprovalKind, ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel, UserRole,

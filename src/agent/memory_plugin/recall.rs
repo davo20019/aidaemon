@@ -87,6 +87,11 @@ impl RecallHost for DaemonRecallHost {
         Ok(self.state.get_setting("people_enabled").await?.as_deref() == Some("true"))
     }
 
+    /// The daemon's memory guide points at its scheduled goals.
+    fn offers_scheduled_goals(&self) -> bool {
+        true
+    }
+
     fn relevance_enabled(&self) -> bool {
         use crate::llm_runtime::decisions::Decision;
         self.side_calls.decision_mode(Decision::RecallFilter) != crate::config::DecisionMode::Off

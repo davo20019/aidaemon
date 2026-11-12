@@ -4,10 +4,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{
-    ApprovalCall, Fact, FactStore, OwnerApprovalNeed, Tool, ToolCallContext, ToolCapabilities,
+use aidaemon_tools::semantics::{
+    ApprovalCall, OwnerApprovalNeed, ToolCallContext, ToolCapabilities,
 };
-use crate::types::FactPrivacy;
+use aidaemon_tools::OutcomeTool as Tool;
+
+use crate::records::{Fact, FactPrivacy};
+use crate::stores::FactStore;
 
 pub struct ShareMemoryTool {
     state: Arc<dyn FactStore>,
@@ -16,14 +19,6 @@ pub struct ShareMemoryTool {
 impl ShareMemoryTool {
     pub fn new(state: Arc<dyn FactStore>) -> Self {
         Self { state }
-    }
-
-    /// A tool over one synthetic, channel-private fact (id 1), for tests.
-    #[cfg(test)]
-    pub(crate) fn with_synthetic_fact(category: &str, key: &str, value: &str) -> Self {
-        Self::new(Arc::new(test_support::SyntheticFacts::with(
-            category, key, value,
-        )))
     }
 
     /// The active fact a call names, if any.
@@ -43,7 +38,7 @@ impl ShareMemoryTool {
                 "Share memory globally: [{}] {} = \"{}\"",
                 args.category,
                 args.key,
-                crate::utils::truncate_str(&fact.value, 83)
+                crate::text::truncate_chars(&fact.value, 83)
             ),
             subject: json!({"category": args.category, "key": args.key}).to_string(),
             risk: aidaemon_core::ApprovalRisk::High,
@@ -93,13 +88,13 @@ impl Tool for ShareMemoryTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let facts = facts.clone();
 
         self.run(arguments, &facts)
             .await
-            .map(crate::traits::ToolCallOutcome::from_output)
+            .map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
@@ -107,11 +102,7 @@ impl ShareMemoryTool {
     /// Run one call with the dispatcher's facts (`call`). The kernel asked
     /// the owner before this runs; a call that reaches the share without the
     /// kernel's judgment is refused.
-    pub(crate) async fn run(
-        &self,
-        arguments: &str,
-        call: &ToolCallContext,
-    ) -> anyhow::Result<String> {
+    pub async fn run(&self, arguments: &str, call: &ToolCallContext) -> anyhow::Result<String> {
         let args: ShareArgs = serde_json::from_str(arguments)?;
 
         match self.find_fact(&args).await? {
@@ -139,7 +130,7 @@ impl ShareMemoryTool {
 }
 
 #[async_trait]
-impl crate::traits::ToolSemantics for ShareMemoryTool {
+impl aidaemon_tools::semantics::ToolSemantics for ShareMemoryTool {
     /// Sharing an existing fact asks the owner, whatever the session. A call
     /// that names no active fact (or cannot be read) changes nothing and
     /// needs no card.
@@ -279,8 +270,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::SyntheticFacts;
     use super::*;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
+    use crate::full::tools::test_support::ToolCalls as _;
+    use aidaemon_tools::semantics::ToolSemantics;
 
     fn tool() -> (Arc<SyntheticFacts>, ShareMemoryTool) {
         let facts = Arc::new(SyntheticFacts::with(
@@ -345,7 +336,7 @@ mod tests {
             .run(
                 args,
                 &ToolCallContext {
-                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
+                    kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Call),
                     ..Default::default()
                 },
             )

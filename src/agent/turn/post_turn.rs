@@ -14,33 +14,14 @@ pub(in crate::agent) fn spawn_learning(
     });
 }
 
-/// Decide whether ordinary conversational memory maintenance may run after a
-/// completed turn. Mandate workers have their own bounded, typed continuity;
-/// allowing either background path here would both leak mandate content into
-/// global owner memory and make unmetered provider calls outside the durable
-/// per-run token lease.
-///
-/// Worker sessions (specialists, sub-agents, background jobs) keep their
-/// session-local summaries but never extract owner facts: their "user" turn
-/// is a delegated brief, so every scheduled run would re-learn its own
-/// instructions as durable memory. Consolidation and retention already treat
-/// these sessions as memory-isolated.
-pub(in crate::agent) fn post_completion_memory_plan(
-    mandate_execution: bool,
-    memory_isolated_session: bool,
-    memory_pipeline_allowed: bool,
-    progressive_facts_enabled: bool,
-    fact_extraction_eligible: bool,
-    summarization_enabled: bool,
-) -> (bool, bool) {
-    if mandate_execution || !memory_pipeline_allowed {
-        return (false, false);
-    }
-    (
-        !memory_isolated_session && progressive_facts_enabled && fact_extraction_eligible,
-        summarization_enabled,
-    )
-}
+/// Whether ordinary conversational memory maintenance may run after a
+/// completed turn: the full memory system's plan
+/// ([`aidaemon_memory::full::writer::post_completion_plan`]). Mandate workers
+/// get neither (their bounded continuity is their own, and background calls
+/// would run outside the run's token lease); worker sessions keep summaries
+/// but never extract owner facts.
+#[cfg(test)]
+pub(in crate::agent) use aidaemon_memory::full::writer::post_completion_plan as post_completion_memory_plan;
 
 #[cfg(test)]
 mod gate_telemetry_tests {

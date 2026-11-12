@@ -1768,11 +1768,29 @@ mod tests {
     #[tokio::test]
     async fn share_memory_asks_before_widening_a_memory() {
         use crate::traits::ToolSemantics;
-        let tool = Arc::new(crate::tools::ShareMemoryTool::with_synthetic_fact(
-            "preference",
-            "report_format",
-            "short summaries for Jordan Lee",
+        use aidaemon_memory::stores::FactStore as _;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        aidaemon_memory::sqlite::migrate(&pool).await.unwrap();
+        let facts = Arc::new(aidaemon_memory::sqlite::SqliteMemory::new(
+            pool,
+            Arc::new(aidaemon_memory::HashEmbedder::new(384)),
         ));
+        facts
+            .upsert_fact(
+                "preference",
+                "report_format",
+                "short summaries for Jordan Lee",
+                "owner",
+                Some("telegram:synthetic-channel-1"),
+                crate::types::FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+        let tool = Arc::new(crate::tools::ShareMemoryTool::new(facts));
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 tools: ApprovalTools::new([tool.clone() as Arc<dyn crate::traits::Tool>]),

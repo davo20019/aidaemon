@@ -4,7 +4,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tracing::warn;
 
 use crate::events::TaskOutcome;
 
@@ -32,80 +31,38 @@ pub(crate) struct LearningContext {
     pub(super) task_outcome: Option<TaskOutcome>,
 }
 
-impl LearningContext {}
+impl LearningContext {
+    /// What the full memory system learns from: this run, with the first
+    /// error stripped of the daemon's scaffolding lines.
+    pub(crate) fn into_run_learning(self) -> aidaemon_memory::full::writer::RunLearning {
+        aidaemon_memory::full::writer::RunLearning {
+            user_text: self.user_text,
+            persistence_allowed: self.memory_persistence_allowed,
+            intent_domains: self.intent_domains,
+            tool_calls: self.tool_calls,
+            errors: self.errors,
+            first_error: self.first_error.map(|error| {
+                error
+                    .lines()
+                    .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            recovery_actions: self.recovery_actions,
+            completed_naturally: self.completed_naturally,
+            explicit_positive_signals: self.explicit_positive_signals,
+            explicit_negative_signals: self.explicit_negative_signals,
+            succeeded: self.task_outcome.map(|outcome| outcome.task_success()),
+        }
+    }
+}
 
 /// Process learning from a completed task - runs in background.
 pub(super) async fn process_learning(
     state: &Arc<dyn aidaemon_memory::stores::MemoryStores>,
     ctx: LearningContext,
 ) -> anyhow::Result<()> {
-    use crate::memory::procedures;
-
-    if !ctx.memory_persistence_allowed {
-        return Ok(());
-    }
-
-    let task_success = if let Some(outcome) = ctx.task_outcome {
-        outcome.task_success()
-    } else if ctx.explicit_negative_signals > 0 {
-        false
-    } else if ctx.explicit_positive_signals > 0 {
-        true
-    } else {
-        let unrecovered_errors = ctx
-            .errors
-            .iter()
-            .filter(|(_, recovered)| !recovered)
-            .count();
-        ctx.completed_naturally && unrecovered_errors == 0
-    };
-
-    // 1. Update expertise for detected domains
-    let domains = aidaemon_memory::detect_domains(&ctx.intent_domains);
-    for domain in &domains {
-        let error = if !task_success {
-            ctx.errors.first().map(|(e, _)| e.as_str())
-        } else {
-            None
-        };
-        if let Err(e) = state.increment_expertise(domain, task_success, error).await {
-            warn!(domain = %domain, error = %e, "Failed to update expertise");
-        }
-    }
-
-    // 2. Save procedure evidence for both successful and failed workflows.
-    // This lets us accumulate failure_count for repeated bad paths.
-    if ctx.tool_calls.len() >= 2 {
-        let generalized = procedures::generalize_procedure(&ctx.tool_calls);
-        let base_name = procedures::procedure_base_name(&generalized);
-        let keyed_name = procedures::generate_procedure_keyed_name(&base_name, &generalized);
-        let procedure = procedures::create_procedure_with_outcome(
-            keyed_name,
-            procedures::extract_trigger_pattern(&ctx.user_text),
-            generalized,
-            task_success,
-        );
-        if let Err(e) = state.upsert_procedure(&procedure).await {
-            warn!(procedure = %procedure.name, error = %e, "Failed to save procedure");
-        }
-    }
-
-    // 3. Learn error-solution if error was recovered
-    if let Some(error) = ctx.first_error.clone() {
-        if !ctx.recovery_actions.is_empty() {
-            let solution = procedures::create_error_solution(
-                procedures::extract_error_pattern(&error),
-                domains.into_iter().next(),
-                procedures::summarize_solution(&ctx.recovery_actions),
-                Some(ctx.recovery_actions.clone()),
-            );
-            if let Err(e) = state.insert_error_solution(&solution).await {
-                warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
-            }
-        }
-    }
-
-    Ok(())
+    aidaemon_memory::full::writer::learn_from_run(state.as_ref(), ctx.into_run_learning()).await
 }
 
 /// Classify the stall cause from recent errors for actionable guidance.

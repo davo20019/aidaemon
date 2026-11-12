@@ -73,6 +73,12 @@ pub trait RecallHost: Send + Sync {
     /// Whether people intelligence is on.
     async fn people_enabled(&self) -> anyhow::Result<bool>;
 
+    /// The host offers a `scheduled_goals` tool for scheduled goals and
+    /// reminders, so the memory guide may point at it.
+    fn offers_scheduled_goals(&self) -> bool {
+        false
+    }
+
     /// Whether [`RecallHost::relevance`] is used at all.
     fn relevance_enabled(&self) -> bool {
         false
@@ -422,6 +428,7 @@ impl FullRecall {
             people: &people,
             current_person: current_person.as_ref(),
             current_person_facts: &current_person_facts,
+            scheduled_goals_tool: self.host.offers_scheduled_goals(),
         };
         let report = render_memory_section(&memory_context, source.settings.max_facts);
         if let Err(error) = store

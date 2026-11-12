@@ -32,7 +32,6 @@ pub(crate) use opt_out::{
     SkipLearningTool, OPTED_OUT_REASON,
 };
 pub(crate) use recall::DaemonRecall;
-#[cfg_attr(not(feature = "sdk-memory"), allow(unused_imports))]
 pub(crate) use system_memory::SystemMemory;
 pub(in crate::agent) use tool_facts::{
     memory_tool_facts, modeled_memory_tools, register_memory_system_tool,
@@ -320,6 +319,8 @@ pub(crate) async fn configured_memory(
 /// [`MemoryInjection`]: aidaemon_policies::MemoryInjection
 pub(crate) struct DaemonMemory {
     inner: Arc<DaemonMemoryInner>,
+    /// The full memory system as the daemon serves it.
+    served: SystemMemory,
 }
 
 pub(crate) struct DaemonMemoryInner {
@@ -334,8 +335,6 @@ pub(crate) struct DaemonMemoryInner {
     /// The full memory system's recall over `store`.
     #[cfg_attr(not(test), allow(dead_code))]
     recall: Arc<aidaemon_memory::full::RecallSource>,
-    /// The full memory system that serves the daemon's turns.
-    system: aidaemon_memory::full::FullMemory,
 }
 
 impl DaemonMemory {
@@ -360,19 +359,36 @@ impl DaemonMemory {
                 ),
             },
         ));
-        Self {
-            inner: Arc::new(DaemonMemoryInner {
-                system: aidaemon_memory::full::FullMemory::new(recall.clone()),
-                recall,
-                state,
-                store,
-                event_store,
-                llm_runtime,
-                side_calls,
-                context_window_config,
-                record_decision_points,
-            }),
-        }
+        let inner = Arc::new(DaemonMemoryInner {
+            recall: recall.clone(),
+            state,
+            store,
+            event_store,
+            llm_runtime,
+            side_calls,
+            context_window_config,
+            record_decision_points,
+        });
+        let host_inner = inner.clone();
+        let served = SystemMemory::new(Arc::new(aidaemon_memory::full::FullMemory::new(recall)))
+            .with_host_facts(Arc::new(move |turn: &MemoryTurn| {
+                let config = &host_inner.context_window_config;
+                let writer = DaemonMemoryWriter::new(
+                    turn.clone(),
+                    WriterSettings {
+                        progressive_facts: config.progressive_facts,
+                        summarization: false,
+                        learning: false,
+                    },
+                    host_inner.clone(),
+                );
+                aidaemon_policies::HostTurn::new(aidaemon_memory::full::FullTurn {
+                    recall: recall::recall_turn(turn),
+                    host: DaemonRecall::host(&host_inner, turn.clone()),
+                    hooks: vec![Arc::new(writer)],
+                })
+            }));
+        Self { inner, served }
     }
 }
 
@@ -446,35 +462,13 @@ impl DaemonMemory {
 }
 
 /// The daemon's memory is the full memory system (`aidaemon_memory::full`)
-/// served like any other `MemorySystem`: the daemon gives it the turn's
-/// audience, its recall host and its run-end writer.
+/// served like any other `MemorySystem`, through [`SystemMemory`] with the
+/// daemon's facts about each turn: its audience, its recall host and its
+/// run-end writer.
 #[async_trait]
 impl MemoryPlugin for DaemonMemory {
     async fn turn(&self, turn: &MemoryTurn) -> MemoryParts {
-        use aidaemon_policies::MemorySystem as _;
-        let config = &self.inner.context_window_config;
-        let writer = DaemonMemoryWriter::new(
-            turn.clone(),
-            WriterSettings {
-                progressive_facts: config.progressive_facts,
-                summarization: false,
-                learning: false,
-            },
-            self.inner.clone(),
-        );
-        let full = aidaemon_memory::full::FullTurn {
-            recall: recall::recall_turn(turn),
-            host: DaemonRecall::host(&self.inner, turn.clone()),
-            hooks: vec![Arc::new(writer)],
-        };
-        let system_turn =
-            system_memory::host_system_turn(turn, aidaemon_policies::HostTurn::new(full));
-        let parts = self.inner.system.turn(&system_turn).await;
-        MemoryParts {
-            hooks: parts.hooks,
-            tools: parts.tools,
-            ..MemoryParts::default()
-        }
+        self.served.turn(turn).await
     }
 
     fn owned_daemon_tools(&self) -> &'static [&'static str] {

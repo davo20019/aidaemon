@@ -39,6 +39,9 @@ pub struct MemoryContext<'a> {
     pub current_person: Option<&'a Person>,
     /// Facts about the current speaker
     pub current_person_facts: &'a [PersonFact],
+    /// The host offers a `scheduled_goals` tool, so the memory guide points
+    /// at it for scheduled goals and reminders.
+    pub scheduled_goals_tool: bool,
 }
 
 const QUERY_MEMORY_MAX_TOKENS: usize = 600;
@@ -214,9 +217,15 @@ pub fn render_memory_section(memory: &MemoryContext, max_facts: usize) -> Memory
     prompt.push_str(
         "\n\n## Your Memory\n\
          You have persistent memory across sessions. When you need user context, look it up — do not guess:\n\
-         - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n\
-         - Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n\
-         - Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
+         - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n",
+    );
+    if memory.scheduled_goals_tool {
+        prompt.push_str(
+            "- Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n",
+        );
+    }
+    prompt.push_str(
+        "- Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
          - To store new facts: use `remember_fact`\n",
     );
 
@@ -451,5 +460,23 @@ mod tests {
         assert_eq!(report.rendered_fact_ids.len(), QUERY_MEMORY_MAX_FACTS);
         assert!(report.prompt.contains("synthetic relevant value 1"));
         assert!(estimate_tokens(&report.prompt) <= QUERY_MEMORY_MAX_TOKENS);
+    }
+
+    #[test]
+    fn the_memory_guide_names_scheduled_goals_only_when_the_host_offers_them() {
+        let guide = "\n\n## Your Memory\n\
+             You have persistent memory across sessions. When you need user context, look it up — do not guess:\n\
+             - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n\
+             - Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n\
+             - Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
+             - To store new facts: use `remember_fact`\n";
+        let offered = MemoryContext {
+            scheduled_goals_tool: true,
+            ..MemoryContext::default()
+        };
+        assert_eq!(render_memory_section(&offered, 0).prompt, guide);
+        let plain = render_memory_section(&MemoryContext::default(), 0).prompt;
+        assert!(!plain.contains("scheduled_goals"), "{plain}");
+        assert!(plain.contains("`remember_fact`"), "{plain}");
     }
 }

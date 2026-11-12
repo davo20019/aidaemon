@@ -5,16 +5,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::traits::{
-    FactStore, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
-    PersonalMemoryWrite, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
+use aidaemon_tools::semantics::{
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
-use crate::types::FactPrivacy;
+use aidaemon_tools::OutcomeTool as Tool;
+
+use crate::records::{
+    FactPrivacy, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
+    PersonalMemoryWrite,
+};
+use crate::stores::FactStore;
 
 pub struct RememberFactTool {
     state: Arc<dyn FactStore>,
     /// Current channel_id set by the agent before tool execution.
-    pub(crate) current_channel_id: Arc<RwLock<Option<String>>>,
+    pub current_channel_id: Arc<RwLock<Option<String>>>,
 }
 
 impl RememberFactTool {
@@ -68,7 +73,32 @@ fn is_persona_manipulation(category: &str, key: &str, value: &str) -> bool {
     let combined = format!("{} {} {}", category, key, value).replace(['_', '-'], " ");
     PERSONA_PATTERNS
         .iter()
-        .any(|p| crate::agent::keyword_match(&combined, p))
+        .any(|p| contains_words(&combined, p))
+}
+
+/// `keyword` appears in `text` as whole words, ignoring case and the
+/// punctuation around words (apostrophes kept).
+fn contains_words(text: &str, keyword: &str) -> bool {
+    let normalize = |w: &str| -> String {
+        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+            .to_lowercase()
+    };
+    let text_words: Vec<String> = text
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let kw_words: Vec<String> = keyword
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    if kw_words.is_empty() {
+        return false;
+    }
+    text_words
+        .windows(kw_words.len())
+        .any(|window| window == kw_words.as_slice())
 }
 
 /// Empty/whitespace-only values and explicit markers delete the fact.
@@ -85,7 +115,7 @@ fn is_deletion_marker(value: &str) -> bool {
 /// True when this exact call would delete at least one fact. Mirrors the
 /// entry selection in `call`: a non-empty `facts` batch wins, otherwise the
 /// single key/value pair.
-pub(crate) fn call_deletes_facts(arguments: &str) -> bool {
+pub fn call_deletes_facts(arguments: &str) -> bool {
     let Ok(args) = serde_json::from_str::<RememberArgs>(arguments) else {
         return false;
     };
@@ -232,8 +262,8 @@ impl Tool for RememberFactTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        _facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: RememberArgs = serde_json::from_str(arguments)?;
             let channel_id = self.current_channel_id.read().await.clone();
@@ -459,13 +489,13 @@ impl Tool for RememberFactTool {
             Ok(results.join("\n"))
         }
         .await;
-        output.map(crate::traits::ToolCallOutcome::from_output)
+        output.map(aidaemon_tools::semantics::ToolCallOutcome::from_output)
     }
 }
 
-impl crate::traits::ToolSemantics for RememberFactTool {
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
             always_offered: true,
             ..Default::default()
         }
@@ -514,29 +544,13 @@ impl crate::traits::ToolSemantics for RememberFactTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::EmbeddingService;
-    use crate::state::SqliteStateStore;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
+    use crate::full::tools::test_support::{memory, ToolCalls as _};
+    use crate::sqlite::SqliteMemory;
+    use aidaemon_tools::semantics::ToolSemantics;
 
-    async fn setup() -> (
-        RememberFactTool,
-        Arc<SqliteStateStore>,
-        tempfile::NamedTempFile,
-    ) {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-        (RememberFactTool::new(state.memory_stores()), state, db_file)
+    async fn setup() -> (RememberFactTool, Arc<SqliteMemory>, ()) {
+        let state = memory().await;
+        (RememberFactTool::new(state.clone()), state, ())
     }
 
     #[tokio::test]
