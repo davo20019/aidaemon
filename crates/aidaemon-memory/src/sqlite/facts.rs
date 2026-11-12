@@ -542,7 +542,108 @@ impl SqliteMemory {
     }
 }
 
+/// Owner type of the cached key-text vectors fact dedup compares. The fact
+/// row owns its vector, so retention drops it with the fact; lookups go by
+/// the key text's hash.
+const DEDUP_KEY_OWNER: &str = "fact_key";
+const DEDUP_KEY_PURPOSE: &str = "dedup";
+
 impl SqliteMemory {
+    /// Vectors for fact-dedup key texts, in order. `texts` pairs each text
+    /// with the fact row it belongs to, if any; a stored row's vector is
+    /// cached under that row and read back next time: a category holds
+    /// thousands of keys, and embedding them all on every write took
+    /// seconds.
+    async fn dedup_key_vectors(
+        &self,
+        texts: Vec<(Option<i64>, String)>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        use crate::embedding_index::content_hash;
+        let model = self.embedding_service.model_id();
+        let hashes: Vec<String> = texts.iter().map(|(_, t)| content_hash(t)).collect();
+        let mut cached: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut unique: Vec<&String> = hashes.iter().collect();
+        unique.sort();
+        unique.dedup();
+        for chunk in unique.chunks(500) {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT content_hash, embedding FROM memory_embeddings
+                 WHERE owner_type = ",
+            );
+            builder
+                .push_bind(DEDUP_KEY_OWNER)
+                .push(" AND embedding_purpose = ")
+                .push_bind(DEDUP_KEY_PURPOSE)
+                .push(" AND embedding_model = ")
+                .push_bind(&model)
+                .push(" AND stale_at IS NULL AND content_hash IN (");
+            let mut separated = builder.separated(", ");
+            for hash in chunk {
+                separated.push_bind(*hash);
+            }
+            separated.push_unseparated(")");
+            for row in builder.build().fetch_all(&self.pool).await? {
+                let blob: Vec<u8> = row.get("embedding");
+                if let Ok(vector) = decode_embedding(&blob) {
+                    cached.insert(row.get("content_hash"), vector);
+                }
+            }
+        }
+
+        // (hash, owning fact, text)
+        let mut missing: Vec<(String, Option<i64>, String)> = Vec::new();
+        let mut queued = std::collections::HashSet::new();
+        for ((owner, text), hash) in texts.iter().zip(&hashes) {
+            if !cached.contains_key(hash) && queued.insert(hash.clone()) {
+                missing.push((hash.clone(), *owner, text.clone()));
+            }
+        }
+        if !missing.is_empty() {
+            let vectors = self
+                .embedding_service
+                .embed_many(missing.iter().map(|(_, _, text)| text.clone()).collect())
+                .await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            for ((hash, owner, _), vector) in missing.iter().zip(&vectors) {
+                let Some(owner) = owner else {
+                    continue;
+                };
+                sqlx::query(
+                    "INSERT INTO memory_embeddings
+                        (owner_type, owner_id, embedding_purpose, embedding_model,
+                         embedding_dim, content_hash, embedding, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                     ON CONFLICT(owner_type, owner_id, embedding_purpose, embedding_model, content_hash)
+                     DO UPDATE SET embedding = excluded.embedding, stale_at = NULL,
+                                   updated_at = datetime('now')",
+                )
+                .bind(DEDUP_KEY_OWNER)
+                .bind(owner.to_string())
+                .bind(DEDUP_KEY_PURPOSE)
+                .bind(&model)
+                .bind(vector.len() as i64)
+                .bind(hash)
+                .bind(encode_embedding(vector))
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            for ((hash, _, _), vector) in missing.into_iter().zip(vectors) {
+                cached.insert(hash, vector);
+            }
+        }
+        hashes
+            .iter()
+            .map(|hash| {
+                cached
+                    .get(hash)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no dedup vector for a key"))
+            })
+            .collect()
+    }
+
     /// Every fact an explicit search ranks, loaded once: canonical
     /// projections, then active rows, minus owner rows a projection already
     /// covers. The map sends each such projection to the raw row it
@@ -1118,13 +1219,14 @@ impl FactStore for SqliteMemory {
             // large category take seconds.
             if !comparable.is_empty() {
                 let mut texts = Vec::with_capacity(comparable.len() + 1);
-                texts.push(build_dedup_key_text(category_clean, key_clean));
-                texts.extend(
-                    comparable.iter().map(|row| {
-                        build_dedup_key_text(category_clean, &row.get::<String, _>("key"))
-                    }),
-                );
-                if let Ok(vectors) = self.embedding_service.embed_many(texts).await {
+                texts.push((None, build_dedup_key_text(category_clean, key_clean)));
+                texts.extend(comparable.iter().map(|row| {
+                    (
+                        Some(row.get::<i64, _>("id")),
+                        build_dedup_key_text(category_clean, &row.get::<String, _>("key")),
+                    )
+                }));
+                if let Ok(vectors) = self.dedup_key_vectors(texts).await {
                     let new_vec = &vectors[0];
                     let mut best_match: Option<(i64, String, String, f32)> = None;
                     for (row, existing_vec) in comparable.iter().zip(&vectors[1..]) {

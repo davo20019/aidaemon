@@ -337,3 +337,74 @@ async fn default_impl_returns_empty_report() {
     assert!(report.hits.is_empty() && report.related.is_empty());
     assert_eq!(report.considered, 0);
 }
+
+/// Counts every text the store embeds.
+struct CountingEmbedder {
+    inner: HashEmbedder,
+    texts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::Embedder for CountingEmbedder {
+    fn model_id(&self) -> &str {
+        crate::Embedder::model_id(&self.inner)
+    }
+
+    fn dimensions(&self) -> usize {
+        crate::Embedder::dimensions(&self.inner)
+    }
+
+    async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+        self.texts
+            .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+        crate::Embedder::embed(&self.inner, texts).await
+    }
+}
+
+#[tokio::test]
+async fn fact_dedup_embeds_each_stored_key_once() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(SqliteConnectOptions::new().filename(file.path()))
+        .await
+        .unwrap();
+    migrate(&pool).await.unwrap();
+    let embedder = Arc::new(CountingEmbedder {
+        inner: HashEmbedder::new(EMBEDDING_DIM),
+        texts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let memory = SqliteMemory::new(pool, embedder.clone());
+    let put = |key: String| {
+        let memory = memory.clone();
+        async move {
+            memory
+                .upsert_fact(
+                    "project",
+                    &key,
+                    "synthetic value",
+                    "synthetic",
+                    None,
+                    FactPrivacy::Global,
+                )
+                .await
+                .unwrap();
+        }
+    };
+    for i in 0..30 {
+        put(format!("orion_setting_{}", ["alpha", "beta", "gamma"][i % 3].repeat(i + 1))).await;
+    }
+    let count = || embedder.texts.load(std::sync::atomic::Ordering::SeqCst);
+    let before = count();
+    put("kestrel_cache".to_string()).await;
+    let first = count() - before;
+    let before = count();
+    put("zephyr_queue".to_string()).await;
+    let second = count() - before;
+    // The second write reuses the cached vectors of the 31 stored keys: it
+    // embeds only its own key text and its fact text (plus any projection).
+    assert!(
+        second + 25 <= first,
+        "existing keys must not be re-embedded: first write {first}, second {second}"
+    );
+}

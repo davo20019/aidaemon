@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Background fact extraction stores only what the user stated.** Each extracted fact must carry the user's stance and a verbatim quote from the user's message; a question ("do you know what kind of boat I own?") no longer becomes a stored fact, and facts the agent already saved during the turn are not stored a second time under another key.
 
-- **Saving a fact into a large category is fast again.** The key-similarity check embeds all comparable keys in one call instead of one call per stored fact, which had made a single write take about 11 seconds.
+- **Saving a fact into a large category is fast again.** The key-similarity check embedded every stored key in the category on each write, about 9 seconds with 1,500 project facts. Each stored key's vector is now computed once and kept with the fact (removed with it by retention), so later writes embed only the new key.
 
 - **"Database is locked" when tagging the identity of a user message.** The annotation takes the write lock before reading, so a concurrent commit no longer fails it instantly.
 

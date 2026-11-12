@@ -215,6 +215,11 @@ impl MemoryRetention {
                        SELECT 1 FROM error_solutions e
                        WHERE e.id = CAST(owner_id AS INTEGER)
                          AND CAST(e.id AS TEXT) = owner_id))
+                OR (owner_type = 'fact_key' AND NOT EXISTS (
+                       SELECT 1 FROM facts f
+                       WHERE f.id = CAST(owner_id AS INTEGER)
+                         AND CAST(f.id AS TEXT) = owner_id
+                         AND f.superseded_at IS NULL))
                 OR (stale_at IS NOT NULL AND stale_at < datetime('now', '-30 days'))",
         )
         .execute(&self.pool)
