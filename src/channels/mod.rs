@@ -4,7 +4,7 @@ pub(crate) use aidaemon_channels::attachments;
 pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]
-mod discord;
+pub(crate) mod discord;
 #[cfg(test)]
 pub(crate) use aidaemon_channels::live_status;
 #[cfg(test)]
@@ -64,6 +64,16 @@ impl ChannelRuntimeDeps {
             inbox_dir: self.inbox_dir.clone(),
             max_file_size_mb: self.max_file_size_mb,
             watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+        }
+    }
+
+    /// The shared slash commands on the daemon's stores.
+    pub(crate) fn command_context(&self) -> commands::CommandContext {
+        commands::CommandContext {
+            agent: self.agent.clone(),
+            state: self.state.clone(),
+            task_registry: self.task_registry.clone(),
+            config_path: self.config_path.clone(),
         }
     }
 

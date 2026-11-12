@@ -236,7 +236,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                         allowed_user_ids: Vec<u64>,
                         guild_id: Option<u64>|
      -> Arc<DiscordChannel> {
-        Arc::new(DiscordChannel::new(
+        Arc::new(crate::channels::discord::new_discord_bot(
             bot_token,
             allowed_user_ids,
             discord_owner_ids.clone(),

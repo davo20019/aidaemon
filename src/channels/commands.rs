@@ -6,10 +6,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub(crate) use aidaemon_channels::slash::{
-    is_slash_command, shared_commands, CommandCategory, CommandDef,
-};
 use aidaemon_channels::admin_commands::{CheckpointCommands, ConfigReload, ReloadCommand};
+pub(crate) use aidaemon_channels::slash::{shared_commands, CommandCategory, CommandDef};
 use aidaemon_channels::slash::{ChatMode, CommandHost, ScheduledItem, SharedCommands};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -28,6 +26,20 @@ pub(crate) struct CommandContext {
     pub state: Arc<dyn StateStore>,
     pub task_registry: Arc<TaskRegistry>,
     pub config_path: PathBuf,
+}
+
+#[async_trait]
+impl aidaemon_channels::bot::SharedCommandDispatch for CommandContext {
+    async fn dispatch(
+        &self,
+        cmd: &str,
+        args: &str,
+        session_id: &str,
+        sender_id: Option<&str>,
+        user_role: UserRole,
+    ) -> Option<String> {
+        CommandContext::dispatch(self, cmd, args, session_id, sender_id, user_role).await
+    }
 }
 
 impl CommandContext {

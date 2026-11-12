@@ -55,3 +55,18 @@ pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
         UserRole::Guest
     }
 }
+
+/// The shared slash commands as the application runs them (its stores,
+/// its extra commands).
+#[async_trait::async_trait]
+pub trait SharedCommandDispatch: Send + Sync {
+    /// The reply to `cmd`; `None` when it is not a shared command.
+    async fn dispatch(
+        &self,
+        cmd: &str,
+        args: &str,
+        session_id: &str,
+        sender_id: Option<&str>,
+        user_role: UserRole,
+    ) -> Option<String>;
+}

@@ -15,9 +15,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::channels::ChannelRuntimeDeps;
 use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::TaskRegistry;
 use crate::testing::{setup_test_agent, MockProvider};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::traits::HubChannel;
+use crate::types::ApprovalResponse;
+use aidaemon_channel_discord::DiscordChannel as SdkDiscord;
 
 const OWNER: u64 = 100_000_000_000_001_001;
 const STRANGER: u64 = 100_000_000_000_002_002;
@@ -162,7 +167,7 @@ async fn channel(
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));
     let inbox = tempfile::tempdir().unwrap().keep();
-    let channel = Arc::new(DiscordChannel::new(
+    let channel = Arc::new(new_discord_bot(
         "synthetic.discord.token",
         allowed,
         owners,
@@ -348,12 +353,4 @@ async fn an_approval_is_asked_with_buttons_and_answered_by_a_press() {
     // The prompt is replaced with its outcome and loses its buttons.
     let edited = mock.wait_for(|r| r.method == "PATCH").await;
     assert_eq!(edited.body["components"], json!([]));
-}
-
-#[test]
-fn session_ids_resolve_for_default_and_named_bots() {
-    assert_eq!(base_session_id("discord:dm:42"), "discord:dm:42");
-    assert_eq!(base_session_id("helper_bot:discord:dm:42"), "discord:dm:42");
-    assert_eq!(base_session_id("helper_bot:discord:ch:77"), "discord:ch:77");
-    assert_eq!(base_session_id("slack:C1"), "slack:C1");
 }

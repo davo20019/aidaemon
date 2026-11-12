@@ -31,7 +31,7 @@ use super::telegram_bootstrap_signing::{
     terminal_tenant_bot_bootstrap_url,
 };
 #[cfg(feature = "discord")]
-use crate::channels::{spawn_discord_channel, DiscordChannel};
+use crate::channels::spawn_discord_channel;
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
@@ -139,15 +139,11 @@ impl DaemonTelegramHost {
             KeyCheck::Unverified(detail) => {
                 format!("{label}: I couldn't verify that key ({detail}). Nothing was changed.")
             }
-            KeyCheck::Accepted => match save_key(&self.runtime.config_path, target.slot, key).await {
+            KeyCheck::Accepted => match save_key(&self.runtime.config_path, target.slot, key).await
+            {
                 Err(error) => format!("{label}: the key works, but saving it failed: {error}"),
                 Ok(stored) => {
-                    let ctx = crate::channels::commands::CommandContext {
-                        agent: Arc::clone(&self.runtime.agent),
-                        state: Arc::clone(&self.runtime.state),
-                        task_registry: Arc::clone(&self.runtime.task_registry),
-                        config_path: self.runtime.config_path.clone(),
-                    };
+                    let ctx = self.command_context();
                     let reload = ctx.reload_config().await.unwrap_or_else(|error| error);
                     super::set_key::key_saved_reply(&target.provider_name(), stored, &reload)
                 }
@@ -172,12 +168,7 @@ impl DaemonTelegramHost {
     }
 
     fn command_context(&self) -> super::commands::CommandContext {
-        super::commands::CommandContext {
-            agent: Arc::clone(&self.runtime.agent),
-            state: Arc::clone(&self.runtime.state),
-            task_registry: Arc::clone(&self.runtime.task_registry),
-            config_path: self.runtime.config_path.clone(),
-        }
+        self.runtime.command_context()
     }
 }
 
@@ -3003,7 +2994,7 @@ impl Cx<'_> {
             if let Some(hub) = weak_hub.upgrade() {
                 // Create the new Discord channel with empty allowed_user_ids —
                 // the bot will auto-claim the first DM user.
-                let new_channel = Arc::new(DiscordChannel::new(
+                let new_channel = Arc::new(super::discord::new_discord_bot(
                     token,
                     vec![], // Empty: auto-claim on first DM
                     vec![], // Owner set on auto-claim

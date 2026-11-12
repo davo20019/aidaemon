@@ -157,6 +157,9 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
  "flate2",
  "futures",
@@ -166,6 +169,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
