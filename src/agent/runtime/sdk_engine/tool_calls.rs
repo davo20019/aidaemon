@@ -901,6 +901,9 @@ impl Agent {
             // The child shares this run's live declines: each is refused
             // what the owner declined in the other, even after the spawn.
             shared_declines: Some(scope.shared_declines.clone()),
+            // The child shares this turn's learning: a sub-agent of a turn
+            // opted out of learning (before or during the run) learns nothing.
+            learning: Some(scope.learning_consent.clone()),
             spawn_family: Some(scope.spawn_family.clone()),
             child_declaration: None,
             parent_run: Some(scope.run_id),

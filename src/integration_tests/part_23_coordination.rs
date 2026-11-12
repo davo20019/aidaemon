@@ -21,6 +21,7 @@ mod coordination_tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            learning: None,
             spawn_family: Some(family.clone()),
             child_declaration: None,
             parent_run: None,

@@ -997,7 +997,11 @@ impl TelegramChannel {
         let session_id = self.session_id(msg.chat.id.0).await;
         let user_id = msg.from.as_ref().map(|user| user.id.0).unwrap_or(0);
         let user_role = determine_role(&self.owner_user_ids, user_id);
-        if let Some(reply) = ctx.dispatch(cmd, arg, &session_id, user_role).await {
+        let sender_id = msg.from.as_ref().map(|u| format!("telegram:{}", u.id.0));
+        if let Some(reply) = ctx
+            .dispatch(cmd, arg, &session_id, sender_id.as_deref(), user_role)
+            .await
+        {
             for chunk in split_telegram_text(&reply, 4096) {
                 let _ = bot.send_message(msg.chat.id, chunk).await;
             }
@@ -3407,7 +3411,7 @@ impl TelegramChannel {
                     let session_id = self.session_id(chat_id).await;
                     let role = determine_role(&self.owner_user_ids, user_id);
                     let reload = ctx
-                        .dispatch("/reload", "", &session_id, role)
+                        .dispatch("/reload", "", &session_id, None, role)
                         .await
                         .unwrap_or_default();
                     format!("{label}: the new key works and is saved. {note}\n{reload}")

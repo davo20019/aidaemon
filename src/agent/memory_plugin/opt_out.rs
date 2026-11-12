@@ -16,10 +16,11 @@
 //! (`/clear`, a new session) nothing brings the turn back. Recall still
 //! works on the turn: opting out is about learning, not reading.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aidaemon_core as sdk;
-use aidaemon_policies::TurnLearning;
+use aidaemon_policies::{OptOutRecorder as _, TurnLearning};
 use async_trait::async_trait;
 
 use crate::events::{EventEmitter, EventType, MemoryPipelineAccess, MemoryPolicyCompiledData};
@@ -87,8 +88,8 @@ impl SkipLearningTool {
         emitter: EventEmitter,
         task_id: String,
         turn_id: String,
-    ) -> aidaemon_policies::SkipLearningTool {
-        aidaemon_policies::SkipLearningTool::new(
+    ) -> RetryingSkipLearning {
+        Self::with_recorder(
             learning,
             Arc::new(TurnOptOut {
                 emitter,
@@ -96,6 +97,73 @@ impl SkipLearningTool {
                 turn_id,
             }),
         )
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub(crate) fn with_recorder(
+        learning: TurnLearning,
+        recorder: Arc<dyn aidaemon_policies::OptOutRecorder>,
+    ) -> RetryingSkipLearning {
+        let mark = Arc::new(MarkUntilRecorded {
+            recorder,
+            recorded: AtomicBool::new(false),
+        });
+        RetryingSkipLearning {
+            inner: aidaemon_policies::SkipLearningTool::new(learning, mark.clone()),
+            mark,
+        }
+    }
+}
+
+/// The opt-out tool whose mark is retried until it is recorded. The turn's
+/// flag flips once, and the policies tool records only on that flip, so a
+/// mark that failed then would leave the turn's events unmarked for good;
+/// whether the mark landed is kept apart from the flag, and a later call
+/// marks again until it has.
+pub(crate) struct RetryingSkipLearning {
+    inner: aidaemon_policies::SkipLearningTool,
+    mark: Arc<MarkUntilRecorded>,
+}
+
+#[async_trait]
+impl sdk::Tool for RetryingSkipLearning {
+    fn spec(&self) -> sdk::ToolSpec {
+        self.inner.spec()
+    }
+
+    fn annotations(&self) -> sdk::ToolAnnotations {
+        self.inner.annotations()
+    }
+
+    fn source_trust(&self, arguments: &serde_json::Value) -> sdk::SourceTrust {
+        self.inner.source_trust(arguments)
+    }
+
+    async fn call(&self, arguments: serde_json::Value, ctx: &sdk::ToolContext) -> sdk::ToolResult {
+        let output = self.inner.call(arguments, ctx).await?;
+        self.mark
+            .record_opt_out()
+            .await
+            .map_err(|error| sdk::ToolError(format!("Could not record the opt-out: {error}")))?;
+        Ok(output)
+    }
+}
+
+/// Records the opt-out once it succeeds; until then every request retries.
+struct MarkUntilRecorded {
+    recorder: Arc<dyn aidaemon_policies::OptOutRecorder>,
+    recorded: AtomicBool,
+}
+
+#[async_trait]
+impl aidaemon_policies::OptOutRecorder for MarkUntilRecorded {
+    async fn record_opt_out(&self) -> Result<(), String> {
+        if self.recorded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.recorder.record_opt_out().await?;
+        self.recorded.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -115,29 +183,41 @@ impl aidaemon_policies::OptOutRecorder for TurnOptOut {
     }
 }
 
-fn private_key(session_id: &str) -> String {
-    format!("learning_opt_out:{session_id}")
+/// A `/private` request belongs to the sender who made it: in a shared chat
+/// another person's message neither consumes nor cancels it. A sender the
+/// channel cannot identify keys by the session alone.
+fn private_key(session_id: &str, sender_id: Option<&str>) -> String {
+    match sender_id {
+        Some(sender) => format!("learning_opt_out:{session_id}:{sender}"),
+        None => format!("learning_opt_out:{session_id}"),
+    }
 }
 
-/// `/private`: opt the chat's next message out of learning (`on`), or cancel.
+/// `/private`: opt the sender's next message in this chat out of learning
+/// (`on`), or cancel the sender's own request.
 pub(crate) async fn set_next_message_private(
     state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
+    sender_id: Option<&str>,
     on: bool,
 ) -> anyhow::Result<()> {
     state
-        .set_setting(&private_key(session_id), if on { "next" } else { "" })
+        .set_setting(
+            &private_key(session_id, sender_id),
+            if on { "next" } else { "" },
+        )
         .await
 }
 
-/// Whether `/private` opted this message out, consuming the request. A read
-/// error opts the message out: a request not to remember must not be lost to
-/// a storage fault.
+/// Whether the sender's `/private` opted this message out, consuming the
+/// request. A read error opts the message out: a request not to remember
+/// must not be lost to a storage fault.
 pub(crate) async fn take_next_message_private(
     state: &(impl crate::traits::SettingsStore + ?Sized),
     session_id: &str,
+    sender_id: Option<&str>,
 ) -> bool {
-    let key = private_key(session_id);
+    let key = private_key(session_id, sender_id);
     match state.get_setting(&key).await {
         Ok(Some(value)) if !value.is_empty() => {
             if let Err(error) = state.set_setting(&key, "").await {

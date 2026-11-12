@@ -377,6 +377,13 @@ pub(crate) struct InheritedAuthority {
     /// runtime handle, never serialized.
     #[serde(skip)]
     pub shared_declines: Option<aidaemon_core::SharedDeclines>,
+    /// The parent turn's live learning consent: the child's turn shares it,
+    /// so a sub-agent of a turn opted out of learning (`/private`,
+    /// `skip_learning`) learns nothing and its events are marked too.
+    /// `None` (a spawn outside any running turn) gives the child its own.
+    /// A runtime handle, never serialized.
+    #[serde(skip)]
+    pub learning: Option<aidaemon_policies::TurnLearning>,
     /// The request's sub-agent tree, shared by every plain child in it.
     /// `None` starts a new tree. A runtime handle, never serialized.
     #[serde(skip)]
@@ -926,6 +933,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            learning: None,
             spawn_family: None,
             child_declaration: None,
             parent_run: None,
@@ -1040,6 +1048,7 @@ mod tests {
             trusted_roots: Vec::new(),
             declined: Vec::new(),
             shared_declines: None,
+            learning: None,
             spawn_family: None,
             child_declaration: None,
             parent_run: None,

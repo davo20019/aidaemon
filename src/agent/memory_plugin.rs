@@ -27,6 +27,7 @@ mod swap_tests;
 mod system_memory;
 mod tool_facts;
 mod writer;
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use opt_out::{
     mark_turn_opted_out, set_next_message_private, take_next_message_private, PrivateTurnGuard,
     SkipLearningTool, OPTED_OUT_REASON,

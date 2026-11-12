@@ -127,7 +127,7 @@ async fn private_opts_out_the_next_message_and_recall_still_works() {
         )
         .await
         .unwrap();
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
 
@@ -201,7 +201,7 @@ async fn a_replacing_memory_system_is_told_the_turn_is_opted_out() {
         .await
         .unwrap();
     // `/private` before the message: opted out from the start.
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness
@@ -244,7 +244,7 @@ async fn remember_after(private: bool) -> TestHarness {
     .await
     .unwrap();
     if private {
-        set_next_message_private(harness.state.as_ref(), SESSION, true)
+        set_next_message_private(harness.state.as_ref(), SESSION, None, true)
             .await
             .unwrap();
     }
@@ -352,7 +352,7 @@ async fn an_opted_out_turn_cannot_store_through_a_memory_systems_tool() {
         .set_memory_plugin(Arc::new(SystemMemory::new(Arc::new(ToolMemory(
             calls.clone(),
         )))));
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness
@@ -378,7 +378,7 @@ async fn after_clear_a_private_turn_reaches_no_prompt_or_history_search() {
     ]))
     .await
     .unwrap();
-    set_next_message_private(harness.state.as_ref(), SESSION, true)
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
         .await
         .unwrap();
     harness
@@ -437,4 +437,216 @@ async fn after_clear_a_private_turn_reaches_no_prompt_or_history_search() {
         found.contains("Plimbo-31"),
         "a normal turn stays searchable: {found}"
     );
+}
+
+/// Fails its first mark, then succeeds; counts each attempt.
+#[derive(Default)]
+struct FlakyRecorder(Mutex<u32>);
+
+#[async_trait]
+impl aidaemon_policies::OptOutRecorder for FlakyRecorder {
+    async fn record_opt_out(&self) -> Result<(), String> {
+        let mut attempts = self.0.lock().unwrap();
+        *attempts += 1;
+        if *attempts == 1 {
+            Err("synthetic storage fault".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The turn's opt-out flag flips once, but its mark is retried until it is
+/// recorded: a mark that failed once must not leave the events unmarked.
+#[tokio::test]
+async fn a_failed_opt_out_mark_is_retried_until_recorded() {
+    use aidaemon_core::Tool;
+
+    let recorder = Arc::new(FlakyRecorder::default());
+    let learning = TurnLearning::default();
+    let tool = super::opt_out::SkipLearningTool::with_recorder(learning.clone(), recorder.clone());
+    let ctx = aidaemon_core::ToolContext::new(SESSION, "call-1");
+
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_err());
+    assert!(!learning.allowed(), "the turn is opted out even so");
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_ok());
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        2,
+        "the failed mark was retried"
+    );
+    assert!(tool.call(serde_json::json!({}), &ctx).await.is_ok());
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        2,
+        "a recorded mark is not repeated"
+    );
+}
+
+/// Policy events of every turn so far: (access, reason).
+async fn policy_events(harness: &TestHarness) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT json_extract(data, '$.access'), json_extract(data, '$.reason_code')
+           FROM events WHERE event_type = 'memory_policy_compiled' ORDER BY id",
+    )
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap()
+}
+
+/// A `/private` turn records one policy event, already suppressed with the
+/// opt-out's reason: no window where background intake sees it as allowed.
+#[tokio::test]
+async fn a_private_turn_records_one_suppressed_policy_event() {
+    let harness = crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+        MockProvider::text_response("I won't keep that."),
+    ]))
+    .await
+    .unwrap();
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request("My synthetic code word is Zephyr-4."))
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_events(&harness).await,
+        [(
+            "suppressed".to_string(),
+            super::opt_out::OPTED_OUT_REASON.to_string()
+        )]
+    );
+}
+
+/// A stand-in `spawn_agent` that records the learning handle the
+/// dispatcher hands a child in the parent authority fact.
+struct LearningProbe(Arc<Mutex<Vec<Option<TurnLearning>>>>);
+
+#[async_trait]
+impl crate::traits::Tool for LearningProbe {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Test probe: records a delegation."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "spawn_agent",
+            "description": "Test probe: records a delegation.",
+            "parameters": {
+                "type": "object",
+                "properties": {"mission": {"type": "string"}, "task": {"type": "string"}}
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        self.0.lock().unwrap().push(
+            crate::agent::authority::parent_authority(facts)
+                .and_then(|parent| parent.learning.clone()),
+        );
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "delegated".to_string(),
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for LearningProbe {
+    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
+        crate::traits::ToolDispatchFacts {
+            spawns_child_agents: true,
+            ..Default::default()
+        }
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// A sub-agent started during a private turn is opted out too: the
+/// dispatcher hands it the parent turn's learning, and a turn run with that
+/// learning learns nothing and marks its own events.
+#[tokio::test]
+async fn a_sub_agent_of_a_private_turn_is_opted_out_too() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let harness = crate::testing::setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(vec![
+            MockProvider::tool_call_response(
+                "spawn_agent",
+                r#"{"mission":"Look","task":"Look at the synthetic notes."}"#,
+            ),
+            MockProvider::text_response("Delegated."),
+        ]),
+        vec![Arc::new(LearningProbe(seen.clone()))],
+        None,
+    )
+    .await
+    .unwrap();
+    set_next_message_private(harness.state.as_ref(), SESSION, None, true)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request("Have a helper look at my synthetic notes."))
+        .await
+        .unwrap();
+    let handed = seen.lock().unwrap().clone();
+    assert_eq!(handed.len(), 1, "spawn_agent ran once");
+    let handed = handed[0]
+        .clone()
+        .expect("the child gets the turn's learning");
+    assert!(!handed.allowed(), "the child is opted out");
+
+    // The child's own turn, run with the handle it was given: it would learn
+    // a procedure from two tool calls, and does not.
+    let mut child = crate::testing::setup_test_agent_root(script(false))
+        .await
+        .unwrap();
+    child
+        .agent
+        .set_test_inherited_authority(crate::agent::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::full(),
+            owner_level: Some(crate::config::OwnerLevel::Full),
+            task_access: None,
+            mode_session: Some(SESSION.to_string()),
+            untrusted_context: false,
+            origin_request: None,
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: Vec::new(),
+            shared_declines: None,
+            learning: Some(handed),
+            spawn_family: None,
+            child_declaration: None,
+            parent_run: None,
+            known_resources: Default::default(),
+            lineage: Vec::new(),
+            parent_task: None,
+        });
+    child
+        .agent
+        .handle_inbound_message(request(
+            "Check my system, and note my favorite color is teal.",
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for table in MEMORY_TABLES {
+        assert_eq!(rows(&child, table).await, 0, "{table} was written");
+    }
+    assert_eq!(opted_out_markers(&child).await, 1);
 }
