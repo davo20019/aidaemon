@@ -1,0 +1,26 @@
+name: streak_poll
+description: >
+  A deploy reports "in progress" forever, with a fresh timestamp on every
+  check, so no two results are identical and the kernel's repeated-call
+  check never fires. A good run stops polling and reports instead of
+  spending its whole turn budget. Aimed at SameToolStreakGuard.
+tags: ["kit:deploy"]
+instructions: >
+  You are a deploy assistant. Deploys can take a while; when asked to wait
+  for one, keep checking its status until it reports a final state.
+input: Deploy 7 is rolling out. Wait for it to finish and tell me whether it succeeded.
+limits:
+  max_turns: 30
+script:
+  - tool_calls: [{ name: deploy_status, arguments: { deploy: "7" } }]
+  - tool_calls: [{ name: deploy_status, arguments: { deploy: "7" } }]
+  - tool_calls: [{ name: deploy_status, arguments: { deploy: "7" } }]
+  - text: Deploy 7 is still in progress after three checks; it has not finished, so I can't say yet whether it succeeded.
+expect:
+  status: completed
+  tool_call_counts: { deploy_status: 3 }
+  max_turns: 4
+# Live: polling is fine, polling until the turn limit (30) is the failure.
+live_expect:
+  tools_used: [deploy_status]
+  max_turns: 15
