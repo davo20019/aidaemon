@@ -8,7 +8,6 @@
 //! | [`ApprovalPolicy`] | `before_tool` | annotations, tool names, tokenized commands, [`ApprovalRules`], [`ApprovalGrants`] |
 //! | [`EgressGuard`] | `before_tool` | secret shapes and literal secrets in outbound arguments |
 //! | [`ScopeGuard`] | `before_tool` | the call's access manifest |
-//! | [`ReceiptCompletionCheck`] | `on_stop` | receipts since the last user message |
 //! | [`Redactor`] | `after_tool` | secret shapes and literal secrets in output |
 //! | [`UntrustedOutput`] | `after_tool` | tool name / prefix configuration |
 //! | [`ProjectInstructions`] | `before_model` | `AGENTS.md` hierarchy on disk |
@@ -32,7 +31,6 @@
 //! in the run before any hook sees it.)
 
 mod approval;
-mod completion;
 mod context_window;
 mod conversation;
 mod egress;
@@ -50,7 +48,6 @@ mod tracing_sink;
 mod untrusted;
 
 pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision};
-pub use completion::{ReceiptCompletionCheck, Requirement};
 pub use context_window::{estimate_tokens, ContextWindow};
 pub use conversation::{
     compaction_threshold, elide_middle, render_summary_note, turns_to_summarize, verbatim_tokens,

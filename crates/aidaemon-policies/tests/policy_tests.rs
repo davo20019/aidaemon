@@ -9,8 +9,7 @@ use aidaemon_core::{
 };
 use aidaemon_policies::{
     ApprovalMode, ApprovalPolicy, ContextWindow, InMemoryRecall, MemoryInjection,
-    ProjectInstructions, ReceiptCompletionCheck, Redactor, Requirement, ScopeGuard, TracingSink,
-    UntrustedOutput,
+    ProjectInstructions, Redactor, ScopeGuard, TracingSink, UntrustedOutput,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -206,156 +205,6 @@ async fn scope_guard_denies_paths_outside_roots() {
     assert_eq!(out.receipts()[1].status, ReceiptStatus::Denied);
     let reason = out.receipts()[1].reason.clone().unwrap();
     assert!(reason.contains("/etc/passwd"), "{reason}");
-}
-
-// ---------- completion ----------
-
-#[tokio::test]
-async fn completion_check_rejects_unresolved_failures_until_fixed() {
-    let provider = Arc::new(ScriptedProvider::new([
-        tool_calls([call("c1", "shell", json!({"command": "false"}))]),
-        text("All done!"),
-        tool_calls([call("c2", "shell", json!({"command": "false"}))]),
-        text("Done now."),
-        text("The job still fails with exit status 1; I could not complete it."),
-    ]));
-    let agent = agent(provider.clone())
-        .tool(Shell)
-        .hook(ReceiptCompletionCheck::default())
-        .build()
-        .unwrap();
-    let out = agent.run("s", "run the job").await.unwrap();
-    assert!(out.is_completed());
-    let rejection = &provider.requests()[2]
-        .messages
-        .last()
-        .unwrap()
-        .content
-        .clone();
-    assert!(
-        rejection.starts_with("[harness] completion check:"),
-        "{rejection}"
-    );
-    assert!(rejection.contains("`shell`"), "{rejection}");
-    assert!(
-        rejection.contains("ended failed (exit status 1"),
-        "{rejection}"
-    );
-    // The retry failed too, so "Done now." was rejected again; after the
-    // cap (default 2) the next answer is accepted.
-    let rejections = out
-        .state
-        .messages
-        .iter()
-        .filter(|m| m.content.starts_with("[harness] completion check:"))
-        .count();
-    assert_eq!(rejections, 2);
-}
-
-#[tokio::test]
-async fn completion_check_accepts_after_successful_retry() {
-    let provider = Arc::new(ScriptedProvider::new([
-        tool_calls([call("c1", "flaky", json!({}))]),
-        text("done"),
-        tool_calls([call("c2", "flaky", json!({}))]),
-        text("done for real"),
-    ]));
-    let attempts = Arc::new(Mutex::new(0));
-    let a = attempts.clone();
-    let flaky = aidaemon_core::FnTool::new(
-        spec("flaky", "fails once", &[]),
-        ToolAnnotations::WRITE,
-        move |_args: Value| {
-            let a = a.clone();
-            async move {
-                let mut n = a.lock().unwrap();
-                *n += 1;
-                if *n == 1 {
-                    Ok(ToolOutput::error("temporary failure"))
-                } else {
-                    Ok(ToolOutput::text("ok"))
-                }
-            }
-        },
-    );
-    let agent = agent(provider)
-        .tool(flaky)
-        .hook(ReceiptCompletionCheck::default())
-        .build()
-        .unwrap();
-    let out = agent.run("s", "go").await.unwrap();
-    assert!(out.is_completed());
-    assert_eq!(out.final_text.as_deref(), Some("done for real"));
-    let rejections = out
-        .state
-        .messages
-        .iter()
-        .filter(|m| m.content.starts_with("[harness]"))
-        .count();
-    assert_eq!(rejections, 1);
-}
-
-#[tokio::test]
-async fn completion_check_is_bounded_and_scoped_to_the_user_turn() {
-    let provider = Arc::new(
-        ScriptedProvider::new([tool_calls([call(
-            "c1",
-            "shell",
-            json!({"command": "false"}),
-        )])])
-        .then_repeat(text("finished")),
-    );
-    let agent = agent(provider.clone())
-        .tool(Shell)
-        .hook(
-            ReceiptCompletionCheck::new([Requirement::RequireNoUnresolvedFailures])
-                .max_rejections(1),
-        )
-        .build()
-        .unwrap();
-    let out = agent.run("s", "go").await.unwrap();
-    assert!(out.is_completed());
-    assert_eq!(out.turns(), 3, "one rejection, then allowed to stop");
-    // Spending the rejection budget lets the run stop; it does not turn the
-    // unresolved failure into success.
-    assert!(!out.is_succeeded());
-    assert_eq!(out.unmet().len(), 1);
-    assert!(out.unmet()[0].contains("`shell`"), "{:?}", out.unmet());
-
-    // A new user message starts a new scope: the old failure is not re-raised.
-    let next = agent
-        .run_from(out.state.with_user_message("thanks"), Default::default())
-        .await
-        .unwrap();
-    assert!(next.is_completed());
-    assert!(next.is_succeeded());
-    assert_eq!(next.turns(), 1);
-}
-
-#[tokio::test]
-async fn require_any_success_rejects_a_bare_done() {
-    let provider = Arc::new(ScriptedProvider::new([
-        text("Done!"),
-        tool_calls([call("c1", "shell", json!({"command": "make"}))]),
-        text("Built."),
-    ]));
-    let agent = agent(provider.clone())
-        .tool(Shell)
-        .hook(ReceiptCompletionCheck::new([
-            Requirement::RequireAnySuccess,
-        ]))
-        .build()
-        .unwrap();
-    let out = agent.run("s", "build it").await.unwrap();
-    assert!(out.is_completed());
-    assert_eq!(out.final_text.as_deref(), Some("Built."));
-    let rejection = provider.requests()[1]
-        .messages
-        .last()
-        .unwrap()
-        .content
-        .clone();
-    assert!(rejection.contains("no tool was called"), "{rejection}");
 }
 
 // ---------- after_tool ----------
@@ -684,7 +533,6 @@ async fn policies_compose_in_one_agent_run() {
         ]),
         tool_calls([call("c4", "delete_file", json!({"path": "build/old.o"}))]),
         tool_calls([call("c5", "shell", json!({"command": "false"}))]),
-        text("Cleaned up the build."),
         tool_calls([call("c6", "shell", json!({"command": "rm -rf ~"}))]),
         text("I could not finish: the cleanup command failed with exit status 1."),
     ]));
@@ -702,7 +550,6 @@ async fn policies_compose_in_one_agent_run() {
         )
         .hook(Redactor::new())
         .hook(UntrustedOutput::default())
-        .hook(ReceiptCompletionCheck::default().max_rejections(1))
         .hook(ContextWindow::new(50_000))
         .event_sink(move |_run, event: &Event| {
             sink_events.lock().unwrap().push(event.clone());
@@ -740,21 +587,10 @@ async fn policies_compose_in_one_agent_run() {
     assert!(tool_text(&out, "c3").starts_with("[UNTRUSTED EXTERNAL DATA"));
     assert!(tool_text(&out, "c6").contains("never allowed"));
 
-    // The bare "Cleaned up" was rejected once because c5 failed.
-    let stop_rejections = events
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| matches!(e, Event::StopRejected { .. }))
-        .count();
-    assert_eq!(stop_rejections, 1);
     assert_eq!(
         out.final_text.as_deref(),
         Some("I could not finish: the cleanup command failed with exit status 1.")
     );
-    // The run stopped honestly, but the failed cleanup keeps it from
-    // counting as a success.
-    assert!(!out.is_succeeded());
     for request in provider.requests() {
         assert!(request.messages[1]
             .content

@@ -47,6 +47,8 @@ Reading it:
 - `ReceiptCompletionCheck` is the one candidate for removal: no gain here or
   in the first round (34/40 both, more turns), and it is not a safety
   boundary. Decision 4 says remove; the coordinator decides.
+  **Decided 2026-11-12: removed** from `aidaemon-policies` (with
+  `Requirement`); `completion_retry` stays as a plain-kernel regression.
 - `UntrustedOutput`, `ScopeGuard` and `ApprovalPolicy` show no gain on Haiku
   because Haiku already behaves; they are kept as boundaries that hold
   whatever the model does (Decision 4's exception for hard safety

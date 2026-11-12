@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Removed
+- `aidaemon-policies`: `ReceiptCompletionCheck` and `Requirement`. Measured live (Decision 4: a policy that shows no gain is removed before it becomes public API), it gained nothing: 34/40 with and without on the first eight scenarios, and 5/5 with and without on `completion_retry`, the scenario built for it (N=5, `claude-haiku-5-5`), at slightly more turns. It is not a safety boundary. A receipt-based check remains a few lines of `on_stop` (see `aidaemon-core/DESIGN.md`); `completion_retry` stays as a plain-kernel regression.
+
 ### Changed
 - Phase 9.0: the daemon's shared contract types and store traits moved into the crates that own them: approval vocabulary, `status::StatusUpdate`, `TerminalConfinement`, `NothingSentError` and the CLI-agent store into `aidaemon-tools`; `specialist::SpecialistKind` into `aidaemon-agents`; the message, dialogue, summary and prompt-snapshot stores into `aidaemon-events::stores`; `triggers::TriggerEvent` and the work-only composite stores into `aidaemon-work`; `registry` into `aidaemon-mcp`; internal `context` and `hub` modules into `aidaemon-channels`; `skills` into `aidaemon-memory`. Serde shapes unchanged.
 
@@ -42,7 +45,7 @@ stability promise.
 - `aidaemon-store-sqlite`: SQLite `RunStore` with journal, snapshots, upkeep helpers.
 - `aidaemon-mcp`: MCP stdio client exposing server tools.
 - `aidaemon-agents`: agents as tools with child budgets.
-- `aidaemon-policies`: approvals, scope and egress guards, completion checks, redaction, untrusted output, context window, memory injection, tracing.
+- `aidaemon-policies`: approvals, scope and egress guards, redaction, untrusted output, context window, memory injection, tracing.
 - `aidaemon-eval`: YAML scenario eval kit with N-of-M pass rates.
 - `aidaemon-channel-telegram`, `-slack`, `-discord`: channel adapters.
 

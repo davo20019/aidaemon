@@ -7,7 +7,7 @@
 //! ANTHROPIC_API_KEY=... AIDAEMON_MODEL=claude-haiku-5-5 EVAL_N=5 \
 //!   cargo run -p aidaemon-eval --features examples --example live_policies -- <out_dir> [config ...]
 //! ```
-//! Configs: `baseline` (default), `completion_check`, `streak_guard`,
+//! Configs: `baseline` (default), `streak_guard`,
 //! `untrusted_output`, `redactor`, `context_window`, `context_window_8k`,
 //! `context_window_8k_recent2`, `egress_guard`, `scope_guard`, `approval`, `all`. Each writes
 //! `<out_dir>/<config>.json` and prints its report, plus a comparison against
@@ -24,14 +24,13 @@ use aidaemon_core::{Hook, Provider};
 use aidaemon_eval::examples::{ExampleExpect, ExampleFactory, ExampleSubject};
 use aidaemon_eval::{compare, NoExtension, Report, Suite};
 use aidaemon_policies::{
-    ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, ReceiptCompletionCheck, Redactor,
-    Requirement, SameToolStreakGuard, ScopeGuard, StreakLimits, UntrustedOutput,
+    ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, Redactor, SameToolStreakGuard,
+    ScopeGuard, StreakLimits, UntrustedOutput,
 };
 use aidaemon_providers::Anthropic;
 
 const CONFIGS: &[&str] = &[
     "baseline",
-    "completion_check",
     "streak_guard",
     "untrusted_output",
     "redactor",
@@ -47,9 +46,6 @@ const CONFIGS: &[&str] = &[
 fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
     match name {
         "baseline" => vec![],
-        "completion_check" => vec![Arc::new(ReceiptCompletionCheck::new([
-            Requirement::RequireNoUnresolvedFailures,
-        ]))],
         "streak_guard" => vec![Arc::new(SameToolStreakGuard {
             read_only_tools: HashSet::new(),
             allowances: HashMap::new(),
@@ -74,7 +70,7 @@ fn policy(name: &str) -> Vec<Arc<dyn Hook>> {
         // Registration order as `aidaemon-policies` documents it.
         "all" => ["scope_guard", "egress_guard", "streak_guard", "redactor"]
             .into_iter()
-            .chain(["untrusted_output", "context_window", "completion_check"])
+            .chain(["untrusted_output", "context_window"])
             .flat_map(policy)
             .collect(),
         other => panic!("unknown config `{other}`; one of {CONFIGS:?}"),
