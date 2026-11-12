@@ -36,7 +36,7 @@ stability promise.
 - Phase 9.3: `aidaemon-work::scheduler`, the goal cycle (due mandate reviews, scheduled goals and reminders, stuck and orphaned tasks, escalated recoveries, goal notifications) as `GoalCycle` and `GoalCycleService`, over `SchedulerStore`. The host gives its agent runtime (`TaskLeadHost`), channels (`NoticeDelivery`) and presentation (`WorkPresenter`). `goals::{tasks_satisfy_goal_completion, goal_completion_summary_indicates_not_finished, is_terminal_task_status}`; `goal_tokens::SCHEDULED_AUTONOMOUS_*`.
 - Phase 9.3: `aidaemon-work::triggers` holds the trigger event bus (`event_bus`, `EventSender`, `EventReceiver`), `TriggerSettings` and, behind the new `email-trigger` feature, the IMAP `TriggerManager`.
 
-## [0.1.0]: first release (not yet published)
+## [0.2.0]: first release (not yet published)
 
 ### aidaemon-core (public contract)
 - Hook-driven agent loop: `Agent` builder, streaming `Provider` with `Retry`, `Tool` with annotations, access manifests and timeout hints, five hook points.

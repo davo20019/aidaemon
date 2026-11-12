@@ -16,4 +16,4 @@ The `shell` tool in `default_tools` runs each command in an OS sandbox confined 
 
 The aidaemon daemon's own general tools also live here, on an `ExecutionBackend` (`LocalBackend` for the host): `web_search` (`web_search::WebSearch`, DuckDuckGo/Brave/SearxNG in parallel), `http_request` (`http_request::HttpRequestTool`, auth profiles and OAuth refresh through `OAuthTokens`), `system_info`, `git_info`, `git_commit`, `project_inspect` and `service_status`, with the support they share (`command_risk`, `command_effects`, `sanitize`, `fs_utils`, `result_spill`). The browser is its own crate, `aidaemon-tool-browser`. The `testing` feature adds helpers for calling a tool directly from a test.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-tools
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-tools

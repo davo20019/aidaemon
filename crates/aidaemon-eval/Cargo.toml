@@ -23,7 +23,7 @@ publish = false
 examples = []
 
 [dependencies]
-aidaemon-core = { version = "0.1.0", path = "../aidaemon-core", features = ["testing"] }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", features = ["testing"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

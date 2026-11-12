@@ -17,4 +17,4 @@ runner.run(CancellationToken::new()).await;
 
 Adapters: `aidaemon-channel-telegram`, `-slack`, `-discord`. Feature `conformance` exposes a test kit for adapter authors.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-channels
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-channels

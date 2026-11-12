@@ -4,4 +4,4 @@
 
 The immutable event store, its payloads and the run aggregate, on a host's SQLite pool. Used by the aidaemon daemon.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-events
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-events

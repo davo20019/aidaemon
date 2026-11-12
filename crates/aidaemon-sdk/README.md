@@ -19,4 +19,4 @@ println!("{}", outcome.final_text.unwrap_or_default());
 
 See the `coding_agent` and `support_triage` examples.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-sdk
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-sdk

@@ -9,4 +9,4 @@ An eval kit: YAML scenarios (scripted or live), N-of-M pass rates, trajectory as
 // `factory` implements `AgentFactory` and builds the agent under test.
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-eval
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-eval

@@ -12,4 +12,4 @@ let server = McpServer::spawn("fs", "npx",
 for tool in server.tools() { builder = builder.tool_arc(tool); }
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-mcp
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-mcp

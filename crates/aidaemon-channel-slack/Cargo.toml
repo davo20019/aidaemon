@@ -18,7 +18,7 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
-aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

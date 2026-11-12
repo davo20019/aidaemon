@@ -26,4 +26,4 @@ println!("{:?}: {}", outcome.status, outcome.final_text.unwrap_or_default());
 
 Run the full tour (approvals, resume) with `cargo run -p aidaemon-core --example quickstart --features testing`.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.1.0). MIT licensed. Docs: https://docs.rs/aidaemon-core
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-core

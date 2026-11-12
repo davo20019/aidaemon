@@ -22,16 +22,16 @@ publish = false
 channels = ["dep:aidaemon-channels"]
 
 [dependencies]
-aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels", optional = true }
-aidaemon-core = { version = "0.1.0", path = "../aidaemon-core" }
+aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", optional = true }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 thiserror = "1"
 
 [dev-dependencies]
-aidaemon-channels = { version = "0.1.0", path = "../aidaemon-channels", features = ["conformance"] }
-aidaemon-core = { version = "0.1.0", path = "../aidaemon-core", features = ["testing"] }
+aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", features = ["testing"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
