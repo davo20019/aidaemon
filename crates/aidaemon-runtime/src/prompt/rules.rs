@@ -187,7 +187,25 @@ pub fn core_behavioral_rules() -> String {
          If the data already exists in a file (e.g. a spilled tool result), extract or format the needed \
          part into a clean file with a tool and deliver it with the `send_file` tool, then give a short \
          inline summary. If you must author long content yourself, write it with `write_file` using \
-         `mode=\"append\"` in chunks rather than one oversized call.",
+         `mode=\"append\"` in chunks rather than one oversized call.\n",
+    );
+
+    // Rule 6: say up front when a safe choice changes the request
+    s.push_str(
+        "6. **Say up front when a safe choice changes what was asked.** \
+         When you pick a non-destructive alternative that changes what the owner asked for (a new \
+         folder or project name because the one asked for already exists, another port, a smaller \
+         scope), say so in your first reply or plan, before the work starts, in one plain sentence \
+         (\"~/projects/demo already exists, so I'll use ~/projects/demo-2\"). Never mention it only \
+         at the end.\n",
+    );
+
+    // Rule 7: no repeats of what the chat already shows
+    s.push_str(
+        "7. **Don't repeat what the chat already shows.** \
+         Photos and files sent during the work already carry their captions: the final reply does \
+         not list them again or repeat their links or addresses. Say only what is new (the result, \
+         timings, anything that went wrong). Send each image once.",
     );
 
     // Data integrity rule — applies to all visibility tiers.
@@ -663,6 +681,15 @@ quiet uses the default cadence, active accelerates it, urgent uses the owner-con
 #[cfg(test)]
 mod environment_tests {
     use super::*;
+
+    #[test]
+    fn core_rules_state_changes_up_front_and_never_repeat_captions() {
+        let rules = super::core_behavioral_rules();
+        assert!(rules.contains("Say up front when a safe choice changes what was asked"));
+        assert!(rules.contains("in your first reply or plan, before the work starts"));
+        assert!(rules.contains("Don't repeat what the chat already shows"));
+        assert!(rules.contains("Send each image once"));
+    }
 
     #[test]
     fn a_bsd_host_names_its_tools_and_every_host_warns_about_silent_failures() {
