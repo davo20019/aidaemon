@@ -35,6 +35,8 @@ struct ScheduledGoalPlan {
     parsed: Vec<ParsedSchedule>,
     fire_policy: String,
     reminder: Option<String>,
+    /// The owner-given name, if any.
+    name: Option<String>,
     next_run: String,
     /// The exact arguments the owner approves (the approval subject).
     subject: String,
@@ -54,18 +56,37 @@ impl ScheduledGoalPlan {
         self.reminder.is_none()
     }
 
-    /// The card the owner confirms the goal with, as the tool asked before.
+    /// The card the owner confirms the goal with: the five lines every
+    /// automation card has, then the next run and the name as details.
     fn approval_request(&self) -> aidaemon_core::OwnerApprovalRequest {
+        let mut card = aidaemon_work::automations::scheduled_card(
+            &self.desc,
+            self.reminder.as_deref(),
+            &self.schedule_specs(),
+            &crate::cron_utils::system_timezone_display(),
+        );
+        card.details.push(format!("Next: {}", self.next_run));
+        if let Some(name) = self.name.as_deref() {
+            card.details.push(format!("Name: {name}"));
+        }
         aidaemon_core::OwnerApprovalRequest {
             effects: Vec::new(),
             summary: self.desc.clone(),
             subject: self.subject.clone(),
             risk: aidaemon_core::ApprovalRisk::Medium,
-            warnings: vec![
-                format!("{} schedule(s)", self.parsed.len()),
-                format!("Next: {}", self.next_run),
-            ],
+            warnings: card.into_lines(),
         }
+    }
+
+    fn schedule_specs(&self) -> Vec<aidaemon_work::automations::ScheduleSpec> {
+        self.parsed
+            .iter()
+            .map(|p| aidaemon_work::automations::ScheduleSpec {
+                cron: p.cron.clone(),
+                one_shot: p.is_one_shot,
+                next: Some(crate::cron_utils::owner_time(&p.next_local)),
+            })
+            .collect()
     }
 }
 
@@ -223,6 +244,33 @@ impl ManageMemoriesTool {
             }
         }
 
+        let name = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        if let Some(name) = name.as_deref() {
+            if name.chars().count() > MAX_AUTOMATION_NAME_CHARS
+                || name.chars().any(char::is_control)
+            {
+                return Ok(Answer(format!(
+                    "The name must be one line of at most {MAX_AUTOMATION_NAME_CHARS} characters."
+                )));
+            }
+            if let Some(taken) = crate::tools::manage_automations::live_name_holder(
+                self.state.as_ref(),
+                session_id,
+                name,
+            )
+            .await?
+            {
+                return Ok(Answer(format!(
+                    "An automation is already named \"{name}\" ({taken}); pick another name or cancel that one first."
+                )));
+            }
+        }
+
         // Checked before anything is stored, so an invalid policy leaves no
         // half-created goal behind.
         let fire_policy = match args.fire_policy.as_deref() {
@@ -255,6 +303,7 @@ impl ManageMemoriesTool {
             "one_shot": parsed.iter().map(|p| p.is_one_shot).collect::<Vec<_>>(),
             "fire_policy": fire_policy,
             "is_paused": args.is_paused.unwrap_or(false),
+            "name": name,
         })
         .to_string();
         Ok(ScheduledGoalPrep::Plan(ScheduledGoalPlan {
@@ -263,6 +312,7 @@ impl ManageMemoriesTool {
             parsed,
             fire_policy,
             reminder,
+            name,
             next_run,
             subject,
         }))
@@ -357,7 +407,7 @@ impl ManageMemoriesTool {
         );
     }
 
-    fn is_protected_system_maintenance_goal(goal: &crate::traits::Goal) -> bool {
+    pub(crate) fn is_protected_system_maintenance_goal(goal: &crate::traits::Goal) -> bool {
         const KNOWLEDGE_GOAL_DESC: &str =
             "Maintain knowledge base: process embeddings, consolidate memories, decay old facts";
         const HEALTH_GOAL_DESC: &str =
@@ -455,13 +505,19 @@ struct ManageArgs {
     goal_id: Option<String>,
     schedule_id: Option<String>,
     schedule: Option<String>,
-    /// A plain reminder's message: delivered as-is when the schedule fires.
+    /// A plain reminder's message, delivered as-is when the schedule fires.
+    /// Set by `set_reminder`; not offered in this tool's schema.
     reminder: Option<String>,
     schedules: Option<Vec<String>>,
     fire_policy: Option<String>,
     is_one_shot: Option<bool>,
     is_paused: Option<bool>,
+    /// create_scheduled_goal: the short name the owner gave it.
+    name: Option<String>,
 }
+
+/// The longest name an automation may carry.
+pub(crate) const MAX_AUTOMATION_NAME_CHARS: usize = 80;
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
@@ -489,11 +545,11 @@ fn manage_memories_schema() -> Value {
                 "goal_id": { "type": "string" },
                 "schedule_id": { "type": "string" },
                 "schedule": { "type": "string" },
-                "reminder": { "type": "string" },
                 "schedules": { "type": "array", "items": { "type": "string" } },
                 "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] },
                 "is_one_shot": { "type": "boolean" },
-                "is_paused": { "type": "boolean" }
+                "is_paused": { "type": "boolean" },
+                "name": { "type": "string" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -835,6 +891,7 @@ impl ManageMemoriesTool {
                     parsed,
                     fire_policy,
                     reminder,
+                    name,
                     next_run,
                     subject: _,
                 } = plan;
@@ -848,6 +905,12 @@ impl ManageMemoriesTool {
                 goal.domain = "orchestration".to_string();
                 if let Some(message) = reminder.as_deref() {
                     goal.context = Some(crate::reminders::context_for_message(message));
+                }
+                if let Some(name) = name.as_deref() {
+                    goal.context = Some(aidaemon_work::automations::context_with_name(
+                        goal.context.as_deref(),
+                        name,
+                    ));
                 }
 
                 self.state.create_goal(&goal).await?;
@@ -3364,8 +3427,18 @@ mod tests {
         };
         assert_eq!(request.summary, "Check API health");
         assert_eq!(request.risk, aidaemon_core::ApprovalRisk::Medium);
-        assert!(request.warnings.iter().any(|w| w == "1 schedule(s)"));
-        assert!(request.warnings.iter().any(|w| w.starts_with("Next: ")));
+        // The same five-line card as a watching automation, then the next run.
+        let card =
+            aidaemon_core::mandate_card::MandateConfirmationCard::from_lines(&request.warnings)
+                .expect("all five lines");
+        assert_eq!(card.what, "Check API health");
+        assert_eq!(card.how_often, "Every 6 hours");
+        assert_eq!(
+            card.can_do,
+            "Anything you can do – it runs with your full access"
+        );
+        assert_eq!(card.ends, "Only when you stop it");
+        assert!(card.details.iter().any(|w| w.starts_with("Next: ")));
         let mut injected = args.clone();
         injected["_session_id"] = json!("synthetic-session");
         let OwnerApprovalNeed::Ask(same) = tool.owner_approval(&injected, &owner).await else {

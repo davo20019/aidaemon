@@ -49,6 +49,9 @@ fn scheduler_arguments(arguments: &str) -> anyhow::Result<String> {
     call.insert("goal".into(), json!(message));
     call.insert("schedule".into(), json!(when));
     call.insert("reminder".into(), json!(message));
+    if let Some(name) = field("name") {
+        call.insert("name".into(), json!(name));
+    }
     Ok(Value::Object(call).to_string())
 }
 
@@ -59,7 +62,7 @@ impl Tool for SetReminderTool {
     }
 
     fn description(&self) -> &str {
-        "Send the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal."
+        "Set up a scheduled automation that only sends the user a reminder message at a time or on a cadence. Nothing else runs when it fires. For scheduled work, use manage_memories create_scheduled_goal."
     }
 
     fn schema(&self) -> Value {
@@ -70,7 +73,8 @@ impl Tool for SetReminderTool {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "Exact text to send, e.g. 'Check the oven.'" },
-                    "when": { "type": "string", "description": "e.g. 'in 2 minutes', 'tomorrow at 9am', 'every weekday at 8am'" }
+                    "when": { "type": "string", "description": "e.g. 'in 2 minutes', 'tomorrow at 9am', 'every weekday at 8am'" },
+                    "name": { "type": "string", "description": "The short name the user gave it, exactly as given; omit when none." }
                 },
                 "required": ["message", "when"],
                 "additionalProperties": false

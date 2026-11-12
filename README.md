@@ -65,7 +65,7 @@ SQLite-backed persistent memory with vector embeddings (AllMiniLML6V2). Backgrou
 Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
 
 ### Automation
-Cron-style scheduled tasks with natural language time parsing. Email triggers via IMAP IDLE. Long-running goal tracking with task breakdown and multi-schedule support.
+Everything that runs on its own is an automation, of two kinds. **Scheduled** automations run a fixed instruction at set times: reminders and recurring tasks, with natural language time parsing and multi-schedule support. **Watching** automations work toward an objective within limits you approve, deciding each time whether to act, wait, ask you, or stop. Ask for what you want; the agent picks the kind. Your automations show in one list, each as the same five-line card (what, how often, what it can do, when it tells you, when it ends), and you pause, resume or cancel any of them by name. Email triggers via IMAP IDLE.
 
 ### Security
 Terminal command allowlists, inline approval flow (Allow Once / Allow Session / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.

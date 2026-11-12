@@ -1,0 +1,43 @@
+{
+  "description": "The user's automations, in one list: scheduled ones (a fixed instruction or reminder at set times) and watching ones (work toward an objective within limits the user approved). List them, show one's card, or pause, resume or cancel one by its name.",
+  "name": "manage_automations",
+  "schema": {
+    "description": "The user's automations, in one list: scheduled ones (a fixed instruction or reminder at set times) and watching ones (work toward an objective within limits the user approved). List them, show one's card, or pause, resume or cancel one by its name.",
+    "name": "manage_automations",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "show",
+            "pause",
+            "resume",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        "id": {
+          "description": "The ref from the list, for one with no name.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Narrows the list, or picks between two automations with the same name.",
+          "enum": [
+            "scheduled",
+            "watching"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "The automation's name, as the user gave it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}
