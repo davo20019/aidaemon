@@ -7,7 +7,7 @@ use chrono::Utc;
 use super::formatting::format_number;
 use crate::config::AppConfig;
 use crate::duration_format::{compact_chrono_duration, ZeroUnitStyle};
-use crate::runtime_ports::ChannelAgentRuntime;
+use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::{TaskRegistry, TaskStatus};
 use crate::traits::{StateStore, TaskJournalEntry, WorkTaskSummary};
 use crate::types::UserRole;
@@ -191,7 +191,7 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
 /// Shared command dispatcher for commands that behave identically across
 /// Telegram, Slack, and Discord channels.
 pub(crate) struct CommandContext {
-    pub agent: Arc<dyn ChannelAgentRuntime>,
+    pub agent: Arc<dyn DaemonAgentRuntime>,
     pub state: Arc<dyn StateStore>,
     pub task_registry: Arc<TaskRegistry>,
     pub config_path: PathBuf,

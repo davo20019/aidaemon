@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::QueueLanePolicyConfig;
-use crate::queue_telemetry::QueuePressure;
+use super::telemetry::QueuePressure;
+use super::QueueLanePolicyConfig;
 
 const MAX_SESSION_BUDGET_ENTRIES: usize = 2048;
 

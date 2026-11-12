@@ -1,14 +1,18 @@
 //! The daemon's outbound surface to a bot: where a session's messages,
-//! media, approvals and goal confirmations go, plus the runtime-managed bot
-//! and session-routing stores. Internal to aidaemon (moves with the turn
-//! runner in Phase 9.5), no stability promise; the public contract is
-//! [`crate::channel`].
+//! media, approvals and goal confirmations go, the [`ChannelHub`] that routes
+//! them to the bot a session came from, plus the runtime-managed bot and
+//! session-routing stores. Internal to aidaemon, no stability promise; the
+//! public contract is [`crate::channel`].
+
+mod router;
+
+pub use router::{ChannelHub, SessionMap};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use aidaemon_tools::semantics::{
-    ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel,
+    ApprovalKind, ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel,
 };
 
 /// The kind of media being sent.
@@ -35,6 +39,18 @@ pub struct MediaMessage {
     /// `oneshot::Sender` is neither `Clone` nor `Default`; `MediaMessage` is moved
     /// (never cloned) through the media channel, so no derive is affected.
     pub result_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+/// A request sent to the ChannelHub for command approval.
+pub struct ApprovalRequest {
+    pub command: String,
+    pub session_id: String,
+    pub risk_level: RiskLevel,
+    pub warnings: Vec<String>,
+    pub permission_mode: PermissionMode,
+    pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    /// What kind of approval this is (command vs goal confirmation).
+    pub kind: ApprovalKind,
 }
 
 /// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).

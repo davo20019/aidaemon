@@ -4,16 +4,16 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-use crate::config::QueuePolicyConfig;
-use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
-use crate::queue_telemetry::{QueuePressure, QueueTelemetry};
+use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
+use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
+
+use super::{ApprovalRequest, HubChannel, MediaKind, MediaMessage};
 #[cfg(test)]
-use crate::runtime_ports::SessionRouteLease;
-use crate::runtime_ports::{AssistantNoteSink, OutboundRouter};
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::traits::HubChannel;
-use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
+use crate::ports::SessionRouteLease;
+use crate::ports::{AssistantNoteSink, OutboundRouter};
+use crate::queue::policy::{should_shed_due_to_overload, SessionFairnessBudget};
+use crate::queue::telemetry::{QueuePressure, QueueTelemetry};
+use crate::queue::QueuePolicyConfig;
 
 /// Shared map of session_id → channel name.
 /// Written by channels when they receive incoming messages,
@@ -172,7 +172,7 @@ impl ChannelHub {
         self
     }
 
-    pub(crate) fn with_delivery_note_sink(mut self, sink: Arc<dyn AssistantNoteSink>) -> Self {
+    pub fn with_delivery_note_sink(mut self, sink: Arc<dyn AssistantNoteSink>) -> Self {
         self.delivery_note_sink = Some(sink);
         self
     }
@@ -423,9 +423,9 @@ impl ChannelHub {
                                     request.kind,
                                     ApprovalKind::AutopilotConfirmation
                                 ) {
-                                    crate::types::GoalConfirmationStyle::Autopilot
+                                    aidaemon_tools::semantics::GoalConfirmationStyle::Autopilot
                                 } else {
-                                    crate::types::GoalConfirmationStyle::Standard
+                                    aidaemon_tools::semantics::GoalConfirmationStyle::Standard
                                 };
                                 match ch
                                     .request_goal_confirmation(
@@ -665,7 +665,7 @@ impl ChannelHub {
             .routed_channel(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
-        let presented = super::prepare_chat_message(text);
+        let presented = crate::presentation::prepare_chat_message(text);
 
         // Deduplicate identical spam (e.g. multiple heartbeats) within a short window.
         // This intentionally remains best-effort: it favors reducing noise over
@@ -730,7 +730,7 @@ impl ChannelHub {
         text: &str,
     ) -> anyhow::Result<Option<String>> {
         if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
-            let presented = super::prepare_chat_message(text);
+            let presented = crate::presentation::prepare_chat_message(text);
             channel.send_text_tracked(&routed_session, &presented).await
         } else {
             anyhow::bail!("No channel found for session {}", session_id)
@@ -746,7 +746,7 @@ impl ChannelHub {
         text: &str,
     ) -> anyhow::Result<bool> {
         if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
-            let presented = super::prepare_chat_message(text);
+            let presented = crate::presentation::prepare_chat_message(text);
             channel
                 .edit_text(&routed_session, message_id, &presented)
                 .await
@@ -952,9 +952,9 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
-    use crate::tools::command_risk::{PermissionMode, RiskLevel};
-    use crate::traits::{ChannelCapabilities, HubChannel};
-    use crate::types::{ApprovalResponse, MediaMessage};
+    use crate::hub::{ChannelCapabilities, HubChannel};
+    use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
+    use aidaemon_tools::semantics::ApprovalResponse;
 
     /// A test channel with a configurable name, used to verify routing.
     struct NamedTestChannel {
@@ -1103,7 +1103,7 @@ mod tests {
             Ok(())
         }
         async fn send_media(&self, _session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-            if let crate::types::MediaKind::Document { file_path, .. } = &media.kind {
+            if let crate::hub::MediaKind::Document { file_path, .. } = &media.kind {
                 self.sent_docs.lock().await.push(file_path.clone());
             }
             Ok(())
@@ -1125,7 +1125,7 @@ mod tests {
         MediaMessage {
             session_id: session_id.to_string(),
             caption: filename.to_string(),
-            kind: crate::types::MediaKind::Document {
+            kind: crate::hub::MediaKind::Document {
                 file_path: file_path.to_string(),
                 filename: filename.to_string(),
             },

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use super::Agent;
 use crate::runtime_ports::{
     AgentIngress, AssistantNoteSink, ChannelAgentRuntime, ChildAgentRequest, ChildAgentRun,
-    ChildAgentRuntime, ConversationRequest, ConversationRuntime, InboundMessageRequest,
-    SalvagedTaskOutcome,
+    ChildAgentRuntime, ConversationRequest, ConversationRuntime, DaemonAgentRuntime,
+    InboundMessageRequest, SalvagedTaskOutcome,
 };
 use crate::traits::AgentRole;
 
@@ -251,7 +251,7 @@ impl AgentIngress for Agent {
 }
 
 #[async_trait]
-impl ChannelAgentRuntime for Agent {
+impl DaemonAgentRuntime for Agent {
     fn is_sensitive_path(&self, path: &std::path::Path) -> bool {
         self.daemon_paths.is_sensitive(path)
     }
@@ -260,6 +260,13 @@ impl ChannelAgentRuntime for Agent {
         self.execution_backend.clone()
     }
 
+    async fn reload_provider(&self, config: &crate::config::AppConfig) -> anyhow::Result<String> {
+        Agent::reload_provider(self, config).await
+    }
+}
+
+#[async_trait]
+impl ChannelAgentRuntime for Agent {
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,
@@ -302,10 +309,6 @@ impl ChannelAgentRuntime for Agent {
 
     async fn clear_model_override(&self) {
         Agent::clear_model_override(self).await;
-    }
-
-    async fn reload_provider(&self, config: &crate::config::AppConfig) -> anyhow::Result<String> {
-        Agent::reload_provider(self, config).await
     }
 
     async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {

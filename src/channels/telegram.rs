@@ -32,7 +32,7 @@ use crate::channels::{spawn_discord_channel, DiscordChannel};
 use crate::channels::{spawn_slack_channel, SlackChannel};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps, SessionMap};
 use crate::config::{AppConfig, TelegramWebhookConfig};
-use crate::runtime_ports::{AgentResponseEnvelope, ChannelAgentRuntime};
+use crate::runtime_ports::{AgentResponseEnvelope, DaemonAgentRuntime};
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{ChannelCapabilities, HubChannel, StateStore};
@@ -62,7 +62,7 @@ pub struct TelegramChannel {
     allowed_user_ids: StdRwLock<Vec<u64>>,
     /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
     owner_user_ids: Vec<u64>,
-    agent: Arc<dyn ChannelAgentRuntime>,
+    agent: Arc<dyn DaemonAgentRuntime>,
     config_path: PathBuf,
     /// Shared session map — maps session_id to channel name.
     session_map: SessionMap,
@@ -252,7 +252,7 @@ impl TelegramChannel {
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
             .collect::<HashSet<_>>();
-        let runner = TurnRunner::new(runtime.clone());
+        let runner = TurnRunner::new(runtime.turn_deps());
         Self {
             runner,
             bot_username: StdRwLock::new("telegram".to_string()),

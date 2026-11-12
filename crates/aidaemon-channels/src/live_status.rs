@@ -4,7 +4,13 @@
 
 use std::sync::Arc;
 
-use crate::channels::ChannelHub;
+use crate::hub::ChannelHub;
+
+/// Whether a plan card (a rendered checklist) shows every step finished.
+/// Such a card is only progress: the reply covers the result.
+pub fn is_completed_checklist(rendered: &str) -> bool {
+    rendered.trim_start().starts_with('✅')
+}
 
 /// Abstraction over the chat surface so `LiveStatus` is testable without a bot.
 #[async_trait::async_trait]
@@ -111,7 +117,7 @@ impl LiveStatus {
     /// the record of what was left.
     pub async fn clear(&mut self, sink: &dyn SurfaceSink, reply_delivered: bool) {
         if let Some(checklist) = self.checklist.as_deref() {
-            if !reply_delivered || !crate::plans::is_completed_checklist(checklist) {
+            if !reply_delivered || !crate::live_status::is_completed_checklist(checklist) {
                 return;
             }
         }

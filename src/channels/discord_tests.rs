@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::runtime_ports::ChannelAgentRuntime;
+use crate::runtime_ports::DaemonAgentRuntime;
 use crate::tasks::TaskRegistry;
 use crate::testing::{setup_test_agent, MockProvider};
 
@@ -157,7 +157,7 @@ async fn channel(
     owners: Vec<u64>,
 ) -> (Arc<DiscordChannel>, crate::testing::TestHarness) {
     let mut harness = setup_test_agent(provider).await.unwrap();
-    let agent: Arc<dyn ChannelAgentRuntime> = Arc::new(std::mem::replace(
+    let agent: Arc<dyn DaemonAgentRuntime> = Arc::new(std::mem::replace(
         &mut harness.agent,
         setup_test_agent(MockProvider::new()).await.unwrap().agent,
     ));
