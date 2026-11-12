@@ -24,7 +24,6 @@ pub(in crate::agent) use run_helpers::{
     accumulate_evidence_requirement_marker_matches, complete_tool_result_semantics,
     evidence_requirement_accepts_nonstandard_outcome, matching_evidence_requirement_indices,
     observation_matches_completion_contract, tool_result_or_metadata_contains_verifiable_evidence,
-    user_facing_external_action_ack,
 };
 pub(in crate::agent) use run_helpers::{
     blocked_for_untrusted_external_reference_message, build_background_detach_ack,

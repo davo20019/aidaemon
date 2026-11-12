@@ -113,15 +113,6 @@ impl std::fmt::Display for ModelCallTimedOut {
 
 impl std::error::Error for ModelCallTimedOut {}
 
-/// A message the same sender sent while the run was going, taken into it
-/// (`sdk_take_steering`). It is answered once a model call that carried it,
-/// with tools offered, returned; one never answered goes back to the channel
-/// queue at run end (`sdk_return_unanswered_steering`).
-pub(in crate::agent) struct AbsorbedSteering {
-    message: crate::tasks::QueuedMessage,
-    answered: bool,
-}
-
 impl Agent {
     /// Make one model call for the SDK run through the daemon's provider
     /// stack: billing-aware retries, the fallback cascade and failover

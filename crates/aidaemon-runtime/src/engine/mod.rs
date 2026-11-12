@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod outcome;
 pub mod provider;
 pub mod recovery;
+pub mod scope;
 pub mod stop;
 pub mod tool_calls;
 

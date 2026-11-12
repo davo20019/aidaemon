@@ -601,6 +601,72 @@ fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schem
     });
 }
 
+/// How a call ended, before its result is recorded.
+pub enum ExecutedOutcome {
+    Returned {
+        outcome: aidaemon_tools::semantics::ToolCallOutcome,
+        status: aidaemon_tools::semantics::ToolOutcomeStatus,
+    },
+    /// The tool returned `Err`: an explicit typed failure.
+    Raised {
+        metadata: aidaemon_tools::semantics::ToolCallMetadata,
+        error_text: String,
+    },
+}
+
+impl ExecutedOutcome {
+    pub fn metadata(&self) -> &aidaemon_tools::semantics::ToolCallMetadata {
+        match self {
+            Self::Returned { outcome, .. } => &outcome.metadata,
+            Self::Raised { metadata, .. } => metadata,
+        }
+    }
+
+    /// The same test the receipt makes.
+    pub fn failed(&self) -> bool {
+        match self {
+            Self::Returned { outcome, status } => {
+                status.is_failure() || outcome.metadata.contract_rejected
+            }
+            Self::Raised { .. } => true,
+        }
+    }
+}
+
+/// A call that ran, waiting for the after-tool hook to record it.
+pub struct ExecutedCall {
+    pub request: crate::engine::calls::KernelCall,
+    pub arguments: String,
+    pub injected_dir: Option<String>,
+    pub facts: aidaemon_tools::semantics::ToolDispatchFacts,
+    pub grant: Option<aidaemon_events::mandate_grant::MandateAuthorityGrant>,
+    pub idempotency_key: Option<String>,
+    pub send_file_key: Option<String>,
+    pub duration_ms: u64,
+    pub trust: sdk::SourceTrust,
+    pub executed: ExecutedOutcome,
+}
+
+/// Calls that ran and are not recorded yet, by run and call id.
+#[derive(Clone, Default)]
+pub struct ExecutedCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), ExecutedCall>>>);
+
+impl ExecutedCalls {
+    pub fn insert(&self, run: sdk::RunId, call_id: &str, call: ExecutedCall) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((run, call_id.to_string()), call);
+    }
+
+    pub fn take(&self, run: sdk::RunId, call_id: &str) -> Option<ExecutedCall> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(run, call_id.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod unset_argument_tests {
     use super::*;
