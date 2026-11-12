@@ -35,7 +35,7 @@ sha2 = "0.10"
 shellexpand = "3"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt"] }
+tokio = { version = "1", features = ["net", "process", "fs", "io-util", "time", "macros", "rt", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

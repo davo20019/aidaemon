@@ -71,6 +71,7 @@ name = "aidaemon"
 version = "0.12.9"
 dependencies = [
  "aes-gcm",
+ "aidaemon-agents",
  "aidaemon-channel-discord",
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
@@ -157,6 +158,7 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-core",
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -219,8 +221,11 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -228,6 +233,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
 ]
 
@@ -310,7 +316,9 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-mcp",
+ "anyhow",
  "async-trait",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

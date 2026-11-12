@@ -1,5 +1,6 @@
 //! The store traits for goals, mandates, tasks, work and notifications.
 
+use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
 
 /// Goal lifecycle and confirmation-flow persistence. Task, schedule, budget,
@@ -1055,4 +1056,56 @@ pub trait NotificationStore: Send + Sync {
     async fn cleanup_expired_notifications(&self) -> anyhow::Result<i64> {
         Ok(0)
     }
+}
+
+/// Focused persistence contract used by goal-trace tooling.
+pub trait GoalTraceStore:
+    GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore + ScheduledRunStore
+{
+}
+
+impl<T> GoalTraceStore for T where
+    T: GoalStore
+        + GoalScheduleStore
+        + MandateStore
+        + TaskStore
+        + WorkCoordinationStore
+        + ScheduledRunStore
+{
+}
+
+/// Focused persistence contract used by blocker reporting.
+pub trait ReportBlockerStore:
+    TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
+{
+}
+
+impl<T> ReportBlockerStore for T where
+    T: TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
+{
+}
+
+/// Focused persistence contract used by scheduled-goal tooling.
+pub trait ScheduledGoalRunsStore:
+    GoalStore
+    + GoalScheduleStore
+    + ScheduledRunStore
+    + GoalBudgetStore
+    + TaskStore
+    + WorkCoordinationStore
+    + SettingsStore
+    + MandateStore
+{
+}
+
+impl<T> ScheduledGoalRunsStore for T where
+    T: GoalStore
+        + GoalScheduleStore
+        + ScheduledRunStore
+        + GoalBudgetStore
+        + TaskStore
+        + WorkCoordinationStore
+        + SettingsStore
+        + MandateStore
+{
 }

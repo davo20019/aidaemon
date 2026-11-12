@@ -57,6 +57,8 @@
 //! delegation is re-run if annotated idempotent and marked indeterminate
 //! otherwise, and nothing the child did is repeated.
 
+pub mod specialist;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};

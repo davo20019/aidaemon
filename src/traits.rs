@@ -75,7 +75,7 @@ pub use memory::{
     PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
-pub(crate) use tools::NothingSentError;
+pub use tools::NothingSentError;
 #[cfg(test)]
 pub use tools::ToolCalls;
 #[allow(unused_imports)]

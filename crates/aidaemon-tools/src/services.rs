@@ -1,4 +1,5 @@
-//! Narrow store services that tools hold: settings and OAuth connections,
+//! Narrow store services that tools hold: settings, OAuth connections and
+//! runtime-managed CLI agents,
 //! plus the plain data those traits carry. The daemon's SQLite store
 //! implements them; a tool receives an `Arc<dyn ...>` of the slice it needs
 //! through its constructor. Memory stores (facts, episodes, history, people)
@@ -116,6 +117,104 @@ pub trait OAuthStore: Send + Sync {
         _expires_at: Option<&str>,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+/// A dynamically added CLI agent configuration (stored in database).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicCliAgent {
+    pub id: i64,
+    pub name: String,
+    pub command: String,
+    pub args_json: String, // JSON array of argument strings
+    pub description: String,
+    pub timeout_secs: Option<u64>,
+    pub max_output_chars: Option<usize>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+/// A record of a CLI agent invocation for logging/auditing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliAgentInvocation {
+    pub id: i64,
+    pub task_id: Option<String>,
+    pub session_id: String,
+    pub agent_name: String,
+    pub prompt_summary: String,
+    pub working_dir: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output_summary: Option<String>,
+    pub success: Option<bool>,
+    pub duration_secs: Option<f64>,
+}
+
+/// Runtime-managed CLI agents persistence + invocation logs.
+#[async_trait]
+pub trait DynamicCliAgentStore: Send + Sync {
+    /// Store a dynamically added CLI agent.
+    async fn save_dynamic_cli_agent(&self, _agent: &DynamicCliAgent) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get all dynamic CLI agents.
+    async fn list_dynamic_cli_agents(&self) -> anyhow::Result<Vec<DynamicCliAgent>> {
+        Ok(vec![])
+    }
+
+    /// Delete a dynamic CLI agent by ID.
+    async fn delete_dynamic_cli_agent(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update a dynamic CLI agent.
+    async fn update_dynamic_cli_agent(&self, _agent: &DynamicCliAgent) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Log the start of a CLI agent invocation. Returns the invocation ID.
+    async fn log_cli_agent_start(
+        &self,
+        _task_id: Option<&str>,
+        _session_id: &str,
+        _agent_name: &str,
+        _prompt_summary: &str,
+        _working_dir: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Log the completion of a CLI agent invocation.
+    async fn log_cli_agent_complete(
+        &self,
+        _id: i64,
+        _exit_code: Option<i32>,
+        _output_summary: &str,
+        _success: bool,
+        _duration_secs: f64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get recent CLI agent invocations (most recent first).
+    async fn get_cli_agent_invocations(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<CliAgentInvocation>> {
+        Ok(vec![])
+    }
+
+    /// Auto-close stale CLI agent invocations that never completed (e.g. crashed worker).
+    ///
+    /// Implementations should mark rows with `completed_at IS NULL` and older than
+    /// `max_age_hours` as completed with `success=false`.
+    async fn cleanup_stale_cli_agent_invocations(
+        &self,
+        _max_age_hours: i64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
     }
 }
 

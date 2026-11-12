@@ -53,6 +53,7 @@ mod search_files;
 pub mod semantics;
 pub mod services;
 mod shell;
+pub mod status;
 mod util;
 pub mod web;
 mod workspace;
@@ -68,14 +69,14 @@ pub use backend::{
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
     best_available_sandbox, BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError,
-    LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox,
+    LocalSandbox, Sandbox, SandboxCommand, SeatbeltSandbox, TerminalConfinement,
 };
 pub use fs::{
     format_with_line_numbers, render_read_file_output, render_read_file_output_within, EditFile,
     FilePolicy, ProtectedPathGuard, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy,
     WriteFile, DEFAULT_IGNORE_DIRS, MAX_READ_CHARS,
 };
-pub use outcome::{CallValidator, KernelAdapter, OutcomeRunner, OutcomeTool};
+pub use outcome::{CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool};
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use search_files::SearchFiles;

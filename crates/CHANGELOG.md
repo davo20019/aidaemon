@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Changed
+- Phase 9.0: the daemon's shared contract types and store traits moved into the crates that own them: approval vocabulary, `status::StatusUpdate`, `TerminalConfinement`, `NothingSentError` and the CLI-agent store into `aidaemon-tools`; `specialist::SpecialistKind` into `aidaemon-agents`; the message, dialogue, summary and prompt-snapshot stores into `aidaemon-events::stores`; `triggers::TriggerEvent` and the work-only composite stores into `aidaemon-work`; `registry` into `aidaemon-mcp`; internal `context` and `hub` modules into `aidaemon-channels`; `skills` into `aidaemon-memory`. Serde shapes unchanged.
+
 ## [0.1.0]: first release (not yet published)
 
 ### aidaemon-core (public contract)

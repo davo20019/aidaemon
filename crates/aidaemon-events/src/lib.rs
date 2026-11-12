@@ -16,6 +16,7 @@ pub mod run_aggregate;
 pub mod schema;
 pub mod session;
 pub mod store;
+pub mod stores;
 pub mod terminal_state;
 pub mod text;
 

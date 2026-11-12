@@ -20,6 +20,19 @@ use crate::semantics::{
     ToolCallOutcome, ToolSemantics, TrustRoots,
 };
 
+/// A tool could not reach its target at all, so nothing took effect and the
+/// call may run again.
+#[derive(Debug)]
+pub struct NothingSentError(pub String);
+
+impl std::fmt::Display for NothingSentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NothingSentError {}
+
 /// A tool whose execution returns a typed outcome.
 #[async_trait]
 pub trait OutcomeTool: ToolSemantics {

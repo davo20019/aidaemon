@@ -34,6 +34,7 @@
 //! it are dropped.
 
 mod client;
+pub mod registry;
 mod tool;
 
 pub use client::{

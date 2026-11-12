@@ -94,6 +94,7 @@ mod scoring;
 pub mod search;
 #[cfg(test)]
 mod search_fixture;
+pub mod skills;
 pub mod sqlite;
 mod store;
 pub mod stores;
