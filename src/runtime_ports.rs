@@ -383,6 +383,11 @@ pub(crate) trait OutboundRouter: Send + Sync {
         -> anyhow::Result<()>;
     async fn background_status_surface(&self, session_id: &str) -> Option<String>;
     async fn take_background_status_surface(&self, session_id: &str) -> Option<String>;
+    /// Delete a message this daemon sent. `Ok(false)` when the channel
+    /// cannot delete it; the default suits routers that never can.
+    async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     async fn request_inline_approval(
         &self,
         session_id: &str,

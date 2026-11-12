@@ -871,6 +871,10 @@ impl OutboundRouter for ChannelHub {
         ChannelHub::take_background_status_surface(self, session_id).await
     }
 
+    async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
+        ChannelHub::delete_message(self, session_id, message_id).await
+    }
+
     async fn request_inline_approval(
         &self,
         session_id: &str,

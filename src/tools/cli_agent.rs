@@ -150,16 +150,18 @@ fn format_background_progress(
     } else {
         format!("{} min", (elapsed_secs + 30) / 60)
     };
-    let mut message = format!(
-        "\u{23f3} Still working on it in the background ({elapsed}).\n{}: {}",
-        tool_name,
+    // The worker's own stream lines ("Working... (120s)") are its status, not
+    // the owner's: the chat message says only how long and what for.
+    let _ = latest_activity;
+    let mut worker = tool_name.chars();
+    let worker = match worker.next() {
+        Some(first) => first.to_uppercase().chain(worker).collect::<String>(),
+        None => String::new(),
+    };
+    format!(
+        "\u{23f3} Still working on it in the background ({elapsed}).\n{worker}: {}",
         truncate_with_note(task_context, 200),
-    );
-    if let Some(activity) = latest_activity.filter(|activity| !activity.trim().is_empty()) {
-        message.push_str("\nLast step: ");
-        message.push_str(&truncate_with_note(activity.trim(), 160));
-    }
-    message
+    )
 }
 
 async fn deliver_cli_agent_notification(
@@ -3328,21 +3330,31 @@ impl CliAgentTool {
                     }
 
                     // The session's background status message ("still working
-                    // on it…") is resolved now the result went out as its own
-                    // message, so it never stays on "working" after the job.
+                    // on it…") is resolved now the job is over. Once the result
+                    // went out as its own message the status only repeats it,
+                    // so it is removed; it is marked resolved instead where the
+                    // channel cannot delete, or when the result was queued.
                     if let Some(ref hub) = hub_for_completion {
                         let surface = hub.take_background_status_surface(&notify_session_id).await;
-                        crate::tools::terminal::finalize_background_completion_surface(
-                            Some(hub),
-                            &notify_session_id,
-                            surface.as_deref(),
-                            if delivered {
-                                crate::tools::terminal::BackgroundSurfaceOutcome::Delivered
-                            } else {
-                                crate::tools::terminal::BackgroundSurfaceOutcome::Queued
-                            },
-                        )
-                        .await;
+                        let removed = match (&surface, delivered) {
+                            (Some(id), true) => {
+                                matches!(hub.delete_message(&notify_session_id, id).await, Ok(true))
+                            }
+                            _ => false,
+                        };
+                        if !removed {
+                            crate::tools::terminal::finalize_background_completion_surface(
+                                Some(hub),
+                                &notify_session_id,
+                                surface.as_deref(),
+                                if delivered {
+                                    crate::tools::terminal::BackgroundSurfaceOutcome::Delivered
+                                } else {
+                                    crate::tools::terminal::BackgroundSurfaceOutcome::Queued
+                                },
+                            )
+                            .await;
+                        }
                     }
 
                     if !delivered {
@@ -5369,8 +5381,8 @@ mod tests {
         );
 
         assert!(message.contains("Still working on it in the background (4 min)"));
-        assert!(message.contains("codex: Investigate"));
-        assert!(message.contains("Last step: Running focused validation"));
+        assert!(message.contains("Codex: Investigate"));
+        assert!(!message.contains("Running focused validation"));
     }
 
     /// Create a CliAgentTool with `echo` registered as a test tool.
