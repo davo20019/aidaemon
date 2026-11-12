@@ -381,10 +381,12 @@ impl MockProvider {
         });
 
         // `uncommitted_work` is an advisory recovery hint for the agent's own
-        // retry ladder, not a provider option; a provider that rejects
-        // non-default options never sees it.
+        // retry ladder and `cache_key` only routes prompt-cache lookups; neither
+        // is a provider option, so a provider that rejects non-default options
+        // never sees them.
         let provider_facing = ChatOptions {
             uncommitted_work: false,
+            cache_key: None,
             ..options.clone()
         };
         if let crate::traits::ResponseMode::JsonSchema { name, .. } = &options.response_mode {

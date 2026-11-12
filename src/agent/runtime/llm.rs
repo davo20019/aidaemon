@@ -77,10 +77,16 @@ fn without_media(request: &aidaemon_core::ModelRequest) -> aidaemon_core::ModelR
 fn with_default_options(
     request: &aidaemon_core::ModelRequest,
 ) -> Option<aidaemon_core::ModelRequest> {
+    // The cache key only routes prompt-cache lookups and adds no field a
+    // provider could reject, so the retry keeps the conversation's cache.
     let defaults = aidaemon_core::ModelRequest {
         model: request.model.clone(),
         messages: request.messages.clone(),
         tools: request.tools.clone(),
+        options: aidaemon_core::RequestOptions {
+            cache_key: request.options.cache_key.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     (defaults != *request).then_some(defaults)

@@ -1745,12 +1745,22 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(!call_log.is_empty(), "expected at least one provider call");
+    // Every call carries the conversation's cache key (81ca9193); it is a
+    // routing hint, not a provider option, so it is compared apart.
     assert!(
         call_log.iter().all(|entry| ChatOptions {
             uncommitted_work: false,
+            cache_key: None,
             ..entry.options.clone()
         } == ChatOptions::default()),
         "expected default chat options when the text-only pass is disabled"
+    );
+    assert!(
+        call_log
+            .iter()
+            .all(|entry| entry.options.cache_key.as_deref()
+                == Some("provider_option_rejection_fallback")),
+        "every call should keep the conversation's cache key"
     );
 }
 
