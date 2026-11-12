@@ -9,6 +9,7 @@
 use crate::traits::{Message, Procedure};
 
 /// The structural helpers live in the SDK memory crate.
+#[allow(unused_imports)]
 pub use aidaemon_memory::{
     extract_trigger_pattern, generalize_procedure, new_error_solution as create_error_solution,
     new_procedure as create_procedure_with_outcome, procedure_base_name,

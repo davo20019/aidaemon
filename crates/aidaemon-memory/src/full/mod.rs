@@ -7,6 +7,7 @@
 pub mod recall;
 pub mod system;
 pub mod tools;
+pub mod writer;
 
 pub use recall::{
     FullRecall, RecallDecision, RecallHost, RecallSettings, RecallSource, RecallTurn,
