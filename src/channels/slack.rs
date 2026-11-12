@@ -10,9 +10,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use super::commands::{shared_commands, CommandCategory, CommandDef};
-use super::formatting::{
-    build_help_text, markdown_to_slack_mrkdwn, sanitize_filename, split_mrkdwn,
-};
 use super::prompts::Prompts;
 use super::turns::{Turn, TurnRunner, TurnSurface};
 use crate::channels::{ChannelHub, ChannelRuntimeDeps};
@@ -24,7 +21,12 @@ use crate::types::{ApprovalResponse, GoalConfirmationStyle, MediaKind, MediaMess
 use crate::types::{
     ChannelContext, ChannelVisibility, UserRole, WorkspaceAccessLevel, WorkspaceGrant,
 };
+use aidaemon_channel_slack::format::{
+    markdown_to_mrkdwn as markdown_to_slack_mrkdwn, split_mrkdwn,
+};
+use aidaemon_channels::slash::build_help_text;
 use aidaemon_channels::Channel as _;
+use aidaemon_events::attachments::sanitize_filename;
 
 /// Longest plain-text message posted here (Slack's text limit is 40,000;
 /// leave margin). Text in a Block Kit section is limited to the adapter's

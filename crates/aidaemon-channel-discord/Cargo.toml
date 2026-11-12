@@ -22,9 +22,23 @@ publish = false
 # tokio-tungstenite has no inflate of its own, so this is the crate's one
 # optional dependency; a build without the feature connects uncompressed.
 zlib = ["dep:flate2"]
+# The bot an application runs (`bot::DiscordBot`): access, sessions,
+# commands and files on the shared turn runner.
+bot = [
+    "dep:aidaemon-core",
+    "dep:aidaemon-events",
+    "dep:aidaemon-tools",
+    "dep:anyhow",
+    "dep:uuid",
+]
 
 [dependencies]
 aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+anyhow = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 async-trait = "0.1"
 flate2 = { version = "1", optional = true }
 futures = "0.3"

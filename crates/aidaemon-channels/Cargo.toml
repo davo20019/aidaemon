@@ -26,6 +26,9 @@ conformance = ["testing", "aidaemon-core/testing"]
 # Exposes `aidaemon_channels::download`, the bounded downloader the HTTP-based
 # adapters share.
 http = ["dep:reqwest"]
+# `/checkpoints` and `/rollback` (`admin_commands::CheckpointCommands`) over
+# aidaemon-tools' filesystem checkpoints.
+checkpoints = ["aidaemon-tools/checkpoints"]
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }

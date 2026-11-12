@@ -6,14 +6,14 @@ use tracing::{info, warn};
 use crate::channels::DiscordChannel;
 #[cfg(feature = "slack")]
 use crate::channels::SlackChannel;
-use crate::channels::{ChannelHub, ChannelRuntimeDeps, TelegramChannel};
+use crate::channels::{new_telegram_bot, ChannelHub, ChannelRuntimeDeps, TelegramBot};
 use crate::config::AppConfig;
 use crate::traits::HubChannel;
 
 pub struct ChannelBundle {
     pub channels: Vec<Arc<dyn HubChannel>>,
-    pub telegram_bots: Vec<Arc<TelegramChannel>>,
-    pub dynamic_telegram_bots: Vec<Arc<TelegramChannel>>,
+    pub telegram_bots: Vec<Arc<TelegramBot>>,
+    pub dynamic_telegram_bots: Vec<Arc<TelegramBot>>,
     #[cfg(feature = "discord")]
     pub discord_bots: Vec<Arc<DiscordChannel>>,
     #[cfg(feature = "discord")]
@@ -75,7 +75,7 @@ impl ChannelBundle {
     pub fn startup_recipients(
         &self,
         config: &AppConfig,
-    ) -> Option<(Arc<crate::channels::TelegramChannel>, Vec<u64>)> {
+    ) -> Option<(Arc<crate::channels::TelegramBot>, Vec<u64>)> {
         let bot = self.telegram_bots.first()?.clone();
         let users = config.all_telegram_bots().first()?.allowed_user_ids.clone();
         Some((bot, users))
@@ -170,8 +170,8 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     let make_telegram = |bot_token: &str,
                          allowed_user_ids: Vec<u64>,
                          webhook: crate::config::TelegramWebhookConfig|
-     -> Arc<TelegramChannel> {
-        Arc::new(TelegramChannel::new(
+     -> Arc<TelegramBot> {
+        Arc::new(new_telegram_bot(
             bot_token,
             allowed_user_ids,
             webhook,
@@ -196,7 +196,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
     }
 
     let mut seen_bot_credentials = std::collections::HashSet::new();
-    let telegram_bots: Vec<Arc<TelegramChannel>> = config
+    let telegram_bots: Vec<Arc<TelegramBot>> = config
         .all_telegram_bots()
         .into_iter()
         .filter_map(|bot_config| {
@@ -236,7 +236,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                         allowed_user_ids: Vec<u64>,
                         guild_id: Option<u64>|
      -> Arc<DiscordChannel> {
-        Arc::new(DiscordChannel::new(
+        Arc::new(crate::channels::discord::new_discord_bot(
             bot_token,
             allowed_user_ids,
             discord_owner_ids.clone(),
@@ -302,7 +302,7 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
         })
         .collect();
 
-    let mut dynamic_telegram_bots: Vec<Arc<TelegramChannel>> = Vec::new();
+    let mut dynamic_telegram_bots: Vec<Arc<TelegramBot>> = Vec::new();
     #[cfg(feature = "discord")]
     let mut dynamic_discord_bots: Vec<Arc<DiscordChannel>> = Vec::new();
     #[cfg(feature = "slack")]

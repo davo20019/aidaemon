@@ -13,11 +13,13 @@
 //! The runner is [`ChannelRunner`]; see [`runner`] for how to wire an agent,
 //! an [`EventRouter`] and channels together.
 
+pub mod admin_commands;
 #[cfg(feature = "conformance")]
 pub mod approval_conformance;
 pub mod approval_render;
 mod approvals;
 pub mod attachments;
+pub mod bot;
 pub mod channel;
 pub mod commands;
 #[cfg(feature = "conformance")]

@@ -28,6 +28,8 @@
 //! [`DiscordChannel::with_zlib_compression`] turns on `zlib-stream` transport
 //! compression.
 
+#[cfg(feature = "bot")]
+pub mod bot;
 mod format;
 mod gateway;
 mod mapping;

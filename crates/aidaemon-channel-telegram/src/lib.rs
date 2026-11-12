@@ -14,6 +14,8 @@
 //! ```
 
 mod api;
+#[cfg(feature = "bot")]
+pub mod bot;
 pub mod bot_api;
 mod callback;
 mod channel;
