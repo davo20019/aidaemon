@@ -3,19 +3,141 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::config::HttpAuthProfile;
-use crate::tools::sanitize::sanitize_external_content;
-use crate::tools::web_fetch::validate_url_for_ssrf;
-use crate::traits::{
-    AuthorizationPreflightRecord, AuthorizationPreflightStatus, Tool, ToolCallContext,
-    ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+use crate::sanitize::sanitize_external_content;
+use crate::semantics::{
+    AuthorizationPreflightRecord, AuthorizationPreflightStatus, ToolCallContext, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
+use crate::web::validate_url_for_ssrf;
+use crate::OutcomeTool as Tool;
+
+/// The OAuth tokens behind some auth profiles, kept fresh by the host.
+#[async_trait]
+pub trait OAuthTokens: Send + Sync {
+    /// The scopes granted to `profile` when the host manages it as an OAuth
+    /// connection, else `None` (the tool then never asks it to refresh).
+    async fn managed_scopes(&self, profile: &str) -> Option<Vec<String>>;
+    /// Refresh `profile`'s access token now; returns a short summary.
+    async fn refresh_token(&self, profile: &str) -> anyhow::Result<String>;
+    /// Refresh `profile`'s access token if it is about to expire; `true`
+    /// when it did.
+    async fn refresh_access_token_if_needed(&self, profile: &str) -> anyhow::Result<bool>;
+}
+
+/// How an [`HttpAuthProfile`] authenticates.
+#[derive(Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAuthType {
+    Oauth1a,
+    Bearer,
+    Header,
+    Basic,
+}
+
+impl std::fmt::Debug for HttpAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpAuthType::Oauth1a => write!(f, "oauth1a"),
+            HttpAuthType::Bearer => write!(f, "bearer"),
+            HttpAuthType::Header => write!(f, "header"),
+            HttpAuthType::Basic => write!(f, "basic"),
+        }
+    }
+}
+
+/// Credentials `http_request` may attach to requests for the allowed domains
+/// (`[http_auth.<name>]` in the daemon's config).
+#[derive(Deserialize, Clone)]
+pub struct HttpAuthProfile {
+    pub auth_type: HttpAuthType,
+    pub allowed_domains: Vec<String>,
+    // OAuth 1.0a fields
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_secret: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub access_token_secret: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    // Bearer token
+    #[serde(default)]
+    pub token: Option<String>,
+    // Header auth
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub header_value: Option<String>,
+    // Basic auth
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// Format an optional secret for Debug output without its value.
+fn redact_option(secret: &Option<String>) -> &'static str {
+    match secret {
+        Some(s) if !s.is_empty() => "Some([REDACTED])",
+        Some(_) => "Some(\"\")",
+        None => "None",
+    }
+}
+
+impl std::fmt::Debug for HttpAuthProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAuthProfile")
+            .field("auth_type", &self.auth_type)
+            .field("allowed_domains", &self.allowed_domains)
+            .field("api_key", &redact_option(&self.api_key))
+            .field("api_secret", &redact_option(&self.api_secret))
+            .field("access_token", &redact_option(&self.access_token))
+            .field(
+                "access_token_secret",
+                &redact_option(&self.access_token_secret),
+            )
+            .field("user_id", &self.user_id)
+            .field("token", &redact_option(&self.token))
+            .field("header_name", &self.header_name)
+            .field("header_value", &redact_option(&self.header_value))
+            .field("username", &self.username)
+            .field("password", &redact_option(&self.password))
+            .finish()
+    }
+}
+
+impl HttpAuthProfile {
+    /// Collect all credential values for this profile (for stripping from error messages).
+    pub fn credential_values(&self) -> Vec<&str> {
+        let mut vals = Vec::new();
+        for v in [
+            &self.api_key,
+            &self.api_secret,
+            &self.access_token,
+            &self.access_token_secret,
+            &self.token,
+            &self.header_value,
+            &self.password,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !v.is_empty() {
+                vals.push(v.as_str());
+            }
+        }
+        vals
+    }
+}
 
 /// Maximum number of redirect hops to follow.
 const MAX_REDIRECTS: usize = 5;
@@ -41,7 +163,7 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 
 pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
-    oauth_gateway: Arc<RwLock<Option<crate::oauth::OAuthGateway>>>,
+    oauth_gateway: Arc<RwLock<Option<Arc<dyn OAuthTokens>>>>,
     #[cfg(test)]
     oauth_refresh_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -59,20 +181,20 @@ impl HttpRequestTool {
         }
     }
 
-    pub fn with_oauth_gateway(mut self, gateway: crate::oauth::OAuthGateway) -> Self {
-        self.oauth_gateway = Arc::new(RwLock::new(Some(gateway)));
+    pub fn with_oauth_gateway(mut self, gateway: impl OAuthTokens + 'static) -> Self {
+        self.oauth_gateway = Arc::new(RwLock::new(Some(Arc::new(gateway))));
         self
     }
 
-    pub async fn set_oauth_gateway(&self, gateway: crate::oauth::OAuthGateway) {
+    pub async fn set_oauth_gateway(&self, gateway: impl OAuthTokens + 'static) {
         let mut guard = self.oauth_gateway.write().await;
-        *guard = Some(gateway);
+        *guard = Some(Arc::new(gateway));
     }
 
     /// Check if a request domain is allowed by the profile's allowed_domains.
     /// Supports exact match and subdomain match (api.twitter.com matches twitter.com)
     /// but NOT suffix tricks (evil-twitter.com does NOT match twitter.com).
-    pub(crate) fn domain_matches(request_domain: &str, allowed: &str) -> bool {
+    pub fn domain_matches(request_domain: &str, allowed: &str) -> bool {
         let req = request_domain.to_lowercase();
         let allow = allowed.to_lowercase();
         if req == allow {
@@ -374,10 +496,10 @@ impl HttpRequestTool {
         format!("{kind}:{encoded}")
     }
 
-    pub(crate) const AUTH_PROFILE_NAMESPACE: &'static str = "auth_profile:";
-    pub(crate) const ACCOUNT_NAMESPACE: &'static str = "account:";
+    pub const AUTH_PROFILE_NAMESPACE: &'static str = "auth_profile:";
+    pub const ACCOUNT_NAMESPACE: &'static str = "account:";
 
-    pub(crate) fn auth_profile_resource_id(profile_name: &str) -> String {
+    pub fn auth_profile_resource_id(profile_name: &str) -> String {
         Self::scoped_resource_id("auth_profile", profile_name)
     }
 
@@ -470,7 +592,7 @@ impl HttpRequestTool {
     /// Records that `text` was truncated at `max_response_bytes` without
     /// embedding a notice in the returned body. The body is echoed back
     /// unchanged; the loop renders the instructional notice from the
-    /// returned `TruncationInfo` (see `crate::utils::render_truncation_notice`)
+    /// returned `TruncationInfo` (see `render_truncation_notice`)
     /// instead of a passive marker baked into tool output.
     fn truncate_marker(text: &str, max_response_bytes: u64) -> (String, Option<TruncationInfo>) {
         let chars = text.chars().count();
@@ -832,7 +954,7 @@ impl HttpRequestTool {
     }
 
     /// Apply auth to a request builder based on profile auth_type.
-    pub(crate) fn apply_auth(
+    pub fn apply_auth(
         builder: reqwest::RequestBuilder,
         profile: &HttpAuthProfile,
         method: &str,
@@ -840,7 +962,7 @@ impl HttpRequestTool {
         body: Option<&str>,
         content_type: Option<&str>,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
-        use crate::config::HttpAuthType;
+        use HttpAuthType;
         match profile.auth_type {
             HttpAuthType::Oauth1a => {
                 let auth_header =
@@ -937,7 +1059,7 @@ impl HttpRequestTool {
         let Some(gateway) = gateway else {
             return Ok(None);
         };
-        if gateway.get_provider(profile_name).await.is_none() {
+        if gateway.managed_scopes(profile_name).await.is_none() {
             return Ok(None);
         }
         let result = gateway.refresh_token(profile_name).await?;
@@ -949,7 +1071,7 @@ impl HttpRequestTool {
         let Some(gateway) = gateway else {
             return Ok(false);
         };
-        if gateway.get_provider(profile_name).await.is_none() {
+        if gateway.managed_scopes(profile_name).await.is_none() {
             return Ok(false);
         }
         gateway.refresh_access_token_if_needed(profile_name).await
@@ -1061,7 +1183,7 @@ impl HttpRequestTool {
             );
         }
 
-        let refresh_result = if matches!(profile.auth_type, crate::config::HttpAuthType::Bearer) {
+        let refresh_result = if matches!(profile.auth_type, HttpAuthType::Bearer) {
             match self.refresh_expiring_oauth_profile(profile_name).await {
                 Ok(true) => {
                     let Some(refreshed) = self.profiles.read().await.get(profile_name).cloned()
@@ -1095,17 +1217,17 @@ impl HttpRequestTool {
             value.is_some_and(|value| !value.trim().is_empty() && value.trim() == value)
         };
         let credentials_ready = match profile.auth_type {
-            crate::config::HttpAuthType::Oauth1a => {
+            HttpAuthType::Oauth1a => {
                 present(profile.api_key.as_deref())
                     && present(profile.api_secret.as_deref())
                     && present(profile.access_token.as_deref())
                     && present(profile.access_token_secret.as_deref())
             }
-            crate::config::HttpAuthType::Bearer => present(profile.token.as_deref()),
-            crate::config::HttpAuthType::Header => {
+            HttpAuthType::Bearer => present(profile.token.as_deref()),
+            HttpAuthType::Header => {
                 present(profile.header_name.as_deref()) && present(profile.header_value.as_deref())
             }
-            crate::config::HttpAuthType::Basic => {
+            HttpAuthType::Basic => {
                 present(profile.username.as_deref()) && present(profile.password.as_deref())
             }
         };
@@ -1132,8 +1254,8 @@ impl HttpRequestTool {
         );
         let mut ready = make(AuthorizationPreflightStatus::Ready, None);
         if let Some(gateway) = self.oauth_gateway.read().await.clone() {
-            if let Some(provider) = gateway.get_provider(profile_name).await {
-                ready.authorized_scopes = provider.scopes;
+            if let Some(scopes) = gateway.managed_scopes(profile_name).await {
+                ready.authorized_scopes = scopes;
                 ready.authorized_scopes.sort();
                 ready.authorized_scopes.dedup();
             }
@@ -1247,7 +1369,7 @@ impl HttpRequestTool {
                     }
                     // The connection never opened, so nothing was sent.
                     if retry_count >= MAX_TRANSIENT_RETRIES {
-                        return Err(crate::traits::NothingSentError(text).into());
+                        return Err(crate::NothingSentError(text).into());
                     }
                     retry_count += 1;
                     let backoff = crate::backoff::exponential_backoff(
@@ -1395,13 +1517,11 @@ impl HttpRequestTool {
         ) {
             return None;
         }
-        crate::tools::web_fetch::local_site_key(url)
+        crate::web::local_site_key(url)
     }
 
     fn redirect_stays_on_local_site(local_site: Option<&str>, next_url: &str) -> bool {
-        local_site.is_some_and(|site| {
-            crate::tools::web_fetch::local_site_key(next_url).as_deref() == Some(site)
-        })
+        local_site.is_some_and(|site| crate::web::local_site_key(next_url).as_deref() == Some(site))
     }
 
     /// The owner approval a request needs (H7), from its arguments as the
@@ -1410,9 +1530,7 @@ impl HttpRequestTool {
     /// (one card per site, naming only the site); anything else asks, High
     /// risk, with subject `"{METHOD} {url}"` (the canonical URL, so grants
     /// match it exactly) and up to 500 characters of the body in the summary.
-    pub(crate) fn owner_approval_request(
-        args: &Value,
-    ) -> Option<aidaemon_core::OwnerApprovalRequest> {
+    pub fn owner_approval_request(args: &Value) -> Option<aidaemon_core::OwnerApprovalRequest> {
         let mut args = args.clone();
         let url = args["url"]
             .as_str()
@@ -1483,10 +1601,10 @@ impl HttpRequestTool {
 
     /// Whether the kernel's approval covers a request with this approval
     /// subject (`METHOD url`, canonical URL).
-    fn scope_covers(scope: Option<&crate::traits::ApprovalScope>, subject: &str) -> bool {
+    fn scope_covers(scope: Option<&crate::semantics::ApprovalScope>, subject: &str) -> bool {
         match scope {
-            Some(crate::traits::ApprovalScope::Call) => true,
-            Some(crate::traits::ApprovalScope::Request { method, url }) => {
+            Some(crate::semantics::ApprovalScope::Call) => true,
+            Some(crate::semantics::ApprovalScope::Request { method, url }) => {
                 let url = reqwest::Url::parse(url)
                     .map(|url| url.to_string())
                     .unwrap_or_else(|_| url.clone());
@@ -1501,7 +1619,7 @@ impl HttpRequestTool {
         arguments: &str,
         mandate_preapproved: bool,
         mandate_execution: bool,
-        kernel_approved: Option<&crate::traits::ApprovalScope>,
+        kernel_approved: Option<&crate::semantics::ApprovalScope>,
     ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
@@ -1733,9 +1851,9 @@ impl HttpRequestTool {
         // requests deliberately are not replayed after a 401, so this preflight
         // keeps long-running mandates healthy without weakening that rule.
         if let Some(profile_name) = auth_profile_name {
-            let is_bearer_profile = profile.as_ref().is_some_and(|resolved| {
-                matches!(resolved.auth_type, crate::config::HttpAuthType::Bearer)
-            });
+            let is_bearer_profile = profile
+                .as_ref()
+                .is_some_and(|resolved| matches!(resolved.auth_type, HttpAuthType::Bearer));
             if is_bearer_profile {
                 match self.refresh_expiring_oauth_profile(profile_name).await {
                     Ok(false) => {}
@@ -1822,9 +1940,9 @@ impl HttpRequestTool {
             }
         } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(profile_name) = auth_profile_name {
-                let is_bearer_profile = profile.as_ref().is_some_and(|resolved| {
-                    matches!(resolved.auth_type, crate::config::HttpAuthType::Bearer)
-                });
+                let is_bearer_profile = profile
+                    .as_ref()
+                    .is_some_and(|resolved| matches!(resolved.auth_type, HttpAuthType::Bearer));
                 if is_bearer_profile {
                     match self.try_refresh_oauth_profile(profile_name).await {
                         Ok(Some(refresh_message)) => {
@@ -2137,9 +2255,9 @@ impl Tool for HttpRequestTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let status_tx = crate::traits::status_sender(facts);
+        facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
+        let status_tx = crate::status::status_sender(facts);
         let exec_ctx = facts.clone();
 
         let _ = status_tx;
@@ -2244,13 +2362,13 @@ impl Tool for HttpRequestTool {
 }
 
 #[async_trait::async_trait]
-impl crate::traits::ToolSemantics for HttpRequestTool {
+impl crate::semantics::ToolSemantics for HttpRequestTool {
     /// A body declared as JSON must parse. Rejected here, before any grant is
     /// reserved or byte is sent, the caller can fix it and call again.
     fn validate_arguments(
         &self,
         arguments: &str,
-    ) -> Result<(), crate::traits::ToolArgumentContractViolation> {
+    ) -> Result<(), crate::semantics::ToolArgumentContractViolation> {
         let Ok(args) = serde_json::from_str::<Value>(arguments) else {
             return Ok(());
         };
@@ -2265,7 +2383,7 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
         };
         match serde_json::from_str::<Value>(body) {
             Ok(_) => Ok(()),
-            Err(error) => Err(crate::traits::ToolArgumentContractViolation::new(format!(
+            Err(error) => Err(crate::semantics::ToolArgumentContractViolation::new(format!(
                 "`body` is not valid JSON ({error}) although content_type is {content_type}; nothing was sent"
             ))
             .with_recovery_hint(
@@ -2274,10 +2392,10 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
         }
     }
 
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+    fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
+        crate::semantics::ToolDispatchFacts {
             always_offered: true,
-            network_reach: crate::traits::NetworkReach::PublicAndLoopback,
+            network_reach: crate::semantics::NetworkReach::PublicAndLoopback,
             ..Default::default()
         }
     }
@@ -2288,15 +2406,15 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
     /// asks, High risk.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &crate::semantics::ApprovalCall<'_>,
         facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> crate::semantics::OwnerApprovalNeed {
         if facts.trusted_session || facts.mandate_preapproved {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return crate::semantics::OwnerApprovalNeed::NotNeeded;
         }
         match Self::owner_approval_request(call.arguments) {
-            Some(request) => crate::traits::OwnerApprovalNeed::Ask(request),
-            None => crate::traits::OwnerApprovalNeed::NotNeeded,
+            Some(request) => crate::semantics::OwnerApprovalNeed::Ask(request),
+            None => crate::semantics::OwnerApprovalNeed::NotNeeded,
         }
     }
 
@@ -2310,13 +2428,13 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
         }
     }
 
-    fn stable_observation_subjects(&self) -> Vec<crate::traits::StableObservationSubject> {
+    fn stable_observation_subjects(&self) -> Vec<crate::semantics::StableObservationSubject> {
         vec![
-            crate::traits::StableObservationSubject::namespace(
+            crate::semantics::StableObservationSubject::namespace(
                 Self::AUTH_PROFILE_NAMESPACE,
                 "auth profile a request used",
             ),
-            crate::traits::StableObservationSubject::namespace(
+            crate::semantics::StableObservationSubject::namespace(
                 Self::ACCOUNT_NAMESPACE,
                 "account a request was bound to",
             ),
@@ -2358,7 +2476,7 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
         if Self::recover_embedded_tool_params_from_url(&mut args, &mut url).is_err() {
             return aidaemon_core::CallEffects::unknown();
         }
-        let Some(host) = crate::tools::command_effects::url_host_effect(&url) else {
+        let Some(host) = crate::command_effects::url_host_effect(&url) else {
             return aidaemon_core::CallEffects::unknown();
         };
         let mut keys = vec![host];
@@ -2384,9 +2502,9 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
     fn call_annotations_in(
         &self,
         arguments: &str,
-        _roots: &crate::traits::TrustRoots<'_>,
+        _roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
-        let mut annotations = crate::traits::default_call_annotations(
+        let mut annotations = crate::semantics::default_call_annotations(
             self.capabilities(),
             &self.call_semantics(arguments),
         );
@@ -2453,7 +2571,7 @@ impl crate::traits::ToolSemantics for HttpRequestTool {
                 .with_verification_mode(ToolVerificationMode::ResultContent)
                 .with_target_hint(ToolTargetHintKind::Url, url.clone())
         };
-        if let Some(operation) = crate::traits::ToolCallOperation::from_http_method(&method) {
+        if let Some(operation) = crate::semantics::ToolCallOperation::from_http_method(&method) {
             semantics = semantics.with_operation(operation);
         }
         if let Some(resource_id) = auth_profile_resource {
@@ -2481,7 +2599,7 @@ mod tests {
             if let Some(content_type) = content_type {
                 args["content_type"] = json!(content_type);
             }
-            crate::traits::prepare_invocation(&tool, &args.to_string())
+            crate::semantics::prepare_invocation(&tool, &args.to_string())
         };
         let rejected = call("{\"text\":\"hello\"", Some("application/json")).unwrap_err();
         assert!(
@@ -2496,8 +2614,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::traits::ToolCalls as _;
-    use crate::traits::ToolSemantics;
+    use crate::semantics::ToolSemantics;
+    use crate::testing::ToolCalls as _;
 
     #[test]
     fn a_local_site_read_asks_the_owner_naming_only_the_site() {
@@ -2586,7 +2704,7 @@ mod tests {
                 &args,
                 false,
                 false,
-                Some(&crate::traits::ApprovalScope::Call),
+                Some(&crate::semantics::ApprovalScope::Call),
             )
             .await;
         match approved {
@@ -2621,7 +2739,6 @@ mod tests {
             assert!(text.contains("localhost"), "{text}");
         }
     }
-    use crate::config::{HttpAuthProfile, HttpAuthType};
 
     #[test]
     fn retries_reads_on_5xx_and_writes_only_on_503() {
@@ -3387,7 +3504,7 @@ mod tests {
                 &json!({"method": "POST", "url": url, "body": "x"}).to_string(),
                 None,
                 ToolCallContext {
-                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
+                    kernel_approved: Some(crate::semantics::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -3538,9 +3655,7 @@ mod tests {
             )
             .await
             .expect_err("a closed port cannot answer");
-        assert!(error
-            .downcast_ref::<crate::traits::NothingSentError>()
-            .is_some());
+        assert!(error.downcast_ref::<crate::NothingSentError>().is_some());
     }
 
     #[tokio::test]
@@ -4189,7 +4304,7 @@ mod tests {
                 }"#,
                 None,
                 ToolCallContext {
-                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
+                    kernel_approved: Some(crate::semantics::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4353,7 +4468,7 @@ mod tests {
         let tool = local_tool();
         let raw = arguments.to_string();
         let info = aidaemon_core::ToolInfo {
-            annotations: tool.call_annotations_in(&raw, &crate::traits::TrustRoots::new(&[])),
+            annotations: tool.call_annotations_in(&raw, &crate::semantics::TrustRoots::new(&[])),
             access: aidaemon_core::AccessManifest::default(),
             effects: tool.call_effects(&raw),
             outbound: Default::default(),
@@ -4453,7 +4568,7 @@ mod tests {
                 &args,
                 None,
                 ToolCallContext {
-                    kernel_approved: Some(crate::traits::ApprovalScope::Call),
+                    kernel_approved: Some(crate::semantics::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
@@ -4473,7 +4588,7 @@ mod tests {
     async fn a_request_scope_covers_only_its_exact_request() {
         let (url, count, server) = spawn_counting_status_server("200 OK").await;
         let scoped = |method: &str, url: &str| ToolCallContext {
-            kernel_approved: Some(crate::traits::ApprovalScope::Request {
+            kernel_approved: Some(crate::semantics::ApprovalScope::Request {
                 method: method.to_string(),
                 url: url.to_string(),
             }),
@@ -4531,7 +4646,7 @@ mod tests {
         assert!(
             result.contains("HTTP 200"),
             "expected HTTP 200, got: {}",
-            crate::utils::truncate_str(&result, 400)
+            crate::text::truncate_str(&result, 400)
         );
         // The corruption-regression assertions:
         assert!(
@@ -4551,7 +4666,7 @@ mod tests {
 
     mod call_effects {
         use super::*;
-        use crate::traits::ToolSemantics;
+        use crate::semantics::ToolSemantics;
         use aidaemon_core::{EffectClass, EffectKey};
 
         fn tool() -> HttpRequestTool {

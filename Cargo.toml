@@ -195,6 +195,7 @@ aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] 
 aidaemon-eval = { path = "crates/aidaemon-eval" }
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
 aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
+aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
 aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
 tempfile = "3"
 proptest = "1"

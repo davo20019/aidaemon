@@ -2990,54 +2990,8 @@ pub struct CliToolConfig {
     pub max_output_chars: Option<usize>,
 }
 
-#[derive(Deserialize, Clone)]
-pub struct SearchConfig {
-    #[serde(default)]
-    pub backend: SearchBackendKind,
-    #[serde(default)]
-    pub api_key: String,
-    /// Base URL of a self-hosted SearxNG instance, wherever the user hosts it
-    /// (e.g. "http://localhost:8080" for the default Docker setup).
-    /// When set, SearxNG becomes available as a search backend.
-    #[serde(default)]
-    pub searxng_url: String,
-    /// When true (default), web_search queries every configured backend in
-    /// parallel and merges the results. When false, only `backend` is used.
-    #[serde(default = "default_true")]
-    pub parallel: bool,
-}
-
-impl Default for SearchConfig {
-    fn default() -> Self {
-        Self {
-            backend: SearchBackendKind::default(),
-            api_key: String::new(),
-            searxng_url: String::new(),
-            parallel: true,
-        }
-    }
-}
-
-impl fmt::Debug for SearchConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SearchConfig")
-            .field("backend", &self.backend)
-            .field("api_key", &redact(&self.api_key))
-            .field("searxng_url", &self.searxng_url)
-            .field("parallel", &self.parallel)
-            .finish()
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchBackendKind {
-    #[default]
-    #[serde(alias = "duckduckgo")]
-    DuckDuckGo,
-    Brave,
-    Searxng,
-}
+#[allow(unused_imports)]
+pub use aidaemon_tools::web_search::{SearchBackendKind, SearchConfig};
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HealthConfig {
@@ -3544,101 +3498,7 @@ fn default_people_reconnect_reminder_days() -> u32 {
     30
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum HttpAuthType {
-    Oauth1a,
-    Bearer,
-    Header,
-    Basic,
-}
-
-impl fmt::Debug for HttpAuthType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpAuthType::Oauth1a => write!(f, "oauth1a"),
-            HttpAuthType::Bearer => write!(f, "bearer"),
-            HttpAuthType::Header => write!(f, "header"),
-            HttpAuthType::Basic => write!(f, "basic"),
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
-pub struct HttpAuthProfile {
-    pub auth_type: HttpAuthType,
-    pub allowed_domains: Vec<String>,
-    // OAuth 1.0a fields
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_secret: Option<String>,
-    #[serde(default)]
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub access_token_secret: Option<String>,
-    #[serde(default)]
-    pub user_id: Option<String>,
-    // Bearer token
-    #[serde(default)]
-    pub token: Option<String>,
-    // Header auth
-    #[serde(default)]
-    pub header_name: Option<String>,
-    #[serde(default)]
-    pub header_value: Option<String>,
-    // Basic auth
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-}
-
-impl fmt::Debug for HttpAuthProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpAuthProfile")
-            .field("auth_type", &self.auth_type)
-            .field("allowed_domains", &self.allowed_domains)
-            .field("api_key", &redact_option(&self.api_key))
-            .field("api_secret", &redact_option(&self.api_secret))
-            .field("access_token", &redact_option(&self.access_token))
-            .field(
-                "access_token_secret",
-                &redact_option(&self.access_token_secret),
-            )
-            .field("user_id", &self.user_id)
-            .field("token", &redact_option(&self.token))
-            .field("header_name", &self.header_name)
-            .field("header_value", &redact_option(&self.header_value))
-            .field("username", &self.username)
-            .field("password", &redact_option(&self.password))
-            .finish()
-    }
-}
-
-impl HttpAuthProfile {
-    /// Collect all credential values for this profile (for stripping from error messages).
-    pub fn credential_values(&self) -> Vec<&str> {
-        let mut vals = Vec::new();
-        for v in [
-            &self.api_key,
-            &self.api_secret,
-            &self.access_token,
-            &self.access_token_secret,
-            &self.token,
-            &self.header_value,
-            &self.password,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !v.is_empty() {
-                vals.push(v.as_str());
-            }
-        }
-        vals
-    }
-}
+pub use aidaemon_tools::http_request::{HttpAuthProfile, HttpAuthType};
 
 /// Context window management configuration.
 /// Controls conversation history trimming, summarization, and progressive fact extraction.

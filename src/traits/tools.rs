@@ -2,11 +2,6 @@
 use async_trait::async_trait;
 #[cfg(test)]
 use serde_json::Value;
-#[cfg(test)]
-use tokio::sync::mpsc;
-
-#[cfg(test)]
-use crate::types::StatusUpdate;
 
 pub use aidaemon_tools::semantics::*;
 
@@ -21,43 +16,7 @@ pub use aidaemon_tools::NothingSentError;
 
 /// Calling a tool directly from a test.
 #[cfg(test)]
-#[async_trait]
-pub trait ToolCalls: Tool {
-    /// Run with no call facts and return the output text.
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        Ok(self
-            .execute(arguments, &ToolCallContext::default())
-            .await?
-            .output)
-    }
-
-    /// Run with a progress channel and return the typed outcome.
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(
-            arguments,
-            &with_status(ToolCallContext::default(), status_tx),
-        )
-        .await
-    }
-
-    /// Run with a progress channel and these call facts.
-    async fn call_with_execution_context(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        facts: ToolCallContext,
-    ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute(arguments, &with_status(facts, status_tx))
-            .await
-    }
-}
-
-#[cfg(test)]
-impl<T: Tool + ?Sized> ToolCalls for T {}
+pub use aidaemon_tools::testing::ToolCalls;
 
 #[cfg(test)]
 mod tests {

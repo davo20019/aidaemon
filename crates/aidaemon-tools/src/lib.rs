@@ -44,6 +44,7 @@ use aidaemon_core::Tool;
 
 pub mod backend;
 pub mod background_deliverable;
+pub mod backoff;
 mod checklist;
 pub mod command_effects;
 pub mod command_risk;
@@ -53,6 +54,7 @@ mod exec;
 pub mod file_delivery;
 mod fs;
 pub mod fs_utils;
+pub mod http_request;
 pub mod outcome;
 pub mod owner_answers;
 pub mod path_class;
@@ -65,9 +67,12 @@ pub mod semantics;
 pub mod services;
 mod shell;
 pub mod status;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod text;
 mod util;
 pub mod web;
+pub mod web_search;
 mod workspace;
 
 #[cfg(test)]

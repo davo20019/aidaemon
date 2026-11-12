@@ -1174,6 +1174,23 @@ fn urlencoded(s: &str) -> String {
     result
 }
 
+#[async_trait::async_trait]
+impl aidaemon_tools::http_request::OAuthTokens for OAuthGateway {
+    async fn managed_scopes(&self, profile: &str) -> Option<Vec<String>> {
+        self.get_provider(profile)
+            .await
+            .map(|provider| provider.scopes)
+    }
+
+    async fn refresh_token(&self, profile: &str) -> anyhow::Result<String> {
+        OAuthGateway::refresh_token(self, profile).await
+    }
+
+    async fn refresh_access_token_if_needed(&self, profile: &str) -> anyhow::Result<bool> {
+        OAuthGateway::refresh_access_token_if_needed(self, profile).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
