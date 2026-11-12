@@ -261,6 +261,11 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     ) -> BoxStream<'a, Result<StreamEvent, ProviderError>> {
         (**self).stream(request)
     }
+    // Forwarded like the calls: without it every `Arc<dyn Provider>` (the
+    // daemon's model backends) reported a used-up model as available.
+    fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
+        (**self).unavailable_until(model)
+    }
 }
 
 /// Retry layer: exponential backoff on retryable errors.
@@ -303,6 +308,9 @@ impl<P: Provider> Retry<P> {
 impl<P: Provider> Provider for Retry<P> {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+    fn unavailable_until(&self, model: &str) -> Option<std::time::SystemTime> {
+        self.inner.unavailable_until(model)
     }
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
