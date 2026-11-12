@@ -1754,15 +1754,25 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         out.opaque();
     }
-    // A `cd` anywhere moves where relative paths resolve, and a redirect is
-    // applied before its own segment runs: no relative path is known.
+    // A `cd` moves where later relative paths resolve, so the scan follows
+    // it: a literal `cd DIR` that the rest of the script runs after (`&&`,
+    // `||`, `;` or a new line) moves the directory paths resolve against.
+    // Anything else (`pushd`/`popd`, a `cd` in a pipe, subshell or the
+    // background, or to an expanded word) leaves no relative path known.
+    // The call stays incomplete: a `cd` that fails before `;` leaves the
+    // script where it was. The same opaque script reworded around a `cd`
+    // then still declares the paths it changes, so an owner's decline binds
+    // it by effect, not by its text.
     let changes_directory = expanded_commands(command)
         .iter()
         .any(|tokens| matches!(basename(&tokens[0]), "cd" | "pushd" | "popd"));
     if changes_directory {
         out.unresolved();
     }
-    let cwd = cwd.filter(|_| !changes_directory);
+    let mut here: Option<String> = cwd
+        .map(str::trim)
+        .filter(|dir| dir.starts_with('/'))
+        .map(str::to_string);
     // Only text the shell executes yields keys: heredoc bodies, comments
     // and the inside of multi-line quoted strings are dropped first.
     for line in executed_text(&command.replace("\\\n", " ")).split('\n') {
@@ -1771,14 +1781,23 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
         if scanned.unsafe_syntax {
             out.opaque();
         }
+        // A redirect is applied before its own segment runs, so on a line
+        // that changes directory its target's directory is not known.
+        let line_moves = scanned.segments.iter().any(|segment| {
+            shell_words::split(segment).is_ok_and(|tokens| {
+                tokens
+                    .first()
+                    .is_some_and(|program| matches!(basename(program), "cd" | "pushd" | "popd"))
+            })
+        });
         for target in &scanned.output_targets {
-            if target.contains(['"', '\'']) {
+            if target.contains(['"', '\'']) || line_moves {
                 out.unresolved();
             } else {
-                out.path(EffectClass::Write, target, cwd);
+                out.path(EffectClass::Write, target, here.as_deref());
             }
         }
-        for segment in &scanned.segments {
+        for (index, segment) in scanned.segments.iter().enumerate() {
             if segment.trim().is_empty() {
                 continue;
             }
@@ -1789,7 +1808,21 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
                 out.opaque();
                 continue;
             };
-            segment_effects(&strip_redirections(tokens), cwd, &mut out);
+            let tokens = strip_redirections(tokens);
+            match tokens.first().map(|program| basename(program)) {
+                Some("cd") => {
+                    here = if scanned.separators.iter().any(|c| matches!(c, '(' | ')'))
+                        || !runs_on_after(&scanned, index)
+                        || has_expansion(segment)
+                    {
+                        None
+                    } else {
+                        changed_directory(&tokens[1..], here.as_deref())
+                    };
+                }
+                Some("pushd" | "popd") => here = None,
+                _ => segment_effects(&tokens, here.as_deref(), &mut out),
+            }
         }
     }
     // A launcher hides its program from the walk above (`sudo curl`,
@@ -1808,6 +1841,39 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
         }
     }
     out
+}
+
+/// Whether the rest of the script runs after segment `index` of a scanned
+/// line in the same shell: the line ends there, or it is followed by `;`,
+/// `&&` or `||`. A pipe or `&` runs it in its own process.
+fn runs_on_after(scanned: &Scan, index: usize) -> bool {
+    let doubled = |c: char| {
+        scanned
+            .segments
+            .get(index + 1)
+            .is_some_and(|next| next.trim().is_empty())
+            && scanned.separators.get(index + 1) == Some(&c)
+    };
+    match scanned.separators.get(index) {
+        None | Some(';') => true,
+        Some('&') => doubled('&'),
+        Some('|') => doubled('|'),
+        Some(_) => false,
+    }
+}
+
+/// The directory `cd ARGS` moves to from `here`: one literal operand,
+/// absolute or relative to a known `here`, normalized. `None` for anything
+/// else (`cd`, `cd -`, options, `~user`, expansion).
+fn changed_directory(args: &[String], here: Option<&str>) -> Option<String> {
+    let [target] = args else {
+        return None;
+    };
+    if target.starts_with('-') {
+        return None;
+    }
+    let absolute = structural_absolute_path(target, here)?;
+    EffectKey::path(EffectClass::Write, &absolute).map(|key| key.target)
 }
 
 /// Whether the shell would expand anything in `segment`: an unquoted brace,
@@ -3717,6 +3783,53 @@ mod tests {
                 CallEffects::unknown(),
                 "{observation}"
             );
+        }
+    }
+
+    /// A script that moves with `cd` before copying and deleting declares
+    /// the paths it changes there, and a reworded script with the same copy
+    /// declares the same write: an owner's decline binds the effect, not the
+    /// script's text.
+    #[test]
+    fn a_literal_cd_moves_where_later_paths_resolve() {
+        let dir = synthetic_dir();
+        let first = shell_call_effects(
+            &format!(
+                "cd {dir}\ncp -R tmp-drupal/. ./\necho \"copy exit: $?\"\nrm -rf tmp-drupal\nls -a"
+            ),
+            None,
+        );
+        assert!(!first.complete);
+        assert!(first.keys.contains(&write(&dir)), "{:?}", first.keys);
+        assert!(
+            first.keys.contains(&delete(&format!("{dir}/tmp-drupal"))),
+            "{:?}",
+            first.keys
+        );
+        // Reworded: no delete, other filler, run from another directory.
+        let reworded = shell_call_effects(
+            &format!("cd {dir} && cp -R tmp-drupal/. ./ ; ls -a"),
+            Some("/tmp/aidaemon-test/elsewhere"),
+        );
+        assert!(reworded
+            .keys
+            .iter()
+            .any(|key| first.keys.iter().any(|declined| declined.overlaps(key))));
+        // Relative `cd` from a known directory, and `||`.
+        let nested = shell_call_effects("cd sub || exit 1\nrm -f x", Some(&dir));
+        assert_eq!(nested.keys, vec![delete(&format!("{dir}/sub/x"))]);
+        // A `cd` the rest of the script does not run after, or to a word
+        // the shell expands, leaves relative paths unknown.
+        for command in [
+            format!("cd {dir} | true\nrm -f x"),
+            format!("cd {dir} & rm -f x"),
+            format!("(cd {dir}) ; rm -f x"),
+            "cd $HOME && rm -f x".to_string(),
+            "cd - && rm -f x".to_string(),
+            format!("pushd {dir} && rm -f x"),
+        ] {
+            let effects = shell_call_effects(&command, None);
+            assert!(effects.keys.is_empty(), "{command}: {:?}", effects.keys);
         }
     }
 

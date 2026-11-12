@@ -1928,6 +1928,10 @@ pub struct SubagentsConfig {
     pub max_iterations_cap: usize,
     #[serde(default = "default_subagents_max_response_chars")]
     pub max_response_chars: usize,
+    /// Seconds a sub-agent may go without progress (no tool call running,
+    /// no model reply or other event of its run) before it is stopped.
+    /// Never a limit on how long it works: a run is bounded by progress and
+    /// cost, so a long install that keeps making calls runs to its end.
     #[serde(default = "default_subagents_timeout_secs")]
     pub timeout_secs: u64,
     /// Iteration limit configuration. Defaults to Unlimited.

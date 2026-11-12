@@ -357,7 +357,7 @@ health_port = 8080
 # coordination = true        # refuse stale file writes across one request's agents; false restores last-writer-wins
 # max_escalations_per_child = 3    # questions a child may put to the top-level agent itself
 # max_escalations_per_request = 12 # escalations of any kind in one request
-# timeout_secs = 300       # 5 minute timeout per sub-agent
+# timeout_secs = 300       # stop a sub-agent after 5 minutes without progress (never for running long)
 
 # [files]
 # Channel file inbox/outbox, LLM vision, and generated-image artifact storage.

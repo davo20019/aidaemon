@@ -164,6 +164,14 @@ pub struct MidRunReading {
     pub answer: Option<String>,
 }
 
+/// A sub-agent running for a chat, as `/status` and `/tasks` list it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningChild {
+    /// The title its parent gave it (the spawn's mission, first line).
+    pub label: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Agent administration surface used by shared channel commands.
 #[async_trait]
 pub trait ChannelAgentRuntime: AgentIngress {
@@ -179,6 +187,11 @@ pub trait ChannelAgentRuntime: AgentIngress {
         None
     }
 
+    /// The sub-agents running now for `session_id` (waited on by a turn or
+    /// in the background), oldest first.
+    async fn running_children(&self, _session_id: &str) -> Vec<RunningChild> {
+        Vec::new()
+    }
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

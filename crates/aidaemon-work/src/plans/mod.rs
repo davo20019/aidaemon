@@ -80,6 +80,7 @@ impl TaskPlan {
                 expected_targets: Vec::new(),
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
+                waits_on_jobs: false,
                 not_done: None,
                 status: if index == 0 {
                     StepStatus::InProgress
@@ -370,6 +371,41 @@ impl TaskPlan {
         changed
     }
 
+    /// The turn handed its work to background jobs `job_ids` without naming
+    /// the steps they do (`checklist_items`): every step still open waits on
+    /// them, so the card reads "continuing in the background", never
+    /// "stopped short", while they run. Their end does not complete such a
+    /// step ([`PlanStep::waits_on_jobs`]). Returns whether anything changed.
+    pub fn wait_on_background_jobs(&mut self, job_ids: &[String]) -> bool {
+        if job_ids.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for step in &mut self.steps {
+            let open = matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+                || (step.status == StepStatus::Deferred && step.not_done.is_none());
+            if !open {
+                continue;
+            }
+            step.status = StepStatus::Background;
+            step.waits_on_jobs = true;
+            step.completed_at = None;
+            for job in job_ids {
+                if !step.background_jobs.contains(job) {
+                    step.background_jobs.push(job.clone());
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            if self.is_finished() {
+                self.status = self.resolved_status();
+            }
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
     /// Record the end of background job `job_id`: a step it served is
     /// completed once every job on it succeeded, and failed as soon as one
     /// did not. The plan resolves once nothing is left to run. Returns
@@ -386,11 +422,17 @@ impl TaskPlan {
             changed = true;
             if succeeded {
                 step.background_jobs.retain(|job| job != job_id);
-                if step.background_jobs.is_empty() {
+                if step.background_jobs.is_empty() && step.waits_on_jobs {
+                    // Nothing was handed this step: the jobs ending does not
+                    // do it.
+                    step.waits_on_jobs = false;
+                    step.status = StepStatus::Deferred;
+                } else if step.background_jobs.is_empty() {
                     step.status = StepStatus::Completed;
                     step.completed_at = Some(now);
                 }
             } else {
+                step.waits_on_jobs = false;
                 step.background_jobs.clear();
                 step.status = StepStatus::Failed;
                 step.completed_at = Some(now);
@@ -650,6 +692,13 @@ pub struct PlanStep {
     /// settles the step ([`TaskPlan::settle_background_job`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_jobs: Vec<String>,
+
+    /// The step was left open while the turn's background jobs ran, not
+    /// handed to them by a launch's `checklist_items`: it reads as running
+    /// while they do, and their end returns it to not done (failed if one
+    /// failed), since no job was given it. Only an update closes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waits_on_jobs: bool,
 
     /// Why a step that was not done was left undone, when the daemon knows it
     /// from typed state (never from the step's text). Such a step was held
@@ -1092,6 +1141,52 @@ mod tests {
             .starts_with("❌ Stopped · 2 of 4 done"));
         // A job nothing waits on changes nothing.
         assert!(!plan.settle_background_job("job-c", true));
+    }
+
+    /// A turn that hands work to background jobs without linking its open
+    /// steps never reads "stopped short" or "not done" while they run, and
+    /// their end does not claim the steps were done.
+    #[test]
+    fn open_steps_wait_on_the_turns_background_jobs_without_being_claimed() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec![
+                "check tools".into(),
+                "install site a".into(),
+                "install site b".into(),
+            ],
+            "track_requirements",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        plan.steps[1].status = StepStatus::Deferred;
+        plan.steps[2].status = StepStatus::Deferred;
+        plan.status = PlanStatus::PartiallyCompleted;
+        assert!(plan
+            .render_compact_checklist()
+            .starts_with("⚠️ Stopped short"));
+
+        let jobs = vec!["job-a".to_string(), "job-b".to_string()];
+        assert!(plan.wait_on_background_jobs(&jobs));
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.starts_with("⏳ Continuing in the background · 1 of 3 done"),
+            "{card}"
+        );
+        assert!(
+            !card.contains("Stopped short") && !card.contains("not done"),
+            "{card}"
+        );
+
+        assert!(plan.settle_background_job("job-a", true));
+        assert!(plan
+            .render_compact_checklist()
+            .starts_with("⏳ Continuing in the background"));
+        assert!(plan.settle_background_job("job-b", true));
+        assert_eq!(plan.steps[1].status, StepStatus::Deferred);
+        assert_eq!(plan.steps[2].status, StepStatus::Deferred);
+        assert_ne!(plan.status, PlanStatus::Completed);
     }
 
     #[test]

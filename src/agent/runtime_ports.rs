@@ -296,6 +296,13 @@ impl ChannelAgentRuntime for Agent {
         Agent::cancel_active_finite_work_for_session(self, session_id).await
     }
 
+    async fn running_children(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_channels::ports::RunningChild> {
+        self.running_children.for_session(session_id)
+    }
+
     async fn current_model(&self) -> String {
         Agent::current_model(self).await
     }

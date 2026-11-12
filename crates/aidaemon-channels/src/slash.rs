@@ -274,8 +274,12 @@ pub struct StatusView {
     pub now: Option<String>,
     /// The chat's mode and when it ends; `None` is full access.
     pub mode: Option<(ChatMode, Option<DateTime<Utc>>)>,
-    /// Running chat tasks: id, description, when it started.
-    pub running: Vec<(u64, String, DateTime<Utc>)>,
+    /// Running chat turns: id and when it started. A turn is named by what
+    /// it is, never by the message that started it: that message may be a
+    /// reply ("Yes, move the files"), not a task.
+    pub running: Vec<(u64, DateTime<Utc>)>,
+    /// Sub-agents running for the chat, by the title they were given.
+    pub children: Vec<crate::ports::RunningChild>,
     pub next_scheduled: Option<ScheduledItem>,
 }
 
@@ -296,6 +300,9 @@ fn mode_line(mode: Option<(ChatMode, Option<DateTime<Utc>>)>, now: DateTime<Utc>
     }
 }
 
+/// How `/status` and `/tasks` name a chat turn.
+const TURN_LABEL: &str = "Working on your message";
+
 /// `/status`: the chat's mode, what is running and what is scheduled next.
 pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
     let mode = mode_line(view.mode, now);
@@ -303,15 +310,21 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         Some(local) => format!("It's {local}. {mode}"),
         None => mode,
     }];
-    if view.running.is_empty() {
+    if view.running.is_empty() && view.children.is_empty() {
         lines.push("Running: nothing right now.".to_string());
     } else {
         lines.push("Running:".to_string());
-        for (id, description, started) in &view.running {
+        for (id, started) in &view.running {
             lines.push(format!(
-                "• {} ({} so far, /cancel {id} to stop it)",
-                crate::presentation::word_preview(description, 80),
+                "• {TURN_LABEL} ({} so far, /cancel {id} to stop it)",
                 compact_chrono_duration(now - *started, ZeroUnitStyle::Trim)
+            ));
+        }
+        for child in &view.children {
+            lines.push(format!(
+                "• Sub-agent: {} ({} so far)",
+                crate::presentation::word_preview(&child.label, 80),
+                compact_chrono_duration(now - child.started_at, ZeroUnitStyle::Trim)
             ));
         }
     }
@@ -511,12 +524,13 @@ impl SharedCommands {
             .await
             .into_iter()
             .filter(|entry| matches!(entry.status, TaskStatus::Running))
-            .map(|entry| (entry.id, entry.description, entry.started_at))
+            .map(|entry| (entry.id, entry.started_at))
             .collect();
         let view = StatusView {
             now: self.host.owner_time(now),
             mode: self.host.chat_mode(session_id, now).await,
             running,
+            children: self.agent.running_children(session_id).await,
             next_scheduled: self.host.next_scheduled().await,
         };
         render_status(&view, now)
@@ -694,10 +708,12 @@ impl SharedCommands {
             .into_iter()
             .filter(|entry| !matches!(entry.status, TaskStatus::Completed))
             .collect::<Vec<_>>();
-        if entries.is_empty() {
+        let now = Utc::now();
+        let children = self.agent.running_children(session_id).await;
+        if entries.is_empty() && children.is_empty() {
             "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string()
         } else {
-            let lines: Vec<String> = entries
+            let mut lines: Vec<String> = entries
                 .iter()
                 .map(|e| {
                     let elapsed = match e.finished_at {
@@ -710,9 +726,16 @@ impl SharedCommands {
                             format!("{}s elapsed", d.num_seconds())
                         }
                     };
-                    format!("#{} [{}] {} ({})", e.id, e.status, e.description, elapsed)
+                    format!("#{} [{}] {TURN_LABEL} ({})", e.id, e.status, elapsed)
                 })
                 .collect();
+            lines.extend(children.iter().map(|child| {
+                format!(
+                    "Sub-agent [running] {} ({}s elapsed)",
+                    crate::presentation::word_preview(&child.label, 80),
+                    (now - child.started_at).num_seconds()
+                )
+            }));
             format!(
                 "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
                 lines.join("\n")
@@ -996,6 +1019,7 @@ mod help_and_status_tests {
             now: None,
             mode: None,
             running: Vec::new(),
+            children: Vec::new(),
             next_scheduled: None,
         };
         assert_eq!(
@@ -1005,11 +1029,11 @@ mod help_and_status_tests {
         let busy = StatusView {
             now: Some("2:05 PM ET".to_string()),
             mode: Some((ChatMode::ReadOnly, Some(now + chrono::Duration::hours(3)))),
-            running: vec![(
-                7,
-                "Read four files".to_string(),
-                now - chrono::Duration::minutes(2),
-            )],
+            running: vec![(7, now - chrono::Duration::minutes(2))],
+            children: vec![crate::ports::RunningChild {
+                label: "Install a Drupal demo site with DDEV".to_string(),
+                started_at: now - chrono::Duration::minutes(4),
+            }],
             next_scheduled: Some(ScheduledItem {
                 what: "Check disk space".to_string(),
                 when: "2:39 PM ET".to_string(),
@@ -1021,7 +1045,11 @@ mod help_and_status_tests {
             "{status}"
         );
         assert!(
-            status.contains("• Read four files (2m so far, /cancel 7 to stop it)"),
+            status.contains("• Working on your message (2m so far, /cancel 7 to stop it)"),
+            "{status}"
+        );
+        assert!(
+            status.contains("• Sub-agent: Install a Drupal demo site with DDEV (4m so far)"),
             "{status}"
         );
         assert!(

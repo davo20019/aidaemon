@@ -5016,7 +5016,11 @@ impl HubChannel for TelegramChannel {
             MediaKind::Document {
                 file_path,
                 filename,
-            } => (filename.clone(), tokio::fs::read(file_path).await?, None),
+            } => {
+                let bytes = tokio::fs::read(file_path).await?;
+                let mime_type = outbound_content_type(&bytes);
+                (filename.clone(), bytes, mime_type)
+            }
         };
         let conversation = aidaemon_channels::Conversation {
             id: chat_id.to_string(),
@@ -5609,6 +5613,14 @@ async fn run_legacy_status_consumer(
     }
 }
 
+/// The content type a file is sent with, from its bytes: an image is an
+/// image whichever tool sent it (a screenshot the browser took, or a PNG a
+/// sub-agent saved and `send_file` delivered), so the transport shows it as
+/// a photo; anything else goes as a document.
+fn outbound_content_type(bytes: &[u8]) -> Option<String> {
+    aidaemon_tools::sniff_image_mime(bytes).map(str::to_string)
+}
+
 #[cfg(test)]
 #[path = "telegram_sdk_tests.rs"]
 mod sdk_tests;
@@ -5616,6 +5628,20 @@ mod sdk_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file is sent by what it is: a PNG or JPEG gets an image type (shown
+    /// as a photo), anything else none (sent as a document).
+    #[test]
+    fn a_sent_files_type_comes_from_its_content() {
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(outbound_content_type(&png).as_deref(), Some("image/png"));
+        assert_eq!(
+            outbound_content_type(&[0xFF, 0xD8, 0xFF, 0xE0]).as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(outbound_content_type(b"%PDF-1.7 synthetic"), None);
+        assert_eq!(outbound_content_type(b"homepage.png but text"), None);
+    }
 
     #[test]
     fn a_status_backlog_keeps_the_newest_card_and_every_must_deliver() {

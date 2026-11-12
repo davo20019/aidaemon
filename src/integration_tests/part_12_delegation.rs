@@ -930,7 +930,6 @@ async fn run_limited_child(provider: MockProvider) -> crate::runtime_ports::Chil
             None,
             Some(crate::runtime_ports::ChildTimeLimit {
                 limit: std::time::Duration::from_millis(1_500),
-                detached: false,
             }),
             None,
         )
@@ -974,6 +973,91 @@ async fn test_child_past_its_limit_with_no_actions_is_safe_to_rerun() {
     ))
     .await;
     assert!(!timed_out.report.may_have_changed_something());
+}
+
+/// A child is bounded by progress, not elapsed time (Decision 1): one that
+/// keeps working well past its idle limit, with a tool call longer than the
+/// limit itself (an install that takes minutes), is never stopped.
+#[tokio::test]
+async fn test_a_slow_but_progressing_child_is_never_stopped() {
+    let step = |seconds: &str| {
+        MockProvider::tool_call_response(
+            "terminal",
+            &serde_json::json!({"command": format!("sleep {seconds} && echo synthetic-step")})
+                .to_string(),
+        )
+    };
+    let provider = MockProvider::with_responses(vec![
+        step("1"),
+        step("1"),
+        step("2.5"),
+        MockProvider::text_response("synthetic install finished"),
+    ]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
+        .await
+        .unwrap();
+    let agent = Arc::new(harness.agent);
+    let begun = std::time::Instant::now();
+    let running = agent.clone();
+    let run = tokio::spawn(async move {
+        running
+            .spawn_child_with_outcome(
+                "Install a synthetic site\nwith every step",
+                "synthetic task",
+                None,
+                ChannelContext::private("test"),
+                UserRole::Owner,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("telegram:synthetic-chat"),
+                None,
+                Some(crate::runtime_ports::ChildTimeLimit {
+                    limit: std::time::Duration::from_millis(1_500),
+                }),
+                None,
+            )
+            .await
+    });
+    // While it runs, the chat's `/status` and `/tasks` list it by its title.
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let children = aidaemon_channels::ports::ChannelAgentRuntime::running_children(
+                agent.as_ref(),
+                "telegram:synthetic-chat",
+            )
+            .await;
+            if !children.is_empty() {
+                break children;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the running child is listed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].label, "Install a synthetic site");
+    let run = run
+        .await
+        .unwrap()
+        .expect("a progressing child runs to its end");
+    assert!(
+        begun.elapsed() > std::time::Duration::from_secs(4),
+        "the child worked well past its idle limit: {:?}",
+        begun.elapsed()
+    );
+    assert!(run.response.contains("synthetic install finished"), "{}", run.response);
+    assert!(
+        aidaemon_channels::ports::ChannelAgentRuntime::running_children(
+            agent.as_ref(),
+            "telegram:synthetic-chat"
+        )
+        .await
+        .is_empty(),
+        "a finished child is no longer listed"
+    );
 }
 
 /// A child charges the tree it belongs to, so a request's budget covers all

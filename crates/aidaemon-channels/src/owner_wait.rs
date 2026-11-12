@@ -113,6 +113,92 @@ impl WorkDeadline {
     }
 }
 
+/// When a run last made progress: the end of a model or tool call, or any
+/// event of its own. A call in flight is progress being made (each call has
+/// its own bound: the model call timeout, a tool's timeout or stall
+/// watchdog), and time spent waiting for the owner never counts as idle. A
+/// child agent is stopped only after it has been idle for its limit, never
+/// for how long it has been running: long legitimate work (an install that
+/// takes minutes) keeps making calls.
+#[derive(Clone)]
+pub struct ProgressClock(Arc<Mutex<ProgressState>>, OwnerWaitClock);
+
+struct ProgressState {
+    /// The last progress: a call began or ended, or the run sent an event.
+    last: Instant,
+    /// The owner clock's total at `last`: waits after it are not idle.
+    waited_at_last: Duration,
+    /// Calls running now.
+    in_flight: usize,
+}
+
+/// Marks one call as running until dropped, however the call ends.
+pub struct InFlight(ProgressClock);
+
+impl ProgressClock {
+    pub fn starting_now(owner_wait: OwnerWaitClock) -> Self {
+        Self(
+            Arc::new(Mutex::new(ProgressState {
+                last: Instant::now(),
+                waited_at_last: owner_wait.waited(),
+                in_flight: 0,
+            })),
+            owner_wait,
+        )
+    }
+
+    /// Record progress now.
+    pub fn touch(&self) {
+        let waited = self.1.waited();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.last = Instant::now();
+        state.waited_at_last = waited;
+    }
+
+    /// A call begins; it is progress until the returned guard drops.
+    pub fn begin(&self) -> InFlight {
+        self.touch();
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).in_flight += 1;
+        InFlight(self.clone())
+    }
+
+    /// How long the run has made no progress: zero while a call runs, else
+    /// the time since the last progress less the owner waits since then.
+    pub fn idle(&self) -> Duration {
+        let waited = self.1.waited();
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.in_flight > 0 {
+            return Duration::ZERO;
+        }
+        state
+            .last
+            .elapsed()
+            .saturating_sub(waited.saturating_sub(state.waited_at_last))
+    }
+
+    /// Resolves once the run has been idle for `limit`, checking every
+    /// `check`.
+    pub async fn idle_for(&self, limit: Duration, check: Duration) {
+        loop {
+            let idle = self.idle();
+            if idle >= limit {
+                return;
+            }
+            tokio::time::sleep((limit - idle).min(check)).await;
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        {
+            let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        self.0.touch();
+    }
+}
+
 impl Drop for OwnerWaiting {
     fn drop(&mut self) {
         let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,5 +208,41 @@ impl Drop for OwnerWaiting {
                 state.waited += since.elapsed();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    const STEP: Duration = Duration::from_millis(60);
+
+    #[tokio::test]
+    async fn a_call_in_flight_is_never_idle_and_its_end_restarts_the_clock() {
+        let clock = ProgressClock::starting_now(OwnerWaitClock::default());
+        tokio::time::sleep(STEP).await;
+        assert!(clock.idle() >= STEP);
+        let call = clock.begin();
+        tokio::time::sleep(STEP * 3).await;
+        assert_eq!(clock.idle(), Duration::ZERO, "a long call is progress");
+        drop(call);
+        assert!(clock.idle() < STEP);
+        tokio::time::sleep(STEP).await;
+        assert!(clock.idle() >= STEP);
+        clock.touch();
+        assert!(clock.idle() < STEP);
+    }
+
+    #[tokio::test]
+    async fn waiting_on_the_owner_is_not_idle() {
+        let owner = OwnerWaitClock::default();
+        let clock = ProgressClock::starting_now(owner.clone());
+        OwnerWaitClock::within(Some(owner), async {
+            let card = OwnerWaitClock::begin_waiting();
+            tokio::time::sleep(STEP * 4).await;
+            drop(card);
+        })
+        .await;
+        assert!(clock.idle() < STEP * 2, "{:?}", clock.idle());
     }
 }

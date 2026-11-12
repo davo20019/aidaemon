@@ -33,13 +33,12 @@ pub(crate) struct SalvagedTaskOutcome {
     pub details: String,
 }
 
-/// How long a child may work.
+/// How long a child may go without progress (no model or tool call running
+/// and no event of its own) before it is stopped. Never a limit on how long
+/// it runs: a child that keeps working is bounded by its budgets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChildTimeLimit {
     pub limit: std::time::Duration,
-    /// The child outlives the call that spawned it (background), so the
-    /// spawning agent's own limit does not bound it.
-    pub detached: bool,
 }
 
 /// What a stopped child had already done, from its own tool records.
@@ -60,7 +59,7 @@ impl ChildWorkReport {
     }
 }
 
-/// A child ran out of working time and was stopped.
+/// A child made no progress for its idle limit and was stopped.
 #[derive(Debug)]
 pub(crate) struct ChildTimedOut {
     pub limit_secs: u64,
@@ -69,7 +68,11 @@ pub(crate) struct ChildTimedOut {
 
 impl std::fmt::Display for ChildTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Specialist timed out after {} seconds", self.limit_secs)
+        write!(
+            f,
+            "Specialist timed out: no progress for {} seconds",
+            self.limit_secs
+        )
     }
 }
 
@@ -80,13 +83,13 @@ impl ChildTimedOut {
     pub(crate) fn render(&self) -> String {
         if !self.report.may_have_changed_something() {
             return format!(
-                "The sub-agent ran out of time after {} seconds. It only used read-only \
-                 tools, so running it again is safe.",
+                "The sub-agent made no progress for {} seconds and was stopped. It only \
+                 used read-only tools, so running it again is safe.",
                 self.limit_secs
             );
         }
         let mut text = format!(
-            "The sub-agent ran out of time after {} seconds and was stopped, but some of its \
+            "The sub-agent made no progress for {} seconds and was stopped, but some of its \
              work may already have taken effect. Do NOT run it again until you have checked \
              the state of the items below: repeating them could duplicate side effects.",
             self.limit_secs

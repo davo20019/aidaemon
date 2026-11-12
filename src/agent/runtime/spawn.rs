@@ -109,6 +109,65 @@ fn resolve_child_outcome(
     }
 }
 
+/// The sub-agents running now, each under the chat it reports to (its
+/// approval route): `/status` and `/tasks` list them by their title.
+#[derive(Default)]
+pub(crate) struct RunningChildren {
+    next: std::sync::atomic::AtomicU64,
+    entries: std::sync::Mutex<Vec<(u64, String, aidaemon_channels::ports::RunningChild)>>,
+}
+
+/// One running child's place in [`RunningChildren`], removed when dropped
+/// however the child ends.
+pub(crate) struct RunningChildEntry {
+    registry: Arc<RunningChildren>,
+    id: u64,
+}
+
+impl RunningChildren {
+    pub(crate) fn enter(self: &Arc<Self>, session_id: &str, mission: &str) -> RunningChildEntry {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                id,
+                session_id.to_string(),
+                aidaemon_channels::ports::RunningChild {
+                    label: child_status_label(mission),
+                    started_at: chrono::Utc::now(),
+                },
+            ));
+        RunningChildEntry {
+            registry: self.clone(),
+            id,
+        }
+    }
+
+    pub(crate) fn for_session(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_channels::ports::RunningChild> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, session, _)| session == session_id)
+            .map(|(_, _, child)| child.clone())
+            .collect()
+    }
+}
+
+impl Drop for RunningChildEntry {
+    fn drop(&mut self) {
+        self.registry
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _, _)| *id != self.id);
+    }
+}
+
 /// A child that ended with a refused write it never made did not do that
 /// work, whatever its own run concluded.
 fn settle_coordinated_outcome(outcome: TaskOutcome, unlanded_write: bool) -> TaskOutcome {
@@ -119,29 +178,13 @@ fn settle_coordinated_outcome(outcome: TaskOutcome, unlanded_write: bool) -> Tas
     }
 }
 
-/// How often a running child checks its working-time limit.
+/// How often a running child checks how long it has been idle.
 const CHILD_LIMIT_CHECK: Duration = Duration::from_millis(250);
-/// Time left for a nested child's report to reach its parent before the
-/// parent's own limit stops it.
-const NESTED_REPORT_GRACE: Duration = Duration::from_secs(10);
 /// How many entries a stopped child's report lists per section.
 const MAX_REPORTED_ACTIONS: usize = 20;
 const REPORTED_ACTION_CHARS: usize = 160;
 /// How many tool records (calls and results) a stopped child's report reads.
 const MAX_REPORT_TOOL_RECORDS: usize = 5_000;
-
-/// The working time a child gets. A child waited on by its parent must end
-/// inside the parent's own limit, or the parent is stopped first and the
-/// child's report is lost.
-fn child_time_limit(requested: ChildTimeLimit, parent_remaining: Option<Duration>) -> Duration {
-    match parent_remaining {
-        Some(left) if !requested.detached => requested
-            .limit
-            .min(left.saturating_sub(NESTED_REPORT_GRACE))
-            .max(Duration::from_secs(1)),
-        _ => requested.limit,
-    }
-}
 
 /// The status channel a child reports through. The parent's live card shows
 /// the parent's own checklist: a child's checklist is the child's plan, so it
@@ -1736,7 +1779,7 @@ impl Agent {
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
         inherited_authority: crate::agent::authority::InheritedAuthority,
-        child_deadline: Option<crate::tools::WorkDeadline>,
+        child_progress: Option<crate::tools::ProgressClock>,
     ) -> Arc<Agent> {
         let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
             Ok(guard) => guard.clone(),
@@ -1838,7 +1881,8 @@ impl Agent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(inherited_authority.clone());
         child.inherited_authority = Some(inherited_authority);
-        child.child_deadline = child_deadline;
+        child.child_progress = child_progress;
+        child.running_children = self.running_children.clone();
         child.sdk_engine = self.sdk_engine.clone();
         child.run_store = self.run_store.clone();
         child.owner_approvals = self.owner_approvals.clone();
@@ -2813,16 +2857,12 @@ impl Agent {
         // Waiting on the owner never counts against the child, whether or not
         // this call runs inside a turn that already keeps that clock.
         let owner_wait = crate::tools::OwnerWaitClock::current().unwrap_or_default();
-        let deadline = time_limit.map(|requested| {
-            let parent_remaining = self
-                .child_deadline
-                .as_ref()
-                .map(crate::tools::WorkDeadline::remaining);
-            crate::tools::WorkDeadline::starting_now(
-                child_time_limit(requested, parent_remaining),
-                owner_wait.clone(),
-            )
-        });
+        // A child is bounded by progress, not elapsed time: it is stopped
+        // only after `idle_limit` with no model or tool call running and no
+        // kernel event (Decision 1). Owner waits never count.
+        let idle_limit = time_limit.map(|requested| requested.limit);
+        let progress =
+            idle_limit.map(|_| crate::tools::ProgressClock::starting_now(owner_wait.clone()));
         let read_only_tools: std::collections::HashSet<String> = scoped_tools
             .iter()
             .filter(|tool| tool.capabilities().read_only)
@@ -2846,11 +2886,11 @@ impl Agent {
                 root_tools,
                 add_spawn_tool,
                 effective_project_scope,
-                effective_approval_session_id,
+                effective_approval_session_id.clone(),
                 max_iterations_override,
                 timeout_secs_override,
                 parent_authority,
-                deadline.clone(),
+                progress.clone(),
             )
             .await;
         let child_session_for_events = child_session.clone();
@@ -2897,6 +2937,11 @@ impl Agent {
         // total even if it then fails.
         crate::agent::authority::mark_child_began();
         let _on_roster = roster_entry;
+        // Listed by `/status` and `/tasks` in the chat it reports to while it
+        // runs, waited on or in the background.
+        let _listed = effective_approval_session_id
+            .as_deref()
+            .map(|chat| self.running_children.enter(chat, mission));
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
@@ -2915,9 +2960,9 @@ impl Agent {
         let _abort = AbortOnDrop(join.abort_handle());
         let mut timed_out = false;
         let deadline_reached = async {
-            match deadline.as_ref() {
-                Some(deadline) => deadline.reached(CHILD_LIMIT_CHECK).await,
-                None => std::future::pending().await,
+            match (progress.as_ref(), idle_limit) {
+                (Some(progress), Some(limit)) => progress.idle_for(limit, CHILD_LIMIT_CHECK).await,
+                _ => std::future::pending().await,
             }
         };
         tokio::pin!(deadline_reached);
@@ -2937,7 +2982,7 @@ impl Agent {
                     join.abort();
                     let _ = (&mut join).await;
                     timed_out = true;
-                    break Err(anyhow::anyhow!("child agent ran out of working time"));
+                    break Err(anyhow::anyhow!("child agent made no progress for its idle limit"));
                 }
                 _ = heartbeat.tick(), if task_attempt.is_some() => {
                     let Some(attempt) = task_attempt.as_ref() else {
@@ -2985,10 +3030,7 @@ impl Agent {
                 &read_only_tools,
             )
             .await;
-            let limit_secs = deadline
-                .as_ref()
-                .map(|deadline| deadline.limit().as_secs())
-                .unwrap_or_default();
+            let limit_secs = idle_limit.map(|limit| limit.as_secs()).unwrap_or_default();
             let timed_out = ChildTimedOut { limit_secs, report };
             let emitter =
                 crate::events::EventEmitter::new(self.event_store.clone(), child_session.clone());
@@ -3521,35 +3563,6 @@ mod tests {
 
     /// A child that saw untrusted content but could not record it, or
     /// whose record cannot be read, returns an untrusted result.
-    #[test]
-    fn a_waited_on_child_ends_inside_its_parents_limit() {
-        let requested = ChildTimeLimit {
-            limit: Duration::from_secs(300),
-            detached: false,
-        };
-        assert_eq!(child_time_limit(requested, None), Duration::from_secs(300));
-        assert_eq!(
-            child_time_limit(requested, Some(Duration::from_secs(100))),
-            Duration::from_secs(90)
-        );
-        assert_eq!(
-            child_time_limit(requested, Some(Duration::from_secs(4))),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn a_background_child_is_not_bound_by_its_parents_limit() {
-        let requested = ChildTimeLimit {
-            limit: Duration::from_secs(300),
-            detached: true,
-        };
-        assert_eq!(
-            child_time_limit(requested, Some(Duration::from_secs(5))),
-            Duration::from_secs(300)
-        );
-    }
-
     async fn synthetic_event_store() -> crate::events::EventStore {
         use crate::events::EventStoreForTests;
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");

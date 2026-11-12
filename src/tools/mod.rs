@@ -42,7 +42,7 @@ mod web_search;
 #[cfg(feature = "browser")]
 pub use aidaemon_tool_browser::BrowserTool;
 pub use approval::ApprovalBroker;
-pub(crate) use approval::{OwnerWaitClock, WorkDeadline};
+pub(crate) use approval::{OwnerWaitClock, ProgressClock};
 #[cfg(feature = "slack")]
 pub use channel_history::ReadChannelHistoryTool;
 pub use cli_agent::CliAgentTool;

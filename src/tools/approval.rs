@@ -3,11 +3,12 @@
 
 pub use aidaemon_runtime::approvals::broker::ApprovalBroker;
 
-pub(crate) use aidaemon_channels::owner_wait::{OwnerWaitClock, WorkDeadline};
+pub(crate) use aidaemon_channels::owner_wait::{OwnerWaitClock, ProgressClock};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_channels::owner_wait::WorkDeadline;
     use std::sync::Arc;
     use std::time::Duration;
 

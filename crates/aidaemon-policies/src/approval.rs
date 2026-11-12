@@ -444,15 +444,25 @@ impl Hook for ApprovalPolicy {
         };
         if decision == ToolDecision::Allow && needs_reask(ctx, info) {
             // Never silently allow an undeterminable call after a decline;
-            // a grant does not cover it either.
-            let why = "the owner declined an action earlier in this run, and what this call \
-                       does cannot be fully determined"
-                .to_string();
-            let request = with_effects(call_request(&call.name, &call.arguments, info, why), info);
+            // a grant does not cover it either. Why it is asked stays in the
+            // interruption's reason (the run's record): the owner's card
+            // names only the action.
+            let mut request = with_effects(
+                call_request(&call.name, &call.arguments, info, String::new()),
+                info,
+            );
+            request.summary = format!("Run {}", request.subject);
             if let Some(refusal) = declined_subject(ctx, &request) {
                 return refusal;
             }
-            return interrupt(request, info);
+            return ToolDecision::Interrupt {
+                reason: format!(
+                    "approval required: {}: a decline earlier in this run, and what this call \
+                     does cannot be fully determined",
+                    request.summary
+                ),
+                kind: InterruptKind::OwnerApproval(request),
+            };
         }
         decision
     }
@@ -811,11 +821,14 @@ mod rules_tests {
             ToolDecision::Allow
         );
         // After one, it is asked about, even where it would be allowed.
-        owner_request(
-            &never
-                .before_tool(&hook_ctx(&declined), &post(), &opaque)
-                .await,
-        );
+        // The owner's card names the action, never the run's own reasoning.
+        let reasked = never
+            .before_tool(&hook_ctx(&declined), &post(), &opaque)
+            .await;
+        let card = owner_request(&reasked);
+        assert!(card.summary.starts_with("Run "), "{}", card.summary);
+        assert!(!card.summary.contains("declined"), "{}", card.summary);
+        assert!(!card.summary.contains("cannot be"), "{}", card.summary);
         let allowed = never
             .clone()
             .allow_tool("http_request")

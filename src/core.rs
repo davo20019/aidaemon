@@ -179,7 +179,8 @@ pub async fn run(
         crate::tools::track_requirements::StableSubjectVocabulary::from_tools(&tools);
     let track_requirements_tool = Arc::new(
         crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone())
-            .with_stable_subjects(stable_subjects),
+            .with_stable_subjects(stable_subjects)
+            .with_state(state.clone()),
     );
     tools.push(track_requirements_tool.clone());
 
