@@ -1349,7 +1349,7 @@ impl Agent {
                     "executor lease was lost before preserving the final handoff"
                 );
             }
-            let workspace_evidence = match crate::workspaces::preserve_task_workspace(
+            let workspace_evidence = match aidaemon_work::task_workspaces::preserve_task_workspace(
                 &*self.execution_backend,
                 self.state.as_ref(),
                 task_id,
@@ -1363,7 +1363,7 @@ impl Agent {
                         error = %workspace_error,
                         "Could not preserve task workspace state"
                     );
-                    crate::workspaces::WorkspaceEvidence::default()
+                    aidaemon_work::task_workspaces::WorkspaceEvidence::default()
                 }
             };
 
@@ -2599,7 +2599,7 @@ impl Agent {
                 let task_id = task_id.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("A claimed executor attempt requires its durable task ID")
                 })?;
-                match crate::workspaces::provision_task_workspace(
+                match aidaemon_work::task_workspaces::provision_task_workspace(
                     &*self.execution_backend,
                     self.state.as_ref(),
                     task_id,

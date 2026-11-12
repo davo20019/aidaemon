@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod sqlite;
 pub mod stores;
+pub mod task_workspaces;
 pub mod tools;
 pub mod triggers;
 

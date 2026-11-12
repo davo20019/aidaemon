@@ -51,6 +51,7 @@ pub mod command_risk;
 pub mod consequential;
 pub mod daemon_guard;
 mod exec;
+pub mod execution;
 pub mod file_delivery;
 mod fs;
 pub mod fs_utils;

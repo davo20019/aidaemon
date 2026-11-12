@@ -80,7 +80,6 @@ mod types;
 mod updater;
 pub mod utils;
 mod wizard;
-mod workspaces;
 
 #[cfg(test)]
 mod contract_shape_tests;

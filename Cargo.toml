@@ -169,7 +169,7 @@ default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel
 browser = ["aidaemon-tool-browser/chromium"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
-execution-docker = []
+execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = [
     "dep:tokio-tungstenite",
     "dep:hkdf",

@@ -20,6 +20,8 @@ publish = false
 [features]
 # Helpers for calling tools directly from tests.
 testing = []
+# The persistent Docker container execution backend.
+docker = []
 
 [dependencies]
 aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }

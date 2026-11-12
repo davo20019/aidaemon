@@ -1,10 +1,16 @@
+//! Task workspaces: where a task attempt works (the shared workspace, an
+//! isolated folder of its own, or a git worktree on its own branch), and
+//! what is kept of it when the attempt ends.
+
 use std::time::Duration;
 
-use crate::execution::{ExecutionBackend, ExecutionRequest};
-use crate::traits::{HandoffArtifact, StateStore, TaskAttempt, TaskWorkspace};
+use aidaemon_tools::{ExecutionBackend, ExecutionRequest};
+
+use crate::goals::{HandoffArtifact, TaskAttempt, TaskWorkspace};
+use crate::stores::{TaskStore, WorkCoordinationStore};
 
 #[derive(Debug, Default)]
-pub(crate) struct WorkspaceEvidence {
+pub struct WorkspaceEvidence {
     pub artifacts: Vec<HandoffArtifact>,
     pub verification: Vec<String>,
 }
@@ -114,13 +120,18 @@ async fn git_output(
     Ok(output.stdout_lossy().trim().to_string())
 }
 
-pub(crate) async fn provision_task_workspace(
+/// The workspace for `attempt` of task `task_id`, provisioned under the
+/// task's workspace policy (reused while the same attempt's is not failed).
+pub async fn provision_task_workspace<S>(
     backend: &dyn ExecutionBackend,
-    state: &dyn StateStore,
+    state: &S,
     task_id: &str,
     attempt: &TaskAttempt,
     project_scope: Option<&str>,
-) -> anyhow::Result<TaskWorkspace> {
+) -> anyhow::Result<TaskWorkspace>
+where
+    S: TaskStore + WorkCoordinationStore + ?Sized,
+{
     if let Some(existing) = state.get_task_workspace(task_id).await? {
         if existing.attempt_id == attempt.id && existing.status != "failed" {
             return Ok(existing);
@@ -243,11 +254,16 @@ pub(crate) async fn provision_task_workspace(
     Ok(workspace)
 }
 
-pub(crate) async fn preserve_task_workspace(
+/// Record what the task's active workspace holds (its path, and for a
+/// worktree its HEAD and status) and mark it preserved.
+pub async fn preserve_task_workspace<S>(
     backend: &dyn ExecutionBackend,
-    state: &dyn StateStore,
+    state: &S,
     task_id: &str,
-) -> anyhow::Result<WorkspaceEvidence> {
+) -> anyhow::Result<WorkspaceEvidence>
+where
+    S: WorkCoordinationStore + ?Sized,
+{
     let Some(mut workspace) = state.get_task_workspace(task_id).await? else {
         return Ok(WorkspaceEvidence::default());
     };
