@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::tools::sanitize::redact_secrets;
+use aidaemon_tools::sanitize::redact_secrets;
 
 use super::PageHandle;
 

@@ -23,7 +23,7 @@
 //!
 //! A consequential flag is set when the action's primary text context (script for
 //! `execute_js`; selector for `click`/`fill`) contains a standalone consequential
-//! keyword (word-boundary match via [`crate::agent::keyword_match`]).
+//! keyword (word-boundary match via [`aidaemon_tools::text::contains_keyword_as_words`]).
 //!
 //! The keyword scan on selectors is intentionally low-recall: real selectors are
 //! usually opaque (`#btn-3`, `.checkout-cta`) and rarely contain plain English
@@ -39,8 +39,8 @@
 // Clippy warning until Task 7 wires approval enforcement.
 #![allow(dead_code)]
 
-pub use crate::tools::web_fetch::local_site_key;
-use crate::tools::web_fetch::{classify_blocked_host, BlockedHostClass};
+pub use aidaemon_tools::web::local_site_key;
+use aidaemon_tools::web::{classify_blocked_host, BlockedHostClass};
 
 // ─── Network policy glue (SSRF) ─────────────────────────────────────────────────
 //
@@ -125,9 +125,9 @@ pub struct BrowserActionRisk {
 // ─── Keyword list ─────────────────────────────────────────────────────────────
 
 /// Whether a selector or script names a consequential action: the one list
-/// every UI tool shares ([`crate::tools::consequential`]).
+/// every UI tool shares ([`aidaemon_tools::consequential`]).
 fn is_consequential(text: &str) -> bool {
-    crate::tools::consequential::names_consequential_action(text)
+    aidaemon_tools::consequential::names_consequential_action(text)
 }
 
 // ─── Classifier ───────────────────────────────────────────────────────────────

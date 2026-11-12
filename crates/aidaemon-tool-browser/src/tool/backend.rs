@@ -24,8 +24,8 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::config::{BrowserConfig, SessionIsolation};
-use crate::tools::browser::diagnostics::BrowserDiagnosticsStore;
+use crate::settings::{BrowserSettings, SessionIsolation};
+use crate::tool::diagnostics::BrowserDiagnosticsStore;
 
 /// Upper bound on how long the graceful Chrome shutdown (`Browser::close()` +
 /// `Browser::wait()`) and per-resource disposal (close-target / dispose-context)
@@ -328,7 +328,7 @@ pub struct ChromiumoxideBackend {
     /// (`Page` — shared cookies) or its own incognito browser context
     /// (`BrowserContext` — isolated cookies).
     session_isolation: SessionIsolation,
-    config: BrowserConfig,
+    config: BrowserSettings,
 }
 
 impl ChromiumoxideBackend {
@@ -339,7 +339,7 @@ impl ChromiumoxideBackend {
     /// persistent profile or remote-debugging Chrome). Callers must surface this
     /// error at startup rather than silently downgrading — honesty over a
     /// false claim of cookie isolation.
-    pub fn new(config: BrowserConfig) -> Result<Self, String> {
+    pub fn new(config: BrowserSettings) -> Result<Self, String> {
         let session_isolation = config.resolve_session_isolation()?;
         let headless = AtomicBool::new(config.headless);
         Ok(Self {
@@ -1908,11 +1908,10 @@ impl BrowserBackend for MockBackend {
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
-    use crate::config::SessionIsolation;
+    use crate::settings::SessionIsolation;
 
-    fn ephemeral_config() -> BrowserConfig {
-        BrowserConfig {
-            enabled: true,
+    fn ephemeral_config() -> BrowserSettings {
+        BrowserSettings {
             headless: true,
             screenshot_width: 1280,
             screenshot_height: 720,
@@ -1920,7 +1919,7 @@ mod isolation_tests {
             user_data_dir: None,
             profile: None,
             session_isolation: None,
-            ..BrowserConfig::default()
+            ..BrowserSettings::default()
         }
     }
 

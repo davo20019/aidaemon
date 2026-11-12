@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::traits::{AttachmentProvenance, MessageAttachment};
 
 pub use aidaemon_events::attachments::{
-    new_resource_id, save_tool_observation_image, sha256_file, tool_artifact_attachment,
-    RESOURCE_ID_PREFIX,
+    new_resource_id, save_tool_observation_image, sha256_file, RESOURCE_ID_PREFIX,
 };
 
 /// Format a single saved file as the legacy text stub (backward compatible).

@@ -5,25 +5,25 @@
 //! cargo test --features browser browser_smoke_real_chrome -- --ignored --nocapture
 //! ```
 
-use crate::traits::ToolCalls as _;
+use aidaemon_tools::testing::ToolCalls as _;
 use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use crate::config::BrowserConfig;
-use crate::testing::CallWithFacts;
-use crate::tools::BrowserTool;
-use crate::types::ApprovalResponse;
+use crate::settings::BrowserSettings;
+use crate::tool::BrowserTool;
+use aidaemon_tools::semantics::ApprovalResponse;
+use aidaemon_tools::testing::CallWithFacts;
 
 /// Run `arguments` as the kernel does, the owner approving any card for the
 /// session.
 async fn call_approved(tool: &BrowserTool, arguments: &str, session: &str) -> String {
-    crate::testing::call_through_kernel(
+    aidaemon_tools::testing::call_through_kernel(
         tool,
         arguments,
-        crate::testing::call_facts(session),
+        aidaemon_tools::testing::call_facts(session),
         Some(ApprovalResponse::AllowSession),
     )
     .await
@@ -31,13 +31,12 @@ async fn call_approved(tool: &BrowserTool, arguments: &str, session: &str) -> St
     .output
 }
 
-fn smoke_browser_config(user_data_dir: &str) -> BrowserConfig {
-    BrowserConfig {
-        enabled: true,
+fn smoke_browser_config(user_data_dir: &str) -> BrowserSettings {
+    BrowserSettings {
         headless: true,
         user_data_dir: Some(user_data_dir.to_string()),
-        session_isolation: Some(crate::config::SessionIsolation::BrowserContext),
-        ..BrowserConfig::default()
+        session_isolation: Some(crate::settings::SessionIsolation::BrowserContext),
+        ..BrowserSettings::default()
     }
 }
 
@@ -75,7 +74,7 @@ async fn browser_smoke_real_chrome() {
         smoke_browser_config(profile.path().to_str().unwrap()),
         media_tx,
         profile.path().join("inbox"),
-        crate::execution::active_execution_backend(),
+        aidaemon_tools::testing::active_execution_backend(),
     )
     .expect("construct browser tool");
 
@@ -88,7 +87,7 @@ async fn browser_smoke_real_chrome() {
                 "url": fixture_url,
             })
             .to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .expect("navigate");
@@ -128,7 +127,7 @@ async fn browser_smoke_real_chrome() {
                 "selector": "#out",
             })
             .to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .expect("get_text");
@@ -143,7 +142,7 @@ async fn browser_smoke_real_chrome() {
                 "action": "get_console_logs",
             })
             .to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .expect("get_console_logs");
@@ -158,7 +157,7 @@ async fn browser_smoke_real_chrome() {
                 "action": "screenshot",
             })
             .to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .expect("screenshot");
@@ -170,7 +169,7 @@ async fn browser_smoke_real_chrome() {
     let close = tool
         .call_with(
             &json!({ "action": "close" }).to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .expect("close");
@@ -199,19 +198,18 @@ html, body { margin: 0; background: #08352d; color: white }
     )
     .expect("write PDF fixture");
 
-    let config = BrowserConfig {
-        enabled: true,
+    let config = BrowserSettings {
         headless: true,
         user_data_dir: None,
-        session_isolation: Some(crate::config::SessionIsolation::BrowserContext),
-        ..BrowserConfig::default()
+        session_isolation: Some(crate::settings::SessionIsolation::BrowserContext),
+        ..BrowserSettings::default()
     };
     let (media_tx, _media_rx) = mpsc::channel(4);
     let tool = BrowserTool::new(
         config,
         media_tx,
         fixture.path().join("inbox"),
-        crate::execution::active_execution_backend(),
+        aidaemon_tools::testing::active_execution_backend(),
     )
     .expect("construct browser tool");
 
@@ -223,7 +221,7 @@ html, body { margin: 0; background: #08352d; color: white }
                 "output_filename": "designed-document.pdf",
             })
             .to_string(),
-            crate::testing::call_facts("pdf-smoke"),
+            aidaemon_tools::testing::call_facts("pdf-smoke"),
         )
         .await
         .expect("render action");

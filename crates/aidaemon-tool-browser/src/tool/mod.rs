@@ -8,12 +8,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::BrowserConfig;
-use crate::traits::{
-    MessageAttachment, Tool, ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
+use crate::settings::BrowserSettings;
+use aidaemon_channels::hub::{MediaKind, MediaMessage};
+use aidaemon_events::conversation::MessageAttachment;
+use aidaemon_tools::semantics::{
+    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::{MediaKind, MediaMessage};
+use aidaemon_tools::OutcomeTool as Tool;
 
 use policy::BrowserRiskClass;
 
@@ -21,7 +23,7 @@ mod backend;
 mod diagnostics;
 pub mod policy;
 mod session;
-#[cfg(all(test, feature = "browser"))]
+#[cfg(test)]
 mod smoke;
 #[cfg(test)]
 mod tests;
@@ -470,7 +472,7 @@ impl DispatchResult {
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
     /// The agent workspace; `render_pdf` is only offered on a local one.
-    execution_backend: crate::execution::SharedExecutionBackend,
+    execution_backend: aidaemon_tools::backend::SharedExecutionBackend,
     media_tx: mpsc::Sender<MediaMessage>,
     /// Shared inbox for persisting screenshots for agent vision context.
     inbox_dir: PathBuf,
@@ -480,7 +482,7 @@ pub struct BrowserTool {
     /// The owner's approvals of exact calls, delivered by the agent kernel
     /// (`record_owner_answer`) after the card `owner_approval_request` asked
     /// for, and consumed by the call. The tool never asks the owner itself.
-    owner_answers: crate::tools::owner_answers::OwnerAnsweredCalls,
+    owner_answers: aidaemon_tools::owner_answers::OwnerAnsweredCalls,
     /// Bounded navigation/DOM-ready timeout (resolved + clamped from config).
     /// Used by `action_navigate` after `goto` and by the `action_click`
     /// nav-race when a click triggers a navigation.
@@ -497,7 +499,7 @@ pub struct BrowserTool {
     diagnostics: BrowserDiagnosticsStore,
 }
 
-/// Upper bound on the element-poll timeout, mirroring `BrowserConfig`'s
+/// Upper bound on the element-poll timeout, mirroring `BrowserSettings`'s
 /// `element_timeout` clamp, applied to a per-call `timeout_secs` override.
 const MAX_ELEMENT_TIMEOUT_SECS: u64 = 120;
 
@@ -567,7 +569,7 @@ fn format_page_preview(text: &str) -> String {
     };
     format!(
         "\n\nPage text:\n{}{}",
-        crate::tools::sanitize::redact_secrets(&shown),
+        aidaemon_tools::sanitize::redact_secrets(&shown),
         more
     )
 }
@@ -582,10 +584,10 @@ impl BrowserTool {
     /// Chrome. On success, logs the resolved mode and whether sessions SHARE
     /// cookies, without logging any profile path contents.
     pub fn new(
-        config: BrowserConfig,
+        config: BrowserSettings,
         media_tx: mpsc::Sender<MediaMessage>,
         inbox_dir: impl Into<PathBuf>,
-        execution_backend: crate::execution::SharedExecutionBackend,
+        execution_backend: aidaemon_tools::backend::SharedExecutionBackend,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -595,8 +597,8 @@ impl BrowserTool {
         let backend = ChromiumoxideBackend::new(config)?;
         let mode = backend.session_isolation();
         let (mode_label, shares_cookies) = match mode {
-            crate::config::SessionIsolation::Page => ("page", true),
-            crate::config::SessionIsolation::BrowserContext => ("browser_context", false),
+            crate::settings::SessionIsolation::Page => ("page", true),
+            crate::settings::SessionIsolation::BrowserContext => ("browser_context", false),
         };
         info!(
             isolation = mode_label,
@@ -619,7 +621,7 @@ impl BrowserTool {
 
     /// Test-only constructor that injects an arbitrary backend (e.g. the mock).
     /// Actions that need the owner run only after the kernel delivered an
-    /// approval (see `crate::testing::call_through_kernel`).
+    /// approval (see `aidaemon_tools::testing::call_through_kernel`).
     #[cfg(test)]
     pub fn with_backend(
         backend: Arc<dyn BrowserBackend>,
@@ -629,7 +631,7 @@ impl BrowserTool {
             backend,
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
-            execution_backend: crate::execution::active_execution_backend(),
+            execution_backend: aidaemon_tools::testing::active_execution_backend(),
             sessions: BrowserSessionRegistry::new(),
             owner_answers: Default::default(),
             nav_timeout: Duration::from_secs(30),
@@ -1081,7 +1083,7 @@ impl BrowserTool {
             return Err("browser actions require a session id".to_string());
         }
 
-        let saved_attachment = crate::channels::attachments::save_tool_observation_image(
+        let saved_attachment = aidaemon_events::attachments::save_tool_observation_image(
             &self.inbox_dir,
             &png_bytes,
             "screenshot.png",
@@ -1191,7 +1193,7 @@ impl BrowserTool {
     /// gives us one deterministic renderer, a hard timeout, print backgrounds,
     /// and CSS `@page` sizing in a single operation.
     async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, String> {
-        if self.execution_backend.kind() != crate::execution::BackendKind::Local {
+        if self.execution_backend.kind() != aidaemon_tools::backend::BackendKind::Local {
             return Err("render_pdf is only available with local execution".to_string());
         }
 
@@ -1199,7 +1201,7 @@ impl BrowserTool {
             .get("source_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
-        let source = crate::tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
+        let source = aidaemon_tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
             .map_err(|e| format!("Invalid source_path: {e}"))?;
         let source = source
             .canonicalize()
@@ -1303,7 +1305,7 @@ impl BrowserTool {
             .await
             .map_err(|e| format!("Failed to save rendered PDF: {e}"))?;
 
-        let mut attachments = vec![crate::channels::attachments::tool_artifact_attachment(
+        let mut attachments = vec![aidaemon_events::attachments::tool_artifact_attachment(
             &output_path,
             output_filename.to_string(),
             "application/pdf".to_string(),
@@ -1318,7 +1320,7 @@ impl BrowserTool {
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("document")
             );
-            match crate::channels::attachments::save_tool_observation_image(
+            match aidaemon_events::attachments::save_tool_observation_image(
                 &self.inbox_dir,
                 &preview_bytes,
                 &preview_hint,
@@ -1521,12 +1523,12 @@ impl BrowserTool {
         };
 
         // Truncate if very long.
-        let text = crate::utils::truncate_with_note(&text, 4000);
+        let text = aidaemon_tools::text::truncate_with_note(&text, 4000);
 
         // Apply secret redaction AFTER truncation. DOM content can contain
         // tokens, API keys, or bearer tokens embedded in the page — these must
         // not reach the user or event persistence in their raw form.
-        let text = crate::tools::sanitize::redact_secrets(&text);
+        let text = aidaemon_tools::sanitize::redact_secrets(&text);
 
         Ok(text)
     }
@@ -1546,8 +1548,8 @@ impl BrowserTool {
             }
             None => "{}".to_string(),
         };
-        let value_str = crate::utils::truncate_with_note(&value_str, 4000);
-        Ok(crate::tools::sanitize::redact_secrets(&value_str))
+        let value_str = aidaemon_tools::text::truncate_with_note(&value_str, 4000);
+        Ok(aidaemon_tools::sanitize::redact_secrets(&value_str))
     }
 
     async fn action_scroll(&self, args: &Value, session_id: &str) -> Result<String, String> {
@@ -1606,11 +1608,11 @@ impl BrowserTool {
             None => "(no return value)".to_string(),
         };
 
-        let value_str = crate::utils::truncate_with_note(&value_str, 4000);
+        let value_str = aidaemon_tools::text::truncate_with_note(&value_str, 4000);
 
         // Apply secret redaction AFTER truncation so the redacted form is what
         // reaches the user and event persistence — never the raw secret.
-        let value_str = crate::tools::sanitize::redact_secrets(&value_str);
+        let value_str = aidaemon_tools::sanitize::redact_secrets(&value_str);
 
         Ok(value_str)
     }
@@ -2235,14 +2237,14 @@ impl Tool for BrowserTool {
     fn approval_card_kind(
         &self,
         request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> crate::types::ApprovalKind {
+    ) -> aidaemon_tools::semantics::ApprovalKind {
         let point_of_action = request.warnings.iter().any(|warning| {
             warning == POINT_OF_ACTION_SENSITIVE || warning == POINT_OF_ACTION_CONSEQUENTIAL
         });
         if point_of_action {
-            crate::types::ApprovalKind::CommandOnce
+            aidaemon_tools::semantics::ApprovalKind::CommandOnce
         } else {
-            crate::types::ApprovalKind::Command
+            aidaemon_tools::semantics::ApprovalKind::Command
         }
     }
 
@@ -2251,11 +2253,11 @@ impl Tool for BrowserTool {
     /// a session approval of an ordinary mutation marks the session approved.
     async fn record_owner_answer(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &aidaemon_tools::semantics::ApprovalCall<'_>,
         facts: &ToolCallContext,
-        response: Option<crate::types::ApprovalResponse>,
+        response: Option<aidaemon_tools::semantics::ApprovalResponse>,
     ) {
-        use crate::types::ApprovalResponse;
+        use aidaemon_tools::semantics::ApprovalResponse;
         let Some(response) = response else {
             return;
         };
@@ -2373,9 +2375,9 @@ impl Tool for BrowserTool {
     async fn execute(
         &self,
         arguments: &str,
-        facts: &crate::traits::ToolCallContext,
-    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-        let status_tx = crate::traits::status_sender(facts);
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
+        let status_tx = aidaemon_tools::status::status_sender(facts);
         let facts = facts.clone();
 
         let _ = status_tx;
@@ -2393,14 +2395,14 @@ impl Tool for BrowserTool {
 }
 
 #[async_trait]
-impl crate::traits::ToolSemantics for BrowserTool {
-    fn dispatch_facts(&self) -> crate::traits::ToolDispatchFacts {
-        crate::traits::ToolDispatchFacts {
+impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
+    fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
+        aidaemon_tools::semantics::ToolDispatchFacts {
             // The owner's answers are kept per call and per session by the
             // tool (`record_owner_answer`), never as kernel session grants.
             keeps_own_grants: true,
-            network_reach: crate::traits::NetworkReach::PublicAndLoopback,
-            file_guard: crate::traits::FileGuard::SensitiveReads,
+            network_reach: aidaemon_tools::semantics::NetworkReach::PublicAndLoopback,
+            file_guard: aidaemon_tools::semantics::FileGuard::SensitiveReads,
             ..Default::default()
         }
     }
@@ -2416,15 +2418,15 @@ impl crate::traits::ToolSemantics for BrowserTool {
     /// runs must match the card the owner approved.
     async fn owner_approval_request(
         &self,
-        call: &crate::traits::ApprovalCall<'_>,
+        call: &aidaemon_tools::semantics::ApprovalCall<'_>,
         facts: &ToolCallContext,
-    ) -> crate::traits::OwnerApprovalNeed {
+    ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
         if call.refused {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
+            return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
         }
         match self.kernel_approval_need(call.arguments, facts).await {
-            Some((request, _)) => crate::traits::OwnerApprovalNeed::Ask(request),
-            None => crate::traits::OwnerApprovalNeed::Unjudged,
+            Some((request, _)) => aidaemon_tools::semantics::OwnerApprovalNeed::Ask(request),
+            None => aidaemon_tools::semantics::OwnerApprovalNeed::Unjudged,
         }
     }
 
@@ -2508,7 +2510,7 @@ fn browser_call_effects(arguments: &str) -> aidaemon_core::CallEffects {
     match (action.as_str(), url) {
         ("navigate" | "new_tab", Some(url)) => reqwest::Url::parse(url)
             .ok()
-            .and_then(|url| crate::tools::command_effects::url_host_effect(&url))
+            .and_then(|url| aidaemon_tools::command_effects::url_host_effect(&url))
             .map_or_else(aidaemon_core::CallEffects::unknown, |key| {
                 aidaemon_core::CallEffects {
                     keys: vec![key],
@@ -2629,8 +2631,8 @@ mod prompt_tests {
     use super::{
         browser_call_semantics, browser_script_has_mutation_signal, format_browser_approval_prompt,
     };
-    use crate::tools::browser::policy::{self, BrowserRiskClass};
-    use crate::traits::ToolMutationEffects;
+    use crate::tool::policy::{self, BrowserRiskClass};
+    use aidaemon_tools::semantics::ToolMutationEffects;
 
     fn sample_risk() -> policy::BrowserActionRisk {
         policy::BrowserActionRisk {

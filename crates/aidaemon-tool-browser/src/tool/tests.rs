@@ -4,8 +4,8 @@
 //! `execute_js` null/undefined handling, screenshot target selection) that
 //! later tasks will touch.
 
-use crate::testing::CallWithFacts;
-use crate::traits::ToolCalls as _;
+use aidaemon_tools::testing::CallWithFacts;
+use aidaemon_tools::testing::ToolCalls as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,8 +15,10 @@ use tokio::sync::Mutex;
 
 use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
-use crate::traits::{AttachmentProvenance, Tool};
-use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
+use aidaemon_channels::hub::{MediaKind, MediaMessage};
+use aidaemon_events::conversation::AttachmentProvenance;
+use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
+use aidaemon_tools::OutcomeTool as Tool;
 
 /// A browser tool called the way the agent kernel calls it: each call's
 /// card (`owner_approval_request`) is recorded and answered with `reply`
@@ -72,11 +74,15 @@ impl KernelSim {
     async fn call_with(
         &self,
         arguments: &str,
-        facts: crate::traits::ToolCallContext,
+        facts: aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<String> {
-        let result =
-            crate::testing::call_through_kernel(&self.tool, arguments, facts, self.reply.clone())
-                .await?;
+        let result = aidaemon_tools::testing::call_through_kernel(
+            &self.tool,
+            arguments,
+            facts,
+            self.reply.clone(),
+        )
+        .await?;
         if let Some(request) = &result.asked {
             self.recorder
                 .commands
@@ -91,7 +97,7 @@ impl KernelSim {
             self.recorder.permission_modes.lock().await.push(
                 self.tool
                     .approval_card_mode()
-                    .unwrap_or(crate::tools::command_risk::PermissionMode::Cautious),
+                    .unwrap_or(aidaemon_tools::command_risk::PermissionMode::Cautious),
             );
         }
         Ok(result.output)
@@ -101,7 +107,7 @@ impl KernelSim {
 fn mock_tool() -> (
     KernelSim,
     Arc<MockBackend>,
-    mpsc::Receiver<crate::types::MediaMessage>,
+    mpsc::Receiver<aidaemon_channels::hub::MediaMessage>,
 ) {
     mock_tool_with(MockBackend::new())
 }
@@ -116,7 +122,7 @@ fn mock_tool_with(
 ) -> (
     KernelSim,
     Arc<MockBackend>,
-    mpsc::Receiver<crate::types::MediaMessage>,
+    mpsc::Receiver<aidaemon_channels::hub::MediaMessage>,
 ) {
     let backend = Arc::new(backend);
     let (media_tx, media_rx) = mpsc::channel(8);
@@ -134,7 +140,7 @@ fn no_channel_tool(
 ) -> (
     BrowserTool,
     Arc<MockBackend>,
-    mpsc::Receiver<crate::types::MediaMessage>,
+    mpsc::Receiver<aidaemon_channels::hub::MediaMessage>,
 ) {
     let backend = Arc::new(backend);
     let (media_tx, media_rx) = mpsc::channel(8);
@@ -148,7 +154,10 @@ async fn dispatch_observation_navigate_routes_through_backend() {
 
     let args = json!({ "action": "navigate", "url": "https://example.com/"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -213,7 +222,10 @@ async fn dispatch_observation_scroll_routes_without_approval() {
         "tab_id": "0",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "Scrolled down 700 pixels");
@@ -244,7 +256,7 @@ async fn schema_exposes_scroll_direction_and_amount() {
 
 #[tokio::test]
 async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
-    use crate::traits::ToolCallOutcome;
+    use aidaemon_tools::semantics::ToolCallOutcome;
 
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("investor brief.html");
@@ -265,7 +277,7 @@ async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
         .call_with_execution_context(
             &args.to_string(),
             None,
-            crate::testing::call_facts("sess-pdf"),
+            aidaemon_tools::testing::call_facts("sess-pdf"),
         )
         .await
         .unwrap();
@@ -334,7 +346,7 @@ async fn render_pdf_rejects_non_html_and_output_path_traversal_before_launch() {
                 "source_path": source,
             })
             .to_string(),
-            crate::testing::call_facts("sess-pdf-invalid"),
+            aidaemon_tools::testing::call_facts("sess-pdf-invalid"),
         )
         .await
         .unwrap();
@@ -350,7 +362,7 @@ async fn render_pdf_rejects_non_html_and_output_path_traversal_before_launch() {
                 "output_filename": "../escaped.pdf",
             })
             .to_string(),
-            crate::testing::call_facts("sess-pdf-invalid"),
+            aidaemon_tools::testing::call_facts("sess-pdf-invalid"),
         )
         .await
         .unwrap();
@@ -383,7 +395,7 @@ async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
                 "output_filename": "never-produced.pdf",
             })
             .to_string(),
-            crate::testing::call_facts("sess-pdf-timeout"),
+            aidaemon_tools::testing::call_facts("sess-pdf-timeout"),
         )
         .await
         .unwrap();
@@ -405,7 +417,10 @@ async fn dispatch_mutation_click_routes_through_backend() {
 
     let args = json!({ "action": "click", "selector": "#submit"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "Clicked element '#submit'");
@@ -447,7 +462,10 @@ async fn get_text_with_selector_routes_through_inner_text() {
 
     let args = json!({ "action": "get_text", "selector": "#headline"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "hello inner", "should return the mocked inner_text");
@@ -488,7 +506,10 @@ async fn get_text_selector_with_single_quote_passes_through_unchanged() {
 
     let args = json!({ "action": "get_text", "selector": selector});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "field text");
@@ -520,7 +541,10 @@ async fn get_text_selector_with_backslash_passes_through_unchanged() {
 
     let args = json!({ "action": "get_text", "selector": selector});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "backslash text");
@@ -548,7 +572,10 @@ async fn get_text_selector_with_newline_passes_through_unchanged() {
 
     let args = json!({ "action": "get_text", "selector": selector});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "newline text");
@@ -578,7 +605,10 @@ async fn get_text_selector_with_css_escape_passes_through_unchanged() {
 
     let args = json!({ "action": "get_text", "selector": selector});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "escaped id text");
@@ -614,9 +644,12 @@ async fn get_text_with_selector_never_calls_evaluate() {
         let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("t"));
 
         let args = json!({ "action": "get_text", "selector": selector});
-        tool.call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
-            .await
-            .unwrap();
+        tool.call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
 
         let calls = backend.calls();
         let calls = calls.lock().await;
@@ -633,7 +666,10 @@ async fn get_text_without_selector_routes_through_body_text() {
 
     let args = json!({ "action": "get_text"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "hello body", "should return the mocked body_text");
@@ -659,7 +695,10 @@ async fn execute_js_json_null_renders_as_null_string() {
 
     let args = json!({ "action": "execute_js", "script": "return null;"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "null", "JSON null must render as the string \"null\"");
@@ -680,7 +719,10 @@ async fn execute_js_undefined_renders_as_no_return_value() {
 
     let args = json!({ "action": "execute_js", "script": "void 0;"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -704,7 +746,10 @@ async fn screenshot_with_selector_records_element_target() {
 
     let args = json!({ "action": "screenshot", "selector": "#hero"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -745,7 +790,10 @@ async fn fill_result_contains_selector_but_not_value() {
     let value = "hunter2-super-secret-token-1234567890";
     let args = json!({ "action": "fill", "selector": "#password", "value": value});
     let result = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -756,7 +804,7 @@ async fn fill_result_contains_selector_but_not_value() {
     );
 
     // The value (or its 23-char prefix) must NOT appear in the result.
-    let prefix_23 = crate::utils::truncate_str(value, 23);
+    let prefix_23 = aidaemon_tools::text::truncate_str(value, 23);
     assert!(
         !result.contains(value),
         "fill result must not contain the full value: {result}"
@@ -789,7 +837,10 @@ async fn fill_replaces_existing_value_not_appends() {
         "value": "new@example.com",
     });
     let result = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -838,7 +889,10 @@ async fn fill_replace_value_cases_round_trip_and_stay_secret() {
 
         let args = json!({ "action": "fill", "selector": selector, "value": value});
         let result = tool
-            .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+            .call_with(
+                &args.to_string(),
+                aidaemon_tools::testing::call_facts("sess-a"),
+            )
             .await
             .unwrap();
 
@@ -877,7 +931,10 @@ async fn screenshot_without_selector_defaults_to_viewport() {
 
     let args = json!({ "action": "screenshot"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -915,7 +972,10 @@ async fn screenshot_full_page_true_passes_through() {
 
     let args = json!({ "action": "screenshot", "full_page": true});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(out.contains("delivered to chat"), "should succeed: {out}");
@@ -940,7 +1000,10 @@ async fn screenshot_delivery_failure_is_reported_honestly() {
     let args = json!({ "action": "screenshot"});
     // The Tool::call wrapper surfaces an internal Err(String) as Ok("Error: ..").
     let msg = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -970,7 +1033,10 @@ async fn screenshot_delivery_success_is_reported() {
 
     let args = json!({ "action": "screenshot"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -984,7 +1050,8 @@ async fn screenshot_delivery_success_is_reported() {
 
 #[tokio::test]
 async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
-    use crate::traits::{AttachmentProvenance, ToolCallOutcome};
+    use aidaemon_events::conversation::AttachmentProvenance;
+    use aidaemon_tools::semantics::ToolCallOutcome;
 
     let (tool, _backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
@@ -994,7 +1061,7 @@ async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
         .call_with_execution_context(
             &args.to_string(),
             None,
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1009,7 +1076,7 @@ async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
 /// its subject, so "send a screenshot" is proven by the screenshot call.
 #[tokio::test]
 async fn delivered_screenshot_receipt_is_a_delivery_of_the_saved_capture() {
-    use crate::traits::{ToolMutationEffects, ToolTargetHintKind};
+    use aidaemon_tools::semantics::{ToolMutationEffects, ToolTargetHintKind};
 
     let (tool, _backend, rx) = mock_tool();
     let _media = spawn_media_responder(rx, Ok(()));
@@ -1022,7 +1089,11 @@ async fn delivered_screenshot_receipt_is_a_delivery_of_the_saved_capture() {
         "nothing is delivered until the channel confirms it"
     );
     let outcome = tool
-        .call_with_execution_context(&arguments, None, crate::testing::call_facts("sess-a"))
+        .call_with_execution_context(
+            &arguments,
+            None,
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     let semantics = &outcome.metadata.semantics;
@@ -1050,7 +1121,10 @@ async fn screenshot_oversized_delivered_as_document() {
 
     let args = json!({ "action": "screenshot", "full_page": true});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -1091,7 +1165,10 @@ async fn screenshot_document_delivery_failure_is_reported_and_inbox_persists() {
 
     let args = json!({ "action": "screenshot", "full_page": true});
     let msg = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -1161,7 +1238,7 @@ async fn screenshot_empty_session_id_refused() {
 
     let args = json!({ "action": "screenshot"});
     let msg = tool
-        .call_with(&args.to_string(), crate::testing::call_facts(""))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts(""))
         .await
         .unwrap();
     assert!(
@@ -1190,7 +1267,10 @@ async fn screenshot_caption_redacts_query_and_fragment() {
 
     let args = json!({ "action": "screenshot"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -1284,15 +1364,21 @@ async fn two_sessions_get_distinct_pages() {
 
     // Session A navigates.
     let a = json!({ "action": "navigate", "url": "https://a.example/"});
-    tool.call_with(&a.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &a.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     // Session B navigates.
     let b = json!({ "action": "navigate", "url": "https://b.example/"});
-    tool.call_with(&b.to_string(), crate::testing::call_facts("sess-b"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &b.to_string(),
+        aidaemon_tools::testing::call_facts("sess-b"),
+    )
+    .await
+    .unwrap();
 
     // Exactly two create_page calls so far, with DISTINCT ids — the two sessions
     // hold different pages.
@@ -1309,9 +1395,12 @@ async fn two_sessions_get_distinct_pages() {
 
     // A SECOND action on session A must REUSE A's page — no new create_page.
     let a2 = json!({ "action": "get_text"});
-    tool.call_with(&a2.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &a2.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     let ids_after = create_page_ids(&backend).await;
     assert_eq!(
@@ -1330,7 +1419,7 @@ async fn empty_session_id_rejected_before_launch() {
     let (tool, backend, _rx) = mock_tool();
     let args = json!({ "action": "navigate", "url": "https://a.example/"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts(""))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts(""))
         .await
         .unwrap();
     assert!(
@@ -1371,13 +1460,19 @@ async fn two_sessions_reuse_pages_without_deadlock() {
 
     for _ in 0..3 {
         let a = json!({ "action": "get_text"});
-        tool.call_with(&a.to_string(), crate::testing::call_facts("sess-a"))
-            .await
-            .unwrap();
+        tool.call_with(
+            &a.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
         let b = json!({ "action": "get_text"});
-        tool.call_with(&b.to_string(), crate::testing::call_facts("sess-b"))
-            .await
-            .unwrap();
+        tool.call_with(
+            &b.to_string(),
+            aidaemon_tools::testing::call_facts("sess-b"),
+        )
+        .await
+        .unwrap();
     }
 
     // Despite six actions, only two pages were ever created (one per session).
@@ -1420,20 +1515,26 @@ async fn list_tabs_reports_tabs_with_redacted_origins() {
 
     // Open the session's first tab via navigate.
     let nav = json!({ "action": "navigate", "url": "https://first.example/"});
-    tool.call_with(&nav.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nav.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     // new_tab — its page reports the secret url; only the origin must be shown.
     let nt = json!({ "action": "new_tab"});
-    tool.call_with(&nt.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nt.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     let out = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1468,9 +1569,12 @@ async fn new_tab_adds_and_activates_tab() {
 
     // First tab via navigate.
     let nav = json!({ "action": "navigate", "url": "https://a.example/"});
-    tool.call_with(&nav.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nav.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     let ids_before = create_page_ids(&backend).await;
     assert_eq!(ids_before.len(), 1, "one page so far: {ids_before:?}");
@@ -1478,7 +1582,10 @@ async fn new_tab_adds_and_activates_tab() {
     // Open a second tab.
     let nt = json!({ "action": "new_tab"});
     let out = tool
-        .call_with(&nt.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &nt.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -1497,7 +1604,7 @@ async fn new_tab_adds_and_activates_tab() {
     let list = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1523,9 +1630,12 @@ async fn popup_after_click_is_discoverable() {
 
     // Establish the session's first tab.
     let nav = json!({ "action": "navigate", "url": "https://a.example/"});
-    tool.call_with(&nav.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nav.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     // The session's active tab is the page minted by navigate — it is the
     // legitimate opener for a popup this session spawns.
@@ -1548,7 +1658,7 @@ async fn popup_after_click_is_discoverable() {
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#open"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1561,7 +1671,7 @@ async fn popup_after_click_is_discoverable() {
     let list = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1601,9 +1711,12 @@ async fn popup_with_foreign_opener_is_not_attributed() {
 
     // Session A establishes its first tab.
     let nav = json!({ "action": "navigate", "url": "https://a.example/"});
-    tool.call_with(&nav.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nav.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     // Script a net-new target whose opener is some OTHER target (not A's active
     // tab) — modeling a tab spawned by a different session or independently.
@@ -1621,7 +1734,7 @@ async fn popup_with_foreign_opener_is_not_attributed() {
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#open"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1639,7 +1752,7 @@ async fn popup_with_foreign_opener_is_not_attributed() {
     let list = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1661,15 +1774,18 @@ async fn switch_tab_changes_active_page() {
 
     // First tab.
     let nav = json!({ "action": "navigate", "url": "https://a.example/"});
-    tool.call_with(&nav.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &nav.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
     let first_id = create_page_ids(&backend).await[0].clone();
 
     // Second tab (now active).
     tool.call_with(
         &json!({ "action": "new_tab"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -1678,7 +1794,7 @@ async fn switch_tab_changes_active_page() {
     let out = tool
         .call_with(
             &json!({ "action": "switch_tab", "tab_id": first_id}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1691,7 +1807,7 @@ async fn switch_tab_changes_active_page() {
     let list = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1715,7 +1831,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     // Session A has one tab.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -1724,7 +1840,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     // Session B has one tab — capture B's real tab id.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://b.example/"}).to_string(),
-        crate::testing::call_facts("sess-b"),
+        aidaemon_tools::testing::call_facts("sess-b"),
     )
     .await
     .unwrap();
@@ -1735,7 +1851,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     let out = tool
         .call_with(
             &json!({ "action": "switch_tab", "tab_id": "no-such-tab"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1748,7 +1864,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     let out = tool
         .call_with(
             &json!({ "action": "switch_tab", "tab_id": b_tab}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1761,7 +1877,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     let out = tool
         .call_with(
             &json!({ "action": "close_tab", "tab_id": b_tab}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1774,7 +1890,7 @@ async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
     let out = tool
         .call_with(
             &json!({ "action": "switch_tab", "tab_id": b_tab}).to_string(),
-            crate::testing::call_facts("sess-b"),
+            aidaemon_tools::testing::call_facts("sess-b"),
         )
         .await
         .unwrap();
@@ -1793,14 +1909,14 @@ async fn close_tab_removes_and_reports_new_active() {
     // First tab + a second (active) tab.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
     let opened = tool
         .call_with(
             &json!({ "action": "new_tab"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1810,7 +1926,7 @@ async fn close_tab_removes_and_reports_new_active() {
     let out = tool
         .call_with(
             &json!({ "action": "close_tab", "tab_id": second_id}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1823,7 +1939,7 @@ async fn close_tab_removes_and_reports_new_active() {
     let list = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1893,7 +2009,7 @@ async fn single_page_actions_use_active_tab() {
     // Navigate establishes the active tab.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -1902,7 +2018,7 @@ async fn single_page_actions_use_active_tab() {
     let out = tool
         .call_with(
             &json!({ "action": "get_text"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -1928,7 +2044,7 @@ async fn single_page_actions_use_active_tab() {
 struct ApprovalRecorder {
     commands: Arc<Mutex<Vec<String>>>,
     kinds: Arc<Mutex<Vec<ApprovalKind>>>,
-    permission_modes: Arc<Mutex<Vec<crate::tools::command_risk::PermissionMode>>>,
+    permission_modes: Arc<Mutex<Vec<aidaemon_tools::command_risk::PermissionMode>>>,
 }
 
 impl ApprovalRecorder {
@@ -1944,7 +2060,7 @@ impl ApprovalRecorder {
         self.kinds.lock().await.clone()
     }
 
-    async fn permission_modes(&self) -> Vec<crate::tools::command_risk::PermissionMode> {
+    async fn permission_modes(&self) -> Vec<aidaemon_tools::command_risk::PermissionMode> {
         self.permission_modes.lock().await.clone()
     }
 }
@@ -2019,7 +2135,7 @@ async fn public_navigation_skips_approval_and_reaches_backend() {
     let out = tool
         .call_with(
             &json!({ "action": "navigate", "url": "https://example.com/"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2056,7 +2172,7 @@ async fn trusted_scheduled_navigation_skips_prompt() {
                 "url": "https://www.nist.gov/research",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
+            aidaemon_tools::semantics::ToolCallContext {
                 session_id: "scheduled-worker".into(),
                 trusted_session: true,
                 ..Default::default()
@@ -2096,7 +2212,7 @@ async fn trusted_scheduled_session_executes_consequential_click_without_prompt()
                 "selector": "#publish",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
+            aidaemon_tools::semantics::ToolCallContext {
                 session_id: "scheduled-worker".into(),
                 trusted_session: true,
                 ..Default::default()
@@ -2123,7 +2239,7 @@ async fn trusted_scheduled_session_still_prompts_for_arbitrary_javascript() {
                 "script": "document.body.remove()",
             })
             .to_string(),
-            crate::traits::ToolCallContext {
+            aidaemon_tools::semantics::ToolCallContext {
                 session_id: "scheduled-worker".into(),
                 trusted_session: true,
                 ..Default::default()
@@ -2152,7 +2268,7 @@ async fn approval_deny_blocks_ordinary_mutation_before_backend() {
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#menu"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2182,7 +2298,7 @@ async fn approval_deny_blocks_consequential_click_before_backend() {
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#delete"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2209,7 +2325,7 @@ async fn approval_timeout_denies_without_backend() {
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#menu"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2228,10 +2344,10 @@ async fn approval_timeout_denies_without_backend() {
         "the request was sent (and recorded) before timing out"
     );
     // A later direct call (not through the kernel) finds no approval either.
-    let direct = crate::testing::call_with_facts(
+    let direct = aidaemon_tools::testing::call_with_facts(
         &tool.tool,
         &json!({ "action": "click", "selector": "#menu"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2249,11 +2365,11 @@ async fn approval_timeout_denies_without_backend() {
 /// once. A point-of-action card is once-only; an ordinary mutation's is not.
 #[tokio::test]
 async fn kernel_approval_covers_only_the_exact_call() {
-    use crate::traits::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
+    use aidaemon_tools::semantics::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
     let backend = Arc::new(MockBackend::new());
     let (media_tx, _media_rx) = mpsc::channel(8);
     let tool = BrowserTool::with_backend(backend.clone(), media_tx);
-    let facts = crate::testing::call_facts("sess-exact");
+    let facts = aidaemon_tools::testing::call_facts("sess-exact");
     assert!(tool.dispatch_facts().keeps_own_grants);
 
     let approved = json!({ "action": "fill", "selector": "#submit", "value": "one" });
@@ -2277,7 +2393,7 @@ async fn kernel_approval_covers_only_the_exact_call() {
     .await;
 
     let other = json!({ "action": "fill", "selector": "#submit", "value": "two" });
-    let out = crate::testing::call_with_facts(&tool, &other.to_string(), facts.clone())
+    let out = aidaemon_tools::testing::call_with_facts(&tool, &other.to_string(), facts.clone())
         .await
         .unwrap();
     assert!(out.contains("Approval required"), "{out}");
@@ -2289,11 +2405,11 @@ async fn kernel_approval_covers_only_the_exact_call() {
         .await
     );
 
-    let out = crate::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
+    let out = aidaemon_tools::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
         .await
         .unwrap();
     assert!(!out.contains("Approval required"), "{out}");
-    let out = crate::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
+    let out = aidaemon_tools::testing::call_with_facts(&tool, &approved.to_string(), facts.clone())
         .await
         .unwrap();
     assert!(
@@ -2337,7 +2453,7 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
     let nav = tool
         .call_with(
             &json!({ "action": "navigate", "url": "https://example.com/"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2358,7 +2474,7 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
     let mutation = tool
         .call_with(
             &json!({ "action": "click", "selector": "#menu"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2375,7 +2491,7 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
     let obs = tool
         .call_with(
             &json!({ "action": "get_text"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2399,7 +2515,7 @@ async fn observations_never_prompt() {
         let out = tool
             .call_with(
                 &json!({ "action": action}).to_string(),
-                crate::testing::call_facts("sess-obs"),
+                aidaemon_tools::testing::call_facts("sess-obs"),
             )
             .await
             .unwrap();
@@ -2440,7 +2556,7 @@ async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
 
     tool.call_with(
         &json!({ "action": "click", "selector": "#menu"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2448,7 +2564,7 @@ async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
 
     tool.call_with(
         &json!({ "action": "click", "selector": "#details"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2478,7 +2594,7 @@ async fn public_navigation_is_free_across_origins_and_agent_sessions() {
             "url": "https://site.example/first?secret=one",
         })
         .to_string(),
-        crate::testing::call_facts("specialist:code:first"),
+        aidaemon_tools::testing::call_facts("specialist:code:first"),
     )
     .await
     .unwrap();
@@ -2488,7 +2604,7 @@ async fn public_navigation_is_free_across_origins_and_agent_sessions() {
             "url": "https://different.example/second?secret=two",
         })
         .to_string(),
-        crate::testing::call_facts("parent-session"),
+        aidaemon_tools::testing::call_facts("parent-session"),
     )
     .await
     .unwrap();
@@ -2518,7 +2634,7 @@ async fn public_navigation_needs_no_persistent_grant_after_tool_restart() {
                 "url": "https://persistent.example/first",
             })
             .to_string(),
-            crate::testing::call_facts("first-agent"),
+            aidaemon_tools::testing::call_facts("first-agent"),
         )
         .await
         .unwrap();
@@ -2533,7 +2649,7 @@ async fn public_navigation_needs_no_persistent_grant_after_tool_restart() {
                 "url": "https://persistent.example/after-restart",
             })
             .to_string(),
-            crate::testing::call_facts("different-agent"),
+            aidaemon_tools::testing::call_facts("different-agent"),
         )
         .await
         .unwrap();
@@ -2559,7 +2675,7 @@ async fn ordinary_mutation_approval_is_session_only() {
     for session in ["specialist:one", "parent-session"] {
         tool.call_with(
             &json!({ "action": "click", "selector": "#menu" }).to_string(),
-            crate::testing::call_facts(session),
+            aidaemon_tools::testing::call_facts(session),
         )
         .await
         .unwrap();
@@ -2570,7 +2686,7 @@ async fn ordinary_mutation_approval_is_session_only() {
         .permission_modes()
         .await
         .iter()
-        .all(|mode| *mode == crate::tools::command_risk::PermissionMode::Cautious));
+        .all(|mode| *mode == aidaemon_tools::command_risk::PermissionMode::Cautious));
 }
 
 /// POINT-OF-ACTION: every `execute_js` call prompts even after AllowSession —
@@ -2587,7 +2703,7 @@ async fn execute_js_prompts_every_call_and_hides_script() {
     for _ in 0..2 {
         tool.call_with(
             &json!({ "action": "execute_js", "script": script}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2636,7 +2752,7 @@ async fn execute_js_prompt_uses_origin_cached_after_navigation() {
             "url": "https://example.com/reservations?token=SECRET",
         })
         .to_string(),
-        crate::testing::call_facts("sess-origin"),
+        aidaemon_tools::testing::call_facts("sess-origin"),
     )
     .await
     .unwrap();
@@ -2646,7 +2762,7 @@ async fn execute_js_prompt_uses_origin_cached_after_navigation() {
             "script": "1 + 1",
         })
         .to_string(),
-        crate::testing::call_facts("sess-origin"),
+        aidaemon_tools::testing::call_facts("sess-origin"),
     )
     .await
     .unwrap();
@@ -2670,7 +2786,7 @@ async fn consequential_click_prompts_despite_session_approval() {
     // authority.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2679,7 +2795,7 @@ async fn consequential_click_prompts_despite_session_approval() {
     // An ordinary mutation receives reusable session approval.
     tool.call_with(
         &json!({ "action": "click", "selector": "#menu"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2689,7 +2805,7 @@ async fn consequential_click_prompts_despite_session_approval() {
     // session.
     tool.call_with(
         &json!({ "action": "click", "selector": "#delete"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2716,7 +2832,7 @@ async fn consequential_fill_prompt_hides_value() {
             "value": secret_value,
         })
         .to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2749,13 +2865,13 @@ async fn allow_once_does_not_persist_session_approval() {
 
     tool.call_with(
         &json!({ "action": "click", "selector": "#menu"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
     tool.call_with(
         &json!({ "action": "click", "selector": "#details"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -2776,7 +2892,7 @@ async fn administrative_actions_never_prompt() {
     let out = tool
         .call_with(
             &json!({ "action": "close"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2830,7 +2946,7 @@ async fn navigate_redirect_to_loopback_is_blocked_on_final_url() {
                 "url": "https://public-redirector.example/go",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2869,7 +2985,7 @@ async fn navigate_redirect_to_public_is_allowed() {
                 "url": "https://start.example/",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2894,7 +3010,7 @@ async fn navigate_to_metadata_endpoint_is_blocked_preflight() {
                 "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2935,7 +3051,7 @@ async fn new_tab_to_private_url_is_blocked() {
                 "url": "http://10.0.0.5/internal?secret=abc",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -2964,7 +3080,7 @@ async fn new_tab_to_private_url_is_blocked() {
 /// ## Why it's deferred (chromiumoxide 0.8 feasibility finding)
 ///
 /// chromiumoxide 0.8 exposes request interception ONLY as a browser-global flag
-/// (`BrowserConfig::enable_request_intercept`, mapped to `config.request_intercept`
+/// (`BrowserSettings::enable_request_intercept`, mapped to `config.request_intercept`
 /// and applied at target creation in `handler/target.rs`). There is no
 /// `Page::set_request_interception` and no public per-request continue/abort
 /// callback. When interception is enabled, `NetworkManager::on_fetch_request_paused`
@@ -2999,7 +3115,7 @@ async fn navigate_blocked_redirect_resets_page_to_about_blank() {
                 "url": "https://public-redirector.example/go",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -3053,7 +3169,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "get_text"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3085,7 +3201,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "screenshot"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3116,7 +3232,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "inspect_page"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3151,7 +3267,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
                     "script": "document.body.innerText",
                 })
                 .to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3187,7 +3303,7 @@ async fn observation_actions_refuse_on_private_current_url() {
     let out = tool
         .call_with(
             &json!({ "action": "get_text"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -3225,7 +3341,7 @@ async fn observation_actions_allowed_on_public_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "get_text"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3244,7 +3360,7 @@ async fn observation_actions_allowed_on_public_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "screenshot"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3267,7 +3383,7 @@ async fn observation_actions_allowed_on_public_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "execute_js", "script": "1 + 1"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3290,7 +3406,7 @@ async fn observation_actions_allowed_on_public_current_url() {
         let out = tool
             .call_with(
                 &json!({ "action": "inspect_page"}).to_string(),
-                crate::testing::call_facts("sess-a"),
+                aidaemon_tools::testing::call_facts("sess-a"),
             )
             .await
             .unwrap();
@@ -3340,7 +3456,10 @@ async fn oversized_script_rejected_before_evaluate() {
         "script": script,
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -3397,7 +3516,10 @@ async fn browser_management_api_denied_not_evaluated() {
             "script": script,
         });
         let out = tool
-            .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+            .call_with(
+                &args.to_string(),
+                aidaemon_tools::testing::call_facts("sess-a"),
+            )
             .await
             .unwrap();
 
@@ -3432,7 +3554,7 @@ async fn browser_management_api_denied_not_evaluated() {
     let out = tool
         .call_with(
             &args.to_string(),
-            crate::testing::call_facts("sess-control"),
+            aidaemon_tools::testing::call_facts("sess-control"),
         )
         .await
         .unwrap();
@@ -3466,7 +3588,10 @@ async fn approved_execute_js_refused_on_blocked_current_url() {
         "script": "document.body.innerText",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -3516,7 +3641,10 @@ async fn execute_js_result_is_redacted() {
         "script": "getSecret()",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -3555,7 +3683,10 @@ async fn get_text_result_is_redacted() {
         "action": "get_text",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -3587,7 +3718,10 @@ async fn denied_execute_js_not_evaluated() {
         "script": "document.title",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
 
@@ -3655,7 +3789,10 @@ async fn dead_handler_triggers_relaunch_on_next_action() {
     // First action establishes the connection.
     let args = json!({ "action": "get_text"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out, "alive");
@@ -3675,7 +3812,10 @@ async fn dead_handler_triggers_relaunch_on_next_action() {
     // Next action must observe the dead handler and relaunch (fresh EnsureReady),
     // then succeed.
     let out2 = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(out2, "alive", "action after relaunch should succeed");
@@ -3709,7 +3849,10 @@ async fn observation_retries_once_after_connection_error() {
 
     let args = json!({ "action": "get_text"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3749,7 +3892,10 @@ async fn mutation_is_not_replayed_after_connection_error() {
 
     let args = json!({ "action": "click", "selector": "#buy-now"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -3794,7 +3940,10 @@ async fn fill_is_not_replayed_after_connection_error() {
         "value": "4111111111111111",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("sess-a"))
+        .call_with(
+            &args.to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
         .await
         .unwrap();
     assert!(
@@ -3834,7 +3983,7 @@ async fn ordinary_error_does_not_trigger_reconnect() {
     let _ = tool
         .call_with(
             &json!({ "action": "list_tabs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -3842,7 +3991,7 @@ async fn ordinary_error_does_not_trigger_reconnect() {
     let out = tool
         .call_with(
             &json!({ "action": "switch_tab", "tab_id": "does-not-exist"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -3872,7 +4021,7 @@ async fn close_on_launched_browser_records_graceful_shutdown() {
     // Establish a session so a browser is "live", then close.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -3906,7 +4055,7 @@ async fn set_mode_change_reuses_graceful_shutdown() {
     // teardown path.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -3936,7 +4085,7 @@ async fn set_mode_change_reuses_graceful_shutdown() {
     // down again — bring a browser back up first, then re-issue the SAME mode.
     tool.call_with(
         &json!({ "action": "navigate", "url": "https://example.com"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -4319,7 +4468,7 @@ async fn wait_present_succeeds_when_element_appears_before_deadline() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#go"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(out, "Element '#go' found", "present should succeed: {out}");
@@ -4334,7 +4483,7 @@ async fn wait_present_times_out_when_element_never_appears() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#never"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4354,7 +4503,7 @@ async fn wait_visible_succeeds_when_element_becomes_visible() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#v", "condition": "visible"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(
@@ -4372,7 +4521,7 @@ async fn wait_visible_times_out_when_never_visible() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#v", "condition": "visible"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4392,7 +4541,7 @@ async fn wait_enabled_succeeds_when_element_becomes_enabled() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#e", "condition": "enabled"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(
@@ -4410,7 +4559,7 @@ async fn wait_enabled_times_out_when_never_enabled() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#e", "condition": "enabled"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4431,7 +4580,7 @@ async fn wait_hidden_succeeds_when_element_becomes_hidden() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#h", "condition": "hidden"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(
@@ -4450,7 +4599,7 @@ async fn wait_hidden_times_out_when_element_stays_visible() {
     let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
     let args = json!({ "action": "wait", "selector": "#h", "condition": "hidden"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4476,7 +4625,7 @@ async fn wait_text_contains_succeeds_when_text_appears() {
         "text": "complete",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4501,7 +4650,7 @@ async fn wait_text_contains_times_out_when_text_never_matches() {
         "text": "complete",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4519,7 +4668,7 @@ async fn wait_text_contains_requires_a_needle() {
         "condition": "text_contains",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4537,7 +4686,7 @@ async fn wait_rejects_unknown_condition() {
         "condition": "exists",
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4562,7 +4711,7 @@ async fn wait_per_call_timeout_overrides_default_and_clamps() {
         "timeout_secs": 2,
     });
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert!(
@@ -4580,7 +4729,7 @@ async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
     let args = json!({ "action": "navigate", "url": "https://example.com/"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(
@@ -4617,7 +4766,7 @@ async fn navigate_bounds_when_navigation_never_settles() {
     let (tool, backend) = wait_tool(MockBackend::new().with_nav_never_settles());
     let args = json!({ "action": "navigate", "url": "https://example.com/"});
     let out = tool
-        .call_with(&args.to_string(), crate::testing::call_facts("s"))
+        .call_with(&args.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     assert_eq!(
@@ -4638,10 +4787,10 @@ async fn click_that_navigates_waits_for_navigation() {
     // so the nav branch of the race wins and the probe is recorded.
     let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
     let args = json!({ "action": "click", "selector": "#go"});
-    let out = crate::testing::call_through_kernel(
+    let out = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &args.to_string(),
-        crate::testing::call_facts("s"),
+        aidaemon_tools::testing::call_facts("s"),
         Some(ApprovalResponse::AllowOnce),
     )
     .await
@@ -4673,10 +4822,10 @@ async fn click_that_does_not_navigate_returns_fast_via_settle() {
     // bounded-timeout path specifically.
     let (tool, backend) = wait_tool(MockBackend::new());
     let args = json!({ "action": "click", "selector": "#noop"});
-    let out = crate::testing::call_through_kernel(
+    let out = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &args.to_string(),
-        crate::testing::call_facts("s"),
+        aidaemon_tools::testing::call_facts("s"),
         Some(ApprovalResponse::AllowOnce),
     )
     .await
@@ -4699,7 +4848,7 @@ async fn click_navrace_still_detects_popup() {
 
     // Prime the session so it has an active tab id (the legitimate opener).
     let prime = json!({ "action": "list_tabs"});
-    tool.call_with(&prime.to_string(), crate::testing::call_facts("s"))
+    tool.call_with(&prime.to_string(), aidaemon_tools::testing::call_facts("s"))
         .await
         .unwrap();
     let opener = backend
@@ -4724,10 +4873,10 @@ async fn click_navrace_still_detects_popup() {
         .await;
 
     let args = json!({ "action": "click", "selector": "#open"});
-    let out = crate::testing::call_through_kernel(
+    let out = aidaemon_tools::testing::call_through_kernel(
         &tool,
         &args.to_string(),
-        crate::testing::call_facts("s"),
+        aidaemon_tools::testing::call_facts("s"),
         Some(ApprovalResponse::AllowOnce),
     )
     .await
@@ -4752,14 +4901,17 @@ async fn get_console_logs_returns_scripted_entries_for_active_tab() {
     let (tool, _backend, _rec) = mock_tool_with(backend);
 
     let prime = json!({ "action": "list_tabs"});
-    tool.call_with(&prime.to_string(), crate::testing::call_facts("sess-a"))
-        .await
-        .unwrap();
+    tool.call_with(
+        &prime.to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     let out = tool
         .call_with(
             &json!({ "action": "get_console_logs"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -4779,7 +4931,7 @@ async fn get_network_errors_redacts_url_origin() {
 
     tool.call_with(
         &json!({ "action": "list_tabs"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -4787,7 +4939,7 @@ async fn get_network_errors_redacts_url_origin() {
     let out = tool
         .call_with(
             &json!({ "action": "get_network_errors"}).to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -4804,7 +4956,7 @@ async fn get_console_logs_unknown_tab_is_rejected() {
 
     tool.call_with(
         &json!({ "action": "list_tabs"}).to_string(),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -4816,7 +4968,7 @@ async fn get_console_logs_unknown_tab_is_rejected() {
                 "tab_id": "not-a-real-tab",
             })
             .to_string(),
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap();
@@ -4867,7 +5019,7 @@ fn local_navigate(url: &str) -> String {
 async fn local_site_card_lets_the_session_open_that_site_only() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
-    let facts = || crate::testing::call_facts("sess-a");
+    let facts = || aidaemon_tools::testing::call_facts("sess-a");
 
     tool.call_with(
         &local_navigate("http://127.0.0.1:8080/login?token=SECRET"),
@@ -4912,7 +5064,7 @@ async fn declined_local_site_never_reaches_the_backend() {
 
     tool.call_with(
         &local_navigate("http://localhost:3000/"),
-        crate::testing::call_facts("sess-a"),
+        aidaemon_tools::testing::call_facts("sess-a"),
     )
     .await
     .unwrap();
@@ -4936,7 +5088,7 @@ async fn local_site_cannot_be_opened_without_the_owner() {
         .call_with_execution_context(
             &local_navigate("http://localhost:3000/"),
             None,
-            crate::testing::call_facts("sess-a"),
+            aidaemon_tools::testing::call_facts("sess-a"),
         )
         .await
         .unwrap()
@@ -4961,7 +5113,10 @@ async fn private_network_and_metadata_targets_get_no_card() {
         "http://169.254.169.254/latest/meta-data",
     ] {
         let out = tool
-            .call_with(&local_navigate(url), crate::testing::call_facts("sess-a"))
+            .call_with(
+                &local_navigate(url),
+                aidaemon_tools::testing::call_facts("sess-a"),
+            )
             .await
             .unwrap();
         assert!(out.to_lowercase().contains("block"), "{out}");
