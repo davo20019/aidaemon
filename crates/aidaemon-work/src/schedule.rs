@@ -1175,6 +1175,25 @@ pub fn owner_time<Tz: TimeZone>(at: &DateTime<Tz>) -> String {
     format_owner_time(&at.fixed_offset(), &Local::now().fixed_offset(), &label)
 }
 
+/// A moment in full, in the owner's zone, for the model's prompt: the
+/// weekday and date it needs plus the same clock and zone label as
+/// [`owner_time`] ("Thursday, November 12, 2026, 2:39 PM ET"), so replies
+/// speak the owner's time instead of UTC.
+pub fn owner_date_time_long<Tz: TimeZone>(at: &DateTime<Tz>) -> String {
+    let at = at.with_timezone(&Local);
+    let label = owner_zone_label(at.offset().local_minus_utc());
+    format_owner_date_time_long(&at.fixed_offset(), &label)
+}
+
+/// Testable core of [`owner_date_time_long`]: `at` in the owner's zone.
+pub fn format_owner_date_time_long(at: &DateTime<FixedOffset>, zone_label: &str) -> String {
+    format!(
+        "{}, {} {zone_label}",
+        at.format("%A, %B %-d, %Y"),
+        at.format("%-I:%M %p")
+    )
+}
+
 /// [`owner_time`] for an RFC 3339 timestamp; `None` when it does not parse.
 pub fn owner_time_rfc3339(value: &str) -> Option<String> {
     DateTime::parse_from_rfc3339(value)
@@ -1244,6 +1263,16 @@ pub fn is_one_shot_schedule(cron_expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prompt_gets_the_full_date_in_the_owners_zone() {
+        let eastern = FixedOffset::west_opt(5 * 3600).unwrap();
+        let at = eastern.with_ymd_and_hms(2026, 11, 12, 13, 57, 0).unwrap();
+        assert_eq!(
+            format_owner_date_time_long(&at, "ET"),
+            "Thursday, November 12, 2026, 1:57 PM ET"
+        );
+    }
 
     #[test]
     fn owner_time_is_one_local_format_with_one_zone_label() {
