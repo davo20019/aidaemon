@@ -4,6 +4,7 @@ pub use aidaemon_events::provider::TokenUsageStore;
 pub use aidaemon_events::stores::{
     ConversationSummaryStore, DialogueStateStore, MessageStore, PromptSnapshotStore,
 };
+pub use aidaemon_mcp::registry::{DynamicMcpServerStore, McpRegistryStore};
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
 pub use aidaemon_tools::services::{
     DynamicCliAgentStore, OAuthGatewayStore, OAuthStore, SettingsStore,
@@ -131,36 +132,6 @@ pub trait SessionChannelStore: Send + Sync {
     }
 }
 
-/// Runtime-managed MCP servers persistence.
-#[async_trait]
-pub trait DynamicMcpServerStore: Send + Sync {
-    /// Store a dynamically added MCP server.
-    async fn save_dynamic_mcp_server(
-        &self,
-        _server: &super::DynamicMcpServer,
-    ) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Get all dynamic MCP servers.
-    async fn list_dynamic_mcp_servers(&self) -> anyhow::Result<Vec<super::DynamicMcpServer>> {
-        Ok(vec![])
-    }
-
-    /// Delete a dynamic MCP server by ID.
-    async fn delete_dynamic_mcp_server(&self, _id: i64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Update a dynamic MCP server.
-    async fn update_dynamic_mcp_server(
-        &self,
-        _server: &super::DynamicMcpServer,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 /// Database health check — verifies the connection is alive.
 #[async_trait]
 pub trait HealthCheckStore: Send + Sync {
@@ -193,11 +164,6 @@ impl<T> MandateToolStore for T where
         + ScheduledRunStore
 {
 }
-
-/// Focused persistence contract used by the dynamic MCP registry.
-pub trait McpRegistryStore: DynamicMcpServerStore {}
-
-impl<T> McpRegistryStore for T where T: DynamicMcpServerStore {}
 
 /// Focused persistence contract used by skill startup and management.
 pub trait SkillsStore: SkillStore + SettingsStore {}

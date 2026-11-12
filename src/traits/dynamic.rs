@@ -50,17 +50,5 @@ pub struct DynamicBot {
     pub created_at: String,
 }
 
-/// A dynamically added MCP server configuration (stored in database).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicMcpServer {
-    pub id: i64,
-    pub name: String,
-    pub command: String,
-    pub args_json: String,     // JSON array of argument strings
-    pub env_keys_json: String, // JSON array of env var key names (values in keychain)
-    pub triggers_json: String, // JSON array of trigger keywords
-    pub enabled: bool,
-    pub created_at: String,
-}
-
+pub use aidaemon_mcp::registry::DynamicMcpServer;
 pub use aidaemon_tools::services::{CliAgentInvocation, DynamicCliAgent};
