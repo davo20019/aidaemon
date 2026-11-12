@@ -1,3 +1,11 @@
+//! The store traits, re-exported from the crates that own them, plus what
+//! the app assembles for itself: the `StateStore` facade over every slice,
+//! and the composites that span crates for tools still in `src/`
+//! (`MandateToolStore`: work + channel routing, moves with the mandate tools
+//! in 9.3; `SkillsStore`: memory + settings, moves with skills in 9.6). The
+//! database liveness probe (`HealthCheckStore`) serves the daemon's own
+//! heartbeat.
+
 use async_trait::async_trait;
 
 pub use aidaemon_channels::hub::{DynamicBotStore, SessionChannelStore};
@@ -6,6 +14,7 @@ pub use aidaemon_events::stores::{
     ConversationSummaryStore, DialogueStateStore, MessageStore, PromptSnapshotStore,
 };
 pub use aidaemon_mcp::registry::{DynamicMcpServerStore, McpRegistryStore};
+pub use aidaemon_memory::skills::SkillStore;
 pub use aidaemon_memory::stores::{EpisodeStore, FactStore, PeopleStore};
 pub use aidaemon_tools::services::{
     DynamicCliAgentStore, OAuthGatewayStore, OAuthStore, SettingsStore,
@@ -15,75 +24,6 @@ pub use aidaemon_work::stores::*;
 
 /// Learning storage lives in the SDK memory crate.
 pub use aidaemon_memory::LearningStore;
-
-/// Skills storage (deprecated dynamic skills + skill drafts).
-#[async_trait]
-pub trait SkillStore: Send + Sync {
-    /// Store a dynamically added skill.
-    /// Deprecated: use filesystem skills instead.
-    #[allow(dead_code)]
-    async fn add_dynamic_skill(&self, _skill: &super::DynamicSkill) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Get all dynamic skills.
-    /// Deprecated: use filesystem skills instead.
-    async fn get_dynamic_skills(&self) -> anyhow::Result<Vec<super::DynamicSkill>> {
-        Ok(vec![])
-    }
-
-    /// Delete a dynamic skill by ID.
-    /// Deprecated: use filesystem skills instead.
-    #[allow(dead_code)]
-    async fn delete_dynamic_skill(&self, _id: i64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Update the enabled flag of a dynamic skill.
-    /// Deprecated: file existence = active, no enable/disable needed.
-    #[allow(dead_code)]
-    async fn update_dynamic_skill_enabled(&self, _id: i64, _enabled: bool) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Get procedures eligible for skill promotion (success_count >= min_success, success rate >= min_rate).
-    async fn get_promotable_procedures(
-        &self,
-        _min_success: i32,
-        _min_rate: f32,
-    ) -> anyhow::Result<Vec<super::Procedure>> {
-        Ok(vec![])
-    }
-
-    /// Store a skill draft from auto-promotion. Returns the draft ID.
-    async fn add_skill_draft(&self, _draft: &super::SkillDraft) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-
-    /// Get all pending skill drafts.
-    async fn get_pending_skill_drafts(&self) -> anyhow::Result<Vec<super::SkillDraft>> {
-        Ok(vec![])
-    }
-
-    /// Get a skill draft by ID.
-    async fn get_skill_draft(&self, _id: i64) -> anyhow::Result<Option<super::SkillDraft>> {
-        Ok(None)
-    }
-
-    /// Update a skill draft's status ("approved" or "dismissed").
-    async fn update_skill_draft_status(&self, _id: i64, _status: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Check if any draft record already exists for a given procedure name
-    /// (pending, approved, or dismissed).
-    async fn skill_draft_exists_for_procedure(
-        &self,
-        _procedure_name: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-}
 
 /// Database health check — verifies the connection is alive.
 #[async_trait]
