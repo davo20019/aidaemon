@@ -284,6 +284,18 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      # The SDK shell's Linux sandbox. Ubuntu 24.04 runners restrict
+      # unprivileged user namespaces through AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), which makes bwrap
+      # fail with "setting up uid map: Permission denied"; the step above
+      # lifts that restriction.
+      - name: Install bubblewrap
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get install -y bubblewrap
+          bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --unshare-pid --unshare-net --die-with-parent --new-session true
+
       - name: Install macOS dependencies
         if: matrix.os == 'macos-latest'
         run: brew install ffmpeg
@@ -309,6 +321,14 @@ jobs:
         with:
           path: .fastembed_cache
           key: fastembed-allminilml6v2-v2
+
+      # Required, not skippable: AIDAEMON_REQUIRE_BWRAP=1 turns the tests'
+      # "bwrap unavailable" skip into a failure.
+      - name: Bubblewrap sandbox tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          AIDAEMON_REQUIRE_BWRAP: "1"
+        run: cargo test -p aidaemon-tools --all-features --test bubblewrap
 
       - name: Run tests
         run: cargo test --all-features
