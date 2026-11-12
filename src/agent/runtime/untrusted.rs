@@ -231,6 +231,7 @@ mod tests {
         assert_eq!(
             verdict,
             VerifierVerdict {
+                owner_reason: None,
                 consistent: false,
                 reason: "cancelled".to_string(),
                 decided: false,
