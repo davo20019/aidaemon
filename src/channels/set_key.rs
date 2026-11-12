@@ -85,7 +85,7 @@ impl KeyTarget {
         self.host().as_deref() == Some("openrouter.ai")
     }
 
-    fn provider_name(&self) -> String {
+    pub(crate) fn provider_name(&self) -> String {
         match self.kind {
             ProviderKind::Anthropic => "Anthropic".to_string(),
             ProviderKind::GoogleGenai => "Google".to_string(),
@@ -304,26 +304,43 @@ fn with_api_key_value(content: &str, slot: KeySlot, value: &str) -> anyhow::Resu
     Ok(doc.to_string())
 }
 
+/// Where a saved key went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyStored {
+    /// The daemon's secret store (the OS keychain, or its stand-in).
+    SecretStore,
+    /// Inline in the config file, readable only by the owner's account.
+    ConfigFile,
+}
+
+/// The reply once a key was tested and saved: the provider, only what the
+/// reload changed, and where the key is only when that is not the usual
+/// secret store.
+pub(crate) fn key_saved_reply(provider: &str, stored: KeyStored, reload: &str) -> String {
+    let mut reply = format!("{provider} key saved and tested. {reload}");
+    if stored == KeyStored::ConfigFile {
+        reply.push_str(
+            " Your keychain wasn't available, so the key is in the config file, which only \
+             your account can read.",
+        );
+    }
+    reply
+}
+
 /// Store `key` for `slot`: in the OS keychain, or inline with the config's
-/// owner-only permissions when the keychain is unavailable. Returns a note
-/// for the owner about where it went.
+/// owner-only permissions when the keychain is unavailable. Returns where it
+/// went.
 pub(crate) async fn save_key(
     config_path: &Path,
     slot: KeySlot,
     key: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<KeyStored> {
     let current = tokio::fs::read_to_string(config_path).await?;
     let (stored, note) = match crate::config::store_in_keychain(&slot.keychain_field(), key) {
-        Ok(()) if crate::config::keychain_disabled() => {
-            ("keychain", "Stored in the daemon's .env file.")
-        }
-        Ok(()) => ("keychain", "Stored in the OS keychain."),
+        Ok(()) => ("keychain", KeyStored::SecretStore),
         Err(error) => {
             tracing::warn!(%error, "Keychain unavailable; saving the API key in the config");
-            (
-                key,
-                "The keychain was unavailable, so it is in config.toml.",
-            )
+            (key, KeyStored::ConfigFile)
         }
     };
     let updated = with_api_key_value(&current, slot, stored)?;
@@ -336,7 +353,7 @@ pub(crate) async fn save_key(
         tokio::fs::write(config_path, &updated).await?;
         crate::tools::config_manager::set_owner_only_permissions(config_path);
     }
-    Ok(note.to_string())
+    Ok(note)
 }
 
 #[cfg(test)]
@@ -494,6 +511,20 @@ api_key = "other-value"
         assert_eq!(
             rejected_keys(&provider).await,
             ["Fallback 1: Anthropic: key rejected (HTTP 401)"]
+        );
+    }
+
+    #[test]
+    fn a_saved_key_reply_says_only_what_matters() {
+        assert_eq!(
+            key_saved_reply("Google", KeyStored::SecretStore, "Nothing else changed."),
+            "Google key saved and tested. Nothing else changed."
+        );
+        let inline = key_saved_reply("Anthropic", KeyStored::ConfigFile, "Nothing else changed.");
+        assert!(inline.contains("only your account can read"), "{inline}");
+        assert!(
+            !inline.contains(".env") && !inline.contains("Provider:"),
+            "{inline}"
         );
     }
 

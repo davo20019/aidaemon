@@ -2080,10 +2080,15 @@ impl SlackChannel {
                 "Use `!workspace ...` as a message in the private Slack group where the grant should apply. Type `!help` for the exact syntax."
                     .to_string()
             }
-            "/help" | "/start" => build_help_text(&slack_commands(), "!"),
-            _ => format!(
-                "Unknown command: {}\nType `!help` for available commands.",
-                cmd
+            "/help" | "/start" => build_help_text(
+                &slack_commands(),
+                "!",
+                aidaemon_channels::slash::HelpScope::from_args(arg),
+            ),
+            _ => aidaemon_channels::slash::unknown_command_reply(
+                &format!("!{}", cmd.trim_start_matches('/')),
+                &slack_commands(),
+                "!",
             ),
         }
     }

@@ -1525,12 +1525,12 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 
     let status = harness.agent.reload_provider(&anthropic).await.unwrap();
     assert!(
-        status.contains("OpenaiCompatible -> Anthropic"),
+        status.contains("Now using Anthropic"),
         "unexpected reload status: {}",
         status
     );
     assert!(
-        status.contains("mock-model -> claude-3-haiku-20240307"),
+        status.contains("(claude-3-haiku-20240307)"),
         "unexpected reload status: {}",
         status
     );
@@ -1569,7 +1569,8 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     );
     let status_1 = harness.agent.reload_provider(&anthropic).await.unwrap();
     assert!(
-        status_1.contains("manual-override -> claude-3-opus-20240229"),
+        status_1.contains("Now using Anthropic (claude-3-opus-20240229).")
+            && status_1.contains("picked automatically again"),
         "unexpected reload status: {}",
         status_1
     );
@@ -1588,12 +1589,12 @@ async fn test_reload_provider_resets_manual_model_and_supports_second_reload() {
     );
     let status_2 = harness.agent.reload_provider(&openai).await.unwrap();
     assert!(
-        status_2.contains("Anthropic -> OpenaiCompatible"),
+        status_2.contains("Now using an OpenAI-compatible provider"),
         "unexpected second reload status: {}",
         status_2
     );
     assert!(
-        status_2.contains("claude-3-opus-20240229 -> openai/gpt-4o-mini"),
+        status_2.contains("(openai/gpt-4o-mini)"),
         "unexpected second reload status: {}",
         status_2
     );

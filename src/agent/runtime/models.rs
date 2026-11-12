@@ -170,11 +170,13 @@ impl Agent {
             *model = new_primary.clone();
             *fallback = new_fallback.clone();
         }
+        let manual_model_cleared;
         {
             let mut override_guard =
                 tokio::time::timeout(Duration::from_secs(2), self.model_override.write())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out acquiring model_override lock"))?;
+            manual_model_cleared = *override_guard;
             *override_guard = false;
         }
 
@@ -196,13 +198,14 @@ impl Agent {
             "Provider runtime reloaded"
         );
 
-        Ok(format!(
-            "Provider: {:?} -> {:?}. Model: {} -> {}. Auto-routing re-enabled.",
-            old_runtime.provider_kind(),
-            config.provider.kind,
+        Ok(aidaemon_providers::routing::ProviderReload {
+            old_provider: old_runtime.provider_kind(),
+            new_provider: config.provider.kind,
             old_model,
-            new_primary
-        ))
+            new_model: new_primary,
+            manual_model_cleared,
+        }
+        .summary())
     }
 
     /// HARD-clear a session (destructive: deletes events). Backs `/wipe`.

@@ -550,11 +550,12 @@ impl DiscordChannel {
             return reply;
         }
         match cmd {
-            "/help" | "/start" => build_help_text(&discord_commands(), "/"),
-            _ => format!(
-                "Unknown command: {}\nType /help for available commands.",
-                cmd
+            "/help" | "/start" => build_help_text(
+                &discord_commands(),
+                "/",
+                aidaemon_channels::slash::HelpScope::from_args(arg),
             ),
+            _ => aidaemon_channels::slash::unknown_command_reply(cmd, &discord_commands(), "/"),
         }
     }
 
