@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::backend::{BackendKind, BackendPath, ExecutionBackend, ExecutionRequest};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 /// Directories to skip during recursive file walks (from the SDK tools crate).
 pub use crate::DEFAULT_IGNORE_DIRS;
@@ -405,8 +405,8 @@ struct CachedProjectRootCatalog {
     entries: Vec<(String, PathBuf)>,
 }
 
-static PROJECT_ROOT_CATALOG_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedProjectRootCatalog>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PROJECT_ROOT_CATALOG_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedProjectRootCatalog>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn project_root_directory_entries(root: &Path) -> Vec<(String, PathBuf)> {
     if let Ok(cache) = PROJECT_ROOT_CATALOG_CACHE.lock() {

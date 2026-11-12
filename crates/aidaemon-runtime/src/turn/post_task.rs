@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use aidaemon_events::TaskOutcome;
 
@@ -350,10 +350,11 @@ pub fn is_productive(
     true
 }
 
-static ABS_UNIX_PATH_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"/(?:Users|home|etc)/[^\s]+").expect("unix path regex must compile"));
-static ABS_WINDOWS_PATH_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[A-Z]:[\\/][^\s]+").expect("windows path regex must compile"));
+static ABS_UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/(?:Users|home|etc)/[^\s]+").expect("unix path regex must compile")
+});
+static ABS_WINDOWS_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Z]:[\\/][^\s]+").expect("windows path regex must compile"));
 
 fn split_trailing_path_punctuation(raw: &str) -> (&str, &str) {
     let mut idx = raw.len();

@@ -97,7 +97,6 @@ libsqlite3-sys = { version = "0.30", optional = true }
 croner = "3"
 regex = "1"
 fd-lock = "4"
-once_cell = "1"
 # Cross-platform per-process cumulative CPU time + disk I/O, used by the
 # background-process reaper to detect genuine progress (CPU/IO/output advancing)
 # vs. a truly-stalled process. Default features disabled — we only need the

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 
 use crate::events::{HarnessEvalSnapshot, LlmPayloadInvalidMetric, PolicyMetricsData};
 

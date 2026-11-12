@@ -195,8 +195,8 @@ fn normalize_file_shared_message(
 
 /// Serialize config mutations across every Slack bot in this process. Without
 /// one shared lock, simultaneous grants/auto-claims could overwrite each other.
-static SLACK_CONFIG_WRITE_LOCK: once_cell::sync::Lazy<Mutex<()>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(()));
+static SLACK_CONFIG_WRITE_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
 
 enum WorkspaceGrantMutation {
     Upsert(WorkspaceGrant),

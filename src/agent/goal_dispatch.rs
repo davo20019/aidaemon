@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock as Lazy;
 
 use crate::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
 use crate::traits::{Goal, ScheduledRunState, StateStore, Task};

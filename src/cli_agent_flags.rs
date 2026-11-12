@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 use tokio::process::Command;
 
 use crate::traits::StateStore;
@@ -211,8 +211,9 @@ pub(crate) fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
-    static LONG_FLAG_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex"));
+    static LONG_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
+    });
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for cap in LONG_FLAG_RE.find_iter(help_text) {
@@ -225,8 +226,9 @@ pub(crate) fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
 }
 
 pub(crate) fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> {
-    static LONG_FLAG_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex"));
+    static LONG_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
+    });
     let mut docs = Vec::new();
     for raw_line in help_text.lines() {
         let line = raw_line.trim();

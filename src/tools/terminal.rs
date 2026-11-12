@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use aidaemon_policies::contains_shell_operator;
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
+use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -1300,8 +1300,8 @@ fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
     // Also scan chained shell segments (e.g. "cd repo && grep -rc ... .").
     // This is intentionally simple and best-effort: it catches common cases
     // without trying to fully parse shell grammar.
-    static SHELL_CHAIN_SPLIT_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?:&&|\|\||;|\|)").expect("valid chain regex"));
+    static SHELL_CHAIN_SPLIT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:&&|\|\||;|\|)").expect("valid chain regex"));
     for segment in SHELL_CHAIN_SPLIT_RE.split(command) {
         let trimmed = segment.trim();
         if trimmed.is_empty() {
@@ -3347,8 +3347,8 @@ fn format_background_continuation_failure(unchecked: &[String]) -> String {
 /// pings (live 2026-07-12). The guard is held across the whole re-engaged
 /// `handle_message` call; later completions then see the earlier turn's
 /// results in history instead of redoing the work.
-static REENGAGE_SERIALIZER: Lazy<tokio::sync::Mutex<()>> =
-    Lazy::new(|| tokio::sync::Mutex::new(()));
+static REENGAGE_SERIALIZER: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[cfg(test)]
 pub(crate) async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {

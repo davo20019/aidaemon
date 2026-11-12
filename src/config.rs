@@ -3259,7 +3259,7 @@ impl AppConfig {
 mod tests {
     use super::*;
     use crate::testing::KeychainIsolation;
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
 
     /// A config written before a policy key was retired must still parse:
     /// `PolicyConfig` tolerates unknown keys rather than failing startup.
@@ -3409,13 +3409,14 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         );
     }
 
-    static ENV_EXPANSION_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_WEB_APP_URL_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_BRIDGE_ENABLED_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
-    static TERMINAL_STATIC_FALLBACK_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
-        Lazy::new(|| std::sync::Mutex::new(()));
+    static ENV_EXPANSION_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_WEB_APP_URL_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_BRIDGE_ENABLED_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_STATIC_FALLBACK_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn cli_agents_config_defaults_to_disabled() {
