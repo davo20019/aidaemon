@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aidaemon_channels::admin_commands::{CheckpointCommands, ConfigReload, ReloadCommand};
-pub(crate) use aidaemon_channels::slash::{shared_commands, CommandCategory, CommandDef};
 use aidaemon_channels::slash::{ChatMode, CommandHost, ScheduledItem, SharedCommands};
+pub(crate) use aidaemon_channels::slash::{CommandCategory, CommandDef};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 

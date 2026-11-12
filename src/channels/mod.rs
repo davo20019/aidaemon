@@ -10,15 +10,13 @@ pub(crate) use aidaemon_channels::live_status;
 #[cfg(test)]
 pub(crate) mod mock_api;
 use aidaemon_channels::presentation;
-pub(crate) use aidaemon_channels::prompts;
-#[cfg(feature = "slack")]
-use aidaemon_channels::rate_limit;
 pub(crate) mod set_key;
 #[cfg(feature = "slack")]
-mod slack;
+pub(crate) mod slack;
 pub(crate) mod telegram;
 pub(crate) use aidaemon_channel_telegram::bot_api as telegram_api;
 mod telegram_bootstrap_signing;
+#[cfg(test)]
 pub(crate) use aidaemon_channels::turns;
 #[cfg(test)]
 mod turns_tests;
@@ -78,6 +76,7 @@ impl ChannelRuntimeDeps {
     }
 
     /// What the shared turn runner needs from these.
+    #[cfg(test)]
     pub(crate) fn turn_deps(&self) -> turns::TurnDeps {
         turns::TurnDeps {
             agent: self.agent.clone(),

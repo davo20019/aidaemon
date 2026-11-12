@@ -178,15 +178,21 @@ version = "0.2.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "shell-words",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

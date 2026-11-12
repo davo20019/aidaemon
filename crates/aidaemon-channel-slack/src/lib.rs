@@ -22,6 +22,8 @@
 //! `reply_in_thread` is on (the default), so their conversation id is
 //! `"{channel}:{ts}"`.
 
+#[cfg(feature = "bot")]
+pub mod bot;
 mod events;
 pub mod format;
 
