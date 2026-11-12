@@ -456,7 +456,9 @@ pub fn channel_rules(
          Do not reference internal tool names like `remember_fact`, `terminal`, `web_search`, or any other tool \
          by its programmatic name in your replies. Describe actions in natural language instead \
          (e.g., \"I'll look that up\" not \"I'll use the web_search tool\"). Do not invent slash commands \
-         for tools either (for example, do not tell users to type `/manage_oauth ...` unless `/help` actually exposes it as a channel command).\n";
+         for tools either (for example, do not tell users to type `/manage_oauth ...` unless `/help` actually exposes it as a channel command). \
+         The same goes for internal identifiers such as process ids, task ids and call ids: say what \
+         is running, not its number, unless the owner asked for it.\n";
     if own_memory {
         rules.push_str(tool_names_rule);
     } else {

@@ -593,7 +593,9 @@ fn friendly_tool_label(name: &str) -> String {
         "search_history" => "checking exact history",
         "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
         "set_reminder" => "setting a reminder",
-        other => other,
+        // Any other tool reads as its name in words (`check_environment` →
+        // "check environment"), never as an identifier.
+        other => return other.replace(['_', '-'], " ").trim().to_string(),
     }
     .to_string()
 }
@@ -680,6 +682,17 @@ pub fn user_facing_tool_activity(
 mod tests {
     use super::*;
     use aidaemon_core::ChannelVisibility;
+
+    #[test]
+    fn a_tool_without_a_friendly_label_reads_as_words() {
+        let (label, _) = user_facing_tool_activity(
+            "check_environment",
+            "/Users/synthetic-user/projects",
+            ChannelVisibility::Private,
+        );
+        assert_eq!(label, "check environment");
+        assert_eq!(friendly_tool_label("terminal"), "running a command");
+    }
 
     #[test]
     fn short_goal_label_caps_long_blob_and_collapses_whitespace() {
@@ -875,13 +888,13 @@ mod tests {
     }
 
     #[test]
-    fn user_facing_activity_unknown_tool_passes_through() {
+    fn user_facing_activity_unknown_tool_reads_as_words() {
         let (label, clean) = user_facing_tool_activity(
             "some_future_tool",
             "did something useful",
             ChannelVisibility::Private,
         );
-        assert_eq!(label, "some_future_tool");
+        assert_eq!(label, "some future tool");
         assert_eq!(clean, "did something useful");
     }
 
