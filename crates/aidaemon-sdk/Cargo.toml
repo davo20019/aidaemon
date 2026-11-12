@@ -81,7 +81,7 @@ required-features = ["providers", "tools", "policies", "sqlite"]
 
 [[example]]
 name = "support_triage"
-required-features = ["providers", "policies"]
+required-features = ["providers", "policies", "testing"]
 
 [[test]]
 name = "tool_macro"

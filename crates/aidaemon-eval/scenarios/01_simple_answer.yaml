@@ -11,3 +11,9 @@ expect:
   tool_call_counts: { get_weather: 0, read_file: 0 }
   max_turns: 1
   max_billable_tokens: 200
+live_expect:
+  status: completed
+  final_text_contains: [paris]
+  final_text_not_contains: [london]
+  tool_call_counts: { get_weather: 0, read_file: 0 }
+  max_turns: 1

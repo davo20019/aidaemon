@@ -66,6 +66,17 @@ impl<S, X> Suite<S, X> {
         self
     }
 
+    /// Run every scenario against the factory's live provider, scripted or
+    /// not: see [`Scenario::into_live`].
+    pub fn live(mut self) -> Self {
+        self.scenarios = self
+            .scenarios
+            .into_iter()
+            .map(Scenario::into_live)
+            .collect();
+        self
+    }
+
     /// Keep only scenarios whose name contains `pattern`.
     pub fn filter(mut self, pattern: &str) -> Self {
         self.scenarios.retain(|s| s.name.contains(pattern));

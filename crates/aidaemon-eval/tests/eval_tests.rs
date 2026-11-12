@@ -944,3 +944,70 @@ async fn typed_suites_load_a_directory_and_run_on_their_subject() {
     let report = suite.run_subject(&TicketDesk, 3).await;
     assert_eq!((report.total_runs, report.total_passes), (3, 3));
 }
+
+// ---------- live mode ----------
+
+/// A scripted scenario run live uses the factory's live provider (even a
+/// scripted one standing in for a model) and `live_expect` instead of
+/// `expect`.
+#[tokio::test]
+async fn live_mode_drops_the_script_and_uses_live_expect() {
+    let yaml = "name: s\ninput: q\nscript: [{ text: scripted answer }]\n\
+                expect: { final_text_contains: [scripted] }\n\
+                live_expect: { final_text_contains: [live], max_turns: 1 }\n";
+    let live: Arc<dyn Provider> = Arc::new(aidaemon_core::testing::ScriptedProvider::new([
+        aidaemon_core::testing::text("a live answer"),
+    ]));
+    let suite = Suite::new(vec![scenario(yaml)]).live();
+    assert!(suite.scenarios[0].script.is_none());
+    assert!(suite.scenarios[0].live_expect.is_none());
+    let report = suite
+        .run(&ExampleFactory::with_live_provider(live), 1)
+        .await;
+    assert!(report.all_passed(), "{}", report.to_markdown());
+
+    // Without `live_expect` the scripted assertions stay.
+    let kept = scenario(
+        "name: k\ninput: q\nscript: [{ text: x }]\nexpect: { final_text_contains: [x] }\n",
+    )
+    .into_live();
+    assert!(kept.script.is_none());
+    assert_eq!(kept.expect.final_text_contains, vec!["x".to_string()]);
+}
+
+/// Every shipped scenario says what a live run must show.
+#[test]
+fn shipped_scenarios_have_live_expectations() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/scenarios");
+    for s in Suite::from_dir(dir).unwrap().scenarios {
+        assert!(s.live_expect.is_some(), "{} has no live_expect", s.name);
+    }
+}
+
+/// Hooks from `with_hooks` run on every agent the factory builds: a hook
+/// that denies everything turns a succeeded call into a denied one.
+#[tokio::test]
+async fn example_factory_adds_hooks() {
+    struct DenyAll;
+    #[async_trait]
+    impl aidaemon_core::Hook for DenyAll {
+        async fn before_tool(
+            &self,
+            _ctx: &aidaemon_core::HookContext<'_>,
+            _call: &aidaemon_core::ToolCall,
+            _tool: &aidaemon_core::ToolInfo,
+        ) -> aidaemon_core::ToolDecision {
+            aidaemon_core::ToolDecision::Deny {
+                reason: "no".into(),
+            }
+        }
+    }
+    let yaml = "name: h\ninput: q\nscript:\n  - tool_calls: [{ name: get_weather, arguments: { city: X } }]\n  - text: done\n\
+                expect: { receipt_statuses: { get_weather: [denied] } }\n";
+    let factory = ExampleFactory::new()
+        .with_hooks(|_| vec![Arc::new(DenyAll) as Arc<dyn aidaemon_core::Hook>]);
+    let result = scenario(yaml).run(&factory).await;
+    assert!(result.passed, "{:?}", result.failures);
+    let plain = run(yaml).await;
+    assert!(!plain.passed);
+}

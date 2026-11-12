@@ -14,7 +14,7 @@ keywords = ["agent", "eval", "llm", "testing", "scenarios"]
 categories = ["development-tools::testing", "development-tools"]
 # Integration tests need dev-dependencies that are not published with the crate;
 # planning notes and the API snapshot stay in the repository.
-exclude = ["tests/", "benches/"]
+exclude = ["tests/", "benches/", "examples/"]
 publish = false
 
 [features]
@@ -33,4 +33,11 @@ thiserror = "1"
 
 [dev-dependencies]
 aidaemon-eval = { path = ".", features = ["examples"] }
+aidaemon-policies = { path = "../aidaemon-policies" }
+aidaemon-providers = { path = "../aidaemon-providers" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# The shipped scenarios against a live model, one policy on at a time.
+[[example]]
+name = "live_policies"
+required-features = ["examples"]

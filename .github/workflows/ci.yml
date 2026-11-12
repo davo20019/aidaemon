@@ -333,7 +333,7 @@ jobs:
           set -euo pipefail
           unset ANTHROPIC_API_KEY OPENAI_API_KEY
           for example in quickstart custom_tool approvals resume_after_crash sub_agent \
-              memory_swap channel_bot sse_server otel_traces; do
+              memory_swap channel_bot sse_server otel_traces support_triage; do
             echo "::group::$example"
             cargo run -q -p aidaemon-sdk --all-features --example "$example"
             echo "::endgroup::"

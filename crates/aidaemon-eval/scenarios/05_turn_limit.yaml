@@ -13,3 +13,8 @@ expect:
   tool_call_counts: { read_file: 2 }
   max_turns: 2
   no_failed_receipts: true
+# Live: the model may read one file or several, but the limit holds.
+live_expect:
+  max_turns: 2
+  tools_used: [read_file]
+  no_failed_receipts: true

@@ -272,6 +272,8 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-eval",
+ "aidaemon-policies",
+ "aidaemon-providers",
  "async-trait",
  "futures",
  "serde",
