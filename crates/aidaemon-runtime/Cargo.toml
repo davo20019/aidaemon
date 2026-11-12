@@ -35,7 +35,7 @@ aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
 aidaemon-work = { version = "0.2.0", path = "../aidaemon-work" }
 anyhow = "1"
 async-trait = "0.1"
-dirs = "6"
+dirs = "7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 futures = "0.3"
 regex = "1"
@@ -47,7 +47,7 @@ shellexpand = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
-tokio-util = "0.7.18"
+tokio-util = "0.7.20"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 

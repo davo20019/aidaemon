@@ -24,7 +24,7 @@ aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-htmd = "0.1"
+htmd = "0.5"
 llm_readability = "0.0"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli", "json"] }

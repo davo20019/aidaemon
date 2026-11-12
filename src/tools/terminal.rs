@@ -4724,7 +4724,11 @@ impl TerminalTool {
 
         // Refresh ALL processes (not just the tracked roots) so descendant
         // CPU/IO is visible. cpu + disk only — we never need names/cmdlines here.
-        let mut sys = System::new();
+        // No process table to read (sysinfo could not open it): no samples,
+        // the same as a pid that has already exited.
+        let Ok(mut sys) = System::new() else {
+            return HashMap::new();
+        };
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,

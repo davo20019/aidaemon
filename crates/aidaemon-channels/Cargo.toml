@@ -34,7 +34,7 @@ aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-base64 = "0.22"
+base64 = "0.23"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, optional = true }
 url = "2"
@@ -47,7 +47,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-toml = "0.8"
+toml = "1.2"
 tempfile = "3"
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 aidaemon-channels = { path = ".", features = ["testing", "conformance", "http"] }
