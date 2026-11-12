@@ -218,13 +218,13 @@ impl MockSocket {
                     };
                     let (mut tx, mut rx) = ws.split();
                     for frame in script {
-                        if tx.send(Message::Text(frame.to_string())).await.is_err() {
+                        if tx.send(Message::text(frame.to_string())).await.is_err() {
                             return;
                         }
                     }
                     while let Some(Ok(msg)) = rx.next().await {
                         match msg {
-                            Message::Text(text) => rec.lock().unwrap().push(text),
+                            Message::Text(text) => rec.lock().unwrap().push(text.to_string()),
                             Message::Close(_) => break,
                             _ => {}
                         }

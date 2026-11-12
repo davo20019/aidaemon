@@ -102,7 +102,7 @@ fd-lock = "4"
 # vs. a truly-stalled process. Default features disabled — we only need the
 # `system` component (processes), not disks/networks/components.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
 self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"], default-features = false }
 semver = "1"
 hmac = "0.12"

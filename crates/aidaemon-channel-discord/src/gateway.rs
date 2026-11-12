@@ -485,7 +485,7 @@ impl DiscordChannel {
             identify
         };
         if sink
-            .send(Message::Text(handshake.to_string()))
+            .send(Message::Text(handshake.to_string().into()))
             .await
             .is_err()
         {
@@ -517,7 +517,7 @@ impl DiscordChannel {
                         return Outcome::Reconnect { delay: Delay::None };
                     }
                     acked = false;
-                    if sink.send(Message::Text(self.heartbeat_payload(shard))).await.is_err() {
+                    if sink.send(Message::Text(self.heartbeat_payload(shard).into())).await.is_err() {
                         return Outcome::Reconnect { delay: Delay::Backoff };
                     }
                     hb.as_mut().reset(Instant::now() + interval);
@@ -553,7 +553,7 @@ impl DiscordChannel {
                         // The guard sends the heartbeat; a successful send
                         // falls through to the no-op arm.
                         OP_HEARTBEAT
-                            if sink.send(Message::Text(self.heartbeat_payload(shard))).await.is_err() =>
+                            if sink.send(Message::Text(self.heartbeat_payload(shard).into())).await.is_err() =>
                         {
                             return Outcome::Reconnect { delay: Delay::Backoff };
                         }

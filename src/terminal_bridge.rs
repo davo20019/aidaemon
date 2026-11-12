@@ -5857,7 +5857,7 @@ impl TerminalBridge {
         S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
         ws_write
-            .send(Message::Text(serde_json::to_string(&value)?))
+            .send(Message::text(serde_json::to_string(&value)?))
             .await?;
         Ok(())
     }

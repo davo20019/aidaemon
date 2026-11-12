@@ -107,7 +107,7 @@ impl InjectSocket {
                     let mut superseded = inbox.take_over();
                     let mut unacked: Vec<Value> = Vec::new();
                     let hello = json!({ "type": "hello", "num_connections": 1 });
-                    if out.send(Message::Text(hello.to_string())).await.is_err() {
+                    if out.send(Message::text(hello.to_string())).await.is_err() {
                         return;
                     }
                     loop {
@@ -127,7 +127,7 @@ impl InjectSocket {
                             frame = inbox.pop() => {
                                 let text = frame.to_string();
                                 unacked.push(frame);
-                                if out.send(Message::Text(text)).await.is_err() {
+                                if out.send(Message::text(text)).await.is_err() {
                                     break;
                                 }
                             }
