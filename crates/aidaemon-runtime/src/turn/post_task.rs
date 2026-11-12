@@ -412,8 +412,12 @@ pub fn build_friendly_background_handoff(user_request: &str) -> String {
     msg
 }
 
-/// First-line, length-capped echo of the user's request for the handoff
-/// "Working on" line. Returns `None` for empty or synthetic/internal prompts.
+/// Most words the handoff's request label keeps.
+const GIST_WORDS: usize = 8;
+
+/// A short label for the user's request on the handoff: its first line, at
+/// most [`GIST_WORDS`] words, so the bubble names the request without
+/// echoing it. Returns `None` for empty or synthetic/internal prompts.
 fn friendly_request_gist(user_request: &str) -> Option<String> {
     let trimmed = user_request.trim();
     // Skip synthetic re-engagement prompts and other bracketed control text —
@@ -425,7 +429,16 @@ fn friendly_request_gist(user_request: &str) -> Option<String> {
     if first_line.is_empty() {
         return None;
     }
-    Some(aidaemon_events::text::truncate_str(first_line, 140))
+    let mut words = first_line.split_whitespace();
+    let mut label = words
+        .by_ref()
+        .take(GIST_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.next().is_some() {
+        label.push_str(" …");
+    }
+    Some(aidaemon_channels::presentation::word_preview(&label, 60))
 }
 
 ///
@@ -588,7 +601,7 @@ mod tests {
         assert!(msg.starts_with("⏳ **Still on it**"));
         assert!(msg.contains("running in the background"));
         assert!(msg.contains("I'll send the result as soon as it's ready"));
-        assert!(msg.contains("**Request:** How many PDF files are in my projects folder?"));
+        assert!(msg.contains("**Request:** How many PDF files are in my projects …"));
         // No internals leaked into chat.
         assert!(!msg.contains("pid="));
         assert!(!msg.contains("Moved to background"));
@@ -616,7 +629,15 @@ mod tests {
     fn test_friendly_request_gist_truncates_long_requests() {
         let long = "a".repeat(500);
         let gist = friendly_request_gist(&long).expect("gist for long request");
-        assert!(gist.chars().count() <= 140);
+        assert!(gist.chars().count() <= 60);
+        // A long request is named in a few words, never echoed whole.
+        assert_eq!(
+            friendly_request_gist(
+                "In the background, run a shell command that sleeps for twenty seconds and then prints done"
+            )
+            .as_deref(),
+            Some("In the background, run a shell command that …")
+        );
         // Multi-line requests collapse to the first line.
         assert_eq!(
             friendly_request_gist("count the files\nthen email me").as_deref(),
