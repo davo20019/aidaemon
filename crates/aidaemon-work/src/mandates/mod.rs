@@ -1,3 +1,6 @@
+pub mod history;
+pub mod policy;
+
 pub use aidaemon_events::mandate_grant::MandateAuthorityGrant;
 
 use std::collections::BTreeSet;

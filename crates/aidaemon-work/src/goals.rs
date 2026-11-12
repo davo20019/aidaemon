@@ -867,6 +867,64 @@ impl NotificationEntry {
     }
 }
 
+/// A task status is "terminal" when it will never advance to `completed` on its
+/// own — either it already succeeded (`completed`/`skipped`), was explicitly
+/// replaced (`superseded`), or it is dead
+/// (`failed`/`blocked`/`interrupted`/`cancelled`/`abandoned`). Terminal tasks
+/// are useful when deciding whether a scheduler can make further progress.
+/// Terminal does not imply successful: strict finite/current-run completion
+/// separately requires [`Task::satisfies_run_completion`].
+pub fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed"
+            | "skipped"
+            | "superseded"
+            | "failed"
+            | "blocked"
+            | "interrupted"
+            | "cancelled"
+            | "abandoned"
+    )
+}
+
+/// Whether every task of a run completed it (and there is at least one).
+pub fn tasks_satisfy_goal_completion(tasks: &[Task]) -> bool {
+    !tasks.is_empty() && tasks.iter().all(Task::satisfies_run_completion)
+}
+
+/// Whether a goal's final summary admits the work is not finished.
+pub fn goal_completion_summary_indicates_not_finished(summary: &str) -> bool {
+    let lower = summary.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    [
+        "i completed part of the request",
+        "i'm blocked from safely finishing",
+        "blocked from safely finishing",
+        "haven't verified the final outcome",
+        "have not verified the final outcome",
+        "haven't verified yet",
+        "have not verified yet",
+        "not verified yet",
+        "not yet verified",
+        "verification pending",
+        "need a final read-only check",
+        "need a final read only check",
+        "before i can claim success",
+        "can't claim success",
+        "cannot claim success",
+        "still need to verify",
+        "still need a final check",
+        "partially completed",
+        "partial completion",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
 #[cfg(test)]
 mod notification_attention_tests {
     use super::NotificationEntry;

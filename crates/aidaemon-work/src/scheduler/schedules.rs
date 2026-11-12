@@ -5,11 +5,11 @@ use super::*;
 /// How soon a one-shot that failed to fire is tried again.
 const ONE_SHOT_RETRY_SECS: i64 = 60;
 
-impl HeartbeatCoordinator {
+impl GoalCycle {
     /// Check for due schedules across active orchestration goals and enqueue tasks.
     ///
     /// Scheduling is per-schedule (`goal_schedules`) rather than a goal column.
-    pub(super) async fn check_due_goal_schedules(&self) {
+    pub async fn check_due_goal_schedules(&self) {
         let due = match self.state.get_due_goal_schedules(50).await {
             Ok(s) => s,
             Err(e) => {
@@ -57,7 +57,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn reconcile_open_scheduled_runs(&self) {
+    pub async fn reconcile_open_scheduled_runs(&self) {
         let goals = match self.state.get_scheduled_goals().await {
             Ok(goals) => goals,
             Err(error) => {
@@ -72,7 +72,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn reconcile_open_scheduled_runs_for_goal(
+    pub async fn reconcile_open_scheduled_runs_for_goal(
         &self,
         goal_id: &str,
     ) -> anyhow::Result<Vec<crate::traits::GoalRun>> {
@@ -126,7 +126,7 @@ impl HeartbeatCoordinator {
     /// `finish_goal_run`, and a failure lands in the same budget accounting.
     /// The paused schedules stay paused during recovery so the cron cannot
     /// double-fire.
-    pub(super) async fn launch_escalated_recoveries(&self) {
+    pub async fn launch_escalated_recoveries(&self) {
         let candidates = match self
             .state
             .list_escalated_recovery_candidates(
@@ -293,7 +293,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
+    pub async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
         // Guardrails (unknown policy/tz -> treat as coalesce/local-only).
         if schedule.tz != "local" {
             tracing::warn!(
@@ -338,7 +338,7 @@ impl HeartbeatCoordinator {
                         let msg = format!(
                             "Heads up: your recurring goal \"{}\" hasn't made progress in {} days. \
                              It's still scheduled and will keep trying — reply if you'd like to pause or cancel it.",
-                            crate::tools::sanitize::short_goal_label(&goal.description),
+                            self.presenter.goal_label(&goal.description),
                             days_idle
                         );
                         let entry = crate::traits::NotificationEntry::new(
@@ -395,7 +395,7 @@ impl HeartbeatCoordinator {
             if schedule.is_one_shot {
                 // Keep the one-shot due, but avoid hot-looping while open work exists.
                 schedule.next_run_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
-            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
                 schedule.next_run_at = next.to_rfc3339();
             }
             schedule.updated_at = now_ts.clone();
@@ -421,7 +421,7 @@ impl HeartbeatCoordinator {
                 self.state.as_ref(),
                 &goal.id,
                 configured_budget,
-                crate::agent::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
+                crate::goal_tokens::SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
             )
             .await
             .map(|value| value.budget_daily)
@@ -438,7 +438,7 @@ impl HeartbeatCoordinator {
             schedule.last_run_at = Some(now_ts.clone());
             schedule.next_run_at = if schedule.is_one_shot {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
-            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
                 next.to_rfc3339()
             } else {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
@@ -450,7 +450,7 @@ impl HeartbeatCoordinator {
                  ({}) is exhausted by cumulative usage across this goal's runs today, not by \
                  this unstarted run alone. No work was started. The schedule remains active and \
                  will try again at its next normal fire after the counter resets.",
-                crate::tools::sanitize::short_goal_label(&goal.description),
+                self.presenter.goal_label(&goal.description),
                 effective_daily_budget.unwrap_or_default(),
             );
             let entry = crate::traits::NotificationEntry::new(
@@ -483,7 +483,7 @@ impl HeartbeatCoordinator {
             schedule.last_run_at = Some(now_ts.clone());
             schedule.next_run_at = if schedule.is_one_shot {
                 (now + chrono::Duration::minutes(15)).to_rfc3339()
-            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
                 next.to_rfc3339()
             } else {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
@@ -496,7 +496,7 @@ impl HeartbeatCoordinator {
                  remain and a full run is allowed up to {}. No work was started. The schedule \
                  remains active and will try again at its next normal fire after the daily \
                  counter resets.",
-                crate::tools::sanitize::short_goal_label(&goal.description),
+                self.presenter.goal_label(&goal.description),
                 remaining,
                 required,
             );
@@ -528,7 +528,7 @@ impl HeartbeatCoordinator {
         let advanced_next_run = if schedule.is_one_shot {
             // Park one-shot far in the future; we delete it after successful task creation.
             (now + chrono::Duration::hours(24)).to_rfc3339()
-        } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+        } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
             next.to_rfc3339()
         } else {
             warn!(schedule_id = %schedule.id, cron = %schedule.cron_expr, "Failed to compute next run for recurring schedule");
@@ -608,7 +608,7 @@ impl HeartbeatCoordinator {
         if let Some(fire_text) =
             crate::reminders::fire_text_for_goal(goal.context.as_deref(), &goal.description)
         {
-            let delivered = if let Some(hub_arc) = self.hub.as_ref().and_then(|w| w.upgrade()) {
+            let delivered = if let Some(hub_arc) = self.hub.clone() {
                 hub_arc
                     .send_text(&goal.session_id, &fire_text)
                     .await
@@ -751,21 +751,19 @@ impl HeartbeatCoordinator {
         // updating message instead of a separate announcement + progress stream.
         let mut running_surface_id: Option<String> = None;
         let local_hour = chrono::Timelike::hour(&chrono::Local::now());
-        if !is_group_session(&goal.session_id)
+        if !aidaemon_events::session::is_group_session(&goal.session_id)
             && crate::traits::NotificationEntry::routine_delivery_allowed_at_local_hour(local_hour)
         {
-            if let Some(hub_weak) = &self.hub {
-                if let Some(hub_arc) = hub_weak.upgrade() {
-                    let short_desc = crate::tools::sanitize::short_goal_label(&goal.description);
-                    running_surface_id = hub_arc
-                        .send_text_tracked(
-                            &goal.session_id,
-                            &format!("⏳ **Scheduled run in progress**\n\n{}", short_desc),
-                        )
-                        .await
-                        .ok()
-                        .flatten();
-                }
+            if let Some(hub_arc) = self.hub.clone() {
+                let short_desc = self.presenter.goal_label(&goal.description);
+                running_surface_id = hub_arc
+                    .send_text_tracked(
+                        &goal.session_id,
+                        &format!("⏳ **Scheduled run in progress**\n\n{}", short_desc),
+                    )
+                    .await
+                    .ok()
+                    .flatten();
             }
         }
 
@@ -773,7 +771,7 @@ impl HeartbeatCoordinator {
         // (which only picks up tasks older than 60s, so every scheduled run
         // used to start at least a minute late). If no agent is available the
         // orphan dispatcher still picks the task up on a later tick.
-        if let Some(agent_arc) = self.agent.as_ref().and_then(|w| w.upgrade()) {
+        if let Some(agent_arc) = self.live_agent() {
             let agent_id = format!("heartbeat-schedule-fire-{}", uuid::Uuid::new_v4());
             match self
                 .state
@@ -784,17 +782,10 @@ impl HeartbeatCoordinator {
                     if let Some(ref registry) = self.goal_token_registry {
                         registry.register(&goal.id).await;
                     }
-                    crate::agent::spawn_background_task_lead(
-                        agent_arc,
+                    agent_arc.spawn_task_lead(
                         goal.clone(),
                         task.description.clone(),
-                        goal.session_id.clone(),
-                        ChannelContext::internal(),
-                        UserRole::Owner,
-                        self.state.clone(),
-                        self.hub.clone(),
-                        self.goal_token_registry.clone(),
-                        Some(task.id.clone()),
+                        task.id.clone(),
                         running_surface_id,
                     );
                 }

@@ -2465,6 +2465,24 @@ pub struct TriggersConfig {
     pub email: Option<EmailTriggerConfig>,
 }
 
+impl TriggersConfig {
+    /// The trigger sources as `aidaemon_work::triggers` runs them.
+    pub fn settings(&self) -> aidaemon_work::triggers::TriggerSettings {
+        aidaemon_work::triggers::TriggerSettings {
+            email: self
+                .email
+                .as_ref()
+                .map(|email| aidaemon_work::triggers::EmailTriggerSettings {
+                    host: email.host.clone(),
+                    port: email.port,
+                    username: email.username.clone(),
+                    password: email.password.clone(),
+                    folder: email.folder.clone(),
+                }),
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct EmailTriggerConfig {
     pub host: String,

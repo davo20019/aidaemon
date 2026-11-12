@@ -11,7 +11,16 @@ use tokio_util::sync::CancellationToken;
 
 use serde::{Deserialize, Serialize};
 
-use crate::traits::{Goal, ScheduledRunHealth, SettingsStore};
+use crate::traits::{Goal, ScheduledRunHealth};
+use aidaemon_tools::services::SettingsStore;
+
+/// Recurring runs may spend one additional envelope when their durable health
+/// snapshot shows concrete progress. This is intentionally small: autonomy
+/// means adapting inside a bounded policy, not silently turning a runaway run
+/// into unbounded spend.
+pub const SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS: usize = 1;
+/// The most a scheduled autonomous run may spend, extensions included.
+pub const SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP: i64 = 2_000_000;
 
 const DAILY_BUDGET_OVERRIDE_PREFIX: &str = "goal_daily_budget_override:";
 
@@ -142,6 +151,12 @@ impl Drop for GoalRunGuard {
         if let Ok(mut runs) = self.registry.active_runs.lock() {
             runs.remove(&self.goal_id);
         }
+    }
+}
+
+impl Default for GoalTokenRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

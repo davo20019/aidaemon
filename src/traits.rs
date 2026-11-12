@@ -10,7 +10,6 @@ mod history;
 mod memory;
 mod people;
 mod tools;
-mod trigger_event;
 
 #[allow(unused_imports)]
 pub use aidaemon_events::conversation::{
@@ -97,7 +96,6 @@ pub use tools::{
     ToolSemantics, ToolStatus, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
     TruncationInfo, TrustRoots, EGRESS_EFFECTS,
 };
-pub use trigger_event::TriggerEvent;
 
 mod state_store;
 pub use state_store::*;

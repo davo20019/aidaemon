@@ -26,7 +26,7 @@ impl PlanStore {
 
     /// Run database migrations for the task_plans table.
     async fn migrate(&self) -> anyhow::Result<()> {
-        crate::db::migrations::migrate_task_plans(&self.pool).await
+        migrate_task_plans(&self.pool).await
     }
 
     // =========================================================================
@@ -317,7 +317,7 @@ impl PlanStore {
             if effects_match && observation_matches && targets_match {
                 step.status = StepStatus::Completed;
                 step.completed_at = Some(Utc::now());
-                step.result_summary = Some(crate::utils::truncate_str(result, 200));
+                step.result_summary = Some(aidaemon_events::text::truncate_str(result, 200));
                 if !step
                     .evidence_receipt_ids
                     .iter()
@@ -548,6 +548,54 @@ impl PlanStore {
             updated_at,
         })
     }
+}
+
+/// Creates the `task_plans` table and its indexes; idempotent.
+pub async fn migrate_task_plans(pool: &SqlitePool) -> anyhow::Result<()> {
+    // Create task_plans table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS task_plans (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            description TEXT NOT NULL,
+            trigger_message TEXT NOT NULL,
+            steps TEXT NOT NULL,
+            current_step INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'in_progress',
+            checkpoint TEXT NOT NULL DEFAULT '{}',
+            creation_reason TEXT NOT NULL,
+            task_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Index for finding incomplete plans for a session
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_plans_session_status
+        ON task_plans(session_id, status)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Index for cleanup of old completed plans
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_plans_updated
+        ON task_plans(updated_at)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    tracing::info!("Task plans table migration complete");
+    Ok(())
 }
 
 #[cfg(test)]

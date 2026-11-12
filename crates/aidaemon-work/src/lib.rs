@@ -1,13 +1,20 @@
+#![recursion_limit = "256"]
 //! Goals, mandates, tasks, work coordination and notifications: the domain
 //! types, the store traits and their SQLite implementation.
 
 pub mod admissibility;
 pub mod authority;
+pub mod goal_tokens;
 pub mod goals;
 pub mod mandates;
+pub mod plans;
+pub mod reminders;
+pub mod schedule;
+pub mod scheduler;
 pub mod schema;
 pub mod sqlite;
 pub mod stores;
+pub mod tools;
 pub mod triggers;
 
 /// Every domain type and store trait, under one path.

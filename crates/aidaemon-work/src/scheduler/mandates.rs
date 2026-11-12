@@ -2,14 +2,14 @@
 
 use super::*;
 
-impl HeartbeatCoordinator {
+impl GoalCycle {
     /// Claim and dispatch due mandate reviews from the mandate-owned wake clock.
     ///
     /// This path is deliberately independent from `goal_schedules`: a mandate
     /// review gets `trigger_type = "mandate"`, no schedule id, and a distinct
     /// root-task description. The mandate lease is the admission fence; the
     /// task-attempt lease and per-goal run guard remain execution fences.
-    pub(super) async fn check_due_mandates(&self) {
+    pub async fn check_due_mandates(&self) {
         let lease_owner = format!("heartbeat-mandate-{}", uuid::Uuid::new_v4());
         let due = match self
             .state
@@ -36,9 +36,7 @@ impl HeartbeatCoordinator {
         // configured model is in a known cooldown (a used-up quota, a
         // rejected credential), move the reviews to when one ends.
         let unavailable_until = self
-            .agent
-            .as_ref()
-            .and_then(Weak::upgrade)
+            .live_agent()
             .and_then(|agent| agent.next_model_answer_at());
         if let Some(until) = unavailable_until {
             let retry_at = chrono::DateTime::<chrono::Utc>::from(until).to_rfc3339();
@@ -95,7 +93,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn dispatch_due_mandate_with_busy_retry(
+    pub async fn dispatch_due_mandate_with_busy_retry(
         &self,
         mandate: Mandate,
     ) -> anyhow::Result<()> {
@@ -122,7 +120,7 @@ impl HeartbeatCoordinator {
         }
     }
 
-    pub(super) async fn dispatch_due_mandate(&self, mandate: Mandate) -> anyhow::Result<()> {
+    pub async fn dispatch_due_mandate(&self, mandate: Mandate) -> anyhow::Result<()> {
         let lease_token = mandate
             .review_lease_token
             .as_deref()
@@ -164,7 +162,7 @@ impl HeartbeatCoordinator {
                 .await;
             let message = format!(
                 "Mandate paused because its backing controller goal is not active: {}",
-                crate::tools::sanitize::short_goal_label(&mandate.objective)
+                self.presenter.goal_label(&mandate.objective)
             );
             let entry = crate::traits::NotificationEntry::new(
                 &goal.id,
@@ -264,7 +262,7 @@ impl HeartbeatCoordinator {
         // Immediate dispatch avoids the orphan-recovery grace period. If the
         // agent or worker slot is unavailable, the pending task remains durable
         // and the ordinary orphan dispatcher may claim this same root later.
-        if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
+        if let Some(agent) = self.live_agent() {
             let worker = format!("heartbeat-dispatch-mandate-{}", uuid::Uuid::new_v4());
             match self
                 .state
@@ -275,17 +273,10 @@ impl HeartbeatCoordinator {
                     if let Some(registry) = self.goal_token_registry.as_ref() {
                         registry.register(&goal.id).await;
                     }
-                    crate::agent::spawn_background_task_lead(
-                        agent,
+                    agent.spawn_task_lead(
                         goal.clone(),
                         task.description.clone(),
-                        goal.session_id.clone(),
-                        ChannelContext::internal(),
-                        UserRole::Owner,
-                        self.state.clone(),
-                        self.hub.clone(),
-                        self.goal_token_registry.clone(),
-                        Some(task.id.clone()),
+                        task.id.clone(),
                         None,
                     );
                 }

@@ -2,11 +2,11 @@
 
 use super::*;
 
-impl HeartbeatCoordinator {
+impl GoalCycle {
     /// Phase 5a: Scan goals that completed/failed and enqueue notifications.
     /// Phase 5b: Process notification queue — attempt delivery.
     /// Phase 5c: Cleanup expired status_update notifications.
-    pub(super) async fn deliver_notifications(&self) {
+    pub async fn deliver_notifications(&self) {
         // Phase 5a: Enqueue notifications for goals that need them
         self.enqueue_goal_notifications().await;
 
@@ -26,7 +26,7 @@ impl HeartbeatCoordinator {
     }
 
     /// Scan for goals needing notification and enqueue them.
-    pub(super) async fn enqueue_goal_notifications(&self) {
+    pub async fn enqueue_goal_notifications(&self) {
         let goals = match self.state.get_goals_needing_notification().await {
             Ok(g) => g,
             Err(e) => {
@@ -64,16 +64,14 @@ impl HeartbeatCoordinator {
                             .unwrap_or_default(),
                     };
                     let fallback_summary: String = goal.description.chars().take(300).collect();
-                    let task_results_summary = build_goal_task_results_summary(
+                    let task_results_summary = self.presenter.goal_task_results(
                         &completed_tasks,
                         latest_root_task_id.as_deref(),
                         &fallback_summary,
                     );
 
                     if !completed_tasks.is_empty()
-                        && !crate::tools::manage_goal_tasks::tasks_satisfy_goal_completion(
-                            &completed_tasks,
-                        )
+                        && !crate::goals::tasks_satisfy_goal_completion(&completed_tasks)
                     {
                         let mut corrected = goal.clone();
                         corrected.status = "failed".to_string();
@@ -108,12 +106,9 @@ impl HeartbeatCoordinator {
                                 .unwrap_or(0);
                             let failed =
                                 summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let blocked = summary
-                                .get("blocked")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let total =
-                                summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let blocked =
+                                summary.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                             (
                                 "failed",
                                 format!(
@@ -125,7 +120,9 @@ impl HeartbeatCoordinator {
                                     task_results_summary.chars().take(4000).collect::<String>()
                                 ),
                             )
-                        } else if crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished(&task_results_summary) {
+                        } else if crate::goals::goal_completion_summary_indicates_not_finished(
+                            &task_results_summary,
+                        ) {
                             // The summary contains verification-blocked or incomplete-work
                             // language. Suppress a duplicate terminal notice; structural task
                             // state above remains the authoritative completion gate.
@@ -168,12 +165,12 @@ impl HeartbeatCoordinator {
     /// Queue delivery bypasses `deliver_parent_text_result`, so persist every
     /// delivered notice in owner history: a reply to it must reach an agent
     /// that can see what it answers.
-    pub(crate) async fn record_delivered_notification(
+    pub async fn record_delivered_notification(
         &self,
         entry: &crate::traits::NotificationEntry,
         delivered_text: &str,
     ) {
-        let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) else {
+        let Some(agent) = self.live_agent() else {
             return;
         };
         // An untrusted notice joins a turn recorded tainted before the note
@@ -210,7 +207,8 @@ impl HeartbeatCoordinator {
             );
         }
         if notice_accepts_mandate_answer(&entry.notification_type) {
-            self.bind_mandate_answer_context(&agent, entry).await;
+            self.bind_mandate_answer_context(agent.as_ref(), entry)
+                .await;
         }
     }
 
@@ -218,9 +216,9 @@ impl HeartbeatCoordinator {
     /// "yes" reaches `answer_question` instead of an agent with no referent.
     /// A timed-out ASK has already resumed, so any non-terminal mandate that
     /// still carries the question qualifies; the answer lands as late guidance.
-    pub(super) async fn bind_mandate_answer_context(
+    pub async fn bind_mandate_answer_context(
         &self,
-        agent: &Agent,
+        agent: &dyn TaskLeadHost,
         entry: &crate::traits::NotificationEntry,
     ) {
         let mandate = match self.state.get_mandate_for_goal(&entry.goal_id).await {
@@ -262,7 +260,7 @@ impl HeartbeatCoordinator {
     }
 
     /// Process the notification queue: attempt delivery, track attempts.
-    pub(super) async fn process_notification_queue(&self) {
+    pub async fn process_notification_queue(&self) {
         // Read past the normal delivery batch so quiet-hour routine entries at
         // the front of the queue cannot hide a later owner-action request.
         let pending = match self.state.get_pending_notifications(100).await {
@@ -325,10 +323,11 @@ impl HeartbeatCoordinator {
                     }
                 }
             }
-            let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
-            let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
-                let message =
-                    crate::channels::present_notification(&entry.notification_type, &sanitized);
+            let sanitized = self.presenter.user_facing(&entry.message);
+            let delivered = if let Some(hub) = self.hub.clone() {
+                let message = self
+                    .presenter
+                    .notification(&entry.notification_type, &sanitized);
                 // A channel adapter is external I/O. It must never be allowed to
                 // pin the heartbeat forever because this same loop admits due
                 // schedules and dispatches pending tasks on the next tick.
