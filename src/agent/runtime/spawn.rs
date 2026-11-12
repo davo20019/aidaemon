@@ -178,6 +178,15 @@ fn child_status_sender(
     Some(tx)
 }
 
+/// How a child's progress line on the parent's card reads once it ended.
+fn child_end_progress(outcome: TaskOutcome) -> &'static str {
+    match outcome {
+        TaskOutcome::Succeeded => "done",
+        TaskOutcome::Partial => "stopped short",
+        TaskOutcome::Failed => "didn't finish",
+    }
+}
+
 /// A short name for a child on the parent's status card: its mission's first
 /// line, cut to a phone-width length.
 fn child_status_label(mission: &str) -> String {
@@ -2882,6 +2891,7 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
+        let parent_status_tx = status_tx.clone();
         let status_tx = child_status_sender(status_tx, mission);
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.
@@ -3006,6 +3016,14 @@ impl Agent {
                 .as_ref()
                 .is_some_and(|tree| tree.has_unlanded_write(&child_session_for_events)),
         );
+        // The child's progress line on the parent's card ends with how the
+        // child ended, not with the last step it reported.
+        if let Some(tx) = &parent_status_tx {
+            let _ = tx.try_send(StatusUpdate::SubAgentProgress {
+                label: child_status_label(mission),
+                progress: child_end_progress(child_outcome).to_string(),
+            });
+        }
         let child_task_end = match child_end_record {
             Ok(record) => record,
             Err(error) => {
