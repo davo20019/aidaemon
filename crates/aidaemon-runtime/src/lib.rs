@@ -21,11 +21,23 @@
 //! - [`context_budget`]: token estimates and context-window budgets.
 //! - [`turn`]: system directives, tool-result notices and task outcomes.
 //! - [`settings`]: what the runtime takes from its host's configuration.
+//! - [`approvals`]: owner approvals on the kernel: the approval rules over
+//!   the turn's tools, the owner's session grants and the card resolver.
+//! - [`authority`]: tool authority resolved once per turn, session modes and
+//!   what a spawned child inherits.
+//! - [`coordination`]: what one request's tree of sub-agents knows about each
+//!   other, and the hook that judges their file writes.
+//! - [`known_resources`]: the context that crosses a handoff.
+//! - [`untrusted`]: the untrusted-content rule's taint facts and verifier.
 
+pub mod approvals;
+pub mod authority;
 pub mod chat_bridge;
 pub mod context_budget;
+pub mod coordination;
 pub mod engine;
 pub mod host;
+pub mod known_resources;
 pub mod llm;
 pub mod markers;
 pub mod message_content;
@@ -33,3 +45,4 @@ pub mod policy;
 pub mod prompt;
 pub mod settings;
 pub mod turn;
+pub mod untrusted;

@@ -9,11 +9,11 @@ use super::completion_contract::looks_like_question_request;
 #[cfg(test)]
 use super::completion_contract::HTTP_URL_RE;
 use super::project_scope::extract_project_scopes_from_text;
+#[cfg(test)]
+use super::project_scope::token_looks_like_filesystem_path;
 use aidaemon_events::traits::Message;
 #[cfg(test)]
 use aidaemon_tools::text::contains_keyword_as_words;
-#[cfg(test)]
-use super::project_scope::token_looks_like_filesystem_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowupMode {

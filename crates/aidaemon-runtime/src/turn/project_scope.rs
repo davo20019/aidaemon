@@ -13,7 +13,6 @@ use std::path::Path;
 
 use aidaemon_events::traits::Message;
 
-
 #[cfg(test)]
 fn is_generic_non_project_token(token: &str) -> bool {
     matches!(
@@ -711,7 +710,10 @@ mod tests {
     use super::*;
 
     fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
-        super::choose_primary_project_scope(&*aidaemon_tools::testing::active_execution_backend(), scopes)
+        super::choose_primary_project_scope(
+            &*aidaemon_tools::testing::active_execution_backend(),
+            scopes,
+        )
     }
 
     fn token_looks_like_filesystem_path(token: &str) -> bool {

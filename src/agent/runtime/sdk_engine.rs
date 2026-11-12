@@ -1230,6 +1230,7 @@ impl Agent {
                 escalator: crate::agent::coordination::Escalator::new(
                     self.side_calls.clone(),
                     self.state.clone(),
+                    self.state.clone(),
                 ),
             },
             canonical: tool_calls::CanonicalCallHook {
@@ -1559,14 +1560,22 @@ impl Agent {
         // broker.
         let resolver = super::approvals::DaemonInterruptResolver {
             untrusted: crate::agent::untrusted::UntrustedVerifier {
-                agent: self,
-                scope: &scope,
+                tools: &self.tools,
+                gateway: &self.side_calls,
+                decisions: self,
+                emitter: scope.emitter,
+                task_id: scope.task_id,
                 origin_request,
                 origin_trusted,
                 cancel: cancel.clone(),
             },
             owner: super::approvals::OwnerApprovalResolver {
-                agent: self,
+                decisions: self,
+                mission: self
+                    .inherited_authority
+                    .as_ref()
+                    .and_then(|inherited| inherited.lineage.last())
+                    .map(String::as_str),
                 approvals,
                 rules,
                 card_session: session_id,

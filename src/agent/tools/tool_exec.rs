@@ -1048,9 +1048,7 @@ impl std::fmt::Display for UnknownToolError {
 
 impl std::error::Error for UnknownToolError {}
 
-
 pub(crate) use aidaemon_runtime::engine::tool_calls::strip_model_arguments;
-
 
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]

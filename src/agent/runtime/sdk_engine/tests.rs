@@ -3886,6 +3886,7 @@ async fn hook_order_is_pinned() {
             escalator: crate::agent::coordination::Escalator::new(
                 harness.agent.side_calls.clone(),
                 harness.state.clone(),
+                harness.state.clone(),
             ),
         },
         dispatch: DispatchGate {

@@ -279,9 +279,9 @@ pub fn access_manifest_scope_check(
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
             ) && (aidaemon_tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
-                &target.value,
-            ))) && !covered_by(target, &call.adapter_read_targets)
+            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(
+                &normalize_scope_path(&target.value),
+            )) && !covered_by(target, &call.adapter_read_targets)
         })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
@@ -294,9 +294,9 @@ pub fn access_manifest_scope_check(
                 ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
             ) && (aidaemon_tools::fs_utils::is_protected_host_data_path(std::path::Path::new(
                 &target.value,
-            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(&normalize_scope_path(
-                &target.value,
-            )))
+            )) || aidaemon_tools::fs_utils::is_protected_host_data_path(
+                &normalize_scope_path(&target.value),
+            ))
         })
         .map(|target| target.value.clone())
         .collect::<Vec<_>>();
@@ -572,16 +572,17 @@ pub fn complete_tool_result_semantics(
             crate::turn::inquiry::evidence_capabilities_for_tool_call(tool_name, arguments);
     }
     if metadata.semantics.evidence.is_empty() && metadata.semantics.observes_state() {
-        metadata.semantics.evidence =
-            crate::turn::inquiry::evidence_capabilities_from_target_hints(
-                &metadata.semantics.target_hints,
-            );
+        metadata.semantics.evidence = crate::turn::inquiry::evidence_capabilities_from_target_hints(
+            &metadata.semantics.target_hints,
+        );
     }
     if metadata.semantics.observes_state()
         && !metadata.semantics.evidence.is_empty()
-        && metadata.semantics.verification_mode == aidaemon_events::traits::ToolVerificationMode::None
+        && metadata.semantics.verification_mode
+            == aidaemon_events::traits::ToolVerificationMode::None
     {
-        metadata.semantics.verification_mode = aidaemon_events::traits::ToolVerificationMode::ResultContent;
+        metadata.semantics.verification_mode =
+            aidaemon_events::traits::ToolVerificationMode::ResultContent;
     }
 }
 
@@ -663,10 +664,7 @@ pub fn tool_target_hint_matches_contract_target(
     }
 }
 
-pub fn verification_target_matches_haystack(
-    target: &VerificationTarget,
-    haystack: &str,
-) -> bool {
+pub fn verification_target_matches_haystack(target: &VerificationTarget, haystack: &str) -> bool {
     let haystack = haystack.replace('\\', "/");
     let needle = match target.kind {
         VerificationTargetKind::Url => normalized_url_value(&target.value),
@@ -1080,7 +1078,9 @@ fn read_receipt_covers_requested_selection(
     }
 }
 
-fn read_receipt_has_complete_content(read: &aidaemon_events::traits::ReadFileResultMetadata) -> bool {
+fn read_receipt_has_complete_content(
+    read: &aidaemon_events::traits::ReadFileResultMetadata,
+) -> bool {
     if read.total_lines == 0 {
         return read.selected_lines.is_empty()
             && read.returned_start_line.is_none()
@@ -1109,7 +1109,9 @@ mod tests {
             aidaemon_events::traits::ToolMutationEffects::NONE,
         );
         let mut metadata = aidaemon_events::traits::ToolCallMetadata {
-            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            outcome_status: Some(
+                aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            ),
             invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
             ..aidaemon_events::traits::ToolCallMetadata::default()
         };
@@ -1132,7 +1134,9 @@ mod tests {
         let semantics = ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent);
         let metadata = aidaemon_events::traits::ToolCallMetadata {
-            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            outcome_status: Some(
+                aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            ),
             exit_code: Some(1),
             semantics: semantics.clone(),
             ..aidaemon_events::traits::ToolCallMetadata::default()
@@ -1177,7 +1181,9 @@ mod tests {
             .with_verification_mode(ToolVerificationMode::ResultContent);
         let mut metadata = aidaemon_events::traits::ToolCallMetadata {
             receipt_kind: aidaemon_events::traits::ToolReceiptKind::Process,
-            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult),
+            outcome_status: Some(
+                aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            ),
             exit_code: Some(1),
             invocation_stage: aidaemon_events::traits::ToolInvocationStage::Dispatched,
             ..aidaemon_events::traits::ToolCallMetadata::default()

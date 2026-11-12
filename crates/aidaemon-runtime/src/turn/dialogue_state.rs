@@ -1,13 +1,13 @@
 use crate::host::{TurnStores, TurnWorkspace};
-use aidaemon_events::{
-    AssistantResponseData, EventType, InteractionRequestedData, InteractionResolvedData,
-    TaskEndData, TaskOutcome, TaskStartData, TaskStatus, UserMessageData,
-};
 use aidaemon_events::traits::{
     extract_primary_message_content, message_content_is_structural_only, ActiveTaskRef,
     ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState, Message,
     OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, ToolSemanticScope,
     UserRequestBinding, UserTurnKind, UserTurnSummary,
+};
+use aidaemon_events::{
+    AssistantResponseData, EventType, InteractionRequestedData, InteractionResolvedData,
+    TaskEndData, TaskOutcome, TaskStartData, TaskStatus, UserMessageData,
 };
 use chrono::Utc;
 
@@ -323,9 +323,7 @@ pub fn resolve_request_antecedent<'a>(
 /// may select only a persisted request node other than the current ingress
 /// message, and it refuses ambiguity. The relationship still comes from the
 /// semantic assessment; no request wording is classified here.
-pub fn unambiguous_request_antecedent(
-    state: &DialogueState,
-) -> Option<&OpenRequest> {
+pub fn unambiguous_request_antecedent(state: &DialogueState) -> Option<&OpenRequest> {
     let current_message_id = state
         .last_user_turn
         .as_ref()
@@ -708,7 +706,10 @@ pub async fn record_dialogue_semantic_user_turn(
     };
     let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
     apply_semantic_user_turn_assessment(&mut state, text, kind, Utc::now());
-    agent.dialogue_states().upsert_dialogue_state(&state).await?;
+    agent
+        .dialogue_states()
+        .upsert_dialogue_state(&state)
+        .await?;
     Ok(Some(kind))
 }
 
@@ -875,7 +876,11 @@ pub async fn get_or_rebuild_dialogue_state(
         Ok(Some(state)) if state.schema_version == DialogueState::SCHEMA_VERSION => state,
         Ok(_) | Err(_) => {
             let rebuilt = rebuild_dialogue_state_from_events(agent, session_id).await;
-            if let Err(err) = agent.dialogue_states().upsert_dialogue_state(&rebuilt).await {
+            if let Err(err) = agent
+                .dialogue_states()
+                .upsert_dialogue_state(&rebuilt)
+                .await
+            {
                 tracing::warn!(
                     session_id,
                     error = %err,
@@ -887,7 +892,10 @@ pub async fn get_or_rebuild_dialogue_state(
     }
 }
 
-async fn rebuild_dialogue_state_from_events(agent: &(impl TurnStores + TurnWorkspace + ?Sized), session_id: &str) -> DialogueState {
+async fn rebuild_dialogue_state_from_events(
+    agent: &(impl TurnStores + TurnWorkspace + ?Sized),
+    session_id: &str,
+) -> DialogueState {
     let mut state = DialogueState::new(session_id);
     let events = agent
         .events()
@@ -1030,7 +1038,10 @@ pub async fn record_dialogue_completion_contract(
             super::completion_contract::persistable_completion_contract(contract),
         );
         state.touch();
-        agent.dialogue_states().upsert_dialogue_state(&state).await?;
+        agent
+            .dialogue_states()
+            .upsert_dialogue_state(&state)
+            .await?;
     }
     Ok(())
 }

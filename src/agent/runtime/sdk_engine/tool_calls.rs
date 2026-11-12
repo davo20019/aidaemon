@@ -1102,6 +1102,7 @@ impl Agent {
                         escalator: crate::agent::coordination::Escalator::new(
                             self.side_calls.clone(),
                             self.state.clone(),
+                            self.state.clone(),
                         ),
                         untrusted_seen: scope.untrusted_seen.load(Ordering::SeqCst),
                     })

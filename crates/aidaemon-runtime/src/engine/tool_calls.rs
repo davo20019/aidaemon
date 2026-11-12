@@ -71,7 +71,8 @@ pub fn grant_own_spill_reads(
     manifest: &mut aidaemon_tools::semantics::ToolCallAccessManifest,
     session_id: &str,
 ) {
-    let Some(dir) = aidaemon_tools::result_spill::session_spill_dir_for_backend(backend, session_id)
+    let Some(dir) =
+        aidaemon_tools::result_spill::session_spill_dir_for_backend(backend, session_id)
     else {
         return;
     };
@@ -182,9 +183,7 @@ pub struct CanonRecord {
 /// [`CanonicalCallHook`] before any other hook judges the call, read by the
 /// approval rules and the dispatcher, so nobody canonicalizes again.
 #[derive(Debug, Clone, Default)]
-pub struct CanonicalCalls(
-    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>,
-);
+pub struct CanonicalCalls(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), CanonRecord>>>);
 
 impl CanonicalCalls {
     pub fn get(&self, run: sdk::RunId, call_id: &str) -> Option<CanonRecord> {
@@ -329,9 +328,7 @@ pub struct GateClearance {
 /// Gate outcomes by run and call id. A call is gated once: the kernel may
 /// put a call to its hooks again, and gets the same decision.
 #[derive(Debug, Clone, Default)]
-pub struct GateOutcomes(
-    Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), GateOutcome>>>,
-);
+pub struct GateOutcomes(Arc<std::sync::Mutex<HashMap<(sdk::RunId, String), GateOutcome>>>);
 
 impl GateOutcomes {
     pub fn get(&self, run: sdk::RunId, call_id: &str) -> Option<GateOutcome> {
@@ -515,12 +512,7 @@ pub fn record_call_for_learning(
 /// One tool call as post-task learning records it (a
 /// `tool_name(summary)` line, marked when it was rejected or failed so
 /// activity summaries never claim work that did not happen).
-pub fn learning_tool_summary(
-    name: &str,
-    arguments: &str,
-    rejected: bool,
-    failed: bool,
-) -> String {
+pub fn learning_tool_summary(name: &str, arguments: &str, rejected: bool, failed: bool) -> String {
     let line = format!(
         "{name}({})",
         crate::turn::tool_summary::summarize_tool_args(name, arguments)
