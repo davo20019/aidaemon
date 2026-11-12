@@ -343,6 +343,7 @@ jobs:
             aidaemon-tool-browser
             aidaemon-memory
             aidaemon-work
+            aidaemon-runtime
             aidaemon-sdk
           )
           WORKSPACE_VERSION="${{ steps.sdk_gate.outputs.version }}"

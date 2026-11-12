@@ -7,6 +7,7 @@ pub(crate) mod cli_agent;
 #[allow(dead_code)]
 pub mod computer_use;
 pub(crate) mod config_manager;
+#[allow(unused_imports)]
 pub(crate) use aidaemon_tools::consequential;
 mod diagnose;
 pub use aidaemon_tools::file_delivery;

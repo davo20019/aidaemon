@@ -12,18 +12,18 @@ use tokio::time::Instant;
 
 use super::side_calls::{ModelChoice, SideCall, SideCallClass, SideCallSpec};
 use super::{ModelBackend, SharedLlmRuntime};
-use crate::events::EventStore;
-use crate::providers::sdk_backed::{
+use crate::chat_bridge::sdk_backed::{
     to_chat_messages, to_chat_options, to_provider_response, to_sdk_messages, to_sdk_response,
 };
-use crate::traits::StateStore;
+use aidaemon_events::provider::TokenUsageStore;
+use aidaemon_events::EventStore;
 
 /// Runs side calls: picks the model chain from the spec, applies its total
 /// deadline and records every attempt.
 #[derive(Clone)]
 pub struct SideCallGateway {
     runtime: SharedLlmRuntime,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn TokenUsageStore>,
     event_store: Arc<EventStore>,
     /// The optional decision backend (`decide`); empty when none is set.
     pub(super) decisions: Arc<std::sync::RwLock<Option<super::decide::DecisionLayer>>>,
@@ -162,7 +162,7 @@ const RECORD_DEADLINE: Duration = Duration::from_secs(2);
 impl SideCallGateway {
     pub fn new(
         runtime: SharedLlmRuntime,
-        state: Arc<dyn StateStore>,
+        state: Arc<dyn TokenUsageStore>,
         event_store: Arc<EventStore>,
     ) -> Self {
         Self {
@@ -181,7 +181,7 @@ impl SideCallGateway {
         self.event_store.clone()
     }
 
-    pub(super) fn state_handle(&self) -> Arc<dyn StateStore> {
+    pub(super) fn state_handle(&self) -> Arc<dyn TokenUsageStore> {
         self.state.clone()
     }
 
@@ -364,7 +364,7 @@ impl SideCallGateway {
             };
             match attempt.finished {
                 Some((elapsed, Ok(response))) => {
-                    crate::events::record_background_model_call_telemetry(
+                    aidaemon_events::model_call_telemetry::record_background_model_call_telemetry(
                         self.event_store.clone(),
                         self.state.as_ref(),
                         &session,
@@ -400,7 +400,7 @@ impl SideCallGateway {
         elapsed: Duration,
     ) {
         tracing::warn!(purpose = spec.purpose, %model, %error, "side call attempt failed");
-        crate::events::record_background_model_call_failure(
+        aidaemon_events::model_call_telemetry::record_background_model_call_failure(
             self.event_store.clone(),
             self.state.as_ref(),
             &format!("background:{}", spec.purpose),
@@ -492,8 +492,8 @@ impl sdk::Provider for SideCallProvider {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support {
     //! Gateways over scripted providers, and counts of the rows they write.
     //! Shared with the tests of the modules whose side calls move here.
 
@@ -503,13 +503,13 @@ pub(crate) mod test_support {
     use async_trait::async_trait;
 
     use super::SideCallGateway;
-    use crate::config::ProviderKind;
-    use crate::events::{EventStore, EventStoreForTests as _};
-    use crate::llm_runtime::{ModelBackend, ProviderRuntimeTarget, SharedLlmRuntime};
-    use crate::traits::StateStore;
+    use crate::llm::{ModelBackend, ProviderRuntimeTarget, SharedLlmRuntime};
+    use aidaemon_events::provider::TokenUsageStore;
+    use aidaemon_events::EventStore;
+    use aidaemon_providers::routing::ProviderKind;
 
     /// A provider that answers every request with `text`.
-    pub(crate) fn provider_answering(text: &str) -> ModelBackend {
+    pub fn provider_answering(text: &str) -> ModelBackend {
         Arc::new(
             aidaemon_core::testing::ScriptedProvider::new([])
                 .then_repeat(aidaemon_core::testing::text(text)),
@@ -533,12 +533,12 @@ pub(crate) mod test_support {
     }
 
     /// A provider that fails every request with a transient `error`.
-    pub(crate) fn provider_failing(error: &str) -> ModelBackend {
+    pub fn provider_failing(error: &str) -> ModelBackend {
         provider_failing_with(sdk::ProviderError::Transient(error.to_string()))
     }
 
     /// A provider that fails every request with `error`.
-    pub(crate) fn provider_failing_with(error: sdk::ProviderError) -> ModelBackend {
+    pub fn provider_failing_with(error: sdk::ProviderError) -> ModelBackend {
         Arc::new(Failing(error))
     }
 
@@ -559,50 +559,89 @@ pub(crate) mod test_support {
     }
 
     /// A provider that never answers.
-    pub(crate) fn provider_hanging() -> ModelBackend {
+    pub fn provider_hanging() -> ModelBackend {
         Arc::new(Hanging)
     }
 
-    async fn state() -> Arc<crate::state::SqliteStateStore> {
+    /// Token usage goes through the event store; the side-call path never
+    /// reads the usage store.
+    struct NoUsage;
+
+    #[async_trait]
+    impl TokenUsageStore for NoUsage {}
+
+    fn state() -> Arc<dyn TokenUsageStore> {
+        Arc::new(NoUsage)
+    }
+
+    async fn new_event_store(pool: sqlx::SqlitePool) -> EventStore {
+        EventStore::on_paths(
+            pool,
+            aidaemon_tools::LexicalPaths::daemon_host(),
+            Arc::new(aidaemon_events::NoEventHost),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// An event store on a fresh file, with the host's `token_usage` table.
+    async fn event_store() -> Arc<EventStore> {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        // The store keeps the file open; the file outlives the test.
+        // The pool keeps the file open; the file outlives the test.
         std::mem::forget(file);
-        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
-        Arc::new(
-            crate::state::SqliteStateStore::new(&path, 100, None, embeddings)
-                .await
-                .unwrap(),
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cached_input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                call_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
         )
+        .execute(&pool)
+        .await
+        .unwrap();
+        Arc::new(new_event_store(pool).await)
     }
 
     /// A gateway whose primary provider is the first target and whose
     /// failover providers are the rest, each with its own model.
-    pub(crate) async fn gateway_with_targets(
+    pub async fn gateway_with_targets(
         targets: Vec<ModelBackend>,
     ) -> (SideCallGateway, Arc<EventStore>) {
-        let state = state().await;
-        let events = Arc::new(EventStore::new(state.pool()).await.unwrap());
-        let state: Arc<dyn StateStore> = state;
+        let events = event_store().await;
         (
-            SideCallGateway::new(runtime(targets), state, events.clone()),
+            SideCallGateway::new(runtime(targets), state(), events.clone()),
             events,
         )
     }
 
     /// A gateway over one provider.
-    pub(crate) async fn gateway_with(provider: ModelBackend) -> (SideCallGateway, Arc<EventStore>) {
+    pub async fn gateway_with(provider: ModelBackend) -> (SideCallGateway, Arc<EventStore>) {
         gateway_with_targets(vec![provider]).await
     }
 
     /// A gateway whose event store cannot be written.
-    pub(crate) async fn gateway_with_broken_event_store(
+    pub async fn gateway_with_broken_event_store(
         provider: ModelBackend,
     ) -> (SideCallGateway, Arc<EventStore>) {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let events = Arc::new(EventStore::new(pool.clone()).await.unwrap());
+        let events = Arc::new(new_event_store(pool.clone()).await);
         pool.close().await;
-        let state: Arc<dyn StateStore> = state().await;
+        let state = state();
         (
             SideCallGateway::new(runtime(vec![provider]), state, events.clone()),
             events,
@@ -611,7 +650,7 @@ pub(crate) mod test_support {
 
     /// A gateway whose event store writes wait forever: its one pooled
     /// connection is held by the returned handle. Keep the handle alive.
-    pub(crate) async fn gateway_with_stuck_event_store(
+    pub async fn gateway_with_stuck_event_store(
         provider: ModelBackend,
     ) -> (SideCallGateway, sqlx::pool::PoolConnection<sqlx::Sqlite>) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -620,9 +659,9 @@ pub(crate) mod test_support {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        let events = Arc::new(EventStore::new(pool.clone()).await.unwrap());
+        let events = Arc::new(new_event_store(pool.clone()).await);
         let held = pool.acquire().await.unwrap();
-        let state: Arc<dyn StateStore> = state().await;
+        let state = state();
         (
             SideCallGateway::new(runtime(vec![provider]), state, events),
             held,
@@ -657,7 +696,7 @@ pub(crate) mod test_support {
             "SELECT data FROM events WHERE event_type = ? \
              AND json_extract(data, '$.call_purpose') = ?",
         )
-        .bind(crate::events::EventType::LlmCall.as_str())
+        .bind(aidaemon_events::EventType::LlmCall.as_str())
         .bind(purpose)
         .fetch_all(&events.pool())
         .await
@@ -672,13 +711,13 @@ pub(crate) mod test_support {
 
     /// The models of the failed `llm_call` rows recorded under `purpose`,
     /// in the order they were written.
-    pub(crate) async fn failed_call_models(events: &EventStore, purpose: &str) -> Vec<String> {
+    pub async fn failed_call_models(events: &EventStore, purpose: &str) -> Vec<String> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data FROM events WHERE event_type = ? \
              AND json_extract(data, '$.call_purpose') = ? \
              AND json_extract(data, '$.error') IS NOT NULL ORDER BY id",
         )
-        .bind(crate::events::EventType::LlmCall.as_str())
+        .bind(aidaemon_events::EventType::LlmCall.as_str())
         .bind(purpose)
         .fetch_all(&events.pool())
         .await
@@ -692,22 +731,22 @@ pub(crate) mod test_support {
     }
 
     /// `llm_call` rows recorded under `purpose` that succeeded.
-    pub(crate) async fn ok_calls(events: &EventStore, purpose: &str) -> usize {
+    pub async fn ok_calls(events: &EventStore, purpose: &str) -> usize {
         count_calls(events, purpose, false).await
     }
 
     /// `llm_call` rows recorded under `purpose` that failed.
-    pub(crate) async fn failed_calls(events: &EventStore, purpose: &str) -> usize {
+    pub async fn failed_calls(events: &EventStore, purpose: &str) -> usize {
         count_calls(events, purpose, true).await
     }
 
     /// One user message, as chat JSON.
-    pub(crate) fn user(text: &str) -> Vec<serde_json::Value> {
+    pub fn user(text: &str) -> Vec<serde_json::Value> {
         vec![serde_json::json!({"role": "user", "content": text})]
     }
 
     /// A request for `model` with one user message.
-    pub(crate) fn request_for(model: &str, text: &str) -> sdk::ModelRequest {
+    pub fn request_for(model: &str, text: &str) -> sdk::ModelRequest {
         sdk::ModelRequest {
             model: model.to_string(),
             messages: vec![sdk::Message::user(text)],

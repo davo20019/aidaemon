@@ -1,0 +1,49 @@
+[package]
+name = "aidaemon-runtime"
+description = "aidaemon's turn runtime: model routing and side calls, budgets, and the turn on top of the aidaemon-core kernel; internal to aidaemon, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-runtime"
+readme = "README.md"
+keywords = ["agent", "llm", "runtime"]
+categories = ["asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/"]
+publish = false
+
+[features]
+# Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
+# reach across a crate boundary.
+testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
+
+[dependencies]
+aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
+aidaemon-decisions = { version = "0.2.0", path = "../aidaemon-decisions", features = ["gemini"] }
+aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
+aidaemon-policies = { version = "0.2.0", path = "../aidaemon-policies" }
+aidaemon-providers = { version = "0.2.0", path = "../aidaemon-providers" }
+aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
+aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
+aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

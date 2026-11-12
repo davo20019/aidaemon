@@ -11,13 +11,19 @@ use std::time::Instant;
 /// rather than wall-clock time scopes a call with [`with_stream_progress`];
 /// streaming providers report each chunk with [`note_stream_progress`].
 #[derive(Debug, Clone)]
-pub(crate) struct StreamProgress {
+pub struct StreamProgress {
     started: Instant,
     last_chunk_ms: Arc<AtomicU64>,
 }
 
+impl Default for StreamProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamProgress {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             started: Instant::now(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -25,7 +31,7 @@ impl StreamProgress {
     }
 
     /// When the latest chunk arrived; the call's start if none has.
-    pub(crate) fn last_activity(&self) -> Instant {
+    pub fn last_activity(&self) -> Instant {
         self.started + std::time::Duration::from_millis(self.last_chunk_ms.load(Ordering::Relaxed))
     }
 
@@ -41,15 +47,12 @@ tokio::task_local! {
 
 /// Run `call` with `progress` receiving the chunk reports of any streaming
 /// provider it reaches on this task (retries and fallbacks included).
-pub(crate) async fn with_stream_progress<F: Future>(
-    progress: StreamProgress,
-    call: F,
-) -> F::Output {
+pub async fn with_stream_progress<F: Future>(progress: StreamProgress, call: F) -> F::Output {
     STREAM_PROGRESS.scope(progress, call).await
 }
 
 /// A streaming provider received a chunk. No-op outside a progress scope.
-pub(crate) fn note_stream_progress() {
+pub fn note_stream_progress() {
     let _ = STREAM_PROGRESS.try_with(StreamProgress::note);
 }
 

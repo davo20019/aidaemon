@@ -19,7 +19,6 @@ pub use aidaemon_events::conversation_turn::{
     turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn,
 };
 pub use aidaemon_events::model_call_telemetry::{
-    record_background_model_call_failure, record_background_model_call_telemetry,
     record_model_call_telemetry, ModelCallTelemetryInput,
 };
 pub use aidaemon_events::payloads::*;

@@ -2,13 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::ToolCapabilities;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelProfile {
-    Cheap,
-    Balanced,
-    Strong,
-}
+pub use aidaemon_providers::routing::ModelProfile;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

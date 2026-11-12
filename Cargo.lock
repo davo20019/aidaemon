@@ -85,6 +85,7 @@ dependencies = [
  "aidaemon-node-protocol",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-runtime",
  "aidaemon-store-sqlite",
  "aidaemon-tool-browser",
  "aidaemon-tools",
@@ -407,9 +408,33 @@ dependencies = [
  "bytes",
  "futures",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aidaemon-runtime"
+version = "0.2.0"
+dependencies = [
+ "aidaemon-core",
+ "aidaemon-decisions",
+ "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-tools",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
 ]

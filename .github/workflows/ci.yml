@@ -98,7 +98,7 @@ jobs:
           cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
-          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord -p aidaemon-parity-agent
           --all-targets --all-features -- -D warnings
@@ -154,7 +154,7 @@ jobs:
           for crate in aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browser \
             aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies \
             aidaemon-eval aidaemon-memory aidaemon-decisions aidaemon-events \
-            aidaemon-work aidaemon-channels aidaemon-channel-telegram \
+            aidaemon-work aidaemon-runtime aidaemon-channels aidaemon-channel-telegram \
             aidaemon-channel-slack aidaemon-channel-discord aidaemon-macros aidaemon-sdk; do
             echo "::group::cargo doc $crate"
             cargo doc --no-deps --all-features -p "$crate"
@@ -201,7 +201,7 @@ jobs:
           -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-memory
-          -p aidaemon-decisions -p aidaemon-events -p aidaemon-work
+          -p aidaemon-decisions -p aidaemon-events -p aidaemon-work -p aidaemon-runtime
           -p aidaemon-channels -p aidaemon-channel-telegram
           -p aidaemon-channel-slack -p aidaemon-channel-discord -p aidaemon-macros
           -p aidaemon-sdk
@@ -341,7 +341,7 @@ jobs:
           cargo test -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
           -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
-          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
           -p aidaemon-channel-discord --all-features
 
