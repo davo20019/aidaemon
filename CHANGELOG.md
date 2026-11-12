@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Explicit memory search ranks one list.** `manage_memories` `search` now pools keyword and semantic candidates and orders them by one score: the reranker's, or reciprocal rank fusion without one. Keyword matches are weighted by how rare each word is, exact-key matches always come first, and results below the reranker's relevance floor are dropped (`Reranker::relevance_floor`, off by default). "Related context" lists at most five facts, drawn only from the namespaces, people and family facts of the results actually shown and ranked against the query. The header reports how many facts were shown, relevant and considered. SDK stores get this through `FactStore::search_facts` and `aidaemon_memory::search`; `search_facts_semantic` and `assemble_neighborhood` are removed.
+- **Explicit memory search ranks one list.** `manage_memories` `search` now pools keyword and semantic candidates and orders them by one score: the reranker's, or reciprocal rank fusion without one. Keyword matches are weighted by how rare each word is, exact-key matches always come first, and results below the reranker's relevance floor are dropped. The floor (`Reranker::relevance_floor`, a `RelevanceFloor`) has a lower bar for candidates the keyword scorer also found than for semantic-only ones, since cross-encoders score keyword-list queries low even for the right fact; SDK rerankers have none by default, and the daemon's reranker sets provisional values from the new `reranker_floor_calibration` test. Multi-word phrase matches pin a fact only on whole consecutive words, at most five per search. "Related context" lists at most five facts, drawn only from the namespaces, people and family facts of the results actually shown, ranked against the query, and kept only when they score within the floor's gap of the best hit. Owner facts shown through their canonical projection remain semantically searchable. The header reports how many facts were shown and considered, and how many were relevant only when a floor judged them. SDK stores get this through `FactStore::search_facts` and `aidaemon_memory::search`; `search_facts_semantic` and `assemble_neighborhood` are removed.
 
 - **A tool must now explicitly signal that it has finished.** A phrase like "Moved to background" in its output no longer ends a run.
 
@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Edit backups leave your folders alone.** `write_file`/`edit_file` keep their one-per-file backup under `~/.aidaemon/file-backups/` on the local backend instead of writing `<file>.bak` beside it.
 
 ### Fixed
+
+- **Background fact extraction stores only what the user stated.** Each extracted fact must carry the user's stance and a verbatim quote from the user's message; a question ("do you know what kind of boat I own?") no longer becomes a stored fact, and facts the agent already saved during the turn are not stored a second time under another key.
+
+- **Saving a fact into a large category is fast again.** The key-similarity check embeds all comparable keys in one call instead of one call per stored fact, which had made a single write take about 11 seconds.
+
+- **"Database is locked" when tagging the identity of a user message.** The annotation takes the write lock before reading, so a concurrent commit no longer fails it instantly.
 
 - **"Database is locked" under concurrent writes.** 38 write transactions began deferred; under WAL one that reads before it writes fails at once when another connection commits first, and the busy timeout cannot help. Every write transaction now takes the write lock when it begins (`BEGIN IMMEDIATE`), and a test rejects a new deferred one. In a contention benchmark with eight writers, deferred transactions lost 85% of their commits and immediate ones none.
 

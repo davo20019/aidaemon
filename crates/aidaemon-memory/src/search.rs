@@ -307,6 +307,14 @@ pub struct FactSearchReport {
     pub floor_applied: bool,
 }
 
+impl FactSearchReport {
+    /// The highest score among the hits. Not the first hit's: pinned hits
+    /// sort first whatever their score.
+    pub fn best_score(&self) -> Option<f32> {
+        self.hits.iter().map(|hit| hit.score).reduce(f32::max)
+    }
+}
+
 /// One pooled candidate. Ranks start at 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
@@ -913,5 +921,36 @@ mod tests {
         assert_eq!(pinned.len(), MAX_PHRASE_PINS + 1);
         assert!(pinned.iter().any(|h| facts[h.index].id == 100));
         assert_eq!(hits.len(), 41, "unpinned phrase matches still score");
+    }
+
+    #[test]
+    fn best_score_ignores_pin_order() {
+        let facts = corpus();
+        let pool = vec![
+            Candidate {
+                index: 0,
+                lexical_rank: Some(1),
+                semantic_rank: None,
+                pinned: true,
+            },
+            Candidate {
+                index: 1,
+                lexical_rank: Some(2),
+                semantic_rank: Some(1),
+                pinned: false,
+            },
+        ];
+        // The pinned exact-key hit leads with a low rerank score.
+        let report = rank(
+            &facts,
+            &pool,
+            Some(&[(0, -2.8), (1, 1.5)]),
+            Some(RelevanceFloor::uniform(-3.0)),
+            10,
+            &FactSearchConfig::default(),
+        );
+        assert_eq!(report.hits[0].fact.id, facts[0].id, "pinned first");
+        assert_eq!(report.best_score(), Some(1.5));
+        assert_eq!(FactSearchReport::default().best_score(), None);
     }
 }

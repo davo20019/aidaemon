@@ -734,13 +734,9 @@ impl FactStore for SqliteMemory {
                 .map(|f| build_fact_embedding_text(&f.category, &f.key, &f.value))
                 .collect();
             let related = match self.explicit_search_rerank(query, docs).await {
-                Some(scores) => search::rank_related(
-                    &neighbors,
-                    &scores,
-                    floor,
-                    report.hits.first().map(|hit| hit.score),
-                    config,
-                ),
+                Some(scores) => {
+                    search::rank_related(&neighbors, &scores, floor, report.best_score(), config)
+                }
                 None => {
                     let scores: Vec<(usize, f32)> = neighbors
                         .iter()
