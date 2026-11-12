@@ -188,6 +188,15 @@ pub fn strip_model_identity_leaks(content: &str) -> String {
     result
 }
 
+/// The label a redacted local path shows (`[REDACTED:File path]`).
+pub const FILE_PATH_LABEL: &str = "File path";
+/// The label a redacted Windows path shows.
+pub const WINDOWS_PATH_LABEL: &str = "Windows path";
+/// The label a redacted `IP:port` endpoint shows.
+pub const ENDPOINT_LABEL: &str = "IP:port";
+/// How every redaction placeholder starts: `[REDACTED]` or `[REDACTED:<label>]`.
+pub const REDACTED_MARKER: &str = "[REDACTED";
+
 /// Shapes that are not secrets but stay out of public replies and activity
 /// logs: local paths and `IP:port` endpoints. Secrets are the SDK's one list
 /// ([`aidaemon_policies::secret_patterns`]), shared with the redactor and the
@@ -196,12 +205,15 @@ static PRIVACY_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     vec![
         (
             Regex::new(r"/(?:Users|home|etc)/[^\s]{5,}").unwrap(),
-            "File path",
+            FILE_PATH_LABEL,
         ),
-        (Regex::new(r"[A-Z][:\\]/[^\s]{5,}").unwrap(), "Windows path"),
+        (
+            Regex::new(r"[A-Z][:\\]/[^\s]{5,}").unwrap(),
+            WINDOWS_PATH_LABEL,
+        ),
         (
             Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+").unwrap(),
-            "IP:port",
+            ENDPOINT_LABEL,
         ),
     ]
 });
@@ -501,7 +513,21 @@ pub fn redact_secrets(text: &str) -> String {
     let mut result = text.to_string();
     for (regex, label) in redaction_patterns() {
         if regex.is_match(&result) {
-            let replacement = format!("[REDACTED:{label}]");
+            let replacement = format!("{REDACTED_MARKER}:{label}]");
+            result = regex.replace_all(&result, replacement.as_str()).to_string();
+        }
+    }
+    result
+}
+
+/// Redact only secret shapes (keys, tokens, connection strings), leaving
+/// local paths and endpoints readable: for text the owner reads to decide
+/// on a call, where the path is what they are approving.
+pub fn redact_secrets_only(text: &str) -> String {
+    let mut result = text.to_string();
+    for (kind, regex) in aidaemon_policies::secret_patterns().iter() {
+        if regex.is_match(&result) {
+            let replacement = format!("{REDACTED_MARKER}:{}]", secret_label(kind));
             result = regex.replace_all(&result, replacement.as_str()).to_string();
         }
     }

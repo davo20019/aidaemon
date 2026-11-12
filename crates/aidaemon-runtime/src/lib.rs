@@ -41,6 +41,7 @@ pub mod known_resources;
 pub mod llm;
 pub mod markers;
 pub mod message_content;
+pub mod mid_run;
 pub mod policy;
 pub mod prompt;
 pub mod settings;

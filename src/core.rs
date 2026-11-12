@@ -131,6 +131,9 @@ pub async fn run(
     )
     .await;
 
+    // Paths in the configured file inbox are shown to the owner by name.
+    aidaemon_tools::internal_markers::register_inbox_dir(&config.files.inbox_dir);
+
     let startup_tools::ToolSetup {
         tools,
         approval_tx,

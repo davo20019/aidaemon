@@ -1133,7 +1133,9 @@ fn refused_call_request(
         .iter()
         .find_map(|key| arguments.get(key).and_then(Value::as_str))
         .map_or_else(|| arguments.to_string(), str::to_string);
-    let shown = aidaemon_tools::sanitize::redact_secrets(&shown);
+    // The owner decides on the call as it would run: secrets stay hidden,
+    // the paths it touches stay readable.
+    let shown = aidaemon_tools::sanitize::redact_secrets_only(&shown);
     let shown = crate::untrusted::cap_strings(&Value::from(shown), REFUSED_CALL_SHOWN_CHARS);
     sdk::OwnerApprovalRequest {
         effects,

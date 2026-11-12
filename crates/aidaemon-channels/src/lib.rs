@@ -29,6 +29,7 @@ pub mod hub;
 mod inbound_files;
 pub mod latex;
 pub mod live_status;
+pub mod mid_run;
 pub mod names;
 pub mod owner_wait;
 pub mod policy;

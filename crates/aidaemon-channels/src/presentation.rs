@@ -18,9 +18,61 @@ static TASK_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("valid task-count regex")
 });
 
+/// Replace the daemon's internal markers (refusal prefixes, redaction
+/// placeholders, file-inbox paths) with what the owner reads instead. The
+/// last check on every outbound message: a marker that reaches it got past
+/// the boundary that should have rendered it, so it is logged.
+pub fn render_internal_markers(text: &str) -> String {
+    let (rendered, found) = aidaemon_tools::internal_markers::render_for_owner(text);
+    if !found.is_empty() {
+        tracing::warn!(
+            markers = ?found,
+            "Replaced internal markers in an outbound chat message"
+        );
+    }
+    rendered
+}
+
+static TASK_NUMBER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(^|[\s(])#(\d{1,6})\b").expect("valid task-number regex"));
+
+/// Replace `#<id>` where `id` is one of this chat's task numbers (`tasks`:
+/// id and description, from the task registry) with a short label of the
+/// task: the numbers are the daemon's bookkeeping, not something the owner
+/// tracks. Any other `#<n>` (an issue, a heading) stays.
+pub fn render_task_numbers(text: &str, tasks: &[(u64, String)]) -> String {
+    if tasks.is_empty() || !text.contains('#') {
+        return text.to_string();
+    }
+    let mut replaced = 0usize;
+    let rendered = TASK_NUMBER_RE.replace_all(text, |caps: &Captures<'_>| {
+        let lead = &caps[1];
+        let label = caps[2]
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| tasks.iter().find(|(task, _)| *task == id))
+            .map(|(_, description)| word_preview(description, 40));
+        match label {
+            Some(label) => {
+                replaced += 1;
+                format!("{lead}\"{label}\"")
+            }
+            None => caps[0].to_string(),
+        }
+    });
+    if replaced > 0 {
+        tracing::warn!(
+            replaced,
+            "Replaced task numbers with task labels in an outbound chat message"
+        );
+    }
+    rendered.into_owned()
+}
+
 /// Prepare arbitrary agent-originated Markdown for a chat surface.
 pub fn prepare_chat_message(text: &str) -> String {
     let cleaned = aidaemon_tools::sanitize::strip_leaked_control_markers(text);
+    let cleaned = render_internal_markers(&cleaned);
     let mut lines = Vec::new();
     let mut previous_blank = false;
 
@@ -499,13 +551,14 @@ pub fn word_preview(text: &str, max_chars: usize) -> String {
 }
 
 /// The reply to a message that arrives while a task runs in its session.
-/// Without attachments the running task takes it in at its next step that
-/// can act on it (one offering tools) when it is from the same sender
-/// (`TaskRegistry::take_steering_messages`); otherwise, or when no model
-/// call answered it, it runs as its own turn once the current one ends, and
-/// this notice is edited into [`queued_message_starting`] then.
-pub fn queued_message_notice(has_attachments: bool) -> String {
-    if has_attachments {
+/// A message that joins the work (`waits_for_own_turn` false) is taken in
+/// at the running task's next step that can act on it (one offering tools)
+/// when it is from the same sender (`TaskRegistry::take_steering_messages`);
+/// one with attachments or read as unrelated to the work, or one no model
+/// call answered, runs as its own turn once the current one ends, and this
+/// notice is edited into [`queued_message_starting`] then.
+pub fn queued_message_notice(waits_for_own_turn: bool) -> String {
+    if waits_for_own_turn {
         "📥 Got it – I'll get to this right after what I'm doing now.".to_string()
     } else {
         "📥 Got it – I'll add this to what I'm doing now.".to_string()
@@ -515,6 +568,42 @@ pub fn queued_message_notice(has_attachments: bool) -> String {
 /// What a queued message's notice says once its own turn starts.
 pub fn queued_message_starting(text: &str) -> String {
     format!("▶️ Now on: \"{}\"", word_preview(text, 50))
+}
+
+#[cfg(test)]
+mod owner_facing_tests {
+    use super::{prepare_chat_message, render_task_numbers};
+
+    #[test]
+    fn this_chat_s_task_numbers_become_task_labels() {
+        let tasks = vec![
+            (12, "Install a WordPress demo site".to_string()),
+            (14, "Install a Drupal demo site".to_string()),
+        ];
+        assert_eq!(
+            render_task_numbers("Both #12 and #14 are done (#14 took longer).", &tasks),
+            "Both \"Install a WordPress demo site\" and \"Install a Drupal demo site\" are \
+             done (\"Install a Drupal demo site\" took longer)."
+        );
+        // Not one of this chat's tasks, or not a task reference: unchanged.
+        assert_eq!(
+            render_task_numbers("Fixed issue #7 and step#12.", &tasks),
+            "Fixed issue #7 and step#12."
+        );
+        assert_eq!(render_task_numbers("Done #12.", &[]), "Done #12.");
+    }
+
+    #[test]
+    fn a_reply_never_shows_the_daemon_s_markers() {
+        let reply = prepare_chat_message(
+            "I could not send it: [OWNER DECLINED] The file [REDACTED:File path] is still at \
+             ~/.aidaemon/files/inbox/dd4dc47d_screenshot.png.",
+        );
+        assert_eq!(
+            reply,
+            "I could not send it: you declined that The file a file is still at screenshot.png."
+        );
+    }
 }
 
 #[cfg(test)]

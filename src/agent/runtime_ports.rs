@@ -267,6 +267,15 @@ impl DaemonAgentRuntime for Agent {
 
 #[async_trait]
 impl ChannelAgentRuntime for Agent {
+    async fn read_mid_run_message(
+        &self,
+        _session_id: &str,
+        text: &str,
+        work: &aidaemon_channels::ports::RunningWork,
+    ) -> Option<aidaemon_channels::ports::MidRunReading> {
+        aidaemon_runtime::mid_run::read_mid_run_message(&self.side_calls, text, work).await
+    }
+
     async fn terminalize_supervised_task(
         &self,
         session_id: &str,

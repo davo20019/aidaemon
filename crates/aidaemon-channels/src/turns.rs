@@ -29,6 +29,7 @@ use crate::hub::{SessionChannelStore, SessionMap};
 use crate::owner_wait::OwnerWaitClock;
 use crate::ports::{
     AgentResponseEnvelope, ChannelAgentRuntime, InboundMessageRequest, InboundMessageTiming,
+    MidRunIntent, MidRunReading, RunningWork,
 };
 use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 
@@ -170,13 +171,21 @@ pub struct TurnRunner {
     /// text and the notice's message id), so the notice can be edited when
     /// that message's turn starts instead of a second bubble being sent.
     queued_notices: Arc<std::sync::Mutex<QueuedNotices>>,
+    /// Each session's running work as its status updates show it, for
+    /// answering a question about it mid-run.
+    live: crate::mid_run::LiveWork,
 }
+
+/// Longest the owner waits for a mid-run message to be read before it
+/// joins the running work unread, as before.
+const MID_RUN_READ_LIMIT: Duration = Duration::from_secs(15);
 
 impl TurnRunner {
     pub fn new(deps: TurnDeps) -> Self {
         Self {
             deps,
             queued_notices: Arc::default(),
+            live: crate::mid_run::LiveWork::default(),
         }
     }
 
@@ -235,12 +244,45 @@ impl TurnRunner {
         let session_id = turn.session_id.clone();
         let dedup_key = turn.dedup_key.as_deref();
         if registry.has_running_task(&session_id).await {
+            let mut steerable = true;
+            match self.read_mid_run(&turn).await {
+                Some(MidRunReading {
+                    intent: MidRunIntent::AboutRunningWork,
+                    answer,
+                }) => {
+                    // Answered now; the run goes on undisturbed.
+                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        let answer = match answer {
+                            Some(answer) => answer,
+                            None => crate::mid_run::running_work_reply(
+                                &self.running_work(&session_id).await,
+                            ),
+                        };
+                        let _ = surface
+                            .say(&crate::presentation::prepare_chat_message(&answer))
+                            .await;
+                    }
+                    return;
+                }
+                Some(MidRunReading {
+                    intent: MidRunIntent::Unrelated,
+                    ..
+                }) => steerable = false,
+                Some(MidRunReading {
+                    intent: MidRunIntent::ChangesWork,
+                    ..
+                })
+                | None => {}
+            }
             let mut queued = QueuedMessage::new(
                 &turn.text,
                 turn.user_role,
                 turn.channel_ctx.clone(),
                 turn.attachments.clone(),
             );
+            if !steerable {
+                queued = queued.not_steerable();
+            }
             if let Some(timing) = turn.ingress_timing.clone() {
                 queued = queued.with_ingress_timing(timing);
             }
@@ -255,7 +297,7 @@ impl TurnRunner {
                     // in parts can arrive as many.
                     if position <= 3 {
                         let notice = crate::presentation::queued_message_notice(
-                            !turn.attachments.is_empty(),
+                            !turn.attachments.is_empty() || !steerable,
                         );
                         if let Ok(ids) = surface.say(&notice).await {
                             if let [message_id] = ids.as_slice() {
@@ -293,6 +335,55 @@ impl TurnRunner {
 
         let runner = self.clone();
         tokio::spawn(async move { runner.run(surface, turn).await });
+    }
+
+    /// The session's running work as its typed state shows it.
+    async fn running_work(&self, session_id: &str) -> RunningWork {
+        let running = self
+            .deps
+            .task_registry
+            .list_for_session(session_id)
+            .await
+            .into_iter()
+            .find(|entry| matches!(entry.status, crate::tasks::TaskStatus::Running));
+        let (request, elapsed) = running.map_or_else(
+            || (String::new(), Duration::ZERO),
+            |entry| {
+                let elapsed = (chrono::Utc::now() - entry.started_at)
+                    .to_std()
+                    .unwrap_or_default();
+                (entry.description, elapsed)
+            },
+        );
+        self.live.snapshot(session_id, &request, elapsed)
+    }
+
+    /// Have the agent read a message the owner sent while a turn runs:
+    /// only the owner's own text is read (another sender's message or one
+    /// with files joins the queue as before), within a time limit.
+    async fn read_mid_run(&self, turn: &Turn) -> Option<MidRunReading> {
+        if turn.user_role != UserRole::Owner
+            || !turn.attachments.is_empty()
+            || turn.text.trim().is_empty()
+        {
+            return None;
+        }
+        let work = self.running_work(&turn.session_id).await;
+        let reading = tokio::time::timeout(
+            MID_RUN_READ_LIMIT,
+            self.deps
+                .agent
+                .read_mid_run_message(&turn.session_id, &turn.text, &work),
+        )
+        .await
+        .ok()
+        .flatten();
+        info!(
+            session_id = %turn.session_id,
+            intent = ?reading.as_ref().map(|r| r.intent),
+            "Read a message sent mid-run"
+        );
+        reading
     }
 
     /// The reply to a cancel word.
@@ -334,6 +425,7 @@ impl TurnRunner {
             // Shown in "current task (…)" notices and cancel replies.
             let description = crate::presentation::word_preview(&text, 80);
             let (task_id, cancel) = registry.register(&session_id, &description).await;
+            self.live.begin(&session_id, task_id);
             let heartbeat = Arc::new(AtomicU64::new(now_secs()));
             registry.set_heartbeat(task_id, heartbeat.clone()).await;
             let working = CancellationToken::new();
@@ -342,7 +434,19 @@ impl TurnRunner {
             }
             surface.show_working(working.clone(), heartbeat.clone(), stale_secs);
             registry.set_typing_cancel(task_id, working.clone()).await;
-            let (status_tx, status_rx) = mpsc::channel::<StatusUpdate>(16);
+            let (status_tx, mut run_updates) = mpsc::channel::<StatusUpdate>(16);
+            let (shown_tx, status_rx) = mpsc::channel::<StatusUpdate>(16);
+            // Each update is noted as the work's live state, then shown.
+            {
+                let live = self.live.clone();
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(update) = run_updates.recv().await {
+                        live.record(&session_id, task_id, &update);
+                        let _ = shown_tx.send(update).await;
+                    }
+                });
+            }
             let private = channel_ctx.visibility == ChannelVisibility::Private;
             let status_task = surface
                 .show_status(status_rx, private)
@@ -375,6 +479,7 @@ impl TurnRunner {
                 },
             };
             working.cancel();
+            self.live.end(&session_id, task_id);
             // The run is over, so its status sender is gone and the surface
             // finishes showing what it sent: the closing checklist must reach
             // the card before the reply, or the card stays on "Working" above
@@ -408,6 +513,13 @@ impl TurnRunner {
                         )
                         .await;
                     let reply = crate::presentation::prepare_chat_message(&envelope.text);
+                    let tasks: Vec<(u64, String)> = registry
+                        .list_for_session(&session_id)
+                        .await
+                        .into_iter()
+                        .map(|entry| (entry.id, entry.description))
+                        .collect();
+                    let reply = crate::presentation::render_task_numbers(&reply, &tasks);
                     let empty = reply.trim().is_empty();
                     let delivered = if empty {
                         Delivered {
@@ -776,6 +888,238 @@ mod tests {
         .expect("stale heartbeat should resolve quickly");
 
         assert!(mins >= 2);
+    }
+
+    /// An agent whose turn runs until released and whose reading of a
+    /// mid-run message is scripted.
+    struct ScriptedAgent {
+        release: tokio::sync::Notify,
+        reading: std::sync::Mutex<Option<MidRunReading>>,
+    }
+
+    #[async_trait]
+    impl crate::ports::AgentIngress for ScriptedAgent {
+        async fn handle_inbound_message(
+            &self,
+            request: InboundMessageRequest,
+        ) -> anyhow::Result<AgentResponseEnvelope> {
+            if let Some(status) = request.status_tx.as_ref() {
+                let _ = status
+                    .send(StatusUpdate::ToolStart {
+                        name: "terminal".into(),
+                        summary: "installing the blog".into(),
+                    })
+                    .await;
+            }
+            self.release.notified().await;
+            Ok(AgentResponseEnvelope {
+                response_id: "r".into(),
+                task_id: "t".into(),
+                turn_id: None,
+                text: "Done.".into(),
+                referenced_receipts: Vec::new(),
+                disposition: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChannelAgentRuntime for ScriptedAgent {
+        async fn read_mid_run_message(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _work: &RunningWork,
+        ) -> Option<MidRunReading> {
+            self.reading.lock().unwrap().clone()
+        }
+        async fn terminalize_supervised_task(
+            &self,
+            _: &str,
+            _: aidaemon_events::TaskStatus,
+            _: String,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn cancel_active_finite_work_for_session(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn current_model(&self) -> String {
+            String::new()
+        }
+        async fn context_debug_settings(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> (bool, usize, usize, usize, Option<i64>) {
+            (false, 0, 0, 0, None)
+        }
+        async fn set_model(&self, _: String) {}
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn clear_model_override(&self) {}
+        async fn clear_session_context(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn clear_session(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoSessions;
+    impl SessionChannelStore for NoSessions {}
+
+    #[derive(Default)]
+    struct Said(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TurnSurface for Said {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(Vec::new())
+        }
+        fn show_working(&self, _: CancellationToken, _: Arc<AtomicU64>, _: u64) {}
+    }
+
+    fn owner_turn(text: &str, key: &str) -> Turn {
+        Turn {
+            session_id: "test:mid-run".into(),
+            text: text.into(),
+            attachments: Vec::new(),
+            user_role: UserRole::Owner,
+            channel_ctx: ChannelContext::private("test"),
+            dedup_key: Some(key.into()),
+            ingress_timing: None,
+        }
+    }
+
+    /// A question about the running work is answered at once from its live
+    /// state and never reaches the run; a change joins the run; anything
+    /// else waits for its own turn.
+    #[tokio::test]
+    async fn a_mid_run_message_is_answered_joined_or_kept_by_its_reading() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+        });
+        let registry = Arc::new(TaskRegistry::new(10));
+        let runner = TurnRunner::new(TurnDeps {
+            agent: agent.clone(),
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: registry.clone(),
+            watchdog_stale_threshold_secs: 0,
+        });
+        let surface = Arc::new(Said::default());
+        let session = "test:mid-run";
+        runner
+            .submit(surface.clone(), owner_turn("Set up two demo sites", "m1"))
+            .await;
+        for _ in 0..200 {
+            if registry.has_running_task(session).await
+                && runner.running_work(session).await.last_step.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let set = |reading: Option<MidRunReading>| *agent.reading.lock().unwrap() = reading;
+        let last = |surface: &Said| {
+            surface
+                .0
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        // A question, with no drafted answer: the state itself is the reply.
+        set(Some(MidRunReading {
+            intent: MidRunIntent::AboutRunningWork,
+            answer: None,
+        }));
+        runner
+            .submit(surface.clone(), owner_turn("How is it going so far?", "m2"))
+            .await;
+        let reply = last(&surface);
+        assert!(
+            reply.starts_with("Still working on \"Set up two demo sites\""),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("Latest step: installing the blog"),
+            "{reply}"
+        );
+        // A question with a drafted answer, worded differently.
+        set(Some(MidRunReading {
+            intent: MidRunIntent::AboutRunningWork,
+            answer: Some("The screenshots are not ready yet; they come when it finishes.".into()),
+        }));
+        runner
+            .submit(
+                surface.clone(),
+                owner_turn("Send me the screenshots now.", "m3"),
+            )
+            .await;
+        assert_eq!(
+            last(&surface),
+            "The screenshots are not ready yet; they come when it finishes."
+        );
+        assert_eq!(registry.queue_len(session).await, 0);
+
+        // Something else: queued for its own turn, not taken into the run.
+        set(Some(MidRunReading {
+            intent: MidRunIntent::Unrelated,
+            answer: None,
+        }));
+        runner
+            .submit(
+                surface.clone(),
+                owner_turn("What is the capital of Peru?", "m4"),
+            )
+            .await;
+        assert_eq!(
+            last(&surface),
+            crate::presentation::queued_message_notice(true)
+        );
+        let ctx = ChannelContext::private("test");
+        assert!(registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await
+            .is_empty());
+        registry.clear_queue(session).await;
+
+        // A change to the work (or no reading at all): it joins the run.
+        for (reading, key) in [
+            (
+                Some(MidRunReading {
+                    intent: MidRunIntent::ChangesWork,
+                    answer: None,
+                }),
+                "m5",
+            ),
+            (None, "m6"),
+        ] {
+            set(reading);
+            runner
+                .submit(surface.clone(), owner_turn("Use port 8081 instead.", key))
+                .await;
+            assert_eq!(
+                last(&surface),
+                crate::presentation::queued_message_notice(false)
+            );
+            let taken = registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await;
+            assert_eq!(taken.len(), 1);
+        }
+
+        agent.release.notify_one();
     }
 
     #[test]
