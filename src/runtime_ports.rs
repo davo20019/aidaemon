@@ -59,6 +59,19 @@ impl ChildWorkReport {
     }
 }
 
+/// The child was stopped by the owner from the chat (`/cancel`, or a stop
+/// request read as one).
+#[derive(Debug)]
+pub(crate) struct ChildStoppedByOwner;
+
+impl std::fmt::Display for ChildStoppedByOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped by the owner")
+    }
+}
+
+impl std::error::Error for ChildStoppedByOwner {}
+
 /// A child made no progress for its idle limit and was stopped.
 #[derive(Debug)]
 pub(crate) struct ChildTimedOut {

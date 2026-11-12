@@ -29,8 +29,22 @@ pub(super) fn closeout_visible_tools<'a>(
     visible
 }
 
+/// How often a held stop rereads whether the run's jobs have ended.
+const UNREPORTED_JOB_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// The longest one held stop waits for the run's jobs.
+const UNREPORTED_JOB_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 impl Agent {
     pub(super) async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
+        if let Some(ended) = self.sdk_wait_for_unreported_jobs(scope).await {
+            let _ = check.reply.send(sdk::StopDecision::Continue {
+                message: crate::agent::system_directives::SystemDirective::BackgroundJobHeld {
+                    ended,
+                }
+                .render(),
+            });
+            return;
+        }
         let mut decision = self.sdk_mandate_commit_check(scope).await;
         if decision == sdk::StopDecision::Accept && self.sdk_background_handoff(scope).await {
             let _ = check.reply.send(decision);
@@ -102,6 +116,60 @@ impl Agent {
         )
         .await;
         true
+    }
+
+    /// Hold a stop while a job this run started is still running with
+    /// nothing to report its result: the run's end would stop the job, so
+    /// a reply now would describe work as running that is about to be
+    /// killed (live 2026-11-12: a counting sub-agent answered "at 15 of
+    /// 300, still running", its end killed the count, and the chat was told
+    /// it finished). Waits, as progress, until those jobs end, at most
+    /// [`UNREPORTED_JOB_MAX_WAIT`] in one run: `None` when nothing was
+    /// running, else whether they ended, so the run reads their result (or
+    /// stops them and says so) before it answers. Read from the tools' typed
+    /// process state, never from the reply.
+    pub(super) async fn sdk_wait_for_unreported_jobs(&self, scope: &TurnScope<'_>) -> Option<bool> {
+        if scope.unreported_jobs_wait_spent.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut waited = false;
+        let started = std::time::Instant::now();
+        let _running = self
+            .child_progress
+            .as_ref()
+            .map(crate::tools::ProgressClock::begin);
+        loop {
+            let mut open = 0usize;
+            for tool in &self.tools {
+                open += tool.jobs_ended_by_task_end(scope.task_id).await;
+            }
+            if open == 0 {
+                return waited.then_some(true);
+            }
+            if waited && started.elapsed() >= UNREPORTED_JOB_MAX_WAIT {
+                scope
+                    .unreported_jobs_wait_spent
+                    .store(true, Ordering::Relaxed);
+                return Some(false);
+            }
+            if !waited {
+                waited = true;
+                self.emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    scope.model_calls.load(Ordering::Relaxed) as usize,
+                    crate::events::DecisionType::PostExecutionValidation,
+                    "Stop held until the run's unreported jobs end".to_string(),
+                    serde_json::json!({
+                        "condition": "unreported_job_running_at_stop",
+                        "open_jobs": open,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
+            }
+            tokio::time::sleep(UNREPORTED_JOB_POLL).await;
+        }
     }
 
     /// A GUI success claim must not ship while the task's last coordinate

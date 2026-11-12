@@ -140,8 +140,8 @@ pub fn shared_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "cancel",
-            description: "Cancel a running task",
-            usage: Some("/cancel <id>"),
+            description: "Stop what's running in this chat",
+            usage: Some("/cancel [all|number]"),
             category: CommandCategory::Core,
         },
         CommandDef {
@@ -274,12 +274,10 @@ pub struct StatusView {
     pub now: Option<String>,
     /// The chat's mode and when it ends; `None` is full access.
     pub mode: Option<(ChatMode, Option<DateTime<Utc>>)>,
-    /// Running chat turns: id and when it started. A turn is named by what
-    /// it is, never by the message that started it: that message may be a
-    /// reply ("Yes, move the files"), not a task.
-    pub running: Vec<(u64, DateTime<Utc>)>,
-    /// Sub-agents running for the chat, by the title they were given.
-    pub children: Vec<crate::ports::RunningChild>,
+    /// Everything running for the chat: its turn, sub-agents and background
+    /// commands. A turn is named by what it is, never by the message that
+    /// started it: that message may be a reply ("Yes, move the files").
+    pub running: crate::stop::WorkList,
     pub next_scheduled: Option<ScheduledItem>,
 }
 
@@ -300,39 +298,56 @@ fn mode_line(mode: Option<(ChatMode, Option<DateTime<Utc>>)>, now: DateTime<Utc>
     }
 }
 
-/// How `/status` and `/tasks` name a chat turn.
-const TURN_LABEL: &str = "Working on your message";
+/// How `/cancel` stops what is listed.
+fn cancel_hint(running: &crate::stop::WorkList) -> &'static str {
+    match running.entries.len() {
+        0 => "",
+        1 => "Send /cancel to stop it.",
+        _ if running.requests() > 1 => {
+            "Send /cancel <number> to stop one, or /cancel all to stop everything."
+        }
+        _ => "Send /cancel to stop all of it, or /cancel <number> for one.",
+    }
+}
 
-/// `/tasks`: the chat's unfinished turns and the sub-agents running for it.
+/// `/tasks`: everything running for the chat (its turn, sub-agents and
+/// background commands), numbered for `/cancel`, and its failed turns.
 pub fn render_tasks(
-    entries: &[crate::tasks::TaskEntry],
-    children: &[crate::ports::RunningChild],
+    running: &crate::stop::WorkList,
+    failed: &[crate::tasks::TaskEntry],
     now: DateTime<Utc>,
 ) -> String {
-    if entries.is_empty() && children.is_empty() {
-        return "No active or failed chat operations. Completed conversation turns are audit history, not durable work. Use /work to inspect persistent work items.".to_string();
+    if running.entries.is_empty() && failed.is_empty() {
+        return "Nothing is running in this chat right now. Use /work to see durable work items."
+            .to_string();
     }
-    let mut lines: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            let elapsed = match e.finished_at {
-                Some(fin) => format!("{}s", (fin - e.started_at).num_seconds()),
-                None => format!("{}s elapsed", (now - e.started_at).num_seconds()),
-            };
-            format!("#{} [{}] {TURN_LABEL} ({})", e.id, e.status, elapsed)
-        })
-        .collect();
-    lines.extend(children.iter().map(|child| {
-        format!(
-            "Sub-agent [running] {} ({}s elapsed)",
-            crate::presentation::word_preview(&child.label, 120),
-            (now - child.started_at).num_seconds()
-        )
-    }));
-    format!(
-        "Chat operations:\n{}\n\nCompleted conversation turns are omitted. Use /work for durable work items.",
-        lines.join("\n")
-    )
+    let mut sections = Vec::new();
+    if running.entries.is_empty() {
+        sections.push("Nothing is running in this chat right now.".to_string());
+    } else {
+        sections.push(format!(
+            "Running in this chat:\n{}\n\n{}",
+            running.lines(now).join("\n"),
+            cancel_hint(running)
+        ));
+    }
+    if !failed.is_empty() {
+        let lines: Vec<String> = failed
+            .iter()
+            .map(|entry| {
+                let at = entry.finished_at.unwrap_or(now);
+                format!(
+                    "#{} {} – it failed after {}",
+                    entry.id,
+                    crate::stop::TURN_LABEL,
+                    compact_chrono_duration(at - entry.started_at, ZeroUnitStyle::Trim)
+                )
+            })
+            .collect();
+        sections.push(format!("Recently failed:\n{}", lines.join("\n")));
+    }
+    sections.push("Use /work for durable work items.".to_string());
+    sections.join("\n\n")
 }
 
 /// `/status`: the chat's mode, what is running and what is scheduled next.
@@ -342,21 +357,16 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         Some(local) => format!("It's {local}. {mode}"),
         None => mode,
     }];
-    if view.running.is_empty() && view.children.is_empty() {
+    if view.running.entries.is_empty() {
         lines.push("Running: nothing right now.".to_string());
     } else {
         lines.push("Running:".to_string());
-        for (id, started) in &view.running {
+        for entry in &view.running.entries {
             lines.push(format!(
-                "• {TURN_LABEL} ({} so far, /cancel {id} to stop it)",
-                compact_chrono_duration(now - *started, ZeroUnitStyle::Trim)
-            ));
-        }
-        for child in &view.children {
-            lines.push(format!(
-                "• Sub-agent: {} ({} so far)",
-                crate::presentation::word_preview(&child.label, 120),
-                compact_chrono_duration(now - child.started_at, ZeroUnitStyle::Trim)
+                "• {} ({} so far, /cancel {} to stop it)",
+                crate::presentation::word_preview(&entry.title, 120),
+                compact_chrono_duration(now - entry.started_at, ZeroUnitStyle::Trim),
+                entry.number
             ));
         }
     }
@@ -369,6 +379,25 @@ pub fn render_status(view: &StatusView, now: DateTime<Utc>) -> String {
         None => "Next scheduled: nothing.".to_string(),
     });
     lines.join("\n")
+}
+
+/// What `/cancel`'s arguments ask for; `None` when they are not a request.
+pub fn cancel_request(args: &str) -> Option<crate::stop::StopRequest> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Some(crate::stop::StopRequest::Bare);
+    }
+    if args.eq_ignore_ascii_case("all") {
+        return Some(crate::stop::StopRequest::All);
+    }
+    let numbers: Option<Vec<u64>> = args
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim_start_matches('#').parse::<u64>().ok())
+        .collect();
+    numbers
+        .filter(|numbers| !numbers.is_empty())
+        .map(crate::stop::StopRequest::Numbers)
 }
 
 /// The command closest to an unknown `name` (without its prefix) by edit
@@ -527,7 +556,7 @@ impl SharedCommands {
             "/models" => self.handle_models().await,
             "/auto" => self.handle_auto().await,
             "/tasks" => self.handle_tasks(session_id).await,
-            "/cancel" => self.handle_cancel(args).await,
+            "/cancel" => self.handle_cancel(args, session_id, user_role).await,
             "/clear" | "/new" => self.handle_clear(session_id).await,
             "/status" => self.handle_status(session_id).await,
             "/wipe" => self.handle_wipe(session_id).await,
@@ -550,19 +579,15 @@ impl SharedCommands {
 
     async fn handle_status(&self, session_id: &str) -> String {
         let now = Utc::now();
-        let running = self
-            .task_registry
-            .list_for_session(session_id)
-            .await
-            .into_iter()
-            .filter(|entry| matches!(entry.status, TaskStatus::Running))
-            .map(|entry| (entry.id, entry.started_at))
-            .collect();
         let view = StatusView {
             now: self.host.owner_time(now),
             mode: self.host.chat_mode(session_id, now).await,
-            running,
-            children: self.agent.running_children(session_id).await,
+            running: crate::stop::running_work(
+                &self.task_registry,
+                self.agent.as_ref(),
+                session_id,
+            )
+            .await,
             next_scheduled: self.host.next_scheduled().await,
         };
         render_status(&view, now)
@@ -619,8 +644,12 @@ impl SharedCommands {
         };
         match self.host.set_chat_mode(session_id, requested, now).await {
             Ok(_) => match requested {
-                ChatMode::ReadOnly => format!("Read-only for this chat for the next {session_mode_ttl_hours} hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."),
-                ChatMode::Unrestricted => format!("Unrestricted for this chat for the next {session_mode_ttl_hours} hours, starting with your next message."),
+                ChatMode::ReadOnly => format!(
+                    "Read-only for this chat for the next {session_mode_ttl_hours} hours, starting now, including work already running. aidaemon can look but not change anything. Send /mode full to end it early."
+                ),
+                ChatMode::Unrestricted => format!(
+                    "Unrestricted for this chat for the next {session_mode_ttl_hours} hours, starting with your next message."
+                ),
                 ChatMode::Full => "Back to full access from your next message.".to_string(),
             },
             Err(error) => {
@@ -733,32 +762,37 @@ impl SharedCommands {
     }
 
     async fn handle_tasks(&self, session_id: &str) -> String {
-        let entries = self
+        let running =
+            crate::stop::running_work(&self.task_registry, self.agent.as_ref(), session_id).await;
+        let failed = self
             .task_registry
             .list_for_session(session_id)
             .await
             .into_iter()
-            .filter(|entry| !matches!(entry.status, TaskStatus::Completed))
+            .filter(|entry| matches!(entry.status, TaskStatus::Failed(_)))
             .collect::<Vec<_>>();
-        let children = self.agent.running_children(session_id).await;
-        render_tasks(&entries, &children, Utc::now())
+        render_tasks(&running, &failed, Utc::now())
     }
 
-    async fn handle_cancel(&self, arg: &str) -> String {
-        if arg.is_empty() {
-            "Usage: /cancel <task-id>\nExample: /cancel 1".to_string()
-        } else {
-            match arg.parse::<u64>() {
-                Ok(task_id) => {
-                    if self.task_registry.cancel(task_id).await {
-                        format!("Task #{} cancelled.", task_id)
-                    } else {
-                        format!("Task #{} not found or not running.", task_id)
-                    }
-                }
-                Err(_) => "Invalid task ID. Usage: /cancel <task-id>".to_string(),
-            }
+    /// `/cancel`: everything running when it comes from one request (else
+    /// the list to pick from), `/cancel all` everything, `/cancel <n>` one
+    /// item. Each stop is read back before it is reported.
+    async fn handle_cancel(&self, arg: &str, session_id: &str, user_role: UserRole) -> String {
+        if user_role != UserRole::Owner {
+            return "Only the owner can stop running work in this chat.".to_string();
         }
+        let Some(request) = cancel_request(arg) else {
+            return "Usage: /cancel, /cancel all or /cancel <number>. Send /tasks to see the \
+                    numbers."
+                .to_string();
+        };
+        crate::stop::stop(
+            &self.task_registry,
+            self.agent.as_ref(),
+            session_id,
+            request,
+        )
+        .await
     }
 
     async fn handle_clear(&self, session_id: &str) -> String {
@@ -1014,25 +1048,63 @@ mod help_and_status_tests {
     }
 
     #[test]
-    fn tasks_lists_running_sub_agents_by_their_title() {
+    fn tasks_lists_every_running_thing_with_a_number() {
         let now = Utc::now();
-        let children = vec![
-            crate::ports::RunningChild {
-                label: "Run one shell command (…echo alpha-test . Report…)".to_string(),
-                started_at: now - chrono::Duration::seconds(30),
-            },
-            crate::ports::RunningChild {
-                label: "Run one shell command (…echo beta-test . Report…)".to_string(),
-                started_at: now - chrono::Duration::seconds(30),
-            },
-        ];
-        let tasks = render_tasks(&[], &children, now);
+        let running = crate::stop::WorkList::for_tests(vec![
+            (
+                7,
+                crate::stop::TURN_LABEL,
+                now - chrono::Duration::seconds(40),
+                "req-1",
+            ),
+            (
+                8,
+                "Sub-agent: Counting agent A",
+                now - chrono::Duration::seconds(30),
+                "req-1",
+            ),
+            (
+                9,
+                "Background command: for i in $(seq 1 300); do echo $i; sleep 2; done",
+                now - chrono::Duration::seconds(30),
+                "req-1",
+            ),
+        ]);
+        let tasks = render_tasks(&running, &[], now);
         assert!(
-            tasks.contains("Sub-agent [running] Run one shell command (…echo alpha-test . Report…) (30s elapsed)"),
+            tasks.starts_with("Running in this chat:\n#7 Working on your message (40s so far)"),
             "{tasks}"
         );
-        assert!(tasks.contains("echo beta-test"), "{tasks}");
-        assert!(render_tasks(&[], &[], now).starts_with("No active"));
+        assert!(
+            tasks.contains("\n#8 Sub-agent: Counting agent A (30s so far)"),
+            "{tasks}"
+        );
+        assert!(
+            tasks.contains("\n#9 Background command: for i in"),
+            "{tasks}"
+        );
+        assert!(
+            tasks.contains("Send /cancel to stop all of it, or /cancel <number> for one."),
+            "{tasks}"
+        );
+        let quiet = render_tasks(&crate::stop::WorkList::default(), &[], now);
+        assert!(
+            quiet.starts_with("Nothing is running in this chat right now."),
+            "{quiet}"
+        );
+    }
+
+    #[test]
+    fn cancel_arguments_are_bare_all_or_numbers() {
+        use crate::stop::StopRequest;
+        assert_eq!(cancel_request(""), Some(StopRequest::Bare));
+        assert_eq!(cancel_request(" ALL "), Some(StopRequest::All));
+        assert_eq!(cancel_request("3"), Some(StopRequest::Numbers(vec![3])));
+        assert_eq!(
+            cancel_request("#3, 4"),
+            Some(StopRequest::Numbers(vec![3, 4]))
+        );
+        assert_eq!(cancel_request("both"), None);
     }
 
     #[test]
@@ -1041,8 +1113,7 @@ mod help_and_status_tests {
         let quiet = StatusView {
             now: None,
             mode: None,
-            running: Vec::new(),
-            children: Vec::new(),
+            running: crate::stop::WorkList::default(),
             next_scheduled: None,
         };
         assert_eq!(
@@ -1052,11 +1123,20 @@ mod help_and_status_tests {
         let busy = StatusView {
             now: Some("2:05 PM ET".to_string()),
             mode: Some((ChatMode::ReadOnly, Some(now + chrono::Duration::hours(3)))),
-            running: vec![(7, now - chrono::Duration::minutes(2))],
-            children: vec![crate::ports::RunningChild {
-                label: "Install a Drupal demo site with DDEV".to_string(),
-                started_at: now - chrono::Duration::minutes(4),
-            }],
+            running: crate::stop::WorkList::for_tests(vec![
+                (
+                    7,
+                    crate::stop::TURN_LABEL,
+                    now - chrono::Duration::minutes(2),
+                    "a",
+                ),
+                (
+                    8,
+                    "Sub-agent: Install a Drupal demo site with DDEV",
+                    now - chrono::Duration::minutes(4),
+                    "a",
+                ),
+            ]),
             next_scheduled: Some(ScheduledItem {
                 what: "Check disk space".to_string(),
                 when: "2:39 PM ET".to_string(),
@@ -1072,7 +1152,9 @@ mod help_and_status_tests {
             "{status}"
         );
         assert!(
-            status.contains("• Sub-agent: Install a Drupal demo site with DDEV (4m so far)"),
+            status.contains(
+                "• Sub-agent: Install a Drupal demo site with DDEV (4m so far, /cancel 8 to stop it)"
+            ),
             "{status}"
         );
         assert!(

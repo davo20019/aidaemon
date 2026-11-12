@@ -115,6 +115,9 @@ fn resolve_child_outcome(
 pub(crate) struct RunningChildren {
     next: std::sync::atomic::AtomicU64,
     entries: std::sync::Mutex<Vec<ListedChild>>,
+    /// Each chat's running turn (its task id), so a child is listed under
+    /// the request that started it.
+    requests: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// One running child as listed: its chat, its title and the task it was
@@ -125,6 +128,39 @@ struct ListedChild {
     title: String,
     task: String,
     started_at: chrono::DateTime<chrono::Utc>,
+    /// The child's own session, where its background commands run.
+    child_session: String,
+    /// The chat turn that was running when it started.
+    request: Option<String>,
+    /// Stops the child when the owner asks.
+    stop: tokio_util::sync::CancellationToken,
+}
+
+/// A listed child, as the chat's running work shows it.
+pub(crate) struct ListedChildView {
+    pub key: String,
+    pub child: aidaemon_channels::ports::RunningChild,
+    pub request: Option<String>,
+}
+
+/// A chat's running turn, recorded while it runs.
+pub(crate) struct RunningRequest {
+    registry: Arc<RunningChildren>,
+    session_id: String,
+    task_id: String,
+}
+
+impl Drop for RunningRequest {
+    fn drop(&mut self) {
+        let mut requests = self
+            .registry
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if requests.get(&self.session_id) == Some(&self.task_id) {
+            requests.remove(&self.session_id);
+        }
+    }
 }
 
 /// One running child's place in [`RunningChildren`], removed when dropped
@@ -132,6 +168,14 @@ struct ListedChild {
 pub(crate) struct RunningChildEntry {
     registry: Arc<RunningChildren>,
     id: u64,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl RunningChildEntry {
+    /// Cancelled when the owner stops this child.
+    pub(crate) fn stopped(&self) -> tokio_util::sync::CancellationToken {
+        self.stop.clone()
+    }
 }
 
 impl RunningChildren {
@@ -140,8 +184,16 @@ impl RunningChildren {
         session_id: &str,
         mission: &str,
         task: &str,
+        child_session: &str,
     ) -> RunningChildEntry {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let stop = tokio_util::sync::CancellationToken::new();
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -151,11 +203,62 @@ impl RunningChildren {
                 title: child_status_label(mission),
                 task: task.to_string(),
                 started_at: chrono::Utc::now(),
+                child_session: child_session.to_string(),
+                request,
+                stop: stop.clone(),
             });
         RunningChildEntry {
             registry: self.clone(),
             id,
+            stop,
         }
+    }
+
+    /// Record `task_id` as the chat's running turn until the guard drops.
+    pub(crate) fn begin_request(
+        self: &Arc<Self>,
+        session_id: &str,
+        task_id: &str,
+    ) -> RunningRequest {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), task_id.to_string());
+        RunningRequest {
+            registry: self.clone(),
+            session_id: session_id.to_string(),
+            task_id: task_id.to_string(),
+        }
+    }
+
+    /// The chat's running turn, if one is recorded.
+    pub(crate) fn current_request(&self, session_id: &str) -> Option<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Ask the listed child `key` to stop; its child session when it was
+    /// listed.
+    pub(crate) fn stop(&self, key: &str) -> Option<String> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let child = entries.iter().find(|child| child_key(child.id) == key)?;
+        child.stop.cancel();
+        Some(child.child_session.clone())
+    }
+
+    /// Whether the child `key` is still listed (running).
+    pub(crate) fn is_listed(&self, key: &str) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|child| child_key(child.id) == key)
     }
 
     /// The chat's running children. Children sharing a title (two parallel
@@ -165,6 +268,14 @@ impl RunningChildren {
         &self,
         session_id: &str,
     ) -> Vec<aidaemon_channels::ports::RunningChild> {
+        self.listed(session_id)
+            .into_iter()
+            .map(|view| view.child)
+            .collect()
+    }
+
+    /// [`Self::for_session`] with each child's key, own session and request.
+    pub(crate) fn listed(&self, session_id: &str) -> Vec<ListedChildView> {
         let entries = self
             .entries
             .lock()
@@ -185,13 +296,21 @@ impl RunningChildren {
                     Some(detail) => format!("{} ({detail})", child.title),
                     None => child.title.clone(),
                 };
-                aidaemon_channels::ports::RunningChild {
-                    label,
-                    started_at: child.started_at,
+                ListedChildView {
+                    key: child_key(child.id),
+                    child: aidaemon_channels::ports::RunningChild {
+                        label,
+                        started_at: child.started_at,
+                    },
+                    request: child.request.clone(),
                 }
             })
             .collect()
     }
+}
+
+fn child_key(id: u64) -> String {
+    format!("agent:{id}")
 }
 
 /// The words of `task` that tell it apart from `siblings`, starting one
@@ -3014,9 +3133,18 @@ impl Agent {
         let _on_roster = roster_entry;
         // Listed by `/status` and `/tasks` in the chat it reports to while it
         // runs, waited on or in the background.
-        let _listed = effective_approval_session_id
-            .as_deref()
-            .map(|chat| self.running_children.enter(chat, mission, task));
+        let listed = effective_approval_session_id.as_deref().map(|chat| {
+            self.running_children
+                .enter(chat, mission, task, &child_session)
+        });
+        let owner_stop = listed.as_ref().map(RunningChildEntry::stopped);
+        let owner_stopped = async {
+            match owner_stop.as_ref() {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(owner_stopped);
         let mut join = tokio::spawn(crate::tools::OwnerWaitClock::within(
             Some(owner_wait),
             async move {
@@ -3058,6 +3186,11 @@ impl Agent {
                     let _ = (&mut join).await;
                     timed_out = true;
                     break Err(anyhow::anyhow!("child agent made no progress for its idle limit"));
+                }
+                _ = &mut owner_stopped => {
+                    join.abort();
+                    let _ = (&mut join).await;
+                    return Err(crate::runtime_ports::ChildStoppedByOwner.into());
                 }
                 _ = heartbeat.tick(), if task_attempt.is_some() => {
                     let Some(attempt) = task_attempt.as_ref() else {
@@ -3635,13 +3768,15 @@ mod tests {
             "chat-1",
             mission,
             "Run this exact shell command: sleep 120 && echo alpha-test . Report the output.",
+            "child-alpha",
         );
         let _beta = registry.enter(
             "chat-1",
             mission,
             "Run this exact shell command: sleep 120 && echo beta-test . Report the output.",
+            "child-beta",
         );
-        let _other_chat = registry.enter("chat-2", mission, "Run: date");
+        let _other_chat = registry.enter("chat-2", mission, "Run: date", "child-other");
         let labels: Vec<String> = registry
             .for_session("chat-1")
             .into_iter()
@@ -3658,6 +3793,29 @@ mod tests {
         assert_eq!(alone[0].label, mission);
         drop(_beta);
         assert_eq!(registry.for_session("chat-1")[0].label, mission);
+    }
+
+    /// A child is listed under the chat turn that started it, and a stop
+    /// from the chat reaches it by its key.
+    #[test]
+    fn a_listed_child_carries_its_request_and_can_be_stopped() {
+        let registry = Arc::new(RunningChildren::default());
+        let turn = registry.begin_request("chat-1", "task-a");
+        let child = registry.enter("chat-1", "Counting agent A", "count", "child-a");
+        drop(turn);
+        let later = registry.enter("chat-1", "Counting agent B", "count", "child-b");
+        let listed = registry.listed("chat-1");
+        assert_eq!(listed[0].request.as_deref(), Some("task-a"));
+        assert_eq!(listed[1].request, None);
+        assert_eq!(registry.current_request("chat-1"), None);
+        let stop = child.stopped();
+        assert_eq!(registry.stop(&listed[0].key).as_deref(), Some("child-a"));
+        assert!(stop.is_cancelled());
+        assert!(registry.is_listed(&listed[0].key));
+        drop(child);
+        assert!(!registry.is_listed(&listed[0].key));
+        assert!(registry.stop(&listed[0].key).is_none());
+        drop(later);
     }
 
     #[test]

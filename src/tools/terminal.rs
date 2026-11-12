@@ -328,6 +328,9 @@ struct RunningProcess {
     semantics: ToolCallSemantics,
     dedupe_key: Option<String>,
     owner_task_id: Option<String>,
+    /// The task that started it, kept when the task disowns it: the chat's
+    /// list of running work groups jobs by the request that started them.
+    origin_task_id: Option<String>,
     detached: bool,
     started_at: Instant,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
@@ -4474,6 +4477,19 @@ impl TerminalTool {
         proc: RunningProcess,
         reason: &str,
     ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
+        self.terminate_running_process_verified(pid, proc, reason)
+            .await
+            .map(|(output, truncation, _)| (output, truncation))
+    }
+
+    /// [`Self::terminate_running_process`], and whether the process is
+    /// known to have exited: its wait returned, rather than being abandoned.
+    async fn terminate_running_process_verified(
+        &self,
+        pid: u32,
+        proc: RunningProcess,
+        reason: &str,
+    ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>, bool)> {
         proc.notify_on_completion.store(false, Ordering::Relaxed);
         let started_at = proc.started_at;
         let command = proc.command.clone();
@@ -4504,7 +4520,8 @@ impl TerminalTool {
             }
         }
 
-        if !reader_handle.is_finished() {
+        let exited = reader_handle.is_finished();
+        if !exited {
             reader_handle.abort();
         }
         let _ = reader_handle.await;
@@ -4520,7 +4537,7 @@ impl TerminalTool {
         );
         let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
         output.push_str(&formatted);
-        Ok((output, truncation))
+        Ok((output, truncation, exited))
     }
 
     async fn cleanup_task_processes(&self, task_id: &str) -> anyhow::Result<usize> {
@@ -5618,6 +5635,7 @@ impl TerminalTool {
                     semantics: command_semantics.clone(),
                     dedupe_key: Some(dedupe_key.clone()),
                     owner_task_id: owner_task_id.clone(),
+                    origin_task_id: owner_task_id.clone(),
                     detached: detach,
                     started_at: Instant::now() - foreground_wait,
                     stdout_buf,
@@ -6676,8 +6694,8 @@ impl TerminalTool {
                     format!(
                         "Command still running after {}s. Moved to background (pid={}).\n\
                          You can run other commands (like curl) while this runs in the background.\n\
-                         No completion notification is available here, so nothing will report its result: \
-                         use action=\"check\" with pid={} to read its output and result before you finish, or action=\"kill\" with pid={} to stop it.",
+                         Its result comes back to this run, not as a separate message: this run cannot finish while it is running, \
+                         so wait for it and read its output and result with action=\"check\" with pid={} before you answer, or stop it with action=\"kill\" with pid={}.",
                         elapsed, pid, pid, pid
                     )
                 };
@@ -6699,7 +6717,7 @@ impl TerminalTool {
                     );
                 } else {
                     msg.push_str(
-                        "\n\nThis process is task-owned and will be auto-killed when the current task ends.",
+                        "\n\nThis process belongs to this task: if the task is stopped, the process is stopped with it.",
                     );
                 }
                 if !partial_output.is_empty() {
@@ -7123,6 +7141,12 @@ impl TerminalTool {
 
         Ok(outcome)
     }
+}
+
+/// A background command as the owner's list of running work names it.
+fn background_job_title(command: &str) -> String {
+    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("Background command: {}", truncate_str(&command, 80))
 }
 
 /// Whether a background job's completion notification reaches a reader: the
@@ -8218,6 +8242,81 @@ impl crate::traits::ToolSemantics for TerminalTool {
             );
         }
         Ok(())
+    }
+
+    async fn background_jobs(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_tools::semantics::BackgroundJob> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now();
+        let mut jobs: Vec<aidaemon_tools::semantics::BackgroundJob> = self
+            .running
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, proc)| {
+                proc.notify_session_id == session_id && !proc.reader_handle.is_finished()
+            })
+            .map(|(pid, proc)| aidaemon_tools::semantics::BackgroundJob {
+                key: pid.to_string(),
+                title: background_job_title(&proc.command),
+                started_at: now
+                    - chrono::Duration::from_std(proc.started_at.elapsed()).unwrap_or_default(),
+                task_id: proc.origin_task_id.clone(),
+            })
+            .collect();
+        jobs.sort_by_key(|job| job.started_at);
+        jobs
+    }
+
+    async fn stop_background_job(&self, key: &str) -> bool {
+        let Ok(pid) = key.parse::<u32>() else {
+            return false;
+        };
+        let taken = self.running.lock().await.remove(&pid);
+        let Some(proc) = taken else {
+            // Not tracked (any more): it is gone.
+            return true;
+        };
+        self.remove_indexes_for_process(pid, &proc).await;
+        self.completed.lock().await.remove(&pid);
+        match self
+            .terminate_running_process_verified(pid, proc, "stopped by the owner")
+            .await
+        {
+            Ok((_, _, exited)) => {
+                info!(pid, exited, "Stopped a background process for the owner");
+                exited
+            }
+            Err(error) => {
+                warn!(pid, %error, "Could not stop a background process for the owner");
+                false
+            }
+        }
+    }
+
+    async fn jobs_ended_by_task_end(&self, task_id: &str) -> usize {
+        let pids = self
+            .task_processes
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        if pids.is_empty() {
+            return 0;
+        }
+        let running = self.running.lock().await;
+        pids.iter()
+            .filter_map(|pid| running.get(pid))
+            .filter(|proc| {
+                !proc.notifier_active && !proc.detached && !proc.reader_handle.is_finished()
+            })
+            .count()
     }
 
     async fn session_context_note(&self, session_id: &str) -> Option<String> {
@@ -11271,6 +11370,122 @@ mod tests {
                 child,
             )
             .await;
+    }
+
+    /// A chat's background command is listed for the chat's running work
+    /// under a plain title, and stopping it reads the process back as gone.
+    #[tokio::test]
+    async fn the_chat_lists_its_background_command_and_stops_it() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+
+        let chat = ToolCallContext {
+            task_id: Some("turn-count".to_string()),
+            ..crate::testing::call_facts("telegram:synthetic-count")
+        };
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"for i in $(seq 1 300); do sleep 2; done","background":true}"#,
+                None,
+                chat,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.background_started);
+        let jobs = tool.background_jobs("telegram:synthetic-count").await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(
+            jobs[0].title,
+            "Background command: for i in $(seq 1 300); do sleep 2; done"
+        );
+        assert_eq!(jobs[0].task_id.as_deref(), Some("turn-count"));
+        assert!(!jobs[0].title.contains("pid"));
+        assert!(tool
+            .background_jobs("telegram:another-chat")
+            .await
+            .is_empty());
+
+        assert!(tool.stop_background_job(&jobs[0].key).await);
+        assert!(tool
+            .background_jobs("telegram:synthetic-count")
+            .await
+            .is_empty());
+        // Gone already: stopping it again reads as stopped.
+        assert!(tool.stop_background_job(&jobs[0].key).await);
+    }
+
+    /// A sub-agent's job (nothing reports its result) is one its task's end
+    /// would stop, so the run is held while it runs; once it is killed it no
+    /// longer counts.
+    #[tokio::test]
+    async fn a_sub_agent_job_counts_as_ended_by_its_task_end() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+
+        let child = ToolCallContext {
+            grant_session: "telegram:synthetic-chat".to_string(),
+            task_id: Some("child-task".to_string()),
+            ..crate::testing::call_facts("specialist:executor:synthetic-count")
+        };
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"sleep 30; echo counted","background":true}"#,
+                None,
+                child,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.metadata.completion_notifications_enabled);
+        assert!(!outcome.output.contains("No completion notification"));
+        assert!(outcome.output.contains("cannot finish while it is running"));
+        assert_eq!(tool.jobs_ended_by_task_end("child-task").await, 1);
+        assert_eq!(tool.jobs_ended_by_task_end("other-task").await, 0);
+        let jobs = tool
+            .background_jobs("specialist:executor:synthetic-count")
+            .await;
+        assert_eq!(jobs.len(), 1);
+        assert!(tool.stop_background_job(&jobs[0].key).await);
+        assert_eq!(tool.jobs_ended_by_task_end("child-task").await, 0);
     }
 
     #[test]

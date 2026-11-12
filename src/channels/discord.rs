@@ -53,7 +53,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("auto", "Re-enable automatic model routing"),
     ("reload", "Reload config.toml"),
     ("tasks", "List running and recent tasks"),
-    ("cancel", "Cancel a running task"),
+    ("cancel", "Stop what's running in this chat"),
     (
         "clear",
         "Start fresh conversation (history kept for memory/audit)",

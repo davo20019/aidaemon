@@ -2252,6 +2252,18 @@ pub fn file_fence(facts: &ToolCallContext) -> Option<&std::sync::Arc<dyn FileFen
         .map(|fence| &fence.0)
 }
 
+/// A job a tool runs in the background for a chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundJob {
+    /// The tool's own handle for it; never shown.
+    pub key: String,
+    /// What it is, in plain words.
+    pub title: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The task (turn) that started it, when known.
+    pub task_id: Option<String>,
+}
+
 /// What a tool says about a call without executing it: its capabilities,
 /// typed semantics, access manifest, receipt protocol, effects and trust.
 /// Every method has a conservative default; a tool overrides only what it
@@ -2289,6 +2301,26 @@ pub trait ToolSemantics: Send + Sync {
     /// turn's task context so a follow-up sees it instead of guessing.
     async fn session_context_note(&self, _session_id: &str) -> Option<String> {
         None
+    }
+
+    /// The jobs this tool is running in the background for `session_id`
+    /// (they outlive the turn that started them), as the chat's list of
+    /// running work shows them.
+    async fn background_jobs(&self, _session_id: &str) -> Vec<BackgroundJob> {
+        Vec::new()
+    }
+
+    /// Stop the background job `key` (from [`Self::background_jobs`]) and
+    /// read its state back: `true` only once the job is gone.
+    async fn stop_background_job(&self, _key: &str) -> bool {
+        false
+    }
+
+    /// How many jobs task `task_id` started that are still running and that
+    /// the task's end would stop: nothing reports their result, so a run that
+    /// ended now would lose their work.
+    async fn jobs_ended_by_task_end(&self, _task_id: &str) -> usize {
+        0
     }
 
     /// Categorize this tool for role-based scoping.

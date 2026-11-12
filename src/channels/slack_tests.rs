@@ -124,7 +124,7 @@ async fn a_cancel_word_with_nothing_running_says_so() {
     channel
         .handle_envelope(message(OWNER, "D0SYNTH", "im", "stop", "1700000000.000300"))
         .await;
-    api.wait_for(|r| posted(r, "No running task to cancel."))
+    api.wait_for(|r| posted(r, "Nothing is running in this chat right now."))
         .await;
     assert_eq!(harness.provider.call_count().await, 0);
 }

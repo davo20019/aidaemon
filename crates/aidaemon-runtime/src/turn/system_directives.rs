@@ -80,6 +80,14 @@ pub enum SystemDirective {
     /// steps (e.g., "start server in background, then test it with curl").
     /// The agent should continue working on the remaining steps.
     BackgroundProcessContinue,
+    /// The run tried to finish while a command it started was still running
+    /// with nothing to report its result; the run waited for it. `ended`:
+    /// the command has ended, and the run now reads its result before
+    /// answering; otherwise it still runs after the longest wait, and the run
+    /// stops it and says it did not finish.
+    BackgroundJobHeld {
+        ended: bool,
+    },
     /// One-shot recovery pass BEFORE the honest failure report: the model
     /// tried to make an external change, it failed, and the model moved to
     /// answering anyway. Carries the ledger evidence and demands a DIFFERENT
@@ -241,6 +249,8 @@ impl SystemDirective {
                 }
             }
             Self::BackgroundProcessContinue => "[SYSTEM] A background process was launched successfully and is now running. Continue with the remaining steps of the user's request (e.g., testing endpoints, verifying output). If the result above does not yet show what the user needs from its startup output (a URL, port, or ready line), read it with action=\"check\" on that pid rather than relaunching it. Then tell the user what is running and how to reach or stop it.".to_string(),
+            Self::BackgroundJobHeld { ended: true } => "[SYSTEM] You tried to finish while a command you started was still running. Nothing else reports its result, and finishing would have stopped it, so your answer was held until the command ended. It has ended now. Read its output and exit status with terminal action=\"check\" and its pid, then answer from that result. Do not describe it as still running.".to_string(),
+            Self::BackgroundJobHeld { ended: false } => "[SYSTEM] You tried to finish while a command you started was still running. Nothing else reports its result, and finishing would have stopped it. It is still running after the longest wait. Read its output so far with terminal action=\"check\", stop it with action=\"kill\", and then say plainly that it did not finish and how far it got.".to_string(),
             Self::ExternalMutationRecoveryRequired(evidence) => format!(
                 "[SYSTEM] The change the user asked for has NOT been made — your earlier attempt(s) failed and were never fixed:\n{}\nYou are NOT done. Try a DIFFERENT approach NOW using tools. Do NOT repeat the same command or method that failed above — change strategy (e.g., if an inline one-liner failed on quoting or parsing, write the code to a file with write_file and run the file; if an API call failed, re-check the payload or endpoint first). If no alternative can possibly work, state plainly what you could not do and why.",
                 evidence

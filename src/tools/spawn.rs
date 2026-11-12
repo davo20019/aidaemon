@@ -1213,6 +1213,12 @@ impl Tool for SpawnAgentTool {
                     }
                     Err(_) => SourceTrust::Untrusted,
                 };
+                // Stopped from the chat (`/cancel`, a stop request): the
+                // same as the owner cancelling it here.
+                let cancelled_by_owner = cancelled_by_owner
+                    || matches!(&result, Err(error) if error
+                        .downcast_ref::<crate::runtime_ports::ChildStoppedByOwner>()
+                        .is_some());
                 let (notification_type, message) = match result {
                     _ if cancelled_by_owner => (
                         "failed",

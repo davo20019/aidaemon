@@ -126,6 +126,9 @@ pub enum MidRunIntent {
     ChangesWork,
     /// Something else: it runs as its own turn once the current one ends.
     Unrelated,
+    /// It asks to stop running work: the items [`MidRunReading::stop`]
+    /// names, or, when it names none, what bare `/cancel` would stop.
+    StopsWork,
 }
 
 /// One helper (sub-agent) of the running work, as its progress last said.
@@ -153,6 +156,16 @@ pub struct RunningWork {
     pub plan: Option<String>,
     /// Its helpers still reporting progress.
     pub helpers: Vec<HelperProgress>,
+    /// Everything running for the chat, numbered as `/tasks` shows it.
+    pub running: Vec<RunningItem>,
+}
+
+/// One thing running for a chat, as `/tasks` numbers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningItem {
+    pub number: u64,
+    pub title: String,
+    pub elapsed: std::time::Duration,
 }
 
 /// How a message sent mid-run is handled.
@@ -162,6 +175,10 @@ pub struct MidRunReading {
     /// For [`MidRunIntent::AboutRunningWork`]: a short reply drawn from the
     /// [`RunningWork`]; without one the channel says the state itself.
     pub answer: Option<String>,
+    /// For [`MidRunIntent::StopsWork`]: the numbers of the
+    /// [`RunningWork::running`] items to stop; empty for what bare `/cancel`
+    /// stops.
+    pub stop: Vec<u64>,
 }
 
 /// A sub-agent running for a chat, as `/status` and `/tasks` list it.
@@ -170,6 +187,35 @@ pub struct RunningChild {
     /// The title its parent gave it (the spawn's mission, first line).
     pub label: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What kind of work runs for a chat besides its turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatWorkKind {
+    SubAgent,
+    BackgroundJob,
+}
+
+/// One piece of work running for a chat outside its turn: a sub-agent or a
+/// background command, read from the agent's typed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatWork {
+    /// The agent's handle for it, stable while it runs; never shown.
+    pub key: String,
+    pub kind: ChatWorkKind,
+    /// What it is, in plain words.
+    pub title: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The request (turn) that started it, when known; opaque.
+    pub request: Option<String>,
+}
+
+/// Everything running for a chat besides its turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatWorkView {
+    /// The request the chat's running turn is working on, if one runs.
+    pub current_request: Option<String>,
+    pub items: Vec<ChatWork>,
 }
 
 /// Agent administration surface used by shared channel commands.
@@ -191,6 +237,25 @@ pub trait ChannelAgentRuntime: AgentIngress {
     /// in the background), oldest first.
     async fn running_children(&self, _session_id: &str) -> Vec<RunningChild> {
         Vec::new()
+    }
+
+    /// Everything running for `session_id` besides its turns: sub-agents
+    /// and background commands.
+    async fn chat_work(&self, _session_id: &str) -> ChatWorkView {
+        ChatWorkView::default()
+    }
+
+    /// Stop the chat's work `key` (from [`Self::chat_work`]) and read its
+    /// state back: `true` only once it is verified gone.
+    async fn stop_chat_work(&self, _session_id: &str, _key: &str) -> bool {
+        false
+    }
+
+    /// Cancel the chat's finite goals (task leads and their executors);
+    /// returns what was cancelled. Its sub-agents and background commands are
+    /// stopped through [`Self::stop_chat_work`].
+    async fn cancel_finite_goals_for_session(&self, session_id: &str) -> Vec<String> {
+        self.cancel_active_finite_work_for_session(session_id).await
     }
     async fn terminalize_supervised_task(
         &self,

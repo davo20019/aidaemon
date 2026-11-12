@@ -159,6 +159,10 @@ pub struct TaskRegistry {
     /// Key: (session_id, text_hash), Value: timestamp when first seen.
     /// This survives message pops so webhook retries are caught.
     recently_seen: RwLock<HashMap<(String, u64), DateTime<Utc>>>,
+    /// The short numbers `/tasks` shows for each chat's sub-agents and
+    /// background commands (by their agent key), drawn from the same counter
+    /// as turn numbers so one `/cancel <n>` names either.
+    work_numbers: std::sync::Mutex<HashMap<String, Vec<(String, u64)>>>,
 }
 
 impl TaskRegistry {
@@ -173,6 +177,7 @@ impl TaskRegistry {
             max_completed,
             queues: RwLock::new(HashMap::new()),
             recently_seen: RwLock::new(HashMap::new()),
+            work_numbers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -280,6 +285,54 @@ impl TaskRegistry {
             }
         }
         cancelled
+    }
+
+    /// The numbers of the chat's running work `keys`, in order: a key keeps
+    /// its number while it runs, a new one gets the next free number, and
+    /// keys no longer running are forgotten.
+    pub fn number_work(&self, session_id: &str, keys: &[&str]) -> Vec<u64> {
+        let mut numbers = self
+            .work_numbers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let known = numbers.remove(session_id).unwrap_or_default();
+        let mut kept: Vec<(String, u64)> = Vec::with_capacity(keys.len());
+        let assigned = keys
+            .iter()
+            .map(|key| {
+                let number = known
+                    .iter()
+                    .find(|(known_key, _)| known_key == key)
+                    .map(|(_, number)| *number)
+                    .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed));
+                kept.push((key.to_string(), number));
+                number
+            })
+            .collect();
+        if !kept.is_empty() {
+            numbers.insert(session_id.to_string(), kept);
+        }
+        assigned
+    }
+
+    /// The work key the chat's number `number` names, if it names one.
+    pub fn work_key(&self, session_id: &str, number: u64) -> Option<String> {
+        self.work_numbers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)?
+            .iter()
+            .find(|(_, known)| *known == number)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// The turn `task_id` as the registry holds it now.
+    pub async fn entry(&self, task_id: u64) -> Option<TaskEntry> {
+        self.tasks
+            .read()
+            .await
+            .get(&task_id)
+            .map(|handle| handle.entry.clone())
     }
 
     /// List all tasks for a given session, sorted by ID.

@@ -252,6 +252,7 @@ mod tests {
                 progress: "step 2 of 4".into(),
                 since: Duration::from_secs(5),
             }],
+            ..RunningWork::default()
         };
         let reply = running_work_reply(&work);
         assert!(reply.starts_with("Still working on \"Set up two demo sites\" (5m 30s so far)."));
