@@ -17,9 +17,11 @@ use crate::memory::TurnLearning;
 pub const SKIP_LEARNING_TOOL: &str = "skip_learning";
 
 /// What the model is told when an opted-out turn tries to store something.
-pub const PRIVATE_TURN_STORE_REFUSAL: &str = "[PRIVATE] This message is private, so \
-nothing from it is stored in memory. Do not try another way to store it; tell the user plainly \
-that you won't remember it.";
+/// It is worded as the reply the user should get, so the model passes it on
+/// as it is instead of describing a part of the system that refused.
+pub const PRIVATE_TURN_STORE_REFUSAL: &str = "Not saved: the user made this message \
+private. Do not try another way to save it. Tell the user, in these words or close to them: \
+This message is private, so I won't save it.";
 
 /// Whether a tool call stores something in memory. The host answers from
 /// what the call's tool declares, never from its name alone.
