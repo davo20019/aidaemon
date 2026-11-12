@@ -169,22 +169,6 @@ pub trait HealthCheckStore: Send + Sync {
     }
 }
 
-/// Focused persistence contract used by goal-trace tooling.
-pub trait GoalTraceStore:
-    GoalStore + GoalScheduleStore + MandateStore + TaskStore + WorkCoordinationStore + ScheduledRunStore
-{
-}
-
-impl<T> GoalTraceStore for T where
-    T: GoalStore
-        + GoalScheduleStore
-        + MandateStore
-        + TaskStore
-        + WorkCoordinationStore
-        + ScheduledRunStore
-{
-}
-
 /// Focused persistence contract used by mandate management. Includes the
 /// schedule and scheduled-run lifecycle so the mandate surface can project
 /// its controller goal's authoritative objective status.
@@ -219,42 +203,6 @@ impl<T> McpRegistryStore for T where T: DynamicMcpServerStore {}
 pub trait SkillsStore: SkillStore + SettingsStore {}
 
 impl<T> SkillsStore for T where T: SkillStore + SettingsStore {}
-
-/// Focused persistence contract used by blocker reporting.
-pub trait ReportBlockerStore:
-    TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
-{
-}
-
-impl<T> ReportBlockerStore for T where
-    T: TaskStore + GoalStore + NotificationStore + WorkCoordinationStore
-{
-}
-
-/// Focused persistence contract used by scheduled-goal tooling.
-pub trait ScheduledGoalRunsStore:
-    GoalStore
-    + GoalScheduleStore
-    + ScheduledRunStore
-    + GoalBudgetStore
-    + TaskStore
-    + WorkCoordinationStore
-    + SettingsStore
-    + MandateStore
-{
-}
-
-impl<T> ScheduledGoalRunsStore for T where
-    T: GoalStore
-        + GoalScheduleStore
-        + ScheduledRunStore
-        + GoalBudgetStore
-        + TaskStore
-        + WorkCoordinationStore
-        + SettingsStore
-        + MandateStore
-{
-}
 
 /// Facade trait kept for backwards compatibility.
 ///

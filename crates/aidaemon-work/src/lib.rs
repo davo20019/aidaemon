@@ -8,6 +8,7 @@ pub mod mandates;
 pub mod schema;
 pub mod sqlite;
 pub mod stores;
+pub mod triggers;
 
 /// Every domain type and store trait, under one path.
 pub mod traits {
