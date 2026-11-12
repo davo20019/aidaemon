@@ -16,7 +16,7 @@ async fn test_public_external_no_memory() {
         .upsert_fact(
             "personal",
             "name",
-            "Alice",
+            "ZXQ_PUBLICEXT_OWNER_NAME",
             "user",
             None,
             crate::types::FactPrivacy::Global,
@@ -89,7 +89,9 @@ async fn test_public_external_no_memory() {
 
     // PublicExternal should not have personal memory
     assert!(
-        !content.contains("Alice"),
+        // A name the prompt's own wording cannot contain: the core rules
+        // illustrate paraphrasing with "Alice" (f00fad8e).
+        !content.contains("ZXQ_PUBLICEXT_OWNER_NAME"),
         "PublicExternal should NOT have personal facts"
     );
     assert!(

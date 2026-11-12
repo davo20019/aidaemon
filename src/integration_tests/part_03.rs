@@ -316,7 +316,10 @@ async fn test_cross_channel_hints() {
     }
 }
 
-/// A relevant legacy fact (NULL channel_id) remains eligible for bounded recall.
+/// A relevant legacy fact (NULL channel_id) remains eligible for bounded recall
+/// wherever a global fact is visible. Since 5d98f2bb the prompt's facts follow
+/// `memory_visible`, under which a public channel no longer sees the owner's
+/// global facts, so the fact is recalled in a DM and kept out of `#dev`.
 #[tokio::test]
 async fn test_legacy_facts_backward_compat() {
     let provider = MockProvider::new();
@@ -336,48 +339,60 @@ async fn test_legacy_facts_backward_compat() {
         .await
         .unwrap();
 
-    // Query from a public channel
-    harness
-        .agent
-        .handle_message(
-            "legacy_session",
-            "what editor do I use?",
-            None,
-            UserRole::Owner,
-            ChannelContext {
-                visibility: ChannelVisibility::Public,
-                platform: "slack".to_string(),
-                channel_name: Some("#dev".to_string()),
-                channel_id: Some("slack:C_DEV".to_string()),
-                workspace_id: None,
-                sender_name: None,
-                sender_id: None,
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                workspace_grant: None,
-                trusted: false,
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    let public = ChannelContext {
+        visibility: ChannelVisibility::Public,
+        platform: "slack".to_string(),
+        channel_name: Some("#dev".to_string()),
+        channel_id: Some("slack:C_DEV".to_string()),
+        workspace_id: None,
+        sender_name: None,
+        sender_id: None,
+        channel_member_names: vec![],
+        user_id_map: std::collections::HashMap::new(),
+        workspace_grant: None,
+        trusted: false,
+    };
+    for (session, channel) in [
+        ("legacy_session_dm", ChannelContext::private("telegram")),
+        ("legacy_session_public", public),
+    ] {
+        harness
+            .agent
+            .handle_message(
+                session,
+                "what editor do I use?",
+                None,
+                UserRole::Owner,
+                channel,
+                None,
+            )
+            .await
+            .unwrap();
+    }
 
     let call_log = harness.provider.call_log.lock().await;
-    let content_owned: String = call_log[0]
-        .messages
-        .iter()
-        .filter(|m| m["role"] == "system")
-        .filter_map(|m| m["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let content = content_owned.as_str();
+    let system_text = |session_call: &crate::testing::MockChatCall| -> String {
+        session_call
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let dm = system_text(&call_log[0]);
     assert!(
-        content.contains("Neovim"),
+        dm.contains("Neovim"),
         "A query-selected legacy fact should be present in the volatile memory tail"
     );
     assert!(
-        content.contains("Your Memory"),
+        dm.contains("Your Memory"),
         "System prompt should contain memory capabilities summary"
+    );
+    let public = system_text(call_log.last().unwrap());
+    assert!(
+        !public.contains("Neovim"),
+        "a public channel must not see the owner's global facts"
     );
 }
 
