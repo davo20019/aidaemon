@@ -206,7 +206,7 @@ impl MockGateway {
 
 impl GwConn {
     pub async fn send(&mut self, v: Value) {
-        self.ws.send(Message::Text(v.to_string())).await.unwrap();
+        self.ws.send(Message::text(v.to_string())).await.unwrap();
     }
 
     pub async fn hello(&mut self, interval_ms: u64) {

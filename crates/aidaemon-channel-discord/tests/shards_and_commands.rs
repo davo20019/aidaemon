@@ -521,7 +521,7 @@ mod zlib {
 
         let mut stream = Stream::new();
         let hello = stream.deflate(&json!({"op": 10, "d": {"heartbeat_interval": 45_000}}));
-        conn.ws.send(Message::Binary(hello)).await.unwrap();
+        conn.ws.send(Message::binary(hello)).await.unwrap();
         assert_eq!(conn.recv().await["op"], 2);
 
         let ready = stream.deflate(&json!({"op": 0, "s": 1, "t": "READY", "d": {
@@ -529,7 +529,7 @@ mod zlib {
             "session_id": "synthetic-session-1",
             "resume_gateway_url": gw.url,
         }}));
-        conn.ws.send(Message::Binary(ready)).await.unwrap();
+        conn.ws.send(Message::binary(ready)).await.unwrap();
 
         // A payload split over several frames; the back-reference to the
         // earlier payloads only works if the context was kept.
@@ -537,14 +537,14 @@ mod zlib {
         let frame = stream.deflate(&json!({"op": 0, "s": 2, "t": "MESSAGE_CREATE",
             "d": dm_from("1001", alice(), &big)}));
         let (head, tail) = frame.split_at(frame.len() / 2);
-        conn.ws.send(Message::Binary(head.to_vec())).await.unwrap();
-        conn.ws.send(Message::Binary(tail.to_vec())).await.unwrap();
+        conn.ws.send(Message::binary(head.to_vec())).await.unwrap();
+        conn.ws.send(Message::binary(tail.to_vec())).await.unwrap();
         let m = run.next_message().await;
         assert_eq!(m.text, big.trim());
 
         let next = stream.deflate(&json!({"op": 0, "s": 3, "t": "MESSAGE_CREATE",
             "d": dm_from("1002", alice(), "after")}));
-        conn.ws.send(Message::Binary(next)).await.unwrap();
+        conn.ws.send(Message::binary(next)).await.unwrap();
         assert_eq!(run.next_message().await.text, "after");
         run.finish().await.unwrap();
     }
@@ -560,13 +560,13 @@ mod zlib {
         );
         let (mut conn, _) = gw.accept_with_query().await;
         conn.ws
-            .send(Message::Binary(vec![1, 2, 3, 4, 0x00, 0x00, 0xff, 0xff]))
+            .send(Message::binary(vec![1, 2, 3, 4, 0x00, 0x00, 0xff, 0xff]))
             .await
             .unwrap();
         let (mut again, _) = gw.accept_with_query().await;
         let mut stream = Stream::new();
         let hello = stream.deflate(&json!({"op": 10, "d": {"heartbeat_interval": 45_000}}));
-        again.ws.send(Message::Binary(hello)).await.unwrap();
+        again.ws.send(Message::binary(hello)).await.unwrap();
         assert_eq!(again.recv().await["op"], 2);
         run.finish().await.unwrap();
     }

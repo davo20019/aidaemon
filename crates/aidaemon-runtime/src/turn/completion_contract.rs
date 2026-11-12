@@ -8,8 +8,8 @@
 
 #[cfg(test)]
 use super::followup::{looks_like_retry_followup, text_contains_any_phrase};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use aidaemon_events::execution_graph::{
     ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
@@ -1277,8 +1277,8 @@ fn mutation_effect_obligations() -> [(&'static str, ToolMutationEffects); 11] {
     ]
 }
 
-pub static HTTP_URL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
+pub static HTTP_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
 
 fn extract_verification_filesystem_targets(
     backend: &dyn aidaemon_tools::ExecutionBackend,

@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 
 use aidaemon_events::traits::ToolOutcomeStatus;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::sync::LazyLock;
 use tracing::warn;
 
 pub fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
@@ -37,19 +37,19 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-static HTTP_STATUS_RE: Lazy<Regex> = Lazy::new(|| {
+static HTTP_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bhttp\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?|\battempt\s+\d+\s*[:=-]\s*([1-5][0-9]{2})\b|\b(?:http\s*)?code\s*[:=]\s*([1-5][0-9]{2})\b"#)
         .expect("http status regex must compile")
 });
 
-static HTTPBIN_STATUS_URL_RE: Lazy<Regex> = Lazy::new(|| {
+static HTTPBIN_STATUS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)\bhttps?://(?:[^/\s]+\.)?httpbin\.org/status/([1-5][0-9]{2})(?:[/?#][^\s]*)?"#,
     )
     .expect("httpbin status url regex must compile")
 });
 
-static EXIT_CODE_RE: Lazy<Regex> = Lazy::new(|| {
+static EXIT_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:\bexit\s*:\s*|\bexit\s*code\s*[:=]?\s*|\[exit\s*code:\s*)(-?\d+)")
         .expect("exit code regex must compile")
 });

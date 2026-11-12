@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::types::Envelope;
 use async_native_tls::TlsConnector;
-use async_std::net::TcpStream;
 use futures::TryStreamExt;
+use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
 use super::{EventSender, TriggerEvent, TriggerSettings};
@@ -22,7 +22,8 @@ impl TriggerManager {
         Self { config, sender }
     }
 
-    /// Spawn all configured triggers as background tasks.
+    /// Spawn all configured triggers as background tasks on the current tokio
+    /// runtime.
     pub fn spawn(self: Arc<Self>) {
         if let Some(ref email_config) = self.config.email {
             let host = email_config.host.clone();
@@ -32,15 +33,13 @@ impl TriggerManager {
             let folder = email_config.folder.clone();
             let sender = self.sender.clone();
 
-            // async-imap/async-std types are easiest to run on the async-std executor.
-            // The tokio broadcast channel is runtime-agnostic, so cross-runtime send is fine.
-            async_std::task::spawn(async move {
+            tokio::spawn(async move {
                 loop {
                     if let Err(e) =
                         imap_idle_loop(&host, port, &username, &password, &folder, &sender).await
                     {
                         error!("IMAP IDLE error: {}. Reconnecting in 30s...", e);
-                        async_std::task::sleep(std::time::Duration::from_secs(30)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     }
                 }
             });

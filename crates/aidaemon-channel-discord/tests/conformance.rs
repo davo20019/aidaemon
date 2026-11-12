@@ -111,7 +111,7 @@ impl InjectGateway {
                     // Dispatches sent on this connection and not yet
                     // confirmed by a heartbeat, with their sequence numbers.
                     let mut unconfirmed: Vec<(u64, (String, Value))> = Vec::new();
-                    let send = |v: Value| Message::Text(v.to_string());
+                    let send = |v: Value| Message::text(v.to_string());
                     let hello = json!({"op": 10, "d": {"heartbeat_interval": 45_000}});
                     if out.send(send(hello)).await.is_err() {
                         return;

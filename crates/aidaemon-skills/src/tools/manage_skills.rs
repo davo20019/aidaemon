@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tracing::{info, warn};
 
 use super::skill_registry::{self, RegistryEntry};
@@ -75,37 +75,37 @@ struct OpenApiOperationSummary {
     responses: Vec<String>,
 }
 
-static HTTP_METHOD_LINE_RE: Lazy<Regex> = Lazy::new(|| {
+static HTTP_METHOD_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)^\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/[-A-Za-z0-9._~!$&'()*+,;=:@%/\{\}\[\],?=&]+)")
         .expect("valid HTTP method line regex")
 });
 
-static MARKDOWN_HEADING_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\s{0,3}#{1,3}\s+(.+?)\s*$").expect("valid heading regex"));
+static MARKDOWN_HEADING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s{0,3}#{1,3}\s+(.+?)\s*$").expect("valid heading regex"));
 
-static HTML_LINK_RE: Lazy<Regex> = Lazy::new(|| {
+static HTML_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)href\s*=\s*["']([^"'#]+(?:#[^"']*)?)["']"#).expect("valid html link regex")
 });
 
-static MARKDOWN_LINK_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\[[^\]]+\]\(([^)\s]+)\)"#).expect("valid markdown link regex"));
+static MARKDOWN_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\[[^\]]+\]\(([^)\s]+)\)"#).expect("valid markdown link regex"));
 
-static GRAPHQL_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
+static GRAPHQL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)```(?:graphql|gql)\s*(.*?)```").expect("valid graphql block regex")
 });
 
-static GRAPHQL_OPERATION_RE: Lazy<Regex> = Lazy::new(|| {
+static GRAPHQL_OPERATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)\b(query|mutation|subscription)\b(?:\s+([A-Za-z_][A-Za-z0-9_]*))?")
         .expect("valid graphql operation regex")
 });
 
-static GRAPHQL_ENDPOINT_RE: Lazy<Regex> = Lazy::new(|| {
+static GRAPHQL_ENDPOINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\bhttps?://[^\s"'()]+/graphql\b|\B/graphql\b"#)
         .expect("valid graphql endpoint regex")
 });
 
-static HTTP_URL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
+static HTTP_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'()<>]+"#).expect("valid http url regex"));
 
 const GRAPHQL_INTROSPECTION_QUERY: &str = r#"{"query":"query AidaemonIntrospection { __schema { queryType { name } mutationType { name } subscriptionType { name } types { kind name fields(includeDeprecated: true) { name } } } }"}"#;
 

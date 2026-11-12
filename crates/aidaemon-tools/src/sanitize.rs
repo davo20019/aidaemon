@@ -1,8 +1,8 @@
 //! Input sanitization for external content (tool outputs, web fetches).
 //! Strips injection patterns from untrusted data before it enters the LLM context.
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// Pattern to strip from external content.
 struct SanitizePattern {
@@ -10,7 +10,7 @@ struct SanitizePattern {
     replacement: &'static str,
 }
 
-static SANITIZE_PATTERNS: Lazy<Vec<SanitizePattern>> = Lazy::new(|| {
+static SANITIZE_PATTERNS: LazyLock<Vec<SanitizePattern>> = LazyLock::new(|| {
     vec![
         // Pseudo-system tags
         SanitizePattern {
@@ -43,13 +43,13 @@ static SANITIZE_PATTERNS: Lazy<Vec<SanitizePattern>> = Lazy::new(|| {
 });
 
 /// Zero-width and invisible Unicode characters used to hide text.
-static INVISIBLE_CHARS: Lazy<Regex> = Lazy::new(|| {
+static INVISIBLE_CHARS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\u{200B}\u{200C}\u{200D}\u{FEFF}\u{200E}\u{200F}\u{202A}-\u{202E}\u{2060}-\u{2064}\u{2066}-\u{2069}]").unwrap()
 });
 
 /// Internal control markers that should not be interpreted as instructions when
 /// they appear in otherwise trusted terminal output.
-static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static INTERNAL_CONTROL_MARKERS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)\[(?:SYSTEM|DIAGNOSTIC|TOOL STATS|UNTRUSTED)(?::[^\]]*)?\]").unwrap(),
         Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
@@ -69,7 +69,7 @@ static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
 /// `INTERNAL_CONTROL_MARKERS` which only removes the bracket tags, these
 /// consume the tag **and** all following text on the same line, plus any
 /// continuation lines that look like sub-items (indented or starting with `-`).
-static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static DIAGNOSTIC_BLOCK_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         // [DIAGNOSTIC] ... plus continuation lines starting with whitespace or `-`
         Regex::new(r"(?m)\[DIAGNOSTIC\][^\n]*(?:\n(?:[ \t]|-)[^\n]*)*").unwrap(),
@@ -162,7 +162,7 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 });
 
 /// Patterns that indicate the underlying LLM is leaking its training identity.
-static MODEL_IDENTITY_LEAKS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static MODEL_IDENTITY_LEAKS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)I am a large language model,? trained by Google\.?").unwrap(),
         Regex::new(r"(?i)I(?:'m| am) (?:a |an )?(?:AI )?(?:language )?model (?:created|made|trained|developed|built) by (?:Google|OpenAI|Anthropic|Meta|DeepMind)\.?").unwrap(),
@@ -192,7 +192,7 @@ pub fn strip_model_identity_leaks(content: &str) -> String {
 /// logs: local paths and `IP:port` endpoints. Secrets are the SDK's one list
 /// ([`aidaemon_policies::secret_patterns`]), shared with the redactor and the
 /// kernel's outbound secret scan.
-static PRIVACY_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
+static PRIVACY_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (
             Regex::new(r"/(?:Users|home|etc)/[^\s]{5,}").unwrap(),
@@ -292,21 +292,21 @@ pub fn strip_diagnostic_blocks(content: &str) -> String {
             for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
                 cleaned = pattern.replace_all(&cleaned, "").to_string();
             }
-            static INLINE_XML_TOOL_TAGS: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
+            static INLINE_XML_TOOL_TAGS: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
             cleaned = INLINE_XML_TOOL_TAGS.replace_all(&cleaned, "").to_string();
             result.push_str(&cleaned);
         }
     }
     // Collapse runs of 3+ newlines left by removed blocks into double newlines.
-    static EXCESS_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+    static EXCESS_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
     result = EXCESS_NEWLINES.replace_all(&result, "\n\n").to_string();
     result.trim().to_string()
 }
 
 /// Meta-instruction patterns that the LLM may parrot from system directives.
 /// These are behavioural guidance meant for the LLM, not the user.
-static META_INSTRUCTION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static META_INSTRUCTION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Your response must accurately reflect\b[^\n]*").unwrap(),
         Regex::new(r"(?i)If retries resolved earlier failures,?\s*say so explicitly\.?").unwrap(),
@@ -407,7 +407,7 @@ pub fn strip_leaked_control_markers(reply: &str) -> String {
     let cleaned = strip_model_identity_leaks(&cleaned);
 
     // Phase 3: raw tool-call protocol tokens only (NOT tool-name references)
-    static LEAKED_TOKEN_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    static LEAKED_TOKEN_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         vec![
             Regex::new(r"(?m)^[^\S\n]*<\|tool_call[^|]*\|>?[^\n]*$").unwrap(),
             Regex::new(r"<\|tool_call[^|]*\|>?").unwrap(),
@@ -437,7 +437,7 @@ pub fn strip_leaked_control_markers(reply: &str) -> String {
             result.push_str(&segment);
         }
     }
-    static EXCESS_NEWLINES2: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+    static EXCESS_NEWLINES2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
     let result = EXCESS_NEWLINES2.replace_all(&result, "\n\n").to_string();
     result.trim().to_string()
 }
@@ -530,7 +530,7 @@ fn shorten_home_dir_with(text: &str, home: &str) -> String {
     text.replace(&format!("{}/", home), "~/")
 }
 
-static UUID_IDENTIFIER: Lazy<Regex> = Lazy::new(|| {
+static UUID_IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
         .expect("valid UUID identifier regex")
 });

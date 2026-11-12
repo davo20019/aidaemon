@@ -17,12 +17,12 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sqlx::{Row, SqlitePool};
+use std::sync::LazyLock;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -139,8 +139,8 @@ fn default_checkpoint_snapshot_timeout_secs() -> u64 {
     10
 }
 
-static ACTIVE_MANAGER: Lazy<RwLock<Option<Arc<CheckpointManager>>>> =
-    Lazy::new(|| RwLock::new(None));
+static ACTIVE_MANAGER: LazyLock<RwLock<Option<Arc<CheckpointManager>>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 const READY: &str = "ready";
 const OPEN: &str = "open";

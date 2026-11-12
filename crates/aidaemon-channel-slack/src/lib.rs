@@ -480,7 +480,7 @@ impl SlackChannel {
             // Ack first: Slack redelivers envelopes not acked within 3s.
             if let Some(id) = envelope.get("envelope_id").and_then(Value::as_str) {
                 let ack = json!({ "envelope_id": id }).to_string();
-                if let Err(e) = tx.send(Message::Text(ack)).await {
+                if let Err(e) = tx.send(Message::Text(ack.into())).await {
                     warn!(error = %e, "failed to ack Slack envelope");
                     return reconnect(false, saw_hello);
                 }
