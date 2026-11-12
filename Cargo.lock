@@ -107,14 +107,10 @@ dependencies = [
  "fastembed",
  "fd-lock",
  "futures",
- "globset",
  "hkdf",
  "hmac",
- "htmd",
- "ignore",
  "libc",
  "libsqlite3-sys",
- "llm_readability",
  "once_cell",
  "opentelemetry_sdk",
  "p256",
@@ -130,7 +126,6 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "serialport",
- "sha1",
  "sha2",
  "shell-words",
  "shellexpand",
@@ -148,7 +143,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "xcap",
- "zeroize",
 ]
 
 [[package]]
@@ -368,12 +362,10 @@ version = "0.1.0"
 dependencies = [
  "aidaemon-node-protocol",
  "anyhow",
- "async-trait",
  "base64 0.22.1",
  "p256",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "serde_json",
  "uuid",
 ]
 
