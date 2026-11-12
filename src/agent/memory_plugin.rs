@@ -30,7 +30,7 @@ mod tool_facts;
 mod writer;
 pub(crate) use opt_out::{
     mark_turn_opted_out, set_next_message_private, take_next_message_private, PrivateTurnGuard,
-    SkipLearningTool,
+    SkipLearningTool, OPTED_OUT_REASON,
 };
 pub(crate) use recall::DaemonRecall;
 #[cfg_attr(not(feature = "sdk-memory"), allow(unused_imports))]

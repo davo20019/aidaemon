@@ -364,3 +364,77 @@ async fn an_opted_out_turn_cannot_store_through_a_memory_systems_tool() {
     assert_eq!(*calls.lock().unwrap(), ["synthetic_memory_recall"]);
     assert!(model_was_told_private(&harness).await);
 }
+
+/// What the private turn said: it may live on in the stored history, but
+/// once the conversation moves on no reader may hand it to a prompt.
+const PRIVATE_DETAIL: &str = "Quillo-11";
+
+#[tokio::test]
+async fn after_clear_a_private_turn_reaches_no_prompt_or_history_search() {
+    let harness = crate::testing::setup_test_agent_root(MockProvider::with_responses(vec![
+        MockProvider::text_response("I can use that here, but I won't save it."),
+        MockProvider::text_response("I don't know your test gecko's name."),
+        MockProvider::text_response("Your test hamster is Plimbo-31."),
+    ]))
+    .await
+    .unwrap();
+    set_next_message_private(harness.state.as_ref(), SESSION, true)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request(&format!(
+            "My test gecko is named {PRIVATE_DETAIL}. Please remember it."
+        )))
+        .await
+        .unwrap();
+    // A normal turn after it, which history search may still return.
+    harness
+        .agent
+        .handle_inbound_message(request("My test hamster is named Plimbo-31."))
+        .await
+        .unwrap();
+    harness.agent.clear_session_context(SESSION).await.unwrap();
+    harness
+        .agent
+        .handle_inbound_message(request("Do you know my test gecko's name?"))
+        .await
+        .unwrap();
+
+    let log = harness.provider.call_log.lock().await;
+    let last = serde_json::to_string(&log.last().unwrap().messages).unwrap();
+    assert!(
+        !last.contains(PRIVATE_DETAIL),
+        "the private turn reached a later prompt"
+    );
+    drop(log);
+
+    // The model's history search, as it runs in that later turn.
+    let history = crate::tools::SearchHistoryTool::new(harness.state.clone(), 90);
+    let facts = crate::traits::ToolCallContext {
+        session_id: SESSION.to_string(),
+        user_role: Some(UserRole::Owner),
+        channel_visibility: Some(crate::types::ChannelVisibility::Private),
+        ..Default::default()
+    };
+    for query in ["gecko", PRIVATE_DETAIL] {
+        let args =
+            serde_json::json!({"action": "search", "query": query, "limit": 10, "context": 1});
+        let found = crate::testing::call_with_facts(&history, &args.to_string(), facts.clone())
+            .await
+            .unwrap();
+        // The query is echoed back; the private message must not be.
+        assert!(
+            !found.contains(&format!("named {PRIVATE_DETAIL}")),
+            "history search: {found}"
+        );
+    }
+    let args = serde_json::json!({"action": "search", "query": "hamster", "limit": 10});
+    let found = crate::testing::call_with_facts(&history, &args.to_string(), facts)
+        .await
+        .unwrap();
+    assert!(
+        found.contains("Plimbo-31"),
+        "a normal turn stays searchable: {found}"
+    );
+}
