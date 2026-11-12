@@ -36,8 +36,8 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::bot_api::{
-    Bot, BotCommand, CallbackQuery, ChatAction, ChatId, LinkPreviewOptions, Message, MessageId,
-    ParseMode, RequestError, Update,
+    Bot, BotCommand, CallbackQuery, ChatAction, ChatId, InlineKeyboardButton, InlineKeyboardMarkup,
+    LinkPreviewOptions, Message, MessageId, ParseMode, RequestError, Update,
 };
 use crate::format::{
     markdown_to_html as markdown_to_telegram_html,
@@ -115,17 +115,6 @@ pub trait TelegramHost: Send + Sync + 'static {
         false
     }
 
-    /// An authorized message, before anything else sees it; `true` means
-    /// the host consumed it (a pasted secret, say) and it goes no further.
-    async fn intercept_message(
-        &self,
-        _bot: &Arc<TelegramBot>,
-        _msg: &Message,
-        _user_id: u64,
-    ) -> bool {
-        false
-    }
-
     /// A message's text before it becomes a turn; `Some` is the host's
     /// answer instead.
     async fn intercept_text(
@@ -155,6 +144,18 @@ pub trait TelegramHost: Send + Sync + 'static {
         None
     }
 
+    /// `/setkey` (owner, private chat): the API keys that can be replaced.
+    /// `Err` is the message to show; an empty list means none.
+    async fn key_choices(&self) -> Result<Vec<KeyChoice>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Test `key` for the choice `id` (shown as `label`) and save it only
+    /// if its provider accepts it; the reply says what happened.
+    async fn install_key(&self, _id: &str, label: &str, _key: &str) -> String {
+        format!("The config changed, so {label} was not updated. Run /setkey again.")
+    }
+
     /// The bot is starting (`label`: its username).
     async fn on_start(&self, _bot: &Arc<TelegramBot>, _label: &str) {}
 
@@ -170,6 +171,24 @@ pub trait TelegramHost: Send + Sync + 'static {
 
 fn disabled_link_preview() -> LinkPreviewOptions {
     LinkPreviewOptions { is_disabled: true }
+}
+
+/// One API key `/setkey` can replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChoice {
+    /// What the button sends back.
+    pub id: String,
+    /// What the owner sees.
+    pub label: String,
+}
+
+/// How long `/setkey` waits for the key after a provider is chosen.
+const PENDING_KEY_TTL: Duration = Duration::from_secs(120);
+
+struct PendingKey {
+    id: String,
+    label: String,
+    expires_at: std::time::Instant,
 }
 
 /// One Telegram bot.
@@ -201,6 +220,8 @@ pub struct TelegramBot {
     /// the configured one when the bot starts.
     transport: StdRwLock<Arc<crate::TelegramChannel>>,
     prompts: Prompts,
+    /// Chats where the owner's next message is an API key, not a request.
+    pending_keys: Mutex<HashMap<(i64, u64), PendingKey>>,
 }
 
 const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
@@ -260,6 +281,7 @@ impl TelegramBot {
             api_url: None,
             transport: StdRwLock::new(adapter),
             prompts: Prompts::default(),
+            pending_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -735,6 +757,11 @@ impl TelegramBot {
             return;
         }
 
+        if let Some(choice) = data.strip_prefix("setkey:") {
+            self.handle_setkey_choice(&q, choice, user_id, &bot).await;
+            return;
+        }
+
         let Some((prompt_id, choice_id)) = self.sdk_transport().approval_choice(&data) else {
             let _ = bot
                 .answer_callback_query(q.id)
@@ -797,6 +824,11 @@ impl TelegramBot {
         let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw);
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
+        if cmd == "/setkey" && self.host.commands().iter().any(|c| c.name == "setkey") {
+            self.handle_setkey_command(msg, bot).await;
+            return;
+        }
+
         // The host's own commands, then the shared ones.
         let reply = match self.host.handle_command(self, cmd, arg, msg).await {
             HostCommand::Handled => return,
@@ -832,6 +864,153 @@ impl TelegramBot {
         for chunk in split_telegram_text(&reply, 4096) {
             let _ = bot.send_message(msg.chat.id, chunk).await;
         }
+    }
+
+    /// `/setkey`: owner only and in a private chat, where a pasted key is not
+    /// visible to anyone else before it is deleted.
+    async fn handle_setkey_command(&self, msg: &Message, bot: &Bot) {
+        let user_id = msg.from.as_ref().map(|user| user.id.0).unwrap_or(0);
+        if determine_role(&self.owner_user_ids, user_id) != UserRole::Owner {
+            let _ = bot
+                .send_message(msg.chat.id, "Only the owner can change API keys.")
+                .await;
+            return;
+        }
+        if !msg.chat.is_private() {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "Use /setkey in a private chat with the bot, so the key is not shown to this group.",
+                )
+                .await;
+            return;
+        }
+        self.pending_keys
+            .lock()
+            .await
+            .remove(&(msg.chat.id.0, user_id));
+        let targets = match self.host.key_choices().await {
+            Ok(targets) => targets,
+            Err(error) => {
+                let _ = bot.send_message(msg.chat.id, error).await;
+                return;
+            }
+        };
+        if targets.is_empty() {
+            let _ = bot
+                .send_message(msg.chat.id, "No configured provider uses an API key.")
+                .await;
+            return;
+        }
+        let mut rows: Vec<Vec<InlineKeyboardButton>> = targets
+            .iter()
+            .map(|target| {
+                vec![InlineKeyboardButton::callback(
+                    target.label.clone(),
+                    format!("setkey:{}", target.id),
+                )]
+            })
+            .collect();
+        rows.push(vec![InlineKeyboardButton::callback(
+            "Cancel",
+            "setkey:cancel",
+        )]);
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                "Which provider's API key do you want to replace?",
+            )
+            .reply_markup(InlineKeyboardMarkup::new(rows))
+            .await;
+    }
+
+    async fn handle_setkey_choice(
+        &self,
+        query: &CallbackQuery,
+        choice: &str,
+        user_id: u64,
+        bot: &Bot,
+    ) {
+        let Some(message) = query
+            .message
+            .as_ref()
+            .filter(|message| message.chat.is_private())
+            .filter(|_| determine_role(&self.owner_user_ids, user_id) == UserRole::Owner)
+        else {
+            let _ = bot
+                .answer_callback_query(query.id.clone())
+                .text("Only the owner can do this, in a private chat.")
+                .await;
+            return;
+        };
+        let key = (message.chat.id.0, user_id);
+        let target = self
+            .host
+            .key_choices()
+            .await
+            .ok()
+            .and_then(|targets| targets.into_iter().find(|target| target.id == choice));
+        let text = match target {
+            Some(target) => {
+                let label = target.label.clone();
+                self.pending_keys.lock().await.insert(
+                    key,
+                    PendingKey {
+                        id: target.id,
+                        label: label.clone(),
+                        expires_at: std::time::Instant::now() + PENDING_KEY_TTL,
+                    },
+                );
+                format!(
+                    "{label}: paste the new API key as your next message. I'll delete it right away and test it before saving. Send /cancel to stop. This expires in 2 minutes."
+                )
+            }
+            None => {
+                self.pending_keys.lock().await.remove(&key);
+                if choice == "cancel" {
+                    "Key entry cancelled.".to_string()
+                } else {
+                    "That provider is no longer in the config. Run /setkey again.".to_string()
+                }
+            }
+        };
+        let _ = bot.answer_callback_query(query.id.clone()).await;
+        let _ = bot
+            .edit_message_text(message.chat.id, message.id, text)
+            .await;
+    }
+
+    /// Consume the owner's message when a key is expected. `true` means it
+    /// was the key (or `/cancel`) and must go no further.
+    async fn capture_pending_key(&self, msg: &Message, user_id: u64, bot: &Bot) -> bool {
+        let pending = {
+            let mut pending_keys = self.pending_keys.lock().await;
+            if pending_keys.is_empty() {
+                return false;
+            }
+            pending_keys.retain(|_, pending| pending.expires_at > std::time::Instant::now());
+            pending_keys.remove(&(msg.chat.id.0, user_id))
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        let text = msg.text().map(str::trim).unwrap_or_default();
+        if text.is_empty() || text.starts_with('/') {
+            let _ = bot.send_message(msg.chat.id, "Key entry cancelled.").await;
+            return text.split('@').next() == Some("/cancel");
+        }
+        let delete_note = match bot.delete_message(msg.chat.id, msg.id).await {
+            Ok(_) => "",
+            Err(_) => "\n\nI couldn't delete your message, so please delete it yourself.",
+        };
+        let reply = self
+            .host
+            .install_key(&pending.id, &pending.label, text)
+            .await;
+        let _ = bot
+            .send_message(msg.chat.id, format!("{reply}{delete_note}"))
+            .await;
+        true
     }
 
     /// Handle an incoming file/photo/audio/video/voice message.
@@ -1102,7 +1281,7 @@ impl TelegramBot {
         }
 
         // A key being entered must reach nothing else: no agent, no event log.
-        if self.host.intercept_message(self, &msg, user_id).await {
+        if self.capture_pending_key(&msg, user_id, &bot).await {
             return;
         }
 
