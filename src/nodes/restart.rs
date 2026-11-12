@@ -792,9 +792,9 @@ mod tests {
 
         async fn age(&self, column: &str, seconds: i64) {
             let at = (Utc::now() - Duration::seconds(seconds)).to_rfc3339();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE node_restart_commands SET {column} = ? WHERE node_id = ?"
-            ))
+            )))
             .bind(at)
             .bind(NODE)
             .execute(self.store.pool())

@@ -440,7 +440,7 @@ mod upkeep_bench {
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = Instant::now();
-                sqlx::query(sql)
+                sqlx::query(*sql)
                     .bind(model)
                     .bind(session)
                     .fetch_all(pool)
@@ -449,7 +449,7 @@ mod upkeep_bench {
                 samples.push(started.elapsed());
             }
             samples.sort();
-            let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind(model)
                 .bind(session)
                 .fetch_all(pool)

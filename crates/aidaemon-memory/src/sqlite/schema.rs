@@ -675,7 +675,9 @@ async fn repair_blank_validity_bounds(pool: &SqlitePool) -> anyhow::Result<()> {
         ),
     ];
     for statement in &statements {
-        sqlx::query(statement).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
     }
     for table in [
         "memory_entity_facts",
@@ -683,9 +685,9 @@ async fn repair_blank_validity_bounds(pool: &SqlitePool) -> anyhow::Result<()> {
         "memory_aliases",
     ] {
         for column in ["valid_from", "valid_to"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET {column} = NULL WHERE TRIM({column}) = ''"
-            ))
+            )))
             .execute(pool)
             .await?;
         }
@@ -826,9 +828,9 @@ async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
     // `PRAGMA secure_delete=ON` still scrubs ordinary SQLite pages; deleted FTS
     // terms are made unqueryable by the standard tombstone/merge mechanism.
     for table in ["memory_claims_fts", "memory_spans_fts"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table}({table}, rank) VALUES('secure-delete', 0)"
-        ))
+        )))
         .execute(pool)
         .await?;
     }
@@ -838,9 +840,11 @@ async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
     // secure-delete segments on SQLCipher's SQLite build. Replace legacy
     // update triggers and suppress true no-op text updates.
     for trigger in ["memory_claims_au", "memory_spans_au"] {
-        sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
-            .execute(pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {trigger}"
+        )))
+        .execute(pool)
+        .await?;
     }
 
     for statement in [
@@ -914,11 +918,12 @@ mod tests {
 
         create_memory_fts(&pool).await.unwrap();
         for table in ["memory_claims_fts_config", "memory_spans_fts_config"] {
-            let secure_delete: i64 =
-                sqlx::query_scalar(&format!("SELECT v FROM {table} WHERE k = 'secure-delete'"))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let secure_delete: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT v FROM {table} WHERE k = 'secure-delete'"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(secure_delete, 0);
         }
         sqlx::query("INSERT INTO memory_claims(id, claim_text) VALUES (1, 'alpha claim')")
@@ -1021,7 +1026,10 @@ mod tests {
     }
 
     async fn count(pool: &SqlitePool, sql: &str) -> i64 {
-        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     /// A database from before channels, privacy, supersession history and

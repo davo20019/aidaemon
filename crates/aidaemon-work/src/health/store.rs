@@ -191,7 +191,7 @@ impl HealthProbeStore {
             "DELETE FROM health_probes WHERE source = 'config' AND name NOT IN ({})",
             placeholders.join(", ")
         );
-        let mut query = sqlx::query(&query_str);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(&*query_str));
         for name in current_names {
             query = query.bind(name);
         }

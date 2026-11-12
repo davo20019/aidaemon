@@ -204,10 +204,11 @@ mod tests {
     async fn count_learned(state: &SqliteStateStore) -> i64 {
         let mut learned = 0;
         for table in ["facts", "procedures", "error_solutions"] {
-            let (count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&state.pool())
-                .await
-                .unwrap();
+            let (count,): (i64,) =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&state.pool())
+                    .await
+                    .unwrap();
             learned += count;
         }
         learned

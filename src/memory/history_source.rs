@@ -530,7 +530,7 @@ impl aidaemon_memory::history::MessageLog for EventHistory {
         }
         let placeholders = vec!["?"; ids.len()].join(", ");
         let sql = format!("SELECT id FROM events WHERE id IN ({placeholders})");
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql));
         for id in ids {
             query = query.bind(id);
         }

@@ -56,7 +56,7 @@ fn script(opt_out: bool) -> MockProvider {
 }
 
 async fn rows(harness: &TestHarness, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(&harness.state.pool())
         .await
         .unwrap()

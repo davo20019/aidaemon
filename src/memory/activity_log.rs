@@ -350,20 +350,20 @@ impl ActivityLog for EventHistory {
         let min = which.min_turns;
         Ok(match which.idle_before {
             Some(idle_before) => {
-                sqlx::query_scalar(&uncaptured_sessions_sql(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(&*uncaptured_sessions_sql(
                     "AND ev.created_at < ?2",
                     &format!("HAVING COUNT(ev.id) >= {min} AND MAX(ev.created_at) < ?2"),
-                ))
+                )))
                 .bind(&episode_ends)
                 .bind(idle_before.to_rfc3339())
                 .fetch_all(self.pool())
                 .await?
             }
             None => {
-                sqlx::query_scalar(&uncaptured_sessions_sql(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(&*uncaptured_sessions_sql(
                     "",
                     &format!("HAVING COUNT(ev.id) >= {min}"),
-                ))
+                )))
                 .bind(&episode_ends)
                 .fetch_all(self.pool())
                 .await?

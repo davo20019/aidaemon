@@ -668,7 +668,7 @@ fn match_expression(tokens: &[String], operator: &str) -> String {
     tokens.join(operator)
 }
 
-fn push_scope(qb: &mut QueryBuilder<'_, Sqlite>, scope: &HistoryScope, alias: &str) {
+fn push_scope(qb: &mut QueryBuilder<Sqlite>, scope: &HistoryScope, alias: &str) {
     let current_is_specialist =
         scope.session_id.starts_with("specialist:") || scope.session_id.starts_with("sub-");
     if !(scope.include_subagents

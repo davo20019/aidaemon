@@ -444,9 +444,9 @@ mod tests {
             .await
             .unwrap();
         for trigger in ["insert", "update", "delete"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP TRIGGER memory_embeddings_generation_{trigger}"
-            ))
+            )))
             .execute(&pool)
             .await
             .unwrap();

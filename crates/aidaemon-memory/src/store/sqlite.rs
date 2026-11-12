@@ -202,7 +202,10 @@ impl SqliteMemoryStore {
     ) -> Result<HashMap<String, FactAccess>> {
         let wanted: HashSet<&String> = ids.iter().collect();
         let sql = format!("SELECT id, privacy, channel_id FROM {table} WHERE scope = ?");
-        let rows = sqlx::query(&sql).bind(scope).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .iter()
             .map(|row| (row.get::<String, _>("id"), row_access(row)))
@@ -230,7 +233,7 @@ impl SqliteMemoryStore {
             "SELECT {id_column} AS id, bm25({table}) AS rank, content FROM {table}
              WHERE {table} MATCH ? AND scope = ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(terms.join(" OR "))
             .bind(scope)
             .fetch_all(&self.pool)
@@ -343,7 +346,7 @@ async fn bump_recalls(
         "UPDATE {table} SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?"
     );
     for id in ids {
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(now)
             .bind(id)
             .execute(&mut **tx)
@@ -426,7 +429,10 @@ impl MemoryStore for SqliteMemoryStore {
             "SELECT {FACT_COLUMNS} FROM memory_facts
              WHERE scope = ? AND superseded_at IS NULL ORDER BY updated_at DESC"
         );
-        let rows = sqlx::query(&sql).bind(scope).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.iter().map(row_to_fact).collect())
     }
 
@@ -449,7 +455,7 @@ impl MemoryStore for SqliteMemoryStore {
             "SELECT {FACT_COLUMNS} FROM memory_facts
              WHERE scope = ? AND category = ? AND key = ? ORDER BY created_at, rowid"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(scope)
             .bind(normalize_category(category))
             .bind(normalize_key(key))
@@ -544,7 +550,10 @@ impl MemoryStore for SqliteMemoryStore {
         let sql = format!(
             "SELECT {EPISODE_COLUMNS} FROM memory_episodes WHERE scope = ? ORDER BY created_at DESC"
         );
-        let rows = sqlx::query(&sql).bind(scope).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.iter().map(row_to_episode).collect())
     }
 
@@ -644,7 +653,7 @@ impl MemoryStore for SqliteMemoryStore {
                AND (? IS NULL OR id > ?)
              ORDER BY id LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(model)
             .bind(after_id)
             .bind(after_id)
@@ -684,7 +693,7 @@ impl MemoryStore for SqliteMemoryStore {
             "UPDATE {table} SET embedding = ?, embedding_model = ?
              WHERE id = ? AND embedding_model IS ? {active}"
         );
-        let changed = sqlx::query(&sql)
+        let changed = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(encode_embedding(&embedding.vector))
             .bind(&embedding.model)
             .bind(&stale.id)

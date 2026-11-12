@@ -795,19 +795,22 @@ async fn uncaptured_session_scan_matches_the_left_join_it_replaced() {
         ("", "HAVING COUNT(ev.id) >= 5"),
     ];
     for (filter, having) in cases {
-        let mut got: Vec<String> = sqlx::query_scalar(&uncaptured_sessions_sql(filter, having))
-            .bind(&ends)
-            .bind(&cutoff)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let mut want: Vec<String> =
-            sqlx::query_scalar(&legacy_uncaptured_sessions_sql(filter, having))
-                .bind(&ends)
-                .bind(&cutoff)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let mut got: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            &*uncaptured_sessions_sql(filter, having),
+        ))
+        .bind(&ends)
+        .bind(&cutoff)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut want: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            &*legacy_uncaptured_sessions_sql(filter, having),
+        ))
+        .bind(&ends)
+        .bind(&cutoff)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         got.sort();
         want.sort();
         assert_eq!(got, want, "filter={filter:?} having={having:?}");

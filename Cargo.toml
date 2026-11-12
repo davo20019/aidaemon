@@ -19,8 +19,8 @@ exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "
 version = "0.2.0"
 edition = "2021"
 # Floor set by the SDK crates' dependency tree with all features
-# (uuid: 1.89); verified in CI by the MSRV job.
-rust-version = "1.89"
+# (sqlx 0.9: 1.94); verified in CI by the MSRV job.
+rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
@@ -71,7 +71,7 @@ aidaemon-node-protocol = { version = "0.1.0", path = "crates/node-protocol" }
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "query", "form", "blocking", "gzip", "deflate", "brotli", "stream"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-saphyr = "2.1"
@@ -93,7 +93,7 @@ dirs = "7"
 fastembed = "4"
 tokio-util = "0.7.20"
 libc = "0.2"
-libsqlite3-sys = { version = "0.30", optional = true }
+libsqlite3-sys = { version = "0.37", optional = true }
 croner = "4"
 regex = "1"
 # Cross-platform per-process cumulative CPU time + disk I/O, used by the

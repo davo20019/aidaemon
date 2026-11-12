@@ -46,9 +46,11 @@ pub async fn optimize(pool: &SqlitePool, when: Optimize) -> Result<(), Error> {
     // Both pragmas must run on the same connection: analysis_limit is
     // per connection.
     let mut connection = pool.acquire().await?;
-    sqlx::query(&format!("PRAGMA analysis_limit = {ANALYSIS_LIMIT}"))
-        .execute(&mut *connection)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA analysis_limit = {ANALYSIS_LIMIT}"
+    )))
+    .execute(&mut *connection)
+    .await?;
     let statement = match when {
         Optimize::AtOpen => "PRAGMA optimize = 0x10002",
         Optimize::Periodic => "PRAGMA optimize",

@@ -161,7 +161,9 @@ async fn migrate_plaintext_db_to_encrypted(db_path: &Path, key: &str) -> anyhow:
         key.replace('\'', "''")
     );
     let plain_pool = connect_sqlite_with_create(db_path_str, true).await?;
-    sqlx::query(&attach_sql).execute(&plain_pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(&*attach_sql))
+        .execute(&plain_pool)
+        .await?;
     sqlx::query("SELECT sqlcipher_export('encrypted')")
         .execute(&plain_pool)
         .await?;
@@ -356,10 +358,13 @@ async fn connect_sqlite_with_create(
 #[cfg(feature = "encryption")]
 async fn apply_encryption_key(pool: &SqlitePool, key: &str) -> anyhow::Result<()> {
     let escaped_key = key.replace('\'', "''");
-    sqlx::query(&format!("PRAGMA key = '{}'", escaped_key))
-        .execute(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA key = '{}'",
+        escaped_key
+    )))
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to apply SQLCipher key: {}", e))?;
     Ok(())
 }
 
@@ -380,7 +385,9 @@ async fn collect_table_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<Strin
             "SELECT COUNT(*) AS c FROM \"{}\"",
             table.replace('"', "\"\"")
         );
-        let (count,): (i64,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+            .fetch_one(pool)
+            .await?;
         counts.insert(table, count);
     }
     Ok(counts)

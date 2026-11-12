@@ -1680,7 +1680,7 @@ impl<S: WorkDatabase> MandateStore for S {
 
     async fn get_mandate(&self, id: &str) -> anyhow::Result<Option<Mandate>> {
         let query = format!("SELECT {MANDATE_COLUMNS} FROM mandates WHERE id = ?");
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(id)
             .fetch_optional(self.work_pool())
             .await?;
@@ -1689,7 +1689,7 @@ impl<S: WorkDatabase> MandateStore for S {
 
     async fn get_mandate_for_goal(&self, goal_id: &str) -> anyhow::Result<Option<Mandate>> {
         let query = format!("SELECT {MANDATE_COLUMNS} FROM mandates WHERE goal_id = ?");
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(goal_id)
             .fetch_optional(self.work_pool())
             .await?;
@@ -1721,13 +1721,15 @@ impl<S: WorkDatabase> MandateStore for S {
             let stable_principal =
                 aidaemon_events::session::stable_private_owner_principal_id(session_id)
                     .unwrap_or_default();
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(&*query))
                 .bind(session_id)
                 .bind(stable_principal)
                 .fetch_all(self.work_pool())
                 .await?
         } else {
-            sqlx::query(&query).fetch_all(self.work_pool()).await?
+            sqlx::query(sqlx::AssertSqlSafe(&*query))
+                .fetch_all(self.work_pool())
+                .await?
         };
         rows.iter().map(mandate_from_row).collect()
     }
@@ -2663,7 +2665,7 @@ impl<S: WorkDatabase> MandateStore for S {
                )
              RETURNING {MANDATE_COLUMNS}"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(&lease_token)
             .bind(&lease_expires_at)
             .bind(&now_string)
@@ -3182,7 +3184,7 @@ impl<S: WorkDatabase> MandateStore for S {
                AND gr.status = 'running'",
             qualified_columns("m", MANDATE_COLUMNS)
         );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(&decision.mandate_id)
             .bind(&decision.goal_run_id)
             .bind(&now_string)
@@ -3567,7 +3569,7 @@ impl<S: WorkDatabase> MandateStore for S {
     ) -> anyhow::Result<Option<MandateDecisionCycle>> {
         let query =
             format!("SELECT {DECISION_COLUMNS} FROM mandate_decision_cycles WHERE goal_run_id = ?");
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(goal_run_id)
             .fetch_optional(self.work_pool())
             .await?;
@@ -3601,7 +3603,7 @@ impl<S: WorkDatabase> MandateStore for S {
              ORDER BY e.id DESC
              LIMIT ?"
         );
-        let mut statement = sqlx::query_scalar::<_, String>(&query)
+        let mut statement = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*query))
             .bind(goal_run_id)
             .bind(i64::from(aidaemon_events::ToolReceiptV1::SCHEMA_VERSION));
         for tool in crate::MANDATE_PROTOCOL_TOOLS {
@@ -3622,7 +3624,7 @@ impl<S: WorkDatabase> MandateStore for S {
             "SELECT {DECISION_COLUMNS} FROM mandate_decision_cycles
              WHERE mandate_id = ? ORDER BY julianday(created_at) DESC, id DESC LIMIT ?"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(mandate_id)
             .bind(limit.clamp(1, 200))
             .fetch_all(self.work_pool())
@@ -3639,7 +3641,7 @@ impl<S: WorkDatabase> MandateStore for S {
             "SELECT {INTENTION_COLUMNS} FROM intentions
              WHERE mandate_id = ? ORDER BY julianday(created_at) DESC, id DESC LIMIT ?"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(mandate_id)
             .bind(limit.clamp(1, 200))
             .fetch_all(self.work_pool())
@@ -3728,7 +3730,7 @@ impl<S: WorkDatabase> MandateStore for S {
             "SELECT {LEARNING_NOTE_COLUMNS} FROM mandate_learning_notes
              WHERE mandate_id = ? ORDER BY julianday(created_at) DESC, id DESC LIMIT ?"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(mandate_id)
             .bind(limit.clamp(1, 100))
             .fetch_all(self.work_pool())
@@ -3754,7 +3756,7 @@ impl<S: WorkDatabase> MandateStore for S {
                )
              ORDER BY julianday(r.created_at) DESC, r.id DESC LIMIT ?"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(mandate_id)
             .bind(limit.clamp(1, 100))
             .fetch_all(self.work_pool())
@@ -4123,7 +4125,7 @@ impl<S: WorkDatabase> MandateStore for S {
         let query = format!(
             "SELECT {MUTATION_ATTEMPT_COLUMNS} FROM mandate_mutation_attempts WHERE id = ?"
         );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(&ledger_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -4279,7 +4281,7 @@ impl<S: WorkDatabase> MandateStore for S {
             "SELECT {MUTATION_ATTEMPT_COLUMNS} FROM mandate_mutation_attempts
              WHERE goal_run_id = ? ORDER BY julianday(reserved_at), id"
         );
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
             .bind(goal_run_id)
             .fetch_all(self.work_pool())
             .await?;

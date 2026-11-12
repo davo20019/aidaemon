@@ -220,7 +220,7 @@ async fn retract(
              WHERE id = ? AND status IN ('active', 'disputed') AND valid_to IS NULL
              RETURNING {entity_column}"
         );
-        let Some(entity_id) = sqlx::query_scalar::<_, i64>(&sql)
+        let Some(entity_id) = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
             .bind(&now)
             .bind(&now)
             .bind(id)

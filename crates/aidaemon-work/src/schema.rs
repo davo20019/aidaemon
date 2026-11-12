@@ -184,7 +184,7 @@ pub async fn migrate_work_tables(
             table: &str,
             column: &str,
         ) -> anyhow::Result<bool> {
-            let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({})", table)))
                 .fetch_all(&mut **tx)
                 .await?;
             Ok(rows
