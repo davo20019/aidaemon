@@ -19,7 +19,8 @@
 //!
 //! | Piece | Plugs in as |
 //! |---|---|
-//! | [`ScopedMemory`] | `aidaemon_policies::MemorySystem`: the whole crate as one replaceable memory system |
+//! | [`full::FullMemory`] | `aidaemon_policies::MemorySystem`: aidaemon's own memory (facts, episodes, procedures, people, profile) over [`sqlite::SqliteMemory`], with its tools and run-end writer; the SDK preset's default |
+//! | [`ScopedMemory`] | `aidaemon_policies::MemorySystem`: a small scope-keyed memory over any [`MemoryStore`] |
 //! | [`MemoryRecall`] | `aidaemon_policies::Recall`, for `MemoryInjection` (`before_model`) |
 //! | [`MemoryWriter`] | `aidaemon_core::Hook` (`on_run_end`, background extraction) |
 //! | [`RememberTool`], [`RecallTool`] | `aidaemon_core::Tool` |

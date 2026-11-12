@@ -66,6 +66,31 @@ pub fn kernel_tools(
         .collect()
 }
 
+/// Settings kept in memory, for a host with no settings store of its own:
+/// `people_enabled` lasts until the process ends.
+#[derive(Default)]
+pub struct LocalSettings(std::sync::Mutex<HashMap<String, String>>);
+
+#[async_trait::async_trait]
+impl SettingsStore for LocalSettings {
+    async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned())
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+}
+
 /// What a call with these arguments can prove.
 pub type Evidence = Box<dyn Fn(&str) -> Vec<ToolEvidenceCapability> + Send + Sync>;
 
@@ -222,11 +247,9 @@ fn manage_memories_output_is_report(result_text: &str, tool_arguments: Option<&s
 /// Stores and helpers for the tools' tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use aidaemon_tools::semantics::ToolCallContext;
-    use aidaemon_tools::services::SettingsStore;
     use aidaemon_tools::OutcomeTool;
     use async_trait::async_trait;
 
@@ -246,24 +269,7 @@ pub(crate) mod test_support {
         ))
     }
 
-    /// Settings kept in memory.
-    #[derive(Default)]
-    pub(crate) struct Settings(Mutex<HashMap<String, String>>);
-
-    #[async_trait]
-    impl SettingsStore for Settings {
-        async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(key).cloned())
-        }
-
-        async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_string());
-            Ok(())
-        }
-    }
+    pub(crate) use super::LocalSettings as Settings;
 
     /// Calling a tool directly from a test.
     #[async_trait]

@@ -56,12 +56,62 @@ impl FullMemory {
             .with_tools(tools::kernel_tools(store, host_settings))
     }
 
+    /// The whole system in a SQLite file (created and migrated if needed),
+    /// or in a private in-memory database when `path` is `None`. Embeddings
+    /// come from `FastEmbedder` with the `fastembed` feature, else from
+    /// [`HashEmbedder`](crate::HashEmbedder); people intelligence's switch is
+    /// kept in memory ([`tools::LocalSettings`]).
+    pub async fn open(path: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        let pool = match path {
+            Some(path) => {
+                let options = SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::from_secs(10));
+                SqlitePoolOptions::new()
+                    .max_connections(4)
+                    .connect_with(options)
+                    .await?
+            }
+            None => {
+                // One connection that never closes: the database lives in it.
+                SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .min_connections(1)
+                    .idle_timeout(None)
+                    .max_lifetime(None)
+                    .connect("sqlite::memory:")
+                    .await?
+            }
+        };
+        crate::sqlite::migrate(&pool).await?;
+        #[cfg(feature = "fastembed")]
+        let embedder: Arc<dyn crate::Embedder> = Arc::new(crate::FastEmbedder::new());
+        #[cfg(not(feature = "fastembed"))]
+        let embedder: Arc<dyn crate::Embedder> = Arc::new(crate::HashEmbedder::new(384));
+        let store = Arc::new(crate::sqlite::SqliteMemory::new(pool, embedder));
+        Ok(Self::over(
+            store,
+            RecallSettings {
+                max_facts: DEFAULT_MAX_FACTS,
+                assistant_name: None,
+            },
+            Arc::new(tools::LocalSettings::default()),
+        ))
+    }
+
     /// Offer `tools` on every turn that may read or write memory.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
 }
+
+/// How many facts recall renders at most, by default (the daemon's
+/// default too).
+pub const DEFAULT_MAX_FACTS: usize = 20;
 
 /// A host with nothing of its own: no goals, people intelligence off.
 struct NoHost;
