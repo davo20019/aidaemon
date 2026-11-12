@@ -19,9 +19,9 @@
 //! | [`work`] | `work` | Goals, mandates, tasks, work coordination and notifications, with their SQLite store |
 //! | [`channels`] | `channels` | The `Channel` contract and the runner that connects channels to agents |
 //! | [`channels::telegram`], [`channels::slack`], [`channels::discord`] | `telegram`, `slack`, `discord` | Built-in channel adapters |
-//! | [`testing`] | `testing` | Scripted provider for tests |
+//! | [`testing`] | `testing` | Scripted provider for tests; the shared behavior suite (`testing::behavior`) |
 //! | [`tool`] | `macros` (default) | `#[tool]`: a tool from a plain function, schema derived |
-//! | [`preset`] | `providers` + `policies` (default) | A short start: provider, safeguards, store and default tools in a few lines |
+//! | [`mod@preset`] | `providers` + `policies` (default) | A short start: provider, safeguards, store and default tools in a few lines |
 //! | [`structured`] | always | Typed output: a model call or an agent's final answer as your type, one repair retry |
 //!
 //! ```no_run
@@ -59,6 +59,23 @@
 //! `crates/aidaemon-core/PLAN.md` for the roadmap.
 
 pub use aidaemon_core::*;
+
+/// Test helpers: the kernel's scripted provider and response builders and,
+/// with the `macros`, `agents` and `channels` features, the
+/// [`behavior`](testing::behavior) suite every assembled agent should pass.
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use aidaemon_core::testing::*;
+
+    #[cfg(all(
+        feature = "macros",
+        feature = "agents",
+        feature = "channels",
+        feature = "providers",
+        feature = "policies"
+    ))]
+    pub mod behavior;
+}
 
 pub mod schema;
 pub mod structured;

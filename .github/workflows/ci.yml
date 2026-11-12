@@ -100,7 +100,7 @@ jobs:
           -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
           -p aidaemon-events -p aidaemon-work -p aidaemon-decisions
           -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
-          -p aidaemon-channel-discord
+          -p aidaemon-channel-discord -p aidaemon-parity-agent
           --all-targets --all-features -- -D warnings
 
   core-api:
@@ -359,6 +359,17 @@ jobs:
             echo "::endgroup::"
           done
           cargo run -q -p aidaemon-core --features testing --example kernel_tour
+
+      # Definition of done 2: an agent assembled from the SDK crates alone
+      # passes the shared behavior suite with the full memory, ScopedMemory
+      # and a custom memory system (scripted model, in-process channel).
+      - name: Parity example and behavior suite (scripted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANTHROPIC_API_KEY OPENAI_API_KEY
+          cargo run -q -p aidaemon-parity-agent
+          cargo test -q -p aidaemon-parity-agent
 
   build-check:
     name: Build check (release)
