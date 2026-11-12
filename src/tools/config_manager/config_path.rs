@@ -414,7 +414,7 @@ fallback = ["a", "b"]
         );
         assert!(text.contains("default = \"first-model\""), "{text}");
         assert!(text.starts_with("# primary provider"), "{text}");
-        let parsed: toml::Value = text.parse().unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(
             parsed["provider"]["fallbacks"][1]["models"]["default"].as_str(),
             Some("new-model")

@@ -1695,7 +1695,7 @@ impl ConfigManagerTool {
             "enable_stt" => self.enable_stt(&args).await.map(Into::into),
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
-                let mut doc: toml::Value = content.parse()?;
+                let mut doc: toml::Value = toml::from_str(&content)?;
                 redact_secrets(&mut doc);
                 let redacted = toml::to_string_pretty(&doc)?;
                 Ok(ConfigReply::done(format!(
@@ -1733,7 +1733,7 @@ impl ConfigManagerTool {
             )));
         }
         let content = tokio::fs::read_to_string(&self.config_path).await?;
-        let doc: toml::Value = content.parse()?;
+        let doc: toml::Value = toml::from_str(&content)?;
         match path.lookup(&doc) {
             Some(value) => {
                 let mut value = value.clone();
@@ -1817,7 +1817,7 @@ impl ConfigManagerTool {
                  use action 'restore' to bring back the backup."
             )));
         }
-        let on_disk: toml::Value = written.parse()?;
+        let on_disk: toml::Value = toml::from_str(&written)?;
         let found = path.lookup(&on_disk);
         let apply_instruction = apply_instruction_for_key(&args.key);
         match &new_value {
