@@ -14,7 +14,6 @@
             "list",
             "get",
             "update",
-            "transfer_owner",
             "pause",
             "resume",
             "answer_question",
@@ -37,14 +36,6 @@
         "allow_observations": {
           "type": "boolean"
         },
-        "attributed_intention_ids": {
-          "items": {
-            "maxLength": 256,
-            "type": "string"
-          },
-          "maxItems": 16,
-          "type": "array"
-        },
         "autonomy_mode": {
           "enum": [
             "bounded",
@@ -65,6 +56,7 @@
           "type": "array"
         },
         "default_review_minutes": {
+          "description": "How often the mandate runs, in minutes (every hour = 60). For a fixed interval set min_review_minutes and max_review_minutes to the same value.",
           "minimum": 1,
           "type": "integer"
         },
@@ -152,7 +144,7 @@
           "type": "string"
         },
         "measurement_value_micros": {
-          "description": "Millionths of one unit (25 engagements = 25000000).",
+          "description": "record_measurement only, for a mandate confirmed with a measured objective. Millionths of one unit (25 engagements = 25000000).",
           "type": "integer"
         },
         "min_review_minutes": {
@@ -171,91 +163,6 @@
         "objective": {
           "maxLength": 2048,
           "type": "string"
-        },
-        "objective_control": {
-          "additionalProperties": false,
-          "description": "Autopilot control loop. *_micros are millionths of one unit (25 engagements = 25000000). measurement_source is the exact authorized GET URL, with any query the metric needs.",
-          "properties": {
-            "baseline_micros": {
-              "type": "integer"
-            },
-            "baseline_observed_at": {
-              "type": "string"
-            },
-            "direction": {
-              "enum": [
-                "at_least",
-                "at_most"
-              ],
-              "type": "string"
-            },
-            "experiment_cohort": {
-              "maxLength": 128,
-              "type": "string"
-            },
-            "experiment_window_secs": {
-              "maximum": 7776000,
-              "minimum": 60,
-              "type": "integer"
-            },
-            "max_stagnant_measurements": {
-              "maximum": 20,
-              "minimum": 1,
-              "type": "integer"
-            },
-            "measurement_cadence_secs": {
-              "maximum": 2592000,
-              "minimum": 60,
-              "type": "integer"
-            },
-            "measurement_source": {
-              "maxLength": 2048,
-              "type": "string"
-            },
-            "metric_name": {
-              "maxLength": 128,
-              "type": "string"
-            },
-            "minimum_effect_micros": {
-              "minimum": 1,
-              "type": "integer"
-            },
-            "run_failure_budget": {
-              "maximum": 10,
-              "minimum": 1,
-              "type": "integer"
-            },
-            "schema_version": {
-              "enum": [
-                1
-              ],
-              "type": "integer"
-            },
-            "target_micros": {
-              "type": "integer"
-            },
-            "unit": {
-              "maxLength": 64,
-              "type": "string"
-            }
-          },
-          "required": [
-            "schema_version",
-            "metric_name",
-            "unit",
-            "baseline_micros",
-            "target_micros",
-            "direction",
-            "measurement_source",
-            "measurement_cadence_secs",
-            "experiment_cohort",
-            "experiment_window_secs",
-            "minimum_effect_micros",
-            "max_stagnant_measurements",
-            "run_failure_budget",
-            "baseline_observed_at"
-          ],
-          "type": "object"
         },
         "observations": {
           "items": {
@@ -421,24 +328,6 @@
           "maxItems": 16,
           "type": "array"
         },
-        "strategy_confidence_bps": {
-          "maximum": 10000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "strategy_key": {
-          "maxLength": 64,
-          "type": "string"
-        },
-        "strategy_kind": {
-          "enum": [
-            "reinforce",
-            "explore",
-            "avoid",
-            "retire"
-          ],
-          "type": "string"
-        },
         "strategy_skill": {
           "maxLength": 256,
           "type": "string"
@@ -451,11 +340,6 @@
           },
           "maxItems": 16,
           "type": "array"
-        },
-        "target_session_id": {
-          "description": "transfer_owner only; exact registered destination session",
-          "maxLength": 256,
-          "type": "string"
         },
         "termination_kind": {
           "description": "STOP only; omit for ACT, WAIT, and ASK.",

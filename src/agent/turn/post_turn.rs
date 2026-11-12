@@ -69,10 +69,7 @@ mod gate_telemetry_tests {
                     "rationale": "No worthwhile action is available in this review.",
                     "reconsider_minutes": 180,
                     "learning_note": "",
-                    "learning_evidence_receipt_ids": [],
-                    "strategy_key": "",
-                    "strategy_kind": "explore",
-                    "strategy_confidence_bps": 0
+                    "learning_evidence_receipt_ids": []
                 })
                 .to_string(),
             ),

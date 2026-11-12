@@ -117,19 +117,6 @@ pub trait MandateStore: Send + Sync {
         Ok(false)
     }
 
-    /// Atomically bind a verified target session to the stable principal and
-    /// move the mandate's delivery/controller route. The authority epoch is
-    /// advanced and all open runs are invalidated before the move commits.
-    async fn transfer_mandate_ownership(
-        &self,
-        _mandate_id: &str,
-        _expected_version: i64,
-        _from_session_id: &str,
-        _to_session_id: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
     /// Append one receipt-backed metric observation for the exact current
     /// mandate run and policy version.
     async fn record_mandate_objective_measurement(
@@ -300,9 +287,7 @@ pub trait MandateStore: Send + Sync {
         task_attempt_id: Option<&str>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            operating_updates.is_none_or(|updates| {
-                updates.learning_note.is_none() && updates.strategy_revisions.is_empty()
-            }),
+            operating_updates.is_none_or(|updates| updates.learning_note.is_none()),
             "adaptive mandate operating updates are not supported by this store"
         );
         self.record_mandate_decision(decision, intention, task_attempt_id)
@@ -359,16 +344,6 @@ pub trait MandateStore: Send + Sync {
         _mandate_id: &str,
         _limit: i64,
     ) -> anyhow::Result<Vec<crate::traits::MandateLearningNote>> {
-        Ok(Vec::new())
-    }
-
-    /// Return the latest adaptive strategy node for each key. Retired nodes
-    /// remain visible for audit but must not be treated as active guidance.
-    async fn list_current_mandate_strategy(
-        &self,
-        _mandate_id: &str,
-        _limit: i64,
-    ) -> anyhow::Result<Vec<crate::traits::MandateStrategyRevision>> {
         Ok(Vec::new())
     }
 

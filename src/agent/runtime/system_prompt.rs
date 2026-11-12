@@ -727,7 +727,6 @@ mod tests {
         );
         let autopilot = task_lead_rules("Autopilot is owner-confirmed.", true);
         assert!(autopilot.contains("record_measurement"), "{autopilot}");
-        assert!(autopilot.contains("max_stagnant_measurements"));
     }
 
     /// The rules name manage_mandates arguments; each must be one the tool's
@@ -755,11 +754,9 @@ mod tests {
             "intention",
             "termination_kind",
             "reconsider_minutes",
-            "strategy_key",
-            "strategy_kind",
             "measurement_value_micros",
             "measurement_confidence_bps",
-            "attributed_intention_ids",
+            "learning_note",
         ] {
             assert!(rules.contains(argument), "rules no longer name {argument}");
             assert!(
@@ -1057,11 +1054,6 @@ mod tests {
             direction: ObjectiveMetricDirection::AtLeast,
             measurement_source: "metric_source:synthetic-public-analytics".to_string(),
             measurement_cadence_secs: 3_600,
-            experiment_cohort: "synthetic-public-cohort".to_string(),
-            experiment_window_secs: 86_400,
-            minimum_effect_micros: 100_000,
-            max_stagnant_measurements: 3,
-            run_failure_budget: 3,
             baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
         });
         mandate.constraints = vec!["OWNER POLICY CONSTRAINT SENTINEL".to_string()];
@@ -1159,8 +1151,8 @@ mod tests {
         assert!(prompt.contains("do not repeat it"));
         assert!(prompt.contains("one exact owner-authored value_criterion"));
         assert!(prompt.contains("do not act to demonstrate activity"));
-        assert!(prompt.contains("strategy_key"));
-        assert!(prompt.contains("never alter authority"));
+        assert!(prompt.contains("learning_note"));
+        assert!(prompt.contains("never alters authority"));
         assert!(prompt.contains("Never ASK for permission to retry"));
         assert!(prompt.contains("ASK once for that exact"));
         assert!(prompt.contains("answer_question or ordinary guidance"));

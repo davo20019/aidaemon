@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use crate::traits::{
     Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,
     MandateMutationQuotaState, MandateObjectiveControl, MandateObjectiveMeasurement, MandateStore,
-    MandateStrategyRevisionKind,
 };
 
 const MAX_DECISIONS: i64 = 5;
@@ -64,13 +63,6 @@ pub async fn build_mandate_history_block(
             .iter()
             .all(|note| note.mandate_id == mandate_id),
         "mandate learning history crossed its authority boundary"
-    );
-    let strategy_nodes = state.list_current_mandate_strategy(mandate_id, 16).await?;
-    anyhow::ensure!(
-        strategy_nodes
-            .iter()
-            .all(|revision| revision.mandate_id == mandate_id),
-        "mandate adaptive strategy crossed its authority boundary"
     );
 
     let mut decision_records = decisions
@@ -141,13 +133,12 @@ pub async fn build_mandate_history_block(
         decision_records,
         action_records,
         learning_notes,
-        strategy_nodes,
         quota,
         objective,
     )
 }
 
-/// Objective control-loop state: baseline, current, target, trend, and when
+/// Measured-objective state: baseline, current, target, trend, and when
 /// the next measurement is due. Measurement records carry only the typed
 /// value, confidence, receipt IDs, and time; run and row identifiers stay
 /// private.
@@ -168,8 +159,6 @@ fn objective_value(
         "target_micros": control.target_micros,
         "direction": control.direction,
         "target_reached": current.map(|value| control.target_reached(value)),
-        "minimum_effect_micros": control.minimum_effect_micros,
-        "max_stagnant_measurements": control.max_stagnant_measurements,
         "measurement_source": control.measurement_source,
         "measurement_cadence_secs": control.measurement_cadence_secs,
         "next_measurement_due": control.next_measurement_at(latest_observed_at),
@@ -177,7 +166,6 @@ fn objective_value(
             "mandate_version": measurement.mandate_version,
             "value_micros": measurement.value_micros,
             "confidence_bps": measurement.confidence_bps,
-            "attributed_intention_ids": measurement.attributed_intention_ids,
             "observed_at": measurement.observed_at,
         })).collect::<Vec<_>>(),
     })
@@ -224,12 +212,10 @@ fn render_bounded_history(
     mut decisions: Vec<HistoryRecord>,
     mut actions: Vec<HistoryRecord>,
     mut learning_notes: Vec<MandateLearningNote>,
-    mut strategy_nodes: Vec<crate::traits::MandateStrategyRevision>,
     quota: Option<MandateMutationQuotaState>,
     objective: Option<Value>,
 ) -> anyhow::Result<String> {
     learning_notes.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    strategy_nodes.sort_by(|left, right| left.strategy_key.cmp(&right.strategy_key));
     loop {
         let rendered = serde_json::to_string(&json!({
             "provenance": "autonomous_mandate_history_untrusted",
@@ -242,14 +228,6 @@ fn render_bounded_history(
                 "mandate_version": note.mandate_version,
                 "summary": note.summary,
                 "created_at": note.created_at,
-            })).collect::<Vec<_>>(),
-            "adaptive_operating_strategy": strategy_nodes.iter().map(|revision| json!({
-                "strategy_key": revision.strategy_key,
-                "state": if revision.kind == MandateStrategyRevisionKind::Retire { "retired" } else { "active" },
-                "kind": revision.kind,
-                "guidance": revision.guidance,
-                "confidence_bps": revision.confidence_bps,
-                "created_at": revision.created_at,
             })).collect::<Vec<_>>(),
             "mutation_quota": quota,
         }))?;
@@ -274,9 +252,6 @@ fn render_bounded_history(
             }
             (None, None) if !learning_notes.is_empty() => {
                 learning_notes.remove(0);
-            }
-            (None, None) if !strategy_nodes.is_empty() => {
-                strategy_nodes.remove(0);
             }
             (None, None) => {
                 anyhow::bail!("typed mandate quota projection exceeded its hard prompt bound")
@@ -335,11 +310,6 @@ mod tests {
             direction: crate::traits::ObjectiveMetricDirection::AtLeast,
             measurement_source: "metric_source:synthetic-analytics".to_string(),
             measurement_cadence_secs: 86_400,
-            experiment_cohort: "synthetic-cohort-a".to_string(),
-            experiment_window_secs: 604_800,
-            minimum_effect_micros: 1_000_000,
-            max_stagnant_measurements: 3,
-            run_failure_budget: 3,
             baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
         };
         let mut older = MandateObjectiveMeasurement::new(
@@ -435,7 +405,6 @@ mod tests {
         };
         let rendered = render_bounded_history(
             vec![huge, recent],
-            Vec::new(),
             Vec::new(),
             Vec::new(),
             None,

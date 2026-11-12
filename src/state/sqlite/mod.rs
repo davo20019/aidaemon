@@ -156,7 +156,6 @@ impl SqliteStateStore {
 
         migrations::migrate_state(&pool).await?;
         crate::nodes::store::migrate(&pool).await?;
-        aidaemon_work::sqlite::enforce_mandate_invariants_on_startup(&pool).await?;
 
         let pool_for_memory = pool.clone();
         Ok(Self {

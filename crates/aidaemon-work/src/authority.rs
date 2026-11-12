@@ -2469,11 +2469,6 @@ mod tests {
             direction: crate::traits::ObjectiveMetricDirection::AtLeast,
             measurement_source: "https://api.x.com/2/users/12345/tweets".to_string(),
             measurement_cadence_secs: 86_400,
-            experiment_cohort: "synthetic-cohort".to_string(),
-            experiment_window_secs: 604_800,
-            minimum_effect_micros: 1_000_000,
-            max_stagnant_measurements: 3,
-            run_failure_budget: 3,
             baseline_observed_at: "2026-01-01T00:00:00Z".to_string(),
         };
         mandate.objective_control = Some(control.clone());

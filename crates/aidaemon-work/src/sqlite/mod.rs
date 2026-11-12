@@ -18,7 +18,6 @@ mod mandates;
 mod notifications;
 mod work;
 
-pub use mandates::enforce_mandate_invariants_on_startup;
 
 /// What the work stores need from whoever owns the database.
 pub trait WorkDatabase: Send + Sync {
