@@ -71,7 +71,7 @@ fn detect_direct_primitives(input: &str, hits: &mut Vec<&'static str>) {
     }
 
     // Command-segment aware detection: catches "x | crontab -", "foo && nohup ...", etc.
-    for (segment, _) in crate::tools::command_risk::split_by_operators(input) {
+    for (segment, _) in crate::command_risk::split_by_operators(input) {
         if segment.is_empty() {
             continue;
         }
@@ -259,7 +259,7 @@ fn extract_nested_payloads(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    for (segment, _) in crate::tools::command_risk::split_by_operators(input) {
+    for (segment, _) in crate::command_risk::split_by_operators(input) {
         if segment.is_empty() {
             continue;
         }
@@ -463,7 +463,7 @@ fn extract_base64_candidates(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    for (segment, _) in crate::tools::command_risk::split_by_operators(input) {
+    for (segment, _) in crate::command_risk::split_by_operators(input) {
         if segment.is_empty() {
             continue;
         }

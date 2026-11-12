@@ -614,7 +614,7 @@ fn summary_is_command_bearing(name: &str) -> bool {
 pub fn user_facing_tool_activity(
     name: &str,
     summary: &str,
-    visibility: crate::types::ChannelVisibility,
+    visibility: aidaemon_core::ChannelVisibility,
 ) -> (String, String) {
     // `manage_memories`/`manage_people` carry the action ("search", "list",
     // "forget", …) as their summary. A read action rendered with the static
@@ -646,14 +646,14 @@ pub fn user_facing_tool_activity(
 
     let cleaned = shorten_home_dir(summary);
     let cleaned = redact_secrets(&cleaned);
-    let cleaned = crate::utils::truncate_str(cleaned.trim(), STATUS_SUMMARY_MAX_CHARS);
+    let cleaned = crate::text::truncate_str(cleaned.trim(), STATUS_SUMMARY_MAX_CHARS);
     (label, cleaned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChannelVisibility;
+    use aidaemon_core::ChannelVisibility;
 
     #[test]
     fn short_goal_label_caps_long_blob_and_collapses_whitespace() {
@@ -776,7 +776,7 @@ mod tests {
         let (label, summary) = user_facing_tool_activity(
             "terminal",
             "`cd '/tmp' && python3 /tmp/netprobe3.py`",
-            crate::types::ChannelVisibility::Private,
+            aidaemon_core::ChannelVisibility::Private,
         );
         assert_eq!(label, "running a command");
         assert_eq!(summary, "", "raw command must not reach chat even in a DM");

@@ -94,7 +94,7 @@ impl FilePolicy for DaemonFilePolicy {
     }
 
     async fn backup_before_overwrite(&self, backend: &SharedExecutionBackend, path: &BackendPath) {
-        fs_utils::backup_before_overwrite(backend, path).await;
+        fs_utils::backup_before_overwrite(backend, path, file_backup_root().as_deref()).await;
     }
 
     async fn post_write_diagnostics(&self, backend: &dyn ExecutionBackend, path: &Path) -> String {
@@ -140,6 +140,18 @@ pub(crate) async fn guarded_call_protecting(
         anyhow::bail!(reason);
     }
     tool.call(arguments).await
+}
+
+/// Where the file tools keep pre-change copies of local files.
+#[cfg(not(test))]
+pub(crate) fn file_backup_root() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".aidaemon").join("file-backups"))
+}
+
+/// Tests never write into the real home directory.
+#[cfg(test)]
+pub(crate) fn file_backup_root() -> Option<std::path::PathBuf> {
+    Some(std::env::temp_dir().join("aidaemon-test-file-backups"))
 }
 
 #[cfg(test)]

@@ -33,34 +33,7 @@ impl ConnectedContentMode {
     }
 }
 
-/// Check if a phrase appears as complete words in text (word-boundary matching).
-/// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
-/// then checks for consecutive word matches. Case-insensitive.
-///
-/// Works for single keywords ("deploy"), multi-word phrases ("set up"),
-/// and contractions ("i'll check").
-pub(crate) fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
-    let normalize = |w: &str| -> String {
-        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_lowercase()
-    };
-    let text_words: Vec<String> = text
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    let kw_words: Vec<String> = keyword
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window == kw_words.as_slice())
-}
+pub(crate) use aidaemon_tools::text::contains_keyword_as_words;
 
 /// Returns `true` when this turn is a background-output delivery injected by
 /// the terminal tool's re-engagement path (see `tools/terminal.rs`).

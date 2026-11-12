@@ -1,7 +1,7 @@
 use shell_words;
 use std::path::Path;
 
-pub use crate::types::{PermissionMode, RiskLevel};
+pub use crate::semantics::{PermissionMode, RiskLevel};
 
 /// Explicit credential/private-key path segments form a narrow deterministic
 /// floor. Open-ended command danger is assessed semantically elsewhere.
@@ -86,7 +86,7 @@ pub fn split_by_operators(cmd: &str) -> Vec<(String, Option<String>)> {
 /// argv values. This is a syntax tree projection, not a natural-language
 /// classifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShellInvocation {
+pub struct ShellInvocation {
     pub program: String,
     pub arguments: Vec<String>,
 }
@@ -330,7 +330,7 @@ fn collect_shell_invocations(command: &str, depth: usize, output: &mut Vec<Shell
 /// shared shell-grammar boundary. Runtime dependency discovery and workload
 /// classification consume this same projection so wrapper depth cannot make
 /// their views drift.
-pub(crate) fn structural_shell_invocations(command: &str) -> Vec<ShellInvocation> {
+pub fn structural_shell_invocations(command: &str) -> Vec<ShellInvocation> {
     let mut invocations = Vec::new();
     collect_shell_invocations(command, 0, &mut invocations);
     invocations

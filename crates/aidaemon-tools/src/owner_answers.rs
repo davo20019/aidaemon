@@ -15,11 +15,11 @@ use std::sync::Mutex;
 
 /// Approvals by (session, subject), each good for one call.
 #[derive(Debug, Default)]
-pub(crate) struct OwnerAnsweredCalls(Mutex<HashMap<(String, String), u32>>);
+pub struct OwnerAnsweredCalls(Mutex<HashMap<(String, String), u32>>);
 
 impl OwnerAnsweredCalls {
     /// The owner approved `subject` in `session` for one call.
-    pub(crate) fn approve(&self, session: &str, subject: &str) {
+    pub fn approve(&self, session: &str, subject: &str) {
         *self
             .0
             .lock()
@@ -29,7 +29,7 @@ impl OwnerAnsweredCalls {
     }
 
     /// Consume one approval of `subject` in `session`, if there is one.
-    pub(crate) fn take(&self, session: &str, subject: &str) -> bool {
+    pub fn take(&self, session: &str, subject: &str) -> bool {
         let mut approved = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let key = (session.to_string(), subject.to_string());
         match approved.get_mut(&key) {

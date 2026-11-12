@@ -99,7 +99,7 @@ pub fn prepare_delivery(
 
 // ── Blocked path patterns ──────────────────────────────────────────────────
 
-pub(crate) const BLOCKED_PATTERNS: &[&str] = &[
+pub const BLOCKED_PATTERNS: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".env",
@@ -112,7 +112,7 @@ pub(crate) const BLOCKED_PATTERNS: &[&str] = &[
     "config.toml",
 ];
 
-pub(crate) fn is_path_blocked(path: &Path) -> bool {
+pub fn is_path_blocked(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     for pattern in BLOCKED_PATTERNS {
         if pattern.starts_with('.') || pattern.starts_with('/') {
@@ -155,7 +155,7 @@ pub(crate) fn is_path_blocked(path: &Path) -> bool {
 
 // ── Allowed-dir check ──────────────────────────────────────────────────────
 
-pub(crate) fn is_path_allowed(canonical: &Path, inbox_dir: &Path, outbox_dirs: &[PathBuf]) -> bool {
+pub fn is_path_allowed(canonical: &Path, inbox_dir: &Path, outbox_dirs: &[PathBuf]) -> bool {
     // Allow files in inbox dir (agent returning processed files)
     if canonical.starts_with(inbox_dir) {
         return true;
@@ -170,7 +170,7 @@ pub(crate) fn is_path_allowed(canonical: &Path, inbox_dir: &Path, outbox_dirs: &
 /// Restricted to system temp roots (the only place agents legitimately write
 /// scratch output) so recovery cannot become an arbitrary-file exfiltration
 /// path. Roots are canonicalized so macOS `/tmp` → `/private/tmp` matches.
-pub(crate) fn is_recoverable_source(canonical: &Path) -> bool {
+pub fn is_recoverable_source(canonical: &Path) -> bool {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(t) = std::env::temp_dir().canonicalize() {
         roots.push(t);
@@ -188,7 +188,7 @@ pub(crate) fn is_recoverable_source(canonical: &Path) -> bool {
 /// Copy a readable file from a recoverable temp root into the inbox so it can
 /// be delivered. Returns the canonical path of the copy. Caller must have
 /// already run the blocked-pattern and `is_recoverable_source` checks on `src`.
-pub(crate) fn recover_into_inbox(src: &Path, inbox_dir: &Path) -> std::io::Result<PathBuf> {
+pub fn recover_into_inbox(src: &Path, inbox_dir: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(inbox_dir)?;
     let filename = src
         .file_name()

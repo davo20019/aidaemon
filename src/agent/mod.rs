@@ -75,6 +75,7 @@ use intent_routing::contains_keyword_as_words;
 #[cfg(test)]
 use intent_routing::infer_intent_gate;
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
+#[allow(unused_imports)]
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 #[path = "policy/policy_signals.rs"]
 mod policy_signals;

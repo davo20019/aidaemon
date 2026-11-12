@@ -9,9 +9,9 @@ pub(crate) mod cli_agent;
 #[allow(dead_code)]
 pub mod computer_use;
 pub(crate) mod config_manager;
-pub(crate) mod consequential;
+pub(crate) use aidaemon_tools::consequential;
 mod diagnose;
-pub mod file_delivery;
+pub use aidaemon_tools::file_delivery;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]
 mod file_policy;
@@ -26,10 +26,10 @@ pub mod image_generation;
 mod manage_mandates;
 mod manage_memories;
 pub(crate) mod objective_status;
-pub(crate) mod owner_answers;
+pub(crate) use aidaemon_tools::owner_answers;
 mod policy_metrics;
-pub mod result_spill;
-pub mod sanitize;
+pub use aidaemon_tools::result_spill;
+pub use aidaemon_tools::sanitize;
 mod scheduled_goal_runs;
 mod search_history;
 mod send_file;
@@ -92,15 +92,15 @@ pub use manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
 pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
+pub(crate) use aidaemon_tools::command_effects;
 pub use manage_mcp::ManageMcpTool;
 pub use manage_skills::ManageSkillsTool;
 pub use report_blocker::ReportBlockerTool;
 pub use skill_resources::SkillResourcesTool;
 pub use use_skill::UseSkillTool;
-pub(crate) mod command_effects;
 pub mod command_patterns;
-pub mod command_risk;
-pub mod daemon_guard;
+pub use aidaemon_tools::command_risk;
+pub use aidaemon_tools::daemon_guard;
 mod semantic_command_risk;
 
 // Deterministic tools
@@ -119,7 +119,7 @@ pub use project_inspect::ProjectInspectTool;
 pub(crate) mod run_command;
 pub use run_command::RunCommandTool;
 mod git_info;
-pub(crate) mod process_control;
+pub(crate) use aidaemon_tools::process_control;
 pub use git_info::GitInfoTool;
 mod git_commit;
 pub use git_commit::GitCommitTool;
@@ -132,5 +132,7 @@ pub use service_status::ServiceStatusTool;
 
 #[cfg(test)]
 mod execution_backend_injection_tests;
+#[cfg(test)]
+mod schema_golden_tests;
 #[cfg(test)]
 mod schema_lint_tests;

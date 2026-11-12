@@ -31,10 +31,10 @@ const CONSEQUENTIAL_ACTION_WORDS: &[&str] = &[
 
 /// Whether `text` names a consequential action as a whole word or phrase.
 /// Derived forms ("submitted", "sender") do not match.
-pub(crate) fn names_consequential_action(text: &str) -> bool {
+pub fn names_consequential_action(text: &str) -> bool {
     CONSEQUENTIAL_ACTION_WORDS
         .iter()
-        .any(|word| crate::agent::keyword_match(text, word))
+        .any(|word| crate::text::contains_keyword_as_words(text, word))
 }
 
 #[cfg(test)]

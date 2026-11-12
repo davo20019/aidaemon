@@ -638,6 +638,24 @@ pub fn normalize_local_lexically(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(normalized)
 }
 
+/// A backend shared between tools.
+pub type SharedExecutionBackend = std::sync::Arc<dyn ExecutionBackend>;
+
+/// Synchronous lexical normalization for policy/scope code that cannot perform
+/// backend I/O. Actual tool calls still run `resolve_path` and its confinement
+/// checks before touching the target.
+pub fn normalize_path_lexically(
+    backend: &dyn ExecutionBackend,
+    path: &str,
+) -> anyhow::Result<BackendPath> {
+    normalize_lexically(
+        backend.kind(),
+        backend.workspace_root(),
+        backend.home_hint(),
+        path,
+    )
+}
+
 #[cfg(test)]
 mod anchored_path_tests {
     use super::*;

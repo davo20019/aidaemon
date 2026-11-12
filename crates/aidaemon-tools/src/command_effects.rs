@@ -8,11 +8,11 @@
 //! unwrap wrappers and groupings and over-report rather than miss.
 //! No wording of the command is ever read for intent.
 
-use crate::tools::command_risk::structural_shell_invocations;
+use crate::command_risk::structural_shell_invocations;
 use aidaemon_core::{CallEffects, EffectClass, EffectKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommandEffects {
+pub struct CommandEffects {
     /// Every executable is a known observer used in a known observing shape.
     pub observation_only: bool,
     /// Some command removes files (`rm`, `find -delete`, `git clean`, ...),
@@ -204,7 +204,7 @@ const NETWORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
 /// other than GET/HEAD, a body, a form or an upload; wget with a body or
 /// such a method; `git push`. Read from option structure, so a plain fetch
 /// is not a write. Other network programs are not judged here.
-pub(crate) fn sends_remote_write(command: &str) -> bool {
+pub fn sends_remote_write(command: &str) -> bool {
     expanded_commands(command).iter().any(|tokens| {
         let args = &tokens[1..];
         match basename(&tokens[0]) {
@@ -305,7 +305,7 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
 
 /// Whether any command (behind wrappers, groupings, substitutions and
 /// `sh -c`) is a known network-reaching executable or subcommand.
-pub(crate) fn fetches_network(command: &str) -> bool {
+pub fn fetches_network(command: &str) -> bool {
     if command.contains("/dev/tcp/") || command.contains("/dev/udp/") || command.contains("$'") {
         return true;
     }
@@ -346,7 +346,7 @@ pub(crate) fn fetches_network(command: &str) -> bool {
 ///
 /// `~`, `$HOME` and `${HOME}` prefixes are expanded and `.`/`..` are
 /// normalized lexically before the global checks.
-pub(crate) fn is_git_config_path(path: &str) -> bool {
+pub fn is_git_config_path(path: &str) -> bool {
     let raw = path_components(path);
     if raw.iter().any(|part| is_repo_config_component(part)) {
         return true;
@@ -440,7 +440,7 @@ fn expand_home(path: &str) -> String {
 /// Whether the directory `root` (home-expanded, resolved against `base` when
 /// relative) holds a `.git` entry directly inside it, so a write anywhere
 /// under it can plant repository configuration.
-pub(crate) fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
+pub fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
     let root = root.trim();
     if root.is_empty() {
         return false;
@@ -457,7 +457,7 @@ pub(crate) fn root_holds_repository(root: &str, base: Option<&str>) -> bool {
 /// Whether any shell word of `command` (including redirect targets,
 /// `--opt=value` operands, substitution bodies and nested `sh -c` scripts)
 /// names a git configuration path per `is_git_config_path`.
-pub(crate) fn command_names_git_config_path(command: &str) -> bool {
+pub fn command_names_git_config_path(command: &str) -> bool {
     names_git_config(command, 0)
 }
 
@@ -491,7 +491,7 @@ fn names_git_config(command: &str, depth: usize) -> bool {
         .any(|body| names_git_config(body, depth + 1))
 }
 
-pub(crate) fn command_effects(command: &str) -> CommandEffects {
+pub fn command_effects(command: &str) -> CommandEffects {
     // ANSI-C quoting (`$'..'`) escapes quotes in a way the scan cannot
     // follow, so a command may hide behind it: over-report.
     let deletes = command.contains("$'")
@@ -585,7 +585,7 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
 /// leading `~/`), ANSI-C quoting, an option with a path glued to it
 /// (`-I/x`), or a command that changes directory (`cd`, `pushd`, `popd`),
 /// since relative operands then resolve somewhere else.
-pub(crate) fn path_operands(command: &str) -> Option<Vec<String>> {
+pub fn path_operands(command: &str) -> Option<Vec<String>> {
     if command.contains("$'") {
         return None;
     }
@@ -973,7 +973,7 @@ fn is_observation_only(command: &str) -> bool {
 /// (`cat < file`). For judging where output came from, with the redirect
 /// targets checked as operands (`path_operands`); the authority view
 /// (`CommandEffects::observation_only`) stays the stricter shape.
-pub(crate) fn is_observation_reading_input(command: &str) -> bool {
+pub fn is_observation_reading_input(command: &str) -> bool {
     is_observation(command, true)
 }
 
@@ -1280,7 +1280,7 @@ fn push_with_wrappers(mut tokens: Vec<String>, depth: usize, out: &mut Vec<Vec<S
 
 /// An egress effect on `host`, with IPv6 brackets stripped so `[::1]` and
 /// `::1` name one host. `None` for an empty or unreadable host.
-pub(crate) fn egress_effect(scheme: &str, host: &str, port: Option<u16>) -> Option<EffectKey> {
+pub fn egress_effect(scheme: &str, host: &str, port: Option<u16>) -> Option<EffectKey> {
     let host = host.trim();
     let bare = match host.strip_prefix('[') {
         // A bracketed host is an IPv6 literal and nothing else.
@@ -1334,7 +1334,7 @@ fn scheme_default_port(scheme: &str) -> Option<u16> {
 /// or curl glob characters (`{ } [ ] * ,`) outside an IPv6 host literal. The
 /// host must also be the one the URL crate reads, so a program's parser and
 /// ours cannot disagree.
-pub(crate) fn url_effect(raw: &str) -> Option<EffectKey> {
+pub fn url_effect(raw: &str) -> Option<EffectKey> {
     let url = strict_url(raw)?;
     url_host_effect(&url)
 }
@@ -1395,7 +1395,7 @@ fn strict_url(raw: &str) -> Option<reqwest::Url> {
 
 /// The egress effect of a parsed URL: its host and its explicit port, else
 /// the scheme's default.
-pub(crate) fn url_host_effect(url: &reqwest::Url) -> Option<EffectKey> {
+pub fn url_host_effect(url: &reqwest::Url) -> Option<EffectKey> {
     let scheme = url.scheme();
     // No key rather than a wrong one: a scheme whose default port is not
     // known here (`dict`, `ldap`, `telnet`) would otherwise be port 0.
@@ -1439,7 +1439,7 @@ fn structural_absolute_path(raw: &str, cwd: Option<&str>) -> Option<String> {
 /// it. A `Delete` keeps its last component: removing a symlink removes the
 /// link. `None` when the path cannot be read structurally (shell expansion)
 /// or is relative with no known working directory.
-pub(crate) fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> Option<EffectKey> {
+pub fn path_effect(class: EffectClass, raw: &str, cwd: Option<&str>) -> Option<EffectKey> {
     let absolute = structural_absolute_path(raw, cwd)?;
     let lexical = EffectKey::path(class, &absolute)?;
     Some(resolved_on_disk(class, lexical))
@@ -1480,7 +1480,7 @@ fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
 /// (shell expansion, relative with no working directory), when an existing
 /// prefix cannot be canonicalized (a dangling symlink), or when `..` follows
 /// a component that does not exist.
-pub(crate) fn shell_path_effects(
+pub fn shell_path_effects(
     class: EffectClass,
     raw: &str,
     cwd: Option<&str>,
@@ -1518,14 +1518,14 @@ pub(crate) fn shell_path_effects(
 
 /// Whether the active execution backend is this machine, so paths resolve on
 /// the local disk.
-pub(crate) fn execution_backend_is_local(backend: &dyn crate::execution::ExecutionBackend) -> bool {
-    backend.kind() == crate::execution::BackendKind::Local
+pub fn execution_backend_is_local(backend: &dyn crate::backend::ExecutionBackend) -> bool {
+    backend.kind() == crate::backend::BackendKind::Local
 }
 
 /// Effects on a remote (SSH, Docker) workspace: its paths cannot be
 /// resolved on this disk, so path keys are dropped and the effects are
 /// incomplete. Egress keys stay.
-pub(crate) fn without_local_paths(mut effects: CallEffects) -> CallEffects {
+pub fn without_local_paths(mut effects: CallEffects) -> CallEffects {
     effects.keys.retain(|key| {
         !matches!(
             key.class,
@@ -1539,8 +1539,8 @@ pub(crate) fn without_local_paths(mut effects: CallEffects) -> CallEffects {
 /// The effects of `write_file`/`edit_file`: a write of the path argument
 /// (or its aliases). A relative path, or any path on a remote workspace, is
 /// undeterminable here.
-pub(crate) fn file_tool_write_effects(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn file_tool_write_effects(
+    backend: &dyn crate::backend::ExecutionBackend,
     arguments: &str,
 ) -> CallEffects {
     if !execution_backend_is_local(backend) {
@@ -1573,7 +1573,7 @@ pub(crate) fn file_tool_write_effects(
 /// be proven fully described (every review round found another construct),
 /// and the keys bind the owner's declines either way. Incompleteness only
 /// means the owner is asked again after a decline.
-pub(crate) fn shell_call_effects(command: &str, cwd: Option<&str>) -> CallEffects {
+pub fn shell_call_effects(command: &str, cwd: Option<&str>) -> CallEffects {
     let analysis = analyze_shell(command, cwd);
     CallEffects {
         keys: analysis.keys,
@@ -2304,7 +2304,7 @@ fn wget(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
 /// subshell or substitution, an expansion, a launcher or variable
 /// assignment, an unlisted option, or a second URL in one invocation (curl
 /// reports only its last transfer).
-pub(crate) fn proven_fetch_urls(command: &str) -> Option<Vec<String>> {
+pub fn proven_fetch_urls(command: &str) -> Option<Vec<String>> {
     let scanned = scan(command);
     if scanned.unsafe_syntax || !scanned.separators.len().is_multiple_of(2) {
         return None;

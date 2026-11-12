@@ -20,20 +20,18 @@ use tokio::process::Command;
 #[cfg(feature = "execution-docker")]
 use crate::config::DockerExecutionConfig;
 use crate::config::{ExecutionConfig, SshExecutionConfig};
-use crate::tools::process_control::{
+use aidaemon_tools::process_control::{
     configure_command_for_process_group, send_sigkill, send_sigterm, terminate_process_tree,
 };
 
-use aidaemon_tools::backend::{
-    normalize_lexically, normalize_local_lexically, normalize_posix_absolute,
-};
+use aidaemon_tools::backend::{normalize_local_lexically, normalize_posix_absolute};
 pub use aidaemon_tools::{
     shell_quote, BackendDirEntry, BackendFileType, BackendKind, BackendMetadata, BackendPath,
     CommandSpec, ExecutionBackend, ExecutionOutput, ExecutionRequest, LexicalPaths, ProcessHandle,
     SpawnedProcess, WriteMode,
 };
 
-pub type SharedExecutionBackend = Arc<dyn ExecutionBackend>;
+pub use aidaemon_tools::backend::{normalize_path_lexically, SharedExecutionBackend};
 
 /// The default local backend for isolated unit tests that construct a tool
 /// without running startup. Production code never reads this: startup builds
@@ -43,21 +41,6 @@ pub fn active_execution_backend() -> SharedExecutionBackend {
     static DEFAULT_LOCAL_BACKEND: once_cell::sync::Lazy<SharedExecutionBackend> =
         once_cell::sync::Lazy::new(|| Arc::new(LocalBackend::current_unrestricted()));
     DEFAULT_LOCAL_BACKEND.clone()
-}
-
-/// Synchronous lexical normalization for policy/scope code that cannot perform
-/// backend I/O. Actual tool calls still run `resolve_path` and its confinement
-/// checks before touching the target.
-pub fn normalize_path_lexically(
-    backend: &dyn ExecutionBackend,
-    path: &str,
-) -> anyhow::Result<BackendPath> {
-    normalize_lexically(
-        backend.kind(),
-        backend.workspace_root(),
-        backend.home_hint(),
-        path,
-    )
 }
 
 /// Build the executable search path used by local agent processes.
