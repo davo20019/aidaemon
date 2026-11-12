@@ -247,7 +247,6 @@ pub async fn run(
         timeout_secs: config.subagents.timeout_secs,
         max_facts: config.state.max_facts,
         iteration_config: config.subagents.effective_iteration_limit(),
-        task_timeout_secs: config.subagents.task_timeout_secs,
         task_token_budget: config.subagents.task_token_budget,
         spawn_family: crate::agent::authority::SpawnFamilyLimits {
             max_concurrent: config.subagents.max_concurrent,

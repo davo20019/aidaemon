@@ -1065,11 +1065,6 @@ impl Agent {
                 }
             }
         }
-        let _effective_task_timeout = if is_scheduled_goal {
-            None
-        } else {
-            self.limits.task_timeout
-        };
         // The kernel runs the iteration loop from the per-turn setup above
         // (assessment, contract, harness eval, budgets, pending directives).
         // Budget extensions, hard token caps and the goal's effective daily

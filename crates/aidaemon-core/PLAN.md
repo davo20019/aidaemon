@@ -67,7 +67,7 @@ Gate: decision 7.
 - [ ] 8.7 items 1+3: honest final status and typed final outcome (test
       first).
 - [ ] 8.7 item 7: learning opt-out.
-- [ ] Delete the task wall-clock timeout setting (decision 1).
+- [x] Delete the task wall-clock timeout setting (decision 1).
 - [x] Add `aidaemon-decisions` to CI and `DESIGN.md` (decision 6).
 - [x] Commit the background-handoff work in the tree (`e0bf437`).
 - [ ] Whole-branch review.
@@ -421,7 +421,7 @@ adapters, tested against local mock servers.
       tasks there are ticked except Task 8 Step 4.
 - [ ] `cargo package` for the daemon: blocked on the owner's decision on
       how `aidaemon-core` ships (publish it, or fold it into the main crate).
-- [ ] Task wall-clock timeout: the legacy loop stopped a task after
+- [x] Task wall-clock timeout (deleted 2026-11-11, decision 1): the legacy loop stopped a task after
       `subagents.task_timeout_secs` (default 30 min, scheduled goals
       exempt); the SDK engine leaves `sdk::Limits::timeout` unset, so
       nothing enforces it. Set it in `sdk_engine.rs` where the limits are

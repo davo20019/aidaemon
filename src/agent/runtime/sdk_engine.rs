@@ -137,6 +137,12 @@ pub(crate) fn settings_from_config(
              use per-goal daily budgets, subagents.task_token_budget or a provider spend limit"
         );
     }
+    if config.subagents.task_timeout_secs.is_some() {
+        warn!(
+            "[subagents] task_timeout_secs is ignored: runs are bounded by progress and cost \
+             (inactivity watchdog, per-call timeouts, limits, token budgets), not elapsed time"
+        );
+    }
     let mut model_override = engine
         .model
         .clone()

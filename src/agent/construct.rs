@@ -58,7 +58,6 @@ pub(crate) struct AgentConstruction {
     pub timeout_secs: u64,
     pub max_facts: usize,
     pub iteration_config: IterationLimitConfig,
-    pub task_timeout_secs: Option<u64>,
     pub task_token_budget: Option<u64>,
     pub spawn_family: crate::agent::authority::SpawnFamilyLimits,
     pub llm_call_timeout_secs: Option<u64>,
@@ -142,7 +141,6 @@ impl Agent {
             timeout_secs,
             max_facts,
             iteration_config,
-            task_timeout_secs,
             task_token_budget,
             spawn_family,
             llm_call_timeout_secs,
@@ -233,7 +231,6 @@ impl Agent {
                 timeout_secs,
                 max_facts,
                 llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
-                task_timeout: task_timeout_secs.map(Duration::from_secs),
                 task_token_budget,
                 spawn_family,
             },
@@ -341,12 +338,6 @@ impl Agent {
         self.limits.iteration_config = config;
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
-        self.limits.task_timeout = timeout;
-    }
-
     /// Offer and run the tools of `registry`'s MCP servers.
     #[cfg(test)]
     pub(crate) fn set_test_mcp_registry(&mut self, registry: crate::mcp::McpRegistry) {
@@ -434,7 +425,6 @@ impl Agent {
         max_response_chars: usize,
         timeout_secs: u64,
         max_facts: usize,
-        task_timeout: Option<Duration>,
         task_token_budget: Option<u64>,
         llm_call_timeout: Option<Duration>,
         mcp_registry: Option<McpRegistry>,
@@ -503,7 +493,6 @@ impl Agent {
                 timeout_secs,
                 max_facts,
                 llm_call_timeout,
-                task_timeout,
                 task_token_budget,
                 spawn_family: Default::default(),
             },

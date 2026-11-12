@@ -473,7 +473,6 @@ struct AgentLimits {
     timeout_secs: u64,
     max_facts: usize,
     llm_call_timeout: Option<Duration>,
-    task_timeout: Option<Duration>,
     task_token_budget: Option<u64>,
     spawn_family: authority::SpawnFamilyLimits,
 }

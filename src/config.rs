@@ -2824,8 +2824,11 @@ pub struct SubagentsConfig {
     /// If not set but max_iterations/max_iterations_cap are set, auto-migrates to Hard mode.
     #[serde(default)]
     pub iteration_limit: IterationLimitConfig,
-    /// Optional time limit per task in seconds. Default: 1800 (30 minutes).
-    #[serde(default = "default_task_timeout_secs")]
+    /// Accepted and ignored: a run is bounded by progress and cost (the
+    /// inactivity watchdog, per-call timeouts, limits and token budgets), not
+    /// by elapsed time, so legitimate long work is never cut off. Setting it
+    /// logs one warning at startup.
+    #[serde(default)]
     pub task_timeout_secs: Option<u64>,
     /// Token budget per task. When exceeded, productive runs may auto-extend
     /// temporarily; otherwise the agent gracefully summarizes and stops.
@@ -2887,7 +2890,7 @@ impl Default for SubagentsConfig {
             max_response_chars: default_subagents_max_response_chars(),
             timeout_secs: default_subagents_timeout_secs(),
             iteration_limit: IterationLimitConfig::default(),
-            task_timeout_secs: default_task_timeout_secs(),
+            task_timeout_secs: None,
             task_token_budget: default_task_token_budget(),
             max_concurrent: default_subagents_max_concurrent(),
             max_per_request: default_subagents_max_per_request(),
@@ -2935,9 +2938,6 @@ fn default_subagents_max_response_chars() -> usize {
 }
 fn default_subagents_timeout_secs() -> u64 {
     300
-}
-fn default_task_timeout_secs() -> Option<u64> {
-    Some(1800) // 30 minutes default
 }
 fn default_task_token_budget() -> Option<u64> {
     Some(500_000)
@@ -5407,9 +5407,11 @@ smart = "claude-3-5-haiku-latest"
     }
 
     #[test]
-    fn task_timeout_default_is_30_minutes() {
+    fn task_timeout_is_accepted_but_unset_by_default() {
         let config = SubagentsConfig::default();
-        assert_eq!(config.task_timeout_secs, Some(1800));
+        assert_eq!(config.task_timeout_secs, None);
+        let parsed: SubagentsConfig = toml::from_str("task_timeout_secs = 600").unwrap();
+        assert_eq!(parsed.task_timeout_secs, Some(600));
     }
 
     #[test]

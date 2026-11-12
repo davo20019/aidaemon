@@ -1797,7 +1797,6 @@ impl Agent {
             self.limits.max_response_chars,
             effective_timeout_secs,
             self.limits.max_facts,
-            self.limits.task_timeout,
             self.limits.task_token_budget,
             self.limits.llm_call_timeout,
             child_mcp_registry,
