@@ -2,7 +2,7 @@
 
 **Tier: implementation.** No stability promise while 0.x; may change in any minor version. Depend on it through [`aidaemon-sdk`](https://docs.rs/aidaemon-sdk) unless you need it alone.
 
-Hook-based policies for `aidaemon-core` agents: approvals (`ApprovalPolicy`, `ApprovalMode`), scope and egress guards, completion checks, redaction, untrusted-output handling, context-window management, memory injection and tracing (`otel` feature).
+Hook-based policies for `aidaemon-core` agents: approvals (`ApprovalPolicy`, `ApprovalMode`), scope and egress guards, a same-tool streak guard, redaction, untrusted-output handling, context-window management, memory injection and tracing (`otel` feature).
 
 ```rust,ignore
 use aidaemon_policies::{ApprovalMode, ApprovalPolicy};

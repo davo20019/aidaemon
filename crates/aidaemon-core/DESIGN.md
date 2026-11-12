@@ -106,9 +106,8 @@ for it (its asking budget is spent, or the remaining work is deferred or
 blocked) returns `AcceptUnmet { unmet }`. The first `Continue` still wins;
 otherwise the run ends `Completed` with every reported line in
 `RunState::unmet`, and `RunOutcome::is_succeeded()` is false (as it is for
-any run with an owner decline). `ReceiptCompletionCheck` reports unresolved
-failures this way once its rejections are spent, and the SDK checklist
-reports deferred items this way. Applications should read
+any run with an owner decline). The SDK checklist reports deferred items
+this way. Applications should read
 `is_succeeded()`, not `is_completed()`, when they mean "the objective was
 met"; `aidaemon-agents`, `aidaemon-channels` and `aidaemon-eval`
 (`expect.succeeded`) do.

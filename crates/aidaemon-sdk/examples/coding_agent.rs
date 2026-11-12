@@ -1,8 +1,7 @@
 //! A small coding agent built only from SDK crates.
 //!
 //! It works inside one directory, asks on the terminal before destructive
-//! actions, keeps runs in SQLite, and will not accept "done" while a tool
-//! failure is unresolved.
+//! actions and keeps runs in SQLite.
 //!
 //! ```text
 //! ANTHROPIC_API_KEY=... cargo run -p aidaemon-sdk --example coding_agent -- <dir> "<task>"
@@ -15,8 +14,7 @@ use std::sync::Arc;
 
 use aidaemon_sdk::policies::{
     ApprovalMode, ApprovalPolicy, ContextWindow, EgressGuard, NestedInstructions,
-    ProjectInstructions, ReceiptCompletionCheck, Redactor, Requirement, ScopeGuard,
-    UntrustedOutput,
+    ProjectInstructions, Redactor, ScopeGuard, UntrustedOutput,
 };
 use aidaemon_sdk::prelude::*;
 use aidaemon_sdk::providers::{Anthropic, OpenAiCompatible};
@@ -71,9 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .hook(ApprovalPolicy::new(ApprovalMode::DestructiveOnly))
         .hook(Redactor::default())
         .hook(UntrustedOutput::default())
-        .hook(ReceiptCompletionCheck::new([
-            Requirement::RequireNoUnresolvedFailures,
-        ]))
         .store(store)
         .event_sink(|_run, event: &Event| match event {
             Event::TextDelta { text, .. } => {

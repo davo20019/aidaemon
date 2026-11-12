@@ -22,6 +22,6 @@ A rough map. The ideas line up closely; the differences are noted.
 | Evals | `aidaemon-eval`: YAML scenarios, N-of-M pass rates | |
 
 Where aidaemon differs on purpose: every tool call produces a receipt (what
-ran, with what arguments, how it ended), completion checks can read receipts
+ran, with what arguments, how it ended), a stop hook can check the receipts
 instead of trusting the model's prose, and tool output is treated as untrusted
 unless a tool says otherwise.

@@ -2,8 +2,9 @@ name: completion_retry
 description: >
   A three-part task where the email step fails once (relay timeout) and
   succeeds when retried. A good run retries and gets all three parts done
-  instead of stopping with the failure unresolved. Aimed at
-  ReceiptCompletionCheck (no unresolved failures).
+  instead of stopping with the failure unresolved. A plain-kernel
+  regression: the receipt completion check it was aimed at showed no gain
+  here (5/5 with and without) and was removed.
 tags: ["kit:order"]
 input: >
   Close out order ORD-77: mark it shipped, email the customer that it is on
