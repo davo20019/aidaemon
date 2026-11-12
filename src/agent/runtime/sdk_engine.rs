@@ -48,6 +48,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::agent_helpers::touch_heartbeat;
+use crate::tools::ProgressClock;
 use super::memory_plugin::{daemon_tool_offer, memory_parts, DaemonToolOffer, MemoryTurn};
 use super::sdk_provider::{
     fit_run_values, from_provider_response, prefix_with_notes, split_injected_notes,
@@ -1109,6 +1110,7 @@ impl Agent {
         drop(calls_tx);
         let sink_status = status_tx.clone();
         let sink_heartbeat = heartbeat.clone();
+        let sink_progress = self.child_progress.clone();
         // The kernel holds one sink: heartbeat, kernel refusals for the
         // ledger, and the thinking status all go through it.
         // Every run journals its events and checkpoints its state, so a
@@ -1122,6 +1124,11 @@ impl Agent {
         }
         builder = builder.event_sink(move |_run, event: &sdk::Event| {
             touch_heartbeat(&sink_heartbeat);
+            // Every kernel event (a turn, a model reply, a tool result) is
+            // the run making progress.
+            if let Some(progress) = &sink_progress {
+                progress.touch();
+            }
             match event {
                 sdk::Event::ToolFinished { receipt }
                     if matches!(
@@ -1435,8 +1442,19 @@ impl Agent {
             tokio::select! {
                 outcome = &mut run => break outcome,
                 Some(call) = calls_rx.recv() => match call {
+                    // A tool call running is progress: each has its own
+                    // bound (its timeout or stall watchdog), so a child that
+                    // runs a long install is never stopped as idle.
                     DaemonCall::Tool(request) => {
-                        in_flight.push(self.dispatch_sdk_tool_call(&scope, request).boxed());
+                        let running = self.child_progress.as_ref().map(ProgressClock::begin);
+                        let call = self.dispatch_sdk_tool_call(&scope, request);
+                        in_flight.push(
+                            async move {
+                                call.await;
+                                drop(running);
+                            }
+                            .boxed(),
+                        );
                     }
                     DaemonCall::AfterCall(check) => {
                         in_flight.push(self.finish_sdk_tool_call(&scope, check).boxed());

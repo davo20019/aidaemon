@@ -198,11 +198,11 @@ impl SpawnAgentTool {
         format_specialist_arg_description(&agent.specialist_descriptions())
     }
 
-    /// The working time a child spawned by this tool gets.
-    fn time_limit(&self, detached: bool) -> Option<ChildTimeLimit> {
+    /// How long a child spawned by this tool may go without progress
+    /// (`subagents.timeout_secs`); never a limit on how long it works.
+    fn time_limit(&self) -> Option<ChildTimeLimit> {
         Some(ChildTimeLimit {
             limit: Duration::from_secs(self.timeout_secs),
-            detached,
         })
     }
 
@@ -1033,7 +1033,7 @@ impl Tool for SpawnAgentTool {
         let task = args.task.clone();
         let mission = args.mission.clone();
         let timeout_secs = self.timeout_secs;
-        let time_limit = self.time_limit(true);
+        let time_limit = self.time_limit();
         let max_response_chars = self.max_response_chars;
         let executor_task_runs = Arc::clone(&self.executor_task_runs);
         let executor_task_id_for_bg = executor_task_id;
@@ -1551,7 +1551,7 @@ impl SpawnAgentTool {
                 specialist: arg_specialist.map(str::to_string),
                 approval_session_id: approval_session_id.map(str::to_string),
                 parent_authority,
-                time_limit: self.time_limit(false),
+                time_limit: self.time_limit(),
                 model_tier,
             })
             .await;
@@ -2272,7 +2272,7 @@ mod child_runtime_tests {
             .await
             .expect_err("nothing happened, so a retry is safe");
 
-        assert!(error.to_string().contains("timed out after 30 seconds"));
+        assert!(error.to_string().contains("no progress for 30 seconds"));
     }
 
     /// A background executor that runs out of time releases its task the way
