@@ -12,6 +12,10 @@ stability promise.
 
 ## [Unreleased]
 
+### Security
+- `aidaemon-sdk`: `preset` without a workspace no longer runs a tool that may change things but declares no access without anyone seeing it: the approval policy asks the owner first (a `#[tool(write)] fn save(path, ..)` with no `access` could write `~/.bashrc` unchecked). With a workspace, a read-only tool that declares no paths is now refused like a writer (it could read `~/.ssh`). New `Preset::path_free_tool` marks tools that touch no files (business APIs); the tools a `Preset::memory` system gives are marked automatically; new `Preset::undeclared_reads`. An explicit `Preset::undeclared_writes(Allow)` still runs undeclared writers without asking.
+- `aidaemon-policies`: `ScopeGuard::path_free_tool`, `ApprovalPolicy::ask_undeclared_writes` and `ApprovalPolicy::path_free_tool`.
+
 ### Removed
 - `aidaemon-policies`: `ReceiptCompletionCheck` and `Requirement`. Measured live (Decision 4: a policy that shows no gain is removed before it becomes public API), it gained nothing: 34/40 with and without on the first eight scenarios, and 5/5 with and without on `completion_retry`, the scenario built for it (N=5, `claude-haiku-5-5`), at slightly more turns. It is not a safety boundary. A receipt-based check remains a few lines of `on_stop` (see `aidaemon-core/DESIGN.md`); `completion_retry` stays as a plain-kernel regression.
 

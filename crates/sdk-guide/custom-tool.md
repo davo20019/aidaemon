@@ -59,5 +59,11 @@ Things worth knowing:
   is your own data.
 - `ToolAnnotations::{READ_ONLY, WRITE, DESTRUCTIVE}` are presets;
   `annotations_for(&arguments)` can relax them per call.
+- A tool that touches files should declare them (`Tool::access`, or
+  `access = ..` on `#[tool]`) so the scope guard can check them. Under the
+  preset, a tool that declares nothing is refused when a workspace is set
+  and, without one, asked about before it runs if it may change things. A
+  tool that touches no files (an order lookup, a refund, a ticket) says so
+  with `preset(..).path_free_tool("name")`.
 - Test tools without a model using the `testing` feature and the tool
   conformance kit in `aidaemon_core::conformance`.

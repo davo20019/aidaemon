@@ -52,6 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instructions("You triage support tickets. Look the order up, then escalate damage claims.")
         .tool(LookupOrder)
         .tool(Escalate)
+        // Escalating opens a ticket and touches no files. Without this, a
+        // tool that may change things and declares no paths waits for the
+        // owner, since no scope check covers it.
+        .path_free_tool("escalate")
         .build()
         .await?;
     let ticket = "Order ORD-1001 arrived with a cracked jar.";
