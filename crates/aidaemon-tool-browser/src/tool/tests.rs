@@ -1300,10 +1300,21 @@ async fn screenshot_caption_redacts_query_and_fragment() {
         !cap.contains("section"),
         "caption must not leak the fragment: {cap}"
     );
-    assert!(
-        cap.contains("host.example/dash/board"),
-        "caption keeps host + path: {cap}"
+    assert_eq!(cap, "Screenshot of host.example/dash/board");
+}
+
+/// A screenshot's caption is short: the page without its scheme.
+#[test]
+fn a_screenshot_caption_names_the_page_briefly() {
+    assert_eq!(
+        super::short_page_name("https://claude-drupal-2.ddev.site/"),
+        "claude-drupal-2.ddev.site"
     );
+    assert_eq!(
+        super::short_page_name("http://localhost:3000/admin/"),
+        "localhost:3000/admin/"
+    );
+    assert_eq!(super::short_page_name("current page"), "current page");
 }
 
 /// Unit test for the dependency-free PNG dimension parser.
@@ -5056,6 +5067,40 @@ async fn local_site_card_lets_the_session_open_that_site_only() {
         !tool.sessions.is_session_approved("sess-a").await,
         "a local-site answer must not approve page mutations"
     );
+}
+
+/// A site the work set up itself (or the owner's request named) is part of
+/// what was asked: no card. Another chat's work still asks.
+#[tokio::test]
+async fn a_local_site_the_work_set_up_opens_without_a_card() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    aidaemon_tools::local_sites::note(
+        "sess-site-setup",
+        &["127.0.0.1:8181".to_string()],
+    );
+    tool.call_with(
+        &local_navigate("http://127.0.0.1:8181/"),
+        aidaemon_tools::testing::call_facts("sess-site-setup"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 0, "its own site does not ask");
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("http://127.0.0.1:8181/".to_string())
+        )
+        .await
+    );
+
+    tool.call_with(
+        &local_navigate("http://127.0.0.1:8181/"),
+        aidaemon_tools::testing::call_facts("sess-site-other"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1, "another chat's work asks");
 }
 
 #[tokio::test]

@@ -150,8 +150,9 @@ impl BrowserSessionRegistry {
             .insert(session_id.to_string(), grant_session.to_string());
     }
 
-    /// The key approvals for `session_id` are kept under.
-    fn grant_key(&self, session_id: &str) -> String {
+    /// The key approvals for `session_id` are kept under: the chat whose
+    /// approvals cover it.
+    pub fn grant_key(&self, session_id: &str) -> String {
         self.grant_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

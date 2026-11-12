@@ -748,15 +748,25 @@ fn asked_by<'r>(
     }
 }
 
-/// How many characters of a mission a card shows.
-const CARD_MISSION_CHARS: usize = 120;
+/// How many characters of a sub-agent's name a card shows.
+const CARD_MISSION_CHARS: usize = 40;
 
+/// A sub-agent's card opens with its short name in plain words ("Drupal
+/// install asks:"): the title its parent gave it, else its mission's first
+/// line cut at a whole word.
 fn sub_agent_card_summary(mission: &str, summary: &str) -> String {
-    let mut shown: String = mission.chars().take(CARD_MISSION_CHARS).collect();
-    if mission.chars().count() > CARD_MISSION_CHARS {
-        shown.push('…');
-    }
-    format!("Sub-agent \"{shown}\" asks:\n{summary}")
+    let line = mission.lines().next().unwrap_or_default().trim();
+    let line = line.trim_end_matches('.');
+    let shown = if line.chars().count() <= CARD_MISSION_CHARS {
+        line.to_string()
+    } else {
+        let head: String = line.chars().take(CARD_MISSION_CHARS - 1).collect();
+        let kept = head
+            .rfind(char::is_whitespace)
+            .map_or(head.as_str(), |at| &head[..at]);
+        format!("{}…", kept.trim_end())
+    };
+    format!("{shown} asks:\n{summary}")
 }
 
 /// The card's risk level for a kernel request.
@@ -1121,32 +1131,44 @@ fn refused_check_may_ask_owner(rules: &AppApprovalRules, origin_trusted: bool) -
 const REFUSED_CALL_SHOWN_CHARS: usize = 1500;
 const REFUSED_CALL_REASON_CHARS: usize = 400;
 
-/// The card for a call the clean check would not pass. It shows the command
-/// the owner would be allowing, not the model's account of it.
+/// The card for a call the clean check would not pass. It says in plain
+/// words what allowing it does and that the step waits meanwhile; the exact
+/// command the owner would be allowing (not the model's account of it) is
+/// under its details, never the headline.
 fn refused_call_request(
     tool: &str,
     arguments: &Value,
     effects: Vec<sdk::EffectKey>,
     check_reason: &str,
 ) -> sdk::OwnerApprovalRequest {
-    let shown = ["command", "script"]
+    let command = ["command", "script"]
         .iter()
-        .find_map(|key| arguments.get(key).and_then(Value::as_str))
-        .map_or_else(|| arguments.to_string(), str::to_string);
+        .find_map(|key| arguments.get(key).and_then(Value::as_str));
+    let shown = command.map_or_else(|| arguments.to_string(), str::to_string);
     // The owner decides on the call as it would run: secrets stay hidden,
     // the paths it touches stay readable.
     let shown = aidaemon_tools::sanitize::redact_secrets_only(&shown);
     let shown = crate::untrusted::cap_strings(&Value::from(shown), REFUSED_CALL_SHOWN_CHARS);
+    let action = if command.is_some() {
+        "Run a command on your computer?".to_string()
+    } else {
+        format!("Let me use {}?", tool.replace('_', " "))
+    };
     sdk::OwnerApprovalRequest {
         effects,
-        summary: format!("{tool}: {}", shown.as_str().unwrap_or_default()),
+        summary: format!(
+            "{action} This work read content from outside, and the safety check couldn't \
+             confirm this step fits your request. This step is paused until you answer."
+        ),
         subject: format!("{tool} {arguments}"),
         risk: sdk::ApprovalRisk::High,
-        warnings: vec![format!(
-            "This run read outside content, and the safety check could not confirm this call \
-             fits your request: {}",
-            aidaemon_events::text::truncate_str(check_reason, REFUSED_CALL_REASON_CHARS)
-        )],
+        warnings: vec![
+            format!("Details: {}", shown.as_str().unwrap_or_default()),
+            format!(
+                "Why the check stopped it: {}",
+                aidaemon_events::text::truncate_str(check_reason, REFUSED_CALL_REASON_CHARS)
+            ),
+        ],
     }
 }
 
@@ -1225,14 +1247,26 @@ mod tests {
         }
     }
 
+    /// The card says in plain words what allowing does and what waits; the
+    /// command is under its details, never the headline.
     #[test]
-    fn a_refused_call_card_shows_the_command_and_why() {
+    fn a_refused_call_card_says_what_happens_and_shows_the_command_under_details() {
         let arguments =
             json!({"action": "run", "command": "rm -rf synthetic-dir", "network": true});
         let request = refused_call_request("terminal", &arguments, Vec::new(), "not requested");
-        assert_eq!(request.summary, "terminal: rm -rf synthetic-dir");
+        assert!(
+            request.summary.starts_with("Run a command on your computer?"),
+            "{}",
+            request.summary
+        );
+        assert!(request.summary.contains("paused until you answer"));
+        assert!(!request.summary.contains("rm -rf"));
+        assert!(!request.summary.contains("terminal"));
         assert_eq!(request.subject, format!("terminal {arguments}"));
-        assert!(request.warnings[0].contains("not requested"));
+        assert_eq!(request.warnings[0], "Details: rm -rf synthetic-dir");
+        assert!(request.warnings[1].contains("not requested"));
+        let other = refused_call_request("http_request", &json!({"url": "x"}), Vec::new(), "r");
+        assert!(other.summary.starts_with("Let me use http request?"));
     }
 
     /// The end of a long command is kept: that is where a payload hides.
@@ -1245,9 +1279,9 @@ mod tests {
             Vec::new(),
             "not requested",
         );
-        assert!(request.summary.contains("start"));
-        assert!(request.summary.contains("rm-tail"));
-        assert!(request.summary.contains("chars cut"));
+        assert!(request.warnings[0].contains("start"));
+        assert!(request.warnings[0].contains("rm-tail"));
+        assert!(request.warnings[0].contains("chars cut"));
     }
 
     fn hook_ctx() -> sdk::HookContext<'static> {
@@ -1412,15 +1446,23 @@ mod tests {
         ));
     }
 
+    /// A sub-agent's card opens with a short plain name, never "Sub-agent"
+    /// or its whole mission in quotes.
     #[test]
-    fn a_sub_agent_card_names_its_mission() {
+    fn a_sub_agent_card_opens_with_its_short_name() {
         assert_eq!(
-            super::sub_agent_card_summary("Write its tests", "terminal: ls"),
-            "Sub-agent \"Write its tests\" asks:\nterminal: ls"
+            super::sub_agent_card_summary("Drupal install", "Run a command?"),
+            "Drupal install asks:\nRun a command?"
         );
+        let card = super::sub_agent_card_summary(
+            "Install a fresh WordPress site with DDEV for a Claude company demo.",
+            "s",
+        );
+        assert_eq!(card, "Install a fresh WordPress site with… asks:\ns");
+        assert!(!card.contains("Sub-agent") && !card.contains('"'));
         let long = "x".repeat(200);
         let card = super::sub_agent_card_summary(&long, "s");
-        assert!(card.contains(&format!("{}…", "x".repeat(120))));
+        assert!(card.starts_with(&format!("{}…", "x".repeat(39))));
     }
 
     #[test]

@@ -524,8 +524,9 @@ fn combine_batch(
     let mut all_succeeded = true;
     let mut trust = SourceTrust::Trusted;
     let mut truncation: Option<crate::traits::TruncationInfo> = None;
-    for (index, (mission, run)) in runs.into_iter().enumerate() {
-        let heading = format!("### Sub-agent {} of {count}: {mission}", index + 1);
+    for (mission, run) in runs {
+        // Its own name, in words the parent can repeat to the owner.
+        let heading = format!("### {mission}");
         match run {
             Ok(outcome) => {
                 if outcome.metadata.output_trust != Some(SourceTrust::Trusted) {
@@ -577,6 +578,10 @@ fn combine_batch(
 struct SpawnArgs {
     /// High-level mission / role description for the sub-agent.
     mission: String,
+    /// A short name the owner reads for this sub-agent on its cards and
+    /// status lines ("Drupal install").
+    #[serde(default)]
+    title: Option<String>,
     /// The concrete task or question the sub-agent should work on.
     task: String,
     /// When true, spawn the sub-agent in the background and return immediately.
@@ -748,6 +753,12 @@ impl Tool for SpawnAgentTool {
                         "type": "string",
                         "description": "High-level mission or role for the sub-agent \
                             (e.g. 'Research assistant focused on Python packaging')"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "A short name for this sub-agent that the owner reads on its \
+                            status lines and approval cards: two to four plain words naming its job \
+                            (e.g. 'Drupal install', 'Price research'), never a sentence."
                     },
                     "task": {
                         "type": "string",
@@ -978,6 +989,12 @@ impl Tool for SpawnAgentTool {
         // lineage plus the mission this call delegates.
         if let Some(parent) = parent_authority.as_mut() {
             parent.lineage.push(args.mission.clone());
+            parent.card_title = args
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string);
         }
 
         // TaskLead -> Executor spawns must target a concrete, pre-claimed task and
@@ -1552,9 +1569,11 @@ impl SpawnAgentTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let runs = futures::stream::iter(tasks.into_iter().map(|task| async move {
-            let mission = task
-                .get("mission")
-                .and_then(Value::as_str)
+            let mission = ["title", "mission"]
+                .iter()
+                .filter_map(|key| task.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .find(|name| !name.is_empty())
                 .unwrap_or_default()
                 .to_string();
             (mission, self.execute(&task.to_string(), facts).await)
@@ -1896,6 +1915,7 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            card_title: None,
             lineage: Vec::new(),
             parent_task: None,
         };
@@ -2547,7 +2567,7 @@ mod child_runtime_tests {
         assert_eq!(combined.metadata.output_trust, Some(SourceTrust::Untrusted));
         assert!(combined
             .output
-            .contains("Sub-agent 2 of 2: second\nFailed: boom"));
+            .contains("### second\nFailed: boom"));
         assert!(combine_batch(
             vec![("only".to_string(), Err(anyhow::anyhow!("boom")))],
             false
@@ -2691,6 +2711,7 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                card_title: None,
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -2805,6 +2826,7 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                card_title: None,
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -2846,6 +2868,7 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                card_title: None,
                 lineage: Vec::new(),
                 parent_task: None,
             });
@@ -2950,6 +2973,7 @@ mod child_runtime_tests {
                 child_declaration: None,
                 parent_run: None,
                 known_resources: Default::default(),
+                card_title: None,
                 lineage: Vec::new(),
                 parent_task: None,
             });

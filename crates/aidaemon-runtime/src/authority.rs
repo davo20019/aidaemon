@@ -458,6 +458,11 @@ pub struct InheritedAuthority {
     /// work its own task is part of.
     #[serde(default)]
     pub lineage: Vec<String>,
+    /// A short name for this child the owner reads on its cards ("Drupal
+    /// install"), as its parent's spawn call gave it. `None`: the cards
+    /// shorten its mission instead.
+    #[serde(default)]
+    pub card_title: Option<String>,
     /// The run that spawns this child, recorded on the child's task start so
     /// the parent can fold the child's results back into its own context.
     #[serde(default)]
@@ -890,6 +895,7 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            card_title: None,
             lineage: Vec::new(),
             parent_task: None,
         }
@@ -1005,6 +1011,7 @@ mod tests {
             child_declaration: None,
             parent_run: None,
             known_resources: Default::default(),
+            card_title: None,
             lineage: Vec::new(),
             parent_task: None,
         };
