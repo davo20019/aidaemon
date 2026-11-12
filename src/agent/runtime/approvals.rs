@@ -188,40 +188,7 @@ impl TerminalScope {
     }
 }
 
-/// A call as the dispatcher executes it: the model's `_` keys and unset
-/// optional arguments dropped, the turn's project directory injected and
-/// unauthorized read roots dropped (`sdk_engine::tool_calls::canonicalize_call`).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CanonicalCall {
-    pub arguments: serde_json::Value,
-    /// The model's own explicit directory; it refines the turn's known
-    /// project directory when the call is dispatched.
-    pub explicit_dir: Option<String>,
-    /// The project directory injected into the call, if any.
-    pub injected_dir: Option<String>,
-    /// Declared read roots dropped as unauthorized.
-    pub stripped_read_roots: Vec<String>,
-}
-
-impl CanonicalCall {
-    /// Only the model's `_` keys and unset optional arguments dropped (no
-    /// turn to anchor against).
-    pub(crate) fn stripped(
-        tool: Option<&dyn crate::traits::Tool>,
-        raw: &serde_json::Value,
-    ) -> Self {
-        let mut arguments = raw.clone();
-        if let serde_json::Value::Object(map) = &mut arguments {
-            crate::agent::tool_exec::strip_model_arguments(map, tool);
-        }
-        Self {
-            arguments,
-            explicit_dir: None,
-            injected_dir: None,
-            stripped_read_roots: Vec::new(),
-        }
-    }
-}
+pub(crate) use aidaemon_runtime::engine::tool_calls::CanonicalCall;
 
 /// A terminal call as the kernel judged it.
 #[derive(Debug, Clone, PartialEq)]

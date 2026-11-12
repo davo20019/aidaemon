@@ -113,7 +113,7 @@ mod recall_guardrails {
 }
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
-use loop_utils::{extract_command_from_args, fixup_message_ordering, is_trigger_session};
+use loop_utils::{fixup_message_ordering, is_trigger_session};
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
@@ -198,8 +198,6 @@ pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
-pub(in crate::agent) use history::VerificationTarget;
-pub(in crate::agent) use history::VerificationTargetKind;
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;

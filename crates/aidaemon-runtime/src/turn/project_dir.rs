@@ -1,5 +1,6 @@
-use crate::agent::*;
-use crate::traits::{ToolCallSemantics, ToolTargetHintKind};
+use serde_json::{json, Value};
+
+use aidaemon_events::traits::{ToolCallSemantics, ToolTargetHintKind};
 
 const PATH_ARGUMENT_KEYS: &[&str] = &[
     "path",
@@ -17,12 +18,12 @@ const PATH_ARGUMENT_KEYS: &[&str] = &[
 ];
 
 #[cfg(test)]
-pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
+pub fn extract_project_dir_hint(text: &str) -> Option<String> {
     extract_project_dir_hint_with_aliases(text, &[])
 }
 
 #[cfg(test)]
-pub(crate) fn extract_project_dir_hint_with_aliases(
+pub fn extract_project_dir_hint_with_aliases(
     text: &str,
     _alias_roots: &[String],
 ) -> Option<String> {
@@ -58,7 +59,7 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
             || token.starts_with("../")
             || looks_windows_abs;
         let normalized = looks_path
-            .then(|| normalize_project_dir(&*crate::execution::active_execution_backend(), token))
+            .then(|| normalize_project_dir(&*aidaemon_tools::testing::active_execution_backend(), token))
             .flatten();
         let Some(normalized) = normalized else {
             continue;
@@ -76,17 +77,17 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
 }
 
 fn normalize_project_dir(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     raw_path: &str,
 ) -> Option<String> {
-    if backend.kind() != crate::execution::BackendKind::Local {
-        let mut path = crate::execution::normalize_path_lexically(backend, raw_path).ok()?;
-        if crate::tools::fs_utils::path_points_to_file(raw_path) {
+    if backend.kind() != aidaemon_tools::BackendKind::Local {
+        let mut path = aidaemon_tools::backend::normalize_path_lexically(backend, raw_path).ok()?;
+        if aidaemon_tools::fs_utils::path_points_to_file(raw_path) {
             path = path.parent()?;
         }
         return Some(path.to_string());
     }
-    crate::tools::fs_utils::normalize_project_scope_path(backend, raw_path)
+    aidaemon_tools::fs_utils::normalize_project_scope_path(backend, raw_path)
         .ok()
         .map(|path| path.to_string_lossy().to_string())
 }
@@ -98,13 +99,13 @@ fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
 }
 
 fn resolve_injected_working_dir(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     project_dir: &str,
 ) -> String {
-    if backend.kind() != crate::execution::BackendKind::Local {
+    if backend.kind() != aidaemon_tools::BackendKind::Local {
         return project_dir.to_string();
     }
-    let resolved = crate::tools::fs_utils::validate_path(backend, project_dir).ok();
+    let resolved = aidaemon_tools::fs_utils::validate_path(backend, project_dir).ok();
     if let Some(path) = resolved {
         if !path.is_dir() {
             if let Some(parent) = path.parent() {
@@ -126,7 +127,7 @@ fn workspace_policy_allows_injected_working_dir(
 }
 
 fn active_workspace_policy_allows_injected_working_dir(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     candidate: &str,
 ) -> bool {
     workspace_policy_allows_injected_working_dir(
@@ -137,7 +138,7 @@ fn active_workspace_policy_allows_injected_working_dir(
 }
 
 fn collect_project_dirs_from_value(
-    backend: &dyn crate::execution::ExecutionBackend,
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     value: &Value,
     parent_key: Option<&str>,
     collected: &mut Vec<String>,
@@ -175,8 +176,8 @@ fn collect_project_dirs_from_value(
     }
 }
 
-pub(super) fn extract_project_dirs_from_tool_args(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn extract_project_dirs_from_tool_args(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
 ) -> Vec<String> {
@@ -213,8 +214,8 @@ pub(super) fn extract_project_dirs_from_tool_args(
 /// project-instruction discovery. Broad grep/glob searches are intentionally
 /// excluded; high-intent reads, writes, project entry, and command working
 /// directories mirror the just-in-time behavior of established coding agents.
-pub(in crate::agent) fn project_instruction_targets_for_tool_call(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn project_instruction_targets_for_tool_call(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
     semantics: &ToolCallSemantics,
@@ -262,8 +263,8 @@ fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-pub(in crate::agent) fn project_dir_from_tool_args(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn project_dir_from_tool_args(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
 ) -> Option<String> {
@@ -272,8 +273,8 @@ pub(in crate::agent) fn project_dir_from_tool_args(
         .next()
 }
 
-pub(in crate::agent) fn maybe_inject_project_dir_into_tool_args(
-    backend: &dyn crate::execution::ExecutionBackend,
+pub fn maybe_inject_project_dir_into_tool_args(
+    backend: &dyn aidaemon_tools::ExecutionBackend,
     tool_name: &str,
     args_json: &str,
     known_project_dir: Option<&str>,
@@ -361,7 +362,7 @@ mod tests {
         known_project_dir: Option<&str>,
     ) -> Option<(String, String)> {
         super::maybe_inject_project_dir_into_tool_args(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
             args_json,
             known_project_dir,
@@ -370,7 +371,7 @@ mod tests {
 
     fn project_dir_from_tool_args(tool_name: &str, args_json: &str) -> Option<String> {
         super::project_dir_from_tool_args(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
             args_json,
         )
@@ -378,7 +379,7 @@ mod tests {
 
     fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &str) -> Vec<String> {
         super::extract_project_dirs_from_tool_args(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
             args_json,
         )
@@ -390,7 +391,7 @@ mod tests {
         semantics: &ToolCallSemantics,
     ) -> Vec<String> {
         super::project_instruction_targets_for_tool_call(
-            &*crate::execution::active_execution_backend(),
+            &*aidaemon_tools::testing::active_execution_backend(),
             tool_name,
             args_json,
             semantics,
@@ -398,7 +399,7 @@ mod tests {
     }
 
     fn normalize_project_dir(raw_path: &str) -> Option<String> {
-        super::normalize_project_dir(&*crate::execution::active_execution_backend(), raw_path)
+        super::normalize_project_dir(&*aidaemon_tools::testing::active_execution_backend(), raw_path)
     }
     use proptest::prelude::*;
 
@@ -650,24 +651,24 @@ mod tests {
 
     #[test]
     fn first_dir_component_exists_for_real_paths() {
-        assert!(crate::tools::fs_utils::first_dir_component_exists(
+        assert!(aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/tmp/foo")
         ));
-        assert!(crate::tools::fs_utils::first_dir_component_exists(
+        assert!(aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/usr/bin")
         ));
-        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+        assert!(!aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/api/notes")
         ));
-        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+        assert!(!aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/v1/status")
         ));
         // Relative paths always pass
-        assert!(crate::tools::fs_utils::first_dir_component_exists(
+        assert!(aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("src/main.rs")
         ));
         // Root itself passes
-        assert!(crate::tools::fs_utils::first_dir_component_exists(
+        assert!(aidaemon_tools::fs_utils::first_dir_component_exists(
             std::path::Path::new("/")
         ));
     }

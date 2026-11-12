@@ -8,7 +8,7 @@ pub use aidaemon_tools::{
     SpawnedProcess, WriteMode,
 };
 
-pub use aidaemon_tools::backend::{normalize_path_lexically, SharedExecutionBackend};
+pub use aidaemon_tools::backend::SharedExecutionBackend;
 
 /// The default local backend for isolated unit tests that construct a tool
 /// without running startup. Production code never reads this: startup builds
