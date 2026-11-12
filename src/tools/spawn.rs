@@ -3008,7 +3008,13 @@ mod child_runtime_tests {
         child.cancel.cancel();
 
         let entry = wait_for_notification(&store).await;
-        assert!(entry.message.contains("cancelled"), "{}", entry.message);
+        assert!(
+            entry
+                .message
+                .contains("Cancelled in the background: Report"),
+            "{}",
+            entry.message
+        );
         assert!(!entry.message.contains("never delivered"));
     }
 

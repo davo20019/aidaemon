@@ -723,7 +723,7 @@ async fn test_background_spawn_timeout_salvages_persisted_executor_outcome() {
         let pending = harness.state.get_pending_notifications(20).await.unwrap();
         if let Some(entry) = pending
             .iter()
-            .find(|n| n.message.contains("Mission: Run the ddev composer update"))
+            .find(|n| n.message.contains("in the background: Run the ddev composer update"))
         {
             completion_message = Some(entry.message.clone());
             break;
