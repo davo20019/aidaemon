@@ -89,3 +89,18 @@ pub fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
         .windows(kw_words.len())
         .any(|window| window == kw_words.as_slice())
 }
+
+/// Returns the largest byte index ≤ `byte_limit` that falls on a UTF-8 char boundary.
+///
+/// Use this when you need to slice a string by approximate byte length without panicking.
+/// The returned index is safe to use with `&s[..index]`.
+pub fn floor_char_boundary(s: &str, byte_limit: usize) -> usize {
+    if byte_limit >= s.len() {
+        return s.len();
+    }
+    let mut i = byte_limit;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}

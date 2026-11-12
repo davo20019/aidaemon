@@ -48,3 +48,28 @@ fn http_request_schema_golden() {
         tokio::sync::RwLock::new(std::collections::HashMap::new()),
     )));
 }
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn browser_schema_golden() {
+    let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+    let tool = crate::tools::BrowserTool::new(
+        crate::config::BrowserConfig::default().settings(),
+        media_tx,
+        std::env::temp_dir().join("aidaemon-golden-inbox"),
+        crate::execution::active_execution_backend(),
+    )
+    .expect("browser tool");
+    check_golden(&tool);
+}
+
+#[test]
+fn send_file_schema_golden() {
+    let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+    check_golden(&crate::tools::SendFileTool::new(
+        crate::execution::active_execution_backend(),
+        media_tx,
+        &[],
+        "/tmp/aidaemon-golden-inbox",
+    ));
+}

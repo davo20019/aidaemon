@@ -55,6 +55,7 @@ pub mod file_delivery;
 mod fs;
 pub mod fs_utils;
 pub mod http_request;
+pub mod local_backend;
 pub mod outcome;
 pub mod owner_answers;
 pub mod path_class;

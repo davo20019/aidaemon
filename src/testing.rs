@@ -4,7 +4,6 @@
 //! suitable for integration tests that exercise the real agent loop.
 
 use crate::events::EventStoreForTests as _;
-use crate::traits::ToolCalls as _;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -595,95 +594,9 @@ pub struct TestHarness {
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
-/// Dispatcher facts for a direct tool test: the call's session, nothing else.
-pub fn call_facts(session_id: &str) -> crate::traits::ToolCallContext {
-    crate::traits::ToolCallContext {
-        session_id: session_id.to_string(),
-        ..Default::default()
-    }
-}
-
-/// Call `tool` the way the dispatcher does, beside `facts`, and return its
-/// output.
-pub async fn call_with_facts<T: Tool + ?Sized>(
-    tool: &T,
-    arguments: &str,
-    facts: crate::traits::ToolCallContext,
-) -> anyhow::Result<String> {
-    tool.call_with_execution_context(arguments, None, facts)
-        .await
-        .map(|outcome| outcome.output)
-}
-
-/// What [`call_through_kernel`] did with a call.
-pub struct KernelCall {
-    /// The tool's output, or the kernel's refusal when the owner did not
-    /// approve (the tool did not run).
-    pub output: String,
-    /// The card the owner was asked with, if the tool asked.
-    pub asked: Option<aidaemon_core::OwnerApprovalRequest>,
-}
-
-/// Call `tool` as the agent kernel does for a tool that judges its own owner
-/// approvals: ask `owner_approval_request` with `facts`; when it asks, hand
-/// `answer` (`None`: no answer) back through `record_owner_answer` and run
-/// the call only when the owner approved. A decline or no answer never runs
-/// it, as with the kernel.
-pub async fn call_through_kernel<T: Tool + ?Sized>(
-    tool: &T,
-    arguments: &str,
-    facts: crate::traits::ToolCallContext,
-    answer: Option<ApprovalResponse>,
-) -> anyhow::Result<KernelCall> {
-    let parsed: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-    let call = crate::traits::ApprovalCall::as_sent(&parsed);
-    let asked = match tool.owner_approval_request(&call, &facts).await {
-        crate::traits::OwnerApprovalNeed::Ask(request) => Some(request),
-        _ => None,
-    };
-    if asked.is_some() {
-        tool.record_owner_answer(&call, &facts, answer.clone())
-            .await;
-        match answer {
-            Some(ApprovalResponse::Deny) => {
-                return Ok(KernelCall {
-                    output: "Error: Denied by user.".to_string(),
-                    asked,
-                });
-            }
-            None => {
-                return Ok(KernelCall {
-                    output: "Error: no answer from the owner. Action denied.".to_string(),
-                    asked,
-                });
-            }
-            Some(_) => {}
-        }
-    }
-    let output = call_with_facts(tool, arguments, facts).await?;
-    Ok(KernelCall { output, asked })
-}
-
-/// `tool.call_with(arguments, facts)`: [`call_with_facts`] as a method.
-#[async_trait]
-pub trait CallWithFacts {
-    async fn call_with(
-        &self,
-        arguments: &str,
-        facts: crate::traits::ToolCallContext,
-    ) -> anyhow::Result<String>;
-}
-
-#[async_trait]
-impl<T: Tool + ?Sized> CallWithFacts for T {
-    async fn call_with(
-        &self,
-        arguments: &str,
-        facts: crate::traits::ToolCallContext,
-    ) -> anyhow::Result<String> {
-        call_with_facts(self, arguments, facts).await
-    }
-}
+pub use aidaemon_tools::testing::{
+    call_facts, call_through_kernel, call_with_facts, CallWithFacts,
+};
 
 /// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
 /// process into its own target directory (so it never waits on the build

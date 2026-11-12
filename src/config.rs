@@ -2674,6 +2674,11 @@ impl ComputerUseConfig {
 }
 
 impl BrowserConfig {
+    #[cfg(test)]
+    pub fn settings(&self) -> Self {
+        self.clone()
+    }
+
     /// Resolved navigation/DOM-ready timeout, clamped to a sane bounded range
     /// (1..=120s) so a typo'd or absurd config value can neither hang the tool
     /// (huge value) nor make navigation give up before any page can load

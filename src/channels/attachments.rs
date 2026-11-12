@@ -1,12 +1,13 @@
 //! Shared inbound file attachment helpers for Telegram, Slack, and Discord.
 
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::traits::{AttachmentProvenance, MessageAttachment};
-use sha2::{Digest, Sha256};
 
-use super::formatting::sanitize_filename;
+pub use aidaemon_events::attachments::{
+    new_resource_id, save_tool_observation_image, sha256_file, tool_artifact_attachment,
+    RESOURCE_ID_PREFIX,
+};
 
 /// Format a single saved file as the legacy text stub (backward compatible).
 pub fn format_file_stub(
@@ -166,28 +167,6 @@ pub fn message_attachment(
     }
 }
 
-/// Prefix of every session resource handle minted here and consumed by
-/// `send_file`/`image_generation`; the checklist binds `res_*` targets to it.
-pub const RESOURCE_ID_PREFIX: &str = "res_";
-
-pub fn new_resource_id() -> String {
-    format!("{RESOURCE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple())
-}
-
-pub fn sha256_file(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
 pub fn ensure_attachment_resource_identity(attachment: &mut MessageAttachment) {
     if attachment.resource_id.is_none() {
         attachment.resource_id = Some(new_resource_id());
@@ -195,51 +174,6 @@ pub fn ensure_attachment_resource_identity(attachment: &mut MessageAttachment) {
     if attachment.sha256.is_none() {
         attachment.sha256 = sha256_file(Path::new(&attachment.local_path));
     }
-}
-
-pub fn tool_artifact_attachment(
-    path: &Path,
-    filename: String,
-    mime_type: String,
-    size_bytes: u64,
-    source_tool: &str,
-) -> MessageAttachment {
-    MessageAttachment {
-        resource_id: Some(new_resource_id()),
-        local_path: path.to_string_lossy().into_owned(),
-        filename,
-        mime_type,
-        size_bytes,
-        provenance: AttachmentProvenance::ToolArtifact,
-        source_tool: Some(source_tool.to_string()),
-        sha256: sha256_file(path),
-    }
-}
-
-/// Save tool-produced image bytes to the shared inbox for agent vision context.
-pub fn save_tool_observation_image(
-    inbox_dir: &Path,
-    bytes: &[u8],
-    filename_hint: &str,
-    mime_type: &str,
-    source_tool: &str,
-) -> io::Result<MessageAttachment> {
-    std::fs::create_dir_all(inbox_dir)?;
-    let sanitized = sanitize_filename(filename_hint);
-    let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let dest_name = format!("{uuid_prefix}_{sanitized}");
-    let dest_path = inbox_dir.join(&dest_name);
-    std::fs::write(&dest_path, bytes)?;
-    Ok(MessageAttachment {
-        resource_id: Some(new_resource_id()),
-        local_path: dest_path.to_string_lossy().into_owned(),
-        filename: sanitized,
-        mime_type: mime_type.to_string(),
-        size_bytes: bytes.len() as u64,
-        provenance: AttachmentProvenance::ToolObservation,
-        source_tool: Some(source_tool.to_string()),
-        sha256: Some(format!("{:x}", Sha256::digest(bytes))),
-    })
 }
 
 /// Infer image MIME from magic bytes when the platform metadata is unreliable.

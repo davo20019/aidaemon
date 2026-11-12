@@ -1,0 +1,26 @@
+{
+  "description": "Send an exact file resource to the user in the current chat. Prefer resource_id from an attachment or artifact result; otherwise provide an exact file_path. Never guess a path or substitute another file with the same name.",
+  "name": "send_file",
+  "schema": {
+    "description": "Send an exact file resource to the user in the current chat. Prefer resource_id from an attachment or artifact result; otherwise provide an exact file_path. Never guess a path or substitute another file with the same name.",
+    "name": "send_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "caption": {
+          "description": "Optional caption for the file",
+          "type": "string"
+        },
+        "file_path": {
+          "description": "Exact absolute path to send. Use only when no resource_id is available.",
+          "type": "string"
+        },
+        "resource_id": {
+          "description": "Exact opaque resource handle (res_...) from this conversation. Preferred for attachments and tool-created artifacts.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

@@ -416,7 +416,6 @@ mod tests {
 
     use super::*;
     use crate::config::ExecutionConfig;
-    use crate::execution::LocalBackend;
 
     async fn local_backend(root: &std::path::Path) -> SharedExecutionBackend {
         let config = ExecutionConfig {
@@ -424,7 +423,7 @@ mod tests {
             allow_outside_workspace: Some(false),
             ..ExecutionConfig::default()
         };
-        Arc::new(LocalBackend::new(&config).await.unwrap())
+        Arc::new(crate::execution::local_backend(&config).await.unwrap())
     }
 
     #[tokio::test]

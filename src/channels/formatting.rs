@@ -269,32 +269,7 @@ pub(crate) fn build_help_text(commands: &[super::commands::CommandDef], prefix: 
     text
 }
 
-/// Sanitize a filename: remove path separators, null bytes, and limit length.
-pub(crate) fn sanitize_filename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
-        .collect();
-    // Strip path traversal sequences
-    let sanitized = sanitized.replace("..", "");
-    // Limit to 200 chars, preserving extension
-    if sanitized.len() <= 200 {
-        sanitized
-    } else if let Some(dot_pos) = sanitized.rfind('.') {
-        let ext = &sanitized[dot_pos..];
-        if ext.len() < 20 {
-            let stem_len = 200 - ext.len();
-            let boundary = crate::utils::floor_char_boundary(&sanitized, stem_len);
-            format!("{}{}", &sanitized[..boundary], ext)
-        } else {
-            let boundary = crate::utils::floor_char_boundary(&sanitized, 200);
-            sanitized[..boundary].to_string()
-        }
-    } else {
-        let boundary = crate::utils::floor_char_boundary(&sanitized, 200);
-        sanitized[..boundary].to_string()
-    }
-}
+pub(crate) use aidaemon_events::attachments::sanitize_filename;
 
 #[cfg(test)]
 mod tests {

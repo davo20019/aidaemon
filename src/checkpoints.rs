@@ -2269,7 +2269,7 @@ mod tests {
             ..Default::default()
         };
         let backend = Arc::new(
-            crate::execution::LocalBackend::new(&execution_config)
+            crate::execution::local_backend(&execution_config)
                 .await
                 .unwrap(),
         );
@@ -2318,7 +2318,7 @@ mod tests {
             ..Default::default()
         };
         let backend = Arc::new(
-            crate::execution::LocalBackend::new(&execution_config)
+            crate::execution::local_backend(&execution_config)
                 .await
                 .unwrap(),
         );
@@ -2383,7 +2383,7 @@ mod tests {
             ..Default::default()
         };
         let backend = Arc::new(
-            crate::execution::LocalBackend::new(&execution_config)
+            crate::execution::local_backend(&execution_config)
                 .await
                 .unwrap(),
         );
@@ -2444,7 +2444,7 @@ mod tests {
             ..Default::default()
         };
         let backend = Arc::new(
-            crate::execution::LocalBackend::new(&execution_config)
+            crate::execution::local_backend(&execution_config)
                 .await
                 .unwrap(),
         );

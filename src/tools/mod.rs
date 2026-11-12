@@ -1,5 +1,5 @@
 pub mod approval;
-pub mod background_deliverable;
+pub use aidaemon_tools::background_deliverable;
 #[cfg(feature = "browser")]
 pub mod browser;
 #[cfg(feature = "slack")]
@@ -104,7 +104,7 @@ pub use aidaemon_tools::daemon_guard;
 mod semantic_command_risk;
 
 // Deterministic tools
-pub(crate) mod fs_utils;
+pub(crate) use aidaemon_tools::fs_utils;
 mod read_file;
 pub(crate) use read_file::render_read_file_output_within;
 pub use read_file::ReadFileTool;
