@@ -327,7 +327,7 @@ mod tests {
         let mut s = LiveStatus::new();
         s.set_checklist(
             &sink,
-            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (deferred)".into(),
+            "⚠️ Stopped short · 1 of 2 done\n\n✅ Step 1\n⏭️ Step 2 (not done)".into(),
         )
         .await;
         s.clear(&sink, true).await;
